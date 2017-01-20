@@ -1,0 +1,843 @@
+%TITLE 'D E L E T E   -- $DELETE processor'
+!<BLF/REQUIRE 'RMSBLF.REQ'>
+MODULE delete (IDENT = '3.0'
+		) =
+BEGIN
+
+!
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1984, 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+
+!++
+! FACILITY:	RMS
+!
+! ABSTRACT:
+!
+!	DELETE contains all routines which
+!	process the $DELETE macro in RMS-20.
+!
+! ENVIRONMENT:	User mode, interrupts deferred until JSYS return.
+!
+! AUTHOR: Ron Lusk , CREATION DATE: 16-Mar-83
+!
+! MODIFIED BY:
+!
+!	, : VERSION
+! 01	- Remote $Delete code
+!--
+
+!
+! TABLE OF CONTENTS
+!
+!
+!	$DELETE	    -	Dispatcher for $DELETE macro
+!	DELSQR	    -	Process $DELETE for SEQ/REL files
+!	CHECKRP	    -	Check file position, record locking
+!	DELIDX	    -	Process $DELETE for indexed files
+!	DODELIDX    -	Perform the work for indexed files
+!	DELUDR	    -	Compress a primary data record and RRV
+!
+!
+! INCLUDE FILES:
+!
+
+REQUIRE 'rmsreq';
+
+!
+! MACROS:
+!
+!	None.
+!
+! EQUATED SYMBOLS:
+!
+
+GLOBAL BIND
+    delev = 2^24 + 0^18 + 400;			! Module version number
+
+!
+! OWN STORAGE:
+!
+!	None.
+!
+! EXTERNAL REFERENCES:
+
+EXTERNAL ROUTINE
+    Dap$Delete;
+
+%SBTTL '$DELETE - record deletion dispatcher'
+
+GLOBAL ROUTINE $delete (rabblock, errorreturn) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	$DELETE always operates on the record designated by
+!	the CURRENT-RECORD.  This is the record indicated by
+!	the DATARFA field in the Record Status Table, and
+!	residing in the current bucket.
+!
+! FORMAL PARAMETERS
+!
+!	RABLOCK	    -	User's Record Access Block
+!	    ISI	    -	Internal Stream Identifier, points
+!			to Record Status Table
+!	    ROP	    -	Record Options
+!		FDL -	Fast Delete (indexed files only)
+!	    STS	    -	Status information (returned)
+!	    STV	    -	Additional status information
+!
+!	ERRORRETURN -	Address of user's error routine
+!
+! IMPLICIT INPUTS
+!
+!	?
+!
+! ROUTINE VALUE:
+!
+!	None, yet not NOVALUE.
+!
+! SIDE EFFECTS:
+!
+!	?
+!
+!--
+
+    BEGIN
+    rmsentry ($delete);
+    !
+    !   Fetch the user's RAB and error address.
+    !
+    rab = .rabblock;				! Get RAB address
+    erradr = .errorreturn;			! And user error address
+    rsetup (axdel);				! Set up world
+
+    IF .Fst[Fst$v_Remote]
+    THEN
+        BEGIN
+        Dap$Delete( .Rab, .erradr );
+        UsrRet();
+        END;
+
+
+    !
+    !   Make sure the file is positioned and is a disk file.
+    !
+    checkrp ();
+
+!+
+!   Dispatch to the proper routine for each file organization.
+!-
+
+    CASE fileorg FROM 0 TO 3 OF
+	SET
+
+	[orgasc] :
+	    usererror (er$iop);			! ASCII - Bad operation
+
+	[orgseq] :
+	    delsqr ();				! Sequential files
+
+	[orgrel] :
+	    delsqr ();				! Relative files
+
+	[orgidx] :
+	    delidx ();				! Indexed files
+	TES;
+
+    !
+    !   The $DELETE was performed successfully. All locking or
+    !   unlocking was performed in the appropriate routine.
+    !
+    setsuccess;
+    usrret ()					! ***Exit to user***
+    END;					! End of $DELETE
+
+%SBTTL 'DELSQR -- delete SEQ/REL record'
+
+GLOBAL ROUTINE delsqr : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Process the $DELETE macro for sequential and
+!	relative files.
+!
+!	This routine must do the following:
+!
+!	1)  Determine address of current record
+!	2)  Position file to that byte address
+!	3)  Set the deleted bit in the record header
+!	4)  Unlock the current record
+!
+! FORMAL PARAMETERS
+!
+!	None.
+!
+! IMPLICIT INPUTS
+!
+!	?
+!
+! ROUTINE VALUE:
+!
+!	None: (if there is an error during processing of
+!	the $DELETE, this routine will exit directly
+!	to the user).
+!
+! SIDE EFFECTS:
+!
+!	None.
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	temp,					! Temporary storage
+	filepointer : REF BLOCK,		! Pointer to current record
+	header,					! Header of current record
+	crp,					! Current RFA
+	bytenum;				! Byte number of current record
+
+    TRACE ('DELSQR');
+    !
+    !   Determine the byte number at which this record begins.
+    !
+    bytenum = (crp = .rst [rstdatarfa]);	! Assume a SEQ file
+
+!+
+!   For relative files, we must convert the record number (RFA)
+!   into the actual byte number of the target record.
+!-
+
+    IF relfile
+    THEN 					! Convert CRP for REL files
+	BEGIN
+
+	IF (bytenum = numbertorfa (.crp)) EQL false THEN usererror (er$rfa)
+
+	END;
+
+    !
+    !   Position file to desired record. It could
+    !   be out of position if the record
+    !   spanned a page boundary.
+    !
+    gtbyte (.bytenum, 				! Byte
+	false);					! Flag
+    !
+    !   Fetch the pointer to the record in the file buffer.
+    !
+    filepointer = .rst [rstpagptr];		! Get the file page pointer
+    header = .filepointer [wholeword];		! And the record header
+    lookat ('	Record header = ', header);	! **Debug**
+    !
+    !   Set the "deleted" bit in the record header
+    !
+
+%IF dbug
+%THEN
+
+    IF chkflag (header, rhdrdelete) NEQ 0 THEN rmsbug (msgflags);
+
+%FI
+
+    filepointer [wholeword] = 			! Store the header back again
+    .header OR (rhdrdelete);
+    setbfdupd (cbd [bkdbfdadr]);		! Indicate file page
+    						! needs updating
+
+!+
+!   Unlock the current record and exit.  Note that the
+!   UNLOCK macro also clears the "datalocked" bit.
+!-
+
+    IF locking THEN unlock (crp);		! Unlock the record
+
+    RETURN 					! Return to $DELETE
+    END;					! End of DELSQR
+
+%SBTTL 'CHECKRP -- Check file and record'
+
+GLOBAL ROUTINE checkrp : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	CHECKRP is called by both the $DELETE and $UPDATE
+!	processors.  Its function is to make sure that the
+!	file is positioned and the current record is locked
+!	(if the file is being shared).
+!
+! FORMAL PARAMETERS
+!
+!	None.
+!
+! IMPLICIT INPUTS
+!
+!	?
+!
+! ROUTINE VALUE:
+!
+!	None.
+!
+! SIDE EFFECTS:
+!
+!	?
+!
+!--
+
+    BEGIN
+
+!+
+!   File must reside on a DASD (disk device).
+!-
+
+    IF NOT dasd THEN usererror (er$dev);
+
+!+
+!   Check that the last operation was a $FIND or a $GET.
+!-
+
+    IF (.rst [rstlastoper] NEQ c$find) AND 	!
+	(.rst [rstlastoper] NEQ c$get)		!
+    THEN
+	usererror (er$cur);
+
+    RETURN
+    END;					! End of CHECKRP
+
+%SBTTL 'DELIDX -- delete indexed record'
+
+GLOBAL ROUTINE delidx : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	DELIDX processes the $DELETE macro for indexed
+!	files.  When this routine is called, there must be a
+!	current bucket set up and a pointer to the current
+!	record must be in the PAGPTR field in the Record
+!	Status Table.  The function of this routine is to
+!	delete all SIDR entries for this record, then mark
+!	the primary record as being deleted.
+!
+!	Note that if the primary key allows duplicates, then
+!	the primary data record will never be compressed out
+!	of the bucket.  This is because if a user was
+!	positioned in the middle of a series of duplicates
+!	and his "current record" was deleted, he would have
+!	no way of getting back to his correct position in
+!	the file.
+!
+!	On an error, this routine exits directly to the
+!	user.
+!
+!	If locking is enabled, then we must lock the file
+!	index only if we need to delete some SIDR pointers.
+!	If no secondary indices have to be accessed, then we
+!	don't need to lock anything, since the current
+!	bucket is already locked.
+!
+! FORMAL PARAMETERS
+!
+!	None.
+!
+! IMPLICIT INPUTS
+!
+!	?
+!
+! ROUTINE VALUE:
+!
+!	None.
+!
+! SIDE EFFECTS:
+!
+!	NONE.
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	databd : BLOCK [bdsize],		! Descriptor for current bucket
+	recdesc : BLOCK [rdsize],		! Record descriptor packet
+	savedstatus,				! Save the results here
+	updateflag;				! Flag for updating bucket
+
+    TRACE ('DELIDX');
+    !
+    !   Fetch the current bucket and make sure there is one.
+    !
+    fetchcurrentbkt (databd);
+
+    IF nullbd (databd) THEN rmsbug (msgbkt);
+
+    setnullbd (cbd);				! Set it to be null
+
+!+
+!   Perform the delete operation.
+!-
+
+    !
+    !   Set the "horizontal-search" flag so we will
+    !   go through the secondary index properly.
+    !
+    recdesc [rdflags] = rdflghorizok;		! Horizontal search is OK
+    recdesc [rdstatus] = 0;			! Clear status
+    recdesc [rdrecptr] = .rst [rstpagptr];
+    kdb = .fst [fstkdb];			! Use primary key
+    savedstatus = dodelidx (recdesc, 		! Record descriptor
+	databd);				! Bucket descriptor
+
+!+
+!   If SAVEDSTATUS is true, then we will
+!   eventually update the bucket to disk.
+!-
+
+    IF .savedstatus NEQ false			! Delete OK so far
+    THEN
+	setbfdupd (cbd [bkdbfdadr]);
+
+    IF writebehind OR (.savedstatus EQL false)	! Do output now?
+    THEN
+	updateflag = false			! No
+    ELSE
+	updateflag = true;			! Yes, write it out
+
+    !
+    !   Release the current bucket.
+    !
+    putbkt (.updateflag, databd);
+
+!+
+!   We now must unlock the file if it was locked.
+!-
+
+    IF indexlocked				!
+    THEN
+	unlockindex;
+
+    IF .savedstatus EQL false THEN usrret ();	! Exit on error
+
+    RETURN
+    END;					! End of DELIDX
+
+%SBTTL 'DODELIDX -- delete indexed record'
+
+GLOBAL ROUTINE dodelidx (recdesc : REF BLOCK, databd : REF BLOCK) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	DODELIDX performs the actual deletion of the current
+!	record in an indexed file.  This routine is called
+!	only by DELIDX.
+!
+!	This routine will never release the current bucket.
+!
+!	If any unexpected error occurs (e.g., RRV was not
+!	found), then an undefined file condition is set and
+!	processing continues.
+!
+!	On input the KDB must be set up for primary key.
+!
+!	No compression is done during a $DELETE.  All
+!	compression is done on a $PUT.
+!
+! FORMAL PARAMETERS
+!
+!	RECDESC	    -	Record descriptor packet
+!	    RECPTR  -	address of current record
+!	    FLAGS   -	FLGHORIZOK is referenced
+!	    STATUS  -	<null>
+!
+!	DATABD	    -	Bucket descriptor of current bucket.
+!
+! IMPLICIT INPUTS
+!
+!	None.
+!
+! ROUTINE VALUE:
+!
+!	TRUE	-   Deletion was successful
+!	FALSE	-   Error
+!		    Could not delete a SIDR
+!
+! SIDE EFFECTS:
+!
+!	NONE.
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	nocompressflag,				! Flag for compression of UDR
+	sizeofcurentrcd,			! Current record size
+	ptrtodata : REF BLOCK,			! Data portion of UDR
+	rfatosearchfor;				! RFA of current record
+
+    REGISTER
+	recordptr : REF BLOCK;			! Current record pointer
+
+    EXTERNAL
+	tbuffer;				! Buffer for key
+
+    TRACE ('DODELIDX');
+    !
+    !   Set up a pointer to the current record and its data.
+    !
+    recordptr = .recdesc [rdrecptr];
+    ptrtodata = .recordptr + .kdb [kdbhsz];
+
+!+
+!   Make a check to make sure the deleted bit is off.
+!-
+
+    IF (chkflag (recordptr [drflags], flgdelete) NEQ 0)	!
+    THEN
+	rmsbug (msgflags);
+
+    !
+    !   Initialize some flags.
+    !
+    nocompressflag = false;			! Assume no errors
+    sizeofcurentrcd = .rst [rstrsz];		! Set up size of record
+
+!+
+!   Perform this loop once for each secondary key. we
+!   will try to delete the SIDR entry for each key.
+!-
+
+    recdesc [rdrrv] = .recordptr [drrrvaddress];
+    kdb = .kdb [kdbnxt];			! First secondary key
+
+    UNTIL .kdb EQL 0 DO
+	BEGIN
+
+!+
+!   Record must contain key string.
+!-
+
+	IF .sizeofcurentrcd GEQ .kdb [kdbminrsz]
+	THEN
+	    BEGIN
+	    lookat ('	Deleting key: ', kdb [kdbref]);
+
+!+
+!   Lock the file if it is not already locked.
+!-
+
+	    IF locking AND NOT indexlocked
+	    THEN
+		BEGIN
+
+		IF lockindex (enqblk, enqexc) EQL false	!
+		THEN
+		    returnstatus (er$edq)
+
+		END;
+
+	    !
+	    !   Move the key string.
+	    !
+	    movekey (.ptrtodata, 		! From record
+		tbuffer);			! To buffer
+	    !
+	    !   Set up the address of this key string.
+	    !
+	    recdesc [rduserptr] = tbuffer;
+	    recdesc [rdusersize] = .kdb [kdbksz];
+
+!+
+!   If there was an error, we will set the
+!   "no-compress" flag because we don't
+!   know what went wrong.
+!-
+
+	    IF delsidr (.recdesc) EQL false	!
+	    THEN
+		nocompressflag = true
+
+	    END;
+
+	!
+	!   We have finished processing the current
+	!   key...move to next one.
+	!
+	kdb = .kdb [kdbnxt]
+	END;
+
+!+
+!   We have now deleted the SIDRs for this record.  We must
+!   determine what we are going to about the primary data
+!   record.  If there was any kind of error during our
+!   processing, or if duplicates are allowed on the primary key,
+!   then we should set the "no-compress" flag in the primary
+!   data record so the record will never go away.
+!-
+
+    kdb = .fst [fstkdb];			! Set up for primary key.
+    !
+    !   Set the deleted bit in the data record.
+    !
+    setupd (databd);				! Indicate that this bucket
+    						!   is being updated.
+    setflag (recordptr [drflags], flgdelete);
+
+!+
+!   For duplicates in the primary index, or on an
+!   error, don't allow compression.
+!-
+
+    IF (duplicates) OR (.nocompressflag NEQ false)	!
+    THEN 					! This record cannot go away
+	setflag (recordptr [drflags], flgnocompress);
+
+!+
+!   Note that at this point, we must not completely
+!   remove this record from the file if duplicates
+!   are allowed in the primary index.  However, for
+!   variable- length records, we can squeeze the
+!   primary record so that it is only as big as the
+!   primary key.  This may not save us anything (if
+!   the key is in the end of the record) or it may
+!   be a big winner.
+!   [This is not done as of March 83 -- RL]
+!-
+
+!+
+!   Should we return success or failure?
+!-
+
+    IF .nocompressflag NEQ false THEN RETURN false;
+
+    RETURN true;				! Return without compression
+    END;					! End of DODELIDX
+
+%SBTTL 'DELUDR -- squeeze UDR and its RRV'
+
+GLOBAL ROUTINE deludr (recdesc : REF BLOCK, databd : REF BLOCK) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	DELUDR squeezes a primary data record and possibly
+!	its RRV out of the current bucket.  This routine is
+!	called if update of a SIDR must be aborted (e.g.,
+!	improperly duplicated key).  This routine squeezes
+!	the UDR out of the bucket and tries to do the same
+!	for the RRV (if any).  There should not be any
+!	errors during this routine.
+!
+!	A not on the algorithm and why it was chosen migh be
+!	useful at this point.  Since we know the RRVs are
+!	always at the bottom of the bucket, squeezing them
+!	away is not a very painful operation.  However, it
+!	would be nice if we could avoid the I/O which is
+!	required to write out the RRV bucket.  Our only
+!	alternative is to set the RRV to be deleted and
+!	leave it alone.  However, it would then still be
+!	possible to have an RRV pointing to a non-existent
+!	data record...thus, we must always write out the RRV
+!	bucket, and since ther are no indices which point to
+!	this RRV, leaving it in the bucket is needless waste
+!	of space.  Therfore, we will compress it out of the
+!	bucket now. [From original source -- RL, March '83]
+!
+!	The KDB must be set up for the primary key.
+!
+! FORMAL PARAMETERS
+!
+!	RECDESC	    -	Record descriptor packet
+!   	    RECPTR  -	address of current record
+!	    LENGTH  -	size (in words) of current record
+!			(including header)
+!	DATABD	    -	Bucket descriptor of current record.
+!
+! IMPLICIT INPUTS
+!
+!	?
+!
+! ROUTINE VALUE:
+!
+!	TRUE	    -	Record squeezed out of bucket.
+!	FALSE	    -	Error
+!			Could not find RRV (file consistency
+!			problem)
+!
+! SIDE EFFECTS:
+!
+!	?
+!
+!--
+
+    BEGIN
+
+    REGISTER
+	recordptr : REF BLOCK,			! Pointer to current record
+	tempac;					! AC used for BLT
+
+    LOCAL
+	bucketptr : REF BLOCK,			! Pointer to top of bucket
+	endptr : REF BLOCK,			! Pointer to end of bucket
+	rrvbd : BLOCK [bdsize],			! Descriptor for RRV bucket
+	amounttomove,				! Size of chunk to move
+	endofrecordptr : REF BLOCK,		! End of current record
+	sizeofcurentrcd,			! Current record size
+	rrvaddress;				! RRV to find
+
+    TRACE ('DELUDR');
+
+!+
+!   Make sure this is a primary key set-up.
+!-
+
+    IF NOT primarykey THEN rmsbug (msginput);
+
+    !
+    !   Get the address of the current record and
+    !   set up some pointers to the bucket.
+    !
+    recordptr = .recdesc [rdrecptr];
+    bucketptr = .databd [bkdbktadr];		! Top of bucket
+    endptr = .bucketptr + .bucketptr [bhnextbyte];
+    !
+    !   Get address of RRV.
+    !
+    rrvaddress = .recordptr [drrrvaddress];
+
+!+
+!   Do we need to squeeze out the RRV too?
+!-
+
+%IF 0
+%THEN
+
+!++
+!   This code does not work, but is rather unimportant
+!   because it is exercised only when a secondary key insert
+!   aborts and the new record caused a bucket split.
+!   Consequently, I'm no-oping it.
+!
+!   [This note came from some developer of ages past --
+!   there is indeed a need for code of this nature, since a
+!   fairly serious bug appeared when a secondary key insert
+!   aborted and a bucket split had already occurred.  But as
+!   of March 1983, this code was still "conditioned" out.
+!			    - RL]
+!--
+
+    IF bucketofrfa (.rrvaddress) EQL filepage (databd)	!
+    THEN 					! There is an RRV record
+	BEGIN
+
+!+
+!   We may have to lock the file here.
+!-
+
+	IF locking AND NOT indexlocked		!
+	THEN
+	    BEGIN
+
+	    IF lockindex (enqblk, enqshr) EQL false THEN returnstatus (er$edq)
+
+	    END;
+
+!+
+!   We must squeeze out the RRV too.
+!-
+
+	rtrace (%STRING ('	Squeezing the RRV...', %CHAR (13, 10)));
+	recdesc [rdrfa] = .rrvaddress;
+	recdesc [rdrecptr] = 0;			! Make sure we start at top
+
+	IF fbyrfa (.recdesc, 			! Record descriptor
+		rrvbd, 				! Bucket descriptor
+		false) EQL false		! Nolock
+	THEN
+	    BEGIN				! We couldn't find the RRV
+	    rtrace (%STRING ('***Couldn''t get RRV...', %CHAR (13, 10)));
+	    fileproblem (er$rrv);
+	    RETURN false;
+	    END;
+
+!+
+!   Get the address of the RRV and its bucket.
+!-
+
+	recordptr = .recdesc [rdrecptr];
+	bucketptr = .rrvbd [bkdbktadr];
+	amounttomove = 				!
+	.bucketptr + .bucketptr [bhnextbyte]	!
+	- .recordptr - rrvrecsize;		!
+	lookat ('	RRV bucket-pointer: ', bucketptr);
+	lookat ('	Amount to move: ', amounttomove);
+
+!+
+!   Is the RRV at the bottom of the bucket?
+!-
+
+	IF .amounttomove NEQ 0
+	THEN
+	    movewords (				!
+		.recordptr + rrvrecsize, 	! From
+		.recordptr, 			! To
+		.amounttomove);			! Size
+
+						!
+	!   Update the bucket header information.
+	!
+	bucketptr [bhnextbyte] = .bucketptr [bhnextbyte] - rrvrecsize;
+	!
+	!   Release the RRV bucket and update it.
+	!
+	putbkt (true, 				! No update
+	    rrvbd)				! Bucket
+	END;
+
+%FI						! End removed code
+
+!+
+!   Now, squeeze out the primary data record.
+!-
+
+    sizeofcurentrcd = .recdesc [rdlength];
+    endofrecordptr = .recordptr + .sizeofcurentrcd;
+    amounttomove = .endptr - .endofrecordptr;
+    lookat ('	Squeezing record at: ', recordptr);
+    lookat ('	Amount to move: ', amounttomove);
+    lookat ('	End of bucket: ', endptr);
+
+    IF .amounttomove NEQ 0
+    THEN
+	movewords (.endofrecordptr, 		! From
+	    .recordptr, 			! To
+	    .amounttomove);			! Size
+
+    						!
+    !   Adjust the bucket header information.
+    !
+    bucketptr [bhnextbyte] = .bucketptr [bhnextbyte] - .sizeofcurentrcd;
+    RETURN true;
+    END;					! End of DELUDR
+
+END						! End of Module DELETE
+
+ELUDOM
+   

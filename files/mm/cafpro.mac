@@ -1,0 +1,539 @@
+	TITLE CAFPRO Cafard Phase I Protocol Routines (OS independent)
+	SUBTTL Written by Mark Crispin/MRC
+
+; Copyright (C) 1985, 1986 Mark Crispin.  All rights reserved.
+
+	SEARCH MACSYM		; system definitions
+	SALL			; suppress macro expansions
+	.DIRECTIVE FLBLST	; sane listings for ASCIZ, etc.
+	EXTERN $SIBE,$BIN,$SOUT,$BLOCK
+
+; Cafard Phase I protocol:
+
+;  All packets start with DLE.  The second byte indicates what sort of
+; packet it is.  The packet sequence is a 4-bit value, the packet data
+; size is an 8-bit value, and the packet checksum is a 16-bit value.
+; All values are expressed as their text hex representation.
+;
+;  Text packets are indicated with STX, followed by the packet sequence
+; byte, two bytes of packet data size, the packet data, four bytes of
+; packet checksum, and a CR.  Inside the packet data, control characters,
+; delete, and the quote character must be quoted.  This is accomplished
+; by sending the quote character followed by the character's ASCII
+; representation expressed in hex.  Note that CR and LF must be quoted.
+;
+;  Acknowledgement packets are indicated with ACK, followed by the packet
+; sequence byte for the packet being acknowledged and the same byte XOR'd
+; with the AXR value.
+	SUBTTL Definitions
+
+A=1				; JSYS, temporary AC's
+B=2
+C=3
+D=4
+E=5
+PC=14				; JSP pointer
+
+; Protocol definitions
+
+PROMAX==^D255			; absolute maximum packet size (2 bytes)
+PROBSZ==^D50			; maximum number of text character in packet
+ACKWAT==^D5			; maximum time to wait for an ack (in seconds)
+MAXINW==^D3			; maximum time to wait for input (in minutes)
+MAXJNK==^D1000			; maximum number of junk characters before DLE
+MAXRTY==^D100			; maximum number of retries/packet
+
+; Packet header protocol
+
+DLE==.CHCNP			; data link escape
+STX==.CHCNB			; start of text
+ACK==.CHCUN			; acknowledgement
+
+; Protocol occuring inside packet data
+QOT=="\"			; quote character
+EOF==377			; end of file
+
+; Magic numbers
+
+XSM==013215			; checksum magic number
+AXR==161			; ACK check byte XOR value
+	SUBTTL Data area
+
+	.PSECT DATA
+
+%PKOUT:	BLOCK 1			; number of packets output
+%RETRY:	BLOCK 1			; number of retransmissions
+
+PRIEOF:	BLOCK 1			; input EOF seen
+PRISEQ:	BLOCK 1			; input sequence
+PRIXSM:	BLOCK 1			; input checksum
+PRIPTR:	BLOCK 1			; input pointer
+PRICTR:	BLOCK 1			; input counter
+PRIBFR:	BLOCK <PROMAX/5>+1	; input buffer
+PROSEQ:	BLOCK 1			; output sequence
+PROXSM:	BLOCK 1			; output checksum
+PROPTR:	BLOCK 1			; output pointer
+PROCTR:	BLOCK 1			; output counter
+PROCNT:	BLOCK 1			; output character counter
+PROBFR:	BLOCK 2+<PROBSZ/5>+1	; output buffer
+
+	.ENDPS
+	.PSECT CODE
+	SUBTTL Protocol initialization
+
+; $PINIT - Initialize protocol
+;	CALL $PINIT
+; Returns +1: Always
+
+$PINIT::SAVEAC <A,B>
+	DMOVE A,[POINT 7,PRIBFR	; initialize protocol pointers
+		 POINT 7,PROBFR+1]
+	MOVEM A,PRIPTR
+	MOVEM B,PROPTR
+	SETZM PRICTR
+	MOVX A,PROBSZ		; initialize counters
+	MOVEM A,PROCTR
+	MOVEM A,PROCNT
+	SETZM PRIEOF		; no EOF status yet
+	SETZM PRISEQ		; initialize sequences
+	SETOM PROSEQ
+	SETZM PROXSM		; initialize output checksum
+	RET
+	SUBTTL Protocol I/O routines
+
+; $PBIN - Get byte from remote using protocol
+;	CALL $PBIN
+; Returns +1: Link died
+;	  +2: Success, B/ byte or -1 if EOF
+
+$PBIN::	SAVEAC <A,C,D,E>
+	SOSGE PRICTR		; any bytes left in current packet?
+	IFSKP.
+	  ILDB B,PRIPTR		; yes, get byte
+	  RETSKP		; bye bye
+	ENDIF.
+	SKIPN B,PRIEOF		; any EOF status?
+	IFSKP.
+	  SETZM PRIEOF		; yes, clear it now that it's been seen
+	  RETSKP		; return success now
+	ENDIF.
+	TRVAR <LSTCHR>
+	SETOM LSTCHR		; no "last character" yet
+	DO.			; here when must read in a packet
+	  SETZM PRICTR		; no data bytes yet
+	  MOVE A,LSTCHR
+	  CAIN A,DLE		; saw DLE?
+	  IFSKP.
+	    MOVX A,MAXJNK	; maximum number of junk bytes allowed
+	    DO.
+	      CALL BINTMO	; no, get DLE we want
+	       RET		; pass up errors
+	      CAIN B,DLE	; saw expected DLE?
+	      IFSKP.
+		SOJG A,TOP.	; no, keep on trying until we get that DLE
+		RET		; too many junk characters
+	      ENDIF.
+	    ENDDO.
+	  ENDIF.
+	  CALL BINTMO		; get packet type
+	   RET			; pass up error
+	  CAIE B,STX		; data packet?
+	   LOOP.		; no others known yet
+	  CALL BINTMO		; get packet sequence byte
+	   RET
+	  CALL UNHEX		; unhexify
+	   LOOP.		; not valid hex
+	  CAME A,PRISEQ		; is this the right sequence?
+	   EXIT.		; no, ack current packet and get next
+	  CALL BINTMO		; get 1st byte of packet data size
+	   RET
+	  CALL UNHEX
+	   LOOP.
+	  MOVEI D,(A)		; copy it
+	  CALL BINTMO		; get 2nd byte of packet data size
+	   RET
+	  CALL UNHEX
+	   LOOP.
+	  LSH D,4		; hexade over first byte
+	  ADDI D,(A)		; D/ number of data bytes following
+	  MOVEM D,PRICTR
+	  MOVE A,[POINT 7,PRIBFR] ; start buffer pointer
+	  MOVEM A,PRIPTR
+	  SETZM PRIEOF		; no EOF status yet
+	  SETZM PRIXSM		; start checksum
+	  DO.
+	    CALL BINTMO		; get a packet data byte
+	     RET
+	    CAIE B,QOT		; quoting byte?
+	    IFSKP.
+	      CALL BINTMO	; yes, get first value byte
+	       RET
+	      CALL UNHEX	; unhexify
+	       EXIT.
+	      MOVEI C,(A)	; save it
+	      CALL BINTMO	; yes, get second value byte
+	       RET
+	      CALL UNHEX	; unhexify
+	       EXIT.
+	      LSH C,4		; hexade over first byte
+	      ADDI C,(A)	; merge the two together
+	      MOVEI B,(C)	; put byte in right register
+	    ENDIF.
+	    CALL INPXSM		; checksum it
+	    CAIN B,EOF		; was this an EOF?
+	    IFSKP.
+	      IDPB B,PRIPTR	; store it in the buffer
+	      SOJG D,TOP.	; no, get next packet data byte
+	    ELSE.
+	      SETOM PRIEOF	; note EOF status
+	      SOJG D,ENDLP.	; this had better be the last byte
+	      SOS PRICTR	; knock this off the counter
+	    ENDIF.
+	  ENDDO.
+	  JUMPG D,TOP.		; resynch on DLE if aborted in data in
+	  MOVE B,PRISEQ		; get data size byte
+	  MOVE B,HEXTAB(B)	; hexify it
+	  CALL INPXSM		; checksum it
+	  CALL BINTMO		; get 1st byte of checksum
+	   RET
+	  CALL UNHEX
+	   LOOP.
+	  MOVEI C,(A)		; save it
+	  CALL BINTMO		; get 2nd byte of checksum
+	   RET
+	  CALL UNHEX
+	   LOOP.
+	  LSH C,4		; hexade over first byte
+	  ADDI C,(A)		; add in 2nd byte
+	  CALL BINTMO		; get 3rd byte of checksum
+	   RET
+	  CALL UNHEX
+	   LOOP.
+	  LSH C,4		; hexade over first two bytes
+	  ADDI C,(A)		; add in 3rd byte
+	  CALL BINTMO		; get 4th byte of checksum
+	   RET
+	  CALL UNHEX
+	   LOOP.
+	  LSH C,4		; hexade over first three bytes
+	  ADDI C,(A)		; add in 4th bytes
+	  CAME C,PRIXSM		; checksums match?
+	   LOOP.		; so sorry...
+	  CALL BINTMO		; finally, get expected CR
+	   RET
+	  CAIE B,.CHCRT		; saw it?
+	   LOOP.		; lose again
+	  MOVE A,[POINT 7,PRIBFR] ; reset buffer pointer
+	  MOVEM A,PRIPTR
+	  AOS A,PRISEQ		; bump sequence to next so right ack happens
+	  ANDX A,17		; only 1 hex byte
+	  MOVEM A,PRISEQ	; make sure copy in memory is okay
+	ENDDO.
+	MOVE D,[BYTE (7) DLE,ACK,0,0,.CHCRT] ; prepare acknowledgement packet
+	MOVE E,[BYTE (7) .CHLFD]
+	MOVE A,PRISEQ		; get sequence number
+	SUBI A,1		; acknowledge previous packet
+	ANDX A,17		; one hext byte
+	MOVE A,HEXTAB(A)	; hexify
+	DPB A,[POINT 7,D,20]	; store in packet
+	XORX A,AXR		; hash with magic number
+	DPB A,[POINT 7,D,27]	; store in packet
+	HRROI B,D		; pointer to packet
+	SETZ C,			; end on null
+	CALL $SOUT		; send acknowledgement
+	 RET
+	JRST $PBIN		; do it now that we know we've won
+
+; Routine to get a byte with eventual timeout
+;	CALL BINTMO
+; Returns +1: Hard error
+;	  +2: Byte in B
+
+BINTMO:	SAVEAC <A>
+	MOVX A,MAXINW*4*^D60	; maximum wait time in 250ms chunks
+	DO.
+	  CALL $SIBE		; any input available?
+	  IFSKP.
+	    CALL $BLOCK		; no, wait a little while
+	    SOJG A,TOP.		; try again
+	    RET			; timed out
+	  ENDIF.
+	ENDDO.
+	CALL $BIN		; have input, get it
+	 RET			; hard error
+	MOVEM B,LSTCHR		; save last character for possible later use
+	RETSKP
+
+	ENDTV.
+
+; Routine to convert hex text to numeric
+; Accepts:
+;	B/ byte
+;	CALL UNHEX
+; Returns +1: Not valid
+;	  +2: Success, A/ numeric value
+
+UNHEX:	CAILE B,"9"		; numeric hex?
+	IFSKP.
+	  CAIGE B,"0"		; could be, make sure in range
+	   RET			; loser
+	  MOVEI A,-"0"(B)	; convert to numeric
+	  RETSKP
+	ENDIF.
+	CAIL B,"A"		; alphabetic hex?
+	 CAILE B,"F"		; could be, make sure in range
+	  RET			; loser
+	MOVEI A,<^D10>-"A"(B)	; convert to numeric
+	RETSKP
+
+; Routine to add this byte to the input checksum
+; Accepts:
+;	B/ byte
+;	CALL INPXSM
+; Returns +1: Always
+
+INPXSM:	EXCH B,PRIXSM		; save character, get checksum
+	IMULI B,XSM		; multiply by magic number
+	ADD B,PRIXSM		; add in new byte
+	ANDX B,177777		; only want 16 bits
+	EXCH B,PRIXSM		; store new checksum
+	RET
+
+; $PSOUT - Send string to protocol
+; Accepts:
+;	A/ string to output
+;	B/ size of string to output
+;	CALL $PSOUT
+; Returns +1: Hard failure
+;	  +2: Success
+
+$PSOUT::STKVAR <PTR,CTR>
+	TXC A,.LHALF		; is destination pointer's LH -1?
+	TXCN A,.LHALF
+	 HRLI A,(<POINT 7,>)	; yes, set up byte pointer
+	MOVEM A,PTR		; save pointer
+	MOVEM B,CTR		; and counter
+	DO.
+	  SOSGE CTR		; any more bytes to do?
+	  IFSKP.
+	    ILDB A,PTR		; yes, get next byte then
+	    CALL $PBOUT		; output it
+	     RET		; percolate error up
+	    LOOP.		; try for more
+	  ENDIF.
+	ENDDO.
+	MOVE A,PTR		; return updated pointer
+	MOVE B,CTR		; and updated counter
+	RETSKP
+
+	ENDSV.
+
+; $PEOF - Send end of file indication
+;	CALL $PEOF
+; Returns +1: Hard failure
+;	  +2: Success
+
+; $PBOUT - Internal routine to send byte to protocol
+; Accepts:
+;	A/ byte to output
+;	CALL $PBOUT
+; Returns +1: Hard failure
+;	  +2: Success
+
+$PEOF::	MOVX A,EOF		; EOF signal is out of band byte
+$PBOUT:	SAVEAC <B,C,D,PC>
+	STKVAR <PKTSIZ,PKDSIZ>
+	IFXE. A,200		; if out-of-band, must be sent quoted
+	  MOVEI B,(A)		; in band, get copy of character
+	  IDIVI B,^D32		; B/ word to check, C/ bit to check
+	  MOVNS C
+	  MOVX D,1B0		; make bit to check
+	  LSH D,(C)
+	  TDNE D,PROMSK(B)	; is it a special character?
+	ANSKP.
+	  IDPB A,PROPTR		; store byte in buffer
+	  SOS B,PROCNT		; account for this byte
+	ELSE.
+	  MOVX B,QOT		; special or out of band, send escape
+	  IDPB B,PROPTR
+	  LDB B,[POINT 4,A,31]	; get high order byte
+	  MOVE B,HEXTAB(B)	; convert to hex and output
+	  IDPB B,PROPTR
+	  LDB B,[POINT 4,A,35]	; get low order byte
+	  MOVE B,HEXTAB(B)	; convert to hex and output
+	  IDPB B,PROPTR
+	  MOVX B,-3		; account for the bytes
+	  ADDB B,PROCNT
+	ENDIF.
+	CALL OUTXSM		; checksum this byte
+	SOS C,PROCTR		; count another data byte
+	IFXE. A,200		; was byte in band?
+	  CAIL B,^D3		; yes, reasonable amount of space left?
+	   RETSKP		; yes to both, can return now
+	ENDIF.
+	MOVEM C,PKDSIZ		; save data free space
+	SUBI B,5+PROBSZ+5	; <packet free space> - <maximum packet size>
+	MOVEM B,PKTSIZ		;  - negative packet size for $SOUT call
+	MOVX C,PROBSZ		; reset counters
+	MOVEM C,PROCTR
+	MOVEM C,PROCNT
+	SUBM C,PKDSIZ		; compute data area size
+
+; Make packet header
+
+	MOVE A,[BYTE (7) DLE,STX,0] ; initialize packet header
+	MOVEM A,PROBFR		;**
+	AOS A,PROSEQ		; get next sequence
+	ANDX A,17		; make hex
+	MOVE A,HEXTAB(A)
+	DPB A,[POINT 7,PROBFR,20] ;*
+	CALL OUTXSM		; checksum it
+	LDB A,[POINT 4,PKDSIZ,31] ; packet size high byte
+	MOVE A,HEXTAB(A)
+	DPB A,[POINT 7,PROBFR,27] ;*
+	LDB A,[POINT 4,PKDSIZ,35] ; packet size low byte
+	MOVE A,HEXTAB(A)
+	DPB A,[POINT 7,PROBFR,34] ;*
+
+; Make packet trailer
+
+	LDB A,[POINT 4,PROXSM,23] ; checksum first byte
+	MOVE A,HEXTAB(A)
+	IDPB A,PROPTR		;*
+	LDB A,[POINT 4,PROXSM,27] ; checksum second byte
+	MOVE A,HEXTAB(A)
+	IDPB A,PROPTR		;*
+	LDB A,[POINT 4,PROXSM,31] ; checksum third byte
+	MOVE A,HEXTAB(A)
+	IDPB A,PROPTR		;*
+	LDB A,[POINT 4,PROXSM,35] ; checksum fourth byte
+	MOVE A,HEXTAB(A)
+	IDPB A,PROPTR		;*
+	MOVX A,.CHCRT
+	IDPB A,PROPTR		;*
+	MOVE A,[POINT 7,PROBFR+1] ; reset pointer
+	MOVEM A,PROPTR
+	SETZM PROXSM		; reset checksum
+
+; Send packet out
+
+	AOS %PKOUT		; count packets output
+	MOVX A,MAXRTY		; get maximum retries
+	MOVEI PC,ACKTST		; start coroutine PC
+	DO.
+	  MOVE B,[POINT 7,PROBFR] ; send packet out
+	  MOVE C,PKTSIZ
+	  CALL $SOUT		; send the buffer
+	   RET			; pass up error
+	  MOVE C,PROSEQ		; get sequence
+	  ANDX C,17		; make hex
+	  MOVE C,HEXTAB(C)	; set up ACK value we want
+	  JSP PC,(PC)		; got an ACK yet?
+	  IFSKP.
+REPEAT ACKWAT*4,<
+	    CALL $BLOCK		; dally a while
+	    JSP PC,(PC)		; have anything yet?
+	  ANSKP.
+>;REPEAT ACKWAT*4
+	    SOJLE A,R		; no, retransmit unless too many times
+	    AOS %RETRY		; count retransmissions
+	    LOOP.		; retransmit
+	  ENDIF.
+	ENDDO.
+	RETSKP
+
+; Routine to add this byte to the output checksum
+; Accepts:
+;	A/ byte
+;	CALL OUTXSM
+; Returns +1: Always
+
+OUTXSM:	EXCH A,PROXSM		; save character, get checksum
+	IMULI A,XSM		; multiply by magic number
+	ADD A,PROXSM		; add in new byte
+	ANDX A,177777		; only want 16 bits
+	EXCH A,PROXSM		; store new checksum
+	RET
+
+; Coroutine to see if acknowledgement has come in yet
+;	JSP PC,ACKTST or JSP PC,(PC) for a retry
+; Returns +1: ACK has come in
+;	  +2: ACK has not come in
+
+ACKTST:	DO.
+	  CALL $SIBE		; any bytes in input stream?
+	  IFSKP.
+	    JSP PC,1(PC)	; no, try again
+	    LOOP.
+	  ENDIF.
+	ENDDO.
+	CALL $BIN		; get the byte
+	 RET			; percolate error up
+	DO.
+	  CAIE B,DLE		; DLE byte?
+	   JRST ACKTST		; no, try again
+	  DO.
+	    CALL $SIBE		; any more bytes?
+	    IFSKP.
+	      JSP PC,1(PC)	; no, try again
+	      LOOP.
+	    ENDIF.
+	  ENDDO.
+	  CALL $BIN		; get the byte
+	   RET			; percolate error up
+	  CAIE B,ACK		; ACK byte?
+	   LOOP.		; no, try again
+	  DO.
+	    CALL $SIBE		; any more bytes?
+	    IFSKP.
+	      JSP PC,1(PC)	; no, try again
+	      LOOP.
+	    ENDIF.
+	  ENDDO.
+	  CALL $BIN		; get the byte
+	   RET			; percolate error up
+	  CAIE B,(C)		; got the ACK we wanted?
+	   LOOP.		; no...
+	  DO.
+	    CALL $SIBE		; any more bytes?
+	    IFSKP.
+	      JSP PC,1(PC)	; no, try again
+	      LOOP.
+	    ENDIF.
+	  ENDDO.
+	  CALL $BIN		; get the byte
+	   RET			; percolate error up
+	  XORX B,AXR		; hash it with magic number
+	  CAIE B,(C)		; got the ACK we wanted?
+	   LOOP.		; no...
+	ENDDO.
+	JRST (PC)		; return success!
+	SUBTTL Protocol break definitions
+
+HEXTAB:	"0"			; table of ASCII hex bytes, done
+	"1"			;  this way for faster code...
+	"2"
+	"3"
+	"4"
+	"5"
+	"6"
+	"7"
+	"8"
+	"9"
+	"A"
+	"B"
+	"C"
+	"D"
+	"E"
+	"F"
+
+	BRINI.			; initialize break mask
+
+	BRKCH. (.CHNUL,.CHCUN)	; all controls are special characters
+	BRKCH. (QOT)		; quote character is special
+	BRKCH. (.CHDEL)		; delete is also a special character
+
+
+PROMSK:	EXP W0.,W1.,W2.,W3.	; form table of special characters
+
+	END

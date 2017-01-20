@@ -1,0 +1,748 @@
+/*
+ *	MALLOC - memory allocation for C programs (first fit)
+ *
+**	(c) Copyright Ken Harrenstien 1989
+**		for all changes after v.195, 1-Sep-1988
+ *	Copyright (C) 1986 by Ian Macky, SRI International
+ *	Magic checkwords addition/misc fixes by Nelson Beebe
+ */
+
+#include <c-env.h>
+#include <sys/c-debug.h>
+#include <stddef.h>	/* for size_t */
+#include <stdio.h>
+#include <stdlib.h>
+
+#include <sys/types.h>		/* For caddr_t */
+
+#if __STDC__
+#define VCHAR void
+#else
+#define VCHAR char
+#endif
+
+#ifndef MALLOC_CHECK
+#define MALLOC_CHECK	1		/* runtime check for block validity? */
+#endif
+
+/* Block in use, pointed to by a (char *) pointer:
+ *
+ *			+-----------------------------------------------+
+ *		flag	|		      IN_USE			|
+ *			+-----------------------------------------------+
+ *		size	|	     Total size of block (in bytes)	|
+ *			+-----------------------------------------------+
+ *		above	|    (free_block *) to block above in memory    |
+ *			+-----------------------------------------------+
+ * (char *) ptr --->	|			 .			|
+ *			.			 .			.
+ *			.		    Block data			.
+ *			.			 .			.
+ *			|			 .			|
+ *			+-----------------------------------------------+
+ *			|		 MAGIC_CHECKWORD		|
+ *			+-----------------------------------------------+
+ *
+ *	When a block is freed, if the next sequential block in memory is
+ *	IN_USE, it's "above" pointer is set to point up to that free block.
+ *	The contents of the following word are always checked against
+ *	MAGIC_CHECKWORD to trap block overwrites.
+ *
+ * Block on freelist:
+ *
+ *			+-----------------------------------------------+
+ *		flag	|			FREE			|
+ *			+-----------------------------------------------+
+ *		size	|		 Total size of block		|
+ *			+-----------------------------------------------+
+ *		previous|  (free_block *) to previous block on freelist |
+ *			+-----------------------------------------------+
+ *		next	|    (free_block *) to next block on freelist   |
+ *			+-----------------------------------------------+
+ *			|			 .			|
+ *			.			 .			.
+ *			.		       Unused			.
+ *			.			 .			.
+ *			|			 .			|
+ *			+-----------------------------------------------+
+ *
+ *	The variable free_head points to the head of the linked-list of free
+ *	blocks.  When the freelist is empty, free_head contains NULL.
+ *
+ *	top_block is the address of the very first block in memory, or NULL
+ *	if none have been allocated yet.
+**
+** NOTE: on CSI none of this may apply, as we use their MEM.MAC module.
+** If the variable "_csimemuse" is set, then allocation is turned over
+** to a set of CSI routines that do their own thing.
+*/
+
+
+#if 0
+typedef double	largest_t;		/* this type requires max storage */
+#else
+/*
+ * No need on word-addressable architecture to round up to double-word
+ * boundry.  Also, word-alignment will force MAGIC_CHECKWORD into word
+ * following last word requested by user, so we are more likely to trap
+ * errors at free() time.
+ */
+typedef int	largest_t;		/* this type requires max storage */
+#endif
+typedef int	blksiz_t;		/* maybe "long" for some machines */
+
+struct free_header {
+    int flag;				/* always FREE, for verification */
+    blksiz_t size;			/* size in bytes of data area */
+    struct free_header *previous;	/* pointer to previous block on f.l. */
+    struct free_header *next;		/* pointer to next block in freelist */
+};
+
+#define free_block	struct free_header
+
+struct used_header {
+    int flag;				/* always IN_USE, for verification */
+    blksiz_t size;			/* size in bytes of data area */
+    free_block *above;			/* pointer to above block in memory */
+};
+
+#define used_block	struct used_header
+
+/*
+ *	these bit-patterns are pretty unlikely to stumble on by accident
+ */
+
+#define FREE		(-'!' - 'F' - 'r' - 'e' - 'e' - '!')
+#define IN_USE		(-'I' - 'n' - ' ' - 'u' - 's' - 'e')
+
+/*
+ * We want MAGIC_CHECKWORD to have some bits on in all 4 9-bit bytes,
+ * and also to not look like normal character data, so each byte has
+ * the high-order bit on.
+ */
+#define MAGIC_CHECKWORD	0476567675765
+#define MAGIC_WORD(block,bytes) *(((int*)(block)) + \
+	((bytes) - sizeof(MAGIC_CHECKWORD))/sizeof(int))
+
+/*
+ *	make sure the block header is a multiple of CHUNK_SIZE bytes long,
+ *	so the data area remains on a boundry suitable for any type
+ */
+
+#define CHUNK_SIZE	(sizeof(largest_t))
+#define ROUND_D(n, m)	((((n) - 1) / (m)) + 1)
+#define ROUND_N(n, m)	(ROUND_D((n), (m)) * (m))
+#define ROUNDUP(n)	ROUND_N((n), CHUNK_SIZE)
+
+/*
+ * Overhead accounts for the block headers, but NOT for the MAGIC_CHECKWORD
+ * block trailer.
+ */
+#define OVERHEAD	ROUNDUP((sizeof(struct free_header) >\
+	 sizeof(struct used_header))\
+	? sizeof(struct free_header)\
+	: sizeof(struct used_header))
+
+static free_block *top_block = NULL;	/* pointer to very 1st block in mem */
+static free_block *free_head = NULL;	/* Freelist pointer */
+
+#if defined(__STDC__) || defined(__cplusplus)
+# define P_(s) s
+#else
+# define P_(s) ()
+#endif
+
+extern caddr_t sbrk P_((size_t nbytes));
+
+static int *boundrize P_((void));
+static void _setup P_((used_block *block,int size));
+static void split P_((free_block *block,blksiz_t newsize));
+static void icopy P_((int *from,int *to,int count));
+static void izero P_((int *to,int count));
+
+#undef P_
+
+#if SYS_CSI
+#define SS_NORMAL 0		/* Value of R$%NOR */
+#define RTS_GET_MEM(nwds,baddr)	  `R$GMEM`(baddr,nwds)
+#define RTS_GET_MEM_Z(nwds,baddr) `R$GMZ`(baddr,nwds)
+#define RTS_FREE_MEM(base)	  `R$FMEM`(base)
+#define RTS_TRIM_MEM(nwds,base)	  `R$TMEM`(base,nwds)
+
+extern int _csimemuse = 0;	/* Set non-zero to use CSI-specific stuff */
+extern int RTS_GET_MEM(int nwds, int **baseaddr);	/* Get mem block */
+extern int RTS_GET_MEM_Z(int nwds, int **baseaddr);	/* Get clred mem blk */
+extern int RTS_FREE_MEM(int *base);			/* Free mem block */
+extern int RTS_TRIM_MEM(int nwds, int *base);		/* Truncate mem blk */
+
+#endif
+
+/*
+ *	malloc - allocate a block of memory big enough to accomodate
+ *	"size" bytes.  a char pointer is returned to the data area,
+ *	which is NOT initialized.  the requested size is rounded up
+ *	to a multiple of CHUNK_SIZE bytes, to keep blocks on boundry
+ *	of largest data-type.
+ *
+ *	mlalloc is the same as malloc, except its arg is a long instead
+ *	of just an int - one just calls the other.  who's on first
+ *	depends on whether longs are equivalent to ints or not.
+ */
+
+char *
+mlalloc(size)
+unsigned long size;
+{
+    return malloc((size_t) size);
+}
+
+VCHAR *
+malloc(size)
+size_t size;
+{
+    free_block *old;
+    used_block *new, *below;
+    char *area;
+    blksiz_t need = size;		/* Get into convenient type */
+
+    if (need < 0)			/* range check argument */
+	return NULL;
+    if (need == 0) need = 1;		/* change 0 to 1 */
+
+#if SYS_CSI
+    if (_csimemuse) {
+	int *addr;
+	if (RTS_GET_MEM(ROUND_D(need, sizeof(int)), &addr) == SS_NORMAL)
+	    return (char *)addr;	/* Won, return char ptr */
+	return NULL;			/* Failed */
+    }
+#endif
+
+    need = ROUNDUP(need) + OVERHEAD + sizeof(MAGIC_CHECKWORD);
+					/* total size w/overhead */
+/*
+ *	look through the freelist for a fit
+ */
+    for (old = free_head; old != NULL; old = old->next) {
+#if MALLOC_CHECK
+	if (old->flag != FREE) {
+	    _dbgl("MALLOC&malloc(");
+	    _dbgd(size);
+	    _dbgs(": bad block (flag != FREE) on freelist at ");
+	    _dbgo((unsigned long)old);
+	    _dbgs("\r\n");
+	    abort();
+	}
+#endif
+	if (old->size >= need) {	/* is this block big enough for us? */
+	    split(old, size);		/* yes, but only keep what we need */
+	    if (!old->previous) free_head = old->next;
+	    else old->previous->next = old->next;
+	    if (old->next) old->next->previous = old->previous;
+	    new = (used_block *) old;
+	    new->flag = IN_USE;
+	    new->above = NULL;
+	    below = (used_block *) ((char *) new + new->size);
+	    if (below->flag == IN_USE) below->above = NULL;
+	    return ((char *) new) + OVERHEAD; /* return ptr to data area */
+	}
+    }
+/*
+ *	didn't find a block big enough so allocate new space.
+ */
+    if (!top_block) boundrize();	/* get on good initial boundry */
+    area = (char *) sbrk(need);		/* allocate space */
+    if ((int) area == -1)		/* get what we requested? */
+	return NULL;			/* nope, no more room at the inn */
+    new = (used_block *) area;		/* got it, make pointer */
+    _setup(new, need);			/* mark up block */
+    return ((char *) new) + OVERHEAD;	/* return pointer to data area */
+}
+
+/*
+ *	get on a good initial boundry, which means an even word boundry.
+ *	we always go to the word after what sbrk(0) says is available,
+ *	in case that word is partly in use, plus getting on an even word
+ *	boundry.
+ */
+
+static int *boundrize()
+{
+    int *start;				/* on these type boundries */
+
+    start = (int *) (char *) sbrk(0);	/* turn into an int pointer */
+    if ((int) start & 1) {		/* if not on an even word boundry, */
+	sbrk(sizeof(int));		/* get on the boundry. */
+	start++;			/* bump up to it. */
+    }
+    top_block = (free_block *) start;
+    return start;
+}
+
+/*
+ *	set up the given block as used.  flag it, fill in the header,
+ *	check the next block down in memory to see if it should point
+ *	back up, etc.
+ */
+
+static void _setup(block, size)
+used_block *block;
+int size;
+{
+    used_block *below;
+
+    block->flag = IN_USE;		/* and mark that it's being used */
+    block->size = size;			/* set total size of block */
+    block->above = NULL;		/* for now; set by others */
+    MAGIC_WORD(block,size) = MAGIC_CHECKWORD;
+    below = (used_block *) ((char *) block + size);
+    if (below->flag == IN_USE)		/* if below block used to have a */
+	below->above = NULL;		/* free block above, change that. */
+}
+
+/*
+ *	split - split a block into a chunk of given size and a remainder,
+ *	which is freed.  a remainder block is not made unless it is of at
+ *	least CHUNK_SIZE data bytes, to keep from having too many small,
+ *	not very useful, fragmented blocks.
+ */
+
+static void split(block, newsize)
+free_block *block;
+blksiz_t newsize;
+{
+    used_block *residue;
+
+    newsize = ROUNDUP(newsize) + OVERHEAD + sizeof(MAGIC_CHECKWORD);
+    if (newsize > 0 && (block->size - newsize) >= CHUNK_SIZE +
+	OVERHEAD + sizeof(MAGIC_CHECKWORD)) {
+	residue = (used_block *) ((char *) block + newsize);
+#if MALLOC_CHECK
+	residue->flag = IN_USE;
+#endif
+	residue->size = block->size - newsize;
+	residue->above = NULL;
+	block->size = newsize;
+	MAGIC_WORD(block,newsize) = MAGIC_CHECKWORD;
+	free((char *) residue + OVERHEAD);
+    }
+}
+
+/*
+ *	calloc - allocate a block of memory big enough to accomodate
+ *	elt_count elements each of size elt_size.  a pointer to the
+ *	first region is returned, and the region itself is cleared
+ *	to zeroes.  since m(l)alloc always returns a pointer to a
+ *	region starting on a boundry which can accomodate ANY type,
+ *	no more boundry twiddling need be done by this routine.
+ */
+
+char *
+clalloc(elt_count, elt_size)
+unsigned long elt_count, elt_size;
+{
+    return calloc((size_t) elt_count, (size_t) elt_size);
+}
+
+VCHAR *
+calloc(elt_count, elt_size)
+size_t elt_count, elt_size;
+{
+    blksiz_t size = elt_count * elt_size;
+    char *cp;
+
+    if (size < 0)			/* range check argument */
+	return NULL;
+    if (size == 0) size = 1;		/* change 0 to 1 */
+#if SYS_CSI
+    if (_csimemuse) {
+	int *addr;
+	if (RTS_GET_MEM_Z(ROUND_D(size, sizeof(int)), &addr) == SS_NORMAL)
+	    return (char *)addr;	/* Won, return char ptr */
+	return NULL;			/* Failed */
+    }
+#endif
+    cp = malloc((size_t)size);
+    if (cp)
+	izero((int *) cp, ROUND_D(size, sizeof(int)));
+    return cp;
+}
+
+#if 0
+/*
+ *	page allocation.  alas, since the data area needs to start right at
+ *	a page boundry, the header that comes before the data area must be
+ *	in the previous page, rendering it useless for page allocation.
+ *	which means sequential 1-page _palloc's return every other page, with
+ *	smaller-than-a-page free chunks between them.
+ */
+
+#define PAGE_SIZE	512		/* number of words/page */
+#define ADDRESS_SPACE	1000		/* size of address space in pages */
+
+int _palloc(n)
+int n;
+{
+    free_block *old;
+    used_block *new;
+    int *area, map_size, need, next_page, pre_page;
+
+    if (n < 1 || n > ADDRESS_SPACE) return NULL;	/* verify arg */
+    map_size = n * PAGE_SIZE * sizeof(int);		/* # of chars in map */
+    need = map_size + OVERHEAD + sizeof(MAGIC_CHECKWORD);
+					/* same but w/OVH */
+    for (old = free_head; old != NULL; old = old->next) {
+#if MALLOC_CHECK
+	if (old->flag != FREE) {
+	    _dbgl("MALLOC&_palloc(");
+	    _dbgd(n);
+	    _dbgs(": bad block (flag != FREE) on freelist at ");
+	    _dbgo(old);
+	    _dbgs("\r\n");
+	    abort();
+	}
+#endif
+	if (old->size < need) continue;		/* big enough for us? */
+	next_page = (((int) old / PAGE_SIZE) + 1) * PAGE_SIZE;
+	pre_page = (next_page - (int) old) * sizeof(int);
+	if (pre_page < sizeof(struct used_header) + CHUNK_SIZE)
+	    continue;				/* too close to next page. */
+	if (old->size - pre_page < map_size)
+	    continue;				/* not aligned right. */
+	split(old, pre_page + map_size);	/* trim excess */
+	old->size = pre_page - OVERHEAD;	/* new old size */
+	new = (used_block *) (next_page - (OVERHEAD / sizeof(int)));
+	_setup(new, need);			/* set up block, flag &tc */
+	new->above = old;			/* manually set this. */
+	return next_page / PAGE_SIZE;		/* return page # */
+    }
+/*
+ *	nothing useable on the free_list, so make a new block
+ */
+    area = (!top_block) ? boundrize() : (int *) sbrk(0);  /* EOM */
+    next_page = (((int) area / PAGE_SIZE) + 1) * PAGE_SIZE;
+    pre_page = (next_page - (int) area) * sizeof(int);
+    if (pre_page < sizeof(struct used_header) + OVERHEAD +
+    	sizeof(MAGIC_CHECKWORD)) {
+	next_page += PAGE_SIZE;		/* not enough room, go to next page */
+	pre_page += PAGE_SIZE * sizeof(int);
+    }
+    area = (int *) sbrk(pre_page + map_size);	/* allocate the space */
+    if ((int) area == -1) return NULL;	/* no more room at the inn */
+    old = (free_block *) area;		/* point to allocated area */
+    old->flag = FREE;			/* leader will be FREE. */
+    old->size = pre_page - OVERHEAD;	/* set the size of the leader */
+    old->previous = NULL;		/* now splice it into the free list. */
+    old->next = free_head;		/* put this at the top of the chain. */
+    free_head = old;			/* point to part we really want */
+    new = (used_block *) (next_page - OVERHEAD / sizeof(int));
+    _setup(new, need);			/* mark it up as in use */
+    return next_page / PAGE_SIZE;	/* return the allocated page # */
+}
+#endif /* 0 */
+
+/*
+ *	free - free a previously allocated block.
+ */
+
+void free(vp)
+VCHAR *vp;
+{
+    char *cp = (char *)(int *)vp; /* Normalize pointer */
+    used_block *current, *q;
+    free_block *p, *below;
+
+    if (cp == NULL)		/* Allow no-op if given null arg */
+	 return;		/* as per ANSI description. */
+
+#if SYS_CSI
+    if (_csimemuse) {
+	(void) RTS_FREE_MEM((int *)cp);
+	return;
+    }
+#endif
+
+    current = (used_block *) (cp -= OVERHEAD); /* make struct ptr to block */
+#if MALLOC_CHECK
+    if (current->flag != IN_USE) {
+	_dbgl("MALLOC&free(");
+	_dbgo((unsigned long)vp);
+	_dbgs(": block not in use (flag != IN_USE) at ");
+	_dbgo((unsigned long)current);
+	_dbgs("\r\n");
+	abort();
+    }
+    if (MAGIC_WORD(current,current->size) != MAGIC_CHECKWORD) {
+	_dbgl("MALLOC&free(");
+	_dbgo((unsigned long)vp);
+	_dbgs(": block overwritten past end (MAGIC_WORD != MAGIC_CHECKWORD) at ");
+	_dbgo((unsigned long)current);
+	_dbgs("\r\n");
+	abort();
+    }
+#endif
+    below = (free_block *) (cp + current->size);
+    if (below->flag != FREE) below = NULL;	/* but only if it's free! */
+/*
+ *	check to see if next and/or previous ("physical") blocks in memory
+ *	are free also, so we can do merge.
+ */
+    if (current->above) {			/* merge with block above */
+	if (!below)
+	    current->above->size += current->size;
+	else {					/* merge w/above AND below */
+	    current->above->size += (current->size + below->size);
+	    if (!below->previous) free_head = below->next;
+	    else below->previous->next = below->next;
+	    if (below->next) below->next->previous = below->previous;
+	}
+	current = (used_block *) current->above;	/* new current block */
+    } else {
+	current->flag = FREE;
+	p = (free_block *) current;		/* this block is free now */
+	if (below) {				/* merge with below only */
+	    p->size += below->size;
+	    if (!below->previous) free_head = p;
+	    else below->previous->next = p;
+	    p->previous = below->previous;
+	    if (p->next = below->next) below->next->previous = p;
+	} else {				/* no merge possible  */
+	    p->previous = NULL;
+	    if (p->next = free_head) p->next->previous = p;
+	    free_head = p;
+	}
+    }
+    q = (used_block *) ((char *) current + current->size);
+    if (q->flag == IN_USE) q->above = (free_block *) current;
+}
+
+void cfree(cp)			/* cfree() and free() are interchangable */
+char *cp;
+{
+    free(cp);
+}
+
+/*
+ *	change the size of an existing block.  reducing the size pares
+ *	a chunk of storage off the end and frees it; increasing the
+ *	size gets you a new block with the old data copied over.
+ *	Note behavior follows ANSI description when given a NULL pointer
+ *	or a zero size:
+ *		If ptr == NULL, acts like malloc.
+ *		Else if size == 0, acts like free and returns NULL.
+ */
+
+char *
+relalloc(ptr, size)
+char *ptr;
+unsigned long size;
+{
+    return realloc(ptr, (size_t) size);
+}
+
+VCHAR *
+realloc(ptr, size)
+VCHAR *ptr;
+size_t size;
+{
+    char *new;
+    used_block *old;
+    blksiz_t need = size;
+
+    if (ptr == NULL)		/* Per ANSI description, if ptr NULL */
+	return malloc(size);	/* then just act like malloc() */
+    if (need <= 0) {		/* Also per ANSI description, if size 0 */
+	free(ptr);		/* then free up the old block */
+	return NULL;		/* and return NULL */
+    }
+#if SYS_CSI
+    if (_csimemuse) {
+	int osize, nsize = ROUND_N(need, sizeof(int));
+	int *newb, *base = (int *)ptr;
+
+	osize = *(base-1);		/* Get preceding word */
+	if (osize >= 0) {		/* Check to be sure it's in use */
+	    _dbgl("MALLOC&realloc(");
+	    _dbgo(ptr);
+	    _dbgs(", ");
+	    _dbgo(size);
+	    _dbgs(": osize < 0 at ");
+	    _dbgo(base);
+	    _dbgs("\r\n");
+	    abort();
+	}
+	osize = ((unsigned)osize >> 18) & 0377777;
+	if (nsize > osize) {
+	    if (RTS_GET_MEM(nsize, &newb) != SS_NORMAL)
+		return NULL;		/* Failed to get bigger block */
+	    icopy(base, newb, osize);	/* Copy old words */
+	    RTS_FREE_MEM(base);		/* Free the old block */
+	    return (char *)newb;	/* Return ptr to new block */
+	}
+	if (nsize < osize)
+	    RTS_TRIM_MEM(nsize, base);
+	return ptr;			/* Trimmed or same size, same ptr */
+    }
+#endif
+
+    old = (used_block *) ((char *)(int *)ptr - OVERHEAD);
+#if MALLOC_CHECK
+    if (old->flag != IN_USE) {
+	_dbgl("MALLOC&realloc(");
+	_dbgo((unsigned long)ptr);
+	_dbgs(", ");
+	_dbgo(size);
+	_dbgs(": old block not in use (flag != IN_USE) at ");
+	_dbgo((unsigned long)old);
+	_dbgs("\r\n");
+	abort();
+    }
+#endif
+    need = ROUNDUP(need) + OVERHEAD + sizeof(MAGIC_CHECKWORD);
+    if (old->size == need)		/* is it worth checking for this? */
+	return ptr;
+    else if (old->size > need) {	/* if reducing, free the tail */
+	split((free_block *)old, (blksiz_t)size);
+	return ptr;
+    } else {				/* bigger, so reallocate and copy */
+	new = malloc(size);		/* allocate a bigger block */
+	if (new) {
+	    icopy((int *) ptr, (int *) new,
+		  ROUND_D(old->size - OVERHEAD, sizeof(int)));
+	    free(ptr);			/* now free the old block */
+	}
+	return new;			/* return updated char pointer */
+    }
+}
+
+/*
+ *	primitives to zero and copy sequential ints
+ *	These both assume they will never see a count <= 0, since
+ *	malloc never deals with zero-length blocks.
+ */
+
+static void icopy(from, to, count)
+int *from, *to, count;
+{
+#if !(CPU_PDP10)
+    while (count-- > 0)
+	*to++ = *from++;
+#else
+#asm
+	JUMPG 17,xicopy
+	MOVE 1,-2(17)		;to		NON-EXTENDED
+	HRL 1,-1(17)		;from,,to
+	MOVE 2,-3(17)		;count
+	ADDI 2,(1)		;to+count
+	BLT 1,-1(2)		;do it.
+	POPJ 17,
+
+xicopy:	MOVE 1,-3(17)		;count		EXTENDED
+	MOVE 2,-1(17)		;from
+	MOVE 3,-2(17)		;to
+	EXTEND 1,[XBLT]		;do it.
+	POPJ 17,
+#endasm
+#endif
+}
+
+static void izero(to, count)
+int *to, count;
+{
+#if !(CPU_PDP10)
+    while (count-- > 0)
+	*to++ = 0;
+#else
+#asm
+	JUMPG 17,xizero
+	AOS 1,-1(17)		;to+1		NON-EXTENDED
+	HRLI 1,-1(1)		;to,,to+1
+	SETZM -1(1)		;zero 1st wd
+	SOSG 2,-2(17)		;count-1
+	 POPJ 17,		;only 1 word
+	ADDI 2,(1)		;<count-1>+<to+1> = <to+count>
+	BLT 1,-1(2)		;do it
+	POPJ 17,
+
+xizero:	MOVE 2,-1(17)		;to		EXTENDED
+	SETZM (2)		;zero (to)
+	MOVE 3,2		;to
+	ADDI 3,1		;to+1
+	SOSLE 1,-2(17)		;count-1
+	 EXTEND 1,[XBLT]	;do it if something left.
+#endasm
+#endif
+}
+
+/*
+ *	debugging stuff.  for manual debugging's sake, if f is 0, it's
+ *	turned into stdout - it's easy to stuff a 0 onto the stack.
+ */
+
+void _free_list()
+{
+    free_block *p;
+
+    if (!free_head)
+	_dbgs("    ---- freelist is empty ----\r\n");
+    else {
+	_dbgs("    ---- free-list ----\r\n");
+	p = free_head;
+	while (p) {
+	    _dbgs("    ");
+	    _dbgo((unsigned long)p);
+	    _dbgs(": ");
+	    _dbgd(p->size);
+	    _dbgs(".\r\n");
+	    p = p->next;
+	}
+    }
+}
+
+void _memory_map()
+{
+    free_block *p;
+    used_block *q;
+    int *z;
+
+    z = (int *) top_block;
+    _dbgs("Top block = ");
+    _dbgo((unsigned long)z);
+    _dbgs("\r\nFree head = ");
+    _dbgo((unsigned long)free_head);
+    _dbgs("\r\n");
+    if (*z)
+	_dbgs("\t--- Memory map of malloc area ---\r\n");
+    while (*z) {			/* if zero, assume EOM */
+	_dbgo((unsigned long)z);
+	_dbgs(":	");
+	p = (free_block *) z;
+	switch (p->flag) {
+	    case IN_USE:
+		q = (used_block *) p;
+		_dbgs("IN_USE\tsize = ");
+		_dbgo(q->size);
+		_dbgs("\tabove = ");
+		_dbgo((unsigned long)q->above);
+		_dbgs("\r\n");
+		z += (q->size / sizeof(int));
+		break;
+	    case FREE:
+		_dbgs("FREE\tsize = ");
+		_dbgo(p->size);
+		_dbgs("\tprev = ");
+		_dbgo((unsigned long)p->previous);
+		_dbgs("\tnext = ");
+		_dbgo((unsigned long)p->next);
+		_dbgs("\r\n");
+		z += (p->size / sizeof(int));
+		break;
+	    default:
+		_dbgs("Bad header value, not FREE or IN_USE: ");
+		_dbgo(p->flag);
+		_dbgs("\r\n");
+		z = 0;
+		break;
+	}
+    }
+}

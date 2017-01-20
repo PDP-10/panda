@@ -1,0 +1,490 @@
+%TITLE 'DIU Notification Routines'
+MODULE diunot (
+               IDENT = '257',
+               ENTRY(notify)
+               )=
+BEGIN
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!++
+! FACILITY:
+!   DIU-10/20 (File Transfer Spooler for TOPS-10/20).
+!
+! ABSTRACT:
+!   This module provides user notification of request disposal.
+!
+! ENVIRONMENT:
+!   TOPS-10/20 user mode, XPORT.
+!
+! AUTHOR: Larry Campbell, CREATION DATE: March 26, 1982
+!
+
+! HISTORY:
+!
+!  257  Change library BLI:MONSYM to just MONSYM.
+!       Gregory A. Scott 7-Jul-86
+!
+!  254  The only real successful completeion code is DIU$_REQUEST_COMPLETED.
+!       Gregory A. Scott 2-Jul-86
+!
+!  253  Rename file to DIUNOT.
+!       Gregory A. Scott 1-Jul-86
+!
+!  234  Change library of RMSUSR to RMSINT.
+!       Gregory A. Scott 17-Jul-86
+!
+!  121  Implement better mail notification with improved Subject line.
+!       Also identify ourselves as DIU rather than FTS.
+!       Gregory A. Scott 19-Apr-86
+!
+!
+! MODIFIED BY: Andrew Nourse
+!
+! 03 - Minor modifications for TOPS-10 [Doug Rayner, 14-Aug-85]
+! 02 - Put in ENTRY points
+! 01 - beginning
+!--
+
+!
+! TABLE OF CONTENTS:
+!
+FORWARD ROUTINE
+    notify : NOVALUE,
+    mail_notify : NOVALUE,
+    tty_notify : NOVALUE,
+    ipcf_notify : NOVALUE;
+!
+! INCLUDE FILES:
+!
+LIBRARY 'BLI:XPORT';                    ! XPORT structures and macros
+LIBRARY 'DIU';                          ! DIU macros and data structures
+LIBRARY 'RMSINT';                       ! RMS macros and data structures
+LIBRARY 'MONSYM';                       ! TOPS-20 Monitor symbols
+
+%IF %SWITCHES (TOPS20)
+%THEN                                   ! TOPS-20 ONLY
+     LIBRARY 'DIUIP2';
+%ELSE                                   ! TOPS-10 ONLY
+     LIBRARY 'FAO';
+     LIBRARY 'DIUIP1';
+%FI
+!
+! MACROS:
+!
+MACRO
+    crlf = %CHAR (13, 10) %;
+!
+! EQUATED SYMBOLS:
+!
+
+!
+! OWN STORAGE:
+!
+
+!
+! EXTERNAL REFERENCES:
+!
+EXTERNAL ROUTINE
+    q$req_block_init : NOVALUE,
+    q$find,
+    q$release_chain : NOVALUE,
+    s$dtstr : NOVALUE,
+%IF %SWITCHES (TOPS20) %THEN
+    s$jfn_str,
+%FI
+    l$new_request : NOVALUE,
+    diu$abort,
+    diu$errmsg : NOVALUE,
+    ip$get_pid,
+    ip$send,
+    ip$receive,
+    s$ttyjob,
+    s$jobusr,
+    s$username,
+    s$broadcast : NOVALUE;
+
+GLOBAL ROUTINE notify (code, code2, p_addtext, p_req_block) : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   This routine notifies the originator of a request of the disposition
+!   of the request.  This notification can be by terminal or by mail.
+!
+! FORMAL PARAMETERS:
+!   code                - DIU completion code
+!   code2               - secondary completion code
+!   p_addtext           - pointer to descriptor for additional text
+!   p_req_block         - pointer to request block
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   If /NOTIFY:TTY, we type on the user's terminal.
+!   If /NOTIFY:MAIL, we send him mail.
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   NONE
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+    BEGIN
+
+    BIND
+        req_block = .p_req_block : $DIU_BLOCK;
+
+    ENABLE
+        DIU$ABORT;                      ! Don't let failures clobber other stuff
+
+    IF .req_block[DIU$V_NOTIFY_MAIL]
+    THEN
+        mail_notify (.code, .code2, .p_addtext, req_block);
+    IF .req_block[DIU$V_NOTIFY_TERMINAL]
+    THEN
+        tty_notify (.code, .code2, .p_addtext, req_block);
+    IF .req_block[DIU$V_NOTIFY_IPCF]
+    THEN
+        ipcf_notify (.code, .code2, .p_addtext, req_block);
+    END;                                ! End of notify
+
+ROUTINE mail_notify (code, code2, p_addtext, p_req_block) : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Notify a user of request disposition by sending mail.
+!
+! FORMAL PARAMETERS:
+!   code                - DIU completion code
+!   code2               - secondary completion code
+!   p_addtext           - pointer to descriptor for additional text
+!   p_req_block         - pointer to request block
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   The text of the message is copied to a temporary filed named MAIL.CPY.
+!   This file begins with with a binary list of recipient user numbers
+!   (see the MAILER or MAILEX sources, or MS sources, for more information
+!   on the format of this file).  We then send IPCF to SYSTEM[MAILEX] or
+!   SYSTEM[MAILER] instructing it to read the file and proceed.
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   NONE
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+    BEGIN
+
+    BIND
+        req_block = .p_req_block : $DIU_BLOCK,
+        addtext = .p_addtext : $STR_DESCRIPTOR ();
+
+    OWN
+        my_pid : INITIAL (0),
+        mailex_pid : INITIAL (0),
+        mailer_pid : INITIAL (0),
+        dstpid : INITIAL (0),
+        mailex_name : $STR_DESCRIPTOR (STRING = '[SYSTEM]MAILEX'),
+        mailer_name : $STR_DESCRIPTOR (STRING = '[SYSTEM]MAILER');
+
+    LOCAL
+        mail_cpy : $XPO_IOB (),
+        ulist : VECTOR [4],
+        retcode,
+        jfn,
+        msg_word_addr,
+        msg_word_length,
+        pdb : $$PDB_DECL,
+        mailer_message : VECTOR [20],
+        date_desc : $STR_DESCRIPTOR (CLASS = DYNAMIC),
+        user_desc : $STR_DESCRIPTOR (CLASS = DYNAMIC),
+        temp_descr : $STR_DESCRIPTOR (CLASS = DYNAMIC),
+        req_descr : $STR_DESCRIPTOR (CLASS = DYNAMIC);
+
+    $STR_DESC_INIT (DESCRIPTOR = temp_descr, CLASS = DYNAMIC);
+    !
+    ! Try for MAILEX, but settle for MAILER.
+    !
+    IF .mailex_pid EQL 0
+    THEN
+        mailex_pid = ip$get_pid (mailex_name, my_pid);
+    IF .mailex_pid EQL 0
+    THEN
+        BEGIN
+        mailer_pid = ip$get_pid (mailer_name, my_pid);
+        IF .mailer_pid EQL 0
+        THEN
+            SIGNAL (DIU$_NO_MAILER);
+        END;
+
+! Have found a mailer...  open the MAIL.CPY file and set recipient list
+
+    $XPO_IOB_INIT (IOB = mail_cpy);
+    IF NOT (retcode = $XPO_OPEN (IOB = mail_cpy,
+                                 OPTIONS = OUTPUT,
+                                 ATTRIBUTES = BINARY,
+                                 FILE_SPEC = 'DSK:MAIL.CPY'))
+    THEN
+        SIGNAL (DIU$_NO_MAIL_CPY, .retcode);
+
+! Create and write recipient list.
+
+    ulist[0] = 0;                       ! Flags
+    ulist[1] = .req_block[DIU$G_USER_NUMBER];
+    ulist[2] = ulist[3] = 0;
+
+! Now write the user list binarily
+
+    $XPO_PUT (IOB = mail_cpy, BINARY_DATA = (4, ulist, FULLWORDS));
+
+! Now close MAIL.CPY and reopen for ASCII append so we can write msg text
+
+    $XPO_CLOSE (IOB = mail_cpy, OPTIONS = REMEMBER);
+    mail_cpy[IOB$V_STREAM] = 1;
+    mail_cpy[IOB$V_BINARY] = 0;
+    $XPO_OPEN (IOB = mail_cpy, OPTIONS = APPEND, ATTRIBUTES = STREAM);
+
+! Build reasonable headers for any mailer to use
+
+$STR_DESC_INIT (DESCRIPTOR = date_desc, CLASS = DYNAMIC);
+$STR_DESC_INIT (DESCRIPTOR = user_desc, CLASS = DYNAMIC);
+
+! Get current date/time string, get username string
+
+s$dtstr (-1, date_desc);
+s$username (.req_block[DIU$G_USER_NUMBER], user_desc);
+$XPO_PUT (IOB = mail_cpy,
+          STRING = $STR_CONCAT ('Date: ', date_desc, crlf,
+                                'From: Data Interchange Utility', crlf,
+                                'To: ', user_desc, crlf));
+$XPO_FREE_MEM (STRING = date_desc);
+$XPO_FREE_MEM (STRING = user_desc);
+
+! Create verbose description of the request
+
+$STR_DESC_INIT (DESCRIPTOR = req_descr, CLASS = DYNAMIC);
+l$new_request (req_block, req_descr);   ! Create wordy description
+
+IF .code EQL DIU$_REQUEST_COMPLETED     ! Did the request complete?
+THEN $XPO_PUT (IOB = mail_cpy,
+               STRING = $STR_CONCAT('Subject: Request Successful', crlf,
+                                    crlf, 'The following Data Interchange Utility request completed successfully: ', crlf, 
+                                    crlf,
+                                    req_descr, crlf, 
+                                    crlf))
+ELSE BEGIN
+     LOCAL
+     msg_descr : $STR_DESCRIPTOR (),
+     msg_length;
+     $STR_DESC_INIT (DESCRIPTOR = msg_descr, CLASS = DYNAMIC);
+     $XPO_PUT (IOB = mail_cpy,
+               STRING = $STR_CONCAT('Subject: Request Failure', crlf,
+                                    crlf,
+                                    'The following Data Interchange Utility request failed: ', crlf,
+                                    crlf,
+                                    req_descr, crlf,
+                                    crlf,
+                                    'The request failed because:', crlf,
+                                    crlf));
+
+     ! Get error message text for the codes we found
+
+     DIU$ERRMSG (.code, .code2, addtext, msg_descr, msg_length);
+     $XPO_PUT (IOB = mail_cpy, STRING = msg_descr);
+     $XPO_FREE_MEM (STRING = msg_descr);
+     END;
+
+$XPO_FREE_MEM (STRING = req_descr);
+$XPO_PUT (IOB = mail_cpy, STRING = crlf);
+
+    !
+    ! Get a true complete copy of the filespec for MAIL.CPY
+    !
+%IF %SWITCHES (TOPS20)
+%THEN
+    jfn = .mail_cpy[IOB$H_CHANNEL];
+    s$jfn_str (.jfn, temp_descr, 0);
+%ELSE
+    $GET_FAO('!J', temp_descr, .mail_cpy[IOB$H_CHANNEL]);
+%FI
+    $XPO_CLOSE (IOB = mail_cpy);
+    !
+    ! Now send the filespec off to MAILER or MAILEX
+    !
+    dstpid = (IF .mailex_pid NEQ 0 THEN .mailex_pid ELSE .mailer_pid);
+    msg_word_addr = .(temp_descr[STR$A_POINTER])<0, 18> + 1;
+    msg_word_length = (.temp_descr[STR$H_LENGTH] + 4) / 5;
+    IF NOT (retcode = (ip$send (.dstpid, my_pid,
+                                .msg_word_addr, .msg_word_length)))
+    THEN
+        BEGIN
+        $XPO_FREE_MEM (STRING = temp_descr);
+        SIGNAL (DIU$_CANT_MAIL, .retcode);
+        END;
+    $XPO_FREE_MEM (STRING = temp_descr);
+    !
+    ! Read mailer's reply
+    !
+    pdb[PDB$$H_MESSAGE_ADDRESS] = mailer_message;
+    pdb[PDB$$H_MESSAGE_LENGTH] = 20;
+    IF NOT (retcode = (ip$receive (my_pid, pdb,
+                                   %FIELDEXPAND (PDB$$H_MESSAGE_LENGTH,
+                                                 0) + 1)))
+    THEN
+        RETURN (SIGNAL (DIU$_CANT_MAIL, .retcode));
+    !
+    ! Check for success or failure from mailer
+    !
+    IF .pdb[PDB$$V_ERROR_CODE] NEQ 0
+    THEN
+        RETURN (SIGNAL (DIU$_CANT_MAIL))
+    ELSE
+        RETURN (DIU$_NORMAL)
+    END;                                ! End of mail
+
+ROUTINE tty_notify (code, code2, p_addtext, p_req_block) : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Notify the submitter of a request of its disposition by splatting
+!   a message on his terminal.
+!
+! FORMAL PARAMETERS:
+!   code                - DIU completion code
+!   code2               - secondary completion code
+!   p_addtext           - pointer to descriptor for additional text
+!   p_req_block         - pointer to request block
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   NONE
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+    BEGIN
+
+    BIND
+        req_block = .p_req_block : $DIU_BLOCK,
+        addtext = .p_addtext : $STR_DESCRIPTOR ();
+
+    LOCAL
+        job,
+        user_number,
+        msg_descr : $STR_DESCRIPTOR (),
+        sts_descr : $STR_DESCRIPTOR (),
+        length;
+
+    job = s$ttyjob (.req_block[DIU$H_TERMINAL]);
+    !
+    ! Insure terminal specified still has a job, and that it's the same user.
+    !
+    IF .job EQL 0
+    THEN
+        RETURN;
+    user_number = s$jobusr (.job);
+    IF .user_number NEQ .req_block[DIU$G_USER_NUMBER]
+    THEN
+        RETURN;
+    $STR_DESC_INIT (DESCRIPTOR = msg_descr, CLASS = DYNAMIC);
+    $STR_DESC_INIT (DESCRIPTOR = sts_descr, CLASS = DYNAMIC);
+    !
+    ! Get a message for the error code
+    !
+    diu$errmsg (.code, .code2, addtext, sts_descr, length);
+    $STR_COPY (TARGET = msg_descr,
+               STRING = $STR_CONCAT (%CHAR (7), crlf,
+                                     '[DIU: Request ',
+                                     $STR_ASCII (.req_block[DIU$H_REQUEST_ID],
+                                                 BASE10),
+                                     ' (',
+                                     $STR_FORMAT ((.req_block[DIU$H_JOBNAME],
+                                                  CH$PTR (req_block[DIU$T_JOBNAME])),
+                                                  UP_CASE),
+                                     ')'));
+
+    ! Check the completion code for the only real success code we know of
+
+    IF .code EQL DIU$_REQUEST_COMPLETED     ! Did the request complete?
+    THEN $STR_APPEND (TARGET = msg_descr,   ! Yes
+                      STRING = $STR_CONCAT (' completed successfully]',
+                                            %CHAR (7, 13, 10
+                                            %IF %SWITCHES (TOPS10) %THEN , 0 %FI)))
+
+    ELSE $STR_APPEND (TARGET = msg_descr,
+                      STRING = $STR_CONCAT (' failed:',
+                                            crlf, '-       ',
+                                            sts_descr,
+                                            ']',
+                                            %CHAR (7, 13, 10
+                                                   %IF %SWITCHES (TOPS10) %THEN , 0 %FI)));
+    !
+    ! Now go bother the guy
+    !
+    s$broadcast (.req_block[DIU$H_TERMINAL], msg_descr);
+    $XPO_FREE_MEM (STRING = msg_descr);
+    $XPO_FREE_MEM (STRING = sts_descr);
+    END;                                ! End of tty_notify
+
+ROUTINE ipcf_notify (code, code2, p_addtext, p_req_block) : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Notify the submitter of a request of its disposition via IPCF.
+!
+! FORMAL PARAMETERS:
+!   code                - DIU completion code
+!   code2               - secondary completion code
+!   p_addtext           - pointer to descriptor for additional text
+!   p_req_block         - pointer to request block
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   NONE
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+    BEGIN
+
+    BIND
+        req_block = .p_req_block : $DIU_BLOCK,
+        addtext = .p_addtext : $STR_DESCRIPTOR ();
+
+    SIGNAL (DIU$_NOT_IMPLEMENTED);
+
+    END;                                ! End of ipcf_notify
+
+END                                     ! End of module
+ELUDOM

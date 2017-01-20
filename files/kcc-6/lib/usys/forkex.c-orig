@@ -1,0 +1,769 @@
+/*
+**	FORKEXEC - Forking and program execution
+**
+**	(c) Copyright Ken Harrenstien 1989
+**
+**	forkexec() - KCC-specific function
+**	execl(), execle(), execv(), execve(), execlp(), execvp()
+**	fork(), vfork()
+*/
+
+#include <c-env.h>
+
+#if SYS_T20+SYS_10X+SYS_T10+SYS_CSI+SYS_WTS	/* Systems supported for */
+
+#include <errno.h>
+#include <frkxec.h>
+#include <string.h>
+#include <sys/usysig.h>
+#include <sys/file.h>
+#include <sys/usysio.h>
+
+#if SYS_T20+SYS_10X
+#include <jsys.h>
+extern int _gtjfn();
+
+#elif SYS_T10+SYS_CSI+SYS_WTS
+#include <muuo.h>
+#include <macsym.h>
+#endif
+
+#ifndef NULL
+#define NULL	0
+#endif
+
+int forkexec();
+
+/* External URT data refs */
+extern int _vfrkf;	/* Non-zero if mem shared by vfork() */
+extern int _nfork;	/* Bumped every time a child is created */
+
+/* exec[lv][ ep]
+**	l - takes argv as variable number of args in call
+**	v - takes argv as pointer to array of args
+**	  - environment pointer taken from current environment
+**	e - environment pointer furnished as last arg in call
+**	p - program name lookup uses shell search rules
+**
+** Matrix:	  -	  p	  e
+**	    l	execl	execlp	execle
+**	    v	execv	execvp	execve
+**
+** execl (prog, arg0, arg1, ..., 0);
+** execlp(prog, arg0, arg1, ..., 0);		- program lookup
+** execle(prog, arg0, arg1, ..., 0, envp);
+** execv (prog, argv);
+** execvp(prog, argv);				- program lookup
+** execve(prog, argv, envp);			- Fundamental form of exec call
+*/
+
+static int doexec();
+static char **revstack();
+
+int
+execl(prog, arg0)	/* (prog, arg0, arg1, ..., 0) */
+char *prog, *arg0;
+{
+    return doexec(0, prog, revstack(&arg0), NULL);
+}
+
+int
+execlp(prog, arg0)	/* (prog, arg0, arg1, ..., 0)  - lookup program */
+char *prog, *arg0;
+{
+    return doexec(FX_PGMSRCH, prog, revstack(&arg0), NULL);
+}
+
+int
+execle(prog, arg0)		/* (prog, arg0, arg1, ..., 0, envp) */
+char *prog, *arg0;
+{
+    return doexec(FX_PGMSRCH, prog, revstack(&arg0), NULL);
+}
+
+int
+execv(prog, argv)		/* (prog, argv) */
+char *prog, **argv;
+{
+    return doexec(0, prog, argv, NULL);
+}
+
+int
+execvp(prog, argv)		/* (prog, argv) - look up program */
+char *prog, **argv;
+{
+    return doexec(FX_PGMSRCH, prog, argv, NULL);
+}
+
+int
+execve(prog, argv, envp)	/* (prog, argv, envp) */
+char *prog, *argv[], *envp[];
+{
+    return doexec(0, prog, argv, envp);
+}
+
+/* REVSTACK - auxiliary for execl*() routines.
+**	Reverses an array of pointers on the stack.
+** On the PDP-10 an arg list like arg1, arg2, ... 0 is stored on
+** the stack such that 0 is at the lowest address, arg1 at highest.
+** We need to reverse this ordering so we can treat it like a normal
+** argv array (with a null pointer as the last element).
+*/
+static char **
+revstack(av)
+char **av;
+{
+    register char **t, **b, *tmp;	/* Top and bottom pointers */
+    register int i;
+
+    for (t = b = av; *t; --t);	/* Back up to top of array (a null ptr) */
+    av = t;			/* Remember where top is */
+    i = (1 + b - t) / 2;	/* Find # of elements to swap in array */
+    for (; i > 0; --i) {
+	tmp = *t;		/* Swap elements, and bump ptrs closer. */
+	*t++ = *b;
+	*b-- = tmp;
+    }
+    return av;			/* Return ptr to top of reversed array */
+}
+
+/* DOEXEC - auxiliary for the exec*() routines.
+*/
+
+static int
+doexec(flags, prog, argv, envp)
+int flags;
+char *prog, **argv, **envp;
+{
+    struct frkxec f;
+
+    f.fx_flags = FX_NOFORK | (flags & FX_PGMSRCH);
+    f.fx_name = prog;
+    f.fx_argv = argv;
+    f.fx_envp = envp;
+    return forkexec(&f);
+}
+
+/*
+** vfork()
+**
+** This keeps the same map as the superior, but makes the superior
+** wait for an exec() call before continuing.  Thus if all that is
+** done is a store of the return value, that will get done again
+** and nothing will be the worse.
+**
+** This cannot however be implemented merely by leaving the maps
+** of the two the same, because then we wouldn't know which pid
+** would be stored last.  UNIX claims to borrow the thread of control
+** of the superior up to the exec(), but we fake it by making the
+** superior wait until a HALTF% in exec(), triggered by _vfrkf != 0.
+*/
+
+static int `vferno` = EAGAIN;	/* Error # to use if CFORK% fails */
+
+int
+vfork()
+{
+    if (0) `vferno`++;		/* Avoid KCC warning of unreffed var */
+#if SYS_T20+SYS_10X
+	asm(USYS_BEG_ASM);		/* Disable interrupts */
+#asm
+	SEARCH MONSYM			/* Uppercase to avoid monsym() clash */
+
+	pop	17,16			/* Get ret addr off stack for safety */
+	move	1,[cr%map!cr%cap!cr%acs!cr%st!vforkr] /* Set fork going */
+	setz	2,			/* Copying registers from ours */
+	cfork%				/* Make a fork */
+	 erjmpa	[move 1,vferno		/* Lose lose */
+		movem 1,errno
+		jrst vfrker]
+	wfork%				/* Wait for it to synch in exec() */
+	move 4,1			/* Save handle (T20 may clobber AC3) */
+	rfsts%				/* Read fork status to verify synch */
+	exch 1,4			/* Restore fork handle */
+	hlrzs 4				/* Get status code in RH */
+	tlz 2,-1			/* Clear LH of PC */
+	cain 4,.rfhlt			/* Must be HALTF%'d and unfrozen */
+	 caie 2,vfksyn			/* at location of synch */
+	  jrst vfork2
+	hrli 1,(sf%con)			/* OK, continue child after synch! */
+	sfork%				/* Start it again */
+vfork2:	setzm .vfrkf			/* No longer inside vfork */
+	aos .nfork			/* Bump count of inferiors created */
+	lsh 1,11			/* Shift fork handle up by 9 bits */
+	andi 1,777000			/* Zap all but low 9 bits of handle */
+	push 17,1			/* Save that */
+	gjinf%				/* Get job # */
+	dpb 3,[001100,,(17)]		/* Store in low 9 bits of PID */
+	caia
+vfrker:	 push 17,[-1]			/* CFORK failed, return -1 as error */
+#endasm
+	asm(USYS_END_ASM);
+#asm
+	pop 17,1
+	jrst (16)			/* All done! */
+
+	/* Child fork of vfork() starts here!
+	** Note we do NOT re-enable interrupts, even though the child process
+	** doesn't have its PSI system on, because our memory is still shared
+	** and clearing .sigusys would permit the parent to handle signals.
+	** This could cause unexpected changes to the shared memory before
+	** the child gets to its exec() call.
+	*/
+vforkr:	setom	.vfrkf			/* Set flag saying inside vfork */
+	setz	1,			/* This is inferior fork */
+	jrst	(16)			/* Return */
+#endasm
+#else 	/* not T20+10X */
+    errno = EAGAIN;		/* Say "no more processes" (sigh) */
+    return -1;
+#endif
+}
+
+/*
+** fork()
+** This does safe map copy before starting inferior
+*/
+static int _fork();
+
+int
+fork()
+{
+    int ret;
+
+    USYS_BEG();			/* Disable interrupts */
+    ret = _fork();		/* Try to fork and see what we get */
+    if (ret == -1)
+	USYS_RETERR(EAGAIN);	/* Assume no more processes */
+    _nfork++;			/* Won, bump count of inferiors created! */
+    if (ret != 0)
+	USYS_RET(ret);		/* We're parent, just return fork handle */
+
+    /* Here, we're the child process.  May need to do some cleanup or
+    ** init stuff here eventually, such as enabling the PSI system!
+    ** As it is, we're in big trouble if a signal happens between now
+    ** and an exec() call.
+    */
+    _nfork = 0;			/* Child has no inferiors yet */
+    USYS_RET(0);
+}
+
+static int
+_fork()
+{
+#if SYS_T20+SYS_10X
+#asm
+	extern $mapsc
+#if SYS_T20
+	nsects==40
+#else
+	nsects==1
+#endif
+	move	1,[cr%cap!cr%acs]	/* Same caps and regs as us */
+	setz	2,			/* Copying registers from ours */
+	cfork%				/* Make a fork */
+	 erjmpa .+2			/* Lose lose, return -1 */
+	  jrst fork1
+	seto 1,
+	popj 17,
+fork1:	move	6,1			/* Copy handle to safer place */
+	movei	7,.fhslf		/* Mapping from self */
+
+	/*
+	** Set inferior map looking like ours.  Can't just do fork-to-fork
+	** PMAP% or CR%MAP CFORK% because then any changes
+	** in impure data in the mother fork would be reflected in
+	** the daughter (but not vice versa if PM%CPY set)
+	*/
+
+	movei	5,nsects		/* Counting off all sections */
+	setzb	10,11			/* Start with sect zero in each fork */
+	pushj	17,$mapsc		/* Map section across */
+	sojg	5,.-1			/* Until we are done */
+
+	/* Map all set, now we can safely start the subfork and return. */
+	move	1,6			/* Pages all mapped, recover handle */
+	xmovei	2,forkst		/* Set subfork to start here */
+	tlne	2,-1			/* If addr is in non-zero section, */
+	 jrst	fork8			/* must start using extended call */
+	sfork%
+	jrst fork9
+fork8:	move	3,2
+	setz	2,
+	xsfrk%			/* Start it at extended address. */
+
+fork9:				/* Return PID.  Fork handle in AC1 */
+	move 6,1		/* Save handle */
+	gjinf%			/* Get job # in AC3 */
+	dpb 6,[111100,,3]	/* Put low 9 bits of handle inside PID */
+	hrrz 1,3		/* Clear LH and return the PID */
+	popj	17,
+
+	/* Child fork starts here. */
+	extern .pidslf, .pidpar		/* From GETPID */
+forkst:	move 1,.pidslf
+	movem 1,.pidpar		/* If have a PID, remember as parent's */
+	setzb 1,.pidslf		/* Zap own PID to force gen of new one */
+	popj 17,		/* Return 0 as child's result for fork() */
+#endasm
+#else 	/* not T20+10X */
+    return -1;			/* Not supported, always fail */
+#endif
+}	/* End of fork() */
+
+/* FORKEXEC - combine fork() with exec() for highest efficiency
+**
+*/
+
+static int sysfkx();
+
+int
+forkexec(f)
+struct frkxec *f;
+{
+    int res;
+
+    USYS_BEG();
+    if (f == NULL)
+	USYS_RETERR(EINVAL);
+    if (res = sysfkx(f))	/* Invoke sys-dep stuff */
+	USYS_RETERR(res);
+    USYS_RET(0);
+}
+
+#if SYS_T20+SYS_10X
+static int findpgm();
+static char *cvtargv();
+static void setpio(), _setpio(), _exec();
+
+#define RSCANLEN 1000
+static int
+sysfkx(f)
+register struct frkxec *f;
+{
+    char rscanbuf[RSCANLEN];
+    char *rscanp;
+    int acs[5], startpc, stoff;
+    int frk = 0, jfn = 0;
+    int flags = f->fx_flags;
+    
+    /* Check out new standard i/o FDs, if any were given */
+    if ((flags & FX_FDMAP) && (
+       (f->fx_fdin  >= 0 && (f->fx_fdin  >= OPEN_MAX || !_uffd[f->fx_fdin]))
+    || (f->fx_fdout >= 0 && (f->fx_fdout >= OPEN_MAX || !_uffd[f->fx_fdout]))
+	))
+	return EBADF;
+
+    stoff = (flags & FX_STARTOFF) ? f->fx_startoff : 0;
+
+#if SYS_T20		/* Get RSCAN buffer into shape */
+    if (flags & FX_T20_RSCAN)
+	rscanp = f->fx_blkadr;
+    else if (f->fx_argv)
+	rscanp = cvtargv(f->fx_argv, rscanbuf, RSCANLEN);
+    else rscanp = NULL;
+
+    if (flags & FX_T20_PRARG) {
+	if (f->fx_blkadr == NULL)
+	    return EINVAL;
+    }
+#endif
+    if (flags & FX_T20_PGMJFN)		/* Use JFN directly? */
+	jfn = (int)f->fx_name;
+    else if (flags & FX_T20_PGMNAME) {	/* Use GTJFN% on name? */
+	acs[1] = GJ_OLD|GJ_SHT;
+	acs[2] = (int)(f->fx_name - 1);
+	if (jsys(GTJFN, acs) <= 0)
+	    return ENOENT;
+	jfn = acs[1] & 0777777;
+    }
+    else if ((jfn = findpgm(f->fx_name, (flags & FX_PGMSRCH))) <= 0)
+	return ENOENT;			/* Couldn't find program */
+
+    /* From this point on, must be careful to free up "jfn" if we fail. */
+    if (flags & FX_NOFORK) {	/* Simple exec()? */
+	frk = _FHSLF;			/* Fork is ourself */
+    } else {
+
+	/* Do a fork(), then apply exec() to that fork. */
+	acs[1] = CR_CAP;
+	if (jsys(CFORK, acs) <= 0) {
+	    errno = EAGAIN;	/* If fail, claim no more procs */
+	    goto fail;
+	}
+	frk = acs[1];		/* Remember fork handle */
+	_nfork++;		/* Bump count of forks created! */
+	acs[1] = (frk << 18) | jfn;
+	if (jsys(GET, acs) <= 0) {
+	    errno = ENOEXEC;		/* Perhaps not executable file? */
+	    goto fail;
+	}
+	jfn = 0;			/* GET won, forget JFN */
+	acs[1] = frk;
+#if SYS_T20
+	if (jsys(XGVEC, acs) > 0)	/* Get extended entry vector */
+	    startpc = acs[3];
+	else
+#endif
+	if (jsys(GEVEC, acs) > 0)	/* Get entry vector */
+	    startpc = (acs[2] & 0777777);
+	else {
+	    errno = ENOEXEC;
+	    goto fail;
+	}
+    }
+
+    /* This code applies whether chaining or not. */
+    if (rscanp) {			/* Set RSCAN buffer if need to */
+	acs[1] = (int)(rscanp-1);
+	if (jsys(RSCAN, acs) <= 0) {
+	    errno = E2BIG;
+	    goto fail;
+	}
+    }
+
+    if (flags & FX_T20_PRARG) {		/* Set PRARG% arg block */
+	acs[1] = (_PRAST<<18) | frk;
+	acs[2] = (int)(int *)f->fx_blkadr;
+	acs[3] = f->fx_blklen;
+	if (jsys(PRARG, acs) <= 0) {
+	    errno = E2BIG;
+	    goto fail;
+	}
+    }
+
+    /* Now must do hack to ensure that stdin and stdout are preserved
+    ** over the map, and work even if new program is not a C program.
+    ** This is done by setting the primary JFNs .PRIIN and .PRIOU to
+    ** whatever stdin and stdout should be for the new fork/program.
+    ** This is normally whatever they are for the current program.
+    */
+    setpio(frk, (flags&FX_FDMAP) ? f->fx_fdin  : -1,
+		(flags&FX_FDMAP) ? f->fx_fdout : -1);
+
+    /* Now if chaining, ready to load program! */
+    if (flags & FX_NOFORK)		/* Simple exec()? */
+	_exec(jfn, stoff);
+
+    /* Starting inferior process! */
+    acs[1] = frk;
+    acs[2] = startpc + stoff;
+    if (jsys(SFORK, acs) <= 0) {
+	errno = EFAULT;			/* What else to use? */
+	goto fail;
+    }
+    if (flags & FX_WAIT) {		/* Wait until fork done? */
+	(void)USYS_END();		/* Allow interrupts while waiting */
+	if (jsys(WFORK, acs) > 0) {	/* Wait for that fork (in AC1) */
+	    jsys(KFORK, acs);		/* if done, kill fork. */
+	    f->fx_pid = 0;
+	    f->fx_waitres = 0;		/* Assume result is OK */
+	    _nfork--;
+	}
+	USYS_BEG();			/* Must say in syscall again  */
+	return 0;			/* Say we won */
+    }
+    jsys(GJINF, acs);
+    f->fx_pid = ((frk & 0777)<<9) | (acs[3] & 0777);
+
+    return 0;			/* Won! */
+
+fail:		/* Failure, clean up any debris */
+    if (frk) {
+	acs[1] = frk;
+	if (jsys(KFORK, acs) > 0)
+	    _nfork--;
+    }
+    if (jfn) {
+	acs[1] = jfn;
+	jsys(RLJFN, acs);
+    }
+    return errno;		/* Fail */
+}
+#endif /* SYS_T20+SYS_10X */
+
+#if SYS_T20+SYS_10X
+
+/* Auxiliaries for forkexec() */
+
+#define PROGLEN 400		/* Max length of program name */
+
+#if SYS_T20
+#define PROGPRE "SYS:"		/* Prefix to use when searching */
+#define PROGPOST ".EXE"		/* Postfix for ditto */
+
+#elif SYS_10X
+#define PROGPRE "<SYSTEM>"	/* Prefix to use when searching */
+#define PROGPOST ".SAV"		/* Postfix for ditto */
+
+#elif SYS_T10+SYS_CSI
+#define PROGPRE "SYS:"		/* Prefix to use when searching */
+#define PROGPOST ""		/* Postfix for ditto */
+
+#elif SYS_WTS
+#define PROGPRE "SYS:"		/* Prefix to use when searching */
+#define PROGPOST ".DMP"		/* Postfix for ditto */
+#endif
+
+static int
+findpgm(prog, srchflg)
+char *prog;		/* Program name */
+int srchflg;		/* True if want to search for program */
+{
+    char buf[PROGLEN], *bprog, *eprog;
+    int jfn, i;
+
+    if ((i = strlen(prog)) > PROGLEN-15) /* Ensure not too big; if so, give */
+	return _gtjfn(prog, O_RDONLY);	/* up, but try using string directly */
+
+    strcpy(buf, PROGPRE);		/* Put prefix at top */
+    bprog = buf + sizeof(PROGPRE)-1;	/* Remember ptr to beg of progname */
+    strcpy(bprog, prog);		/* Add program name */
+    eprog = bprog + i;			/* Remember ptr to end of progname */
+    strcpy(eprog, PROGPOST);		/* Add postfix */
+
+    if (srchflg) {
+	if ((jfn = _gtjfn(buf, O_RDONLY)) > 0)	/* try SYS:prog.EXE */
+	    return jfn;
+	i = *eprog;
+	*eprog = '\0';		/* Insert null to drop .EXE or .SAV */
+	if ((jfn = _gtjfn(buf, O_RDONLY)) > 0)	/* try SYS:prog */
+	    return jfn;
+	*eprog = i;				/* restore suffix char */
+    }
+    if ((jfn = _gtjfn(bprog, O_RDONLY)) > 0) 	/* try prog.EXE */
+	return jfn;
+    if ((jfn = _gtjfn(prog, O_RDONLY)) > 0)	/* try just prog */
+	return jfn;
+    return 0;					/* All failed, give up */
+}
+
+static char *
+cvtargv(av, buf, len)
+char **av, *buf;
+int len;
+{
+    register char *t, *f;
+
+    if (av == NULL || *av == NULL)
+	return NULL;		/* No args */
+    for (t = buf-1; *av; ++av) {
+	f = *av-1;
+	while (--len > 0 && (*++t = *++f));
+	*t = ' ';		/* Space between each arg */
+    }
+    *t = '\n';			/* Last arg ends with linefeed, not space */
+    if (len > 0) ++t;
+    *t = '\0';			/* and a null */
+    return buf;
+}
+#endif /* SYS_T20+SYS_10X */
+
+#if SYS_T20+SYS_10X
+
+static void
+setpio(frk, infd, outfd)
+int infd, outfd;
+{
+    int injfn, outjfn;
+
+    if (infd < 0) infd = UIO_FD_STDIN;
+    if (outfd < 0) outfd = UIO_FD_STDOUT;
+
+    injfn  = _uffd[infd]  ? _uffd[infd]->uf_ch  : -1;
+    outjfn = _uffd[outfd] ? _uffd[outfd]->uf_ch : -1;
+
+    _setpio(frk, injfn, outjfn);
+}
+
+static void
+_setpio(frk, in, out)
+int frk, in, out;
+{
+#asm
+	move 1,-1(17)		; Get fork handle to use
+	gpjfn%			; Get current settings for primary i/o
+	move 5,2		; Save them elsewhere
+	hrre 4,-2(17)		; Check input arg
+	jumpl 4,skipin		; If no setting, skip input stuff.
+	caie 4,.priin
+	 hrl 2,4		; If non-standard, set LH to new value!
+skipin:	hrre 4,-3(17)		; Check output arg
+	jumpl 4,skipo		; If no setting, skip output stuff.
+	caie 4,.priou
+	 hrr 2,4		; If non-standard, set RH to new value!
+skipo:
+	camn 2,5		; OK, is new setting any different from old?
+	 popj 17,
+	move 1,-1(17)		; One is different, must map!
+	spjfn%			; Do it
+#endasm
+}
+#endif /* T20+10X */
+
+#if SYS_T20+SYS_10X
+/*
+** Low level support for exec()
+**
+** _exec(jfn, offset)
+**	Chains to the program in the file that the jfn identifies.
+**	Never returns if successful.
+**
+**	If we were in vfork() we HALTF% to give the superior a chance to synch.
+*/
+static void
+_exec(jfn, offset)
+int jfn, offset;
+{
+#asm
+	extern .vfrkf			/* in URT */
+
+#if SYS_T20
+	movei 1,.fhslf
+	setz 2,
+	scvec%			/* Reset compat package vector! */
+#endif
+	/* NOTE!! We cannot use SFRKV% to start ourselves if the start offset
+	** is anything but 0, because SFRKV% does funny things if the entry
+	** vector is JRST FOO (as it is for program like LINK).  In that case
+	** it starts the program at .JBREN rather than .JBSA+offset, and things
+	** blow up.  Hence the extra code to get the entry vector explicitly,
+	** and we have to use XGVEC% in case the program is extended to begin
+	** with!  Space is sure getting tight in the ACs...
+	*/
+#if SYS_T20
+	movei 1,.fhslf
+	xgvec%			/* Must find out whether this will work */
+	erjmp exec4		/* If failed, jump to handle old system */
+	/* Set up ACs for multi-section system */
+	move	0,[acsext,,1]	/* Get BLT pointer to set regs */
+	blt 	0,16		/* Copy all of ACs 1-16 across */
+	hrr	acoffx,-2(17)	/* Set start offset in RH of proper AC */
+	jrst exec5
+#endif
+	/* Set up ACs for single-section system */
+exec4:	move	0,[acsone,,1]	/* Get BLT pointer to set regs */
+	blt 	0,16		/* Copy all of ACs 1-16 across */
+	hrr	acoff1,-2(17)	/* Set start offset in RH of proper AC */
+
+
+exec5:	move	0,-1(17)	/* Save JFN for GET in AC0 */
+	hrli	0,.fhslf	/* <handle>,,<jfn> */
+
+	/* Now no longer need memory for anything, all is in the ACs. */
+	skipe	.vfrkf			/* If in vfork() */
+	 haltf%				/* Stop and let superior catch up */
+vfksyn:	/* This PC is checked to ensure HALTF% is right one! */
+
+	jrst	@[4]			/* Jump to section 0 regs */
+
+#if SYS_T20
+	/* ACs for multi-section TOPS-20 */
+acsext:				/* where to copy regs from */
+	-1			/* AC1  unmapping */
+	.fhslf,,0		/* AC2  from self starting page 0 */
+	pm%cnt!pm%epn!1000	/* AC3  to bottom of the section */
+	pmap%			/* AC4  unmap section zero */
+	hrri	2,1		/* AC5  make pointer to section 1 */
+	movei	3,37		/* AC6  count of sections to unmap */
+	smap%			/* AC7  unmap all nonzero sections */
+	erjmp	11		/* AC10 win with pre-rel-5 TOPS-20 */
+	move	1,0		/* AC11 get back GET% argument */
+	get%			/* AC12 map new program into ourself */
+	movei	1,.fhslf	/* AC13 this process again */
+	xgvec%			/* AC14 get extended entry vector */
+acoffx==15
+	addi	3,0		/* AC15 add start offset */
+	xjrstf  2		/* AC16 start there! */
+		/* Note that PC flags get restored from junk in AC2, but
+		** since the LH will normally be zero, we'll risk it.
+		*/
+#endif /* T20 */
+
+	/* ACs for single-section system (TOPS-20 or TENEX) */
+acsone:
+	-1			/* AC1  unmapping */
+	.fhslf,,0		/* AC2  from self starting page 0 */
+#if SYS_T20
+	pm%cnt!pm%epn!1000	/* AC3  to bottom of the section */
+	pmap%			/* AC4  unmap section zero */
+	jfcl			/* AC5 */
+	jfcl			/* AC6 */
+#else
+	1000			/* AC3  TENEX has no PM%CNT */
+	pmap%			/* AC4  unmap a page */
+	aoj	2,		/* AC5  point to next */
+	sojg	3,4		/* AC6  loop until all unmapped */
+#endif
+	move	1,0		/* AC7 get back GET% argument */
+	get%			/* AC10 map new program into ourself */
+	movei	1,.fhslf	/* AC11 this process again */
+	gevec%			/* AC12 Get entry vector, and */
+acoff1==13
+	jrst (2)		/* AC13 start there, plus offset */
+	block 3			/* AC14, AC15, AC16 */
+
+#endasm
+}
+#endif /* T20+10X */
+
+#if SYS_T10+SYS_CSI+SYS_WTS
+extern int _fparse();	/* From OPEN */
+extern void _panic();	/* URT */
+
+static int
+sysfkx(f)
+struct frkxec *f;
+{
+    struct _filespec fs;
+    struct runblk {
+	int rn_dev;
+	int rn_nam;
+	int rn_ext;
+	int rn_x;	/* Unused, shd be 0 */
+	int rn_ppn;
+	int rn_mem;
+	} rn;
+    int res, off;
+    int flags = f->fx_flags;
+
+    /* First ensure realistic expectations */
+    if (!(flags&FX_NOFORK))
+	return EAGAIN;		/* Cannot create process */
+    flags &= ~FX_WAIT;		/* No point waiting if chaining */
+    if (flags & ~(FX_NOFORK|FX_PGMSRCH|FX_STARTOFF))	/* Only hack these */
+	return EINVAL;		/* Unimplemented flags given */
+
+    /* Try to determine what program to run */
+    if (res = _fparse(&fs, f->fx_name))
+	return res;		/* Parse failed, return error */
+    
+    rn.rn_dev = fs.fs_dev;	/* Set up block for RUN UUO */
+    rn.rn_nam = fs.fs_nam;
+    rn.rn_ext = fs.fs_ext;
+    rn.rn_ppn = (fs.fs_nfds > 1)	/* Set directory (PPN or path) */
+		    ? (int)&fs.fs_path : fs.fs_path.p_path.ppn;
+    rn.rn_x = rn.rn_mem = 0;
+
+    /* If no device or PPN and wants search, use SYS:, else just DSK: */
+    if (!rn.rn_dev)
+	rn.rn_dev = (!rn.rn_ppn && (flags&FX_PGMSRCH))
+			? _SIXWRD("SYS") : _SIXWRD("DSK");
+#if SYS_WTS
+    if (!rn.rn_ext)
+	rn.rn_ext = _SIXWRD("DMP");
+#endif
+
+    off = (flags & FX_STARTOFF)		/* Set start addr offset */
+		? f->fx_startoff : 0;
+
+    if (MUUO_ACVAL("RUN", XWD(off, (int)&rn), &res) <= 0) {
+	/* Perhaps could try to interpret error code in res, but... */
+	return ENOENT;
+    }
+    _panic("RUN returned?!");		/* Should never get here!!! */
+    return ESRCH;			/* Random return to pacify compiler */
+}
+#endif /* T10+CSI+WAITS */
+
+#endif /* T20+10X+T10+CSI+WAITS */

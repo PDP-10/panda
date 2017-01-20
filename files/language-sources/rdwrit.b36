@@ -1,0 +1,626 @@
+MODULE RDWRIT (	! Local Block I/O service for RMS
+		IDENT = '2',
+                ENTRY(
+                      R$READ,           ! RMS $READ (Block-mode input)
+                      R$WRITE,          ! RMS $WRITE (Block-mode output)
+                      RMS$READ,         ! RMS Local $READ
+                      RMS$WRITE,        ! RMS Local $WRITE
+                      RMS$WBUCKET,      ! Put out current bucket
+                      RDHANDLE          ! Handler for $READ
+                      )
+		) =
+BEGIN
+!  COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1982, 1986.
+!  ALL RIGHTS RESERVED.
+!  
+!  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!  COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!  THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!  ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!  AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!  SOFTWARE IS HEREBY TRANSFERRED.
+!  
+!  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!  NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!  EQUIPMENT CORPORATION.
+!  
+!  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!  ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+
+!++
+! FACILITY:  DAP
+!
+! ABSTRACT:  Routines to transfer records or blocks of file data.
+!
+!
+! ENVIRONMENT:  RMS, BLISSNET, XPORT, Transportable code.
+!
+! AUTHOR:	Andrew Nourse, CREATION DATE:  23-Apr-82
+!
+! MODIFIED BY:
+!
+! 	, : VERSION
+! 02    - Put in entry points
+! 01	- The beginning
+!--
+!
+! INCLUDE FILES:
+!
+
+ LIBRARY 'RMSINT';                      ! RMS Definitions
+ LIBRARY 'BLI:XPORT';
+ LIBRARY 'RMSLIB';                      ! INTERNAL RMS definitions
+ LIBRARY 'BLISSNET';                    ! BLISS DECNET Interface
+ LIBRARY 'CONDIT';                      ! Condition handler defs
+ LIBRARY 'DAP';                         ! DAP package defs
+%IF %SWITCHES(TOPS20)
+%THEN
+ UNDECLARE %QUOTE BPT;
+ LIBRARY 'BLI:MONSYM';
+%FI;
+
+!
+! TABLE OF CONTENTS:
+!
+
+FORWARD ROUTINE
+	R$READ,                         ! RMS $READ (Block-mode input)
+        R$WRITE,                        ! RMS $WRITE (Block-mode output)
+        RMS$READ,                       ! RMS Local $READ
+        RMS$WRITE,                      ! RMS Local $WRITE
+        NEXT_BUCKET,                    ! Find the next bucket number
+        RMS$WBUCKET,                    ! Put out current bucket
+        RDHANDLE;                       ! Handler for $READ
+
+!
+! STRUCTURES
+!
+
+STRUCTURE RMS_BLOCK[O,P,S]=(RMS_BLOCK+O)<P,S,0>;  ! Unsigned always
+                                                  ! otherwise like BLOCK
+!
+! MACROS:
+!
+
+MACRO
+    BUILD_LIST(BLK)[LST]=BLK[%COUNT]=LST %,
+
+    $UTIL(FUNC)=(LOCAL ARGBLK: BLOCK[%LENGTH];
+                 BIND ARGS=ARGBLK[1,0,0,0]: VECTOR;
+                 BUILD_LIST(ARGS,%REMAINING);
+                 ARGBLK[0,0,18,0]=FUNC;
+                 ARGBLK[0,18,18,0]=1-%LENGTH;
+                 $UTLINT(UAB=ARGBLK, ERR=RMS$SIGNAL);
+                 .ARGBLK[0,0,36,0]) %;
+
+
+KEYWORDMACRO
+    GET_BUCKET(RAB=SAME_RAB,BUCKET,BUCKET_SIZE=1,LOCK=0,DESC)=
+       (%IF NOT %IDENTICAL(RAB,SAME_RAB)
+        %THEN $UTIL(U$SETENVIR,RAB);
+        %FI
+        $UTIL(U$GETBKT,BUCKET,BUCKET_SIZE,LOCK,DESC)) %,
+
+    PUT_BUCKET(RAB=SAME_RAB,DESC,UPDATE=1)=
+       (%IF NOT %IDENTICAL(RAB,SAME_RAB)
+        %THEN $UTIL(U$SETENVIR,RAB);
+        %FI
+        $UTIL(U$PUTBKT,UPDATE,DESC)) %;
+
+MACRO  FREE_BUCKET(A)=PUT_BUCKET(A,%REMAINING,UPDATE=0) %;
+
+MACRO COPY(AFROM,ATO,LEN)=               ! Copy a block of memory
+      (REGISTER BLTPTR;                  ! using BLT instruction
+       BLTPTR<LH>=(AFROM);               ! FROM is source addr
+       BLTPTR<RH>=(ATO);                 ! TO is destination addr
+       BLT(BLTPTR,((ATO)+(LEN)-1))) %;   ! LEN is length of block
+
+!
+! EQUATED SYMBOLS:
+!
+
+LITERAL Rab$k_Fts_Bft = 255;
+
+LITERAL FIRST_VBN=1;
+
+! UTLINT function codes and arguments
+
+%(  Defined in RMSLIB
+
+LITERAL
+    U$SETENVIR=0,                ! SETENVIR(RAB)
+    U$GMEM=1,                    ! GMEM(Len)
+    U$GPAGE=2,                   ! GPAGE(Numberofpages)
+    U$PMEM=3,                    ! PMEM(Len,Addr)
+    U$PPAGE=4,                   ! PPAGE(Pagenum,Numberofpages,KillFlag)
+
+** Functions below this require SETENVIR to be done first
+
+    U$CHKDUP=6,                  ! CHKDUP(RecDesc_FirstSidr,BktDesc)
+    U$CKEYKU=7,                  ! CKEYKU(RDPptr,RECptr)
+    U$CKEYKK=%O'10',             ! CKEYKK(RDPptr,KeyStringptr)
+    U$FBYRRV=%O'11',             ! FBYRRV(RecDesc_Target,BktDesc)
+    U$FBYRFA=%O'12',             ! FBYRFA(RecDesc_Target,BktDesc)
+    U$FNDDATA=%O'13',            ! FNDDATA(RecDesc_Keystring,BktDesc)
+    U$FOLOPATH=%O'14',           ! FOLOPATH(RecDesc_Searchkey,BktDesc)
+    U$GETBKT=%O'15',             ! GETBKT(Bktno,Bktsize,Lockflag,BktDesc)
+    U$GETIDB=%O'16',             ! GETIDB(BktDesc)
+    U$GETKDB=%O'17',             ! GETKDB(Krf)
+    U$GETROOT=%O'20',            ! GETROOT(RecDesc)
+    U$GTBKTPTR=%O'21',           ! GTBKTPTR(RecDesc,BktDesc_curr,BktDesc_next)
+    U$MOVEKEY=%O'22',            ! MOVEKEY(RecPtr,KeybufPtr)
+    U$PATH=%O'23',               ! PATH()
+    U$PUTBKT=%O'24',             ! PUTBKT(UpdateFlag,BktDesc)
+    U$PUTSIDR=%O'25';            ! PUTSIDR(RecDesc)
+)%
+
+!
+! OWN STORAGE:
+!
+
+
+!
+! EXTERNAL REFERENCES:
+!
+EXTERNAL ROUTINE
+                DAP$GET,
+                DAP$PUT,
+                DAP$GET_MESSAGE,
+                DAP$PUT_MESSAGE,
+                DAP$GET_STRING,
+                DAP$GET_STATUS,
+                DAP$PUT_STRING,
+                DAP$PUT_CONTROL,
+                DAP$GET_ACK,
+                DAP$ERROR_DAP_RMS,
+                RMS$SIGNAL,
+                DAP$HANDLE;             ! Condition handler
+BUILTIN
+    MACHOP;
+
+EXTERNAL
+    RMSV3;
+
+GLOBAL ROUTINE R$READ (RAB,ERR)  =	! Get a bucket from a file
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Get a bucket from an open file.
+!       Use RMS if file is local, DAP (via DAP$GET) if remote.
+!
+! FORMAL PARAMETERS:
+!
+!       RAB: A RAB as defined by RMS
+!       ERR: Address of error routine
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+    MAP RAB: REF $RAB_DECL;
+    BIND FAB=.RAB[RAB$A_FAB]: $FAB_DECL;
+    LOCAL V;
+
+    V=(IF .FAB[FAB$H_BID] NEQ FAB$K_BID
+       THEN DAP$GET(RAB[$],.ERR)
+       ELSE RMS$READ(RAB[$],.ERR));
+
+    .V
+    END;			!End of R$READ
+
+GLOBAL ROUTINE R$WRITE (RAB,ERR) =	! Put a page
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Put a page to an open file.
+!       Use RMS if file is local, DAP (via DAP$PUT) if remote.
+!
+! FORMAL PARAMETERS:
+!
+!       RAB: A RAB as defined by RMS
+!       ERR: Address of error routine
+!
+! COMPLETION CODES:
+!
+!	Standard RMS codes
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!--
+
+    BEGIN
+    MAP RAB: REF $RAB_DECL;
+    BIND FAB=.RAB[RAB$A_FAB]: $FAB_DECL;
+    IF .FAB[FAB$H_BID] NEQ FAB$K_BID
+    THEN DAP$PUT(RAB[$],.ERR)
+    ELSE RMS$WRITE(RAB[$],.ERR)
+    END;			!End of R$WRITE
+GLOBAL ROUTINE RMS$READ (URAB,ERR)  =	! Get a page from a file
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Get a page from an open local file.
+!
+! FORMAL PARAMETERS:
+!
+!       URAB: A RAB as defined by RMS
+!       ERR: Address of error routine
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+BEGIN
+BIND RAB=.URAB: $RAB_DECL;
+
+LOCAL CRAB: REF $RAB_DECL VOLATILE;
+LOCAL CERR: VOLATILE;
+
+ENABLE RDHANDLE(CRAB,CERR);         ! Handle page-not-found, in particular
+
+CRAB=RAB;                          ! Copy for handler
+CERR=.ERR;                          ! 
+
+
+IF .Rmsv3
+THEN
+    BEGIN
+    Rab[Rab$b_Rac] = Rab$k_Bft; ! BFT for v3
+    $READ( Rab=Rab, Err=Rms$Signal );
+    Rab[RAb$b_Rac] = Rab$k_Fts_Bft
+    END
+ELSE
+    BEGIN
+    BIND RST=.RAB[RAB$A_ISI]: RMS_BLOCK;
+    BIND CBKD=RST[RSTCBKD1]: RMS_BLOCK;
+    BIND CBFD=.CBKD[BKDBFDADR]: RMS_BLOCK;
+
+    !Free the buffer if necessary
+    IF CBFD NEQ 0                       ! Is there any buffer descriptor?
+    THEN
+        BEGIN
+        IF .CBFD[BFDUSECOUNT] GTR 0           ! Is a bucket in the buffer?
+        THEN FREE_BUCKET(RAB=RAB, DESC=CBKD); ! Yes. free it.
+        END;
+
+    RAB[RAB$G_RFA]=.RAB[RAB$G_BKT];     ! Assume we get what we asked for
+                                        ! (If not, handler will fix it)
+
+    ! Special case for VBN 0, which is the FDB of the file
+    IF .RAB[RAB$G_RFA] EQL 0
+    THEN
+        BEGIN
+        %IF %SWITCHES(TOPS20)
+        %THEN
+
+        LINKAGE JSYS_3=JSYS(REGISTER=1,REGISTER=2,REGISTER=3): SKIP(0);
+        BIND ROUTINE GTFDB__=GTFDB_: JSYS_3;
+        BIND FAB=.RAB[RAB$A_FAB]: $FAB_DECL;
+        RAB[RAB$H_RSZ]=$FBLEN;          ! Length of FDB
+
+        GTFDB__(.FAB[FAB$H_JFN],$FBLEN^18,.RAB[RAB$A_UBF]);
+
+        %ELSE %ERROR('Not implemented for TOPS-10')
+        %FI
+
+        RETURN RMS$_NORMAL
+        END;
+
+    ! Get the requested page of the file
+    GET_BUCKET(RAB=RAB, DESC=CBKD, BUCKET=(.RAB[RAB$G_RFA]-FIRST_VBN));
+
+    SELECT .RAB[RAB$B_RAC] OF
+    SET
+    [RAB$K_BLK, RAB$K_BFT, RAB$K_FTS_BFT]:     ! If block mode,
+        BEGIN                           ! user wants the bucket itself
+        RAB[RAB$H_RSZ]=PAGESIZE*.CBKD[BKDBKTSIZE];
+        IF .RAB[RAB$V_LOC]
+        THEN RAB[RAB$A_RBF]=.CBKD[BKDBKTADR]        !Point RBF at bucket itself
+        ELSE
+            BEGIN
+            RAB[RAB$A_RBF]=.RAB[RAB$A_UBF];         !Point RBF at user's buffer
+            COPY(.CBKD[BKDBKTADR],.RAB[RAB$A_RBF],.RAB[RAB$H_RSZ]);
+            END;
+        END;
+    TES;
+
+    RMS$_NORMAL
+    END;
+END;                                !End of RMS$READ
+GLOBAL ROUTINE RMS$WRITE (URAB,ERR) =	! Put a page
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Put a page to an open local file.
+!
+! FORMAL PARAMETERS:
+!
+!       URAB: A RAB as defined by RMS
+!       ERR: Address of error routine
+!
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!--
+
+BEGIN
+BIND RAB=.URAB: $RAB_DECL;
+LOCAL CRAB: REF $RAB_DECL VOLATILE;
+LOCAL CERR: VOLATILE;
+
+ENABLE RDHANDLE(CRAB,CERR);         ! Handle page-not-found, in particular
+
+CRAB=RAB;                           ! Copy for handler
+CERR=.ERR;                          ! 
+
+IF .Rmsv3
+THEN
+    BEGIN
+    Rab[Rab$b_Rac] = Rab$k_Bft; ! BFT for v3
+    $Write( Rab=Rab, Err=Rms$Signal );
+    Rab[RAb$b_Rac] = Rab$k_Fts_Bft
+    END
+ELSE
+    BEGIN
+    BIND RST=.RAB[RAB$A_ISI]: RMS_BLOCK;
+    BIND CBKD=RST[RSTCBKD1]: RMS_BLOCK;
+    BIND CBFD=.CBKD[BKDBFDADR]: RMS_BLOCK;
+
+    !Free the buffer if necessary
+    IF CBFD NEQ 0                       ! Is there any buffer descriptor?
+    THEN
+        BEGIN
+        IF .CBFD[BFDUSECOUNT] GTR 0           ! Is a bucket in the buffer?
+        THEN FREE_BUCKET(RAB=RAB, DESC=CBKD); ! Yes. free it.
+        END;
+
+    RAB[RAB$G_RFA]=.RAB[RAB$G_BKT];     ! Assume we got what we wanted
+
+    ! Special case for VBN 0, which is the FDB of the file
+    ! Note that words in the FDB
+    !  that corrrespond to zero words in the buffer are not changed!
+    IF .RAB[RAB$G_RFA] EQL 0
+    THEN
+        BEGIN
+        %IF %SWITCHES(TOPS20)
+        %THEN
+        LINKAGE JSYS_3E=JSYS(REGISTER=1,REGISTER=2,REGISTER=3): SKIP(-1);
+        BIND FAB=.RAB[RAB$A_FAB]: $FAB_DECL;
+        BIND ROUTINE CHFDB__=CHFDB_: JSYS_3E;
+        OWN FDB_MASK:VECTOR[$FBLEN]  ! Mask of what CHFDB can change
+                     PRESET([$FBCTL]=FB_TMP+FB_PRM+FB_DEL+FB_NOD+FB_INV+FB_FCF,
+                                     ! Temporary, Permanent, Deleted, No-dump,
+                                     ! Invisible, File Class (RMS/not-RMS)
+                            [$FBPRT]=%O'777777',! Protection of file
+                            [$FBBYV]=FB_RET+FB_BSZ+FB_MOD, ! GenRetent,bsz,mode
+                            [$FBSIZ]=-1,        ! Size of file in bytes
+                            [$FBCRV]=-1,        ! Creation Date/Time
+                            [$FBWRT]=-1,        ! Last user write dtm
+                            [$FBREF]=-1,        ! Last user read dtm
+                            [$FBUSW]=-1         ! User settable word
+                            );
+                            
+        LOCAL PTR: REF VECTOR;
+        LOCAL LEN;
+
+        PTR=.RAB[RAB$A_RBF];            ! Pointer to 'record'
+
+        INCR I FROM 0 TO MIN(.RAB[RAB$H_RSZ],$FBLEN)-1
+        DO  BEGIN
+            IF (.FDB_MASK[.I] NEQ 0) ! If anything to change here
+            AND (.PTR[.I] NEQ 0)     ! and we provided something there
+            THEN CHFDB__(CF_NUD+(.I^18)+.FAB[FAB$H_JFN],.FDB_MASK[.I],.PTR[.I])
+            END;
+
+        %ELSE %ERROR('Not implemented for TOPS-10')
+        %FI
+        RETURN RMS$_NORMAL
+        END;
+
+    GET_BUCKET(RAB=RAB, DESC=CBKD, BUCKET=(.RAB[RAB$G_RFA]-FIRST_VBN)); !Get it
+    COPY(.RAB[RAB$A_RBF], .CBKD[BKDBKTADR], .RAB[RAB$H_RSZ]); ! Copy into it
+    PUT_BUCKET(UPDATE=1, DESC=CBKD);                          ! Write it out
+    RMS$_NORMAL
+    END;
+END;			!End of RMS$WRITE
+ROUTINE NEXT_BUCKET(URAB)=
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!    Find next bucket of file
+!
+! FORMAL PARAMETERS:
+!
+!    URAB: Address of RAB
+!
+! RETURNED VALUE:
+!
+!    Next bucket (page) number
+!
+! SIDE EFFECTS:
+!
+!   If no next page, RMS$_EOF is signalled
+!   All other errors signal as RMS$_BUG
+!--
+    BEGIN
+    LINKAGE JSYS1E=JSYS(REGISTER=1;REGISTER=1): SKIP(-1);
+    BIND ROUTINE FFUFP__=FFUFP_: JSYS1E;
+    ! Find next file page JSYS
+    BIND RAB=.URAB: $RAB_DECL;
+    BIND FAB=.RAB[RAB$A_FAB]: $FAB_DECL;
+    LOCAL NEXTB;
+
+    IF FFUFP__(((.FAB[FAB$H_JFN])^18)+(.RAB[RAB$G_RFA]-FIRST_VBN);NEXTB)
+    THEN
+        BEGIN
+        RAB[RAB$G_BKT]=RAB[RAB$G_RFA]=.NEXTB<RH>+FIRST_VBN;
+        RETURN RMS$_NORMAL
+        END
+    ELSE                                ! If no next page
+        BEGIN                           ! probably end of file
+        RAB[RAB$H_STS]=(IF .NEXTB EQL FFUFX3    ! Is it end of file?
+                        THEN RMS$_EOF
+                        ELSE RMS$_BUG);
+        RAB[RAB$H_STV]=.NEXTB;          ! Secondary status is TOPS-20 code
+                  
+        SIGNAL(.RAB[RAB$H_STS],.NEXTB,RAB[$],1)    ! oops
+        END
+    END;
+
+
+GLOBAL ROUTINE RMS$WBUCKET (URAB,ERR) =	! Put current bucket
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Put current bucket to an open local file.
+!
+! FORMAL PARAMETERS:
+!
+!       URAB: A RAB or an RST as defined by RMS
+!       ERR: Address of error routine
+!
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!--
+
+    BEGIN
+    BIND RAB=.URAB: $RAB_DECL;
+    BIND RST=(IF .RAB[RAB$H_BID] EQL RAB$K_BID
+              THEN .RAB[RAB$A_ISI]
+              ELSE .URAB):  RMS_BLOCK;
+    BIND CBKD=RST[RSTCBKD1]: RMS_BLOCK;
+    BIND CBFD=.CBKD[BKDBFDADR]: RMS_BLOCK;
+
+    IF CBFD NEQ 0                       ! Is there any buffer descriptor?
+    THEN
+        BEGIN
+        IF .CBFD[BFDUSECOUNT] GTR 0             ! Is a bucket in the buffer?
+        THEN PUT_BUCKET(UPDATE=1, DESC=CBKD);   ! Write it out
+        END;
+    RMS$_NORMAL          ! Good return
+    END;			!End of RMS$WBUCKET
+
+GLOBAL ROUTINE RDHANDLE (SIGNAL_ARGS,MECH_ARGS,ENABLE_ARGS) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Condition handler for RMS$READ and RMS$WRITE
+!
+! FORMAL PARAMETERS:
+!
+!	SIGNAL_ARGS: addr of vector of SIGNAL arguments,
+!       MECH_ARGS: not used,
+!       ENABLE_ARGS: args passed when this handler was established
+!                  [1]: Address of RAB
+!                  [2]: Error routine
+!
+! COMPLETION CODES:
+!
+!	0: Resignal, 1: Continue
+!
+! SIDE EFFECTS:
+!
+!   RMS$_UDF is changed to RMS$_RNF
+!   because this can only occur if the page doesn't exist
+!--
+
+    BEGIN
+    MAP SIGNAL_ARGS: REF VECTOR,
+        MECH_ARGS: REF VECTOR,
+        ENABLE_ARGS: REF VECTOR;
+
+    LOCAL SEVERITY;
+
+    BIND ROUTINE $$ERRRTN=..ENABLE_ARGS[2]: RMS_ERCAL;       ! ERROR ROUTINE
+    BIND RAB=..ENABLE_ARGS[1]: $RAB_DECL;
+
+    IF RAB EQL 0 THEN RETURN SS$_RESIGNAL;      ! Not Set Up
+
+    SEVERITY=.(SIGNAL_ARGS[1])<0,3>;
+
+    SELECT .SIGNAL_ARGS[1] OF
+           SET
+           [SS$_UNWIND]: RETURN SS$_CONTINUE;
+           [RMS$_UDF]: BEGIN
+                       IF (.RAB[RAB$B_RAC] GEQ RAB$K_TRA) ! Blk Mode Xfer
+                       OR .RAB[RAB$V_KGE]
+                       THEN
+                           BEGIN
+                           NEXT_BUCKET(RAB);  ! Find next
+                           RMS$READ(RAB,$$ERRRTN); ! And read it
+                           SETUNWIND();
+                           RETURN MECH_ARGS[1]=.RAB[RAB$H_STS] ! Return status
+                           END;  ! Unwind
+                             
+                       SIGNAL_ARGS[1]=RMS$_RNF; ! GET_BUCKET returns this 
+                       END;                     ! if the page doesn't exist.
+                                                ! We want Record-not-found
+           [RMS$K_ERR_MIN TO RMS$K_ERR_MIN+%O'7777']: ! RMS-20 predates
+                        (SEVERITY=STS$K_ERROR;        ! the standard
+                         RAB[RAB$H_STS]=.SIGNAL_ARGS[1]);
+           [RMS$K_SUC_MIN TO RMS$K_SUC_MIN+%O'17']:   !
+                        (SEVERITY=STS$K_NORMAL;       ! 
+                         RAB[RAB$H_STS]=.SIGNAL_ARGS[1]);
+           TES;
+
+    CASE .SEVERITY FROM 0 TO 7 OF
+         SET
+         [STS$K_ERROR, STS$K_WARNING]:  
+                BEGIN
+                $$ERRRTN( RAB, 1 );              !? Should get operation too
+                SETUNWIND();
+                END;
+         [STS$K_NORMAL, STS$K_INFO]: RETURN STS$K_NORMAL;
+         [STS$K_FATAL,INRANGE]: ;
+         TES;
+
+    STS$K_RESIGNAL
+    END;			!End of RDHANDLE
+
+
+END				!End of module
+ELUDOM

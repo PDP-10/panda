@@ -1,0 +1,534 @@
+TITLE FAO -- Formatted Ascii Output for TOPS-20 RTL
+
+; Which is essentially a method for making error messages from a pattern
+; string and a list of parameters.
+
+;
+;	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1984, 1986.
+;	ALL RIGHTS RESERVED.
+;
+;	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+;	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+;	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+;	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+;	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+;	SOFTWARE IS HEREBY TRANSFERRED.
+;
+;	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+;	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+;	EQUIPMENT CORPORATION.
+;
+;	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+;	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+;
+
+; Edit History
+
+; Version 1.0
+
+; Version 1.1
+
+;.EDIT 50	Formally go to version 1.1, update copyright, insert V1.1
+;			development changes (formally V2)
+;		DDB,15-Jan-85,SPR:NONE
+;.EDIT 55	Add RL$2BG -- convert two-word byte-pointer to OWG.
+;			Teach FAO about 2-word byte pointers
+;		DDB,10-JUN-85,SPR:NONE
+
+SALL
+
+SEARCH DYNSYM,DDBSYM,MONSYM,MACSYM
+
+REGDEF CX, PP			;Pattern string pointer
+REGDEF F, DP			;Destination pointer
+REGDEF P7, AP			;Argument pointer
+REGDEF P6, DL			;Destination length remaining
+
+SEGMENT CODE
+
+; FAO controlling tables
+
+; BLDFAO builds the FAO tables by calling FAOBLD for pairs pattern,routine.
+; These entries must be in alphabetical order.
+
+DEFINE BLDFAO <
+    FAOBLD ("!", IFIW!AFREXC)
+    FAOBLD ("%S", IFIW!AFR%S)
+    FAOBLD ("%s", IFIW!AFR%SS)
+    FAOBLD ("/", IFIW!AFRSLS)
+    FAOBLD ("AA", IFIW!AFRAA)
+    FAOBLD ("AC", IFIW!AFRAC)
+    FAOBLD ("AZ", IFIW!AFRAZ)
+    FAOBLD ("BP", IFIW!AFRBP)
+    FAOBLD ("F", IFIW!AFRJFN)
+    FAOBLD ("JER", IFIW!AFRJER)
+    FAOBLD ("OH", IFIW!AFROH)
+    FAOBLD ("OW", IFIW!AFROW)
+    FAOBLD ("SW", IFIW!AFRSW)
+    FAOBLD ("VER", IFIW!AFRVER)
+    FAOBLD ("^G", IFIW!AFRBEL)
+    FAOBLD ("_", IFIW!AFRTAB)
+>
+
+; ATBL holds pointers to the pattern strings needed to invoke various 
+; functions (it is parallel to FTBL, which holds a dispatch address for each).
+
+DEFINE FAOBLD (pat, disp) <
+    POINT 7, [ASCIZ pat]
+>
+
+ATBL:	BLDFAO
+	0			;Terminating entry
+
+; FTBL holds dispatch address for the various patters in ATBL
+
+DEFINE FAOBLD (pat, disp) <
+    disp
+>
+
+FTBL:	BLDFAO
+	0			;Terminating entry
+
+SUBTTL RL$FAO -- FAO for TOPS-20 RTL
+
+; This routine produces a string in memory given a pattern string and a stack
+; of arguments to fill in the blanks in the pattern string.
+
+; Arguments:
+;	1/	Destination string pointer
+;	2/	Max allowable destination string length
+;	3/	Model (pattern) string pointer
+;	4/	Address of first arg (others follow at higher addresses)
+;		Note that args may be on stack, or elsewhere, FAO don't care
+;	5/	Count of FAO args (for error checking)
+
+; On return,
+;	1/	Destination string pointer is updated
+;	2/	Count left is returned
+;	3-5/	Trashed
+
+;	All registers not mentioned are preserved.
+
+; For consistency and low overhead, this macro is used to put something
+; (a character, any character) to the destination string and test for 
+; overflow).
+
+DEFINE TODP (reg, errtn<FAOOVF>) <
+    SOJL DL, errtn		;;Error if destination is full
+    IDPB reg, DP		;;Deposit character to destination
+>
+
+DEFINE FRMPP (reg, endrtn<FAODON>) <
+    ILDB reg, PP		;;Get next pattern character
+    JUMPE reg, endrtn		;;Go to done routine if this is end of pattern
+>
+
+DEFINE NXTARG (reg, errtn<FAOTMA>) <
+    SOSGE FAOCNT(P)		;;Skip if not out yet
+	JRST errtn		;;Error -- not enough args (or too many
+				;;substitutions)
+    MOVE reg, 0(AP)		;;Get the argument
+    AOS AP			;;Increment argument pointer
+>
+
+SEGMENT CODE
+
+RL$FAO::
+	SAVACS			;Save 0-16 on stack
+
+	MOVE DP, .SVAC1(P)
+	MOVE DL, .SVAC2(P)
+	MOVE PP, .SVAC3(P)
+	MOVE AP, .SVAC4(P)
+FAOPLU==-AFRTSZ			;Plural flag (set if last number not 1)
+AFRTSZ==30			;AFRTMP size
+AFRTMP==-AFRTSZ+1		;AFR routine workspace
+FAOSIZ==AFRTSZ+1
+FAOCNT==.SVAC5-FAOSIZ		;Refer to argument count on stack
+	ADJSP P, FAOSIZ		;Temp work space for AFR routines
+
+; Loop through looking for exclamation marks (copy to destination as we go)
+FAONXP:	FRMPP T0		;Get next pattern character or go to FAODON
+	CAIN T0, "!"		;Skip if not substitution-introducer
+	  JRST FAOEXC		;Go process substitution
+	TODP T0			;Put harmless character to destination
+	JRST FAONXP		;Loop
+
+; We found an exclamation mark; find what it matches and dispatch
+FAOEXC:	SETZB P1,P2		;SI is null; Point to top of ATBL, FTBL
+	MOVX P3, <POINT 9, P1>	;Pointer to SI (for adding chars)
+
+FAONID:	FRMPP T0		;Done (and ignore invalid pattern) if end
+	IDPB T0, P3		;Add character to SI
+
+FAONTB:	MOVX T1, <POINT 9, P1>	;SI pointer
+	MOVE T2, ATBL(P2)	;Get pointer from ATBL plus index
+	JUMPE T2, FAOTRB	;If pointer is zero, we lose
+
+FAO001:	ILDB T3, T1		;Get SI byte
+	ILDB T4, T2		;Get table byte
+
+	CAMLE T3, T4
+	  AOJA P2, FAONTB	;(T3>T4) Try next table entry
+
+	CAME T3, T4
+	  JRST FAO002
+
+	JUMPN T3, FAO001	;(T3=T4#0) So far so good
+	JRST @FTBL(P2)		;(T3=T4=0) Exact match
+				;(routines exit by jumping to FAONXP)
+
+FAO002:	JUMPE T3, FAONID	;(T3=0,T4#0) Get additional SI character
+
+; Trouble -- invalid pattern string (detected as no match in table, or
+; run off end of table)
+FAOTRB:	JRST FAONXP		;Ignore error, this gets too recursive
+
+; Destination string overflow
+FAOOVF:	SETZ T0,
+	DPB T0, DP		;Overlay last character
+	JRST FAOEXI		;And return with no error indication
+
+; Too many args requested by pattern string (or not enough specified)
+FAOTMA:				;Fall through to FAODON
+
+; Done -- set up to return registers as defined
+FAODON:	SETZ T0,
+	IDPB T0, DP		;Make result string ASCIZ
+
+FAOEXI:	ADJSP P, -FAOSIZ	;Remove AFR workspace
+	MOVEM DP, .SVAC1(P)
+	MOVEM DL, .SVAC2(P)
+	MOVEM PP, .SVAC3(P)
+	RSTACS
+	RET
+
+SUBTTL FAO action routines
+
+; One of these routines exists for each defined pattern.
+
+; They should expect pp, dp, ap, dl to be set up, and they may use them
+; for their normal purposes (pronouns are magic).  No other registers
+; need be respected.
+
+; Table for decoding P&S field of one-word global byte pointers
+; Index by P&S-45 (octal [55]); LH is P, RH is S
+PSTBL:	6,,44			;45
+	6,,36			;46
+	6,,30			;47
+	6,,22			;50
+	6,,14			;51
+	6,,6			;52
+	6,,0			;53
+	10,,44			;54
+	10,,34			;55
+	10,,24			;56
+	10,,14			;57
+	10,,4			;60
+	7,,44			;61
+	7,,35			;62
+	7,,26			;63
+	7,,17			;64
+	7,,10			;65
+	7,,1			;66
+	11,,44			;67
+	11,,33			;70
+	11,,22			;71
+	11,,11			;72
+	11,,0			;73
+	22,,44			;74
+	22,,22			;75
+	22,,0			;76
+
+; Code !/ --  Put a CRLF into output
+AFRSLS:	MOVX T1, .CHCRT
+	TODP T1
+	MOVX T1, .CHLFD
+	TODP T1
+	JRST FAONXP
+
+; Code !_ --  Put a TAB into output
+AFRTAB:	MOVX T1, .CHTAB
+	TODP T1
+	JRST FAONXP
+
+; Code !! -- Put an exclamation point into output
+AFREXC:	MOVX T1, "!"
+	TODP T1
+	JRST FAONXP
+
+; Code !^G -- Put a BELL character into the output
+AFRBEL:	MOVX T1, .CHBEL
+	TODP T1
+	JRST FAONXP
+
+; Code !OW -- Print ARG in octal
+AFROW:	XMOVEI T1, AFRTMP(P)	;Address of temp area
+	TXO T1, 61B5		;OWGBP 7-bit
+	NXTARG T2
+	SETZM FAOPLU(P)		;Assume not plural
+	CAIE T2, 1		;Skip if not plural
+	  SETOM FAOPLU(P)	;Is plural
+	MOVX T3, <NO%MAG!FLD(10,NO%RDX)>
+	NOUT%
+	  JFCL			;No such thing as mistakes around here
+	SETZ T0,
+	IDPB T0, T1		;Make result ASCIZ
+	XMOVEI T1, AFRTMP(P)
+	TXO T1, 61B5
+	JRST AFRCST		;Now copy the number we just made as ASCIZ
+
+; Code !SW -- Print ARG as signed decimal
+AFRSW:	XMOVEI T1, AFRTMP(P)	;Address of temp area
+	TXO T1, 61B5		;OWGBP 7-bit
+	NXTARG T2
+	SETZM FAOPLU(P)		;Assume not plural
+	CAIE T2, 1		;Skip if not plural
+	  SETOM FAOPLU(P)	;Is plural
+	MOVX T3, <FLD(12,NO%RDX)>
+	NOUT%
+	  JFCL			;No such thing as mistakes around here
+	SETZ T0,
+	IDPB T0, T1		;Make result ASCIZ
+	XMOVEI T1, AFRTMP(P)
+	TXO T1, 61B5
+	JRST AFRCST		;Now copy the number we just made as ASCIZ
+
+; Code !OH -- Print ARG as octal halfwords with commas between
+AFROH:	XMOVEI T1, AFRTMP(P)	;Address of temp area
+	TXO T1, 61B5		;OWGBP 7-bit
+	NXTARG P1
+	SETZM FAOPLU(P)		;Assume not plural
+	CAIE P1, 1		;Skip if not plural
+	  SETOM FAOPLU(P)	;Is plural
+	HLRZ T2, P1		;Get left halfword
+	JUMPE T2, AFRH01	;Don't print "0,,"
+	MOVX T3, <NO%MAG!FLD(10,NO%RDX)>
+	NOUT%
+	  JFCL			;No such thing as mistakes around here
+	MOVX T0, ","
+	IDPB T0, T1
+	IDPB T0, T1
+AFRH01:	HRRZ T2, P1
+	MOVX T3, <NO%MAG!FLD(10,NO%RDX)>
+	NOUT%
+	  JFCL
+	SETZ T0,
+	IDPB T0, T1		;Make result ASCIZ
+	XMOVEI T1, AFRTMP(P)
+	TXO T1, 61B5
+	JRST AFRCST		;Now copy the number we just made as ASCIZ
+
+; Code !AA -- Print 7-bit ASCIZ string at address ARG
+AFRAA:	NXTARG T1
+	TXO T1, 61B5		;OWGBP 7-BIT
+	JRST AFRCST
+
+; Code !AZ -- Print ASCIZ string pointed to by ARG (byte-pointer)
+AFRAZ:	NXTARG T1		;Pointer to string to insert
+
+AFRCST:	;Copy string from pointer in T1 to destination
+AZ001:	ILDB T0, T1		;Get next source character
+	JUMPE T0, FAONXP	;Done?
+	TODP T0			;To destination
+	JRST AZ001
+
+; Code !AC -- Print string pointed to by ARG1 containing ARG2 characters
+AFRAC:	NXTARG T1		;Pointer to string
+	NXTARG T3		;Length of string
+AC001:	SOJL T3, FAONXP		;Done?
+	ILDB T0, T1		;Get next source character
+	TODP T0			;To destination
+	JRST AC001
+
+; Code !%S -- Put in capital S if last number was not 1
+AFR%S:	SKIPN FAOPLU(P)		;Skip if plural
+	  JRST FAONXP		;Not plural
+	MOVX T1, "S"
+	TODP T1
+	JRST FAONXP
+
+; Code !%s -- Put in lower case s if last number was not 1
+AFR%SS:	SKIPN FAOPLU(P)		;Skip if plural
+	  JRST FAONXP		;Not plural
+	MOVX T1, "s"
+	TODP T1
+	JRST FAONXP
+
+; Code !JFN -- Print file spec corresponding to JFN ARG
+AFRJFN:	NXTARG T1		;Throw away the JFN
+	MOVX T1, <POINT 7, [ASCIZ "JFN FAO not implemented"]>
+	JRST AFRCST
+
+; Code !VER -- Print ARG as version number
+AFRVER:	NXTARG P1		;Get and save version number
+	XMOVEI T1, AFRTMP(P)	;Temp area
+	TXO T1, 61B5		;OWGBP 7-BIT
+	LDB T2, [POINTR P1, VI%MAJ] ;Get major version number
+	MOVX T3, <NO%MAG!FLD(^D8,NO%RDX)>
+	NOUT%
+	  ERJMP .+1		;No errors in FAO
+	LDB T2, [POINTR P1, VI%MIN] ;Get minor version number
+	JUMPE T2, AFRV01	;Don't print .MIN if minor is 0
+	MOVX T0, "."
+	IDPB T0, T1
+	MOVX T3, <NO%MAG!FLD(^D8,NO%RDX)>
+	NOUT%
+	  ERJMP .+1
+AFRV01:	LDB T2, [POINTR P1, VI%EDN] ;Get edit number
+	JUMPE T2, AFRV02	;Don't print (edit) if edit is 0
+	MOVX T0, "("
+	IDPB T0, T1
+	MOVX T3, <NO%MAG!FLD(^D8,NO%RDX)>
+	NOUT%
+	  ERJMP .+1
+	MOVX T0, ")"
+	IDPB T0, T1
+AFRV02:	LDB T2, [POINTR P1, VI%WHO]
+	JUMPE T2, AFRV03	;Don't print -who if who is 0
+	MOVX T0, "-"
+	IDPB T0, T1
+	MOVX T3, <NO%MAG!FLD(^D8,NO%RDX)>
+	NOUT%
+	  ERJMP .+1
+AFRV03:	SETZ T0,
+	IDPB T0, T1		;Make ASCIZ
+	XMOVEI T1, AFRTMP(P)
+	TXO T1, 61B5		;Pointer to start of temp area
+	JRST AFRCST		;Now copy this string to destination
+	
+; Code !JER -- Print ARG as JSYS error text (from ERSTR%)
+AFRJER:	XMOVEI T1, AFRTMP(P)	;Address of temp area
+	TXO T1, 61B5		;OWGBP 7-BIT
+	NXTARG T2		;Get the error code
+	HRLI T2, .FHSLF
+	MOVX T3, AFRTSZ*5-1	;Room for NUL
+	ERSTR%
+	  JFCL
+	  JFCL
+	SETZ T0,
+	IDPB T0, T1		;Make result asciz
+	XMOVEI T1, AFRTMP(P)
+	TXO T1, 61B5
+	JRST AFRCST		;Copy string to destination
+
+; Code !BP -- print a byte pointer
+; [55] This now deals with one-word local, one-word global, and 2-word ponters.
+
+AFRBP:	NXTARG P1		;Get the byte pointer
+	XMOVEI T1, AFRTMP(P)	;Address of temp area
+	TXO T1, 61B5		;OWGBP 7-bit
+	LDB T2, [POINTR P1, BP%POS] ;Get P or P&S
+	CAILE T2, 44		;Skip if local format
+	  JRST AFRB01
+
+; [55] May also be 2-word global
+; Local -- print P, S, I, X
+	MOVX T3, <NO%MAG!FLD(10,NO%RDX)>
+	NOUT%
+	  JFCL			;No such thing as mistakes around here
+	MOVX T5, " "
+	IDPB T5, T1
+	LDB T2, [POINTR P1, BP%SIZ] ;Get S
+	MOVX T3, <FLD(12,NO%RDX)>
+	NOUT%
+	  JFCL			;No such thing as mistakes around here
+	IDPB T5, T1
+
+	TXNE P1, BP%2WD		;[55] Skip if one-word format
+	  JRST AFRB2W		;[55] 2-word case
+
+; [55] Local case
+	LDB T2, [POINTR P1, 1B13] ;Get I
+	MOVX T3, <NO%MAG!FLD(12,NO%RDX)>
+	NOUT%
+	  JFCL			;No such thing as mistakes around here
+	IDPB T5, T1
+	LDB T2, [POINTR P1, MASKB(14,17)] ;Get X
+	MOVX T3, <NO%MAG!FLD(10,NO%RDX)>
+	NOUT%
+	  JFCL			;No such thing as mistakes around here
+	IDPB T5, T1
+	HRRZ T2, P1		;Get Y
+	MOVX T3, <NO%MAG!FLD(10,NO%RDX)>
+	NOUT%
+	  JFCL			;No such thing as mistakes around here
+	SETZ T0,
+	IDPB T0, T1		;Make result ASCIZ
+	XMOVEI T1, AFRTMP(P)
+	TXO T1, 61B5		;OWGBP 7-bit
+	JRST AFRCST
+
+; [55] 2-word
+AFRB2W:	NXTARG P1		;Get 2nd word of pointer
+	LDB T2, [POINTR P1, 1B1] ;Get I
+	MOVX T3, <NO%MAG!FLD(12,NO%RDX)>
+	NOUT%
+	  JFCL			;No such thing as mistakes around here
+	IDPB T5, T1
+	LDB T2, [POINTR P1, MASKB(2,5)] ;Get X
+	MOVX T3, <NO%MAG!FLD(10,NO%RDX)>
+	NOUT%
+	  JFCL			;No such thing as mistakes around here
+	IDPB T5, T1
+	LDB T2, [POINTR P1, MASKB(6,17)] ;Get section
+	MOVX T3, <NO%MAG!FLD(10,NO%RDX)>
+	NOUT%
+	  JFCL			;No such thing as mistakes around here
+	MOVX T0, ","
+	IDPB T0, T1
+	IDPB T0, T1
+	HRRZ T2, P1		;Get address
+	MOVX T3, <NO%MAG!FLD(10,NO%RDX)>
+	NOUT%
+	  JFCL			;No such thing as mistakes around here
+	IDPB T5, T1
+	MOVEI T0, "<"
+	IDPB T0, T1
+	MOVX T0, "2"
+	IDPB T0, T1
+	MOVEI T0, ">"
+	IDPB T0, T1
+	SETZ T0,
+	IDPB T0, T1		;Make result ASCIZ
+	XMOVEI T1, AFRTMP(P)
+	TXO T1, 61B5		;OWGBP 7-bit
+	JRST AFRCST
+
+; Global
+AFRB01:	MOVE T4, T2		;Save P&S
+	HLRZ T2, PSTBL-45(T4)	;[55] Get P
+	MOVX T3, <NO%MAG!FLD(10,NO%RDX)>
+	NOUT%
+	  JFCL			;No such thing as mistakes around here
+	MOVX T0, "&"
+	IDPB T0, T1
+	HRRZ T2, PSTBL-45(T4)	;[55] Get S
+	MOVX T3, <FLD(12,NO%RDX)>
+	NOUT%
+	  JFCL			;No such thing as mistakes around here
+	MOVX T0, " "
+	IDPB T0, T1
+	LDB T2, [POINTR P1, MASKB(6,17)] ;Get section
+	MOVX T3, <NO%MAG!FLD(10,NO%RDX)>
+	NOUT%
+	  JFCL			;No such thing as mistakes around here
+	MOVX T0, ","		;[55]
+	IDPB T0, T1		;[55]
+	IDPB T0, T1		;[55]
+	HRRZ T2, P1		;[55] Get address
+	MOVX T3, <NO%MAG!FLD(10,NO%RDX)>
+	NOUT%
+	  JFCL			;No such thing as mistakes around here
+	SETZ T0,
+	IDPB T0, T1		;Make result ASCIZ
+	XMOVEI T1, AFRTMP(P)
+	TXO T1, 61B5		;OWGBP 7-bit
+	JRST AFRCST
+
+UN$PP
+UN$DP
+UN$AP
+UN$DL
+
+	END

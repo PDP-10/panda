@@ -1,0 +1,406 @@
+%TITLE 'FALDO - Work routine for TOPS-20 RMSFAL'
+MODULE FALDO (
+              IDENT='7.0(656) 13-Oct-86',
+              ENTRY(
+                    Fal$Do,
+                    Fal$Handle,
+                    UsrErr
+                   )
+             ) =
+BEGIN
+!
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1984, 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+
+!++
+! FACILITY: RMS FAL
+!
+! ABSTRACT:
+!          This is the top level of the RMS File Access Listener for TOPS-20
+!          It will (eventually) support:
+!
+!          o   Record Mode File Access,
+!          o   Record Mode File Transfer,
+!          o   Block Mode File Transfer,
+!          o   $ERASE (file deletion)
+!          o   $RENAME
+!          o   $SUBMIT (transfer & submit as batch job)
+!          o   $EXECUTE (submit existing file as batch job)
+!          o   Directory List
+!
+! ENVIRONMENT: TOPS-20
+!
+! AUTHOR: Andrew Nourse
+
+
+! Revision History
+!
+! RMS edit  Who              Reason
+!
+!  656      (GAS, 13-Oct-86) Add protection XAB for reading/writing protections
+!
+
+!
+! Table of Contents
+!
+
+FORWARD ROUTINE
+    fal$do,
+    fal$handle;
+
+!
+! Library and Include files
+!
+
+REQUIRE 'RMSREQ';
+LIBRARY 'BLISSNET';
+LIBRARY 'CONDIT';
+
+!
+! Literals
+!
+
+LITERAL namesize=300;
+%IF %BLISS(BLISS36)
+    %THEN
+    %IF %SWITCHES(TOPS20)
+        %THEN
+            LITERAL our_ostype=dap$k_tops20;
+            LITERAL ma_return = 1;
+
+        %FI
+    %FI
+
+!
+! OWN Storage
+!
+GLOBAL
+    Usrsts,
+    Usrstv,
+    UsrRecNum,
+    UsrTxt;
+
+GLOBAL BIND debugword=%O'135';          ! Kludge for debug FAL
+
+OWN logger;                             ! Log errors if nonzero
+
+UNDECLARE %QUOTE type;                  ! This macro breaks XPN totally
+
+GLOBAL
+    FalFna: VECTOR[CH$ALLOCATION(namesize)] VOLATILE,
+    FalEsa: VECTOR[CH$ALLOCATION(namesize)] VOLATILE,
+    FalRsa: VECTOR[CH$ALLOCATION(namesize)] VOLATILE,
+    FalTyp: $typ() VOLATILE,
+    FalNam: $nam(Rsa=CH$PTR(FalRsa), Rss=Namesize,    ! NAMe block for file
+              Esa=CH$PTR(FalEsa), Ess=Namesize) VOLATILE,
+    FalCfg: $xabcfg() VOLATILE ,
+    Idd: $dap_descriptor VOLATILE,
+    Odd: $dap_descriptor VOLATILE,
+    FalFst: $rms_fst VOLATILE PRESET( [fst$h_bln] = fst$k_bln, ! Block length
+                                      [fst$h_bid] = fst$k_bid, ! Block ID
+                                      [fst$a_config] = FalCfg, ! Remote info
+                                      [fst$a_i_dd] = idd,      ! Input Dap Desc
+                                      [fst$a_o_dd] = odd ),    ! Output ..
+
+    obuff: VECTOR[CH$ALLOCATION(dap$k_buffer_size,8)] VOLATILE,   !M541
+    usrbuf: VECTOR[CH$ALLOCATION(dap$k_buffer_size,9)] VOLATILE,  !M541
+    KeyBuf: VECTOR[255] VOLATILE,
+    faldat: $XABDAT () VOLATILE,                        ! Date time XAB
+    falpro: $XABPRO (NXT=faldat, PRO=<,,,>) VOLATILE,   ! Protection XAB
+    falsum: $XABSUM (NXT=falpro) VOLATILE,              ! Summary XAB
+
+    FalFab: $fab(fna=CH$PTR(FalFna),   ! FAB for file being accessed
+              typ=FalTyp,
+              nam=FalNam,
+              xab=FalSum) VOLATILE,
+
+    RabVector: BLOCKVECTOR[ 256, Rab$k_Bln ] FIELD( Rab$r_Fields ) VOLATILE, 
+    RstVector: BLOCKVECTOR[ 256, Rst$k_Bln ] FIELD( Rst$r_Fields ) VOLATILE;
+UNDECLARE
+    Fab, Rab, Fst, Rst, Fpt, Cbd, Kdb, Adb;
+
+GLOBAL
+    Fab:  REF BLOCK %( $Fab_decl )% INITIAL( FalFab ),
+    Rab:  REF BLOCK %( $Rab_decl )%,
+    Fst:  REF BLOCK %( $Rms_Fst )% INITIAL( FalFst ),
+    Rst:  REF BLOCK %( $Rms_Rst )%,
+    Fpt:  REF BLOCK %( $Rms_Fpt )%,
+    Cbd:  REF BLOCK %( $Rms_Bucket_Descriptor )%,
+    Kdb:  REF BLOCK %( $Rms_Kdb )%,
+    Adb:  REF BLOCK %( $Rms_Adb[8] )%;
+
+MAP
+    Fab:  REF $Fab_decl,
+    Rab:  REF $Rab_decl,
+    Fst:  REF $Rms_Fst,
+    Rst:  REF $Rms_Rst,
+    Fpt:  REF $Rms_Fpt,
+    Cbd:  REF $Rms_Bucket_Descriptor,
+    Kdb:  REF $Rms_Kdb,
+    Adb:  REF $Rms_Adb[8];
+
+!
+! Externals
+!
+EXTERNAL ROUTINE
+    dap$get_config,
+    dap$put_config,
+    dap$$get_attributes,
+    dap$$put_attributes,
+    dap$get_access,
+    dap$get_control,
+    dap$put_status,
+    dap$put_ack,
+    dap$$put,
+    rms$signal,
+    dap$get_message,
+    dap$put_message,
+    dap$put_string,
+    dap$error_rms_dap,
+    xpn$signal,
+    r$message,
+    dap$retry_last_operation,
+    dap$get_access_complete,
+    dap$get_continue;
+
+EXTERNAL
+    d_acr: $xpn_descriptor();
+
+GLOBAL ROUTINE Fal$Do ( P_Nlb ) =
+!
+! Functional Description
+!
+!          This is the top level of the RMS File Access Listener for TOPS-20
+!
+! Formal Parameter:
+!
+!    P_NLB: Address of NLB on which we just got a connect
+!
+! Condition Codes:
+!
+!    RMS success or error code
+!
+!--
+BEGIN
+BIND Nlb=.P_Nlb: $Xpn_Nlb();        ! This is the NLB
+
+ENABLE fal$handle( FalFab, FalFst );    ! Set up condition handler
+
+$Xpn_Desc_Init( Descriptor=Odd, Class=Dynamic_Bounded,
+                Binary_Data=(Dap$k_Buffer_Size, Obuff, Bytes) );
+
+$Xpn_Desc_Init( Descriptor=Idd, Class=Bounded );
+
+Fst[Fst$a_Nlb]=Nlb;                     ! Set up the NLB in the FST
+Fst[Fst$a_I_dd]=Idd;                    ! Point the FST at the descriptors
+Fst[Fst$a_O_dd]=Odd;                    ! ..
+Idd[Dap$a_Nlb]=Nlb;                     ! and the Dap descriptors
+Odd[Dap$a_Nlb]=Nlb;                     ! so the rest of the code can find it
+Odd[Dap$a_Other_dd]=Idd;                ! Link the descriptors to each other
+Idd[Dap$a_Other_dd]=Odd;                ! ..
+
+DO                                      ! Loop while link remains active
+    BEGIN
+    Dap$Get_Config(Idd, FalCfg, falfab);        ! get a config message !m637
+    IF .Idd[Dap$b_Operator] EQL Dap$k_Config    ! If we got one        !m557
+    THEN
+        BEGIN
+        Dap$Put_Config( Odd, Dap$k_Buffer_Size ); ! send back one
+        Dap$Put_Message( Odd );                   ! now
+        END;
+
+    Dap$$Get_Attributes( Idd, FalFab, FalFst ); ! process attributes
+    Dap$Get_Access( Idd, FalFab, FalFst );      ! process access message
+
+    IF .Fst[Fst$v_File_Open]                    ! If access opened a file
+    THEN Dap$Get_Control( Idd );                ! Process Control Messages!m557
+    END WHILE 1
+END;                                    ! FAL
+
+GLOBAL ROUTINE fal$handle (signal_args,mech_args,enable_args) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Condition handler for requests
+!
+! FORMAL PARAMETERS:
+!
+!	SIGNAL_ARGS: addr of vector of SIGNAL arguments,
+!       MECH_ARGS: not used,
+!       ENABLE_ARGS: args passed when this handler was established
+!                    [1] Addr of FAB
+!                    [2] Addr of FST
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! COMPLETION CODES:
+!
+!	0: Resignal, 1: Continue
+!
+! SIDE EFFECTS:
+!
+!	Will UNWIND if severity is ERROR
+!
+!--
+
+BEGIN
+MAP signal_args: REF VECTOR,
+    mech_args: REF VECTOR,
+    enable_args: REF VECTOR;
+
+BIND blk=..enable_args[1]: $rab_decl;          ! RMS block
+BIND rab=(IF .blk[rab$h_bid] EQL rab$k_bid
+          THEN blk                             ! Block was a RAB
+          ELSE 0): $Rab_decl;
+BIND fab=(IF .blk[rab$h_bid] EQL fab$k_bid
+          THEN blk                             ! Block was a FAB
+          ELSE .blk[rab$a_fab]): $fab_decl;    ! Block was a RAB
+BIND rst=..enable_args[2]: $rms_rst;
+BIND fst=(IF .rst[rst$h_bid] EQL fst$k_bid
+          THEN rst
+          ELSE .rst[rst$a_fst]): $rms_fst;
+BIND nlb=.Fst[Fst$a_Nlb]: $Xpn_Nlb();
+
+LOCAL severity;
+
+severity= .(signal_args[1])<0,3>;
+
+SELECT .signal_args[1] OF
+       SET
+       [SS$_UNWIND]:
+                     BEGIN          ! Just return winningly
+                     RETURN sts$k_normal;
+                     END;
+
+       [rms$k_suc_min TO rms$k_suc_max]: severity=SS$_NORMAL;
+
+       [RMS$K_ERR_MIN TO RMS$K_ERR_MAX]:
+                     severity=SS$_ERROR;
+
+       [RMS$_EOF]:
+                     IF .Rab[Rab$h_Rsz] NEQ 0   ! If we got some data
+                     THEN
+                         BEGIN
+                         Dap$$Put (Rab, Rst, Rms$Signal);
+                         END;
+
+       [rms$k_err_min TO rms$k_err_max, rms$k_suc_min TO rms$k_suc_max]:
+                     BEGIN
+                     Usrsts=.signal_args[1];
+                     Usrstv=.signal_args[2];
+
+                     UsrErr ();         ! send a status message 
+                     END;
+
+       [xpn$$select_xpn_errors]:
+            IF NOT .severity
+            THEN
+                BEGIN
+                fst[fst$v_file_open]=fst[fst$v_access_active]=0;
+                             ! abort means it is not open any more
+                severity=sts$k_error;  ! treat as error
+                Usrsts=rms$_dcb;
+                Usrstv=.signal_args[1];
+                END;       ! Network link broken (Abort or Disconnect)
+
+       [Dap$k_Facility_Code TO Dap$k_Facility_Code + %O'7777777']: !a545vv
+                BEGIN
+                Usrsts=.signal_args[1];
+                Usrstv=.signal_args[2];
+                UsrErr();
+                END;                                               !a545^^
+
+       [OTHERWISE]:
+            BEGIN
+            Usrsts=rms$_bug;        ! should not occur
+            Usrstv=.signal_args[1]; !
+            severity=ss$_fatal;     !
+            END;
+       TES;
+
+blk[rab$h_sts]=.Usrsts;
+blk[rab$h_stv]=.Usrstv;
+
+IF .logger NEQ 0                    ! Log error message if possible
+THEN
+    BEGIN
+    LOCAL filedesc: $str_descriptor();
+    $str_desc_init(desc=filedesc, string=asciz_str(.fab[fab$a_fna]));
+    r$message(.Usrsts,.Usrstv,filedesc);
+    END;
+
+
+CASE .SEVERITY FROM 0 TO 7 OF
+     SET
+     [STS$K_ERROR]:
+            BEGIN
+            SETUNWIND();
+            mech_args[ma_return]=.Usrsts;  ! Return status code
+            RETURN 0;
+            END;
+     [STS$K_WARNING]:  
+            BEGIN
+            RETURN STS$K_NORMAL;
+            END;
+     [STS$K_NORMAL, STS$K_INFO]: RETURN STS$K_NORMAL;
+     [STS$K_FATAL,INRANGE]: ;
+     TES;
+
+SS$_RESIGNAL
+    END;			!End of FAL$HANDLE
+
+GLOBAL ROUTINE UsrErr: ExitSub =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!     Send Error status back to requestor
+!
+! IMPLICIT INPUTS:
+!
+!     UsrSts: STS value (RMS Status Code)
+!     UsrStv: STV value (Secondary Status)
+!     Rab[Rab$g_Rfa]: Record RFA number
+!     UsrRecnum: Record number
+!     UsrTxt: Descriptor for error text or 0
+!
+! COMPLETION CODE:
+!
+!     The RMS status code (contents of UsrSts)
+!
+!--
+BEGIN
+Dap$Put_Status( Odd,
+                0, ! Maccode included in miccode
+                Dap$Error_Rms_Dap( .Usrsts ),
+                .Rab[Rab$g_Rfa],
+                .Usrrecnum,
+                .Usrstv,
+                .Usrtxt );
+
+Dap$Put_Message ( Odd );                ! Force the message out now
+
+.UsrSts                                 ! Return the status code
+END;                                    ! End of UsrErr
+END ELUDOM
+   

@@ -1,0 +1,466 @@
+title	IDLKIL - kill idle jobs
+subttl	NH Samuelson, 2644, 8/10/81
+
+	search	slaunv
+	slaplg	idl
+
+idledt==^d6
+;edit date		description
+;6  10/28/81	Add countdown for errors
+;5  10/16/81	Include program name in log entry
+;4  10/15/81	Double time limits if NOT in EXEC
+;3  8/20/81	remove minimum threshold for idle time
+;2  8/20/81	use TTMSG%, not SOUT% to avoid hanging on output
+
+	.reques	sys:macrel
+
+subttl	Definitions
+
+nd maxjob,200			;128 jobs should be plenty
+nd maxerr,^d10			;10 errors before death.
+nd maxwin,10			;8 "winners" who will not be logged off.
+nd jilen,.jimax+1		;number of entries to return from GETJI
+nd txtlen,^d132			;max length of command in .ini file
+subttl	Storage
+
+zerbeg:				;start of area to clear on startup
+txtbuf:	block	<txtlen/5+1>
+atmbuf:	block	<txtlen/5+1>
+inijfn:	block	1		;jfn for ini file
+logjfn:	block	1		;jfn for log file
+numwin:	block	1		;initial aobjn counter for winners
+wintbl:	block	maxwin		;user numbers for exempt users
+curdtm:	block	1		;current date/time
+lasact:	block	maxjob		;when we last saw action on this job
+lasrtm:	block	maxjob		;run time when last active
+lgitim:	block	maxjob		;when this job logged in
+flags:	block	maxjob		;random flags
+jiblk:	block	jilen		;storage for GETJI info
+zerend==.-1			;end of area to clear on startup
+
+lim01:	^d30*nbsmin		;30 minutes till first warning
+lim02:	^d40*nbsmin		;40 minutes till logout
+limdet:	^d10*nbsmin		;10 minutes, no warning, for detached jobs
+trshld:	^d2*^d1000		;runtime threshold, two seconds
+errcnt:	maxerr			;countdown for errors
+
+dispat:	block	maxjob		;where to go to look at this job
+stak:	block	stksiz		;pdl
+
+;command state block for COMND%
+csb:	z			;flags,,no reparse
+	z	.nulio		;input jfn will be filled in
+	-1,,[asciz/IDLKIL> /]	;no control-r stuff
+	-1,,txtbuf		;start of input buffer
+	-1,,txtbuf		;next thing to parse
+	z	txtlen		;space left in buffer
+	z			;characters left in buffer
+	-1,,atmbuf		;start of atom buffer
+	z	txtlen		;size of atom buffer
+	z	jfnblk		;pointer to gtjfn block
+
+jfnblk:	block	20		;for COMND to do GTJFN
+
+subttl	initialization
+
+entvec:	jrst	go
+	jrst	go
+	vernum
+
+go:	makstk
+	reset
+	movei	t1,.fhslf	;check our capabilities
+	rpcap%
+	txnn	t3,sc%whl!sc%opr ;am I god?
+	 jrst	no.god		;no, loose
+	clearm	zerbeg		;clear everything
+	move	t1,[zerbeg,,zerbeg+1]
+	blt	t1,zerend
+	movei	t1,er.job	;assume no jobs anywere
+	movem	t1,dispat
+	move	t1,[dispat,,dispat+1] ;prepare for blt
+	blt	t1,dispat+maxjob-1
+	call	inifil		;read the initialization file
+	call	st.log		;start the log file
+	jrst	main		;go to the main loop
+
+subttl	main loop
+
+main:	gtad%			;get current date/time
+	movem	t1,curdtm
+	move	p1,[-maxjob,,1]	;setup for aobjn
+main.1:	movei	t1,(p1)		;job number to check
+	move	t2,[-jilen,,jiblk] ;where to put the data
+	clear	t3,		;get all job info
+	getji%
+	 erjmp	no.ji		;check for errors
+;we have a job here, see if it is the same as the last time
+	skipn	t1,jiblk+.jilln	;get login time
+	 jrst	no.job		;not logged in
+	camn	t1,lgitim(p1)	;compare with old data
+	jrst	@dispat(p1)	;he is idle, go see what to do.
+
+is.new:	movem	t1,lgitim(p1)
+	skipge	jiblk+.jibat	;is this a batch job?
+	 jrst	is.bat		;yes!
+	move	p2,numwin	;see if he is a winner
+	move	t1,jiblk+.jiuno	;get his user number
+	camn	t1,wintbl(p2)	;is he a winner
+	 jrst	is.win		;yes
+	aobjn	p2,.-2
+
+is.act:	move	t1,curdtm	;the job is active
+	movem	t1,lasact(p1)	;save his run time and the current time
+	move	t1,jiblk+.jirt
+	movem	t1,lasrtm(p1)
+	movei	t1,chkidl	;where to go next time
+	movem	t1,dispat(p1)
+	jrst	nxtjob
+ck.bat:	jrst	nxtjob
+ck.win:	jrst	nxtjob
+nxtjob:	aobjn	p1,main.1	;look at the next job
+main.9:	movei	t1,^d30*^d1000	;wait 30 seconds and do it again
+	disms%
+	jrst	main
+
+subttl	subroutines
+
+is.bat:	skipa	t1,[ck.bat]	;ignore all batch jobs for now
+is.win:	movei	t1,ck.win	;dont do any checking on exempt jobs
+	movem	t1,dispat(p1)
+	jrst	nxtjob
+
+chkidl:	move	t1,jiblk+.jirt	;latest run time
+	sub	t1,lasrtm(p1)	;get the change
+	camle	t1,trshld	;changed more than minimum
+	 jrst	is.act		;yes, he is active
+	move	t2,curdtm	;get current date/time
+	sub	t2,lasact(p1)	;how long idle?
+	skipge	t1,jiblk+.jitno	;get terminal number
+	 jrst	is.det		;he is detached...
+	skipn	jiblk+.jit20	;[4]skip if in exec
+	 ash	t2,-1		;[4]not exec, double the time limit
+	camg	t2,lim01	;short time?
+	 jrst	nxtjob		;yes, dont do anything yet
+	txo	t1,.ttdes	;make terminal designator for SOUT%
+	hrroi	t2,[asciz/
+
+
+Your job has been idle for a LONG time.  It will be logged out
+in a few minutes if still inactive.
+
+/]
+;;;	clearb	t3,t4
+;;;	sout%
+	ttmsg%			;force it out
+
+	hrroi	t2,[asciz/ Warn idle job /]
+	call	displa
+	movei	t1,chkkil	;change dispatch address
+	movem	t1,dispat(p1)
+	jrst	nxtjob
+
+chkkil:	move	t1,jiblk+.jirt	;latest run time
+	sub	t1,lasrtm(p1)	;get the change
+	camle	t1,trshld	;changed more than minimum
+	 jrst	is.act		;yes, he is active
+	move	t2,curdtm	;get current date/time
+	sub	t2,lasact(p1)	;how long idle?
+	skipge	t1,jiblk+.jitno	;get terminal number
+	 jrst	is.det		;he is detached...
+	skipn	jiblk+.jit20	;[4]skip if in exec
+	 ash	t2,-1		;[4]not exec, double the time limit
+	camg	t2,lim02	;too long?
+	 jrst	nxtjob		;not yet
+	txo	t1,.ttdes	;make terminal designator for SOUT%
+	hrroi	t2,[asciz/
+
+
+Your job has been idle for TOO LONG.  Goodbye.
+
+/]
+;;;	clearb	t3,t4
+;;;	sout%
+	ttmsg%
+
+	hrroi	t2,[asciz/ Kill idle job /]
+	call	displa
+kilhim:	movei	t1,(p1)		;log him off...
+	lgout%
+	 erjmp	.+1		;must ignore errors here, in case he
+				;just logged out himself...
+	movei	t1,er.job	;in case he is still there next time...
+	movem	t1,dispat(p1)
+	jrst	nxtjob
+
+is.det:	camg	t2,limdet	;too long?
+	 jrst	nxtjob		;not yet
+	hrroi	t2,[asciz/ Kill detached job /]
+	call	displa
+	jrst	kilhim		;yes...no warning, just kill him
+
+no.job:	skipn	lgitim(p1)	;do we know he is gone?
+	 jrst	nxtjob		;yes, forget it
+	clearm	lgitim(p1)
+	movei	t1,er.job
+	movem	t1,dispat(p1)
+	jrst	nxtjob
+
+displa:	hrroi	t1,txtbuf	;build string here first
+	push	p,t2		;save starting string
+	seto	t2,
+	clear	t3,
+	odtim%
+	pop	p,t2
+	sout%
+	movei	t2,(p1)		;get job #
+	movei	t3,^d10		;decimal
+	nout%
+	 jfcl
+	hrroi	t2,[asciz/ user /]
+	clear	t3,
+	sout%
+	move	t2,jiblk+.jiuno	;get user number
+	dirst%			;convert to user name
+	 erjmp	[hrroi	t2,[asciz/Unknown/]
+		sout%
+		jrst	.+1]
+
+;[5] add program name to log entry
+	hrroi	t2,[asciz/ in /]
+	sout%
+	skipn	t2,jiblk+.jipnm	;[5] use program name if any
+	 move	t2,jiblk+.jisnm	;[5] else use subsystem name
+	skipn	t2		;[5] if still none,
+	 move	t2,[sixbit/*NONE*/]
+pgm.lp:	clear	t3,
+	rotc	t2,6		;[5] bring next char into t3
+	addi	t3," "		;[5] convert sixbit to ascii
+	idpb	t3,t1
+	jumpn	t2,pgm.lp	;[5] loop over whole name
+
+do.tty:	skipge	jiblk+.jitno	;detached?
+	 jrst	no.tty
+	hrroi	t2,[asciz/ on TTY/]
+	clear	t3,
+	sout%
+	movei	t3,^d8		;octal
+	move	t2,jiblk+.jitno
+	nout%
+	 jfcl
+no.tty:	hrroi	t2,[asciz/
+/]
+	sout%
+	call	wrtlog
+	ret
+
+wrtlog:	skipn	t1,logjfn	;log file?
+	 ret			;no
+	movx	t2,<<7b5>!of%app>
+	openf%
+	 erjmp	jserr0##
+	hrroi	t2,txtbuf
+	clear	t3,
+	sout%
+	 ercal	jserr0##
+	txo	t1,co%nrj	;dont release the jfn
+	closf%
+	 erjmp	jserr0##
+	ret
+
+er.job:	tmsg	<
+%Error in IDLKIL while processing job >
+	movei	t1,.priou
+	movei	t2,(p1)
+	movei	t3,^d10
+	nout%
+	 jfcl
+	tmsg	<.   Please notify Sam
+>
+	sosl	errcnt		;count down error counter
+	 jrst	nxtjob		;still ok...
+	tmsg	<?Max error count exceeded>
+	haltf%
+	 jrst	main		;in case of continue
+
+
+die:	tmsg	<
+?Fatal error in IDLKIL initialization>
+	haltf
+	 jrst	main
+
+no.god:	tmsg	<?Wheel or Operator capability required>
+	haltf%
+	 jrst	no.god
+
+no.ji:	cain	t1,gtjix4	;no such job?
+	 jrst	no.job		;yes, clear our data
+	cain	t1,gtjix3	;invalid job number?
+	 jrst	main.9		;yes, must be thru, go sleep
+	call	jshlt0##	;tell about the error and quit
+subttl	log initialization
+
+st.log:	hrroi	t1,txtbuf
+	seto	t2,
+	clear	t3,
+	odtim%			;start with time and date
+	hrroi	t2,[asciz/ Idle Job Killer started
+  The following users are exempt: /]
+	sout%
+	move	p2,numwin
+	jrst	lg.exm
+lg.ex0:	hrroi	t2,[asciz/, /]
+	sout%
+lg.exm:	move	t2,wintbl(p2)
+	dirst%
+	 erjmp	.+1
+	aobjn	p2,lg.ex0
+	hrroi	t2,[asciz/
+/]
+	sout%
+	call	wrtlog		;write the first part to the log file
+	hrroi	t1,txtbuf
+	hrroi	t2,[asciz/  Jobs not using more than /]
+	sout%
+	move	t2,trshld	;threshold for idle time
+	idivi	t2,^d100	;convert to tenths of seconds
+	idivi	t2,^d10		;convert to seconds
+	movem	t3,p1		;save remainder
+	movei	t3,^d10
+	nout%
+	 jfcl
+	skipe	p1		;remainder non-zero?
+	 jrst	[movei	t2,"."
+		bout%
+		move	t2,p1
+		nout%
+		 jfcl
+		jrst	.+1]
+	hrroi	t2,[asciz/ seconds in /]
+	clear	t3,
+	sout%
+	move	t2,lim02	;get limit
+	idivi	t2,nbsmin	;convert back to minutes
+	movei	t3,^d10
+	nout%
+	 jfcl
+	hrroi	t2,[asciz/ minutes will be killed,
+  with detached jobs killed after /]
+	clear	t3,
+	sout%
+	move	t2,limdet
+	idivi	t2,nbsmin
+	movei	t3,^d10
+	nout%
+	 jfcl
+	hrroi	t2,[asciz/ minutes.
+Time limits are doubled if the job is in a user program, rather than the EXEC.
+
+/]
+	clear	t3,
+	sout%
+	call	wrtlog		;finish the log entry
+	ret			;all done
+
+subttl	file initialization
+
+keytbl:	n$key,,n$key
+KEY	DETACHED
+KEY	EXEMPT
+KEY	IDLE
+KEY	LOG
+KEY	THRESHOLD
+n$key==.-keytbl-1
+
+inifil:	movx	t1,<gj%sht!gj%old>
+	hrroi	t2,[asciz/system:idle-job-killer.init/]
+	gtjfn%
+	 erjmp	[tmsg	<?Cant get SYSTEM:IDLE-JOB-KILLER.INIT>
+		jrst	jshlt0##]
+	movem	t1,inijfn	;store the jfn
+	hrlm	t1,csb+.cmioj	;in the CSB also
+	movx	t2,<<7b5>!of%her!of%rd>
+	openf%			;open for read
+	 erjmp	[tmsg	<?Cant open init file>
+		jrst	jshlt0##]
+	jrst	ini.1
+ini.0:	movei	t2,[flddb. .cmcfm]
+	call	docomd
+ini.1:	movei	t2,[flddb. .cmini]
+	call	docomd
+	movei	t2,[flddb. .cmkey,,keytbl]
+	call	docomd
+	hrrz	t2,(t2)		;get dispatch address
+	jrst	(t2)		;go
+
+
+inieof:	skipg	t1,numwin	;how many winners do we have
+	 jrst	[tmsg	<?No EXEMPT users> ;must have some...
+		jrst	die]
+	movni	t1,(t1)		;make it negative for aobjn
+	hrlzm	t1,numwin
+	move	t1,inijfn
+	closf%
+	 erjmp	.+1		;ignore error on close
+	ret
+
+.IDLE:	movei	t2,[flddb.	.cmnum,,^d10]
+	call	docomd
+	caig	t2,^d15		;must be at least 15 minutes
+	 jrst	[tmsg	<IDLE time limit must be at least 15 minutes>
+		jrst	die]
+	imuli	t2,nbsmin	;convert minutes to correct form
+	movem	t2,lim02	;save as final limit
+	subi	t2,^d10*nbsmin	;warn 10 minutes earlier
+	movem	t2,lim01
+	jrst	ini.0
+
+.DETAC:	movei	t2,[flddb.	.cmnum,,^d10]
+	call	docomd
+	caig	t2,^d5		;must be at least 15 minutes
+	 jrst	[tmsg	<DETACH time limit must be at least 5 minutes>
+		jrst	die]
+	imuli	t2,nbsmin	;convert minutes to correct form
+	movem	t2,limdet	;save as new limit
+	jrst	ini.0
+
+.THRES:	movei	t2,[flddb.	.cmnum,,^d10]
+	call	docomd
+;;;	caig	t2,^d1000	;must be at least 1 second
+;;;	 jrst	[tmsg	<THRESHOLD must be at least 1000 ms>
+;;;		jrst	die]
+	caile	t2,^d60*^d1000	;not over 60 seconds
+	 jrst	[tmsg	<THRESHOLD too big>
+		jrst	die]
+	movem	t2,trshld	;store new threshold
+	jrst	ini.0
+
+.EXEMP:	movei	t2,[flddb. .cmusr]
+	call	docomd
+	aos	t1,numwin	;another winner
+	cail	t1,maxwin	;too many?
+	 jrst	[tmsg	<?Too many EXEMPT entries>
+		jrst	die]
+	movem	t2,wintbl-1(t1)	;store this user number
+	jrst	ini.0
+
+.LOG:	movei	t2,[flddb. .cmofi,,,,<system:idle-job-killer.log>]
+	call	docomd
+	movem	t2,logjfn	;save the jfn
+	jrst	ini.0
+
+docomd:	movei	t1,csb
+	comnd%
+	 erjmp	[movei	t1,.fhslf
+		geter%
+		tlz	t2,-1
+		jrst	chkerr]
+	txnn	t1,cm%nop	;parse ok?
+	 ret			;yes
+chkerr:	cain	t2,iox4		;eof?
+	 jrst	[movei	t2,[inieof]
+		ret]
+	tmsg	<?Error reading init file>
+	jrst	jshlt0##
+
+	end	<3,,entvec>

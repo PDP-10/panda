@@ -1,0 +1,107 @@
+/*
+**	SETBUF - change buffer for stream
+**
+**	(c) Copyright Ken Harrenstien 1989
+**		for all changes after v.30, 27-Oct-1987
+**	(c) Copyright Ian Macky, SRI International 1986
+**	Revised & cleaned up by KLH for new I/O ptr scheme, 1987
+**
+**	Note that for name disambiguation reasons, "setbuffer" is changed
+**	to "_setbuf" in a stdio.h preprocessor declaration.
+*/
+
+#include <stdio.h>
+#include <stdlib.h>
+
+void
+setbuf(f, buf)
+FILE *f;
+char *buf;
+{
+    setbuffer(f, buf, BUFSIZ);
+}
+
+void
+setbuffer(f, buf, size)
+FILE *f;
+char *buf;
+size_t size;
+{
+    if (buf) (void) setvbuf(f, buf, _IOFBF, size);	/* Full buffering */
+    else (void) setvbuf(f, (char *)NULL, _IONBF, 0);	/* No buffering */
+}
+
+void
+setlinebuf(f)
+FILE *f;
+{
+    if (f->siocheck != _SIOF_OPEN)
+	return;
+    if (f->sioflgs & _SIOF_DYNAMBUF)		/* If auto buffer, */
+	setvbuf(f, (char *)NULL, _IOLBF, 0);	/* just re-allocate. */
+    else						/* otherwise, */
+	setvbuf(f, f->siopbuf, _IOLBF, f->siolbuf);	/* preserve user buf */
+}
+
+/*
+ *	setvbuf - from ANSI draft (which claims it's from SYS5)
+ */
+
+int
+setvbuf(f, buf, type, size)
+FILE *f;
+char *buf;
+int type;
+size_t size;
+{
+
+    if (f->siocheck != _SIOF_OPEN)
+	return -1;			/* Bad FILE pointer */
+    fflush(f);				/* flush buffers so clean slate */
+    if (f->siopbuf && (f->sioflgs & _SIOF_DYNAMBUF))	/* If old buf was */
+	free(f->siopbuf);		/* dynamic, release it now. */
+
+    f->sioflgs &= ~(_SIOF_BUF|_SIOF_AUTOBUF|_SIOF_LINEBUF|_SIOF_DYNAMBUF);
+    f->siopbuf = NULL;
+    f->sioocnt = f->siocnt = 0;		/* force calls to fgetc/fputc */
+    switch (type) {
+	case _IONBF:			/* No buffering */
+	    return 0;			/* return successfully */
+	case _IOLBF:			/* Line buffering */
+	case _IOFBF:			/* Full buffering */
+	    break;
+	default:
+	    return -1;			/* Bad _IOxxx type argument */
+    }
+
+    if (buf == NULL) {			/* Point to user buffer? */
+	if ((f->siopbuf = malloc(BUFSIZ)) == NULL)	/* No, use own */
+	    return -1;			/* Could not allocate, stay unbuffed */
+	f->sioflgs |= _SIOF_DYNAMBUF;	/* Won, remember dynamic */
+	f->siolbuf = BUFSIZ;		/* Set size of buffer */
+    } else {
+	if (size <= 0)			/* User specified buffer, check size */
+	    return -1;			/* Bad size, fail. */
+	f->siopbuf = buf;
+	f->siolbuf = size;		/* Set size of buffer */
+    }
+#ifdef _SIOP_BITS
+    if (f->sioflgs & _SIOF_CONVERTED) {
+#ifdef _SIOP_MAXBITS		/* Enforce limit on size of converted buff */
+	if (f->siolbuf > (1<<_SIOP_MAXBITS))
+	    f->siolbuf = (1<<_SIOP_MAXBITS);
+#else					/* Ugh, painful hair */
+	register unsigned n, i;
+	i = f->siopmask = (f->siolbuf & (-f->siolbuf)) - 1;
+	for (n = 0; i; i >>= 1, n++);	/* Find # bits in mask */
+	f->siopbits = n;
+#endif
+    }
+#endif /* _SIOP_BITS */
+
+    f->sioflgs |= _SIOF_BUF;		/* Remember we are buffered */
+    if (type == _IOLBF)			/* Specify line-buffered if so */
+	f->sioflgs |= _SIOF_LINEBUF;
+    _prime(f);				/* prime stream for I/O */
+    return 0;				/* Success! */
+}

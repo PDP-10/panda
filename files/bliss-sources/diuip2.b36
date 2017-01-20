@@ -1,0 +1,661 @@
+%TITLE 'TOPS-20 IPCF Routines for DIU'
+
+MODULE DIUIP2 (
+               IDENT = '253',
+               ENTRY(
+                     ip$get_pid,        ! Get a PID for a named process
+                     ip$send,           ! Send an IPCF message
+                     ip$receive,        ! Receive an IPCF message
+                     ip$declare,        ! Declare a name for a PID
+                     ip$qtest,          ! Test for nonempty receive queue
+                     ip$quota,          ! Set send/recieve quotas
+                     ip$int_set,        ! Set up for interrupts on IPCF traffic
+                     ip$delete_PID      ! Delete a PID
+                   )
+             )=
+BEGIN
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!++
+! FACILITY:
+!   DIU-20
+!
+! ABSTRACT:
+!   This module provides the interprocess communication primitives
+!   for DIU-20.
+!
+! ENVIRONMENT:
+!   TOPS-20 user mode, XPORT.
+!
+! AUTHOR:  Larry Campbell,  CREATION DATE:  March 15, 1982
+
+! HISTORY:
+!
+!  253  Rename file to DIUIP2.
+!       Gregory A. Scott 1-Jul-86
+!
+!  133  Add call to set the IPCF send/recieve quota up for the entire job in
+!       IP$INT_SET.  Change module name to IPCF20 for DDT and GLOB.
+!       Gregory A. Scott 29-Apr-86
+!
+! MODIFIED BY: Andrew Nourse
+!
+! 03 - Make max jsys retry easier to patch and add a few comments 
+! 02 - Put in ENTRY points
+! 01 - beginning
+!--
+
+!
+! TABLE OF CONTENTS:
+!
+FORWARD ROUTINE
+    ip$get_pid,                         ! Get a PID for a named process
+    ip$send,                            ! Send an IPCF message
+    ip$receive,                         ! Receive an IPCF message
+    ip$declare,                         ! Declare a name for a PID
+    ip$qtest,                           ! Test for nonempty receive queue
+    ip$quota : NOVALUE,                 ! Set send/recieve quotas
+    ip$int_set : NOVALUE,               ! Set up for interrupts on IPCF traffic
+    ip$$jsys,                           ! Do IPCF JSYS, retry if necessary
+    ip$delete_PID : NOVALUE;            ! Delete a PID
+!
+! INCLUDE FILES:
+!
+LIBRARY 'BLI:XPORT';
+LIBRARY 'TOPS20';                       ! Monitor symbols
+LIBRARY 'DIU';
+LIBRARY 'DIUIP2';                       ! IPCF block definitions
+
+!
+! BUILTINS:
+!
+BUILTIN
+    JSYS;
+
+! 
+! EQUATED SYMBOLS:
+! 
+LITERAL
+    IP$$K_SLEEP_MSEC = 500,             ! Milliseconds to sleep between retries
+    IP$$K_MAX_RETRIES = 120;            ! How many times to retry IPCF JSYSes
+
+! OWN STORAGE:
+! 
+GLOBAL
+    retry_counter;                      ! Global retry count for failed JSYSes
+
+OWN JSYSRETRYMAX: INITIAL(IP$$K_MAX_RETRIES);   ![3] PATCHABLE
+
+! 
+! EXTERNAL REFERENCES:
+! 
+EXTERNAL ROUTINE
+    s$geterr;                           ! Return last TOPS20 error code
+
+GLOBAL ROUTINE ip$get_pid (p_name_desc, p_pid) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!  Get a PID for the named process. 
+! 
+! FORMAL PARAMETERS:
+!  p_name_desc  - pointer to descriptor for name of process
+!  p_pid        - address of word containing PID to use for the query
+! 
+! IMPLICIT INPUTS:
+!  NONE
+! 
+! IMPLICIT OUTPUTS:
+!   If the PID passed is 0, the PID assigned by the monitor
+!   is passed back to the caller.
+! 
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   The PID of the named process, or 0 if couldn't get PID. 
+! 
+! SIDE EFFECTS:
+!   NONE
+! 
+!--
+    BEGIN
+
+    BIND
+        name_desc = .p_name_desc : $STR_DESCRIPTOR(),
+        pid = .p_pid;
+
+    LOCAL
+        pdb : $$PDB_DECL,
+        packet_block : VECTOR[8],
+        packet_length;
+    ! 
+    ! If we don't have a PID yet, ask INFO to create one. 
+    ! 
+    pdb[PDB$$V_FLAGS] = 0;
+    pdb[PDB$$V_CREATE_PID] = (.pid EQL 0);
+    pdb[PDB$$G_SENDER_PID] = .pid;
+    pdb[PDB$$G_RECEIVER_PID] = 0;
+    !
+    ! Set up message for INFO
+    !
+    packet_block[$IPCI0] = $IPCIW;
+    packet_block[$IPCI1] = 0;
+    !
+    ! Copy process name to packet block - append null for ASCIZ
+    !
+    CH$COPY (.name_desc[STR$H_LENGTH], .name_desc[STR$A_POINTER],
+             0,
+             .name_desc[STR$H_LENGTH] + 1, CH$PTR (packet_block[$IPCI2]));
+    !
+    ! Set up [length,,address] of packet block
+    !
+    pdb[PDB$$H_MESSAGE_LENGTH] =
+        (.name_desc[STR$H_LENGTH]/5) + $IPCI2 + 1;
+    pdb[PDB$$H_MESSAGE_ADDRESS] = packet_block;
+    !
+    ! OK, set up JSYS args and try it
+    !
+    IF NOT ip$$jsys (MSEND_, $IPCFP + 1, pdb)
+    THEN
+        RETURN (0);
+    IF .pid EQL 0
+    THEN
+        pid = .pdb[PDB$$G_SENDER_PID];
+    !
+    ! Now try to receive reply from INFO
+    !
+    pdb[PDB$$V_FLAGS] = 0;
+    pdb[PDB$$G_SENDER_PID] = 0;
+    pdb[PDB$$G_RECEIVER_PID] = .pid;
+    pdb[PDB$$H_MESSAGE_LENGTH] = 8;
+    pdb[PDB$$H_MESSAGE_ADDRESS] = packet_block;
+    IF NOT ip$$jsys (MRECV_, $IPCFP + 1, pdb)
+    THEN
+        RETURN (0);
+    !
+    ! If any error codes set, return failure
+    !
+    IF .pdb[PDB$$V_ERROR_CODE] NEQ 0
+    THEN
+        RETURN (0);
+    !
+    ! OK, word $IPCI1 of return message should have the PID
+    !
+    RETURN (.packet_block[$IPCI1])
+    END;                                ! End of get_pid
+
+GLOBAL ROUTINE ip$send (dstpid, p_srcpid, message_address, message_length) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Send an IPCF message, page mode.
+!
+! FORMAL PARAMETERS:
+!   dstpid              - PID of destination
+!   p_srcpid            - pointer to PID of source
+!   message_address     - address of message
+!   message_length      - length of message in words
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   1,3                 - success, message sent (3 if retries required)
+!   code,,0             - failure, code is TOPS-20 error code
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+    BEGIN
+
+    BIND
+        srcpid = .p_srcpid;
+
+    LOCAL
+	pdb : $$PDB_DECL,               ! Packet descriptor block
+        retcode;
+
+    pdb[PDB$$V_FLAGS] = 0;
+    pdb[PDB$$V_CREATE_PID] = (.srcpid EQL 0);
+    pdb[PDB$$V_PAGE_MODE] = .message_length EQL 512;
+    pdb[PDB$$G_SENDER_PID] = .srcpid;
+    pdb[PDB$$G_RECEIVER_PID] = .dstpid;
+    IF .pdb[PDB$$V_PAGE_MODE]
+    THEN
+        pdb[PDB$$H_MESSAGE_ADDRESS] = .message_address ^ -9
+    ELSE
+        pdb[PDB$$H_MESSAGE_ADDRESS] = .message_address;
+    pdb[PDB$$H_MESSAGE_LENGTH] = .message_length;
+    IF NOT (retcode = ip$$jsys (MSEND_,
+                                %FIELDEXPAND (PDB$$H_MESSAGE_LENGTH, 0) + 1,
+                                pdb))
+    THEN
+        RETURN (.retcode)
+    ELSE
+        BEGIN
+        IF .srcpid EQL 0
+        THEN
+            srcpid = .pdb[PDB$$G_SENDER_PID];
+        RETURN (DIU$_NORMAL)
+        END
+    END;                                ! End of ip$send
+
+GLOBAL ROUTINE ip$receive (p_pid, p_pdb, pdb_length) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Receive an IPCF packet.  If the message length is 512, then we
+!   unmap the page if necessary before receiving into it.
+!
+! FORMAL PARAMETERS:
+!   p_pid               - pointer to PID to receive on
+!   p_pdb               - address of packet descriptor block
+!   pdb_length          - length of packet descriptor block
+!
+! IMPLICIT INPUTS:
+!   The caller must set the following PDB field:
+!       PDB$$H_MESSAGE_ADDRESS  - address where message will go
+!       PDB$$H_MESSAGE_LENGTH   - length of message buffer
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   DIU$_NORMAL         - success, got only message in queue
+!   DIU$_MORE           - success, more messages still in queue
+!   code,,0             - failure, code = TOPS-20 error code
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+    BEGIN
+
+    BIND
+        pid = .p_pid,
+        pdb = .p_pdb : $$PDB_DECL;
+
+    REGISTER
+        ac1 = 1,
+        ac2 = 2,
+        ac3 = 3;
+
+    LOCAL
+        temp_pdb : VECTOR [$IPCFP + 3],
+        retcode,
+        page_mode;
+    !
+    ! First we need to sniff at the pending PDB to see if it is going
+    ! to be page mode or not.  Get a piece of the pending PDB.
+    !
+    temp_pdb[0] = $MUQRY;
+    temp_pdb[1] = .pid;
+    IF NOT (retcode = ip$$jsys (MUTIL_, $IPCFP + 3, temp_pdb))
+    THEN
+        RETURN (.retcode);
+    !
+    ! See if length of pending message is 512.
+    !
+    page_mode = (.temp_pdb[1] AND IP_CFV) NEQ 0;
+    IF .page_mode
+    THEN
+        BEGIN
+        !
+        ! Page mode receive.  Check page access bits to see if it needs
+        ! to be unmapped.
+        !
+        ac1<lh> = $FHSLF;
+        ac1<rh> = .pdb[PDB$$H_MESSAGE_ADDRESS] ^ -9;
+        JSYS (0, RPACS_, ac1, ac2);
+        !
+        ! If page exists, unmap it.
+        !
+        IF (.ac2 AND PA_PEX) NEQ 0
+        THEN
+            BEGIN
+            ac1 = -1;
+            ac2<lh> = $FHSLF;
+            ac2<rh> = .pdb[PDB$$H_MESSAGE_ADDRESS] ^ -9;
+            ac3 = 0;
+            JSYS (0, PMAP_, ac1, ac2, ac3)
+            END;
+        END;
+    pdb[PDB$$V_FLAGS] = 0;
+    pdb[PDB$$V_PAGE_MODE] = .page_mode;
+    IF .page_mode
+    THEN
+        pdb[PDB$$H_MESSAGE_ADDRESS] = .pdb[PDB$$H_MESSAGE_ADDRESS] ^ -9;
+    pdb[PDB$$G_RECEIVER_PID] = .pid;
+    ac1 = .pdb_length;
+    ac2 = pdb;
+    IF NOT JSYS (-1, MRECV_, ac1, ac2)
+    THEN
+        RETURN (.ac1 ^ 18);
+    IF .ac1 EQL 0
+    THEN
+        RETURN (DIU$_NORMAL)
+    ELSE
+        RETURN (DIU$_MORE)
+    END;                                ! End of ip$receive
+
+GLOBAL ROUTINE ip$declare (p_name_desc, p_pid) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Declare a name for my PID.
+!
+! FORMAL PARAMETERS:
+!   p_name_desc         - pointer to descriptor of name string
+!   p_pid               - pointer to PID
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   If PID is 0, it is filled in with the PID the monitor assigns.
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   1           - success
+!   code,,0     - failure, code is TOPS-20 error code or INFO magic number
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+    BEGIN
+
+    BIND
+        name_desc = .p_name_desc : $STR_DESCRIPTOR (),
+        pid = .p_pid;
+
+    LOCAL
+	pdb : $$PDB_DECL,               ! Packet descriptor block
+        packet : VECTOR[8],             ! Packet
+        retcode;
+
+    pdb[PDB$$V_FLAGS] = 0;
+    pdb[PDB$$V_CREATE_PID] = (.pid EQL 0);
+    pdb[PDB$$G_SENDER_PID] = .pid;
+    pdb[PDB$$G_RECEIVER_PID] = 0;       ! [SYSTEM]INFO
+    !
+    ! Init packet and copy name string to it
+    !
+    packet[$IPCI0] = $IPCII;            ! Assign name to PID function
+    packet[$IPCI1] = 0;
+    !
+    ! Copy string and append null for ASCIZ
+    !
+    CH$COPY (.name_desc[STR$H_LENGTH], .name_desc[STR$A_POINTER],
+             0,
+             .name_desc[STR$H_LENGTH] + 1, CH$PTR (packet[$IPCI2]));
+    pdb[PDB$$H_MESSAGE_ADDRESS] = packet;
+    pdb[PDB$$H_MESSAGE_LENGTH] = $IPCI2 + (.name_desc[STR$H_LENGTH]/5) + 1;
+    IF NOT (retcode = ip$$jsys (MSEND_, $IPCFP + 1, pdb))
+    THEN
+        RETURN (.retcode);
+    !
+    ! If the monitor assigned a PID, pass the PID assigned back to caller.
+    !
+    IF .pid EQL 0
+    THEN
+        pid = .pdb[PDB$$G_SENDER_PID];
+    !
+    ! Set up to receive reply from INFO
+    !
+    pdb[PDB$$V_FLAGS] = 0;
+    pdb[PDB$$G_SENDER_PID] = 0;
+    pdb[PDB$$G_RECEIVER_PID] = .pid;
+    pdb[PDB$$H_MESSAGE_LENGTH] = 8;
+    pdb[PDB$$H_MESSAGE_ADDRESS] = packet;
+    IF NOT (retcode = ip$$jsys (MRECV_, $IPCFP + 1, pdb))
+    THEN
+        RETURN (.retcode);
+    !
+    ! If any error codes set, return failure
+    !
+    IF (retcode = .pdb[PDB$$V_ERROR_CODE]) NEQ 0
+    THEN
+        RETURN (.retcode ^ 18);
+    !
+    ! Everything worked, return success
+    !
+    RETURN (DIU$_NORMAL)
+    END;                                ! End of ip$declare
+
+GLOBAL ROUTINE ip$qtest (pid) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Test to see if the receive queue for a given PID is nonempty.
+!
+! FORMAL PARAMETERS:
+!   pid         - PID to test
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   1           - queue is nonempty
+!   0           - queue is empty
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+    BEGIN
+
+    REGISTER
+        ac1 = 1,
+        ac2 = 2;
+
+    LOCAL
+        temp_pdb : VECTOR [$IPCFP + 3];
+
+    IF .pid EQL 0
+    THEN
+        RETURN (0);
+    temp_pdb[0] = $MUQRY;
+    temp_pdb[1] = .pid;
+    ac1 = $IPCFP + 3;
+    ac2 = temp_pdb;
+    IF NOT JSYS (-1, MUTIL_, ac1, ac2)
+    THEN
+        IF (.ac1 EQL IPCFX2)
+        THEN
+            RETURN (0)
+        ELSE
+            SIGNAL (DIU$_BUG, .ac1)
+    ELSE
+        RETURN (1)
+    END;                                ! End of ip$qtest
+
+GLOBAL ROUTINE ip$quota (pid, squota, rquota) : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!       Sets the IPCF send and recieve quotas for the specified PID
+!
+! FORMAL PARAMETERS:
+!       pid: pid to get interrupted for
+!       channel: interrupt channel
+!
+!--
+    BEGIN
+
+    LOCAL
+        mutil_argblk : VECTOR [3];
+
+    REGISTER
+        ac1 = 1,
+        ac2 = 2;
+
+! First set the send/recieve quotas to 777
+
+    ac1 = 3;                            ! Length of argument block
+    ac2 = mutil_argblk;                 ! argument block address
+    mutil_argblk[0] = $MUSSQ;           ! Set send/rec quotas
+    mutil_argblk[1] = .pid;             ! PID to set for
+    mutil_argblk[2] = (.squota)^9+.rquota;      ! Load the quotas
+    JSYS (-1, MUTIL_, ac1, ac2);        ! Do the function, ignore errors
+
+    END;                                ! End of ip$int_set
+
+GLOBAL ROUTINE ip$int_set (pid, channel) : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!       Enable interrupts for IPCF traffic on a given PID.
+!
+! FORMAL PARAMETERS:
+!       pid: pid to get interrupted for
+!       channel: interrupt channel
+!
+!--
+    BEGIN
+
+    LOCAL
+        mutil_argblk : VECTOR [3];
+
+    REGISTER
+        ac1 = 1,
+        ac2 = 2;
+
+    ac1 = 3;                            ! Length of argument block
+    ac2 = mutil_argblk;                 ! argument block address
+    mutil_argblk[0] = $MUPIC;           ! Set interrupt channel function
+    mutil_argblk[1] = .pid;             ! PID to set for
+    mutil_argblk[2] = .channel;         ! Channel to interrupt on
+    JSYS (-1, MUTIL_, ac1, ac2);        ! Shake it shake it baby don't break it
+
+    END;                                ! End of ip$int_set
+
+ROUTINE ip$$jsys (jsys_num, arg1, arg2) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Do an IPCF JSYS, retrying for certain error codes.
+!
+! FORMAL PARAMETERS:
+!   jsys_num            - JSYS number
+!   arg1                - contents of AC1
+!   arg2                - contents of AC2
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   1                   - Unconditional success
+!   3                   - Success, but retries were necessary
+!   code,,0             - Failure, code = TOPS-20 error code
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+    BEGIN
+
+    REGISTER
+        ac1 = 1,
+        ac2 = 2;
+
+    ac1 = .arg1;
+    ac2 = .arg2;
+    IF JSYS (-1, .jsys_num, ac1, ac2)
+    THEN
+        RETURN (1);                     ! Immediate win
+    !
+    ! See if retries warranted.
+    !
+    INCR retry_count FROM 0 TO .JSYSRETRYMAX ![3] Make retry max patchable
+    DO
+        BEGIN
+        SELECTONE .ac1 OF
+            SET
+            [IPCFX2,                    ! No message for this PID
+             IPCFX6,                    ! Send quota exceeded
+             IPCFX7,                    ! Receiver quota exceeded
+             IPCFX8,                    ! IPCF free space exhausted
+             IPCF12,                    ! No free PIDs available
+             IPCF19] :                  ! No PID for [SYSTEM]INFO
+                BEGIN
+                ac1 = IP$$K_SLEEP_MSEC; ! Sleep for a while
+                JSYS (-1, DISMS_, ac1); !  and hope resources free up
+                END;
+            [OTHERWISE] : RETURN (.ac1 ^ 18);
+            TES;
+        ac1 = .arg1;
+        ac2 = .arg2;
+        IF JSYS (-1, .jsys_num, ac1, ac2)
+        THEN
+            BEGIN
+            retry_counter = .retry_counter + .retry_count;
+            RETURN (3)
+            END
+        END;
+    RETURN (s$geterr ($FHSLF) ^ 18)     ! Retried but no luck
+    END;                                ! End of ip$$jsys
+
+GLOBAL ROUTINE ip$delete_PID (pid) : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Delete a PID.
+!
+! FORMAL PARAMETERS:
+!   pid         - the PID to delete
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   NONE
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+    BEGIN
+
+    REGISTER
+        ac1 = 1,
+        ac2 = 2;
+
+    LOCAL
+        argblk : VECTOR [2];
+
+    IF .pid EQL 0
+    THEN
+        RETURN;
+    ac1 = 2;
+    ac2 = argblk;
+    argblk[0] = $MUDES;
+    argblk[1] = .pid;
+    JSYS (-1, MUTIL_, ac1, ac2);
+
+    END;                                ! End of ip$delete_PID
+
+END                                     ! End of module
+ELUDOM

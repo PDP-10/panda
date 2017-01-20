@@ -1,0 +1,240 @@
+
+.subtitle	main body
+.library	/sys$library:lib.mlb/
+.psect	code,exe,nowrt
+
+	.entry smtpfork,^m<>
+
+.page
+start:	$create	fab = smtpfab			;create the file
+	blbs	r0,10$
+	jmp	rmserr				;signal an rms error
+10$:	$connect rab = smtprab			;connect to record stream
+	blbs	r0,20$
+	jmp	rmserr				;signal an rms error
+20$:	bsbw	mapfil				;make sure necessary files are mapped
+	bsbw	rmain				;in a future release we
+	$disconnect rab = smtprab		;disconnect from record stream
+	$close fab = smtpfab			;close the file
+	$erase fab = smtpfab			;erase the file
+	ret					;will add sending service
+
+
+
+
+rmain::	clrb	f.nic				;nickname flag
+	clrb	f.helo				;helo cmd flag
+	clrb	f.mail				;mail cmd flag
+	clrb	f.rcpt				;rcpt cmd flag
+	clrb	f.lcl				;local mail flag
+	clrb	f.del				;delivery options flag
+	clrb	f.kwn				;known site flag
+	clrb	f.rly				;relay site flag
+	clrb	f.data				;data cmd flag
+	clrb	f.quit				;quit cmd flag
+	clrb	f.err				;processing error flag
+
+	bsbw	opnp				;open a passive connection
+	bsbw	info				;get info on this connection
+	bsbw	setup				;say we are ready
+10$:	bsbw	getcmd				;get a cmd
+	bsbw	parse				;check out the command
+	tstb	f.quit				;have we received the quit cmd?
+	beql	10$				;no so get the next cmd
+	rsb
+
+
+.page
+;	Assign a TCP/IP channel.  Open a passive TCP/IP connection.
+
+opnp::	$assign_s devnam = port,-		;assign the network device
+		  chan	 = pchan
+	blbs	r0,10$				;did we get the assignment?
+	jmp	rmserr				;die on error
+10$:	$qiow_s chan	= pchan,-		;execute a network command
+		iosb	= piosb,-		;Save the status and para
+		func	= #tcp$open,-		;Open a connection
+		p1	= #wild,-		;any host
+		p2	= #wild,-		;any foreign port
+		p3	= #smtp,- 		;local port smtp
+		p4	= #passive,- 		;connection mode 
+		p5	= #page,-		;buffer size
+		p6	= #timout		;time out after x seconds
+	blbs	r0,20$				;check if we queued the call
+	jmp	rmserr				;die on error
+20$:	blbs	piosb,30$			;check the success of the call	
+	movzwl	piosb,r0			;show the problem
+	jmp	tcperr				;die on error
+30$:	movl	pioex,lcid			;save the local connection
+	rsb
+
+.page
+;	Get information on who has opened our connection.
+
+info::	$qiow_s chan	= pchan,-		;execute a network command
+		iosb	= piosb,-		;Save the status and para
+		func	= #tcp$info,-		;who we are talking too
+		p1	= fhnasz,-		;put it in info buffer
+		p2	= #inbufsz,-		;info buffer size
+		p3	= lcid	 		;local port 
+	blbs	r0,20$				;check if we queued the call
+	jmp	rmserr				;die on error
+20$:	blbs	piosb,30$			;check the success of the call	
+	movzwl	piosb,r0			;show the problem
+	jmp	tcperr				;die on error
+30$:	rsb
+
+
+.page
+;	Send some information to the TCP/IP connection.
+;	The information is in mbuf
+;	R7 is the size of the buffer
+
+snd::	$qiow_s chan	= pchan,-		;Send a packet to the port
+		iosb	= piosb,-		;Save the status and count
+		func	= #tcp$send,-		;send to the foreign host
+		p1	= mbuf	,-		;buffer for the info
+		p2	= r7,-			;size of the buffer
+		p3	= lcid,-		;local port
+		p4	= #7,-			;local tag
+		p5	= #1,-			;eol flag
+		p6	= #1			;urgent flag
+	blbs	r0,10$				;check if we queued the call
+	jmp	rmserr				;die on error
+10$:	blbs	piosb,20$			;check the success of the call	
+	jmp	tcperr				;die on error
+20$:	pushr	#^m<r1,r2,r3,r4,r5,r6,r7,r8,r9>
+	movzbw	r7,smtprab+rab$w_rsz		;store the size
+	$put	rab = smtprab			;output the text
+	popr	#^m<r1,r2,r3,r4,r5,r6,r7,r8,r9>
+	rsb
+
+.page
+;	Read from the tcp/ip connection until a either a <crlf> has been
+;	sent (success) or until we have reached the maximum buffer size
+;	(error).
+
+getcmd::moval	mbuf,r8				;point to the start the buffer
+	clrl	r7				;zero a counter
+10$:	bsbw	read				;read from the buffer
+	addw2	piolen,r7			;add how much we read
+	addw2	r7,r8				;bump up the pointer
+	matchc	#1,#cr,r7,mbuf			;end on a cr
+	beql	25$				;or if the buffer is over 	
+	cmpw	r7,#page			;size of mbuf
+	blss	10$				;if less do another read
+25$:	movw	r7,piolen			;store actual size read
+	
+;	Don't pass a line that starts with a crlf (remove them)
+
+	cmpw	piolen,#2			;test for a blank line
+	bleq	30$				;pass a blank line
+	moval	mbuf,r2				;point to the start of the buffer
+	cmpb	#cr,(r2)+			;starting cr?
+	bneq	30$				;if so remove it
+	decw	piolen				;bump the count
+	movc3	piolen,(r2),mbuf		;shift the characters
+	moval	mbuf,r2				;point to the start of the buffer
+	cmpb	#lf,(r2)+			;starting lf?
+	bneq	30$				;if so remove it
+	decw	piolen				;bump the count
+	movc3	piolen,(r2),mbuf		;shift the characters
+30$:	rsb
+
+
+.page
+;	Read data from the tcp/ip connection.  Remove any parity bits.
+;	R8 is the pointer to the location to store the information read.
+
+read::	$qiow_s chan	= pchan,-		;Read a packet from the port
+		iosb	= piosb,-		;Save the status and count
+		func	= #tcp$receive,-	;receive from the foreign host
+		p1	= (r8),-		;buffer for the info
+		p2	= #page,-		;size of the buffer
+		p3	= lcid			;local port
+	blbs	r0,10$				;check if we queued the call
+	jmp	rmserr				;die on error
+10$:	blbs	piosb,20$			;check the success of the call	
+	movzwl	piosb,r0			;show the problem
+	jmp	tcperr				;die on error
+
+;	Remove any existing parity.
+
+20$:	movzwl	piolen,r3			;set up a counter
+	movl	r8,r2				;start with what we just read in
+30$:	mcomb	#parity,r1			;set up the parity complement
+	bicb2	r1,(r2)+			;do it and point to the next ch
+	sobgtr	r3,30$				;get the next if any
+	pushr	#^m<r1,r2,r3,r4,r5,r6,r7,r8,r9>
+	movzbw	piolen,smtprab+rab$w_rsz		;store the size
+	movc3	smtprab+rab$w_rsz,(r8),mbuf	;get the text
+	$put	rab = smtprab			;output the text
+	popr	#^m<r1,r2,r3,r4,r5,r6,r7,r8,r9>
+	rsb
+
+.page
+;	Close the tcp/ip connection.  This currently fails. (I don't
+;	know why.)  So ignore tcp/ip error.
+
+close::	$qiow_s chan	= pchan,-		;execute a network command
+		iosb	= piosb,-		;Save the status and para
+		func	= #tcp$close,-		;Close a connection
+		p1	= lcid			;local port id
+	blbs	r0,10$				;check if we queued the call
+	jmp	rmserr				;die on error
+10$:	rsb					;ignore the tcp/ip status
+
+
+
+.page
+.psect dat,noexe,wrt,long
+
+	;	Version information
+
+vmajor::.ascii	/1/				;major version 1
+	.byte	46				;period
+vminor::.ascii	/0/				;minor version 0
+vend	==	.-vmajor
+
+
+.page
+;	Supported SMTP command table.  The table structure is as follows:
+;	The first byte of the table contains the number of commands.
+;	The following lines contain an ascii counted string of a command (up case)
+;	Following each command is a execution routine address for that cmd.
+
+cmdtbl::.byte	14				;11 cmds supported/3 unsupported
+	.ascic	/HELO/				;Hello cmd
+	.address rhelo
+	.ascic	/MAIL/				;Mail cmd
+	.address rmail
+	.ascic	/RCPT/				;Receipt cmd
+	.address rrcpt
+	.ascic	/DATA/				;Data cmd
+	.address rdata
+	.ascic	/RSET/				;Reset cmd
+	.address rrset
+	.ascic	/HELP/				;Help cmd
+	.address rhelp
+	.ascic	/NOOP/				;Noop cmd 
+	.address rnoop
+	.ascic	/QUIT/				;Quit cmd
+	.address rquit
+	.ascic	/SEND/				;Send cmd
+	.address rsend				
+	.ascic	/SOML/				;Send or Mail cmd
+	.address rsoml				
+	.ascic	/SAML/				;Send and Mail cmd
+	.address rsaml				
+
+;	This ends the currently supported commands.  Smtp commands not
+;	supported in this version include:
+
+	.ascic	/EXPN/				;Expand list cmd
+	.address unsup				
+	.ascic	/VRFY/				;Verify user cmd
+	.address unsup				
+	.ascic	/TURN/				;Exchange send/receive roles
+	.address unsup				
+
+.end smtpfork

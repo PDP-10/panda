@@ -1,0 +1,401 @@
+
+MODULE DAPSAI (	! Extract access info from node ID, or put it in
+		IDENT = '3(665)'
+                %BLISS36(,
+                    ENTRY(
+                          D$SetAi, ! Nodeid with access info -> NLB
+                          D$JfnAi, ! JFN -> node user pass acct
+                          D$FspAi, ! Filespec -> node user pass acct
+                          D$NamAi  ! Fill access info into NAM block
+                          ))
+		) =
+BEGIN
+
+!
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1981, 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+
+!++
+! FACILITY: 
+!
+! ABSTRACT:
+!
+!
+! ENVIRONMENT:
+!
+! AUTHOR:	Andrew Nourse
+!
+! 665        - Repair D$NAMAI not to blank fill.
+! 577        - Put in D$JfnAi, & extract D$FspAi from D$SetAi
+! 571        - Put in D$NamAi, add D$ prefix to Setai, remove SetaiF
+! 511  03    - Ext addr fix
+!      02    - Handle TOPS-20 format
+!      01    - Write these routines to parse VMS-format network filespecs
+!--
+!
+! TABLE OF CONTENTS:
+!
+
+FORWARD ROUTINE
+        D$SetAi: NOVALUE,
+        D$JfnAi: NOVALUE,
+        D$FspAi: NOVALUE,
+        D$NamAi: NOVALUE;
+
+!
+! INCLUDE FILES:
+!
+REQUIRE 'RMSREQ';
+REQUIRE 'rmsosd';				! OS-dependent definitions
+LIBRARY 'BLISSNET';
+!LIBRARY 'BLI:XPORT';
+
+!
+! MACROS:
+!
+MACRO Descriptor_Length[]=Fixed_Desc_Len %;
+
+
+
+MACRO Allocate_Descriptor[]=
+       (LOCAL Desc: REF $Str_Descriptor(%REMAINING);
+        $Xpo_Get_Mem(Units=Descriptor_Length(%REMAINING),
+                     Result=Desc,
+                     Fill=0);
+        $Str_Desc_Init(%REMAINING, Descriptor=.Desc);
+        .Desc) %;
+
+MACRO Allocated_Descriptor[]=Allocate_Descriptor(%REMAINING):
+                            $Str_Descriptor(%REMAINING) %;
+
+!
+! EQUATED SYMBOLS:
+!
+
+LITERAL
+        Fixed_Desc_Len = Str$k_F_Bln ,        ! Length of a fixed descriptor
+	Dynamic_Desc_Len = Str$k_D_Bln ,      ! Length of a dynamic descriptor
+	Bounded_Desc_Len = Str$k_B_Bln ,      ! Length of a bounded descriptor
+	Dynamic_Bounded_Desc_Len = Str$k_Db_Bln ; ! dynamic bounded descriptor
+
+!
+! THERE SHALL BE NO OWN STORAGE
+! However XPORT declares many things OWN that are really pure
+
+PSECT OWN=$HIGH$;
+
+OWN Space: $Str_Descriptor( String=' ');
+OWN Quote: $Str_Descriptor( String='"');
+
+GLOBAL ROUTINE D$Setai (
+                        P_Nlb: REF $Xpn_Nlb(),
+                        P_Fab: REF $Fab_decl
+                        ) : NOVALUE = 
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Extract the nodename and access info (if any) from a network filespec
+!       and stuff it into the NLB
+!
+! FORMAL PARAMETERS:
+!
+!	P_Nlb: Addr of NLB
+!       P_Fab: Addr of FAB for remote filespec
+!
+! IMPLICIT INPUTS:
+!
+!       UserJfn: JFN for filespec, or 0
+!
+! SIDE EFFECTS:
+!
+!	STRING DESCRIPTORS WILL BE ALLOCATED FOR NODE, USERID, PASSWORD
+!       ACCOUNT, & OPTIONAL DATA IF PRESENT IN NODEID
+!
+!--
+
+    BEGIN
+
+    BIND Fab=.P_Fab: $Fab_Decl,
+         Nlb=.P_Nlb: $Xpn_Nlb();
+
+    BIND
+	Nodeid=Allocated_Descriptor(Class=Fixed),
+	Userid= Allocated_Descriptor(Class=Fixed),
+	Password= Allocated_Descriptor(Class=Fixed),
+	Account=Allocated_Descriptor(Class=Fixed),
+        Optional= Allocated_Descriptor(Class=Fixed);
+
+    LOCAL Nodespec: $Str_Descriptor(Class=Bounded); 		       ![2]
+    LOCAL
+        fnaptr;                         ! Byte pointer to filespec     ![2]
+
+    Nlb[Nlb$a_Node_Name]=Nodeid;
+    Nlb[Nlb$a_User_Id]=Userid;
+    Nlb[Nlb$a_Password]=Password;
+    Nlb[Nlb$a_Account]=Account;
+    Nlb[Nlb$a_Optional]=Optional;
+
+    !
+    ! Get pointer to filespec and make it a byte pointer if necessary. ![2]
+    ! Handle both a straight address, and a -1,,address (as well as bp)
+    !
+
+    fnaptr=UAPointer(.fab[fab$a_fna]);                                  ![3]
+
+%IF %BLISS(BLISS36)
+%THEN %IF %SWITCHES(TOPS20)
+%THEN
+    !
+    ! See if we got a TOPS-20-format remote filespec	       ![2]
+    !
+    IF .UserJfn EQL 0
+    THEN
+        BEGIN
+        LOCAL jfn;
+        IF Gtjfn( Gj_Sht, .fnaptr; jfn ) NEQ 0
+        THEN RlJfn ( .jfn )
+        ELSE IF .jfn EQL  Gjfx55
+        THEN IF Gtjfn (Gj_Sht+Gj_Ofg, .fnaptr; jfn)
+             THEN UserJfn = .jfn<rh>;
+        END;
+
+    !
+    ! If we have a JFN, use it
+    !
+    IF (.UserJfn NEQ 0) AND (.UserJfn LSS %O'600000')
+    THEN RETURN D$JfnAi( .UserJfn, Nodeid, Userid, Password, Account );
+
+%FI
+%FI ! End TOPS-20-specific code
+
+
+    $Str_Desc_Init(Descriptor=Nodespec, Class=Bounded,
+                   String=Asciz_Str(.fnaptr));
+
+    D$FspAi( NodeSpec, Nodeid, Userid, Password, Account, Optional );
+    END;			!End of D$SETAI
+
+%IF %SWITCHES(TOPS20)
+%THEN
+GLOBAL ROUTINE D$JfnAi( Jfn,                            ! JFN
+                        P_nodeid: REF $Str_Descriptor(),  ! Desc for nodeid
+                        P_userid: REF $Str_Descriptor(),  ! Desc for userid
+                        P_password: REF $Str_Descriptor(),! Desc for password
+                        P_account: REF $Str_Descriptor()  ! Desc for account
+                      ) : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Extract the nodename and access info (if any) from a JFN
+!       and return it in the descriptors provided
+!
+! FORMAL PARAMETERS:
+!
+!       Jfn: JFN for remote file
+!       P_nodeid: Descr for remote nodeid or 0
+!       P_userid: Descr for remote userid or 0
+!       P_password: Descr for remote password or 0
+!       P_account: Descr for remote account or 0
+!
+! SIDE EFFECTS:
+!
+!       The descriptors (p_nodeid ... p_account) are changed to DYNAMIC
+!--
+BEGIN
+LOCAL jfnsbuff: VECTOR[CH$ALLOCATION(40)];
+LOCAL jptr: INITIAL(CH$PTR(jfnsbuff));
+
+! Change the descriptors to dynamic
+$Str_Desc_Init(Desc=.P_nodeid, Class=Dynamic);
+$Str_Desc_Init(Desc=.P_userid, Class=Dynamic);
+$Str_Desc_Init(Desc=.P_password, Class=Dynamic);
+$Str_Desc_Init(Desc=.P_account, Class=Dynamic);
+
+Jfns(.jptr, .UserJfn,Js_Nod);
+IF .P_Nodeid NEQ 0
+THEN $Str_Copy(String=Asciz_Str(.jptr), Target=.P_nodeid);
+
+Jfns(.jptr, .UserJfn,Js_At1,Pp('USERID'));
+IF .P_UserId NEQ 0
+THEN $Str_Copy(String=Asciz_Str(.jptr), Target=.P_Userid);
+
+Jfns(.jptr, .UserJfn,Js_At1,Pp('PASSWORD'));
+IF .P_Password NEQ 0
+THEN $Str_Copy(String=Asciz_Str(.jptr), Target=.P_password);
+
+Jfns(.jptr, .UserJfn,Js_At1,Pp('CHARGE'));
+IF .P_Account NEQ 0
+THEN $Str_Copy(String=Asciz_Str(.jptr), Target=.P_account);
+
+RETURN;
+END;
+%ELSE ! No such thing on TOPS-10
+GLOBAL ROUTINE D$JfnAi : NOVALUE = ;
+%FI
+
+GLOBAL ROUTINE D$FspAi( P_Filespec,
+                        P_Nodeid, P_UserId, P_Password, P_Account, P_Optional
+                        ) : NOVALUE =
+    !
+    ! Handle VMS-format network filespec
+    ! 
+
+    BEGIN
+    BIND Filespec=.P_Filespec: $Str_Descriptor();
+    BIND Nodeid=.P_Nodeid: $Str_Descriptor();
+    BIND Userid=.P_Userid: $Str_Descriptor();
+    BIND Password=.P_Password: $Str_Descriptor();
+    BIND Account=.P_Account: $Str_Descriptor();
+    BIND Optional=.P_Optional: $Str_Descriptor();
+    LOCAL d;
+
+    $Str_Scan( Remainder=Filespec, Stop='":', Delimiter=D,
+               Substring=Filespec );
+
+    IF Nodeid NEQ 0
+    THEN $Str_Desc_Init( Descriptor=Nodeid, String=Filespec );            !d577
+
+    IF .d EQL %C'"'
+    THEN
+        BEGIN
+        $Str_Scan( Remainder=Filespec, Span='"', Substring=Filespec );
+        $Str_Scan( Remainder=Filespec, Stop='" ', Delimiter=d,
+                   Substring=Filespec );
+        IF Userid NEQ 0
+        THEN $Str_Desc_Init( Descriptor=Userid, String=Filespec );        !m577
+
+        IF .d EQL %C' '
+        THEN
+            BEGIN
+            $Str_Scan( Remainder=Filespec, Span=' ', Substring=Filespec );
+            $Str_Scan( Remainder=Filespec, Stop='" ', Delimiter=d,
+                      Substring=Filespec );
+
+            IF Password NEQ 0
+            THEN $Str_Desc_Init( Descriptor=Password, String=Filespec );  !m577
+
+            IF .D EQL %C' '
+            THEN
+                BEGIN
+                $Str_Scan( Remainder=Filespec, Span=' ',Substring=Filespec );
+                $Str_Scan( Remainder=Filespec, Stop='" ', Delimiter=d,
+                          Substring=Filespec );
+
+                IF Account NEQ 0                                         !m600
+                THEN $Str_Desc_Init( Descriptor=Account, String=Filespec );
+
+                IF .D EQL %C' '
+                THEN
+                    BEGIN
+                    $Str_Scan( Remainder=Filespec, Span=' ',
+                               Substring=Filespec );
+                    $Str_Scan( Remainder=Filespec, Stop='" ', Delimiter=D,
+                               Substring=Filespec );
+
+                    IF Optional NEQ 0
+                    THEN $Str_Desc_Init( Descriptor=Optional,
+                                         String=Filespec );               !m577
+                    END;
+                END;
+            END;
+        END;
+    END;
+
+GLOBAL ROUTINE D$NamAi (
+                          P_Nam: REF $Nam_decl,
+                          P_Nodeid: REF $Str_Descriptor(),
+                          P_Userid: REF $Str_Descriptor(),
+                          P_Password: REF $Str_Descriptor(),
+                          P_Account: REF $Str_Descriptor()
+                          ) : NOVALUE  =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Extract the nodename and access info (if any) from NLB
+!       and stuff it into the NAM block pointed to by the FAB
+!
+! FORMAL PARAMETERS:
+!
+!       P_Nam: Addr of NAM block for remote filespec
+!       P_Nodeid: Descr for remote nodeid
+!       P_Userid: Descr for remote userid
+!       P_Password: Descr for remote password
+!       P_Account: Descr for remote account
+!--
+BEGIN
+BIND Nam = .P_Nam: $Nam_decl;                                          !m575
+BIND Nodeid=.P_Nodeid: $Str_Descriptor();
+BIND Userid=.P_Userid: $Str_Descriptor();
+BIND Password=.P_Password: $Str_Descriptor();
+BIND Account=.P_Account: $Str_Descriptor();
+LOCAL edesc: $Str_Descriptor( Class=Bounded );
+LITERAL ebuffsize = 6 + 1 + 39 + 1 + 39 + 1 + 39 + 1 + 2 ;
+LOCAL ebuff: VECTOR[CH$ALLOCATION(ebuffsize)];
+REGISTER donttouchmethere=6;  ! Kludge for compiler bug    !a571
+donttouchmethere=.donttouchmethere;                        !a571
+
+IF (Nam EQL 0)
+THEN RETURN;
+
+IF .Nam[Nam$h_Bid] NEQ Nam$k_Bid ! Is it a name block           !a575
+THEN UserError( Rms$_Nam );      ! no. complain
+
+IF .Nam[Nam$h_Bln] NEQ Nam$k_Bln ! Is name block right length?    !m575
+THEN RETURN;                     ! No. ignore it. (error breaks FTS)
+
+IF .Nam[Nam$b_Node] NEQ  0       ! Fill in node only if needed !a545
+THEN RETURN;
+
+$Str_Desc_Init( Desc=edesc, Class=Bounded,
+                String=(ebuffsize, CH$PTR(ebuff)) );
+
+$Str_Copy( String=Nodeid, Target=edesc );
+
+IF .Userid[Str$h_Length] NEQ 0
+THEN
+    BEGIN
+    $Str_Append( String=Quote, Target=edesc );
+    $Str_Append( String=UserId, Target=edesc );
+    $Str_Append( String=Space, Target=edesc );
+    IF .Nam[Nam$v_Pwd]          ! Really include password
+    THEN $Str_Append( String=Password, Target=edesc )
+    ELSE $Str_Append( String='password', Target=edesc );
+    $Str_Append( String=Space, Target=edesc );
+    $Str_Append( String=Account, Target=edesc );
+    $Str_Append( String=Quote, Target=edesc );
+    END;
+
+$Str_Append( String='::', Target=edesc );                                 !a575
+Nam[Nam$b_Node]=.edesc[Str$h_Length];
+
+IF .nam[NAM$H_RSS] NEQ 0
+THEN $STR_COPY (STRING = edesc,
+                TARGET = (MIN (.nam[NAM$H_RSS], .nam[NAM$B_NODE]),
+                          UAPOINTER (.nam[NAM$A_RSA])));
+
+IF .nam[NAM$H_ESS] NEQ 0
+THEN $STR_COPY (STRING = edesc,
+                TARGET = (MIN (.nam[NAM$H_ESS], .nam[NAM$B_NODE]),
+                          UAPOINTER (.nam[NAM$A_ESA])));
+END;
+
+
+END				!End of module
+ELUDOM
+   

@@ -1,0 +1,313 @@
+;;; -*- Lisp -*-
+;;;
+;;; **********************************************************************
+;;; This code was written as part of the Spice Lisp project at
+;;; Carnegie-Mellon University, and has been placed in the public domain.
+;;; If you want to use this code or any part of Spice Lisp, please contact
+;;; Scott Fahlman (FAHLMAN@CMUC). 
+;;; **********************************************************************
+;;;
+;;; Spice Lisp Function Stepper
+;;;    these functions are part of the standard Spice Lisp environment.
+;;;
+;;; Written by Jim Large
+;;;
+;;; Maintained by Steven Handerson
+;;;
+;;; **********************************************************************
+
+(in-package 'lisp)
+
+(export '(step *step-print-level* *step-print-length* *terminal-line-mode*))
+
+(proclaim '(special
+	    *evalhook*			;function which subs for eval
+	    Step-state		        ;On, off (aborted), or sleeping
+	    step-indentation-level	;# of spaces to indent step output
+	    ))
+
+(defvar *step-print-level* 4
+  "*Print-level* is bound to this when stepper prints forms.")
+
+(defvar *step-print-length* 5
+  "*Print-length* is bound to this when stepper prints forms.")
+
+(defvar *max-step-indentation* 40
+  "The maximum number of spaces that step output may be indented.")
+
+(defvar *terminal-line-mode* nil
+  "When nil, step will not require a terminating end-of-line for commands.")
+
+(defvar *old-tlm* nil
+  "Used by Step-get-char to see if *terminal-line-mode* has been toggled.
+   A kludge.")
+
+(defvar step-state nil
+  "Step's memory.  Nil means off, T means on. A list of functions is a
+  search list.  A non-symbol means step is asleep.")
+
+(defvar step-indentation-level 0
+  "Makes the step facilities prinout nicer.")
+
+(eval-when (compile eval)
+  (defmacro step-off-p ()
+    '(null step-state))
+
+  (defmacro step-on-p ()
+    '(eq step-state t))
+
+  (defmacro awaken-stepper ()
+    '(setq step-state t
+	   *evalhook* #'step-command-loop
+	   step-indentation-level 0))
+
+  (defmacro abort-stepper ()
+    '(setq step-state nil))
+
+  (defmacro sleep-stepper (&optional (functions 0))
+    `(setq step-state ,functions
+	   *evalhook* #'step-command-loop
+	   step-indentation-level 0))
+
+  (defmacro step-search-list ()
+    `(and (listp step-state) step-state))
+
+  )
+
+(eval-when (compile load eval)
+  (defmacro with-terminal-modes (stream modelist &rest body)
+    (let ((tm (gensym)))
+      `(let ((,tm (get-terminal-modes ,stream)))
+	 (unwind-protect
+	   (progn (set-terminal-modes ,stream ,@modelist)
+		  ,@body)
+	   (apply #'set-terminal-modes ,stream ,tm))))))
+
+
+
+;;; Flushes whitespace.
+(eval-when (compile load eval)
+  (defmacro step-get-char-CR ()
+    `(do ((char (read-char *terminal-io*) (read-char *terminal-io*)))
+	 ((not (member char '(#\return #\linefeed)))
+	  char))))
+
+(defmacro step-get-char ()
+  `(cond (*terminal-line-mode*
+	  (unless *old-tlm* (setq *old-tlm* t)
+	    (set-terminal-modes *terminal-io* :pass-all nil))
+	  (step-get-char-CR))
+	 (t
+	  (when *old-tlm* (setq *old-tlm* nil)
+	    (set-terminal-modes *terminal-io* :pass-all t))
+	  (clear-input *terminal-io*)
+	  (prog1 (read-char *terminal-io*)
+		 (terpri)))))
+
+(defmacro step-step-form (form environment)
+  `(let* ((results (multiple-value-list
+	   (apply #'evalhook ,form #'step-command-loop () ,environment))))
+     (step-print-values results)
+     (values-list results)))
+
+(defmacro step-eval-form (form environment)
+  `(let ((results
+	  (multiple-value-list
+	   (apply #'*eval ,form ,environment))))
+     (step-print-values results)
+     (values-list results)))
+
+;;; Step-Help
+
+;;; Step help is called to print a help message on the console.
+(defun step-help ()
+  (princ "
+
+Commands are single characters.  If you don't like (linmode nil), then
+(setq *terminal-line-mode* t).
+
+ N (next)    also space	    evaluate current expression in step mode.
+ S (skip)    CR, tab           ''      ''        ''     without stepping.
+ M (macro)		    steps a macroexpansion, signaled by a :: prompt.
+ Q (quit)    linefeed       finish evaluation, but turn stepper off.
+ p (print)   (lowercase-p)  print current exp.
+			      (ignore *step-print-level* & *step-print-length*)
+ P	     (uppercase-P)  pretty-print current exp.
+ B (break)		    enter break loop.
+ E (eval)		    evaluate an arbitrary expression,
+			      in the current environment.
+ ? (help)		    print this text.
+ R (return)		    prompt for an arbitrary value to return
+			      as result of current exp.
+ G			    throw to top level.
+
+" *standard-output*))
+;;; Step-Print
+
+;;; Step-print is called to print a form according to the current indentation
+;;;  level, and according to *step-print-level* and *step-print-length*.
+
+(defun step-print (form)
+  (do ((*print-level* *step-print-level*)
+       (*print-length* *step-print-length*)
+       (i (min step-indentation-level *max-step-indentation*)
+	  (1- i)))
+      ((zerop i) (prin1 form *standard-output*))
+    (princ " " *standard-output*)))
+
+
+;;; Step-print-values is called to print a list of values which were returned
+;;;  from an evaluation.
+
+(defun step-print-values (value-list)
+  (fresh-line *standard-output*)		;In case of prints.
+  (if (not (null value-list)) (step-print (car value-list)))
+  (do ((*print-level* *step-print-level*)
+       (*print-length* *step-print-length*)
+       (vlist (cdr value-list) (cdr vlist)))
+      ((null vlist) (terpri *standard-output*))
+    (princ "  " *standard-output*)
+    (prin1 (car vlist) *standard-output*)))
+
+
+
+
+
+;;; Step-Command-Loop
+;;;
+;;; Step-command-loop is a substitute for *eval.  It prints the form, and
+;;;  then enters a command loop.  The commands are read as single characters
+;;;  from the terminal.  If the stepper has subsequently been turned off,
+;;;  do the equivalent of the s command without printing.
+
+(defun step-command-loop (form &rest environment)
+  (cond
+   ;; If aborted, just eval it.
+   ((step-off-p)
+    (apply #'*eval form environment))
+   ((or (step-on-p)
+	(and (listp form)
+	     (member (car form) (step-search-list))))
+    ;;Otherwise, bind indent level, print form, and enter command loop.
+    (let ((step-indentation-level (1+ step-indentation-level)))
+      (cond ((or (symbolp form)
+		 (constantp form))	  ;Could be quoted.
+	     (step-print form)
+	     (princ " = " *standard-output*)
+	     (prog1
+	      (prin1 (apply #'*eval form environment) *standard-output*)
+	      (terpri *standard-output*)))
+	    (t (prog ()
+		TOP
+		 (step-print form)
+		NO-PRINT
+		 (if (and (listp form) (atom (car form))
+			  (macro-function (car form)))
+		     (princ " :: " *standard-output*)	;Notify the user for
+                                                        ; expansion.
+		     (princ " : " *standard-output*))
+		NO-PROMPT
+		 (case (step-get-char)
+		   ((#\m #\M)
+		    (return (step-step-form form environment)))
+		   ((#\n #\N #\space)
+		    (cond ((and (listp form) (atom (car form))
+				(macro-function (car form)))
+			   (setq form
+				 (macroexpand form environment))
+			   (go TOP))
+			  (t (return
+			      (step-step-form form environment)))))
+		   ((#\s #\S #\return #\tab)
+		    (return (step-eval-form form environment)))
+		   ((#\q #\Q #\linefeed)
+		    (abort-stepper)
+		    (return (apply #'*eval form environment)))
+		   ((#\p) (prin1 form *standard-output*) (go NO-PRINT))
+		   ((#\P) (pprint form *standard-output*) (go NO-PRINT))
+		   ((#\b #\B) (break "Step") (terpri *standard-output*))
+		   ((#\e #\E)
+		    (princ "eval: " *query-io*)
+		    (with-terminal-modes
+		      *terminal-io* (:pass-all nil)
+		      (let ((*evalhook* ()))
+			(prin1 (apply #'*eval (read *query-io*) environment)
+			       *standard-output*)
+			(terpri *standard-output*))))
+		   ((#\?) (step-help))
+		   ((#\r #\R)
+		    (princ "return: " *standard-output*)
+		    (with-terminal-modes
+		      *terminal-io* (:pass-all nil)
+		      (let* ((*evalhook* ())
+			     (results (multiple-value-list
+				       (apply #'*eval (read) environment))))
+			(step-print-values results)
+			(return (values-list results)))))
+		   ((#\g #\G) (throw 'top-level-catcher ()))
+		   (T (princ "Type ? for help. " *standard-output*)
+		      (clear-input *standard-input*)
+		      (go NO-PROMPT)))
+		 (go TOP))))))
+   ;; Haven't found one yet.
+   (t (apply #'evalhook form #'step-command-loop () environment))))
+
+
+
+;;; Step
+
+;;; Nice to know, but not an error.
+(defun step-parse-functions (list)
+  "Picks out functions from the list, and tells the user about those that 
+weren't."
+  (do* ((list list (Cdr list))
+	(functions ())
+	(non-functions ()))
+       ((null list)
+	(if non-functions
+	    (format *error-output* "Non-functions ignored - ~S" non-functions))
+	functions)
+    (if (and (symbolp (car list))
+	     (fboundp (Car list)))
+	(setq functions (cons (car list) functions))
+	(setq non-functions (cons (car list) non-functions)))))
+
+
+;;; (Step form) is a special form which  "invokes the stepper".
+;;; If no form, set up the stepper for being turned on inside a break loop.
+;;; If form is T, turn the stepper on,
+;;;           (),  ''  ''     ''   off,
+;;; (step &rest functions) looks for any of the functions and steps on them.
+;;;
+
+(macro step (form)
+  "With arg T or (), turns stepper on or off.  (Step) at top-level
+  lets a (step t) in a break loop turn on stepping globally.  With a
+  list of functions, turns on stepping when any are called.
+  Otherwise, the arg is evaled with stepper bound on.  If T,
+  *terminal-line-mode* causes step to wait for a return after a
+  command."
+  `(internal-step ',(cdr form)))
+
+(Defun internal-step (forms)
+  "With arg T or (), turns stepper on or off.  (Step) at top-level lets
+  a (step t) in a break loop turn on stepping globally.  With a list of 
+  functions, turns on stepping when any are called.  Otherwise, the arg
+  is evaled with stepper bound on."
+  (condition-bind ((() #'(lambda (&rest ignore)
+			    (unless *old-tlm* (setq *old-tlm* t)
+				    (set-terminal-modes
+				     *terminal-io* :pass-all nil))
+			    nil)))
+    (with-terminal-modes *terminal-io* (:pass-all t)
+      (cond ((null forms) (sleep-stepper) T)
+	    ((equal forms '(nil)) (abort-stepper) nil)
+	    ((equal forms '(t)) (awaken-stepper) T)
+	    ((symbolp (car forms))			;Check if function
+	     (let ((functions (step-parse-functions forms)))
+	       (sleep-stepper functions)
+	       functions))
+	    (T (let ((*evalhook* #'step-command-loop)
+		     (step-state t)
+		     (step-indentation-level 0))
+		 (eval (car forms))))))))

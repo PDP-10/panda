@@ -1,0 +1,1430 @@
+	Title	VMAIL - MMAILR / TOPS-20 Mail-11 Listener
+	Subttl	LCampbell/GStevens/DDyer-Bennet/MDLyons/JHTorrey/PLBudne/MRCrispin
+	Search Macsym,Monsym
+	.require Sys:Macrel
+	Sall
+	.directive Flblst
+	.TEXT "/SYMSEG:PSECT:.LOW."
+	.text "/NOINITIAL"
+	.text "VMAIL/SAVE"
+IFNDEF OT%822,OT%822==:1
+
+; This  program  is  derived  from   the  VMAIL  distributed  on   the
+; "integration tools tape".  It listens  on DECnet object 27 for  mail
+; from the VMS MAIL Utility.  When a VMS user says "MAIL NODE::USER" A
+; connection is established then and there, and text is sent one  line
+; at a time.  A problem is that this server is single thread, and  one
+; VMS user can  tie up  the port,  making all  other mail  to the  '20
+; fail!!
+
+; Another interesting problem is that there  may be no reply path  for
+; mail.  I had thought of taking the VMAILR program and hacking it  to
+; be the delivery agent for a #Special domain.  At BU we run  software
+; tools mail on most VMS systems, so this is not a problem.
+
+IFNDEF FTRCVD,FTRCVD==1		;INCLUDE RECIEVED: HEADER
+IFNDEF MBXF,MBXF==1		;MMAILBOX INTERFACE
+
+T1==1
+T2==2
+T3==3
+T4==4
+T5==5
+P1==6
+P2==7
+P3==10
+P4==11
+P5==12
+Ptr==13				;Global Byte Pointer To Receive Mail
+Cnt==14				;Global Byte Count For Same
+Cx==16
+P==17
+
+.ver==7
+.mvr==1
+.edt==^D83
+
+	Loc 137
+	Exp <.ver>B11+<.mvr>B17+1B18+.edt
+	Reloc
+
+Define Jerr(String),<
+	Xlist
+	IFJER.
+	  Hrroi T1,[Asciz /VMAIL error: /]
+	  Esout
+	  Hrroi T1,[Asciz /String/]
+	  Psout
+	  Hrroi T1,[Asciz / because: /]
+	  Psout
+	  Movx T1,.priou
+	  Hrloi T2,.fhslf
+	  Erstr
+	   Erjmp .+2
+	   Erjmp .+1
+	  Call Dtstmp	;; Log This Lossage Also
+	  Log <String>
+	  Log < Because: >
+	  Move T1,LogJFN
+	  Hrloi T2,.fhslf
+	  Erstr
+	   Erjmp .+2
+	   Erjmp .+1
+	  Jrst Fatal
+	ENDIF.
+	List
+>
+
+Define Log(String),<		;; Put Message Into Log File
+	Xlist
+	Hrroi T1,[Asciz \String\] ;; So It Can Type Slashes
+	Call Logmsg
+	List
+>
+
+Define Debug(String),<
+	Skipn Dbugsw
+	IFSKP.
+	  Hrroi T1,[Asciz /String/]
+	  Psout
+	ENDIF.
+>
+
+Define Debstr(String),<
+	Skipn Dbugsw
+	IFSKP.
+	  Hrroi T1,String
+	  Psout
+	ENDIF.
+>
+
+Define Clrbuf(bufnam,Buflen),<
+	Setzm Bufnam
+	Move  T1,[Bufnam,,Bufnam+1]
+	Blt   T1,Bufnam+buflen-1
+>
+
+Define Nchar,<
+	Move T1,NetJFN
+	Bin
+	Move T1,T2
+>
+
+Define Nrecord(Buffer,Nchar),<
+	Move  T1,NetJFN
+	Hrroi T2,Buffer
+	Movni T3,Nchar
+	Setz  T4,
+	Sinr
+	 Jerr <SINR failed at Nrecord>
+>
+
+Define Vaxsuccess,<
+	Move  T1,NetJFN
+	Hrroi T2,[Ascii//]
+	Movei T3,-4
+	Setz  T4,
+	Soutr
+>
+
+Define Vaxerr(Errmsg),<
+	Move  T1,NetJFN
+	Hrroi T2,[Ascii//]
+	Movei T3,-4
+	Setz  T4,
+	Soutr
+
+	Move  T1,NetJFN
+	Hrroi T2,[Asciz /Errmsg/]
+	Setzb T3,T4
+	Sout
+
+	Hrroi T2,Atmbuf
+	Setzb T3,T4
+	Sout
+
+	Hrroi T2,[Asciz/ At Node /]
+	Setzb T3,T4
+	Sout
+
+	Hrroi T2,ournam
+	Setzb T3,T4
+	Soutr			; force string transmission
+
+	Hrroi T2,[0]
+	Movei T3,-1
+	Setz  T4,
+	Soutr
+>
+
+Define Die(String),<		;; Fatal Internal Error
+	Xlist
+	Jrst [  Hrroi T1,[Asciz /VMAIL fatal internal error: /]
+		Esout
+		Hrroi T1,[Asciz /String/]
+		Psout
+		Hrroi T1,[Asciz /
+/]
+		Psout
+		Call Dtstmp	;; Time Stamp It
+		Hrroi T1,[Asciz /Fatal error: /]
+		Call Logmsg
+		Hrroi T1,[Asciz /String/]
+		Call Logmsg
+		Jrst Fatal]
+	List
+>
+
+Define Herald(Ver,Edt),<
+	Xlist
+;	Tmsg <VMAIL version Ver(Edt) running>
+	Hrroi T1,[Asciz /VMAIL version Ver(Edt) running/]
+	Call Logmsg
+	List
+>
+
+Define Log(String),<
+	Xlist
+	Hrroi T1,[Asciz \String\]
+	Call Logmsg
+	List
+>
+
+;Storage
+Tmplen==500			; Temporary Storage
+Natmbf==^D5000			; Length Of Atom Buffer In Words
+MAXRCP==^D500			; Maximum number of recipients
+FFSIZ==10000			; Length of free space in words
+Bbflen==300000			;[154] Length Of Big Mail Buffer
+Nfrmbf==70			; Length Of Sender Name Buffer
+Timen==^D<10*60*1000>		; Milliseconds Before Sender Declared Tardy
+Stklen==200			; Size Of Stack
+
+Dbugsw:	0			; -1 If Debug
+Atmbuf:	Block Natmbf		; Atom Buffer
+Subbuf:	Block Natmbf		; Subject Buffer
+Toocnt:	Block 1			; Count of recipients per line in TOOBUF
+Tooptr:	Block 1			; Pointer to current position in TOOBUF
+Toobuf:	Block Natmbf		; To Names Buffer
+FREPTR:	BLOCK 1			; Pointer into free space
+Ulist:	Block MAXRCP+1		; Where To Store Mailbox Directory Numbers
+Frmbuf:	Block Nfrmbf		; Where To Put Sender'S Name Plus Host
+Frmnam:	Block Nfrmbf		; Where To Put Sender'S Name
+Ournam:	Block 2			; Our Host Name
+Hstnam:	Block 2			; Host name we are sending to
+Usrnum:	Block 1			; User number we are sending to
+MYPID:	BLOCK 1			;[BUDD] OUR IPCF PID
+BUFFER:	BLOCK 10		;[BUDD] IPCF BUFFER
+IPCBLK:	BLOCK 4			;[BUDD] IPCF DESCR BLOCK
+OURJOB:	BLOCK 1			;[BUDD] OUR JOB NUMBER
+QUEJFN:	BLOCK 1			;[BUDD] MMAILR QUEUE JFN
+Filnam:	Block 1			;[BUDD] File name for MMAILR QUEUE FILE
+Temp1:	Block Tmplen
+Temp2:	Block Tmplen
+Stack:	Block Stklen		; One Stack For Each Fork
+NetJFN:	Block 1			; Network File JFN
+LogJFN:	Block 1			; Log File JFN
+LOGP:	BLOCK 1			; Non-zero if keeping logs
+Ntime:	Block 1			; Time Receipt Of Mail Initiated (For Status)
+Elptim:	Block 1			; Elapsed Time For Receipt Of Mail
+Kepliv:	Block 1			; Keep alive count for dead mans timer
+Bytcnt:	Block 1			; Length Of Mail In Bytes
+Capenb:	Block 1			; Saved Capabilities
+
+IFN MBXF,<
+MBXFRK:	BLOCK 1			; MMailbox fork
+>;IFN MBXF
+
+Pc1:	Block 1			; Pc Save Location For Psi Level
+Pc2:	Block 1
+Pc3:	Block 1
+Levtab:	Pc1
+	Pc2
+	Pc3
+Chntab:	2,,Conect		; Connect Initiate On Level 2
+	1,,Timout		; Timeout Psi On Level 1
+	Xlist			; Nothing Else
+	Repeat ^d34,<Exp 0>
+	List
+
+VMAIL::	Reset
+	Move P,[-Stklen,,Stack]
+	SETZM MBXFRK
+	GJINF			;[BUDD]
+	Movem T3,OurJob		;[BUDD]
+
+	Movx T1,.ndgln		; Get Local Node Name Function
+	Move T2,[Point 7,Ournam]
+	Movem T2,1(P)		; Put Pointer On Stack
+	Movei T2,1(P)		; And Point To It
+	Node			; Get Node Name
+	ifjer.
+	  tmsg <?No DECnet in this monitor>
+	  haltf%
+	endif.
+
+IFN MBXF,SETZM MBXFRK
+
+	Movx T1,.fhslf		; This Process
+	Move T2,[Levtab,,Chntab]
+	Sir			; Init Psi System
+	Eir
+	Call Opnlog		; Open Log File
+	Movem T1,LogJFN		; Save JFN
+	Call Dtstmp		; Time Stamp It
+	Herald \.ver,\.edt
+	Log< on node >
+;	Tmsg < on node >
+;	Hrroi T1,Ournam
+;	Psout
+;	Tmsg <
+;>
+	Hrroi T1,Ournam
+	Call Logmsg
+VMAIL0:	Call Opnlsn		; Open Connection And Set Interrupt Up
+	Move T1,LogJFN		; Close Log File For Perusers
+	Closf
+	 Erjmp .+1
+	Wait			; For Connect Initiate
+
+;Here When Connection Initiated
+
+Conect:	Move P,[-Stklen,,Stack]	; Reset Stack
+	Call Timeit		; Time This Guy
+	Call Opnlog		; Open Log File
+	Movem T1,LogJFN
+	Call Dtstmp		; Time Stamp This Transaction
+	Log <----Connect from >
+	Debug <----Connect from >
+	Call T4nhst		; Type Foreign Host Name At Log File
+
+	Clrbuf Subbuf,Natmbf
+
+	Move  T1,NetJFN		; Accept Connection
+	Movx  T2,.mocc
+	Setzb T3,T4		; No Additional Data
+	Mtopr
+	 Jerr <Couldn't accept net connection>
+Conct1:	Move  T1,NetJFN		; Get network link status
+	Movei T2,.morls
+	Mtopr
+	 Jerr <Couldn't get link status>
+	TXNE	T3,MO%ABT	; [154] Has the link been aborted?
+	  JRST	DMPLNK		; [154]   Yes, get rid of it.
+	Txne  T3,Mo%con		; Skip if link not connected
+	Jrst  Conct2
+	Movei T1,^D1000		; Wait a second and try again
+	Disms
+	Jrst  Conct1
+
+Conct2:	Movx T1,.hpelp		; Elapsed Time Since System Startup
+	Hptim			; Snarf It
+	 Jerr <HPTIM failed>
+	Movem T1,Ntime		; Remember Time This Reception Started
+	Call Parse		; Parse The Mail
+	 Jrst Errxit		; Failed, Quit Now
+	Call Dtstmp		; Time Stamp Log
+	Log <Message from >
+	Hrroi T1,Frmbuf		; Sender'S Name
+	Call Logmsg		; Log It
+	Log < received >
+	Call Lstats		; Log Statistics
+	Call Mailit		; Send The Mail Off
+	 Die <Failure returned from MAILIT>
+
+Errxit:	Call Clznet		; Close And Reopen Net Link
+	Call Cncltm		; Cancel Timeout Request
+	Call Dtstmp
+	Log <----Connection closed>
+	Move T1,LogJFN
+	Closf			; Close Log File For Perusers
+	 Erjmp .+1
+	Debrk			; Return To Background
+
+; Parse Mail Received.  Place Sender Name In Frmbuf, Recipient Directory
+; Numbers In Ulist, Terminated With A Zero Entry
+; Headers Must Appear In The Following Order.
+;			From, To, Cc
+; Returns +1: Failure
+;	  +2: Success
+;
+;PROGRAM FLOW DESCRIPTION NOT ALL ITEMS IN FLOW ARE IN THIS ROUTINE BUT
+;IT DOES REPRESENT THE PROCEDURE TO SEND TO A VAX WHICH IS WHY IT IS
+;INCLUDED HERE
+;
+;	RECEIVE FROM FIELD FROM VAX
+;	PARSE FROM FIELD CONVERTING IT TO MS TYPE FIELD IN FRMBUF
+;	REPEAT UNTIL NULL RECEIVED
+;	:  RECEIVE A RECIPIENT NAME FOR VERIFICATION
+;	:  IF NULL RECEIVED
+;	:  :  THEN
+;	:  :  :  EXIT REPEAT LOOP
+;	:  ENDIF
+;	:  PARSE USER NAME AND NODE
+;	:  IF NODE SAME AS THIS NODE
+;	:  :  THEN
+;	:  :  :  IF USER IS ON THIS SYSTEM
+;	:  :  :  :  THEN
+;	:  :  :  :  :  SEND SUCCESS CODE TO VAX
+;	:  :  :  :  :  PUT USER NUMBER INTO ULIST
+;	:  :  :  :  ELSE
+;	:  :  :  :  :  SEND FAILURE CODE TO VAX
+;	:  :  :  :  :  SEND ERROR MESSAGE TO VAX
+;	:  :  :  :  :  SEND NULL TERMINATING ERROR MESSAGE TO VAX
+;	:  :  :  :  :  RETURN FROM ROUTINE
+;	:  :  :  ENDIF
+;	:  :  ELSE
+;	:  :  :  SEND SUCCESS TO VAX (MESSAGE WILL BE QUEUED)
+;	:  :  :  PUT -1 INTO ULIST
+;	:  :  :  PUT NODE NAME INTO NODLST
+;	:  ENDIF
+;	END REPEAT
+;	RECEIVE TO FIELD FROM VAX
+;	PARSE TO FIELD CONVERTING IT TO MS TYPE FIELD IN TOOBUF
+;	RECEIVE SUBJECT FIELD FROM VAX
+;	BEGIN FORMATING MESSAGE INTO MS TYPE MESSAGE
+;	REPEAT UNTIL NULL RECEIVED
+;	:  RECEIVE A LINE FROM VAX
+;	:  IF NULL RECEIVED
+;	:  :  THEN
+;	:  :  :  EXIT REPEAT LOOP
+;	:  ENDIF
+;	:  OUTPUT TO MS MESSAGE BUFFER
+;	END REPEAT
+;	REPEAT UNTIL NULL DETECTED
+;	:  GET FIRST ITEM IN ULIST
+;	:  IF FIRST ITEM IN ULIST = -1
+;	:  :  THEN
+;	:  :  :  GET NODE FROM NODLST
+;	:  :  :  PUT MAIL INTO FILE FOR DMAILR
+;	:  :  :  SET FLAG IN DECNET-FLAGS SO FILE GETS SENT
+;	:  :  ELSE
+;	:  :  :  PUT MAIL INTO USERS MAIL FILE
+;	:  :  :  SPLAT OBNOXIOUS MESSAGE ACCRESS USERS SCREEN
+;	:  ENDIF
+;	:  IF NO ERROR
+;	:  :  THEN
+;	:  :  :  SEND POSITIVE ACKNOWLEDGEMENT TO VAX
+;	:  :  ELSE
+;	:  :  :  SEND NEGATIVE ACKNOWLEDGEMENT TO VAX
+;	:  :  :  SEND ERROR MESSAGE TO VAX
+;	:  :  :  SEND NULL TERMINATOR TO VAX
+;	:  ENDIF
+;	END REPEAT
+;	RETURN +2
+
+Parse:	Clrbuf Frmnam,Nfrmbf
+
+	Move  T1,NetJFN			; Save It
+	Movei T2,.morss			; Read Max Record Size
+	Mtopr
+	  Jerr <Couldn't read max record size>	; This could fail...
+
+	Nrecord <Frmnam>,<Nfrmbf*5-1>	; Read From Field
+
+	Hrroi T1,Temp1			; Setup Default Host
+	Hrroi T2,Hstnam
+	Setzb T3,T4
+	Sout
+	Hrroi T1,Frmbuf			;Parse from field, results to FRMBUF
+	Move  T2,[Point 7,Frmnam]
+	Call  Prsnam
+
+	Setzm Toobuf		; Clear first location of TOOBUF
+	Hrroi T1,Toobuf		; Setup pointer to TOOBUF
+	Movem T1,Tooptr
+	Movei T1,3		; Setup count of recipients per line in TOOBUF
+	Movem T1,Toocnt
+	MOVEI T1,FREE		; Get pointer to free space
+	MOVEM T1,FREPTR		; initialize free space
+	Movsi P1,-MAXRCP		; Maximum Of MAXRCP Names In List
+
+Parse3:	Clrbuf Atmbuf,Natmbf	; Clear receive area
+	Nrecord <Atmbuf>,<Natmbf*5-1> ; Receive recipient from VAX
+	Aos   Kepliv		; Increment keep alive count
+	Skipn Atmbuf		; Skip if not end of list
+	Jrst  Parse6		;   End of recipient list
+	Call  Prsusr		; Parse recipient
+	 Jrst [ Call Dtstmp		; None Found, Complain
+		Vaxerr <%Network mail error: No such user >
+		Log <%Network mail error: No such user >
+		Hrroi T1,Atmbuf		; Also Log Losing Name
+		CallRet Logmsg]
+	Movem T1,Ulist(P1)	; Save number returned for mailing
+	Vaxsuccess		; Send VAX the success code
+	Aobjn P1,Parse3		; Jump if not too many recipients
+
+	Call Dtstmp		; Woops, Too Many
+	Hrroi T1,Atmbuf		; Also Tell Log File
+	CallRet Logmsg
+
+Parse6:	Setzm Ulist(P1)		; Tie Off Recipient List
+
+;
+; Now Get Mailed To Field With Node Name And Subject
+;
+
+	Clrbuf Atmbuf,Natmbf
+	Nrecord <Atmbuf>,<Natmbf*5-1>
+	Nrecord <Subbuf>,<Natmbf*5-1>
+
+; Now Conbine It All Into Bigbuf
+
+	Setzm Bytcnt
+	Hrroi T1,Bigbuf
+IFN FTRCVD,<			;[BUDD]
+	Hrroi T2,[Asciz /Received: from /] ;[BUDD] now, write Received line
+	Setz T3,		;[BUDD]
+	SOUT			;[BUDD]
+	Hrroi T2,HSTNAM		;[BUDD]
+	SOUT			;[BUDD]
+	HRROI T2,[ASCIZ ' by ']	;[BUDD]
+	SOUT			;[BUDD]
+	HRROI T2,OURNAM		;[BUDD]
+	SOUT			;[BUDD]
+	Hrroi T2,[Asciz ' using MAIL-11 '] ;[BUDD]
+	SOUT			;[BUDD]
+	Seto T2,		;[BUDD] output current date/time
+	MovX T3,OT%DAY!OT%SPA!OT%TMZ!OT%SCL!OT%822
+	ODTIM			;[BUDD] RFC 822 standard date
+	 JERR <ODTIM in recieved line failed> ;[BUDD]
+	Hrroi T2,CRLF0		;[BUDD]
+	Setz T3,		;[BUDD]
+	SOUT			;[BUDD]
+> ;IFN FTRCVD
+	Hrroi T2,[Asciz /Date: /]
+	Setz T3,
+	Sout
+	Seto  T2,
+	MovX T3,OT%DAY!OT%SPA!OT%TMZ!OT%SCL!OT%822
+	Odtim
+	 Jerr <Couldn't get current date-time at PARSE6+n>
+
+	Hrroi T2,[Asciz/
+From: /]
+	Setz T3,
+	Sout
+
+	Hrroi T2,Frmbuf
+	Setz T3,
+	Sout
+
+	Hrroi T2,[Asciz/
+To: /]
+	Setzb T3,T4
+	Sout
+
+	Hrroi T2,Toobuf
+	Setzb T3,T4
+	Sout
+
+	Hrroi T2,[Asciz/
+Subject: /]
+	Setzb T3,T4
+	Sout
+
+	Hrroi T2,Subbuf
+	Setzb T3,T4
+	Sout
+
+	Hrroi T2,[Asciz/
+Mailed-to: /]			;[BUDD]
+	Setzb T3,T4
+	Sout
+
+	Hrroi T2,Atmbuf
+	Setz T3,
+	Sout
+
+	Hrroi T2,CRLF0
+	SOUT
+	Hrroi T2,CRLF0
+	SOUT
+
+	Move  T5,T1
+Repeat:	Clrbuf Temp1,Tmplen	; Clear storage area
+	Nrecord <Temp1>,<Tmplen*5-1> ; Get a message line from the VAX
+	Aos   Kepliv		; Increment keep alive count
+	Camn  T3,[-<tmplen*5-1>] ; Blank line ?
+	 Jrst Crlf		; Yes, output CRLF
+	Skipn Temp1		; End of message ?
+	 Jrst Done		; Yes
+	Move  T1,T5		; Output message line to BIGBUF
+	Hrroi T2,Temp1
+	Setzb T3,T4
+	Sout
+	  Jerr <SOUT failed at REPEAT+a few> ; [151] Add error check
+	Move  T5,T1
+Crlf:	Move  T1,T5		; Output CRLF to BIGBUF
+	Hrroi T2,[Asciz/
+/]
+	Setzb T3,T4
+	Sout
+	 Jerr <SOUT failed at CRLF+3> ;[152] Add error check
+	Move  T5,T1
+	Jrst Repeat
+
+Done:	Move  T1,T5		; Close off message
+	Hrroi T2,[Asciz /
+/]
+	Setzb T3,T4
+	Sout
+
+	Call Gtbfsz		; Get Buffer Size Into Bigbug
+	Debug <
+>
+	Debstr <Bigbuf>
+
+	Retskp			; All Done!
+
+;
+;Store Size Of Bigbuf Into Bytcnt
+;
+
+Gtbfsz:	Setz  T3,
+	Setz  T2,
+	Move  T1,[Point 7,Bigbuf]
+Geta:	Ildb  T2,T1
+	Jumpe T2,Go
+	Addi  T3,1
+	Jrst  Geta
+Go:	Movem T3,Bytcnt
+	Jrst  R
+
+;Routine to parse a node and user name and convert it to a TOPS-20
+;string compatable with MS
+;
+;CALL:
+;	T1	 = STRING POINTER TO THE DESTINATION
+;	T2	 = STRING POINTER TO FIELD RECEIVED
+;	CALL PRSNAM
+;
+;VARIABLES RETURNED ON SUCCESSFUL COMPLETION
+;	DESTINATION CONTAINS THE MS STRING
+;	TEMP1  = HOST
+;	TEMP2  = USER NAME
+;	T1	 = UPDATED STRING POINTER
+;
+;RETURNS:
+;	+1 ALWAYS
+
+PRSNAM:
+	ACVAR  <SPTR,DPTR,GH>	; STORAGE FOR SOURCE/DEST. POINTERS
+	MOVEM T1,DPTR		; SAVE DESTINATION POINTER
+	MOVEM T2,SPTR		; SAVE SOURCE POINTER
+	SETZ GH,		;Do not have host name yet
+PRSNM1:	MOVE  T1,[POINT 7,TEMP2] ; GET POINTER TO WHERE TO STORE STRING
+PRSNM2:	ILDB  T3,SPTR		; GET CHARACTER
+	JUMPE T3,PRSNMD		; NULL, DONE
+	CAIE T3,""""		;Quoted string?
+	IFSKP.
+	  DO.
+	    ILDB T3,SPTR	;Copy quoted string literally
+	    CAIN T3,""""	;End of quoted string?
+	     JRST PRSNM2
+	    IDPB T3,T1
+	    LOOP.
+	  ENDDO.
+	ENDIF.
+	CAIN  T3," "		; SPACE SEPARATOR?
+	JRST  PRSNM3		; YES, LOOK FOR PERSONAL NAME
+	SKIPN GH		;Unless got a host already
+	 CAIE  T3,":"		; END OF NODE SPECIFIER?
+	IFSKP.
+	  ILDB  T3,SPTR		; YES, EAT NEXT COLON
+	  SETZ  T3,		; TERMINATE STRING
+	  IDPB  T3,T1
+	  HRROI T1,TEMP1	; UPDATE ORIGINATING HOST
+	  HRROI T2,TEMP2
+	  SOUT
+	  SETO GH,		;Note got a host
+	  JRST  PRSNM1
+	ENDIF.
+	IDPB  T3,T1		; SAVE CHARACTER IN TEMP2
+	JRST  PRSNM2
+
+PRSNM3:	SETZ  T3,		; TERMINATE STRING
+	IDPB  T3,T1
+PRSNM4:	ILDB  T3,SPTR		; GET CHARACTER FROM INPUT STRING
+	JUMPE T3,PRSNMD		; STRING EXHAUSTED
+	CAIE  T3,42		; IS CHARACTER START OF PERSONAL NAME?
+	JRST  PRSNM4		; NO, LOOP TILL STRING EXHAUSTED OR '"' FOUND
+	MOVE  T1,DPTR		; GET DESTINATION POINTER
+	MOVE  T2,SPTR		; GET SOURCE POINTER
+	SETZ  T3,
+	MOVEI T4,42		; TILL '"'
+	SOUT
+	MOVEI T2," "		; CHANGE '"' TO SPACE
+	DPB   T2,T1
+	MOVEI T2,"<"		; OUTPUT START OF USERNAME at NODE STRING
+	IDPB  T2,T1
+	CALL  PRSNMS		; CALL ROUTINE TO OUTPUT USERNAME at NODE
+	MOVEI T2,">"		; OUTPUT END OF USERNAME at NODE STRING
+	IDPB  T2,T1
+	SETZ  T2,		; TERMINATE THE OUTPUT STRING
+	IDPB  T2,T1
+	RET			; SUCCESS RETURN
+
+PRSNMD:	IDPB	T3,T1		; TERMINATE STRING
+	MOVE	T1,DPTR		; BUILD STRING IN DESTINATION BUFFER
+	CALLRET PRSNMS
+	ENDAV.
+
+;Routine to create user name at node string in output buffer.
+;
+;CALL:
+;	T1	= STRING POINTER TO WHERE TO STORE THE OUTPUT
+;	TEMP2	= USER NAME
+;	TEMP1	= NODE NAME
+;	CALL PRSNMS
+;
+;VARIABLES RETURNED:
+;	T1	= UPDATED STRING POINTER
+;
+;RETURNS:
+;	+1 ALWAYS
+
+PRSNMS:	STKVAR <NOQUOT>
+	SETO T4,		;No quotes
+	MOVE T2,[POINT 7,TEMP2]	;Sniff for quotes in string
+	DO.
+	  ILDB T3,T2		;Snarf character
+	  JUMPE T3,ENDLP.	;Done if null
+	  CAIN T3,":"		;Saw a colon?
+	   TDZA T4,T4		;Flag quoting
+	    LOOP.		;Else try for next
+	ENDDO.
+	MOVEM T4,NOQUOT		;Save no-quoting flag
+	SKIPE NOQUOT
+	IFSKP.
+	  MOVEI T2,""""
+	  BOUT%
+	ENDIF.
+	HRROI T2,TEMP2		; OUTPUT USER NAME
+	SETZB T3,T4
+	SOUT
+	SKIPE NOQUOT
+	IFSKP.
+	  MOVEI T2,""""
+	  BOUT%
+	ENDIF.
+;;	HRROI T2,[ASCIZ/ at /]	; OUTPUT SEPARATOR
+;;	SOUT
+	MOVEI T2,"@"
+	BOUT
+	MOVEI T2,177
+	BOUT%
+	HRROI T2,TEMP1		; OUTPUT NODE NAME
+	SOUT
+	HRROI T2,[asciz/.#DECnet/]
+	SOUT
+	MOVEI T2,177
+	BOUT%
+	MOVE T2,T1		; Tie off string
+	IDPB T3,T1
+	RET			; SUCCESS RETURN
+
+;Routine to parse addressing of VAX mail and build TO string in TOOBUF
+;
+;CALL:
+;	ATMBUF = ADDRESS STRING RECEIVED FROM THE VAX
+;	CALL PRSUSR
+;
+;VARIABLES RETURNED ON SUCCESS:
+;	TEMP1  = NODE OF RECIPIENT
+;	TEMP2  = NAME OF RECIPIENT
+;	T1	 = USER NUMBER IF ON CURRENT NODE OR
+;		 PTR TO NODE // '\0' // USER FOR 4N HOST
+;
+;RETURNS:
+;	+1: ERROR, MAIL WAS ADDRESSED TO THIS NODE AND USER WAS UNKNOWN
+;	+2: OK, ALL RETURNED VARIABLES VALID
+
+PRSUSR:
+	MOVE  T1,TOOPTR		; GET POINTER TO TOOBUF
+	SKIPN TOOBUF		; SKIP IF TOOBUF NOT EMPTY
+	 JRST  PRSUS1
+	SOSE  TOOCNT		; SUBTRACT FROM COUNT/LINE - SKIP IF .NE. 0
+	IFSKP.
+	  HRROI T2,[BYTE (7) ",", "M"-100, "J"-100, "I"-100]
+	  SETZ T3,
+	  SOUT
+	  MOVEI T2,3		; RESET COUNT OF USERS PER LINE IN TOOBUF
+	  MOVEM T2,TOOCNT
+	  JRST  PRSUS1
+	ENDIF.
+	HRROI T2,[ASCIZ/, /]	; OUTPUT SEPARATOR
+	SETZ T3,
+	SOUT
+
+PRSUS1:	MOVEM T1,TOOPTR		; SAVE STRING DESTINATION POINTER
+	HRROI T1,TEMP1		; SETUP DEFAULT HOST
+	HRROI T2,OURNAM
+	SETZ T3,
+	SOUT
+	MOVE  T1,TOOPTR		; GET DESTINATION POINTER
+	MOVE  T2,[POINT 7,ATMBUF] ; GET POINTER IN INPUT STRING
+	CALL  PRSNAM		; GET TOPS-20 MS STRING
+	MOVEM T1,TOOPTR		; SAVE POINTER TO TOOBUF
+
+	HRROI T1,OURNAM		; GET POINTER TO THIS SYSTEMS NODE NAME
+	HRROI T2,TEMP1		; GET HOST NAME FROM FIELD
+	STCMP			; IS MESSAGE FOR THIS HOST ?
+	JUMPE T1,PRSUS2		; JUMP IF FOR THIS HOST
+
+;MAIL IS FOR A REMOTE HOST.  GET HOST,,USER STRING POINTERS
+	HRRZ T4,FREPTR		;GET POINTER TO STRING SPACE
+	HRRO T1,T4		;PUT NODE NAME INTO NODE STRING SPACE
+	HRROI T2,TEMP1
+	SETZ T3,
+	SOUT
+	IDPB T3,T1		;GET TERMINATOR
+	HRROI T2,TEMP2		;GET USER
+	SOUT
+	IDPB T3,T1
+	ADDI T1,1		; Ensure on word boundary
+	HRRZM T1,FREPTR
+
+	MOVE T1,T4		;GET STRING POINTER
+	RETSKP			; RETURN ADDRESS
+
+;MAIL IS FOR THIS SYSTEM.  CHECK TO SEE IF USER NAME IS VALID.
+
+PRSUS2:
+IFE MBXF,<
+	HRROI T2,TEMP2		; POINT TO USER NAME STRING
+	MOVX  T1,RC%EMO		; EXACT MATCH ONLY
+	RCUSR			; IS THIS USER NAME VALID ?
+	 ERJMP R		; NO, ERROR
+	TXNE  T1,RC%NOM		; SKIP IF USERNAME FOUND
+	 RET			; NO SUCH USER - ERROR
+	MOVE T1,T3		; RETURN USER NUMBER IN T1
+> ;IFE MBXF
+IFN MBXF,<
+	HRROI T1,TEMP2		; Get mailbox name
+	CALL RUNMBX		; Validate mailbox name
+	 RET			; Bogon
+	HRRZ T4,FREPTR		; Pointer to current free space
+	HRRO T1,T4		; Copy string to free space
+	HRROI T2,OURNAM		; Start with our host name
+	SETZ T3,
+	SOUT%
+	IDPB T3,T1
+	HRROI T2,TEMP2
+	SOUT%
+	IDPB T3,T1
+	ADDI T1,1		; Ensure on word boundary
+	HRRZM T1,FREPTR		; Update new free space pointer
+	MOVE T1,T4		; Return string pointer
+> ;IFN MBXF
+	RETSKP			; RETURN SUCCESS
+
+; Validate a mailbox
+; Accepts: T1/ pointer to mailbox name
+;	CALL RUNMBX
+; Returns +1: Mailbox bogus
+;	  +2: Mailbox good or unable to validate
+
+RUNMBX:	STKVAR <MBXPTR>
+	MOVEM T1,MBXPTR		; save mailbox pointer
+	SKIPLE MBXFRK		; see if already a mailbox fork
+	IFSKP.
+	  SETOM MBXFRK		; no, flag trying to get a mailbox fork
+	  MOVX T1,GJ%OLD!GJ%SHT	; get JFN of forwarder
+	  HRROI T2,[ASCIZ/SYS:MMAILBOX.EXE/]
+	  GTJFN%
+	   ERJMP RSKP		; no mailbox fork
+	  MOVEM T1,MBXFRK	; save here temporarily
+	  MOVX T1,CR%CAP	; create an inferior fork
+	  CFORK%
+	   ERJMP RSKP
+	  EXCH T1,MBXFRK	; save fork handle, get JFN
+	  HRL T1,MBXFRK		; get prog into fork
+	  GET%
+	   ERJMP RSKP
+	ENDIF.
+	HRLZ T1,MBXFRK		; page 0 of inferior
+	DMOVE T2,[.FHSLF,,MBXPAG/1000 ; mapped to this fork's MBXPAG
+		  PM%RD!PM%WR!PM%CNT+2] ; read+write access
+	PMAP%
+	 ERJMP RSKP
+	MOVE T1,[POINT 7,MBXPAG+200] ; destination
+	MOVE T2,MBXPTR		; source address
+	SETZ T3,
+	SOUT%
+	 ERJMP RSKP
+	MOVE T1,MBXFRK		; get fork handle back again
+	MOVX T2,4		; validate existance entry
+	SFRKV%			; start fork
+	 ERJMP RSKP
+	WFORK%			; wait for it to halt
+	 ERJMP RSKP
+	RFSTS%			; see if it finished ok
+	 ERJMP RSKP
+	HLRZ T1,T1
+	CAIN T1,.RFHLT		; halted normally?
+	IFSKP.
+	  SETO T1,		; unmap shared pages
+	  DMOVE T2,[.FHSLF,,MBXPAG/1000 ; mapped to this fork's MBXPAG
+		    PM%CNT+2]
+	  PMAP%
+	   ERJMP RSKP
+	  MOVE T1,MBXFRK	; flush the fork
+	  KFORK%
+	   ERJMP RSKP
+	  SETZM MBXFRK
+	  RETSKP
+	ENDIF.
+	SKIPG MBXPAG+177	; yes, success answer?
+	 RET			; no, non-skip return
+	RETSKP			; success, skip return with fork still mapped
+
+	ENDSV.
+
+; Here To create MMAILR queue file
+
+; Returns +1: Problems Of Some Sort
+;	  +2: Ok
+
+Mailit:	Hrroi T1,FILNAM
+	Hrroi T2,[Asciz 'MAILQ:[--QUEUED-MAIL--].NEW-']
+	Setz T3,
+	SOUT
+	Move T2,T1
+	GTAD
+	Exch T1,T2
+	Movei T3,10
+	NOUT
+	 Trn
+	Hrroi T2,[Asciz '-VMAIL-J']
+	Setz T3,
+	SOUT
+	Move T2,OURJOB
+	Move T3,[3,,^D10]
+	NOUT
+	 Trn
+	Hrroi T2,[Asciz '.-1;P770000']
+	Setz T3,
+	SOUT
+	Idpb T2,T3
+	Movsi T1,(GJ%SHT+GJ%FOU)
+	Hrroi T2,FILNAM
+	GTJFN
+	 JERR <Could not get queue JFN>
+	Movem T1,QUEJFN
+	Move T2,[fld(7,OF%BSZ)+OF%WR]
+	OPENF
+	 JERR <Could not open queue JFN>
+	Hrroi T2,[Asciz '=NET-MAIL-FROM-HOST:']
+	Setz T3,
+	SOUT
+	Hrroi T2,HstNam
+	SOUT
+	Hrroi T2,CRLF0
+	SOUT
+
+	Hrroi T2,[Asciz '=RETURN-PATH:']
+	SOUT
+	Hrroi T2,FRMBUF
+	SOUT
+	Hrroi T2,CRLF0
+	SOUT
+
+;; This is not documented -- but it makes MMAILR splat your TTY right!
+	Hrroi T2,[Asciz '_']
+	SOUT
+	Hrroi T2,HstNam
+	SOUT
+	Hrroi T2,[ASCIZ/.#DECnet
+/]
+	SOUT
+	Move T3,[Point 7,FrmNam]
+	DO.
+	  Ildb T2,T3
+	  Jumpe T2,ENDLP.
+	  Cain T2," "
+	   EXIT.
+	  BOUT
+	  LOOP.
+	OD.
+	Hrroi T2,CRLF0
+	Setz T3,
+	SOUT
+
+	Setzb P1,P2		; Init Index And Failure Flag
+Mailt1:	Move  T1,Ulist(P1)	; Get Next Recipient
+	Jumpe T1,Mailt5		; End Of List
+	Call  Sendit		; ADD NAME TO TOP OF QUEUE FILE
+	 TRN
+Mailt2:	Vaxsuccess
+	Aoja  P1,Mailt1
+
+Mailt5:	Jumpn P2, Rskp		; Don'T Log Success on error
+;;	Skipe P1		; Anything Sent?
+;;	IFSKP.
+;;	  Call Dtstmp		; Yes, Loc Lack Of Local Users
+;;	  Log <No local electronic recipients>
+;;	ENDIF.
+	Move T1,QUEJFN		; Get MMAILR queue JFN
+;;[76]	Hrroi T2,CRLF0
+	Setz T3,
+;;[76]	SOUT			;Sendit now has been fixed!!
+	Movei T2,"L"-100
+	BOUT
+	Hrroi T2,CRLF0
+	SOUT
+	HRROI T2,BIGBUF
+	Movn T3,Bytcnt		; Get negative byte count
+	SOUT
+	 Erjmp .+1
+	CLOSF
+	 TRN
+	CALL WAKEUP
+	Retskp
+
+; Append Mail To User'S Mail File
+; Call With User Number Of Recipient In T1
+
+Sendit:	Stkvar <Usrno>
+	Movem T1,Usrno		; Save Recipients User Number
+IFE MBXF,<
+	Jumpg T1,Quefil		; 4n host
+
+	Move T1,QueJFN		; Get QUEUE file
+	Movei T2,"L"-100	; Get <FF>
+	BOUT
+	Hrroi T2,OurNam
+	Setz T3,
+	SOUT
+	Hrroi T2,CRLF0
+	SOUT
+	Move T2,UsrNo
+	DIRST
+	Hrroi T2,CRLF0
+	SOUT
+	Retskp
+>;IFE MBXF
+
+;Sending to a remote host.
+Quefil:	MOVE T1,QUEJFN
+	MOVEI T2,"L"-100
+	BOUT
+	HRRO T2,USRNO		;GET HOST BP
+	SETZ T3,
+	SOUT
+	MOVEM T2,USRNO		;SAVE BP TO USER
+	HRROI T2,CRLF0
+	SOUT
+	MOVE T2,USRNO		;GET USER BP
+	SOUT
+	HRROI T2,CRLF0
+	SOUT
+	RETSKP			;all done
+
+;Here to copy (and quote) "from" string into area pointed to by T1
+; Quotes all characters (to save trouble of checking need for it)
+
+QUOTE:	MOVE T2,[POINT 7,FRMBUF]
+	TLC T1,-1		; lh of byte pointer all ones?
+	TLCN T1,-1		;  ..
+	HRLI T1,(POINT 7,)	; yes, make real byte pointer
+	MOVEI T4,<24*5>-1	; maximum characters allowed in string
+QUOTE1:	MOVEI T3,"V"-100	; quote character
+	IDPB T3,T1		; stuff it
+	ILDB T3,T2		; next char of source string
+	IDPB T3,T1		; stuff it
+	JUMPE T3,[MOVNI T2,1		; if zero, back up over last ctrl-V
+		ADJBP T2,T1		;  ..
+		DPB T3,T1		; wipe it out with null
+		RET]			; and return
+	SOJGE T4,QUOTE1		; insure no overflow
+	DIE <QUOTE overflow>
+
+;Open Log File
+
+Opnlog:	MOVX T1,.NULIO		; No logs unless
+	SKIPN LOGP		;  LOGP is set non-zero
+	 RET			; Oh well
+	Movx  T1,Gj%sht		; Try Logical Name First
+	Hrroi T2,[Asciz /MAIL:VMAIL.LOG/]
+	GtJFN
+	 Erjmp Opnerr
+	Movx  T2,<070000,,0>+Of%app
+	Openf			; Open For Append
+	 Erjmp Opnerr
+	Ret
+
+Opnerr:	Hrroi T1,[Asciz /VMAIL: Can't open log file because: /]
+	Esout
+	Movx  T1,.priou
+	Hrloi T2,.fhslf
+	Erstr
+	 Erjmp .+1
+	 Erjmp .+1
+	Jrst Fatal
+
+;Time Stamp Log File
+
+Dtstmp:	Move  T1,LogJFN
+	HRROI T2,[ASCIZ/
+/]
+	SETZ T3,
+	SOUT%
+	 Jerr <Can't write to log file>
+	Seto  T2,		; Current Time
+	Odtim
+	IFJER.
+	  Hrroi T1,[Asciz /VMAIL: Odtim Failed: /]
+	  Esout
+	  Movx  T1,.priou
+	  Hrloi T2,.fhslf
+	  Erstr
+	   Erjmp .+2
+	   Erjmp .+1
+	  Tmsg <
+DTSTMP called from >
+	  Movx  T1,.priou		; Type Pc Of Caller On Terminal
+	  Hrrz  T2,(P)
+	  Movx  T3,^D8		; In Octal
+	  Nout
+	   Erjmp .+1
+	  Jrst  Fatal		; Go Fire Up The World Again
+	ENDIF.
+	Movei T2," "		; Space
+	Bout
+	Ret
+
+;Write Asciz String Pointed To By T1 To Log File
+
+Logmsg:	Move  T2,T1		; Copy String Pointer
+	Move  T1,LogJFN
+	Setzb T3,T4
+	Sout
+	 Jerr <Can't write to log file>
+	Move  T1,T2
+	Ret
+
+
+;Write Statistics To Log File
+
+Lstats:	Stkvar<Elptm0>
+;	Move  T1,LogJFN
+;	Move  T2,Elptim		; Elapsed Time For Mail Receipt
+;	Fltr  T2,T2		; Flost It
+;	Fdvr  T2,[100000.0]	; Compute Seconds
+;	Movx  T3,<1b1+Fl%one+Fl%pnt+3b23+3b29>
+;	Flout			; Type Seconds
+;	 Erjmp [Haltf]		; Never Happens
+;	Movem T2,Elptm0		; Save Time
+;	Log < seconds, >
+	Log < : >
+	Move  T1,LogJFN
+	Move  T2,Bytcnt		; Byte Count
+	Movx  T3,^D10		; Base 10
+	Nout
+	 Jerr <NOUT failure>
+	Log < chars
+>
+;	Move  T1,LogJFN
+;	Fltr  T2,Bytcnt		; Float Byte Count
+;	Fdvr  T2,Elptm0		; Compute Bytes Per Second
+;	Movx  T3,<1b1+Fl%one+Fl%pnt+5b23+3b29>
+;	Flout
+;	 Jerr <FLOUT failure>
+;	Log < chars/sec/
+;>
+	Ret
+
+;Close Net Connection And Reopen It.  Re-Enable For Interrupts
+; On Connect Initiate Messages
+
+CLZNET:	MOVEI T1,^D4000		; Give pipe four seconds to empty
+	DISMS			;  ..
+	MOVE T1,NETJFN		; normal close
+	CLOSF
+	IFJER.
+	  CALL DTSTMP		; We should complain about these
+	  LOG <%Close error for net link: >
+	  MOVE T1,LOGJFN
+	  HRLOI T2,.FHSLF
+	  ERSTR
+	   ERJMP .+1
+	   ERJMP .+1
+	  MOVE T1,NETJFN
+	  TXO T1,CZ%ABT		; Try real hard to close it
+	  CLOSF			;  so we don't eat all job 0 JFNs
+	   ERJMP .+1
+	  MOVE T1,NETJFN
+	  RLJFN
+	   ERJMP .+1
+	ENDIF.
+	CALL OPNLSN		; open connection again
+	RET			; return
+
+;Open The Net Connection And Listen For Connect Initiates
+
+Opnlsn:	Movx  T1,Gj%sht
+	Hrroi T2,[Asciz /Srv:27/]	 ; Magic Number For Vax Mail Server
+	GtJFN
+	 Jerr <Can't get net JFN for server>
+	Movx  T2,Of%rd!Of%wr!<100000,,0>
+	Openf
+	 Jerr <Can't open net JFN>
+	Movem T1,NetJFN
+	Movx  T2,.moacn		; Enable For Psi On Network Transitions
+	Movx  T3,0b8+<.mocia>B17+<.mocia>B26 ; Channel Zero
+	Mtopr
+	 Jerr <Can't enable for PSI on network transitions>
+	Movx  T1,.fhslf
+	Movx  T2,1b0		; Activate Channel Zero
+	Aic
+	Ret
+
+
+;Log Name Of Foreign Host
+
+T4nhst:	Setzm Hstnam		; Zero This String
+	Setzm 1+Hstnam		;  ..
+	Move  T1,NetJFN		; Get Net JFN
+	Movx  T2,.morhn		; Return Host Name
+	Hrroi T3,Hstnam		; Where To Put It
+	Mtopr
+	IFJER.
+	  Hrroi T1,[Asciz /???/]
+	  Callret  Logmsg	; Log confusion
+	ENDIF.
+	Hrroi T1,Hstnam		; Copy Name To Log File
+	Skipe Dbugsw
+	 Psout
+	Hrroi T1,Hstnam		; Copy Name To Log File
+	Call  Logmsg		;  ..
+	Ret
+
+;Set Up To Time Out If Network Too Slow
+
+Timeit:	Move  T1,[.fhslf,,.timel]
+	Move  T2,[Timen]		; Milliseconds To Allow
+	Movei T3,1		; Channel One
+	Timer
+	 Jerr <Can't time myself>
+	Movx  T1,.fhslf		; Activate Timer Channel
+	Movx  T2,<1b1>
+	Aic
+	Ret
+
+;Cancel Above Timer Request
+
+Cncltm:	Move  T1,[.fhslf,,.timal] ; Remove All Pending Timer Requests
+	Movei T3,1		; For This Channel
+	Timer
+	 Jerr <Can't remove pending timer request>
+	Ret
+
+
+;Here On Timeout
+
+Timout:
+;	Call Dtstmp
+	Skipn KEPLIV		; Skip if still alive
+	Die  <Timeout Occured>	; [153] No activity, dead
+	Setzm KEPLIV		; Clear keep alive flag
+	Push  P,T1		; Save ACs before calling Timeit
+	Push  P,T2
+	Push  P,T3
+	Call  Timeit		; Start new timer
+	Pop   P,T3		; Restore ACs before resuming
+	Pop   P,T2
+	Pop   P,T1
+	Debrk			; Allow things to continue
+
+;Here If Net Link Dies While Outputting To It
+
+Dmplnk:	Cis			; Zap Things
+	Movx  T1,Cz%abt		; Abort The Net JFN
+	Hrr   T1,NetJFN		;  ..
+	Closf			;  ..
+	 Erjmp .+1		; Don'T Care
+	Call  Dtstmp
+	Log <----Connection aborted
+
+>
+	Movx  T1,.fhslf		; Deactivate Connect Initiate Channel
+	Movx  T2,<1b0>		;  ..
+	Dic			;  ..
+	Call  Cncltm		; Cancel Pending Timer Requests
+	Move  T1,LogJFN		; Close Log File
+	Closf
+	 Erjmp .+1
+;	Jrst  VMAIL0		; Go Wait For New Mail
+	Jrst  VMAIL		; Restart on connection abort
+
+
+;Here On Fatal Wipeout (Jsys Which Can'T Fail Does, For Instance)
+
+Fatal:	Movx  T1,.fhslf
+	Dir			; Disbale Interrupts
+	Cis			; Clear Interrupts
+; Remove out-of-synch message on fatal error
+;;	Move  T1,NetJFN		; Type A Record To Force Net Buffers Out
+;;	Hrroi T2,[Asciz /
+;;?VMAIL Internal Error/]
+;;	Setzb T3,T4		; Add Question Mark So Mail Isn'T Requeued
+;;	Soutr			;  ..
+;;	 Erjmp .+1
+;;	Movei T1,^D5000		; Wait Five Seconds
+;;	Disms
+	skipe t1,logJFN
+	 Closf
+	  Erjmp .+1
+	setzm logJFN
+	Movx  T1,.fhslf!cz%abt	; Abort All JFNs
+	Clzff			;  ..
+	 ERJMP .+1		; Ignore errors in the fatal error routine
+	Call  Opnlog		; Reopen Log File
+	Movem T1,LogJFN
+	Call  Dtstmp
+	Log <Error restart...
+>
+	Tmsg <VMAIL error restart...
+>
+	Move T1,LogJFN
+	CLOSF%
+	 ERJMP .+1
+	Movei T1,^D5000		; Wait Some More
+	Disms
+	Jrst VMAIL		; And Fire Up The World Again
+
+;Disable Capabilities So Quota-Checking Happens
+
+Capoff:	Push  P,T1		; Don'T Clobber
+	Movx  T1,.fhslf		; Get My Caps
+	Rpcap
+	Movem T3,Capenb		; Remember For Later
+	Setz  T3,		; No Caps At All
+	Epcap
+	Pop   P,T1		; Restore
+	Ret
+
+
+;Re-Enable Caps
+
+Capon:	Push  P,T1		; No Clobberage
+	Movx  T1,.fhslf
+	Move  T3,Capenb		; Caps We Had Before
+	Epcap
+	Pop   P,T1
+	Ret
+
+CRLF0:	ASCIZ /
+/
+
+; FROM DMASER.MAC
+A==1
+B==2
+C==3
+
+WAKEUP:	SKIPE T2,MYPID		; have a PID already?
+	 TDZA T1,T1		; yes, use it
+	  MOVX T1,IP%CPD	; no, create a PID
+	MOVEM T1,IPCBLK+.IPCFL
+	MOVEM T2,IPCBLK+.IPCFS	; PID to use if one there
+	SETZM IPCBLK+.IPCFR	; send to INFO
+	MOVX T1,<.IPCI2+3,,BUFFER> ; length of INFO msg,,where INFO msg is
+	MOVEM T1,IPCBLK+.IPCFP
+	MOVX T1,.IPCIW		; return PID associated with name
+	MOVEM T1,BUFFER+.IPCI0
+	SETZM BUFFER+.IPCI1	; duplicate copy not needed
+	DMOVE T1,[ASCII/[SYSTEM]MM/] ; 1st part of PID to look up
+	DMOVEM T1,BUFFER+.IPCI2
+	MOVE T1,[ASCII/AILR/]	; 2nd part of PID to look up
+	MOVEM T1,BUFFER+.IPCI2+2
+	MOVX T1,.IPCFP+1		; length of block
+	MOVEI T2,IPCBLK		; get MMailr's PID
+	MSEND%
+	 ERJMP R		; looks like INFO isn't there
+	MOVE T1,IPCBLK+.IPCFS	; get the PID I made
+	MOVEM T1,MYPID		; remember it for next time
+	DO.
+	  SETZM IPCBLK+.IPCFL	; no flags
+	  SETZM IPCBLK+.IPCFS	; any sender
+	  MOVE T1,MYPID		; I'm the receiver
+	  MOVEM T1,IPCBLK+.IPCFR
+	  MOVX T1,<10,,BUFFER>	; place to put the reply
+	  MOVEM T1,IPCBLK+.IPCFP
+	  MOVX T1,.IPCFP+1	; length of block
+	  MOVEI T2,IPCBLK	; get reply from INFO
+	  MRECV%
+	   ERJMP R		; failure irrelevant here
+	  LOAD T1,IP%CFC,IPCBLK+.IPCFL ; see who sent message
+	  CAIE T1,.IPCCC		; from <SYSTEM>IPCF?
+	   CAIN T1,.IPCCF	; no, from <SYSTEM>INFO?
+	   IFSKP.
+	     LOOP.		; no, get another message
+	   ENDIF.
+	ENDDO.
+	JN <IP%CFE,IP%CFM>,IPCBLK+.IPCFL,R ; give up if undeliverable
+	SETZM IPCBLK+.IPCFL	; no flags
+	MOVE T1,MYPID		; I'm the sender
+	MOVEM T1,IPCBLK+.IPCFS
+	MOVE T1,BUFFER+.IPCI1	; MMailr is the recipient
+	MOVEM T1,IPCBLK+.IPCFR
+	MOVX T1,<1,,BUFFER>	; one word from BUFFER
+	MOVEM T1,IPCBLK+.IPCFP
+	MOVX T1,'PICKUP'		; magic word to wake up MMailr
+	MOVEM T1,BUFFER
+	MOVX C,^D20
+	DO.
+	  MOVX T1,.IPCFP+1	; length
+	  MOVEI T2,IPCBLK	; send wakeup to MMailr
+	  MSEND%
+	  IFJER.
+	    MOVEI T1,^D1000	; failed, wait a bit
+	    DISMS%
+	    SOJG C,TOP.		; try a few times
+	    RET			; failed, give up
+	  ENDIF.
+	ENDDO.
+	MOVX T1,.MUQRY		; query function for MUTIL%
+	MOVEM T1,BUFFER
+	MOVE T1,MYPID		; query packets for our PID
+	MOVEM T1,BUFFER+1
+	MOVX C,^D20		; number of retries
+	DO.
+	  MOVX T1,.IPCFP+2	; number of words to return
+	  MOVEI T2,BUFFER	; argument block in BUFFER
+	  MUTIL%
+	  IFJER.
+	    MOVEI T1,^D1000	; wait a bit
+	    DISMS%
+	    SOJG C,TOP.		; retry a few times
+	    RET
+	  ENDIF.
+	ENDDO.
+	DO.
+	  SETZM IPCBLK+.IPCFL	; no flags
+	  SETZM IPCBLK+.IPCFS	; sender is filled in by monitor
+	  MOVE T1,MYPID		; I'm the receiver
+	  MOVEM T1,IPCBLK+.IPCFR
+	  MOVX T1,<10,,BUFFER>	; where MMailr reply will go
+	  MOVEM T1,IPCBLK+.IPCFP
+	  MOVX T1,.IPCFP+1	; size of block
+	  MOVEI T2,IPCBLK	; get reply from MMailr
+	  MRECV%
+	   ERJMP .+1		; error uninteresting here
+	  LOAD T1,IP%CFC,IPCBLK+.IPCFP ; get sender code
+	  IFN. T1		; special sender?
+	    CAIE T2,.IPCCF	; from <SYSTEM>INFO
+	     CAIN T2,.IPCCP	; or private <SYSTEM>INFO?
+	      LOOP.		; yes, try for another message
+	  ENDIF.
+	ENDDO.
+	RET
+
+	.PSECT PAGDAT,50000
+
+MBXPAG:	BLOCK 2000		; MMailbox window pages
+FREE:	BLOCK FFSIZ		; Free string space
+Bigbuf:	Block Bbflen		; Where It All Is Combined To
+	.ENDPS
+
+	End VMAIL

@@ -1,0 +1,462 @@
+MODULE mxfork =
+BEGIN
+!	COPYRIGHT (c) DIGITAL EQUIPMENT CORPORATION 1985, 1989.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A  LICENSE AND MAY BE USED AND  COPIED
+!	ONLY IN  ACCORDANCE  WITH  THE  TERMS OF  SUCH  LICENSE  AND  WITH  THE
+!	INCLUSION OF THE ABOVE  COPYRIGHT NOTICE.  THIS  SOFTWARE OR ANY  OTHER
+!	COPIES THEREOF MAY NOT BE PROVIDED  OR OTHERWISE MADE AVAILABLE TO  ANY
+!	OTHER PERSON.  NO  TITLE TO  AND OWNERSHIP  OF THE  SOFTWARE IS  HEREBY
+!	TRANSFERRED.
+!
+!	THE INFORMATION IN THIS  SOFTWARE IS SUBJECT  TO CHANGE WITHOUT  NOTICE
+!	AND SHOULD  NOT  BE CONSTRUED  AS  A COMMITMENT  BY  DIGITAL  EQUIPMENT
+!	CORPORATION.
+!
+!	DIGITAL ASSUMES NO  RESPONSIBILITY FOR  THE USE OR  RELIABILITY OF  ITS
+!	SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+
+!++
+! FACILITY:	Decmail/MS Message eXchange (MX) Fork Handling Routines
+!
+! ABSTRACT:	This module contains the data structures and routines used by
+!          the Message Queue Manager to handle subforks.
+!
+! ENVIRONMENT:	Tops-20 User Mode
+!
+! AUTHOR: Richard B. Waddington, CREATION DATE: 10-Oct-1988
+!
+! MODIFIED BY:
+!
+!   MX: VERSION 1.0
+! 01	-
+!--
+!
+! INCLUDE FILES:
+!
+    LIBRARY 'monsym';
+    UNDECLARE time;
+    LIBRARY 'mxjlnk';
+    LIBRARY 'mxnlib' ;	! Our version of NML's utility library
+    LIBRARY 'mxlib';
+    REQUIRE 'blt';
+!
+! TABLE OF CONTENTS:
+!
+FORWARD	ROUTINE
+    mx$fork_initialize: NOVALUE,
+    mx$fork_create,
+    mx$fork_kill: NOVALUE,
+    mx$fork_run,
+    mx$fork_interrupt: VANILLA_INTERRUPT_LINKAGE NOVALUE;
+
+!
+! EQUATED SYMBOLS
+!
+LITERAL
+    subfork_doorbell = %O'400000000000';    !1B0
+!
+! OWN STORAGE
+!
+OWN
+    fork_list: REF fork_info_block;
+
+!
+! EXTERNAL REFERENCES
+!
+EXTERNAL ROUTINE
+        mx$error_routines,
+	nmu$memory_manager,
+        nmu$page_allocator,
+	nmu$text_manager,
+	nmu$sched_manager,
+	nmu$queue_manager;
+
+
+EXTERNAL 
+    levtab: VECTOR[3],
+    dattab: VECTOR[36],
+    chntab: VECTOR[36],
+    nettab: VECTOR;
+
+%global_routine('MX$FORK_INITIALIZE'): NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!	This routine initializes the fork handling code.  It must be called
+!   prior to using any of the other routines in this module.
+!
+! FORMAL PARAMETERS:
+!
+!       None.
+!
+! IMPLICIT INPUTS:
+!
+!	We assume that the interrupt system has been set up.  
+!       We use FORK_LIST.
+!
+! IMPLICIT OUTPUTS:
+!
+!       FORK_LIST gets cleared.
+!
+! COMPLETION CODES:
+!
+!       None.
+!
+! SIDE EFFECTS:
+!
+!--
+
+    BEGIN
+    MAP
+        fork_list: VOLATILE;
+
+    $TRACE('MX$FORK_INITIALIZE Called');
+    WHILE .fork_list NEQ 0 DO MX$FORK_KILL(.fork_list);
+    END;			!End of MX$WAKE_UP
+%global_routine('MX$FORK_CREATE', CODE, EVENT) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!	This task creates an MX subfork.
+!
+! FORMAL PARAMETERS:
+!
+!       CODE - contains either the start address, or a byte pointer to an
+!   executable file which contains the code to be executed by the subfork.
+!
+!       EVENT - contains the address of an EVENT_BLOCK, or 0 if the task
+!   should not block.
+!
+! IMPLICIT INPUTS:
+!
+!	We assume that the interrupt system has been set up.  
+!
+! IMPLICIT OUTPUTS:
+!
+!       A subfork gets created.  
+!
+! COMPLETION CODES:
+!
+!       Returns $true if fork was created, $false otherwise.
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+    declare_jsys(CFORK,GET,GTJFN,SFRKV);      !Use these JSYS's
+
+    LOCAL
+        temp,
+        page,
+        mytask: REF task_block,
+        fib: REF fork_info_block;
+
+$TRACE('MX$FORK_CREATE called');
+!
+! Do we already have a subfork?
+!
+    mytask = current_task;
+    IF .mytask[tb_fork] NEQ 0
+    THEN
+        BEGIN
+!
+! Reuse the existing FIB
+!
+        fib = .mytask[tb_fork];
+        mx$init_fork_data_page(.fib[fork_page],.fib[fork_channel]);
+        fib [fork_event] = .event;
+        mx$fork_run(.fib,30);
+        END
+    ELSE
+        BEGIN
+        fib = MX$GET_FIB;
+!
+! Set up fork interrupts
+!
+        fib[fork_channel] = allocate_interrupt_channel(
+                                mx$fork_interrupt,
+                                .fib);
+        activate_interrupt(.fib[FORK_CHANNEL]);
+!
+! Store the event block address in the FIB
+!
+        fib[fork_event] = .event;
+!
+! Create the data page
+!
+        page = mx$get_fork_data_page(.fib);
+!
+! Create the fork
+!
+        IF .code<left_half> EQL 0
+        THEN
+            BEGIN
+            fib[fork_start] = .code;
+
+            IF NOT $$cfork(
+                    (cr_cap OR cr_map OR cr_acs OR cr_st) + .code,
+                    .page;
+                    fib[fork_handle])
+            THEN 
+                RETURN $error(SEVERITY =        STS$K_WARNING,
+                              CODE =            fk$ccf,
+                              FACILITY =        $err,
+                              OPTIONAL_MESSAGE =(FAC=$mon),
+                              OPTIONAL_DATA =   .fib[fork_handle]);
+
+            nmu$sched_wait(.event,30)
+            END
+        ELSE
+            BEGIN
+            IF NOT $$cfork(
+                    cr_cap OR cr_acs,
+                    .page;
+                    fib[fork_handle])
+            THEN 
+                RETURN $error(SEVERITY =        STS$K_WARNING,
+                              CODE =            fk$ccf,
+                              FACILITY =        $err,
+                              OPTIONAL_MESSAGE =(FAC=$mon),
+                              OPTIONAL_DATA =   .fib[fork_handle]);
+
+!
+! GET an exe
+!
+            IF NOT $$gtjfn(gj_sht,.code;code) 
+            THEN 
+                RETURN $error(SEVERITY =        STS$K_WARNING,
+                              CODE =            fk$gjf,
+                              FACILITY =        $err,
+                              OPTIONAL_MESSAGE =(FAC=$mon),
+                              OPTIONAL_DATA =   .code);
+
+        !Note: code now contains the jfn
+
+            IF NOT $$get((.fib[fork_handle]^18) + .code) 
+            THEN 
+                RETURN $error(SEVERITY =        STS$K_WARNING,
+                              CODE =            fk$gef,
+                              FACILITY =        $err,
+                              OPTIONAL_MESSAGE =(FAC=$mon),
+                              OPTIONAL_DATA =   $last_error);
+
+            fib[FORK_START] = 0;
+
+            $$sfrkv(.fib[fork_handle],0) ;
+            END !Called with byte pointer
+
+        END;
+
+    RETURN .fib
+    END;			!End of MX$FORK_CREATE
+%global_routine('MX$FORK_KILL', fib): NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!	This routine "kills" a subfork.
+!
+! FORMAL PARAMETERS:
+!
+!       FIB - The Fork Info Block.
+!
+! IMPLICIT INPUTS:
+!
+!       None.
+!
+! IMPLICIT OUTPUTS:
+!
+!       The fork is removed from the FORK_LIST, and all memory associated
+!   with the fork is released.
+!
+! COMPLETION CODES:
+!
+!       None.
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+    MAP
+        fib: REF fork_info_block;
+
+    declare_jsys(kfork);
+
+    LOCAL
+        task: REF task_block,
+        fork: REF fork_info_block;
+
+
+    $TRACE('MX$FORK_KILL called');
+    IF .fib NEQ 0
+    THEN
+        BEGIN
+        deactivate_interrupt(.fib[fork_channel]);
+        release_interrupt_channel(.fib[fork_channel]);
+
+        task = .fib[fork_task];
+        task[tb_fork] = 0;
+
+        $$kfork(.fib[fork_handle]);
+
+        fork = .fork_list;
+        IF .fork NEQ .fib
+        THEN
+            WHILE (.fork NEQ 0) AND (.fork[fork_next] NEQ .fib) DO 
+                fork = .fork[fork_next];
+!
+! If we get here, then either fork is 0 (in which case the FIB is not in
+! FORK_LIST???) or fork is pointing to the entry prior to the FIB.
+!
+        IF .fork NEQ 0
+        THEN
+            fork[fork_next] = .fib[fork_next]
+        ELSE
+            $ERROR(SEVERITY =       STS$K_WARNING,
+                   CODE =           fk$nfl,
+                   FACILITY =       $err);
+!
+! At this point, the FIB is no longer in the FORK_LIST, and all resources
+! have been released except the FIB itself.
+!
+        nmu$page_release(.fib[fork_page]);
+        nmu$memory_release(.fib,fork_info_block_size);
+        END;
+    END;			!End of MX$FORK_KILL
+%global_routine('MX$FORK_RUN', fib, timeout) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!	This task starts an MX subfork.
+!
+! FORMAL PARAMETERS:
+!
+!       FIB - The Fork Info Block, properly set up to invoke the subfork.
+!       TIMEOUT - The number of seconds to wait for the subfork to
+!                 complete, or zero to wait forever.
+!
+! IMPLICIT INPUTS:
+!
+!       None.
+!
+! IMPLICIT OUTPUTS:
+!
+!       A subfork gets invoked.
+!
+! COMPLETION CODES:
+!
+!       Returns $true if fork was started, $false otherwise.
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+    MAP
+        fib: REF fork_info_block;
+
+    BIND
+        event = .fib[FORK_EVENT]: event_block,
+        page = (.fib[FORK_PAGE] * 512): fork_data_page;
+
+    declare_jsys(IIC,SFRKV);
+
+    LOCAL
+        fsts;
+
+    $TRACE('MX$FORK_RUN called');
+
+    $TRACE('EB = %O',event);
+    $TRACE('EB_NOINT = %O',.event[eb_noint]);
+
+    IF .page[sf_run]
+    THEN
+        RETURN 0;
+
+    page[sf_run] = 1;
+    page[sf_rea] = 0;
+
+    IF NOT (SELECTONE .fib[fork_start] OF
+                SET
+                [0]:
+                    $$sfrkv(.fib[fork_handle],0) ;
+
+                [OTHERWISE]:
+                    $$IIC(.fib[fork_handle], subfork_doorbell)
+                TES)
+    THEN
+        RETURN $ERROR(SEVERITY =       STS$K_WARNING,
+                      CODE =           fk$css,
+                      FACILITY =       $err,
+                      OPTIONAL_MESSAGE = (FAC=$mon),
+                      OPTIONAL_DATA =  $last_error);
+
+    IF nmu$sched_wait(.fib[fork_event],.timeout)
+    THEN
+        BEGIN
+        $TRACE('EB = %O',event);
+        $TRACE('EB_NOINT = %O',.event[eb_noint]);
+        page[sf_run] = 0;
+        RETURN (.page[sf_err] EQL 0)
+        END;
+!
+! Here if we timed out
+!
+    $error(SEVERITY =        STS$K_WARNING,
+           CODE =            fk$sto,
+           FACILITY =        $err);
+
+    RETURN $false
+    END;			!End of MX$FORK_RUN
+%global_routine('MX$FORK_INTERRUPT', fib): VANILLA_INTERRUPT_LINKAGE NOVALUE=
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!	This task processes interrupts from a subfork.
+!
+! FORMAL PARAMETERS:
+!
+!       FIB - The Fork Info Block.
+!
+! IMPLICIT INPUTS:
+!
+!       None.
+!
+! IMPLICIT OUTPUTS:
+!
+!       If FIB[FORK_EVENT] is non-zero, a sleeping task gets awakened.
+!
+! COMPLETION CODES:
+!
+!       None.
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+    MAP
+        fib: REF fork_info_block;
+
+    %IF %VARIANT EQL 1 %THEN
+    !Can't use $trace here because interrupt stack is too small.
+    $e_display(CH$ASCIZ('MX$FORK_INTERRUPT Called'));
+    $e_display(crlf_pointer);
+    %FI
+
+    nmu$sched_flag(.fib[fork_event]);
+    process_wake;
+    END;			!End of MX$FORK_INTERRUPT
+
+END
+ELUDOM

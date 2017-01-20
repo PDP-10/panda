@@ -1,0 +1,741 @@
+module NMUMEM (					!Storage Management Module
+		ident = 'X00.18'
+		) =
+begin
+!	COPYRIGHT (c) DIGITAL EQUIPMENT CORPORATION 1985, 1989.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A  LICENSE AND MAY BE USED AND  COPIED
+!	ONLY IN  ACCORDANCE  WITH  THE  TERMS OF  SUCH  LICENSE  AND  WITH  THE
+!	INCLUSION OF THE ABOVE  COPYRIGHT NOTICE.  THIS  SOFTWARE OR ANY  OTHER
+!	COPIES THEREOF MAY NOT BE PROVIDED  OR OTHERWISE MADE AVAILABLE TO  ANY
+!	OTHER PERSON.  NO  TITLE TO  AND OWNERSHIP  OF THE  SOFTWARE IS  HEREBY
+!	TRANSFERRED.
+!
+!	THE INFORMATION IN THIS  SOFTWARE IS SUBJECT  TO CHANGE WITHOUT  NOTICE
+!	AND SHOULD  NOT  BE CONSTRUED  AS  A COMMITMENT  BY  DIGITAL  EQUIPMENT
+!	CORPORATION.
+!
+!	DIGITAL ASSUMES NO  RESPONSIBILITY FOR  THE USE OR  RELIABILITY OF  ITS
+!	SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+
+!++
+! Facility: LSG DECnet Network Management
+!
+! Abstract:
+!
+!	This module offers the storage management functions used for
+!	dynamic memory allocation. The alogrithm employed is based upon
+!	the article "Buddy Systems" by James L. Peterson and Theodore
+!	A. Norman published in Communications of the ACM Volume 20,
+!	Number 6 - June 1977.
+!
+! Environment:	TOPS10 and TOPS20 user mode, MCB RSX task mode
+!
+! Author: Scott G. Robinson, Creation date: 13-DEC-78
+!
+! Modified by:
+!
+!	Scott G. Robinson, 15-JUL-79 : Version X00.01
+!	- Convert to XPORT interfaces and make transportable.
+!	Steven M. Jenness, 21-Feb-80 : Version X00.02
+!       - Change to conform to NM coding standards and needs.
+!
+!--
+!<BLF/PAGE>
+
+!
+! Include files
+!
+
+library 'MXNLIB';			! All required definitions
+
+%if $TOPS20
+    %then
+	library 'MONSYM';			! Monitor symbols
+
+	library 'MXJLNK';			! JSYS linkage definitions
+    %fi
+
+!
+! Undefine TENDEFs POINTR macro
+!
+
+%if $TOPS10 %then
+undeclare %quote POINTR;
+%fi
+
+!
+! Global routines
+!
+
+forward routine
+    NMU$MEMORY_MANAGER;				! Define global entry points
+
+!
+! Local routines
+!
+
+forward routine
+    BUDDY_ADDRESS;				! Calculate buddy address of memory block
+
+!
+! Memory block format
+!
+! macro:   MEMORY_BLOCK     Defines header for memory block
+!
+
+%if not $MCB
+%then macro $index = $tiny_integer %;
+%else macro $index = $short_integer %;
+%fi
+
+$field
+    MEMORY_BLOCK_FIELDS =
+	set
+	QUEUE_INFO = [$sub_block (Q_HEADER_SIZE)],	! Storage list queue linkages
+	INDEX = [$index],			! The SIZEINDEX for this block
+	TAG = [$bit],				! Indicates ALLOCATED or AVAILABLE
+	SELF = [$bit],				! Indicates LEFT or RIGHT Buddy
+	PARENT = [$bit],			! Indicates LEFT or RIGHT of The Parent
+	  $align (FULLWORD)
+	MB_TASK = [$address],			! Address of allocating task
+	MB_LIMIT = [$address],			! Address of last unit of memory block
+	MB_ALLOCATION = [$short_integer],	! Number of addressable units
+	  $align (FULLWORD)
+	DATA = [$sub_block (0)]			! Start of useable data portion
+	tes;
+
+literal
+    MB_LENGTH = $field_set_size,
+    ALLOC_OVERHEAD = $field_set_units + 1;	! The length of the block header
+						!  plus the terminator
+
+macro
+    MEMORY_BLOCK = BLOCK [MB_LENGTH] FIELD (MEMORY_BLOCK_FIELDS)%;
+
+literal
+    TERMINATOR = 				! Value for limit word
+    %if $MCB					!  of memory block
+    %then
+	%O'125';				! 8 bit value for MCB
+    %else
+	%O'252525252525';			! 36 bit value for KL
+    %fi
+
+literal
+    AVAILABLE = 0,				! Values for TAG field
+    ALLOCATED = 1;
+
+literal
+    LEFT = 0,					! Values for SELF and PARENT
+    RIGHT = 1;
+
+!
+
+literal
+    SIZEINDEX = 29,				! Number of Buddy Slots
+    INDEX_LIMIT = SIZEINDEX - 1;		! Number of elements to search
+
+!
+! Own storage
+!
+
+macro
+    SIZE_INIT =
+     0,0,4,4,4,8,12,16,24,36,52,76,112,164,240,352,
+     516,756,1108,1624,2380,3488,5112,7492,10980,16092,
+     23584,34564,50656 %,
+
+    BUDDY_INDEX_INIT =
+     0,0,0,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,
+     18,19,20,21,22,23,24,25 %;
+
+$field
+    ASL_FIELD =
+	set
+	ASL_QUEUE = [$sub_block (Q_HEADER_SIZE)]
+	tes;
+
+$literal
+    ASL_FIELD_SIZE = $field_set_size;
+
+own
+    SIZE : vector [SIZEINDEX] INITIAL (SIZE_INIT) psect($high$),
+    BUDDY_INDEX : vector [SIZEINDEX] INITIAL (BUDDY_INDEX_INIT) psect($high$),
+    ASL_LST : blockvector [SIZEINDEX, ASL_FIELD_SIZE] field (ASL_FIELD);
+
+global bind
+    BLKSIZ = SIZE,
+    BLKBDY = BUDDY_INDEX,
+    BLKLST = ASL_LST;
+
+!
+! External references
+!
+
+external routine
+    NMU$QUEUE_MANAGER;				! Queue management routines
+
+!
+! Definitions used when debugging
+!
+
+external
+    %debug_data_base;
+
+    %module_name ('NMUMEM');
+
+!<BLF/SYNONYM %UNQUOTE =>
+
+%global_routine ('NMU$MEMORY_RESET') : novalue =
+
+!++
+! Functional description:
+!
+!	This routine resets the free pool data base to empty.
+!
+! Formal parameters: none
+!
+! Routine value: none
+! Side effects:
+!
+!	All queues on the ASL_LST are cleared.
+!
+!--
+
+    begin
+
+    local
+	ASL : ref block field (ASL_FIELD);
+
+%debug (MEMORY_CONSISTENCY,
+	(TRACE_INFO ('Available storage list reset')));
+
+    ASL = ASL_LST [0, ASL_QUEUE];
+
+    INTERRUPT_OFF;			! Disable interrupts
+
+    decru COUNT from SIZEINDEX to 1 do
+	begin
+	NMU$QUEUE_RESET (ASL [ASL_QUEUE]);
+	ASL = vector [ASL [ASL_QUEUE], ASL_FIELD_SIZE];
+	end;
+
+    INTERRUPT_ON;			! Allow interrupts now
+
+    end;				! End of NMU$MEMORY_RESET
+
+%global_routine ('NMU$MEMORY_INITIALIZE', AMOUNT) : novalue =
+
+!++
+! Functional description
+!
+!	Add the specified amount of memory to the free pool
+!	of the storage manager.
+!
+! Formal parameters
+!
+!	AMOUNT - the initial amount of storage to allocate
+!
+! Implicit inputs
+!
+!	SIZE - the block size array
+!	ASL - the Available storage list
+!
+! Implicit outputs
+!
+!	ASL - the Available storage list
+!
+! Routine value: none
+!
+! Side effects: none
+!
+!--
+
+    begin
+
+    local
+	P : ref MEMORY_BLOCK,			! Allocated block
+	I;					! Size index for "P"
+
+    %debug (MEMORY_CONSISTENCY,
+            (TRACE_INFO ('Initializing %D. (%O) units in free pool', .AMOUNT, .AMOUNT)));
+
+!
+! Find size index for AMOUNT
+!
+    I = -1;
+
+    incr POINTR from 1 to INDEX_LIMIT do
+
+	if ((.AMOUNT + ALLOC_OVERHEAD) lequ .SIZE [.POINTR])
+	then
+	    begin
+	    I = .POINTR;
+	    exitloop;
+	    end;
+
+    if (.I lss 0)
+    then
+	begin
+	TASK_ERROR ('Memory block too large to initialize');
+	return ;
+	end;
+
+!
+! Now allocate the block
+!
+    if (P = CORE_GET (.SIZE [.I])) eqla 0
+    then
+	begin
+	TASK_ERROR ('Operating system refused memory request');
+	return ;
+	end;
+    
+    P [INDEX] = .I;
+    P [TAG] = AVAILABLE;
+    P [SELF] = LEFT;
+    P [PARENT] = LEFT;
+!  %debug (always,(
+!    begin
+!    P [MB_ALLOCATION] = .SIZE [.I];
+!    P [MB_TASK] = 0;
+!    end));
+
+  %debug (MEMORY_CONSISTENCY,
+          (TRACE_INFO_C ('Adding %D. (%O) units at %O to free pool',
+                         .SIZE [.I], .SIZE [.I], .P)));
+
+    INTERRUPT_OFF;
+    NMU$QUEUE_INSERT (ASL_LST [.I, ASL_QUEUE], .P);
+    INTERRUPT_ON;
+    end;					! End of NMU$MEMORY_INITIALIZE
+
+forward routine MEMORY_GET;
+
+%global_routine ('NMU$MEMORY_GET', AMOUNT) =
+
+begin
+    local VALUE;
+
+    INTERRUPT_OFF;
+    VALUE = MEMORY_GET(.AMOUNT);
+    INTERRUPT_ON;
+    .VALUE
+end;
+
+%routine ('MEMORY_GET', AMOUNT) =
+
+!++
+! Functional description
+!
+!	Get a block of storage from dynamic memory.
+!	Return its address.
+!
+! Formal parameters
+!
+!	AMOUNT - Number of words to allocate
+!
+! Implicit inputs
+!
+!	ASL - Available Storage List
+!	Dynamic Memory
+!
+! Implicit outputs
+!
+!	ASL - Available Storage List
+!
+! Routine value
+!
+!	The address of the storage block or 0 if no memory available
+!
+! Side effects: none
+!
+!--
+
+    begin
+
+    local
+	P : ref MEMORY_BLOCK,			! Allocated block
+	Q : ref MEMORY_BLOCK,			! Buddy to allocated block
+	I,					! Exact index for "AMOUNT"
+	J;					! Index actually used from ASL
+
+%debug (MEMORY_TRACE,
+	(TRACE_INFO ('Request for %D. units', .AMOUNT)));
+
+!
+! Start off with no block allocated
+!
+    P = 0;
+!
+! Calculate index for block of size AMOUNT
+!
+    I = -1;
+
+    incr POINTR from 1 to INDEX_LIMIT do
+
+	if ((.AMOUNT + ALLOC_OVERHEAD) lequ .SIZE [.POINTR])
+	then
+	    begin
+	    I = .POINTR;
+	    exitloop;
+	    end;
+
+    if (.I lss 0)
+    then
+	begin
+	TASK_ERROR ('Size of Memory Block Requested is too large');
+	return 0
+	end;
+
+!
+! Find first non-empty ASL entry, starting with
+! entry pointed to by I (exact index).
+!
+
+    incr TEST_INDEX from .I to INDEX_LIMIT do
+
+	if (P = NMU$QUEUE_REMOVE (ASL_LST [.TEST_INDEX, ASL_QUEUE])) neq 0
+	then
+	    begin
+	    J = .TEST_INDEX;
+	    exitloop;
+	    end;
+
+!
+! If no memory already available .. try to initialize
+! the appropriate amount from the operating system.
+!
+
+    if .P eqla 0
+    then
+	begin
+	NMU$MEMORY_INITIALIZE (.AMOUNT);
+	P = NMU$QUEUE_REMOVE (ASL_LST [.I, ASL_QUEUE]);
+	J = .I;
+	end;
+
+!
+! Allocate memory and (optionally) split off buddy
+!
+
+    while (.J gtr .I) do
+	begin
+
+	if (.SIZE [.BUDDY_INDEX [.J]] neq 0)
+	then
+	    begin
+	    Q = .P + .SIZE [.BUDDY_INDEX [.J]];
+	    Q [TAG] = AVAILABLE;
+	    Q [PARENT] = .P [PARENT];
+	    Q [SELF] = RIGHT;
+	    Q [INDEX] = .J - 1;
+	    P [TAG] = AVAILABLE;
+	    P [PARENT] = .P [SELF];
+	    P [SELF] = LEFT;
+	    P [INDEX] = .BUDDY_INDEX [.J];
+
+%debug (MEMORY_CONSISTENCY,
+	(begin
+	 TRACE_INFO_C (' Block at %O Index %O Self= ',.P,.P[INDEX]) ;
+
+         if .P [SELF] eql LEFT
+         then TRACE_INFO_CL ('LEFT ')
+         else TRACE_INFO_CL ('RIGHT ') ;
+
+         if .P [PARENT] eql LEFT
+         then TRACE_INFO_CL ('Parent=LEFT split with')
+         else TRACE_INFO_CL ('Parent=RIGHT split with') ;
+
+	 TRACE_INFO_C (' buddy at %O Index %O Self=',.Q,.Q[INDEX]) ;
+
+         if .Q [SELF] eql LEFT
+         then TRACE_INFO_CL ('LEFT ')
+         else TRACE_INFO_CL ('RIGHT ') ;
+
+         if .Q [PARENT] eql LEFT
+         then TRACE_INFO_CL ('Parent=LEFT')
+         else TRACE_INFO_CL ('Parent=RIGHT') ;
+
+         end));
+
+	    if (.I leq .BUDDY_INDEX [.J])
+	    then
+		NMU$QUEUE_INSERT (ASL_LST [.Q [INDEX], ASL_QUEUE], .Q)
+	    else
+		begin
+		NMU$QUEUE_INSERT (ASL_LST [.P [INDEX], ASL_QUEUE], .P);
+		P = .Q;
+		end;
+
+	    J = .P [INDEX];
+	    end
+	else
+	    exitloop;
+
+	end;
+
+    P [TAG] = ALLOCATED;
+!
+! Return 0 if no memory allocated.
+! Return address of zeroed data portion of allocated
+!  block if allocation was successful.
+!
+    %debug (MEMORY_TRACE,
+	    (if (.P eqla 0)
+	     then TRACE_INFO_C ('Allocation failure')
+	     else TRACE_INFO_C ('Allocated %D. units at %O',
+                              .SIZE [.P[INDEX]], P [DATA])));
+
+    (if (.P eqla 0) then
+	begin
+	    TASK_ERROR ('Memory request failed');
+	    0
+	end
+	 else
+	begin
+	local
+	    A : ref block,
+	    CNT;
+
+	CNT = .AMOUNT;
+	P [MB_TASK] = CURRENT_TASK;
+	P [MB_ALLOCATION] = .CNT;
+	P [MB_LIMIT] = P [DATA] + .CNT;		! Address of terminator
+	P = P [DATA];
+	A = .P;
+
+	do (A [0, 0, %bpunit, 0] = 0; A = .A + 1) while (CNT = .CNT - 1) neq 0;
+
+	A [0, 0, %bpunit, 0] = TERMINATOR;	! Mark end of block
+	.P
+	end
+    )
+    end;					!End of NMU$MEMORY_GET
+
+forward routine MEMORY_RELEASE : novalue;
+
+%global_routine ('NMU$MEMORY_RELEASE', P, AMOUNT) : novalue =
+
+begin
+    INTERRUPT_OFF;
+    MEMORY_RELEASE (.P, .AMOUNT);
+    INTERRUPT_ON
+end;
+
+%routine ('MEMORY_RELEASE', P, AMOUNT) : novalue =
+
+!++
+! Functional description
+!
+!	Returns a block of memory to the ASL.
+!
+! Formal parameters
+!
+!	P - address of memory block to return
+!	AMOUNT - Size of memory block
+!
+! Implicit inputs
+!
+!	ASL - the Available Storage List
+!
+! Implicit outputs
+!
+!	ASL - the Available Storage List
+!
+! Routine value: none
+! Side effects:	none
+!
+!--
+
+    begin
+
+    map
+	P : ref MEMORY_BLOCK;
+
+    local
+	Q : ref MEMORY_BLOCK,
+	R,
+	T : ref MEMORY_BLOCK;
+
+    %debug (MEMORY_TRACE,
+ 	    (TRACE_INFO ('Releasing %D. units at %O',
+                         .AMOUNT,.P)));
+
+!
+! Remove Allocation Overhead amount to obtain real MEMORY_BLOCK address
+!
+    T = .P - (ALLOC_OVERHEAD - 1);
+
+!
+! Check to make sure block is actually allocated and not corrupted.
+!
+
+    if (.T [TAG] neq ALLOCATED) or
+       (.T [MB_ALLOCATION] nequ .AMOUNT) or
+       (.T [MB_LIMIT] neqa (T [DATA] + .T [MB_ALLOCATION])) or
+       (.(.T [MB_LIMIT])<0,%bpunit,0> neq TERMINATOR)
+    then
+	begin
+	%if not $MCB
+	%then
+	TRACE_INFO ('Error detected while releasing %D. units of memory',
+			.AMOUNT);
+	TRACE_INFO_C ('Block begins at %O; header starts at %O',
+			T [DATA],
+			.T);
+	TRACE_INFO_C ('Header shows %D. units',
+			.T [MB_ALLOCATION]);
+	TRACE_INFO_C ('Allocation flag is %O (1=allocated, 0=available)',
+			.T [TAG]);
+	TRACE_INFO_C ('Header shows units were allocated by task at %O',
+			.T [MB_TASK]);
+	TRACE_INFO_C ('Header shows limit word:  %O / %O',
+			.T [MB_LIMIT],
+			..T [MB_LIMIT]);
+	TRACE_INFO_C ('Limit word should contain:  %O',
+			TERMINATOR);
+	%fi
+	TASK_ERROR ('Memory database inconsistency');
+	return ;
+	end;
+
+!
+! Tag this block as available now.
+!
+
+    T [TAG] = AVAILABLE;
+
+!
+! Try to find Buddy and form with it
+!
+    Q = BUDDY_ADDRESS (.T);
+
+    while (.Q neqa 0) do
+	begin
+
+
+%debug (MEMORY_CONSISTENCY,
+	(begin
+
+	 TRACE_INFO_C (' Block at %O Index %O Self= ',.T,.T [INDEX]) ;
+
+         if .T [SELF] eql LEFT
+         then TRACE_INFO_CL ('LEFT ')
+         else TRACE_INFO_CL ('RIGHT ') ;
+
+         if .T [PARENT] eql LEFT
+         then TRACE_INFO_CL ('Parent=LEFT merged with')
+         else TRACE_INFO_CL ('Parent=RIGHT merged with') ;
+
+         TRACE_INFO_C (' buddy at %O Index %O Self=',.Q,.Q[INDEX]) ;
+
+         if .Q [SELF] eql LEFT
+         then TRACE_INFO_CL ('LEFT ')
+         else TRACE_INFO_CL ('RIGHT ') ;
+
+         if .Q [PARENT] eql LEFT
+         then TRACE_INFO_CL ('Parent=LEFT')
+         else TRACE_INFO_CL ('Parent=RIGHT');
+
+         end));
+	if not NMU$QUEUE_EXTRACT (ASL_LST [.Q [INDEX], ASL_QUEUE], .Q)
+	then
+	    begin
+	    TASK_ERROR ('Available storage list corrupted');
+	    return ;
+	    end;
+
+	if (.T gtra .Q)
+	then
+	    begin
+	    R = .T;
+	    T = .Q;
+	    Q = .R
+	    end;
+
+	T [TAG] = AVAILABLE;
+	T [SELF] = .T [PARENT];
+	T [PARENT] = .Q [PARENT];
+	T [INDEX] = 1 + .Q [INDEX];
+	Q = BUDDY_ADDRESS (.T);
+	end;
+
+    NMU$QUEUE_INSERT (ASL_LST [.T [INDEX], ASL_QUEUE], .T);
+
+    end;					! End of NMU$MEMORY_RELEASE
+
+%routine ('BUDDY_ADDRESS', P) =
+
+!++
+! Functional description
+!
+!	Calculate and return address of buddy of Memory block at address P.
+!
+! Formal parameters
+!
+!	P - Address of a memory block
+!
+! Implicit inputs
+!
+!	SIZE - size of various memory blocks
+!	Dynamic Memory
+!
+! Implicit outputs: none
+!
+! Routine value:
+!
+!	The address of the buddy to P or 0 if none
+!
+! Side effects: none
+!
+!--
+
+    begin
+
+    map
+	P : ref MEMORY_BLOCK;			! Designated block
+
+    local
+	Q : ref MEMORY_BLOCK,			! Buddy block
+	J;					! Size index for buddy
+
+!
+! Process according to whether block is a LEFT
+! or RIGHT buddy.
+!
+
+    if (.P [SELF] eql LEFT)
+    then
+	begin
+	Q = .P + .SIZE [.P [INDEX]];
+
+	if ((.Q geqa .MEMSIZE) or (.Q [SELF] eql LEFT)) then return 0;
+
+	end
+    else
+	begin
+	J = .BUDDY_INDEX [.P [INDEX] + 1];
+	Q = .P - .SIZE [.J];
+
+	if (.Q [INDEX] neq .J) then return 0;
+
+	end;
+
+    if (.Q [TAG] eql ALLOCATED) then return 0;
+
+    .Q
+    end;					! End of BUDDY_ADDRESS
+end						! End of module MEMORY
+
+eludom
+
+! Local Modes:
+! Mode:Fundamental
+! Comment Start:! 
+! Comment Column:40
+! Comment Rounding:+1
+! Auto Save Mode:2
+! End:

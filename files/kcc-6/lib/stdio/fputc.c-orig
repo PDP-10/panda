@@ -1,0 +1,105 @@
+/*
+**	FPUTC - put a character to stream
+**
+**	(c) Copyright Ken Harrenstien 1989
+**		for all changes after v.38, 12-Apr-1988
+**	(c) Copyright Ian Macky, SRI International 1986
+*/
+
+#include <stdio.h>
+#include <errno.h>
+
+extern int write();	/* Syscall */
+
+int fputc(c, f)
+register int c;
+register FILE *f;
+{
+    char tinybuf[1];			/* grossness!  ick! */
+
+    if (!_writeable(f))			/* Verify FILE pointer is OK */
+	return EOF;
+    if (--f->siocnt >= 0)		/* If have room in buffer, */
+	return *++f->siocp = c;		/* just deposit char there. */
+
+    /* No room left in buffer.  Empty it if we have one. */
+    if (f->sioflgs & _SIOF_BUF) {
+	if (f->sioflgs & _SIOF_LINEBUF && --f->siolcnt >= 0) {
+	    if ((*++f->siocp = c) == '\n' && fflush(f))
+		return EOF;			/* couldn't flush old data */
+	    return c;
+	}
+#ifdef NEWSTREXP
+	if (f->sioflgs & _SIOF_GROWBUF) {	/* if an expanding string, */
+	    if (!_expand(f, f->siosinc))
+		return EOF;
+	    return putc(c, f);
+	}
+#endif
+	/* Normal buffering */
+	if (fflush(f)) return EOF;		/* couldn't flush old data */
+	return fputc(c, f);
+    }
+
+    /* Don't have a buffer to empty.  Should we create one? */
+    if (f->sioflgs & _SIOF_AUTOBUF) {
+	if (setvbuf(f, (char *)NULL,
+			((f->sioflgs&_SIOF_LINEBUF) ? _IOLBF : _IOFBF), 0)) {
+	    f->sioerr = ENOMEM;		/* Non-zero return means failed. */
+	    return EOF;
+	}
+	return putc(c, f);
+    }
+
+    /* We're not using any buffering at all.  Write char directly. */
+    tinybuf[0] = c;
+    if (write(f->siofd, tinybuf, 1) == -1) {
+	f->sioerr = errno;
+	return EOF;
+    }
+    f->siofdoff++;
+    return c;
+}
+
+int _writeable(f)
+FILE *f;
+{
+    if (f->siocheck != _SIOF_OPEN)	/* make sure real FILE block */
+	return 0;			/* and open, too. */
+    if (f->sioflgs & _SIOF_WRITE)
+	return 1;
+    if (f->sioflgs & _SIOF_UPDATE &&
+	(!(f->sioflgs & _SIOF_READ) || (f->sioflgs & _SIOF_EOF))) {
+	f->sioflgs = f->sioflgs & ~_SIOF_READ | _SIOF_WRITE;
+	_prime(f);			/* prime i/o */
+	return 1;
+    }
+    return 0;
+}
+
+#ifdef NEWSTREXP
+/*
+ *	expand the given string file <by> chars.
+ */
+
+int _expand(f, by)
+FILE *f;
+int by;
+{
+    int new_size;
+    char *new_buf, *realloc();
+
+    if (!(f->sioflgs & _SIOF_GROWBUF))	/* if not an auto-expand string */
+	return 0;			/* then don't do it!! */
+    new_size = f->siolbuf + by;		/* new size of string buf */
+    if (!(new_buf = realloc(f->siopbuf, new_size)))
+	return 0;			/* couldn't get bigger buffer */
+    if (new_buf != f->siopbuf) {	/* if our buffer moved */
+	f->siopbuf = new_buf;		/* move to same pos in new buffer */
+	f->siocp = new_buf + (f->siolbuf - f->siocnt) - 1;
+    }
+    f->siolbuf = new_size;		/* it's this big */
+    f->siocnt = by;			/* this much gap now */
+    return 1;
+}
+#endif /* NEWSTREXP */

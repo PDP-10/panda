@@ -1,0 +1,1339 @@
+%title 'F I N D E R -- $FIND service routines'
+!<BLF/REQUIRE 'RMSBLF.REQ'>
+MODULE finder (IDENT = '3.0'
+		) =
+BEGIN
+!
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1984, 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+!++
+! FACILITY:	RMS
+!
+! ABSTRACT:
+!
+!	FINDER contains all routines which process
+!	the $FIND service in RMS-20.
+!
+! ENVIRONMENT:	User mode, Top level
+!
+! AUTHOR: Ron Lusk , CREATION DATE:  1-Apr-83
+!
+! MODIFIED BY:
+!
+!	Ron Lusk, 7-Jul-83 : VERSION 2
+! 01	-   Return relative record's page number in LSN if FB$SMU is set.
+! 420	-   Use global addressing in fetching key buffer contents.
+!       Andrew Nourse  Version 3
+! 501   -   Implement remote FIND
+! 504   -   Implement Image mode FIND
+! 565	-   (RL) Return STV from FFF calls
+!--
+
+!
+! TABLE OF CONTENTS
+!
+!
+!	$FIND	    -	dispatcher for $FIND service
+!	FINDASC	    -	$FIND for ASCII files
+!       FINDIMA     -   $FIND for IMAGE files
+!	FINDSEQ	    -	$FIND for Sequential files
+!	FINDREL	    -	$FIND for Relative files
+!	FINDIDX	    -	$FIND for Indexed files
+!
+!
+! INCLUDE FILES:
+!
+
+REQUIRE 'rmsreq';
+
+!
+! MACROS:
+!
+!   None.
+!
+! EQUATED SYMBOLS:
+!
+!   None.
+!
+! OWN STORAGE:
+!
+!   None.
+!
+! EXTERNAL REFERENCES:
+!
+EXTERNAL ROUTINE
+    F$Find;
+
+%SBTTL '$FIND - $FIND dispatcher'
+
+GLOBAL ROUTINE $find (rabblock, errorreturn) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	$FIND performs all processing of a $FIND macro.  It
+!	is not called directly by any other routine within
+!	RMS-20, but is called only from the primary RMS
+!	dispatcher.
+!
+! FORMAL PARAMETERS
+!
+!	RABBLOCK	-   address of user Record Access Block
+!		RABISI	-   Internal stream identifier
+!		RABKBF	-   key buffer address (REL/IDX)
+!		RABKRF	-   key of reference (IDX)
+!		RABKSZ	-   size of key in buffer (IDX)
+!		RABRAC	-   record access
+!		RABRFA	-   record's file address (RFA access)
+!		RABROP	-   record options
+!		    RAH	-   Read-Ahead
+!		    KGT	-   Key greater than (IDX)
+!		    KGE	-   Key greater than or equal to (IDX)
+!
+!		    * RAB fields output *
+!
+!		RABBKT	-   relative record number of target (REL)
+!		RABRFA	-   record's file address
+!		RABSTS	-   status of operation
+!		RABSTV	-   secondary status
+!
+!	ERRORRETURN	-   address of user error routine
+!
+! IMPLICIT INPUTS
+!
+!	?
+!
+! ROUTINE VALUE:
+!
+!	None, yet not novalue.
+!
+! SIDE EFFECTS:
+!
+!	?
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	!
+	!	Data blocks for indexed files
+	recdesc : BLOCK [rdsize],		! Record descriptor
+	databd : BLOCK [bdsize];		! Bucket descriptor
+
+    rmsentry ($find);
+!+
+!   Fetch the user's RAB and error address.
+!-
+    rab = .rabblock;				! Get RAB address
+    erradr = .errorreturn;			!   and user error address
+    rsetup (true);				! A $FIND is legal always
+
+
+!+
+!   Check for a remote file.  If it is use the DAP routine instead.
+!-
+
+    IF .Fst[Fst$v_Remote]
+    THEN                                                                !m555
+        Dap$Find( .Rab, .erradr )
+    ELSE
+!+
+!   We now can dispatch to the correct routine to locate the
+!   target record.  Notice that for all file organizations
+!   except indexed, all parameters are stored in the Record
+!   Status Table.  For indexed files, however, we must pass
+!   a Record Descriptor and a Bucket Descriptor.  These
+!   arguments are not used by this routine, but since they
+!   are required for $GET, they will be passed fo FINDIDX.
+!-
+
+    CASE fileorg FROM 0 TO Fab$k_Idx OF
+	SET
+
+	[0] :                           ! Non-RMS file
+            SELECT .Fst[Fst$h_File_Class] OF    		!a504 vv
+                SET
+                [0, Typ$k_Ascii]:
+                    findasc ( true );                 ! ASCII           !m575
+                [Typ$k_Image, Typ$k_Byte]:
+                    findima ( true );                 ! IMAGE           !m575
+                [OTHERWISE]:
+                    BEGIN
+                    F$Find( .Rab );                                     !m524 
+		    usrstv = .rab [rab$h_stv];	! Return STV value	!A565
+
+                    IF NOT $Rms_Status_Ok( .Rab )                       !a524
+                    THEN Usererror( .Rab[Rab$h_Sts] );                  !a524
+                    END;
+                TES;                                             !a504 ^^
+
+	[Fab$k_Seq] :
+	    findseq ();				! Sequential
+
+	[Fab$k_Rel] :
+	    findrel ();				! Relative
+
+	[Fab$k_Idx] :
+	    findidx (recdesc, databd)		! Indexed
+	TES;
+
+    setsuccess;
+    usrret ()					! Exit to user
+    END;					! End of $FIND
+
+%SBTTL 'FINDASC - $FIND for ASCII'
+
+GLOBAL ROUTINE findasc ( eofcheck ) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Processes $FIND service for ASCII file.
+!
+! FORMAL PARAMETERS
+!
+!	EofCheck: Check for end-of-file if nonzero
+!
+! IMPLICIT INPUTS
+!
+!	RSTDATARFA  -	byte number of current record
+!	RSTRSZ	    -	size in bytes of current record
+!
+! ROUTINE VALUE:
+!
+!	None.
+!
+! SIDE EFFECTS:
+!
+!	?
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	sizeoflastrecrd,
+	temp;
+
+    TRACE ('FINDASC');
+!+
+!   RFA access:
+!-
+![2] Using RFA from RAB, set up buffer, count, and pointers
+
+    IF rfaadr
+    THEN
+	BEGIN
+
+	LOCAL
+	    pagenum,
+	    rfanum,
+	    pagebyte;
+
+	! Clear End-Of-File, this is random access
+	rst [rstflags] = .rst [rstflags] AND NOT flgeof;
+	rst [rstdatarfa] = rfanum = .rab [rabrfa, 0];
+	pagenum = .rfanum/ch_in_p;		! Get page number
+	pagebyte = .rfanum MOD ch_in_p;		! and byte within page
+	rst [rstnrp] = .pagenum;
+	readbuffer ();
+	! Read page containing start of record
+	! Point page pointer to correct place in buffer
+	rst [rstpagptr] = CH$PLUS (.rst [rstpagptr], .pagebyte);
+
+	! Is RFA past end of file? If so, give EOF error
+
+	IF .EofCheck AND (.rst [rstbytecount] LSS .pagebyte)           !m575
+        THEN usererror (er$eof);	! Record not found
+
+	! Update byte count
+	rst [rstbytecount] = .rst [rstbytecount] - .pagebyte;
+	RETURN true;
+	END;
+
+!+
+!   SEQuential access:
+!-
+!+
+!   If we are at EOF, then don't try finding a record.
+!-
+
+    IF .EofCheck AND endoffile THEN usererror (er$eof);                 !m575
+
+!+
+!   If the last RMS operation issued was a $FIND, or if the
+!   last record fetched was too big for the user's buffer
+!   (i.e., "partial" record), then we must skip a record and
+!   position ourselves to the next one.  In all other cases
+!   (i.e., the last JSYS was a $OPEN or $GET), we are
+!   already positioned at the correct place.
+!
+!   This module also must insure that the current record's
+!   starting address is maintained correctly.  This
+!   procedure varies depending upon the current file
+!   context.  For instance, if two successive $FINDs are
+!   done, a record must be skipped and its length added to
+!   the starting address of the last record.  If the last
+!   record access was a "partial" record, the length of that
+!   record must be added to its starting address, then the
+!   rest of the record must be skipped and the amount that
+!   was skipped also added into the current RFA address.
+!
+!   For normal conditions (i.e., a $FIND is done after a
+!   successful $GET or $FIND), then the length of the last
+!   record (i.e., current record to the user) must be added
+!   to its starting byte number to produce the address of
+!   the next record, which then immediately becomes the
+!   current record.  This entire process must also be done
+!   for sequenced files, except all bytes are in terms of
+!   words and the line-number must be accounted for in
+!   certain calculations.
+!-
+
+    IF (.rst [rstlastoper] EQL c$find) OR 	! If last RMS call was a $FIND
+	(partialflag NEQ 0)			!   or last record was too big.
+    THEN
+	BEGIN					! To skip a record
+
+	IF partialflag NEQ 0
+	THEN 					! We must update current RFA
+	    BEGIN
+	    sizeoflastrecrd = .rst [rstrsz];	! Get last record's size
+	    ! Compute start of this record
+	    rst [rstdatarfa] = .rst [rstdatarfa] + .sizeoflastrecrd;
+	    lookat ('	SIZEOFLAST: ', sizeoflastrecrd)
+	    END;
+
+	rst [rstrsz] = getascii (false);	! Skip a record
+	clrflag (rst [rstflags], flgpartial);	! Clear the partial flag
+	END;
+
+!+
+!   We must now update the RFA to point to the current
+!   record's starting address.
+!-
+    rst [rstdatarfa] = 				! Compute start of next record
+    .rst [rstdatarfa] + .rst [rstrsz];
+!+
+!   If this is a sequenced file, and if we need to update
+!   the file pointer (such as on a $FIND-$FIND sequence),
+!   then we must now move the file position to the next full
+!   word in the file.
+!-
+
+    IF sequenced AND (chkflag (rst [rstflags], flgupdptr) NEQ 0)
+    THEN
+	BEGIN					! Move to next full word
+	temp = (5 - .rst [rstdatarfa] MOD 5) MOD 5;
+	rst [rstdatarfa] = .rst [rstdatarfa] + .temp;
+	rst [rstbytecount] = .rst [rstbytecount] - .temp;
+	temp = .rst [rstpagptr];		! Get sub-field
+
+	IF .temp<30, 6> NEQ 36			! Word-aligned already?
+	THEN
+	    rst [rstpagptr] = POINT (.rst [rstpagptr] + 1, 36, 7);
+
+!+
+!   Clear the "update the pointer" flag.
+!-
+	clrflag (rst [rstflags], flgupdptr)
+	END;
+
+!+
+!   Return RFA to user
+!-
+    rab [rabrfa, 0] = .rst [rstdatarfa];	![2] Return RFA to user
+    RETURN true
+    END;					! End of FINDASC
+%SBTTL 'FINDIMA - $FIND for IMAGE'
+
+GLOBAL ROUTINE findima ( EofCheck ) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Processes $FIND service for IMAGE file.
+!
+! FORMAL PARAMETERS
+!
+!	EofCheck: Check for end-of-file if nonzero
+!
+! IMPLICIT INPUTS
+!
+!	RSTDATARFA  -	byte number of current record
+!	RSTRSZ	    -	size in bytes of current record
+!
+! ROUTINE VALUE:
+!
+!	None.
+!
+! SIDE EFFECTS:
+!
+!	?
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	sizeoflastrecrd,
+	temp;
+
+    TRACE ('FINDIMA');
+!+
+!   RFA access:
+!-
+![2] Using RFA from RAB, set up buffer, count, and pointers
+
+    IF rfaadr
+    THEN
+	BEGIN
+
+	LOCAL
+	    pagenum,
+	    rfanum,
+            bytesperpage,
+	    pagebyte;
+
+	! Check if last oper was sequential write
+        ! If so flush buffer
+        IF (.rst[rst$v_last_operation] EQL C$Put)
+        AND .rst[rst$v_last_sequential]
+        THEN WriteBuffer();
+
+	rst[rst$v_eof] = 0;        ! this is random access
+	rst [rstdatarfa] = rfanum = .rab [rabrfa, 0];
+        bytesperpage = %BPVAL/.Fst[Fst$h_Bsz]*pagesize;
+	pagenum = .rfanum/.bytesperpage;		! Get page number
+	pagebyte = .rfanum MOD .bytesperpage;		! and byte within page
+	rst [rstnrp] = .pagenum;
+	readbuffer ();
+	! Read page containing start of record
+	! Point page pointer to correct place in buffer
+	rst [rstpagptr] = CH$PLUS (.rst [rstpagptr], .pagebyte);
+	! Is RFA past end of file? If so, give EOF error
+
+	IF .EofCheck AND (.rst [rstbytecount] LSS .pagebyte)              !m575
+        THEN usererror (er$eof);	! Record not found
+
+	! Update byte count
+	rst [rstbytecount] = .rst [rstbytecount] - .pagebyte;
+        
+        rst[rst$v_last_sequential] = 0; ! This is not sequential
+	RETURN true;
+	END;
+
+
+!+
+!   SEQuential access:
+!-
+    rst[rst$v_last_sequential] = 1;     ! This is sequential           !a577
+
+!+
+!   If we are at EOF, then don't try finding a record.
+!-
+
+    IF .EofCheck AND EndofFile THEN usererror (er$eof);                !m575
+
+!+
+!   If the last RMS operation issued was a $FIND, or if the
+!   last record fetched was too big for the user's buffer
+!   (i.e., "partial" record), then we must skip a record and
+!   position ourselves to the next one.  In all other cases
+!   (i.e., the last JSYS was a $OPEN or $GET), we are
+!   already positioned at the correct place.
+!
+!   This module also must insure that the current record's
+!   starting address is maintained correctly.  This
+!   procedure varies depending upon the current file
+!   context.  For instance, if two successive $FINDs are
+!   done, a record must be skipped and its length added to
+!   the starting address of the last record.  If the last
+!   record access was a "partial" record, the length of that
+!   record must be added to its starting address, then the
+!   rest of the record must be skipped and the amount that
+!   was skipped also added into the current RFA address.
+!
+!   For normal conditions (i.e., a $FIND is done after a
+!   successful $GET or $FIND), then the length of the last
+!   record (i.e., current record to the user) must be added
+!   to its starting byte number to produce the address of
+!   the next record, which then immediately becomes the
+!   current record.  This entire process must also be done
+!   for sequenced files, except all bytes are in terms of
+!   words and the line-number must be accounted for in
+!   certain calculations.
+!-
+
+    IF (.rst [rstlastoper] EQL c$find) OR 	! If last RMS call was a $FIND
+	(partialflag NEQ 0)			!   or last record was too big.
+    THEN
+	BEGIN					! To skip a record
+
+	IF partialflag NEQ 0
+	THEN 					! We must update current RFA
+	    BEGIN
+	    sizeoflastrecrd = .rst [rstrsz];	! Get last record's size
+	    ! Compute start of this record
+	    rst [rstdatarfa] = .rst [rstdatarfa] + .sizeoflastrecrd;
+	    lookat ('	SIZEOFLAST: ', sizeoflastrecrd)
+	    END;
+
+	rst [rstrsz] = getimage (false);	! Skip a record
+	clrflag (rst [rstflags], flgpartial);	! Clear the partial flag
+	END;
+
+!+
+!   We must now update the RFA to point to the current
+!   record's starting address.
+!-
+    rst [rstdatarfa] = 				! Compute start of next record
+    .rst [rstdatarfa] + .rst [rstrsz];
+
+!+
+!   Return RFA to user
+!-
+    rab [rabrfa, 0] = .rst [rstdatarfa];	![2] Return RFA to user
+    RETURN true
+    END;					! End of FINDIMA
+
+%SBTTL 'FINDSEQ - $FIND for sequential file'
+
+GLOBAL ROUTINE findseq =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	FINDSEQ processes the $FIND service for RMS
+!	sequential files.
+!
+!	This routine exits directly to the user on an error.
+!
+! FORMAL PARAMETERS
+!
+!	None.
+!
+! IMPLICIT INPUTS
+!
+!	RSTDATARFA  -	byte number of current record
+!	RSTRSZ	    -	size in bytes of current record
+!
+! ROUTINE VALUE:
+!
+!	None, yet not NOVALUE.
+!
+! SIDE EFFECTS:
+!
+!	?
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	temp1,
+	recordlength,
+	crp : BLOCK [1],			! Byte number of current record
+	rfapagenum,				! Page number of current record
+	nrp,					! Byte number of next record
+	bytesword,				! Number of bytes in one word
+	header : BLOCK [1],			! Storage for record header
+	checkpageflag,				! On for RFA addressing,
+						!   off for sequential
+	valid;					! Flag for exit from loop
+
+    REGISTER
+	tempac;
+
+    TRACE ('FINDSEQ');
+!+
+!   For sequential access, we can  assume the next page exists  unless
+!   the current record address points to  the top of a page, in  which
+!   case we must check  for that page.  However,  for RFA or  relative
+!   addressing, we must check if the target page exists because if the
+!   file is only being read, we  will get an illegal instruction  trap
+!   if the page doesn't exist.  We can also clear the user's RFA field
+!   unless he is using RFA addressing.
+!-
+    checkpageflag = false;
+
+    IF seqadr                                                         !m567
+    THEN
+	BEGIN
+	rab [rabrfa, 0] = 0;			! Clear the RFA field
+	tempac = .rst [rstnrp];			! Next record pointer
+
+	IF (.tempac^w2p)^p2w EQL .tempac	! Top of new page
+	THEN
+	    checkpageflag = true;		! Check for EOF
+
+	END
+    ELSE 					! Must be sequential addressing
+	checkpageflag = true;			! Check for RFA addressing
+
+!+
+!   This is the main loop.  It continues until any of the
+!   following are found:
+!
+!	1)  Record unavailable
+!	2)  EOF
+!	3)  Valid record found
+!
+!-
+    valid = false;				! Set flag as invalid
+
+    WHILE .valid EQL false DO
+	BEGIN
+!+
+!   Fetch the user's record-access parameter (RAC) and use
+!   it to determine the location of the next record.
+!
+!-
+!+
+!   Save the current record address.
+!-
+
+	CASE recordaccess FROM RAB$K_SEQ TO RAB$K_BFT OF            !m570
+	    SET
+	    [RAB$K_SEQ,
+             RAB$K_TRA] : tempac =.rst [rstnrp];   ! Get NRP for sequential
+	    [RAB$K_KEY] : tempac =.UAddr(rab [rabkbf, 0]);  ! User's key buffer
+	    [RAB$K_RFA] : 
+!+
+!   If the current record address is less than the address
+!   of the first data record, or is greater than the maximum
+!   RFA, then there is an error.
+!-
+                        BEGIN
+                 	tempac = .rab [rabrfa, 0];      ! Get user's RFA
+
+                        IF (.tempac LSS .fst [fstlobyte])  ! Must be in
+                        OR	(.tempac GEQ bitn (8))     ! file data space
+                        THEN usererror (er$rfa);           ! Bad RFA
+                        END;
+
+            [RAB$K_BLK,
+             RAB$K_BFT]: Usererror( er$bug );   ! Should not get here
+	    TES;
+
+	crp = .tempac;
+!+
+!   Dequeue the current record.  Note that if a record is
+!   "found" twice in succession, RMS will still perform the
+!   $FINDs as two separate operations:  the record will be
+!   unlocked and then locked again.
+!-
+
+	IF datalocked
+        THEN unlock (rst [rstdatarfa]);	! Unlock the current record
+
+!+
+!   Fetch the record pointer and make it current.
+!-
+	rst [rstdatarfa] = .crp;		! Save record pointer for user
+!+
+!   If the current page is in our window, then we don't have
+!   to call an external routine to get it.
+!-
+	rfapagenum = .crp [rfapage];
+
+	IF (.currentwindow EQL 0) OR 		! There is no current bucket
+	    (.currentfilepage NEQ .rfapagenum)
+	THEN
+	    BEGIN				! Get the new page
+
+	    IF getwindow (.rfapagenum, 		! Page number
+		    .checkpageflag)		! Page must exist
+		EQL false
+	    THEN
+		BEGIN				! Page does not exist
+
+		IF rfaadr
+		THEN 				! RFA error
+		    usererror (er$rfa)
+		ELSE 				! End of file
+		    doeof ()
+
+		END;
+
+	    END;
+
+!+
+!   Now, the page we want is in our window.  We must set up
+!   a pointer to it in the RST.
+!-
+	tempac = (rst [rstpagptr] = (.curentbufferadr) + .crp [ofset]);
+!+
+!   The record is now available to us.  We must pick up the
+!   record header to see if it is a valid record.
+!-
+	header = ..tempac;
+!+
+!   If the header is an end-of-page marker, then we need to
+!   bump our pointer to the start of the next file page.
+!   This condition should occur only if the file has the
+!   FB$BLK attribute.
+!-
+
+	IF .header EQL eopmarker		! Check for end-of-page
+	THEN
+	    BEGIN				! Found end-of-page marker
+	    rtrace ('	End-of-page marker found');
+!+
+!   For RFA addressing, we can give an immediate error.
+!-
+
+	    IF rfaadr THEN usererror (er$rfa);
+
+	    IF blocked
+	    THEN 				! We can bump the pointer
+	    					!   to the next file page
+		nrp = (.crp OR ofsetmask) + %O'1'	! Bump to next page
+	    ELSE
+		rmsbug (msgeop);		! End-of-page marker found
+
+	    END
+	ELSE
+	    BEGIN
+	    lookat ('	Header read =  ', header);
+	    !
+	    !	Check that undefined bits in header are off.
+	    !
+
+	    IF .header [rhdrundef] NEQ 0	! Check unused part of header
+	    THEN
+		usererror (er$rfa);
+
+!+
+!   We will now compute the starting byte number of the next
+!   record.  We will do this by computing the number of full
+!   words this record occupies and adding the size of the
+!   record header.
+!-
+	    recordlength = sizeinwords (.header [rhdrsize], .fst [fstbsz]);
+	    nrp = .crp + .recordlength + headersize;
+	    lookat ('	Updated NRP = ', nrp);
+
+!++
+!   We must now check to see if this record actually exists,
+!   or if it has been deleted sometime in the past.  Before
+!   we can check the "valid" bit for sure, we must lock the
+!   record so than no one else can come in an delete it
+!   after we have already examined the deleted bit.
+!   However, the overhead for locking the record is extreme.
+!   Therefore, we will check the bit to see if the record
+!   exists or not.  If so, we will lock the record and check
+!   again.  If either check fails, the record has been
+!   deleted.  If it is deleted after we have checked the bit
+!   but before we can lock it, that's OK because we will
+!   continue and the record will be unlocked during the next
+!   pass through this loop.
+!--
+
+!+
+!   First, check that this record has been written; that is,
+!   if the "valid" bit is on.
+!-
+
+	    IF (.header AND rhdrvalid) EQL 0
+	    THEN 				! Is probably the EOF
+		BEGIN
+
+		IF rfaadr THEN usererror (er$rfa);	! Bad RFA
+
+		doeof ()			! Sequential access means EOF
+		END;
+
+	    IF (.header AND rhdrdelete) EQL 0
+	    THEN
+		BEGIN
+
+		IF locking THEN lockrec (crp);	! Lock record
+
+		header = .(.rst [rstpagptr])	! Re-fetch header
+		END;
+
+!+
+!   We now must check the header again to make sure it's
+!   still good.
+!-
+
+	    IF (.header AND rhdrdelete) EQL 0
+	    THEN
+		valid = true			! Leave the loop
+	    ELSE 				! Record has been deleted
+		BEGIN
+
+		IF rfaadr THEN usererror (er$del)
+
+		END
+
+	    END;
+
+!+
+!   Update all data pages.
+!-
+	rst [rstrszw] = .recordlength;		! Save record size in words
+	rst [rstrsz] = .header [rhdrsize];	! And in bytes
+
+	IF chkflag (rab [rabrop, 0], ropnrp) NEQ 0
+	THEN
+	    rst [rstnrp] = .crp			! Cause sequential GET to
+	    					!   always get found record
+	ELSE
+
+	    IF (seqadr) OR (currentjsys EQL c$get)	!
+	    THEN
+		rst [rstnrp] = .nrp;		! Update the NRP if
+
+						!   sequential access-mode
+	END;
+
+    !+
+    !   Fall thru as soon as a valid record is found.
+    !-
+
+    lookat ('	Record found at: ', crp);
+    lookat ('	NRP = ', nrp);
+!+
+!   Set up the user's RFA because the operation was OK.
+!-
+    rab [rabrfa, 0] = .rst [rstdatarfa];
+    RETURN true
+    END;					! End of FINDSEQ
+
+%SBTTL 'FINDREL - $FIND for relative file'
+
+GLOBAL ROUTINE findrel =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Processor for $FIND service for a relative file.
+!
+!	If FB$SMU is set in the FAC field, then return the
+!	page number containing the record in the LSN field
+!	of the user's RAB.  Zero LSN if a SMU find fails.
+!
+! FORMAL PARAMETERS
+!
+!	None.
+!
+! IMPLICIT INPUTS
+!
+!	?
+!
+! ROUTINE VALUE:
+!
+!	None.
+!
+! SIDE EFFECTS:
+!
+!	?
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	crp,
+	tempnrp,
+	header : BLOCK [1],
+	temp,
+	currentemtpage,				! Page number already checked
+						!   to see if it exists
+	valid,
+	bytenum : BLOCK [1];
+
+    REGISTER
+	tempac;					! AC for temporary calculations
+
+    TRACE ('FINDREL');
+!+
+!   Especially for FB$SMU, zero the LSN field of the RAB.
+!-
+
+    IF (.fab [fabfac, 0] AND fb$smu) NEQ 0	! SMU set?
+    THEN
+	rab [rablsn, 1] = 0;			! Zero the LSN
+
+!+
+!   Loop until a valid record is found.
+!-
+    valid = false;				! Assume record is not valid
+    currentemtpage = 0;				! Clear this value
+!+
+!   In this loop, we will update the user's permanent NRP
+!   only when a good record is found.  This is to avoid the
+!   situation which would arise if the user tried to read a
+!   record, when he was already at the last record in the
+!   file.  In such a case, it is important that his NRP not
+!   be changed from what it was before he attempted to read
+!   the record.  There is a small drawback to this
+!   technique, though.  If the user tries to read a record,
+!   and the only one on thecurrent page is locked by
+!   someone else, he will get an error message (as he
+!   should), but his NRP will not have been changed from
+!   what it was before he did the $GET.
+!-
+    tempnrp = .rst [rstnrp];			! Don't update real NRP until
+    						!   operation succeeds
+
+    WHILE .valid EQL false DO
+	BEGIN
+!+
+!   Fetch the address of the target record, which depends on
+!   the user's record-access (RAC) field value.
+!-
+	crp = (CASE recordaccess FROM racseq TO racrfa OF
+	    SET
+	    [racseq] : .tempnrp;		! Sequential (CRP = NRP)!M420
+	    [rackey] : 				! Key retrieval		!M420
+		BEGIN				! Fetch key value	!A420
+
+		LOCAL 				!			!A420
+		    kbuf;			! For building global	!A420
+
+		kbuf = .rab [rabkbf, 0];	! User's key buffer	!A420
+
+		IF .kbuf<lh> EQL 0		! Local address?	!A420
+		THEN 				!			!A420
+		    kbuf = .kbuf OR .blksec;	! Yes - build global	!A420
+
+		..kbuf				! Return key value	!A420
+		END;				!			!A420
+	    [racrfa] : .rab [rabrfa, 0];	! RFA (CRP = RFA)	!M420
+	    TES);
+!+
+!   Unlock the current record.
+!-
+
+	IF datalocked THEN unlock (rst [rstdatarfa]);
+
+!+
+!   Store the current record number in the RST.
+!-
+	rst [rstdatarfa] = .crp;		! Set CRP in user's RAB
+!+
+!   Find the starting byte address of this record.
+!-
+
+	IF (bytenum = numbertorfa (.crp)) EQL false
+	THEN
+	    BEGIN				! Record number was beyond MRN
+!+
+!   The record number of the target record was greater than
+!   the maximum record number of the file.  If the user was
+!   processing the file sequentially, then he should get an
+!   EOF error; otherwise, he should get a record-not-found
+!   error.
+!-
+
+	    IF seqadr THEN doeof ();
+
+	    usrsts = er$key;			! Assume key error
+
+	    IF rfaadr THEN usrsts = er$rfa;
+
+	    usrerr ()				! Exit to user
+	    END;
+
+!+
+!   We must now position to the target record.  However, we
+!   must also check to see if the page exists.  If not, then
+!   we may be through (if key access is being user).  If it
+!   does exist, then we can go ahead and read it.
+!-
+
+	IF gtbyte (.bytenum, 			! RFA address
+		true)				! Abort if non-existent
+	    EQL false
+	THEN
+	    BEGIN				! Found a non-existent page
+
+	    IF ( NOT seqadr)			! Record not found?
+	    THEN
+		usererror (er$rnf);
+
+!+
+!   This page is non-existent.  This could be caused either
+!   by a sparse file, or by the true last page in the file.
+!   If the file is sparse (there is more to come), then we
+!   will continue to process it.  But if we have reached the
+!   last page in the file, we must give an EOF error return.
+!-
+
+	    IF (tempac = .bytenum [rfapage]) NEQ (.currentemtpage)
+	    THEN
+		BEGIN				! We must check this page
+		tempac = nextpage (.fst [fstjfn], .tempac);
+
+		IF .tempac EQL false
+		THEN
+		    doeof ()			! If no more pages, it's EOF
+		ELSE
+		    currentemtpage = .tempac;	! Remember this page
+
+		END
+
+	    END
+	ELSE
+	    BEGIN
+	    header = .(.rst [rstpagptr]);	! Fetch header
+
+	    IF .header EQL eopmarker THEN rmsbug (msgptr);	! Bad header found
+
+	    IF (.header [rhdrundef] NEQ 0) THEN usererror (er$rfa);	! Bad RFA
+
+!+
+!   Check to see if this record has been written.
+!-
+
+	    IF (.header AND rhdrvalid) EQL 0
+	    THEN 				! The record was never created
+		BEGIN
+		rab [rabrfa, 0] = 0;		! Zap RFA
+
+		IF NOT seqadr THEN usererror (er$rnf);
+
+		END
+	    ELSE 				! The record was written once
+		BEGIN
+
+		IF (.header AND rhdrdelete) EQL 0
+		THEN
+		    BEGIN
+
+		    IF locking THEN lockrec (crp);
+
+		    header = .(.rst [rstpagptr])
+		    END;
+
+!+
+!   Recheck the record header.
+!-
+
+		IF (.header AND rhdrdelete) EQL 0	! Check delete bit
+		THEN
+		    valid = true		! Set flag so we'll fall thru
+		ELSE 				! The record is deleted
+		    BEGIN
+!+
+!   Decide what to do depending on RAC value.
+!-
+
+		    CASE recordaccess FROM 0 TO 2 OF
+			SET
+
+			[0] :
+			    0;			! Sequential--do nothing
+
+			[1] :
+			    usererror (er$rnf);	! Key
+
+			[2] :
+			    usererror (er$del)	! RFA
+			TES;
+
+		    rab [rabrfa, 0] = 0
+		    END
+
+		END
+
+	    END;
+
+	lookat ('	Record header: ', header);
+!+
+!   Update user's parameter block.
+!-
+
+	IF (seqadr) OR (currentjsys EQL c$get)	!
+	THEN
+	    tempnrp = .crp + 1;			! Update loop variable to CRP+1
+
+!+
+!   Store the size in bytes and words of this record.
+!-
+	rst [rstrsz] = .header [rhdrsize];	! Save size of this record
+	rst [rstrszw] = sizeinwords (.rst [rstrsz], .fst [fstbsz])
+	END;
+
+    IF (chkflag (rab [rabrop, 0], ropnrp) NEQ 0) AND 	! NRP?
+	(currentjsys EQL c$find)		!   and $FIND?
+    THEN
+	rst [rstnrp] = .crp			! Make sequential GET to
+						!   always be found record
+    ELSE
+
+	IF (seqadr) OR (currentjsys EQL c$get)	!
+	THEN
+	    rst [rstnrp] = .crp + 1;		! Update the NRP if sequential
+
+    						!   access-mode
+!+
+!   Store the number of the current record in the RABBKT
+!   field.  Note that if there is an error later during the
+!   processing of this record, the BKT field will still
+!   contain the number of the target record.  Thus, users
+!   should not assume that a non-zero record number in BKT
+!   reflects a successful operation.
+!-
+    rab [rabrfa, 0] = (rab [rabbkt, 0] = .crp);
+!+
+!   If we are doing a $FIND with FB$SMU set, return
+!   the record's page number in the relative file
+!   so LIBOL can do some locking.
+!-
+
+    IF (.fab [fabfac, 0] AND fb$smu) NEQ 0	! SMU in progress?
+    THEN
+	rab [rablsn, 1] = .bytenum [rfapage];	! Return the page number
+
+    RETURN true
+    END;					! End of FINDREL
+
+%SBTTL 'FINDIDX - $FIND for ISAM file'
+
+GLOBAL ROUTINE findidx (			! Find indexed record
+    recdesc : REF BLOCK, 			! Record descriptor
+    databd : REF BLOCK				! Bucket descriptor
+    ) : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Routine to perform the $FIND service for an indexed
+!	file.  This routine is called also by the $GET
+!	processor in order to position to the correct
+!	record.
+!
+!	If there is an error during this routine, it will
+!	not return but will exit directly to the user.
+!
+! FORMAL PARAMETERS
+!
+!	RECDESC	    -	Record descriptor packet
+!	    RFA	    -	RFA of target record (returned)
+!	    RRV	    -	RRV address of target record (returned)
+!
+!	DATABD	    -	Data bucket descriptor, all fields
+!			returned.
+!
+! IMPLICIT INPUTS
+!
+!	RAB	    -	User's Record Access Block
+!	    RABRAC  -	Record access value
+!	    RABKRF  -	Key of reference
+!
+! ROUTINE VALUE:
+!
+!	None.
+!
+! SIDE EFFECTS:
+!
+!	?
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	bdptr : REF BLOCK,			! Current bucket descriptor
+	savedstatus,				! Store status here
+	nextbucket,				! Next bucket for read-ahead
+	bucketsize,				! Size of a bucket
+	tptr : REF BLOCK,			! Temp pointer
+	nextbd : BLOCK [bdsize],		! Descriptor of next bucket
+	lockaccess,				! Shared/exclusive
+	recordptr : REF BLOCK;			! Current record
+
+    TRACE ('FINDIDX');
+    kdb = .fst [fstkdb];			! Set up primary KDB
+    !
+    !   Clear some fields in the Record Descriptor which we will
+    !   pass to the lower level routines.
+    !
+    recdesc [rdstatus] = 0;			! Clear status bits
+    recdesc [rdflags] = rdflghorizok;		! Horizontal search OK
+    fetchcurrentbkt (databd);			! Set current bucket to null
+!+
+!   Dispatch to the correct routine.
+!-
+
+    IF seqadr
+    THEN
+	BEGIN					! Sequential access
+	setnullbd (cbd);			! Indicate no current bucket
+	savedstatus = fidxseq (.recdesc, .databd);
+	END
+    ELSE
+	BEGIN					! Random access
+!+
+!   We can release the current bucket because since this is
+!   a random access, it is unlikely that both the target
+!   record and the current record are in the same bucket.
+!-
+	releascurentbkt;
+!+
+!   We must now lock the entire index structure so that we
+!   can move around the file at will until we reach the
+!   target record.
+!-
+
+	IF locking
+	THEN
+	    BEGIN
+
+	    IF lockindex (enqblk, enqshr) EQL false	! Wait, shared
+	    THEN
+		returnstatus (er$edq);		! Shouldn't fail
+
+	    END;
+
+!+
+!   Dispatch to correct routine depending on record access.
+!-
+
+	IF keyadr THEN savedstatus = fbykey (.recdesc, .databd) ELSE savedstatus = frecrfa (.recdesc, .databd)
+
+	;
+	END;
+
+!+
+!   At this point, we have either succeeded or failed in
+!   our efforts to locate the next record.  However, in
+!   either case, we may have locked the index of the file
+!   which now must be unlocked.  Also, if we located the
+!   target record, we must lock its bucket if we have not
+!   already done so.
+!-
+
+    IF locking AND .savedstatus NEQ false
+    THEN
+	BEGIN					! Do some unlocking & locking
+!+
+!   Lock the bucket if it is not locked.
+!-
+
+	IF ( NOT bktlocked (databd))
+	THEN
+	    BEGIN				! Lock the bucket descriptor
+	    lockaccess = enqshr;		! Assume read-only
+
+	    IF NOT inputmode THEN lockaccess = enqexc;
+
+	    rtrace ('	Locking the bucket...');
+
+	    IF lockbd (databd, enqaa, .lockaccess) EQL false
+	    THEN
+		BEGIN
+		rtrace ('	***Lock already locked');
+		savedstatus = false;		! Return failure
+		putbkt (false, 			! No update
+		    .databd);			! Bucket
+		usrsts = er$rlk			! Set error code
+		END
+
+	    END;
+
+!+
+!   It is possible that another user could have deleted this
+!   record between the time we found it and locked it.  If
+!   this is the case, unlock the buffer and say the record
+!   was never found.
+!-
+	recordptr = .recdesc [rdrecptr];
+
+	IF deleteflag (recordptr) EQL 1
+	THEN
+	    BEGIN				! Record actually deleted
+	    rtrace ('	Unlocking bucket - record deleted!');
+	    unlockbucket (.databd [bkdbktno]);
+	    savedstatus = false;		! Return failure
+	    usrsts = er$rnf			! Set error code
+	    END;
+
+	END;
+
+!+
+!   Unlock the index structure, if necessary.
+!-
+
+    IF indexlocked THEN unlockindex;
+
+!+
+!   We have now done the $FIND.  Was it OK?
+!-
+
+    IF .savedstatus EQL false
+    THEN
+	BEGIN
+	rtrace ('	Error in $FIND...');
+	!
+	!   Clear the user's RFA and our record pointer.
+	!
+	rst [rstdatarfa] = 0;
+
+	IF NOT rfaadr THEN rab [rabrfa, 0] = 0;
+
+	usrerr ()				! Exit to user
+	END;
+
+!+
+!   The $FIND was successful.  We must now save the current
+!   RFA and the current bucket.  However, if we are
+!   currently processing a $GET macro, then we should return
+!   without performing the normal clean-up operations, which
+!   will be done in the $GET routine.
+!-
+    setcurrentbkt (databd);			! SAVE CURRENT BKT
+!+
+!   Save the pointer to the current record and set the
+!   record size of this record (this is used only on $UPDATE
+!   to check if the record size has been changed by the
+!   user.  If record-length modification is supported, then
+!   this operation is unnecessary.
+!-
+    rst [rstpagptr] = (recordptr = .recdesc [rdrecptr]);
+
+    IF fixedlength				! What format?
+    THEN
+	rst [rstrsz] = .fst [fstmrs]		! Get record size from FST
+    ELSE
+	rst [rstrsz] = .recordptr [drrecsize];	! Get it from the record
+
+    rst [rstrszw] = sizeinwords (.rst [rstrsz], .fst [fstbsz]);
+
+    IF currentjsys EQL c$get THEN RETURN;	! Leave if we are $GETting
+
+!+
+!   Update the Next-Record-Pointer data in the RST.
+!-
+    setnrp (.recdesc, .databd);			! Update data base
+!+
+!   Set up the RFA in the user's RAB.
+!-
+    rab [rabrfa, 0] = .recdesc [rdrrv];
+    RETURN;
+    END;					! End of FINDIDX
+
+END						! End of Module FINDER
+
+ELUDOM
+    

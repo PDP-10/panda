@@ -1,0 +1,787 @@
+MODULE xpnpmr (
+               %BLISS36 ( ENTRY (XPN$PMR) )
+              ) =
+BEGIN
+!
+!  COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1981, 1986.
+!  ALL RIGHTS RESERVED.
+!  
+!  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!  COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!  THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!  ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!  AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!  SOFTWARE IS HEREBY TRANSFERRED.
+!  
+!  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!  NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!  EQUIPMENT CORPORATION.
+!  
+!  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!  ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+
+!++
+! FACILITY:
+!   XPN, the Transportable DECNET Interface for BLISS, TOPS-20 version.
+!
+! ABSTRACT:
+!   This module provides poor-man's routing for XPN callers.
+!
+! ENVIRONMENT:
+!   TOPS-20 user mode, XPORT.
+!
+! AUTHOR: Larry Campbell, CREATION DATE: October 5, 1982
+!
+! MODIFIED BY:
+!
+!--
+
+
+LINKAGE
+    tlook_linkage =
+        PUSHJ (; REGISTER = 2) :
+        LINKAGE_REGS (15, 14, 1);
+!
+! TABLE OF CONTENTS:
+!
+FORWARD ROUTINE
+    xpn$pmr,
+    init_node_table: NOVALUE,
+    tbl_lookup : tlook_linkage,
+    tbl_enter : NOVALUE,
+    do_pmr,
+    negotiate,
+    report_error : NOVALUE,
+    report_success : NOVALUE;
+!
+! INCLUDE FILES:
+!
+LIBRARY 'BLI:XPORT';
+LIBRARY 'BLI:MONSYM';
+REQUIRE 'JSYSDEF';
+LIBRARY 'BLI:TENDEF';
+LIBRARY 'BLISSNET';
+!
+! MACROS:
+!
+MACRO
+    alphanumerics =
+        'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789' %;
+
+!
+! EQUATED SYMBOLS:
+!
+$FIELD
+    node_block_fields =
+        SET
+        node_name = [$DESCRIPTOR (DYNAMIC)],
+        node_path = [$DESCRIPTOR (DYNAMIC)],
+        node_next_block = [$ADDRESS],
+        node_real_name = [$ADDRESS],
+        node_bits = [$BITS (16)],
+            $OVERLAY (node_bits)
+            node_synonym = [$BIT]
+            $CONTINUE
+        TES;
+
+LITERAL
+    node_block_length = $FIELD_SET_SIZE,
+    maximum_nodes = 1300;
+!
+! OWN STORAGE:
+!
+OWN
+    term_line_no : INITIAL (0),
+    term_iob : $XPO_IOB (),
+    node_table : VECTOR [maximum_nodes + 1] INITIAL (0);
+!
+! EXTERNAL REFERENCES:
+!
+EXTERNAL ROUTINE
+    xpn$errmsg : NOVALUE;
+
+GLOBAL ROUTINE xpn$pmr (p_nlb) = 
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Open a link, using pass-through if necessary.
+!   This routine first tries a direct link (does $XPN_OPEN directly).
+!   If that fails with "no path", then we look in the node table
+!   for a path or paths.  If we find one, we try it.
+!
+! FORMAL PARAMETERS:
+!   p_nlb       - pointer to the NLB for the link
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   NONE
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+    BEGIN
+
+    BIND
+        nlb = .p_nlb : $XPN_NLB ();
+
+    LOCAL
+        original_timeout,
+        retcode;
+    !
+    ! This stuff is valid only for active links, and only for format 0 connects
+    !
+    IF (NOT .nlb[NLB$V_ACTIVE])
+        OR (.nlb[NLB$B_REM_FORMAT] NEQ 0)
+    THEN
+        RETURN (XPN$_BAD_FLAGS);
+    !
+    ! First try a direct link.  OPTION = PMR implies OPTION = WAIT.
+    !
+    original_timeout = .nlb[NLB$B_TIMEOUT];
+    IF (retcode = $XPN_OPEN (NLB = nlb, OPTION = WAIT, FAILURE = 0))
+    THEN
+        RETURN (.retcode);
+    !
+    ! If the failure was "access not permitted", then there's no point
+    ! trying alternate paths.
+    !
+    IF .retcode EQL XPN$_NO_ACCESS
+    THEN
+        RETURN (.retcode);
+    !
+    ! Direct link failed.  Make sure node table is full and try PMR.
+    !
+    IF .node_table[0] EQL 0
+    THEN
+        init_node_table ();
+    nlb[NLB$B_TIMEOUT] = .original_timeout;
+    RETURN (do_pmr (nlb))
+    END;                                ! End of xpn$pmr
+
+ROUTINE init_node_table : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Parse SYSTEM:DECNET-HOSTS.TXT and fill in our node table.
+!   The node table is a TBLUK-style table whose left halves point
+!   to node name strings and whose right halves point to node_blocks.
+!
+! FORMAL PARAMETERS:
+!   NONE
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   NONE
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+    BEGIN
+
+    LOCAL
+	node_file : $XPO_IOB (),
+        line_scan : $STR_DESCRIPTOR (CLASS = BOUNDED),
+        node_descr : $STR_DESCRIPTOR (),
+        node_block : REF BLOCK [node_block_length] FIELD (node_block_fields);
+
+    LABEL
+        loop;
+
+    $XPO_IOB_INIT (IOB = node_file, FILE_SPEC = 'SYSTEM:DECNET-HOSTS.TXT',
+                   OPTIONS = INPUT);
+    IF NOT $XPO_OPEN (IOB = node_file)
+    THEN
+        RETURN;
+    node_table[0] = maximum_nodes;
+    WHILE $XPO_GET (IOB = node_file)
+    DO
+loop:   BEGIN
+        LOCAL
+            char,
+            table_index;
+        $STR_DESC_INIT (DESCRIPTOR = line_scan, CLASS = BOUNDED,
+                        STRING = node_file[IOB$T_STRING]);
+        !
+        ! Skip leading spaces
+        !
+        $STR_SCAN (REMAINDER = line_scan, SPAN = ' ',
+                   SUBSTRING = line_scan, DELIMITER = char);
+        !
+        ! Check for comments
+        !
+        IF (.char EQL %C'!') OR (.char EQL %C';')
+        THEN
+            LEAVE loop;
+        !
+        ! OK, this must be a node name, span alphanumerics
+        !
+        $STR_SCAN (REMAINDER = line_scan, SPAN = alphanumerics,
+                   SUBSTRING = line_scan, DELIMITER = char);
+        !
+        ! If delimiter is not comma or equal-sign, ignore this line
+        !
+        IF (.char NEQ %C',')    !*** temp ***  AND (.char NEQ %C'=')
+        THEN
+            LEAVE loop;
+        !
+        ! Copy the node name
+        !
+        $STR_DESC_INIT (DESCRIPTOR = node_descr, STRING = line_scan);
+        !
+        ! Skip the comma
+        !
+        $STR_SCAN (REMAINDER = line_scan, SPAN = ', ',
+                   SUBSTRING = line_scan);
+        !
+        ! Now span alphanumerics and colons.  This is the path string.
+        !
+        $STR_SCAN (REMAINDER = line_scan, SPAN = %STRING (alphanumerics, ':'),
+                   SUBSTRING = line_scan);
+        IF .line_scan[STR$H_LENGTH] EQL 0
+        THEN
+            LEAVE loop;
+        !
+        ! Allocate a node block and fill it in.
+        !
+        $XPO_GET_MEM (FULLWORDS = node_block_length, FILL = 0,
+                      RESULT = node_block);
+        $STR_DESC_INIT (DESCRIPTOR = node_block[node_name], CLASS = DYNAMIC);
+        $STR_DESC_INIT (DESCRIPTOR = node_block[node_path], CLASS = DYNAMIC);
+        $STR_COPY (TARGET = node_block[node_name],
+                   STRING = node_descr);
+        $STR_COPY (TARGET = node_block[node_path],
+                   STRING = line_scan);
+        !
+        ! Now check to see if this node is already in the node table.
+        !
+        IF tbl_lookup (node_table, node_descr; table_index)
+        THEN
+            BEGIN
+            !
+            ! This node already has an entry...  append this node block
+            ! to the end of the chain of node blocks
+            !
+            LOCAL
+                blk : REF BLOCK [node_block_length] FIELD (node_block_fields);
+            blk = .(.table_index)<0, 18>;
+            WHILE .blk[node_next_block] NEQ 0
+            DO
+                blk = .blk[node_next_block];
+            blk[node_next_block] = .node_block;
+            END
+        ELSE
+            !
+            ! Not in the table... enter it then
+            !
+            tbl_enter (node_table, node_descr, .node_block);
+        END;                            ! loop
+    $XPO_CLOSE (IOB = node_file);
+    END;                                ! End of init_node_table
+
+ROUTINE do_pmr (p_nlb) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Do poor-man's route-through negotiation for a link.  If we're successful,
+!   the link referred to by the NLB is open just as if a direct connection
+!   existed.  If any errors occur, we return XPN$_PMR_ERROR.
+!
+! FORMAL PARAMETERS:
+!   p_nlb       - pointer to NLB for link.
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   NONE
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+    BEGIN
+
+    BIND
+        nlb = .p_nlb : $XPN_NLB (),
+        node_name_descr = .nlb[NLB$A_NODE_NAME] : $STR_DESCRIPTOR ();
+
+    LOCAL
+	current_node_block : REF BLOCK [node_block_length]
+                                 FIELD (node_block_fields);
+
+    IF NOT tbl_lookup (node_table, node_name_descr; current_node_block)
+    THEN
+        RETURN (XPN$_NOSUCHNODE);
+    current_node_block = .(.current_node_block)<0, 18>;
+    !
+    ! Now, for each possible path, try negotiating a link
+    !
+    WHILE .current_node_block NEQ 0
+    DO
+        BEGIN
+        LOCAL
+            original_timeout,
+            retcode;
+        original_timeout = .nlb[NLB$B_TIMEOUT];
+        !
+        ! If we succeed, or fail with access denied, return now
+        !
+        IF (retcode = negotiate (nlb, current_node_block[node_path]))
+            OR (.retcode EQL XPN$_NO_ACCESS)
+        THEN
+            RETURN (.retcode);
+        nlb[NLB$B_TIMEOUT] = .original_timeout;
+        current_node_block = .current_node_block[node_next_block];
+        END;
+    RETURN (XPN$_UNREACH)
+    END;                                ! End of xpn$$do_pmr
+
+ROUTINE tbl_enter (p_table, p_descr, datum) : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Add an entry to a TBLUK-style table.
+!
+! FORMAL PARAMETERS:
+!   p_table             - pointer to table
+!   p_descr             - address of descriptor for ID string
+!   datum               - datum for entry
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   NONE
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+    BEGIN
+
+    BIND
+        descr = .p_descr : $STR_DESCRIPTOR (),
+        table = .p_table : VECTOR [0];
+
+    LOCAL
+        asciz_descr : $STR_DESCRIPTOR (),
+        ac2;
+
+    $STR_DESC_INIT (DESCRIPTOR = asciz_descr, CLASS = DYNAMIC);
+    $STR_COPY (TARGET = asciz_descr,
+               STRING = $STR_CONCAT (descr, %CHAR (0)));
+    ac2<18, 18> = .asciz_descr[STR$A_POINTER] + 1;
+    ac2< 0, 18> = .datum;
+    JSYS_TBADD (table, .ac2)
+
+    END;                                ! End of tbl_enter
+
+ROUTINE tbl_lookup (p_table, p_descr; index) : tlook_linkage =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Look an entry up in a TBLUK-style table.
+!
+! FORMAL PARAMETERS:
+!   NONE
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   0           - failure, entry not found
+!   1           - success, index gets index into table
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+    BEGIN
+
+    BIND
+        table = .p_table : VECTOR [0],
+        descr = .p_descr : $STR_DESCRIPTOR ();
+
+    LOCAL
+        asciz_descr : $STR_DESCRIPTOR (),
+        asciz_buff : VECTOR [CH$ALLOCATION (40)],
+        bits : MONWORD;
+
+    $STR_DESC_INIT (DESCRIPTOR = asciz_descr,
+                    STRING = (40, CH$PTR (asciz_buff)));
+    $STR_COPY (TARGET = asciz_descr,
+               STRING = $STR_CONCAT (descr, %CHAR (0)));
+    IF NOT JSYS_TBLUK (table, .asciz_descr[STR$A_POINTER]; index, bits)
+    THEN
+        RETURN (0);
+    IF .bits[TL_EXM]
+    THEN
+        RETURN (1)
+    ELSE
+        RETURN (0)
+
+    END;                                ! End of tbl_lookup
+
+ROUTINE negotiate (p_nlb, p_path_descr) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Negotiate a poor-man's routing link.
+!
+! FORMAL PARAMETERS:
+!   p_nlb               - pointer to the NLB
+!   p_path_descr        - pointer to descriptor for path string of the
+!                         form:  "NODE1::NODE2::NODE3::"
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   Success:
+!        XPN$_NORMAL            - link successfully negotiated
+!   Failure:
+!        XPN$_PMR_ERROR         - any failure
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+    BEGIN
+
+    BIND
+        nlb = .p_nlb : $XPN_NLB (),
+        path_descr = .p_path_descr : $STR_DESCRIPTOR ();
+
+    LOCAL
+        path_scan : $STR_DESCRIPTOR (CLASS = BOUNDED),
+        real_node_name,
+        real_object,
+        real_username,
+        real_password,
+        real_account,
+        first_node_descr : $STR_DESCRIPTOR (),
+        empty : $STR_DESCRIPTOR (),
+        optional_data_descr : $XPN_DESCRIPTOR (),
+        optional_data : VECTOR [CH$ALLOCATION (2)],
+        retcode,
+        length,
+        pointer;
+
+    $STR_DESC_INIT (DESCRIPTOR = path_scan, STRING = path_descr,
+                    CLASS = BOUNDED);
+    $STR_DESC_INIT (DESCRIPTOR = empty, STRING = (0, 0));
+    !
+    ! Preserve the "real" node name and access info period for later
+    !
+    real_node_name = .nlb[NLB$A_NODE_NAME];
+    real_object = .nlb[NLB$B_REM_OBJTYP];
+    real_username = .nlb[NLB$A_USER_ID];
+    real_password = .nlb[NLB$A_PASSWORD];
+    real_account = .nlb[NLB$A_ACCOUNT];
+    !
+    ! Scan off the first node name in the path
+    !
+    $STR_SCAN (REMAINDER = path_scan, STOP = ':',
+               SUBSTRING = path_scan);
+    $STR_DESC_INIT (DESCRIPTOR = first_node_descr, CLASS = FIXED,
+                    STRING = path_scan);
+    !
+    ! Point the NLB to that node name, zero access info, set PMR object type
+    !
+    nlb[NLB$A_NODE_NAME] = first_node_descr;
+    nlb[NLB$A_ACCOUNT] = 0;
+    nlb[NLB$A_PASSWORD] = 0;
+    nlb[NLB$A_USER_ID] = 0;
+    nlb[NLB$B_REM_OBJTYP] = XPN$K_PASS_THROUGH;
+    !
+    ! If we have a buffer request, build an optional data message for
+    ! PMR's benefit.  Note that we have to build it backwards, for
+    ! the little-endians (cf. "Gulliver's Travels", by Jonathan Swift)
+    !
+    IF .nlb[NLB$H_RECEIVE_MAX] NEQ 0
+    THEN
+        BEGIN
+        optional_data<28, 8> = .nlb[NLB$H_RECEIVE_MAX];
+        optional_data<20, 8> = .nlb[NLB$H_RECEIVE_MAX] ^ -8;
+        $XPN_DESC_INIT (DESCRIPTOR = optional_data_descr,
+                        BINARY_DATA = (2, optional_data))
+        END
+    ELSE
+        $XPN_DESC_INIT (DESCRIPTOR = optional_data_descr,
+                        BINARY_DATA = (0, 0));
+    !
+    ! Now do a waiting open... if this fails, restore stuff and quit.
+    !
+    IF NOT (retcode = $XPN_OPEN (NLB = nlb, FAILURE = 0,
+                                 STRING = optional_data_descr,
+                                 OPTION = WAIT))
+    THEN
+        BEGIN
+        report_error (nlb, path_descr);
+        nlb[NLB$A_NODE_NAME] = .real_node_name;
+        nlb[NLB$B_REM_OBJTYP] = .real_object;
+        nlb[NLB$A_USER_ID] = .real_username;
+        nlb[NLB$A_PASSWORD] = .real_password;
+        nlb[NLB$A_ACCOUNT] = .real_account;
+        RETURN (.retcode)
+        END;
+    !
+    ! OK, copy actual link info back into NLB
+    !
+    nlb[NLB$A_NODE_NAME] = .real_node_name;
+    nlb[NLB$B_REM_OBJTYP] = .real_object;
+    nlb[NLB$A_USER_ID] = .real_username;
+    nlb[NLB$A_PASSWORD] = .real_password;
+    nlb[NLB$A_ACCOUNT] = .real_account;
+    !
+    ! We now have an open link to the 1st node in the chain.  Skip
+    ! the colons after the node name and send the remainder string over
+    ! the link.  We contract the string by 2 to remove the last double colon.
+    !
+    $STR_SCAN (REMAINDER = path_scan, SPAN = ':',
+               SUBSTRING = path_scan);
+    length = .path_scan[STR$H_MAXLEN]
+             - (.path_scan[STR$H_PFXLEN] + .path_scan[STR$H_LENGTH] + 2);
+    pointer = CH$PLUS (.path_scan[STR$A_POINTER], .path_scan[STR$H_LENGTH]);
+    !
+    ! Make valid descriptors for access info -- if zero, empty descriptor
+    !
+    IF .real_username EQL 0 THEN real_username = empty;
+    IF .real_password EQL 0 THEN real_password = empty;
+    IF .real_account EQL 0 THEN real_account = empty;
+    !
+    ! Send the path string, accounting info, and object type info
+    !
+    $XPN_PUT (NLB = nlb, TYPE = DATA, OPTION = END_OF_MESSAGE, FAILURE = 0,
+              STRING = $STR_CONCAT (%CHAR (1),
+                                    (.length, .pointer),
+                                    '"',
+                                    .real_username,
+                                    ' ',
+                                    .real_password,
+                                    ' ',
+                                    .real_account,
+                                    '"::"',
+                                    $STR_ASCII (.real_object),
+                                    '="'));
+    !
+    ! Post a read and wait for the data
+    !
+    IF (retcode = $XPN_GET (NLB = nlb, TYPE = DATA, FAILURE = 0))
+    THEN
+        retcode = $XPN_EVENT_INFO (NLB = nlb, FAILURE = 0, OPTION = WAIT);
+    IF .retcode NEQ XPN$_DATA
+    THEN
+        BEGIN
+        nlb[NLB$G_COMP_CODE] = .retcode;        ! For error reporting
+        report_error (nlb, path_descr);
+        RETURN (.retcode)
+        END;
+    !
+    ! The first byte of the message contains the success/fail code
+    !
+    IF (.nlb[NLB$H_STRING] LEQ 0)
+        OR
+        (NOT CH$RCHAR (.nlb[NLB$A_STRING]))
+    THEN
+        BEGIN
+        LOCAL
+            error_code,
+            error_str : $STR_DESCRIPTOR ();
+        !
+        ! If we find certain strings which we "know" mean access denied
+        ! in the error message, we return XPN$_NO_ACCESS rather than
+        ! XPN$_PMR_ERROR, in order to prevent spoolers from requeuing.
+        ! First we make a copy of the string so XPORT likes it (the NLB
+        ! copy is a binary descriptor, not a string descriptor)
+        !
+        $STR_DESC_INIT (DESCRIPTOR = error_str, CLASS = DYNAMIC);
+        $XPO_GET_MEM (DESCRIPTOR = error_str,
+                      CHARACTERS = .nlb[NLB$H_STRING]);
+        CH$MOVE (.nlb[NLB$H_STRING],
+                 .nlb[NLB$A_STRING],
+                 .error_str[STR$A_POINTER]);
+        error_code =
+            (IF ($STR_SCAN (STRING = error_str,
+                           FIND = 'Login information invalid at remote node')
+                 OR $STR_SCAN (STRING = error_str,
+                               FIND = 'Access not permitted'))
+             THEN
+                 XPN$_NO_ACCESS
+             ELSE
+                 XPN$_PMR_ERROR);
+        $XPO_FREE_MEM (STRING = error_str);
+        report_error (nlb, path_descr);
+        $XPN_DISCONNECT (NLB = nlb, TYPE = ABORT, FAILURE = 0);
+        $XPN_CLOSE (NLB = nlb, FAILURE = 0);
+        RETURN (.error_code)
+        END;
+    report_success (path_descr);        ! Report success if we have terminal
+    RETURN (XPN$_NORMAL)                ! Return success
+    END;                                ! End of negotiate
+
+ROUTINE report_error (p_nlb, p_path_descr) : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Report failure of a PMR path
+!
+! FORMAL PARAMETERS:
+!   p_nlb               - pointer to the NLB
+!   p_path_descr        - pointer to descriptor for path string of the
+!                         form:  "NODE1::NODE2::NODE3::"
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   Success:
+!        XPN$_NORMAL            - link successfully negotiated
+!   Failure:
+!        XPN$_PMR_ERROR         - any failure
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+    BEGIN
+
+    BIND
+        nlb = .p_nlb : $XPN_NLB (),
+        path_descr = .p_path_descr : $STR_DESCRIPTOR ();
+
+    LOCAL
+        length,
+        jobno,
+        error_descr : $STR_DESCRIPTOR ();
+    !
+    ! Get our line number.  If we're detached, quit now.
+    !
+    IF .term_line_no EQL 0
+    THEN
+        BEGIN
+        JSYS_GJINF (; jobno, , , term_line_no);
+        IF (.term_line_no EQL 0)
+            OR (.jobno EQL 0)
+        THEN
+            term_line_no EQL -1;
+        $XPO_IOB_INIT (IOB = term_iob);
+        END;
+    IF .term_line_no EQL -1
+    THEN
+        RETURN;
+    !
+    ! Ok, we're running on a real terminal.  Report the error.
+    !
+    $XPO_OPEN (IOB = term_iob, FILE_SPEC = $XPO_INPUT);
+    $STR_DESC_INIT (DESCRIPTOR = error_descr, CLASS = DYNAMIC);
+    !
+    ! If the NLB points to a received message, it's the error.  If not,
+    ! we report nlb[NLB$G_COMP_CODE], because we got an $XPN_OPEN error.
+    !
+    IF .nlb[NLB$H_STRING] NEQ 0
+    THEN
+        !
+        ! The first byte of the msg is a numeric code.  Skip it.
+        !
+        $STR_COPY (TARGET = error_descr,
+                   STRING = (.nlb[NLB$H_STRING] - 1,
+                             CH$PLUS (.nlb[NLB$A_STRING], 1)))
+    ELSE
+        xpn$errmsg (.nlb[NLB$G_COMP_CODE], error_descr, length, 0);
+    $XPO_PUT (IOB = term_iob,
+              STRING = $STR_CONCAT ('?PMR error: path "',
+                                    path_descr,
+                                    '" failed',
+                                    %CHAR (13,10),
+                                    error_descr));
+    $XPO_CLOSE (IOB = term_iob);
+    $XPO_FREE_MEM (STRING = error_descr);
+    END;                                ! End of report_error
+
+ROUTINE report_success (p_path_descr) : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Report success of a PMR path
+!
+! FORMAL PARAMETERS:
+!   p_path_descr        - pointer to descriptor for path string of the
+!                         form:  "NODE1::NODE2::NODE3::"
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   NONE
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+    BEGIN
+
+    BIND
+        path_descr = .p_path_descr : $STR_DESCRIPTOR ();
+
+    LOCAL
+        jobno;
+    !
+    ! Get our line number.  If we're detached, quit now.
+    !
+    IF .term_line_no EQL 0
+    THEN
+        BEGIN
+        JSYS_GJINF (; jobno, , , term_line_no);
+        IF (.term_line_no EQL 0)
+            OR (.jobno EQL 0)
+        THEN
+            term_line_no EQL -1;
+        $XPO_IOB_INIT (IOB = term_iob);
+        END;
+    IF .term_line_no EQL -1
+    THEN
+        RETURN;
+    !
+    ! Ok, we're running on a real terminal.  Report success.
+    !
+    $XPO_OPEN (IOB = term_iob, FILE_SPEC = $XPO_INPUT);
+    $XPO_PUT (IOB = term_iob,
+              STRING = $STR_CONCAT (' (Using path "',
+                                    path_descr,
+                                    '")'));
+    $XPO_CLOSE (IOB = term_iob);
+    END;                                ! End of report_error
+
+END                                     ! End of module
+ELUDOM

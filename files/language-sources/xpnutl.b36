@@ -1,0 +1,558 @@
+%TITLE 'XPNUTL - Utility routines for BLISSnet-20'
+MODULE XPNUTL (
+               ENTRY ( XPN$$VALID_NLB,
+                       XPN$$LINK_STATUS,
+                       XPN$$NEW_BUFFER,
+                       XPN$$INT_SET,
+                       XPN$$SLEEP,
+                       XPN$$JSYS_ERROR,
+                       XPN$$ASSIGN_CHANNEL
+                     ),
+               IDENT = '1'
+              ) =
+BEGIN
+!  COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1981, 1986.
+!  ALL RIGHTS RESERVED.
+!  
+!  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!  COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!  THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!  ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!  AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!  SOFTWARE IS HEREBY TRANSFERRED.
+!  
+!  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!  NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!  EQUIPMENT CORPORATION.
+!  
+!  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!  ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+
+!++
+! FACILITY:
+!   Transportable BLISS interface to DECNET, TOPS20 implementation.
+!
+! ABSTRACT:
+!   This module contains various utility routines called by more then
+!   one module in the interface.
+!
+! ENVIRONMENT:
+!   TOPS20 user mode, with XPORT.
+!
+! AUTHOR: Larry Campbell, CREATION DATE: November 3, 1981
+!
+! MODIFIED BY: Andrew Nourse
+!
+!  01 - End-of-file is an abort condition, not a bug.
+!--
+
+!
+! TABLE OF CONTENTS:
+!
+FORWARD ROUTINE
+    xpn$$valid_nlb,                     ! Validate an NLB
+    xpn$$link_status,                   ! Return status of a link
+    xpn$$new_buffer : NOVALUE,          ! Allocate new input buffer
+    xpn$$int_set : NOVALUE,             ! Set up interrupts for a link
+    xpn$$sleep : NOVALUE,               ! Sleep until interrupted
+    xpn$$wake : NOVALUE,                ! Wake up
+    xpn$$jsys_error,                    ! Handle JSYS failure
+    xpn$$assign_channel;                ! Assign interrupt channel & handler
+!
+! INCLUDE FILES:
+!
+LIBRARY 'BLI:XPORT';                    ! XPORT definitions
+LIBRARY 'BLISSNET';                     ! Transportable BLISSnet stuff
+LIBRARY 'BLI:MONSYM';                   ! Monitor symbol definitions
+LIBRARY 'BLISSNET20';                   ! BLISSnet-20 specific stuff
+REQUIRE 'JSYSDEF';                      ! JSYS linkage definitions
+!
+! MACROS:
+!
+
+!
+! EQUATED SYMBOLS:
+!
+UNDECLARE
+    wait,
+    disms;
+
+LITERAL
+    wait = %O'104000000306',            ! WAIT JSYS
+    disms = %O'104000000167',           ! DISMS JSYS
+    jfcl = %O'255000000000';            ! JFCL
+!
+! OWN STORAGE:
+!
+OWN
+    net_channel;                        ! Interrupt channel we're using for net
+!
+! EXTERNAL REFERENCES:
+!
+EXTERNAL
+    psiwxx;                             ! Location of WAIT JSYS
+
+EXTERNAL ROUTINE
+    psiint,                             ! BLSPSI.MAC routines
+    psisir,
+    psiwai,
+    psirst;
+
+GLOBAL ROUTINE xpn$$valid_nlb (nlb) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   This routine checks a Network Link Block for validity
+!
+! FORMAL PARAMETERS:
+!   nlb         - address of the Network Link Block
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   XPN$_NORMAL         - NLB is OK
+!   XPN$_BAD_SIZE       - length is wrong
+!   XPN$_VERSION        - version skew
+!   XPN$_BAD_FLAGS      - inconsistent flags setting
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+    BEGIN
+
+    MAP
+        nlb : REF $XPN_NLB();
+
+    nlb_binds;
+    IF .nlb[NLB$H_LENGTH] NEQ NLB$K_LENGTH
+    THEN
+        RETURN (XPN$_BAD_SIZE);
+    IF .nlb[NLB$B_VERSION] NEQ NLB$K_VERSION
+        OR .nlb[NLB$B_LEVEL] NEQ NLB$K_LEVEL
+    THEN
+        RETURN (XPN$_VERSION);
+    IF active AND passive
+    THEN
+        RETURN (XPN$_BAD_FLAGS);
+    RETURN (XPN$_NORMAL)
+    END;                                !End of xpn$$valid_nlb
+
+GLOBAL ROUTINE xpn$$link_status (nlb) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Returns the link status word returned by the MTOPR_ JSYS $MORLS function.
+!
+! FORMAL PARAMETERS:
+!   nlb         - address of the Network Link Block
+!
+! IMPLICIT INPUTS:
+!   NLB$H_JFN   - JFN for the network link
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   One fullword of link status as returned by the MTOPR_ $MORLS function.
+!   If there is no JFN, or the MTOPR_ fails, zero is returned.
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+    BEGIN
+
+    MAP
+        nlb : REF $XPN_NLB();
+
+    LOCAL
+        retval;
+
+    IF .nlb[NLB$H_JFN] EQL 0
+    THEN
+        RETURN (0);
+    IF JSYS_MTOPR (.nlb[NLB$H_JFN], $MORLS, 0, 0; , , retval)
+    THEN
+        RETURN (.retval)
+    ELSE
+        BEGIN
+        JSYS_GETER ($FHSLF; retval);
+        nlb[NLB$G_2ND_CODE] = .retval<rh>;
+        RETURN (0)
+        END;
+    END;                                ! End of xpn$$link_status
+
+GLOBAL ROUTINE xpn$$new_buffer (buffer_descriptor, byte_count) : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   This routine releases any previous buffer associated with an NLB
+!   and allocates a new buffer with room for .byte_count bytes.  We
+!   have to fudge with the descriptor because XPORT binary data descriptors
+!   want to put one 8-bit byte per addressable unit (word), which is incredibly
+!   inefficient on 36-bit machines.  We set up the descriptors to point to
+!   real strings of 8-bit bytes, so all the CH$xxx functions can work.
+!
+! FORMAL PARAMETERS:
+!   buffer_descriptor   - address of the descriptor for the buffer
+!   byte_count          - how many bytes to allocate space for
+!
+! IMPLICIT INPUTS:
+!   Buffer descriptor   - memory pointed to is freed
+!
+! IMPLICIT OUTPUTS:
+!   Buffer descriptor   - updated to point to new buffer
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   NONE
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+    BEGIN
+
+    MAP
+        buffer_descriptor : REF $XPO_DESCRIPTOR (CLASS = DYNAMIC);
+    !
+    ! Release stale previous buffer if necessary
+    !
+    IF .buffer_descriptor[XPO$A_ADDRESS] NEQ 0
+    THEN
+	BEGIN
+        LOCAL
+            buffer_address;
+	buffer_descriptor[XPO$H_LENGTH] =
+            (.buffer_descriptor[XPO$H_LENGTH] + 3) / 4;
+        !
+        ! XPO$A_ADDRESS really contains a byte pointer, which we must first
+        ! convert to an address for $XPO_FREE_MEM's sake.  BLISS character
+        ! pointers point to <byte - 1> (for ILDB's sake) so we have to
+        ! increment the pointer first.
+        !
+        buffer_address = CH$PLUS (.buffer_descriptor[XPO$A_ADDRESS], 1);
+        buffer_address = .buffer_address<rh>;
+        buffer_descriptor[XPO$A_ADDRESS] = .buffer_address;
+	$XPO_FREE_MEM (BINARY_DATA = .buffer_descriptor)
+	END;
+    !
+    ! Allocate string space for this data, fudge the descriptor
+    ! to point to string of 8-bit bytes rather than string of
+    ! addressable units.
+    !
+    $XPO_DESC_INIT (DESCRIPTOR = .buffer_descriptor,
+                    CLASS = DYNAMIC);
+    $XPO_GET_MEM (FULLWORDS = ((.byte_count + 3) / 4),
+		  DESCRIPTOR = .buffer_descriptor);
+    buffer_descriptor[XPO$H_LENGTH] = .byte_count;
+    buffer_descriptor[XPO$A_ADDRESS] =
+        CH$PTR (.buffer_descriptor[XPO$A_ADDRESS], 0, 8);
+
+    END;                                !End of xpn$$new_buffer
+
+GLOBAL ROUTINE xpn$$int_set (nlb_vector) : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Sets up to receive interrupts for connect events on any JFN for any
+!   link specified by NLBs given.  The first time this routine is called,
+!   it initializes the software interrupt system and assigns an unused
+!   channel for the interface's use.
+!
+! FORMAL PARAMETERS:
+!   nlb_vector  - counted vector of addresses of Network Link Blocks
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   NONE
+!
+! SIDE EFFECTS:
+!   An unassigned interrupt channel is assigned.
+!
+!--
+    BEGIN
+
+    MAP
+        nlb_vector : REF VECTOR[0];
+
+    OWN
+        once_only_flag : INITIAL (0);
+
+    !
+    ! Assign an unused interrupt channel if we haven't already done so.
+    !
+    IF NOT (.once_only_flag)
+    THEN
+        BEGIN
+        net_channel = xpn$$assign_channel (xpn$$wake);
+        once_only_flag = 1
+        END;
+    !
+    ! For each NLB specified, request the monitor to interrupt us on any events
+    !
+    INCR i FROM 1 TO .nlb_vector[0]
+    DO
+        BEGIN
+        BIND
+            nlb = .nlb_vector[.i] : $XPN_NLB();
+        IF NOT .nlb[NLB$V_INT_SET]
+        THEN
+            BEGIN
+            LOCAL
+                channel_args;
+            channel_args = 0;
+            channel_args<27,9> = .net_channel;   ! Connect events
+            channel_args<18,9> = .net_channel;   ! Interrupt msg events
+            channel_args< 9,9> = .net_channel;   ! Data available events
+            IF NOT JSYS_MTOPR (.nlb[NLB$H_JFN],
+                               $MOACN,
+                               .channel_args,
+                               0)
+            THEN
+                xpn$$bug ('Cannot set interrupt assignments');
+            nlb[NLB$V_INT_SET] = 1
+            END
+        END
+    END;
+
+GLOBAL ROUTINE xpn$$sleep (msec) : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Sleep the specified number of milliseconds.  An interrupt on any
+!   link will cause a premature wakeup, giving the program the opportunity
+!   to service the condition more quickly.  Requesting a sleep of zero
+!   length causes an infinite sleep.
+!
+! FORMAL PARAMETERS:
+!   msec        - number of milliseconds to sleep
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   NONE
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+    BEGIN
+    !
+    ! Set up a WAIT or DISMS, depending on which caller wants.
+    !
+    psiwxx = (IF .msec EQL 0 THEN wait ELSE disms);
+    !
+    ! Now activate the channel and go to sleep.
+    !
+    JSYS_AIC ($FHSLF, 1 ^ (35 - .net_channel));
+    PSIWAI (.msec)                      ! Sleep, return to caller when woken
+    END;                                ! End of xpn$$sleep
+
+ROUTINE xpn$$wake : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   This is the routine called at interrupt level when an event occurs
+!   for any of the NLBs specified in the call to XPN$$SLEEP.  It merely
+!   deactivates the interrupt channel (so interrupts are stacked) and
+!   calls PSIRST to wake up the background routine.  We also step on
+!   the WAIT JSYS at PSIWXX (turn it to JFCL) in case the interrupt
+!   happened before PSIWAI was called.  PSIWAI's caller must reset it
+!   before calling PSIWAI.
+!
+! FORMAL PARAMETERS:
+!   NONE
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   NONE
+!
+! SIDE EFFECTS:
+!   The interrupt channel is deactivated and the sleeping background
+!   task is woken.  The instruction at PSIWXX is turned to JFCL.
+!
+!--
+    BEGIN
+
+    JSYS_DIC ($FHSLF, 1 ^ (35 - .net_channel));
+    PSIRST ();                          ! Wake the sleeping routine
+    psiwxx = jfcl;
+
+    END;                                ! End of xpn$$wake
+
+GLOBAL ROUTINE xpn$$jsys_error (nlb, jsys_number) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Handles unexpected failure of a JSYS.
+!
+! FORMAL PARAMETERS:
+!   nlb         - address of the Network Link Block involved
+!   jsys_number - low-order 18 bits of the failing JSYS instruction
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   This routine attempts to return a "reasonable" error code depending
+!   on the nature of the JSYS error.  For example, IOX5 (device or data
+!   error) will return XPN$_ABORTED, while DESX1 (invalid source/destination
+!   designator) almost certainly is the result of a bug and will result
+!   in XPN$_BUG.
+!
+!   XPN$_ABORTED        - link was apparently aborted
+!   XPN$_BUG            -
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+    BEGIN
+
+    LOCAL
+        tops20_code;
+
+    MAP
+        nlb : REF $XPN_NLB ();
+
+    JSYS_GETER ($FHSLF; tops20_code);
+    tops20_code = .tops20_code<rh>;
+    RETURN
+        SELECTONE .tops20_code OF
+            SET
+            [IOX4, IOX5, NSPX00 TO NSPX22, DCNX11] :	![1] Abort/Disconnect
+                BEGIN                   		!   in several flavors 
+                LOCAL
+                    link_status;
+                link_status = xpn$$link_status (.nlb);
+                nlb[NLB$G_2ND_CODE] = .link_status<rh>;
+                IF (.link_status AND MO_ABT) NEQ 0
+                THEN
+                    XPN$_ABORTED
+                ELSE
+                    XPN$_DISCONN
+                END;
+            [OTHERWISE] :
+                BEGIN
+                nlb[NLB$G_2ND_CODE] = .tops20_code;
+                XPN$_BUG
+                END;
+            TES
+    END;                                ! End of xpn$$jsys_error
+
+GLOBAL ROUTINE xpn$$assign_channel (handler) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Assign an unused interrupt channel.  Init interrupt system if
+!   necessary.  Set up LEVTAB and CHNTAB and point CHNTAB to the
+!   handler routine.  This routine does not activate the channel;
+!   the caller must do the AIC JSYS to activate the channel.  This
+!   insures that interrupts won't occur until the caller is ready.
+!
+! FORMAL PARAMETERS:
+!   handler	- address of interrupt handler routine
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   The channel assigned is returned.
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+    BEGIN
+
+    OWN
+        once_only_flag : INITIAL (0);
+
+    LOCAL
+        channel_mask,
+	channel;
+
+    BUILTIN
+        FIRSTONE;                       ! JFFO!  Yaayyy!
+
+    IF NOT .once_only_flag              ! If first time,
+    THEN                                !  then initialize interrupt system
+        BEGIN
+        once_only_flag = 1;
+        psisir ($FHSLF)                 ! Set interrupt tables
+        END;
+    !
+    ! Get complement of assigned channel mask
+    !
+    channel_mask = NOT
+        BEGIN
+        LOCAL
+            retval;
+        JSYS_RCM ($FHSLF; retval);
+        .retval
+        END;
+    !
+    ! Search for an unused channel
+    !
+    channel = -1;
+    WHILE .channel_mask NEQ 0
+    DO
+        BEGIN
+        !
+        ! Find first one bit and clear it from the mask
+        !
+        channel = FIRSTONE (.channel_mask);
+        channel_mask = .channel_mask XOR (1 ^ (35 - .channel));
+        !
+        ! Now make sure this is a channel we're allowed to use
+        !
+        SELECTONE .channel
+        OF
+            SET
+            [6 TO 22] : channel = -1;       ! No good
+            [OTHERWISE] : channel_mask = 0; ! Win...
+            TES;
+        END;
+    !
+    ! OK, we either found a channel or none are available
+    !
+    IF .channel EQL -1
+    THEN
+        $XPO_PUT_MSG (SEVERITY = FATAL,
+                      STRING = 'No interrupt channels available');
+    !
+    ! Set up LEVTAB and CHNTAB
+    !
+    psiint (.channel, .handler, 3);
+    JSYS_EIR ($FHSLF);
+    RETURN (.channel)
+    END;                                ! End of xpn$$assign_channel
+
+END                                     ! End of module XPNUTL
+ELUDOM

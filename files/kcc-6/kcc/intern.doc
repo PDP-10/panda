@@ -1,0 +1,874 @@
+This file attempts to document the internal workings of KCC.  It is
+still incomplete.
+
+Current holes in documentation:
+	Need to explain what pseudo-code looks like, what types there are,
+and which of them use which parts of a pseudo-code entry.  CCCODE etc.
+	Need to explain KCC's notion of "register" and how these registers
+are allocated and handled.  CCGEN, CCREG etc.
+
+This diagram (based on a msg from David Eppstein) lists each
+KCC module with a summary of what its routines do.
+  
+    CCDATA -- allocation for global variables, tables.  Used in various places
+    CC -- main control -- parses command line and calls parser for each file
+	CCINP -- file input and preprocessor.  Provides input chars.
+	CCLEX -- lexical analysis.  Provides input tokens.
+	CCDECL, CCSTMT -- parsing (recursive descent) and semantic analysis
+data		CCDECL handles declarations; CCSTMT handles statments & exprs.
+flows	    CCSYM -- symbol table manipulation
+this	    CCTYPE -- type checking and automatic coercion
+way	    CCERR -- error messages
+ |	CCEVAL, CCFOLD -- parse tree optimization and constant folding
+ |	CCGEN, CCGEN1, CCGEN2 -- code generation.  Decls, Stmts, Exprs.
+ V	    CCGSWI -- code generation for "switch" statements
+	    CCLAB - label management
+	    CCREG -- register allocation
+	    CCCODE -- subroutines to send pseudo-codes to optimizer
+	CCOPT, CCJSKP, CCCSE -- peephole optimization (some elsewhere too)
+	    CCCREG -- retroactively change registers
+	CCOUT -- emission to assembly file
+	CCASMB -- invoke assembler/linker on output file
+	CCDUMP -- various debugging output routines
+
+--------------------------
+Message from David Eppstein, 4-Dec-85:
+
+As indicated, you can think of the data as moving through successive
+stages of interpretation -- input files get read into chars and munged
+by the preprocesser, turned into tokens by the lexer, turned into
+parse trees by the parser, munged by the parse tree optimizer, turned
+into pseudo-codes by the generator, munged by the peepholer and then
+turned into chars again as assembly language by the emitter.
+
+(this parag modified --KLH) The control structure is a little different
+-- the file argument handler is the main control, and it calls the
+parser which calls the lexer which calls the preprocessor to pull data
+in from the file.  The parser returns a parse tree, which the main loop
+then pushes out in the other direction by calling the code generator
+which calls the peepholer and emitter.
+	The parse tree optimizer is called (for ccopt)
+by the parser and (for cceval, whose sole purpose is to see if a for
+loop test can be moved to the end of the loop) by code generation.
+The symbol table is used and maintained by many different phases.
+Also, the preprocessor can call the parser recursively to handle #if.
+
+General overview: data flow
+
+[NOTE: for clarity the following discussion talks only about "the" input
+file.  KCC can compile multiple files, but each one is compiled
+separately and handled in the same way.]
+
+KCC is a one-pass compiler; it reads its input only once, and does so
+sequentially without ever looking back.  It outputs an intermediate
+assembly-language file which is then processed by the system's
+assembler, in effect adding a second pass.  Each top-level declaration
+statement (a function is a single such declaration statement) is handled
+separately, and each goes through the following complete cycle:
+	(1) The statement is completely parsed into a single "parse tree",
+	which is a linked list of "NODE" structures.  (CCDECL, CCSTMT)
+	(2) Some optimization is done on the parse tree. (CCOPT, CCEVAL)
+	(3) The code generator is called on this parse tree, to fill a
+	"peephole" buffer with what are called "pseudo-code" instructions.
+	The buffer is a linear array of "PSEUDO" structures.  The code
+	generator is subdivided into two general phases:
+		(3a) CCGEN - Determine from parse-tree what pseudo-code to use.
+			This phase knows about BOTH parse trees and
+			pseudo-code, but does not manipulate the buffer.
+		(3b) CCCODE - Put pseudo-code in buffer, applying optimization
+			and forcing out buffer when there is no more need to
+			look back at buffered pseudo-code.  (or when full!)
+			This phase only knows about pseudo-code.
+	(4) Whenever the buffer is forced out, the output processor (CCOUT) is
+	called on each pseudo-code instruction to generate the actual
+	character strings needed for the assembler file.  The output
+	processor never sees the parse tree, only the pseudo-code
+	as it comes from the buffer.
+
+Optimization occurs at various places.  Some optimization can be done
+directly on the parse tree itself, but it looks as if most actual optimization
+comes during (3b) -- as pseudo-code is being added to the peephole buffer,
+various checks are made trying to combine the current op with previous
+ops in more efficient ways.  A few optimizations are done in (4) when
+CCOUT selects the best way to do some minor things.
+This description can use some more details.
+
+Since the entire parse tree for a declaration is kept in memory, it
+may be possible that extremely large functions or data initializations
+could cause problems for KCC.  However, such things are considered
+bad practice and are rarely if ever seen; this is unlikely to ever be
+a problem.  Note this only applies to single declaration statements, not
+to the entire file.
+
+More about input processing:
+	All input is handled by the CCINP module, which provides the
+"nextc" function to read the next character.  CCINP handles all of the
+pre-processor '#' commands as they are encountered; the rest of KCC
+never sees them.  CCINP also provides macro-expansion text just as if
+it was part of the regular input stream.
+	The only thing it cannot do is start macro expansions; this is
+taken care of by the next level of input, CCLEX, which provides the
+"nextoken" function.  This is THE main input function as far as the
+rest of KCC is concerned; nothing else but CCLEX calls CCINP's
+"nextc".  "nextoken" simply reads the next C-language token and
+returns its code (codes defined in CC.H).  Nothing outside of CCLEX
+should be concerned with input characters; only with tokens.
+"nextoken" does set certain globals as a side effect, since values may
+be associated with some types of tokens (notably constants).  CCLEX
+does not know anything about parse trees.  The comments at the start
+of CCLEX pretty much explain what variables nextoken() can set as
+side effects.
+
+CCDECL and CCSTMT perform the actual semantic analysis of the tokens
+that "nextoken" returns, building the parse tree.  Nothing else calls
+"nextoken", except CCERR in order to attempt recovery from some kinds
+of errors.
+
+How a program gets compiled (control flow):
+
+main()	does simple switch inits, and scans all arguments once in order to
+	process all switches furnished by the user.  Then scans the arguments
+	once more, and calls cfile() to process each remaining file argument.
+	After all arguments are processed, the linking loader
+	(LINK) may or may not be invoked.
+
+    cfile()	Hacks an argument filename.  Processing depends on current
+		switch values.  Does necessary per-file initializations,
+		then normally tries to compile the file by first
+		calling entdef() (a special hack, can be ignored) and
+		then (TA DA!) loops calling extdef() to process external
+		definitions as long as input exists, feeding the results
+		into the code generator via gencode().
+		When input is done, postamble() takes care of final output
+		to the assembler file.  An additional "prefix" assembler
+		file may also be generated at this point.  Finally,
+		asmb() is used to invoke the assembler on the file.
+
+So, extdef() and gencode() actually do all the real work; everything
+seen in the file is some kind of top-level declaration, either of data
+or of a function.
+	extdef() initializes a few things (see note below re ENTRY hacking)
+	and then calls declarator() to parse as far as the first identifier
+	(symbol name).
+	If it was anything but a function, datadef() is called to
+		generate a parse tree from not only this definition but
+		all succeeding definitions until the end of the declaration
+		statement is seen.
+	If it was a function, extdef will parses the parameter list
+		itself and then invoke funcdef().  This routine parses the
+		parameter declarations and the function body.
+
+Note on ENTRY and entdef():
+	In order to remain compatible with older source files used with
+	KCC which used the "entry" statement, a special routine called
+	entdef() is invoked at the start of compilation.  This scans
+	ENTRY statements, which must precede any other kind
+	of declaration.  Thereafter ENTRY is ignored.
+	The ENTRY statement is peculiar to KCC.  It was needed
+	only because the PDP10 assembler insists that any library
+	entry points be specified BEFORE any code is produced!
+	This was fixed by having KCC generate an auxiliary "prefix"
+	assembler file and feeding that to the assembler just ahead of
+	the main file.  ENTRY should no longer be used, and KCC should
+	eventually not support it.
+
+In more code-like form:
+
+CC main()			- Main program
+CC	<Initialize compiler switch values>
+CC	Scan all arguments for switches.  For each switch, call
+CC		cswitch() - process a switch.
+CC	Scan all arguments again for filenames.  For each file, call
+CC		cfile() - process one file.
+CC			<initialize all per-file stuff>
+CCDECL			Invoke entdef() for "entry" stmt compatibility
+CC			Until EOF on input, call
+CCDECL				extdef() - process one external def.
+CCGEN				gencode() - generate code for it.
+CCOUT			postamble()	- output assembler-file postamble.
+CCOUT			makprefile()	- Make assembler prefix file if needed.
+CCASMB			asmb()		- Invoke assembler.
+CC	If invoking linking loader, call
+CCASMB		runlnk().
+	
+
+Where the real work happens:
+
+CCDECL extdef()	- Read one external definition, and return parse tree if any.
+CCDECL	Initialize for a declaration statement, then call
+CCDECL		declarator()	- Parse one identifier
+CCDECL	If got non-function, call
+CCDECL		datadef()	- Parse rest of declaration, return it.
+CCDECL			Until semicolon seen, call
+CCSTMT				defnode()	- Make parse-tree node
+CCDECL				declarator()	- parse another identifier
+CCDECL	else got function.
+CCDECL		<parse parameter list>, then call
+CCDECL		funcdef()	- Parse rest of function, return it.
+CCDECL			<Set up various things>
+CCDECL			Parse parameter declarations, by calling
+CCDECL				declarator()
+CCDECL			<Set up parameter (local var) stuff>
+CCDECL			Then parse the function body, by calling
+CCSTMT				statement()	- Parse a statement
+CCDECL			Then finish consing together the resulting parse-tree
+CCSTMT				with defnode().
+
+CCGEN	gencode() is fairly easy to follow.
+
+
+This page describes some of the basic KCC data structures and constant types.
+
+In general, structures are declared in the following way:
+	#define NAME _name
+	struct _name {...};
+and references to the structure tag should use NAME.  Pointers should
+be declared as NAME *.
+
+Important structures:
+	TOKEN	Token definition (entry in table)
+	  T_	  Token identifiers (codes)
+	  TKTY_	  Token types
+	TYPE	Type Definition
+	  TS_	  Type Specifier codes
+	SYMBOL	Symbol Definition
+	  SC_	  Symbol Classes
+	NODE	Parse tree node
+	  N_	  Node identifiers (opcodes)
+	  NF_	  Node flags
+	  CAST_	  Cast (coercion) types
+	PCODE	Pseudo-Code entry (in peephole buffer)
+	  P_	  Opcode values (almost == to PDP10 instructions)
+	  POF_	  Opcode flags
+	  POS_	  Opcode skip values
+	  POSF_	  Opcode skip value bits
+	  PTF_	  Type Flags
+	  PTA_	  Type Addressing modes
+	  PTV_	  Type Values (flag/addr combos)
+
+Minor structures:
+	SMEM	Structure Member
+	RESWD	Reserved Word table entry
+	TYNAME	Built-in Type table entry
+
+NOTE: Currently, for historical reasons the token types, node op-codes, and
+a few other things are all mixed together.  The following prefixes indicate
+symbols which used to all be "token constants":
+	N_	- Only used as a node op-code
+	T_	- Only used as a token value
+	Q_	- Used as BOTH a node op-code and token value!
+		(Why Q?  Well, it's exactly halfway between N and T...
+		 also, think about a Q-ship, which isn't what it seems.)
+
+See CCSYM.H for details on the format of symbol table entries (SYMBOL)
+and type specifiers (TYPE).
+
+---------------------- PARSE TREE STRUCTURE ---------------------
+
+	Only the parser creates parse trees, and the CCDECL and CCSTMT
+modules contain all of the parser.  The modules which form the code
+generator and which read the parse tree are CCGEN, CCGEN1, CCGEN2 and
+CCGSWI.
+
+	The parse tree generated by KCC's parser (and passed to the
+code generator) is made of NODE structures.  The format and many
+details are explained in CCNODE.H.  The node-ops, flags, and token
+types are defined in CCTOKS.H.  The following pages describe specifics
+of the way each node-op uses the NODE structure.
+
+------- GENERAL ---------
+
+<node-op symbol>	<brief description>		<syntax>
+	T: <C type pointer>
+	F: <flags>
+	X: <extra variable, if used.  Normally isn't.>
+	L: <Nleft pointer>
+	R: <Nright pointer>
+
+NOTE: NULL is not allowed as a value for any pointer unless explicitly
+mentioned as an option!
+
+NOTE: Only a few types of nodes can ever be seen as "lvalues".  H&S 7.1
+describes the kinds of expressions that can be lvalues.  It is slightly
+wrong; [*] marks corrective footnotes.
+
+	0. Names of scalar/struct/union type variables, but not functions,
+	   arrays, or enum constants.
+		Q_IDENT (depending on type)
+	1. Subscript expression e[k], always. [*]
+		(Same thing as 5, N_PTR).
+	2. Parenthesized expression, if contents are lvalue.
+		(Irrelevant)
+	3. Direct component selection e.name, if e is lvalue. [*]
+		Q_DOT (sometimes).
+	4. Indirect component selection e->name, always. [*]
+		Q_MEMBER (always).
+	5. Indirection *e, always. [*]
+		N_PTR (always).
+
+	[*] "Always" is untrue.  NONE of those are lvalues if the type
+	of the expression is "array" or "function"!!!
+
+Note on array types:
+	To simplify matters, whenever an expression of array type is seen,
+it is NOT immediately converted into a pointer.  It is the responsibility
+of each operator to perform this type conversion if required.  "sizeof",
+"&", and function calls don't.
+	The lvalue expressions noted above are the only ones that can
+yield an array.  Because they are so common, the nodes Q_IDENT and
+N_PTR + Q_PLUS have some special type fudging to eliminate the
+overhead of a "&" and "*".  Normally a Q_IDENT's Ntype is the same
+as its symbol Stype; but if Ntype is array, conversion results in simply
+setting Ntype to pointer (the original type is still available in Stype).
+	By contrast, normally a Q_PLUS's Ntype is pointer (where
+arrays are involved), but it is sometimes changed to an array type.
+Array subscripting, e[x], is represented by *(e + x); if this result
+still of array type then the almost inevitable conversion would result
+in &(*(e + x)) which is the same as (e + x).  In order to avoid the
+overhead of the &*, the * is flushed and Q_PLUS's Ntype is made "array"
+as if the * was present.  Then when the conversion to pointer happens,
+Q_PLUS's Ntype is clobbered from "array of T" to "pointer to T"
+(dropping another level of arrayness) rather than creating a N_ADDR (&) node.
+	For the other possible things that can be arrays (N_PTR,
+Q_DOT, and Q_MEMBER), the conversion is accomplished by applying
+N_ADDR to the node.  However, unlike the normal usage where, given an
+operand of type T, the result type is "pointer to T", the
+array-conversion usage gives a result type of "pointer to T's
+subtype".  That is, it takes out a level of arrayness.
+	Someday array handling may be made more consistent.
+
+------- Primary Expressions (type TKTY_PRIMARY) ---------
+
+Q_IDENT: <identifier>				TERMINAL NODE
+	T: <type>
+	F: <flags?>
+	X: (actually "Nid") pointer to symbol
+	L,R: null
+
+	Note: the node type (Ntype) will be identical to the symbol's type
+	(Nid->Stype) in all cases EXCEPT when the symbol is an array or
+	function, in which case the Ntype will be "pointer to <Stype>".
+	This avoids the overhead of a N_ADDR node for the frequent
+	conversion of array/function names to array/function pointers.
+	Routines that need the actual type (eg data defs) can use the Stype.
+
+	Note: This node is an lvalue expression unless the symbol type is
+	enum, array, or function.
+
+N_ICONST: <integer constant>			TERMINAL NODE
+	T: <type> - normally "int" but may be any integral type.
+	F: ?
+	X: (actually "Niconst") - contains value of constant
+	L,R: null
+
+N_FCONST: <floating-point constant>		TERMINAL NODE
+	T: <type> - either "double" or "float"
+	F: ?
+	X,L: (actually "Nfconst") - value of constant.
+	R: null
+
+N_SCONST: <string constant>			TERMINAL NODE
+	T: <type> - always "char *"
+	F: ?
+	X,L: String constant value in "Nsconst" and "Nsclen".
+	R: null
+		Also uses "Nsclab" in code generation.
+
+N_PCONST: <pointer constant>			TERMINAL NODE
+	T: <type> - pointer to X
+	F: ?
+	X: (actually "Niconst") - contains value of constant
+	L,R: null
+
+	This node is used for casts of constant values to some pointer type.
+
+N_VCONST: <void "constant">			TERMINAL NODE
+	T: <type> - always "void"
+	F: ?
+	L,R: null
+
+	This node is used for casts of constant values to "void".
+
+Q_ASM:	asm(string-literal)			TERMINAL NODE
+	T: <type "void">
+	F: 0
+	L: null
+	R: null or <exprlist>	arguments.  Only N_SCONST allowed.
+
+	Note: This op is considered to have side effects!
+	Note: this is deliberately similar to N_FNCALL.  Currently the
+	string literal argument is passed directly to the assembler output
+	file.
+
+N_FNCALL:	<function-call>		<expr>(<expr1>, ... <lastexpr>)
+	T: <type of function>
+	F: <various flags>
+	X: (actually Nretstruct) pointer to auto symbol for returning struct.
+	L: <expr>		must evaluate to function address.
+	R: null			if no args
+		or, if one or more args, R points to an <exprlist>:
+	R: N_EXPRLIST
+		T: <type of lastexpr>
+		F: 0
+		L: N_EXPRLIST
+		    ...
+			N_EXPRLIST
+				T: <type of expr1>
+				F: 0
+				L: null
+				R: <expr1>
+		    ...
+		R: <lastexpr>
+
+	Note: This op is considered to have side effects!
+	Note: Nretstruct is only set if the function returns a structure 
+	larger than 2 words.  It is a SYMBOL * pointer which identifies
+	a temporary, unique internal auto struct declaration which the returned
+	structure can be copied to, if the code generation wishes to do so.
+
+Q_DOT:	<direct structure member selection>	<struct>.<member>
+	T: <C type of member>
+	F: <various flags>
+	X: (actually Nxoff) (int) offset from start of struct (see note below)
+	L: <expr>		Must evaluate to structure address
+	R: null
+
+	Note: This node is an lvalue expression if <struct> is an lvalue
+	AND <member> is not an array type.
+
+	Note: Nxoff is encoded just as for Ssmoff in structure member symbols.
+	If positive, it is a word offset from start of struct.
+	If negative, it is a bitfield.  After making it positive again,
+		the low 12 bits are the P+S fields of a byte pointer, and
+		the remaining high bits are the word offset.
+
+Q_MEMBER: <indirect structure member selection>	<&struct> -> <member>
+	See Q_DOT; same structure.
+	Note: This node is always an lvalue expression unless <member>
+	is an array type.
+
+------- Unary Expressions (type TKTY_UNOP, TKTY_BOOLUN) ---------
+
+T_SIZEOF:	<sizeof-expression>		sizeof <expr or typename>
+	This is only seen as an input token, not a node.  The
+	result value of the sizeof is evaluated immediately and
+	converted into a N_ICONST (integer constant) node.
+
+N_CAST:	<cast-expression>		(<type>) <expr>
+	T: <desired type of result>
+	F: <various flags>
+	X: (actually Ncast) holds CAST_ type to apply.
+	L: <expression>
+	R: null
+
+N_POSTINC:	<postincr-expr>		(lvalue-expr)++
+N_POSTDEC:	<postdecr-expr>		(lvalue-expr)--
+N_PREINC:	<preincr-expr>		++(lvalue-expr)
+N_PREDEC:	<predecr-expr>		--(lvalue-expr)
+Q_COMPL:	<bitwise-not-expr>	~(expr)
+Q_NOT:		<logical-not-expr>	!(expr)     (the only TKTY_BOOLUN op)
+N_NEG:		<unary-minus-expr>	-(expr)
+N_ADDR:		<address-expr>		&(lvalue-expr)
+N_PTR:		<indirect-expr>		*(expr)
+	T: <type of expr>
+	F: <flags>
+	L: <expr>
+	R: <null - unused>
+
+	Note: The 4 inc/dec ops all require that their operand be an lvalue.
+		They are also all considered side-effect ops!
+	Note: N_ADDR requires that its operand be an lvalue.
+	Note: N_PTR is always an lvalue expression unless the result type
+	is an array.
+
+------- Binary Expressions (type TKTY_BINOP, TKTY_BOOLOP) ---------
+
+	All of these operators have the same basic structure.  All are
+left-associative during parsing.  It does not matter which operand
+(left or right) is evaluated first, except for || and && which are
+required to evaluate the left operand first.  These are the only operators
+for which the precedence table is significant.
+
+Q_MPLY: Q_DIV: Q_MOD:	13 * / %  Multiply, Divide, Remainder
+Q_PLUS: Q_MINUS:	12 + -	 Add, Subtract
+Q_LSHFT: Q_RSHFT:	11 << >>  Left shift, Right shift
+Q_LESS: Q_GREAT: Q_LEQ: Q_GEQ:	10 < > <= >=  Comparisons
+Q_EQUAL: Q_NEQ:		9 == !=  Equal, Unequal
+Q_ANDT:			8 &	 Bitwise AND
+Q_XORT:			7 ^	 Bitwise XOR
+Q_OR:			6 |	 Bitwise OR
+Q_LAND:			5 &&	 Logical AND
+Q_LOR:			4 ||	 Logical OR
+	T: <C type of result>
+	F: <flags>
+	L: <left operand expr>
+	R: <right operand expr>
+
+	Note: Q_PLUS has a special usage for array subscripting.
+	See discussion of arrays above.
+
+------- Binary Assignment Expressions (type TKTY_ASOP) ---------
+
+	All operators have the same structure as the basic Q_ASGN
+assignment op, and all require that the left operand be an lvalue.
+They are also all considered side-effect ops.
+
+Q_ASPLUS: Q_ASMINUS: Q_ASMPLY: Q_ASDIV: Q_ASMOD:
+Q_ASRSH:  Q_ASLSH:   Q_ASAND:  Q_ASXOR: Q_ASOR:
+Q_ASGN:	<assignment operation>		<lvalue-expr> <asop> <expr>
+	T: <resulting C type>
+	F: <flags>
+	X: (actually Nascast) Applicable assignment conversion (CAST_ value)
+	L: <lvalue expression>
+	R: <value expression>
+
+Note: if a type conversion of the <lvalue expression> is required, L will
+point to a N_CAST node which points to the <lvalue>.  However, that expression
+is evaluated only once; the cast is applied only for the operation.  If another
+conversion is needed before storing the result value back into the <lvalue>
+then this is specified by the contents of Nascast; anything but CAST_NONE
+indicates a conversion.
+
+------- Ternary Expression (type TKTY_TERNARY) ---------
+
+Q_QUERY:	<conditional-expression>	  <EC> ? <E1> : <E2>
+	T: <type of E1>
+	F: <flags>
+	L: <expr>			EC (condition)
+	R: <node>
+		T: <type of E1>
+		F: 0
+		L: null or <expr>	E1 ("then")
+		R: null or <aexpr>	E2 ("else")		
+
+	Note: Normally the types of E1 and E2 are the same as the overall
+type of the expression.  However, if the value of the ternary expression
+is not used for anything (NF_DISCARD will be set) then it is possible for
+the types to be mismatched or for either or both expressions to be NULL.
+
+------- Comma Expression (type TKTY_SEQ) ---------
+
+N_EXPRLIST:	<expression-list>  expr1, expr2, ... lastexpr
+	T: <type of lastexpr>
+	F: 0
+	L: N_EXPRLIST
+	  ...
+		T: <type of expr2>
+		F: 0
+		L: N_EXPRLIST
+			T: <type of expr1>
+			F: 0
+			L: null
+			R: <expr1>
+		R: <expr2>
+	R: <lastexpr>
+
+------- Compound statements (type TKTY_RWCOMP) ---------
+
+Q_GOTO:	<goto-statement>			goto <label>;
+	T: null, F: 0
+	X: (actually Nxfsym) (SYMBOL *) set to plabel(sym,0)
+	L, R: null
+
+Q_RETURN:	<return-statement>		return <expr>;
+	T: null or <type of current function> if a return-value exists.
+	F: 0
+	L: null
+	R: null or <expr>	Return value
+
+Q_BREAK:	<break-statement>		break;
+	No T, F, L, R.
+
+Q_CONTINUE:	<continue statement>		continue;
+	No T, F, L, R.
+
+Q_IF:	<conditional-statement>     if (<expr>) <thenstmt> [else <elsestmt>]
+	T: null, F: 0
+	L: <expr>		Used as condition
+	R: <node>
+		T: null, F: 0
+		L: <then-statement>
+		R: <else-statement>	NULL if no "else"
+
+Q_FOR:	<for-statement>			for ( <e1> ; <e2> ; <e3> ) <stmt>
+	T: null, F: 0
+	L: <node>
+		T: null, F: 0
+		L: <node>
+			T: null, F: 0
+			L: null or <expr>	E1 init
+			R: null or <expr>	E2 condition
+		R: <node>
+			T: null, F: 0
+			L: null or <expr>	E3 increment
+			R: null
+	R: <statement>		Body
+
+Q_DO:	<do-statement>			do <stmt> while ( <expr> );
+	T: null, F: 0
+	L: <expr>		Condition
+	R: <statement>		Body
+
+Q_WHILE: <while-statement>		while ( <expr> ) <stmt> ;
+	T: null, F: 0
+	L: <expr>		Condition
+	R: <statement>		Body
+
+Q_SWITCH:	<switch-statement>	switch ( <expr> ) <stmt> ;
+	T: null, F: 0
+	X: (actually Nxswlist)	Points to head of a list of case/default stmts.
+	L: <expr>		Condition
+	R: <statement>		Body (usually a compound stmt)
+
+Q_CASE:	<case-statement>		case <expr> : <stmt> ;
+	T: null, F: 0
+	X: (actually Nxfint or Nxfsym) <case value>
+	L: <statement>		Statement labelled by this case-label
+	R: null, or ptr to next Q_CASE node within this switch body.
+
+Q_DEFAULT:	<default-statement>	default: <stmt> ;
+	T: null, F: 0
+	L: <statement>	Statement this is a label for
+	R: null, or ptr to next Q_CASE node within this switch body.
+
+	This is the same as Q_CASE except that no case value is furnished.
+	During the code generation phase Q_DEFAULT is turned into a Q_CASE.
+
+------- Other statement node ops (type TKTY_NULL) ---------
+
+N_FUNCTION: <function-definition>
+	T: null, F: 0
+	L: <node>
+		T: null, F: 0
+		L: Q_IDENT for header (contains name, type)
+		R: <local-scope static decls> or null if none.
+			Note the decl list is made of all static decls within
+			the entire function, regardless of actual scope.
+	R: N_STATEMENT
+		L: <statement>	Function body (will be compound stmt)
+		R: N_STATEMENT
+			T: null, F: 0
+			L: Q_RETURN
+				T: null, F: 0, L: null, R: null
+			R: null
+
+N_STATEMENT: <compound-statement>	{ decls stmt1 stmt2 ... last-stmt }
+	T: null, F: 0
+	L: <decls>		; If no decls, is stmt1.
+	R: N_STATEMENT
+		T: null, F: 0
+		L: <stmt1>
+		R: N_STATEMENT
+		     ...
+			T: null, F: 0
+			L: <last-stmt>
+			R: null
+
+N_LABEL:	<label-statement>	<label>: <statement>
+	T: null, F: 0
+	X: (actually Nxfsym) (SYMBOL *) to result of plabel(sym,1)
+	L: <statement>
+	R: null
+
+------- Data definition node ops (type TKTY_NULL) ---------
+
+N_DATA:	<data declaration or definition>	Any declaration not a funct def
+	T: null, F: 0				e.g. int A,B=2,C;
+	L: N_IZ for A
+	R: N_DATA
+		T: null, F: 0
+		L: N_IZ for B
+		R: N_DATA
+			... until R: null
+
+	Note that the structure for N_IZ is the same as that for Q_ASGN.
+	This makes it easy to generate initialization code by replacing the
+	N_IZ op with a Q_ASGN op when it is encountered.
+
+N_IZ:	<storage alloc for variable>
+	T: null, F: 0
+	L: Q_IDENT
+		T: <C type of data>
+		F: 0
+		X: (actually Nid) (SYMBOL *) for this identifier
+		L,R: unused
+	R: null or <expr> or N_IZLIST		Optional initializer
+
+	Note: the Ntype of the Q_IDENT here is never examined when
+	generating code for static-extent data (gendata()); the symbol's
+	Stype is used instead.  See the note for Q_IDENT.
+
+N_IZLIST:	<initializer-list>	= { e1, e2, ... elast }
+	T: null, F: 0
+	L: <expr> or N_IZLIST		E1
+	R: N_IZLIST
+		T: null, F: 0
+		L: <expr> or N_IZLIST		E2
+		R: N_IZLIST
+			T: null, F: 0
+			L: <lastexpr> or N_IZLIST	Elast
+			R: null
+
+------- Miscellaneous node ops (type TKTY_NULL) ---------
+
+N_NODE:	<node>
+	This node op is used for random nodes that are treated
+	specially anyway by whatever points to them.  Everything that
+	used to set a node op to 0 now sets it to N_NODE; the only
+	purpose of this value is to ensure that all active nodes have
+	non-zero op values.
+---------------------------------------------------------------------
+
+Note about null statements:
+	<null-statement> has no representation other than by a null pointer.
+	If CCSTMT's statement() parses a null statement, a null pointer is
+	returned.
+
+Definition of <statement>:
+	The node pointer returned from CCSTMT's statement() will be one of the
+following:
+	<null> i.e. a null statement
+	<statement> - a node op of type TKTY_RWCOMP or TKTY_NULL.
+	<expr> - any kind of expression.
+
+The above node descriptions make a few rudimentary distinctions between
+different kinds of expressions, such as <expr> and <aexpr>.  These are more
+in the nature of hints than accurate descriptions -- see the syntax in
+H&S or ANSI for the real thing.
+	To illustrate:
+		<expr>			<aexpr>
+	K&R	<expression-list>	<expression>
+	H&S v1	<comma-expression>	<no-comma-expression>
+	H&S v2	<comma-expression>	<assignment-expression>
+	ANSI	<comma-expression>	<assignment-expression>
+
+	The first can be a comma-expression, the second cannot.  The
+difference is mainly syntactic, significant during parsing.  There is
+very little difference between them in terms of parse-tree nodes since
+a true <expr> (i.e. a list of expressions separated by commas) can
+be converted into an <aexpr> just by enclosing it in parentheses,
+which results in exactly the same parse-tree node structure except
+that the top node has its NF_INPARENS flag set.
+	ANY of the nodes described as "expressions" may be found as an
+<expr> or <aexpr>.  The only restriction is that if an <aexpr> is
+required, then N_EXPRLIST cannot be seen unless NF_INPARENS is set.
+
+	Only a few nodes are guaranteed to be terminating nodes:
+Q_IDENT and the various types of constants.  All other expression nodes
+MUST point to further non-null expression nodes.  This is different
+from the situation with <statement> nodes, which can always be null to
+represent null statements.
+
+	The NF_ flags as far as I know are only used with expression
+nodes and are meaningless in any other type of node.  That is, they are
+not used for TKTY_COMP or TKTY_NULL nodes.  The flags themselves
+are for the most part only used within the expression parser itself
+(CCSTMT).
+
+NF_LVALUE	/* expr can be an lvalue */
+	Mainly used in CCSTMT.  One reference in CCGEN2 to see if trying to
+extract a structure component from a "virtual" non-addressable
+structure, ie one returned on stack from a function.  A couple of refs
+in CCTYPE when doing type conversion checking.
+
+NF_RETEXPR	/* want result in RETVAL so can be returned */
+	Only used in the code generator (CCGEN,1,2).  The parser never
+uses this.
+
+NF_GLOBAL	/* unable to cause a stackref */
+	Mainly used in CCSTMT; one ref in CCTYPE.
+This is used to help with NF_STKREF but not clear on this one yet.
+
+NF_STKREF	/* counted already as a stackref */
+	Mainly in CCSTMT.  Its usage is documented in CCSTMT.
+One ref in CCTYPE.
+
+NF_INPARENS	/* Expr was parenthesized */
+	Only in CCSTMT.  This flag is set only to indicate
+that an expression node was enclosed in parentheses, and thus may occur
+for any type of expression node.  Its only use is for printing nice
+warning (not error) messages about possible operator precedence
+problems (ternary and binary).
+
+NF_WASCOMP 	/* Operator is a comparison or logical &&, || */
+	Only in CCSTMT's binary().  This flag is set only for
+nodes of type TKTY_BOOLOP, and is only used in order to print a nice
+warning message if it looks like the user has gotten the precedence of
+the | and & operators mixed up with the comparison/logical operators.
+
+NF_ARRFCONV	/* This N_ADDR is an implicit array/function conversion */
+	OBSOLETE -- to be flushed soon!
+	Only in CCSTMT.  This flag is set only for N_ADDR nodes which
+were created as part of an "immediate conversion" of an array or function
+name parsed as a primary expression.  The flag is for the benefit of
+the "sizeof" operator and function call (.)() processing, so that the
+conversion can be reversed if the flag is seen.  Perhaps someday this
+can be flushed when the code generation knows how to handle array/function
+objects properly.
+
+NF_DISCARD	This expression's value will be discarded.
+	Set by CCFOLD's evaldiscard(), used by CCSTMT and CCGEN2.  As
+per H&S 7.12, there are three places where an expression may have this
+flag set: (1) an expression statement, (2) the first operand of a
+comma expression, and (3) the initialization and incrementation
+expressions in a "for" statement.  As much as possible of the expression
+is recursively discarded, and the remaining expression will have this
+flag set for the topmost node.  CCGEN2 checks this in various places to
+optimize code generation.
+
+NF_USERCAST	This N_CAST operation was explicitly given by user.
+	A N_CAST node can be generated either by an explicit user cast
+in the code, or by an implied type coercion (the "usual unary/binary/etc
+conversions").  This flag is set by CCSTMT and distinguishes the two;
+it is only used by CCFOLD's evaldiscard() to avoid generating warning
+messages when discarding implicit cast conversions.
+
+NF_SIDEFF	This expression has side effects.
+	Not yet implemented; may or may not be a good idea.  Idea is
+that any operator that has a side effect will set this flag, which
+should be propagated upwards (that is, a node will have the flag set
+if any of its operands have it set).
+
+For any particular expression node, at any time:
+	T: <the C type of the expression this node represents>
+	F: <NF_ flags for this expression result>
+
+CODE GENERATOR
+
+Virtual Registers:
+
+	The code generator translates the parse-tree nodes into
+pseudo-code operations on "virtual registers".  A virtual register
+(vreg) is treated as if it was a machine register, but whether its
+contents are actually in a machine register, or on the stack, is
+generally unspecified; the register allocation routines in CCREG are
+responsible for saving virtual registers on the stack as needed.
+	A vreg may consist of one or two words, and this is sufficient
+to hold an object of any type except structures/unions larger than 2 words.
+Not all of the bits in a vreg are actually significant; this depends on
+the type.  For example, types which are smaller than 1 word (such as
+chars and bit-fields) can only treat the rightmost N bits as significant,
+where N is the number of bits in the type.  Cast conversions can change
+the contents of a vreg in two ways:
+	(1) Change the number of significant bits (or # of words)
+	(2) Change the representation (for those bits significant in the
+		new type)
+
+Note that, in general, cast conversion to a smaller type does not result
+in any code being produced.  This is because all that changes is the
+number of bits considered significant, and the representation of the
+significant bits remains the same.  Conversion to a larger type, however,
+will enlarge the number of significant bits, and these new bits have
+to be set to some value, so some code is likely to be generated to
+accomplish this.
+
+For example, in the expression:
+	int a, b;
+	a = (char)b;
+The value of b is first retrieved into a vreg, which amounts to a "MOVE vreg,b"
+instruction, and the cast to (char) is then applied.  However, this does NOT
+generate any code, because all that happens is that only the rightmost 9
+bits of the vreg contents become significant.  It is only when this value
+is implicitly converted back to (int) for the store into "a" that the 
+cast from (char) to (int) takes effect and the non-significant bits are
+zapped.

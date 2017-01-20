@@ -1,0 +1,888 @@
+%TITLE 'DIU Logging Routines'
+
+MODULE DIULG2 (IDENT='257',
+               LANGUAGE(BLISS36),
+               ENTRY(
+                     l$event,           ! Log event code in system log file
+                     l$uevent,          ! Log event in user log file
+                     l$text,            ! Log text in system log file
+                     lj$event,          ! Log event for subjob in system log
+                     lj$text,           ! Log text for subjob
+                     lj$ulog,           ! Log event code in user log file
+                     lj$uevent,         ! Log event code in user log file
+                     lj$utxt,           ! Log text in user log file
+                     l$uinit,           ! Open user log file (or not)
+                     l$check_access,    ! Check access to log file
+                     l$new_request      ! Cons a new request string for logging
+                     )
+               )=
+BEGIN
+
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+! FACILITY:   DIU-20 (Data Interchange Utility for TOPS-20).
+!
+! ABSTRACT:   This module contains routines that open, close, and write
+!             in the log files.
+!
+!** This module was originally written transportably, using XPORT for all I/O
+!   to the log files.  However, XPORT at the time of this writing has the
+!   serious deficiency that it opens files in restricted mode and does not use
+!   TOPS-20 append mode (that is, even with OPTIONS = APPEND, the OPENF bits
+!   XPORT uses are OF%RD, OF%WR, and OF%RTD, instead of just OF%APP).  This
+!   makes it impossible for users to open the log files for read at any time;
+!   a serious bug.  If XPORT is ever fixed, this code should be rewritten to
+!   use it, and not JSYSes.
+!
+! ENVIRONMENT: TOPS-20 V6.1   (user mode privileged)
+!              BLISS-36 V4    XPORT
+!
+! AUTHOR:      Larry Campbell               CREATION DATE: March 27, 1982
+
+! HISTORY:
+!
+!  257  Change library BLI:MONSYM to just MONSYM.
+!       Gregory A. Scott 7-Jul-86
+!
+!  254  Don't write the job number in LJ$UTXT if we are yet the spooler.
+!       Gregory A. Scott 2-Jul-86
+!
+!  154  Add the l$uevent routine which logs a random event  to  the  user  log.
+!       Simplify the l$new_request routine.
+!       Gregory A. Scott 12-May-86
+!
+!  152  Add routine l$check_access which checks to see if a user has access  to
+!       a log file that he specifed.  Add l$event which logs a DIU event to the
+!       system log file.  Add lj$event which  logs a slave job type message  to
+!       system log file.  Add lj$uevent which logs a slave message to user  log
+!       file from spooler.
+!       Gregory A. Scott 11-May-86
+!
+!  147  Add routine L$UINIT to open the user log file.  Fix lj$utxt so that  it
+!       can be called from DIUC20 at the time that request is  created.   Clean
+!       up user log routines.
+!       Gregory A. Scott 8-May-86
+!
+!  125  Change slightly the string returned by L$NEW_REQUEST.
+!       Gregory A. Scott 24-Apr-86
+!
+!  121  Put a line seperator in between the filenames when logging a new 
+!       request.
+!       Gregory A. Scott 19-Apr-86
+!
+! V01-005 RDF0001          Rick Fricchione                26-Oct-1984
+!         Convert for DIU.  Modify some small areas and clean up
+!         code.
+!
+! V01-004 AWN0004          Andrew Nourse                  --no date--
+!         04 - Sleep & retry if log file can't be opened
+!         03 - Do not try to write log file after failing to open it
+!         02 - Put in Entry Points
+!         01 - Use JSYSes instead of XPORT because XPORT gets it wrong
+!--
+
+!**************************************************************************
+!**                  F O R W A R D   R O U T I N E 
+!**************************************************************************
+FORWARD ROUTINE
+    l$open : NOVALUE,                   ! Open log file
+    l$close : NOVALUE,                  ! Close log file
+    l$event : NOVALUE,                  ! Log event to system log file
+    l$uevent : NOVALUE,                 ! Log event to user log file
+    l$text : NOVALUE,                   ! Log text to system log file
+    lj$event : NOVALUE,                 ! Log event for subjob
+    lj$text : NOVALUE,                  ! Log text for subjob
+    lj$ulog : NOVALUE,                  ! Log code in user log file
+    lj$uevent : NOVALUE,                ! Log code in user log file
+    lj$utxt : NOVALUE,                  ! Log text in user log file
+    l$uinit : NOVALUE,                  ! Init spec to the user log file
+    l$check_access,                     ! Check for access to the user log file
+    l$new_request : NOVALUE;            ! Log new request
+
+!**************************************************************************
+!**                   L I B R A R Y     F I L E S 
+!**************************************************************************
+LIBRARY 'BLI:XPORT';                    ! Of course
+LIBRARY 'MONSYM';                       ! Monitor symbols
+LIBRARY 'DIU';                          ! DIU Data structures
+REQUIRE 'JSYSDEF';                      ! JSYS defs
+
+!**************************************************************************
+!**                   G L O B A L   S T O R A G E 
+!**************************************************************************
+
+LITERAL max_log_retries = 10,
+        log_retry_wait = 1000;
+
+OWN sys_log_jfn,                        ! System log file JFN
+    usrlog_reqblk,
+    usrlog_desc : $STR_DESCRIPTOR(CLASS=FIXED);
+
+!**************************************************************************
+!**             E X T E R N A L   D E C L A R A T I O N S 
+!**************************************************************************
+
+EXTERNAL interactive,                   ! 0 if we are a slave, 1 if not
+         mst_flag : VOLATILE,           ! We are (yet) the spooler if nonzero
+         jobstatus : BLOCKVECTOR [DIU$K_MAX_MJOB, DIUJ$K_LEN]
+                     FIELD (DIUJ$$JOBSTAT_FIELDS);
+
+EXTERNAL ROUTINE
+    s$jobno,                            ! Return current job no.
+    s$noint : NOVALUE,                  ! Disable interrupts
+    s$okint : NOVALUE,                  ! Enable interrupts
+    q$extract_filespecs : NOVALUE,      ! Extract filespecs from request block
+    q$options_extract : NOVALUE,        ! Extract command options from req blk
+    diu$abort,                          ! Default condition handler
+    diu$errmsg : NOVALUE,               ! Convert condition code into text
+    s$dtstr : NOVALUE;                  ! Convert date/time to string
+
+!**************************************************************************
+!**                            L $ O P E N
+!**************************************************************************
+ROUTINE l$open : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Open the system log file (SYSTEM:DIU.LOG) for append.
+!
+! FORMAL PARAMETERS:
+!   NONE
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   NONE
+!
+! SIDE EFFECTS:
+!   We go NOINT to prevent races in writing the log file.  L$CLOSE will
+!   undo this.
+!
+!--
+    BEGIN
+
+    LOCAL
+        retcode,
+        logfile_descr : $STR_DESCRIPTOR (),
+        error,
+        output,
+        retries: INITIAL (0);
+
+    s$noint ();
+    !
+    ! Init descr to ASCIZ filespec string, but fudge byte count to not
+    ! include trailing null.
+    !
+    $STR_DESC_INIT (DESCRIPTOR = logfile_descr, CLASS = FIXED,
+                    STRING =
+                        (%STRING (
+                         %IF %SWITCHES(DEBUG)
+                         %THEN
+                          'SYSTEM:DIUDEB.LOG'
+                         %ELSE
+                          'SYSTEM:DIU.LOG'
+                         %FI, %CHAR (0))));
+    logfile_descr[STR$H_LENGTH] = .logfile_descr[STR$H_LENGTH] - 1;
+    IF NOT JSYS_GTJFN (GJ_SHT, .logfile_descr[STR$A_POINTER]; output)
+    THEN
+        SIGNAL (DIU$_SYS_LOG_FAULT, .output, 0, logfile_descr);
+    sys_log_jfn = .output;
+
+    WHILE NOT JSYS_OPENF (.output, OF_APP + %O'070000000000'; error)
+    DO                                  ![4] Retry open if locked
+        BEGIN
+        JSYS_RLJFN (.sys_log_jfn);
+
+        IF (.error NEQ OPNX9)           ![4] Only retry if locked by another
+        OR ((retries = .retries + 1) GTR max_log_retries) ![4]
+        THEN
+            EXITLOOP SIGNAL (DIU$_SYS_LOG_FAULT, .error, 0, logfile_descr)
+        ELSE
+            JSYS_DISMS (log_retry_wait) ![4] sleep for one second
+        END;
+    END;                                ! End of l$open
+
+!**************************************************************************
+!**                             L $ C L O S E 
+!**************************************************************************
+ROUTINE l$close : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Close the log file.
+!
+! FORMAL PARAMETERS:
+!   NONE
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   NONE
+!
+! SIDE EFFECTS:
+!   S$OKINT is called to reenable interrupts.
+!
+!--
+    BEGIN
+
+    JSYS_CLOSF (.sys_log_jfn);
+    s$okint ();
+
+    END;                                ! End of l$close
+
+!**************************************************************************
+!**                        L $ E V E N T
+!**************************************************************************
+GLOBAL ROUTINE l$event (code, code2, p_descr) : NOVALUE =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Log an event in the system log file.  This  routine can be called  from
+!       anywhere in DIU.
+!
+! FORMAL PARAMETERS:
+!
+!      code: condition code
+!      code2: secondary condition code
+!      p_descr:  pointer to descriptor for optional text
+!
+!--
+
+BIND opt_descr = .p_descr : $STR_DESCRIPTOR ();
+
+LOCAL descr : $STR_DESCRIPTOR (CLASS = DYNAMIC);
+
+! Get message for this code
+
+$STR_DESC_INIT (DESCRIPTOR = descr, CLASS = DYNAMIC);
+DIU$ERRMSG(.code, .code2, opt_descr, descr, %REF(0));
+
+! Place message in log file
+
+l$text (descr);
+
+! Gee that was easy, free memory and return
+
+$XPO_FREE_MEM (STRING = descr);         ! Thanks for the memories
+
+END;                                    ! End of l$event
+
+!**************************************************************************
+!**                        L J $ E V E N T
+!**************************************************************************
+GLOBAL ROUTINE lj$event (code, code2, p_descr, job_handle) : NOVALUE =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Log an event in the system log file.
+!
+! FORMAL PARAMETERS:
+!
+!      code: condition code
+!      code2: secondary condition code
+!      p_descr:  pointer to descriptor for optional text
+!      job_handle: DIU stream number
+!
+!--
+
+BIND opt_descr = .p_descr : $STR_DESCRIPTOR ();
+
+LOCAL descr : $STR_DESCRIPTOR (CLASS = DYNAMIC);
+
+! Get message for this code
+
+$STR_DESC_INIT (DESCRIPTOR = descr, CLASS = DYNAMIC);
+DIU$ERRMSG(.code, .code2, opt_descr, descr, %REF(0));
+
+! Place message in system wide log file
+
+lj$text (descr, .job_handle);
+
+! Gee that was easy, free memory and return
+
+$XPO_FREE_MEM (STRING = descr);         ! Thanks for the memories
+
+END;                                    ! End of l$jevent
+
+!**************************************************************************
+!**                          L $ T E X T 
+!**************************************************************************
+GLOBAL ROUTINE l$text (p_descr) : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Place a line of text in the log file.
+!
+! FORMAL PARAMETERS:
+!   p_descr     - pointer to descriptor for text to put in log file
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   NONE
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+    BEGIN
+
+    BIND
+        descr = .p_descr : $STR_DESCRIPTOR ();
+
+    LOCAL
+	retcode,
+        date_descr : $STR_DESCRIPTOR (),
+        date_buff : VECTOR [CH$ALLOCATION (19)],
+        log_line_descr : $STR_DESCRIPTOR (CLASS = DYNAMIC);
+
+    $STR_DESC_INIT (DESCRIPTOR = date_descr,
+                    STRING = (19, CH$PTR (date_buff)));
+    $STR_DESC_INIT (DESCRIPTOR = log_line_descr, CLASS = DYNAMIC);
+    l$open ();
+    s$dtstr (-1, date_descr);
+    $STR_COPY (TARGET = log_line_descr,
+               STRING = $STR_CONCAT (date_descr,
+                                     descr,
+                                     %CHAR (13, 10, 0)));
+    JSYS_SOUT (.sys_log_jfn, .log_line_descr[STR$A_POINTER], 0, 0);
+    $XPO_FREE_MEM (STRING = log_line_descr);
+    !
+    ! Close log file for readers
+    !
+    l$close ();
+    END;                                ! End of l$text
+
+!**************************************************************************
+!**                            L J $ T E X T 
+!**************************************************************************
+GLOBAL ROUTINE lj$text (p_descr, job_handle) : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Append a line of text pertaining to a particular slave job
+!   to the log file.  The pertinent job is identified.
+!
+! FORMAL PARAMETERS:
+!   p_descr             - pointer to descriptor for string
+!   job_handle          - job handle (index into JOBSTATUS blockvector)
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   NONE
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+    BEGIN
+
+    BIND
+        descr = .p_descr : $STR_DESCRIPTOR (),
+        req_block = .jobstatus[.job_handle, DIUJ$A_REQ_BLOCK] : $DIU_BLOCK;
+
+    LOCAL
+	retcode,
+        date_descr : $STR_DESCRIPTOR (),
+        date_buff : VECTOR [CH$ALLOCATION (19)],
+        log_line_descr : $STR_DESCRIPTOR (CLASS = DYNAMIC);
+
+    $STR_DESC_INIT (DESCRIPTOR = date_descr,
+                    STRING = (19, CH$PTR (date_buff)));
+    $STR_DESC_INIT (DESCRIPTOR = log_line_descr, CLASS = DYNAMIC);
+    l$open ();
+    s$dtstr (-1, date_descr);
+    $STR_COPY (TARGET = log_line_descr,
+               STRING = $STR_CONCAT (date_descr,
+                                     'Req ',
+                                     $STR_ASCII (.req_block[DIU$H_REQUEST_ID]),
+                                     ' (',
+                                     $STR_FORMAT ((.req_block[DIU$H_JOBNAME],
+                                                  CH$PTR (req_block[DIU$T_JOBNAME])),
+                                                  UP_CASE),
+                                     '), job ',
+                                     $STR_ASCII (.jobstatus[.job_handle,
+                                                            DIUJ$H_JOB_NUMBER]),
+                                     ': ',
+                                     descr,
+                                     %CHAR (13, 10, 0)));
+    JSYS_SOUT (.sys_log_jfn, .log_line_descr[STR$A_POINTER], 0, 0);
+    $XPO_FREE_MEM (STRING = log_line_descr);
+    !
+    ! Close system log for perusers
+    !
+    l$close ();
+    END;                                ! End of lj$text
+
+!**************************************************************************
+!**                        L J $ U L O G 
+!**************************************************************************
+GLOBAL ROUTINE lj$ulog (code, code2, p_descr) : NOVALUE =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Log an event in the user-specified log file.  This routine is called by
+!       a slave job  or by  the master  job, but  the access  has already  been
+!       checked when  the  request  was  queued.   If  the  condition  code  is
+!       DIU$_USER_LOG_FAULT, we just turn off user logging and return.
+!
+! FORMAL PARAMETERS:
+!
+!      code: condition code
+!      code2: secondary condition code
+!      p_descr:  pointer to descriptor for optional text
+!
+! IMPLICIT INPUTS:
+!
+!      usrlog_desc: points to the log file text
+!
+!--
+
+BIND opt_descr = .p_descr : $STR_DESCRIPTOR ();
+
+LOCAL length,
+      descr : $STR_DESCRIPTOR (CLASS = DYNAMIC);
+
+ENABLE DIU$ABORT;
+
+! If we are being called because of a user log fault, just turn off
+! logging (to prevent infinite loops) and return.
+
+IF .code EQL DIU$_USER_LOG_FAULT
+THEN usrlog_desc[STR$H_LENGTH] = 0;
+
+! If user said /NOLOG_FILE or there have been errors then return now
+
+IF .usrlog_desc[STR$H_LENGTH] EQL 0
+THEN RETURN;
+
+! Get message for this code
+
+$STR_DESC_INIT (DESCRIPTOR = descr, CLASS = DYNAMIC);
+DIU$ERRMSG(.code, .code2, opt_descr, descr, length);
+
+! Place message in log file
+
+lj$utxt (descr);
+
+! Free memory and return
+
+$XPO_FREE_MEM (STRING = descr);
+
+END;                                ! End of lj$ulog
+
+!**************************************************************************
+!**                        L $ U E V E N T
+!**************************************************************************
+GLOBAL ROUTINE l$uevent (code, code2, p_descr, p_req_block) : NOVALUE =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Log an event in the user's log file.  Should only be called from
+!       interrupt level in spooler job.
+!
+! FORMAL PARAMETERS:
+!
+!      code: condition code
+!      code2: secondary condition code
+!      p_descr:  pointer to descriptor for optional text
+!      p_req_block: request block associated with request (for log file spec)
+!
+!--
+
+BIND opt_descr = .p_descr : $STR_DESCRIPTOR (),
+     req_block = .p_req_block : $DIU_BLOCK;
+
+LOCAL descr : $STR_DESCRIPTOR (CLASS = DYNAMIC);
+
+! Get message for this code
+
+$STR_DESC_INIT (DESCRIPTOR = descr, CLASS = DYNAMIC);
+DIU$ERRMSG(.code, .code2, opt_descr, descr, %REF(0));
+
+! Place message in user log file (if any)
+
+l$uinit(req_block);
+lj$utxt(descr);
+
+! Gee that was easy, free memory and return
+
+$XPO_FREE_MEM (STRING = descr);         ! Thanks for the memories
+
+END;                                    ! End of l$uevent
+
+!**************************************************************************
+!**                        L J $ U E V E N T
+!**************************************************************************
+GLOBAL ROUTINE lj$uevent (code, code2, p_descr, job_handle) : NOVALUE =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Log an event in the user's log file.  Should only be called from slave
+!       or from interrupt level in spooler job.
+!
+! FORMAL PARAMETERS:
+!
+!      code: condition code
+!      code2: secondary condition code
+!      p_descr:  pointer to descriptor for optional text
+!      job_handle: DIU stream number
+!
+!--
+
+BIND opt_descr = .p_descr : $STR_DESCRIPTOR ();
+
+LOCAL descr : $STR_DESCRIPTOR (CLASS = DYNAMIC);
+
+! Get message for this code
+
+$STR_DESC_INIT (DESCRIPTOR = descr, CLASS = DYNAMIC);
+DIU$ERRMSG(.code, .code2, opt_descr, descr, %REF(0));
+
+! Place message in user log file (if any)
+
+l$uinit(.jobstatus[.job_handle, DIUJ$A_REQ_BLOCK]);
+lj$utxt(descr);
+
+! Gee that was easy, free memory and return
+
+$XPO_FREE_MEM (STRING = descr);         ! Thanks for the memories
+
+END;                                    ! End of lj$uevent
+
+!**************************************************************************
+!**                         L J $ U T X T 
+!**************************************************************************
+GLOBAL ROUTINE lj$utxt (p_descr) : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Place a line of text in the user's log file.
+!
+! FORMAL PARAMETERS:
+!
+!       p_descr: address of descriptor of text to write
+!
+! IMPLICIT INPUTS:
+!
+!       usrlog_reqblk: points to the request we are handling
+!       usrlog_desc: points to the log file string
+!--
+BEGIN
+
+LOCAL date_descr : $STR_DESCRIPTOR (CLASS = FIXED),
+      date_buff : VECTOR [CH$ALLOCATION (19)],
+      retcode,
+      logline_descr : $STR_DESCRIPTOR (CLASS = DYNAMIC),
+      usr_log_jfn,
+      error;
+
+BIND req = .usrlog_reqblk : $DIU_BLOCK,
+     descr = .p_descr : $STR_DESCRIPTOR ();
+
+ENABLE DIU$ABORT;
+
+! If user said /NOLOG_FILE then return now
+
+IF .usrlog_desc[STR$H_LENGTH] EQL 0
+THEN RETURN;
+
+! Attempt to open the file
+
+IF NOT JSYS_GTJFN (GJ_SHT, CH$PTR(req[DIU$T_LOG_FILESPEC]); usr_log_jfn)
+THEN BEGIN
+     SIGNAL (DIU$_USER_LOG_FAULT, .usr_log_jfn, 0, usrlog_desc);
+     RETURN
+     END;
+
+! Some other slave job might be trying to write in the file.  If
+! we get an OPNX9 (invalid simultaneous access), sleep for a second
+! and try again, up to 10 seconds.
+
+DECR counter FROM 10 TO 1               ! Try this ten times
+DO IF JSYS_OPENF (.usr_log_jfn, OF_APP + %O'070000000000'; error)
+   THEN EXITLOOP                        ! If success, quit the loop
+   ELSE IF .error EQL OPNX9             ! If invalid simultaneous access
+        THEN JSYS_DISMS (1000)          !  sleep for one second
+        ELSE BEGIN                      !  any other error, give up
+             JSYS_RLJFN (.usr_log_jfn);
+             SIGNAL (DIU$_USER_LOG_FAULT, .error, 0, usrlog_desc);
+             RETURN
+             END;
+
+! Log file is open now, get the current date and time asciized
+
+$STR_DESC_INIT (DESCRIPTOR = date_descr,
+                STRING = (19, CH$PTR (date_buff)));
+s$dtstr (-1, date_descr);
+
+! Start building the message that we will write to the log file.
+
+$STR_DESC_INIT (DESCRIPTOR = logline_descr, CLASS = DYNAMIC);
+
+$STR_COPY (TARGET = logline_descr,
+           STRING = $STR_CONCAT (date_descr,
+                                 'Req ',
+                                 $STR_ASCII (.req[DIU$H_REQUEST_ID]),
+                                 ' (',
+                                 (.req[DIU$H_JOBNAME],
+                                  CH$PTR(req[DIU$T_JOBNAME]))));
+
+IF .mst_flag                                    ! Am I yet the spooler
+THEN $STR_APPEND(TARGET = logline_descr,        ! Yes, put that in the log
+                 STRING = ') spooler')
+ELSE $STR_APPEND(TARGET = logline_descr,        ! No, put slave job number
+                 STRING = $STR_CONCAT(') job ',
+                                      $STR_ASCII(s$jobno())));
+
+$STR_APPEND(TARGET = logline_descr,
+            STRING = $STR_CONCAT(': ',
+                                 descr,
+                                 %CHAR(13,10,0)));
+
+! Write that string to the user's log file
+
+JSYS_SOUT (.usr_log_jfn, .logline_descr[STR$A_POINTER], 0, 0);
+
+! Free the memory we used, close the log file and return
+
+$XPO_FREE_MEM (STRING = logline_descr); ! Thanks for the memories
+
+JSYS_CLOSF (.usr_log_jfn);              ! Thump
+
+END;                                    ! End of lj$utxt
+
+!**************************************************************************
+!*                             L $ U I N I T
+!**************************************************************************
+GLOBAL ROUTINE l$uinit (p_req) : NOVALUE =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Copies the user log filespec to userlog for later use.
+!
+! FORMAL PARAMETERS:
+!
+!       p_req: request block (containing log file specification)
+!
+! IMPLICIT OUTPUTS:
+!
+!       usrlog_desc: set up to point to user log descr
+!--
+
+BIND req = .p_req : $DIU_BLOCK;
+
+! Init a string desc to the log filespec in the request block we were passed.
+! Note that if the length of this desc is zero then we aren't doing logging.
+
+$STR_DESC_INIT(DESC=usrlog_desc, CLASS=FIXED,
+               STRING=(.req[DIU$H_LOG_FILESPEC],
+                       CH$PTR(req[DIU$T_LOG_FILESPEC])));
+
+! Remember the address of the request block passed to us or later use.
+
+usrlog_reqblk = req;
+
+END;                                    ! l$uinit
+
+!**************************************************************************
+!*                      L $ C H E C K _ A C C E S S
+!**************************************************************************
+GLOBAL ROUTINE l$check_access (user_num, dir_num, caps, log_filespec) : =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Checks to see if a user has append access to the given log file.
+!
+! FORMAL PARAMETERS:
+!
+!       user_num: user number of request creator
+!       dir_num: connected directory of request creator
+!       caps: capabilities of request creator
+!       log_filespec: address of log filespec 
+!
+! ROUTINE VALUES:
+!
+!       TRUE if access is allowed
+!       DIU$_ILLEGAL_USER_LOG if access is not allowed
+!--
+
+LOCAL chkac_block: VECTOR[$CKAUD+1],
+      retcode,
+      log_jfn;
+
+! First get a JFN on the file we are going to check
+
+IF NOT JSYS_GTJFN (GJ_SHT, CH$PTR(.log_filespec); log_jfn)
+THEN RETURN (DIU$_ILLEGAL_USER_LOG);    ! Return owie if can't get JFN
+
+! Construct the log file chkac block
+
+chkac_block[$CKAAC] = $CKAAP;           ! Check append access to file
+chkac_block[$CKALD] = .user_num;        ! User number
+chkac_block[$CKACD] = .dir_num;         ! Connected directory number
+chkac_block[$CKAEC] = .caps;            ! Enabled capabilities
+chkac_block[$CKAUD] = .log_jfn;         ! File to check access to
+
+! Do the call to check access and return if it had an error
+
+IF NOT JSYS_CHKAC(CK_JFN+$CKAUD+1, chkac_block; retcode)
+THEN BEGIN                              ! Punt if JSYS fails
+     JSYS_RLJFN(.log_jfn);              ! Release the JFN
+     RETURN DIU$_ILLEGAL_USER_LOG;      ! Return the error
+     END;
+
+! Release the log file jfn and return based on whatever CHKAC gave us
+
+JSYS_RLJFN(.log_jfn);                   ! Release the jfn
+
+IF .retcode                             ! Did CHKAC return -1 or 0?
+THEN RETURN TRUE                        ! -1, access allowed
+ELSE RETURN DIU$_ILLEGAL_USER_LOG;      !  0, access not allowed
+
+END;                                    ! l$check_access
+
+!**************************************************************************
+!**                   L $ N E W _ R E Q U E S T
+!**************************************************************************
+GLOBAL ROUTINE l$new_request (p_req_block, p_descr) : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Create a hairy multiline exposition of a new request.  This is
+!       used to log new requests in the system and user log files.
+!
+! FORMAL PARAMETERS:
+!
+!       p_req_block: pointer to request block
+!       p_descr: pointer to descriptor for string to receive text
+!
+!--
+BEGIN
+
+BIND req_block = .p_req_block : $DIU_BLOCK,
+     log_descr = .p_descr : $STR_DESCRIPTOR ();
+
+LOCAL source_descr : $STR_DESCRIPTOR (CLASS = DYNAMIC),
+      dest_descr : $STR_DESCRIPTOR (CLASS = DYNAMIC),
+      options_descr : $STR_DESCRIPTOR (CLASS = DYNAMIC);
+
+MACRO function_to_string [funct, str] =
+      [%NAME ('DIU$K_', funct)] : $STR_APPEND (STRING = str,
+                                               TARGET = log_descr) %,
+      continuation = %CHAR (13, 10, %C'-', 9) %;
+
+! Init string descriptors
+
+$STR_DESC_INIT (DESCRIPTOR = source_descr, CLASS = DYNAMIC);
+$STR_DESC_INIT (DESCRIPTOR = dest_descr, CLASS = DYNAMIC);
+$STR_DESC_INIT (DESCRIPTOR = options_descr, CLASS = DYNAMIC);
+$STR_DESC_INIT (DESCRIPTOR = log_descr, CLASS = DYNAMIC);
+
+! Start the string with the job name and so forth.
+
+$STR_COPY(TARGET = log_descr,
+          STRING = $STR_CONCAT ('Request ',
+                                $STR_ASCII (.req_block[DIU$H_REQUEST_ID]),
+                                ' (',
+                                (.req_block[DIU$H_JOBNAME],
+                                 CH$PTR (req_block[DIU$T_JOBNAME])),
+                                ') created by user ',
+                                (.req_block[DIU$H_USERNAME],
+                                 CH$PTR(req_block[DIU$T_USERNAME])), 
+                                %CHAR(%C':',13,10,%C'-',9)));
+
+! Get the function figured out
+
+SELECTONE .req_block[DIU$H_FUNCTION] OF
+SET
+function_to_string (COPY,     'COPY ',
+                    APPEND,   'APPEND ',
+                    DELETE,   'DELETE ',
+                    RENAME,   'RENAME ',
+                    PRINT,    'PRINT ',
+                    SUBMIT,   'SUBMIT ',
+                    DIRECTORY,'DIRECT ')
+TES;
+
+! Get the filespecs formatted
+
+q$extract_filespecs (req_block, source_descr, dest_descr);
+$STR_APPEND (TARGET = log_descr,
+             STRING = source_descr);
+
+! Get the switches that we care about extracted
+
+q$options_extract (req_block, options_descr);
+
+! Append destination filespecs if needed
+
+SELECTONE .req_block[DIU$H_FUNCTION] OF
+SET
+[DIU$K_COPY, DIU$K_DIRECTORY, DIU$K_RENAME, DIU$K_APPEND] :
+    $STR_APPEND (TARGET = log_descr,
+                 STRING = $STR_CONCAT (continuation,
+                                       '(to) ',
+                                       dest_descr));
+[DIU$K_PRINT, DIU$K_SUBMIT]:
+    $STR_APPEND (TARGET = log_descr,
+                 STRING = $STR_CONCAT (continuation,
+                                       '(after copying to) ',
+                                       dest_descr));
+TES;
+
+! Append in the options
+
+$STR_APPEND (TARGET = log_descr,
+             STRING = $STR_CONCAT (continuation,
+                                   options_descr));
+
+! Free memory and return
+
+$XPO_FREE_MEM (STRING = source_descr);
+$XPO_FREE_MEM (STRING = dest_descr);
+$XPO_FREE_MEM (STRING = options_descr);
+
+END;                                    ! End of l$new_request
+
+END                                     ! End of module
+ELUDOM

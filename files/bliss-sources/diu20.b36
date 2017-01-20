@@ -1,0 +1,292 @@
+%TITLE'DIU20 TOPS-20 DIU Main Program'
+
+MODULE DIU20 (                          ! Top Level of DIU
+                MAIN = main,
+                IDENT= '261',
+                ENVIRONMENT( STACK=s )
+                ) =
+BEGIN
+
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+
+
+! FACILITY:     DIU-20  (TOPS-20 Data Interchange Utility)
+!
+! ABSTRACT:     This module initializes the world and parses commands 
+!
+! ENVIRONMENT:  TOPS-20 V6.1  RMS V3     XPORT
+!               FAO-36        
+!
+! AUTHOR:       Rick Fricchione                     CREATED:  4-Feb-1985
+
+! HISTORY:    
+!
+!  261  Remove logical names from LIBRARY statements.
+!       Gregory A. Scott 7-Jul-86
+!
+!  165  Edit 163 broke CCL takes, which is fixed now.
+!       Gregory A. Scott 16-May-86
+!
+!  164  Clear the noint depth on startup for restarting.
+!       Gregory A. Scott 16-May-86
+!
+!  134  Insure that the shutdown flag is cleared before attempting restart.
+!       Gregory A. Scott 30-Apr-86
+!
+!  131  Remove the diudbg cell since it is no longer used.
+!       Gregory A. Scott 28-Apr-86
+!
+!  126  TAKEFLAG should be zeroed on startup, in case of ^C out of a TAKE or
+!       EXIT within a take then START.
+!       Gregory A. Scott 26-Apr-86
+!
+!  124  Use conditional assembly to set diudeb cell rather than keeping another
+!       copy of DIU20.B36  around in  the debug build  area.  UnFricchione  the
+!       comments (put them before  the code like the  rest of the human  race).
+!       Set slave job's program name to DIUDEB if debuging.
+!       Gregory A. Scott 24-Apr-86
+!
+!  123  Make restarts work better if we are the spooler.
+!       Gregory A. Scott 23-Apr-86
+!
+!    V01-000  RDF0001             Rick Fricchione             4-Feb-1985
+!             Original version of DIU.B36.  Get to call DIUCMD, and 
+!             rewrite for new header format.
+!
+!--
+
+!*************************************************************************
+!                   F O R W A R D   R O U T I N E 
+!*************************************************************************
+
+FORWARD ROUTINE
+    main  : NOVALUE,                    ! Initializes and calls COMAND
+    slave : NOVALUE;                    ! Does detached slave-job thing
+
+
+!*************************************************************************
+!                    L I B R A R Y    F I L E S 
+!*************************************************************************
+
+LIBRARY 'BLI:XPORT';                    ! XPORT of course
+LIBRARY 'RMSINT';                       ! RMS V3 interface
+LIBRARY 'DIU';                          ! DIU Definitions
+
+
+!************************************************************************
+!          M A C R O   A N D   B I N D   D E C L A R A T I O N S 
+!************************************************************************
+
+BIND start_address   = %O'120',
+     reenter_address = %O'124';
+
+!************************************************************************
+!                    G L O B A L   S T O R A G E 
+!************************************************************************
+
+GLOBAL s: VECTOR[10000],                ! A BIG stack
+       time_restart,                    ! The time when we were restarted
+       interactive,                     ! 1 if interactive, 0 if spooler subjob
+       job_index;                       ! Internal identifier for this stream
+
+!************************************************************************
+!                E X T E R N A L    R O U T I N E S 
+!************************************************************************
+
+EXTERNAL noint_depth,                   ! Depth of noints
+         takeflag,                      ! if 1 we are in a take
+         shutdown,                      ! If 1 we are in the middle of shutdown
+         mst_flag;                      ! If 1 we are (yet) the spooler
+
+EXTERNAL ROUTINE DIU$ABORT,             ! DIU condition handler
+                 IP_INIT : NOVALUE,     ! Init IPCF
+                 IP_FIND,               ! Find a request to perform
+                 S$SETNAME : NOVALUE,   ! Set my job name
+                 S$ENABLE : NOVALUE,    ! Enable capabilities
+                 S$HALT : NOVALUE,      ! Halt this fork
+                 S$JOBUSR,              ! Get user number from job number
+                 S$USERNAME,            ! Get user name from user number
+                 SP$START : NOVALUE,    ! Restart the spooler
+                 DEF$INIT : NOVALUE,    ! Init list of default blocks
+                 DIU$DO,                ! Perform a DIU request
+                 DIUCMD;                ! Process DIU commands
+
+
+!************************************************************************
+!                              M A I N    
+!************************************************************************
+GLOBAL ROUTINE main (request_id,job_handle,c,d,ccl) : NOVALUE =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       This routine is the top level of DIU.  It initializes the world,  reads
+!       the init file and loops calling DIUCMD to process commands.  If we're a
+!       slave job (CCL flag  on) then we  call SLAVE to  fetch and process  one
+!       request from the queue.
+!
+! FORMAL PARAMETERS:
+!
+!       request_id  : request to process if CCL=1, else ignored
+!       job_handle  : internal index which identifies this stream
+!       c,d         : Not used.
+!       ccl         : 0 if entered at normal entry point, 1 if CCL entry
+!                     CCL entry means we are subjob of spooler
+!
+! SIDE EFFECTS:
+!
+!       DIUCMD is called to process init file and commands if interactive
+!       SLAVE is called to process requests if not interactive
+!
+!--
+
+$NOMESSAGE;                             ! Turn off page-trap checking
+
+takeflag = 0;                           ! We are not in a take any more
+IP_INIT();                              ! Init IPCF interface
+
+! Set interactive flag.  If we are entered at CCL then we must be running as a
+! CRJOBed slave from the spooler to process a request.  Otherwise we must be
+! reading commands from the terminal
+
+interactive = .ccl XOR 1;               ! Interactive if not CCL,
+                                        ! spooler subjob if CCL
+
+IF .interactive                         ! If interactive
+THEN BEGIN                              ! Then perform the following
+     OWN usrbuf  : VECTOR[CH$ALLOCATION(60)],
+         usrdesc : $STR_DESCRIPTOR(STRING=(60,CH$PTR(usrbuf))),
+         inifab  : $FAB(RFM=stm, FAC=NIL, FNA=CH$PTR(usrbuf)),
+         didini  : INITIAL(0); 
+     LOCAL l; 
+
+     ENABLE DIU$ABORT;                  ! In case restarting master job
+
+     reenter_address = .start_address<0,18>;    ! Make REENTER work
+
+     IF .didini EQL 0                   ! If we have not (yet) read DIU.INIT
+     THEN BEGIN                         ! Then read it
+          DEF$INIT();                   ! Initialize default chain first time
+
+          l = S$USERNAME(S$JOBUSR(-1),usrdesc); ! Get our user name 
+          $STR_COPY(STRING=$STR_CONCAT('PS:<',  ! PS:<loggedindir>DIU.INIT
+                                       (.L,.USRDESC[STR$A_POINTER]),
+                                       %STRING('>DIU.INIT',%CHAR(0))),
+                    TARGET=USRDESC);
+
+          $OPEN(FAB=inifab);            ! Open FTS.INIT
+
+          ! If we could open the file, process it, and set flag
+
+          IF .inifab[FAB$H_STS] EQL RMS$_SUC
+          THEN BEGIN
+               DIUCMD(.inifab[FAB$H_JFN]);
+               $CLOSE(FAB=INIFAB);
+               didini=-1;
+               END;
+
+          END;  %(diu.init processing)%
+
+     ! See if I was (yet) the spooler, and restart me if so.
+
+     IF .mst_flag                       ! Was I the spooler?
+     THEN BEGIN                         ! Yes, I am restarting
+          shutdown = 0;                 ! We are not (yet) shutting down
+          mst_flag = 0;                 ! Not (yet) the spooler again
+          SP$START();                   ! I will be the spooler
+          END;
+
+     ! Process commands forever by calling DIUCMD
+
+     WHILE 1                            ! Forever is a long time
+     DO DIUCMD(0);                      ! Process command
+     END                                ! (end of interactive DIU block)
+
+! Otherwise, we have to be a slave job so start that up please
+
+ELSE SLAVE(.request_id,.job_handle);    ! Process a slave request
+
+END;                                    ! End of Routine MAIN
+
+
+!************************************************************************
+!                           S L A V E 
+!************************************************************************
+ROUTINE SLAVE (request_id, job_handle) : NOVALUE =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!   Process one request in slave mode.  We are running detached, having
+!   been CRJOBed into existence by the master DIU job.  Ask it for a request
+!   block and go process it.
+!
+! FORMAL PARAMETERS:
+!
+!   request_id          - identifier for the request
+!   job_handle          - internal identifier used by master DIU job
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   NONE
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+
+ENABLE DIU$ABORT;
+
+LOCAL reqchain,                         ! Pointer to chain of DIU block(s)
+      template  : $DIU_BLOCK;           ! Pattern to pick out
+                                        ! 
+! Set our name for SYSTAT's use and enable our given capabilities
+
+%IF %SWITCHES(DEBUG)
+%THEN S$SETNAME (%SIXBIT'DIUDEB');      ! Debug mode
+%ELSE S$SETNAME (%SIXBIT'DIU');         ! Production mode
+%FI
+S$ENABLE ();
+
+! Record job handle passed to us for use in IPCF reports to master
+
+job_index = .job_handle;
+
+! Clean the request id template and load the request to perform
+
+CLEARV(template);          
+template[DIU$H_REQUEST_ID] =.request_id;
+
+! Ask the master to find the request
+
+IP_FIND(template,reqchain);         
+
+! Now process it if it was returned to us
+
+IF .reqchain NEQ 0 THEN DIU$DO(.reqchain+1);            
+
+END;                                    ! End of SLAVE
+
+END                                     ! End of DIU20
+ELUDOM                                  ! End of module

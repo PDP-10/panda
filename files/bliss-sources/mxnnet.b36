@@ -1,0 +1,1361 @@
+module NMUNET (					! Task to task network communications
+		ident = 'X00.12'
+		) =
+begin
+!	COPYRIGHT (c) DIGITAL EQUIPMENT CORPORATION 1985, 1989.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A  LICENSE AND MAY BE USED AND  COPIED
+!	ONLY IN  ACCORDANCE  WITH  THE  TERMS OF  SUCH  LICENSE  AND  WITH  THE
+!	INCLUSION OF THE ABOVE  COPYRIGHT NOTICE.  THIS  SOFTWARE OR ANY  OTHER
+!	COPIES THEREOF MAY NOT BE PROVIDED  OR OTHERWISE MADE AVAILABLE TO  ANY
+!	OTHER PERSON.  NO  TITLE TO  AND OWNERSHIP  OF THE  SOFTWARE IS  HEREBY
+!	TRANSFERRED.
+!
+!	THE INFORMATION IN THIS  SOFTWARE IS SUBJECT  TO CHANGE WITHOUT  NOTICE
+!	AND SHOULD  NOT  BE CONSTRUED  AS  A COMMITMENT  BY  DIGITAL  EQUIPMENT
+!	CORPORATION.
+!
+!	DIGITAL ASSUMES NO  RESPONSIBILITY FOR  THE USE OR  RELIABILITY OF  ITS
+!	SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+
+!++
+! Facility: LSG DECnet Network Management
+!
+! Abstract: This module provides a "generic" interface to DECnet
+!	    task to task communications.
+!
+!	    As perceived by  the user of  these interfaces, there  are
+!	    two types of link ends: TARGET and SOURCE.  A TARGET  task
+!	    (sometimes known as  a SERVER) waits  for another task  to
+!	    issue a connect to it.  A SOURCE task issues a connect  to
+!	    the task it  wishes to communicate  with.  Thus the  major
+!	    difference  between  the  ends  of  a  link  is  the  link
+!	    connection operation.
+!
+! Environment: TOPS10/TOPS20 user mode, MCB RSX task level
+!
+! Author: Steven M. Jenness, Creation date: 12-Sep-80
+!
+!--
+
+!<BLF/SYNONYM $FIELD=FIELD>
+!<BLF/SYNONYM %unquote =>
+!<BLF/PAGE>
+!
+! Include files
+!
+
+library 'MXNLIB';			! Get all required definitions
+
+%IF %SWITCHES(TOPS20) %THEN
+library 'MONSYM';			! Monitor symbols
+
+library 'MXJLNK';			! JSYS linkage definitions
+%FI
+
+library 'MXLIB';                        ! MX definitions
+!
+! Global routines
+!
+
+forward routine
+    NMU$NETWORK_UTILITIES;			! Define global entry points
+
+!
+! Local routines
+!
+
+forward routine
+    NETWORK_EVENT : NETWORK_INTERRUPT_LINKAGE novalue,	! Network interrupt handler
+    %if $TOPS10
+    %then
+         PARSE_PPN,			! Parse PPN from network connect
+         PARSE_PASSWORD,                ! Parse password from connect
+    %else %if $TOPS20
+          %then
+               LOCAL_NODE_NUMBER : novalue, ! Get EXECUTOR node number
+               LOCAL_NODE_NAME : novalue, ! Get EXECUTOR node name
+               BUILD_LINK_INFO_BLOCK : novalue,
+          %fi
+    %fi
+    IQ_SCAN;                            ! Scanning routine for info queue
+
+!
+! Constants
+!
+
+bind
+    FAIL_TYPE = uplit
+
+!	Failure code			Reject/object code
+!	------------			------------------
+
+	(	5,			!	0
+		4,			!	1
+		2,			!	2
+	       11,			!	3
+		7,			!	4
+		1,			!	5
+		9,			!	6
+	       12,			!	7
+	       15,			!	8
+	       14,			!	9
+    rep 22 of (15),			!   10-31
+		4,			!      32
+		9,			!      33
+		8,			!      34
+	       15,			!      35
+		8,			!      36
+	       15,			!      37
+	       10,			!      38
+		3,			!      39
+	       15,			!      40
+	       15,			!      41
+	       15,			!      42
+		8): vector;		!      43
+
+bind
+    RETRY_CODE = uplit
+
+!	Return code			Reject/object code
+!	-----------			------------------
+
+	(	-2,			!	0
+		-1,			!	1
+		-2,			!	2
+		-2,			!	3
+		-2,			!	4
+		-2,			!	5
+		-1,			!	6
+		-2,			!	7
+		-1,			!	8
+		-2,			!	9
+    rep 22 of (-2),			!   10-31
+		-1,			!      32
+		-1,			!      33
+		-2,			!      34
+		-2,			!      35
+		-2,			!      36
+		-2,			!      37
+		-1,			!      38
+		-2,			!      39
+		-2,			!      40
+		-2,			!      41
+		-2,			!      42
+		-2): vector;		!      43
+
+!
+! Own variables
+!
+
+own
+    LOCAL_NODE : block [ch$allocation (9, 8)],	! Local node id
+    NEXT_LINK_ID,			! Link identification sequence
+    INFO_QUEUE : Q_HEADER;		! Queue of all link info blocks
+
+!
+! Structures
+!
+
+    $field
+    LINK_INFO_FIELDS =
+	set
+	LINK_QUEUE = [$sub_block (Q_ENTRY_SIZE)], ! Queue of all links
+	LINK_EVENT = [$sub_block (EVENT_BLOCK_SIZE)], ! Link event
+	LINK_ID = [$integer],		! Link identifier
+	LINK_TYPE = [$integer],		! Link type (source, target)
+	LINK_STATUS = [$sub_block (LINK_STATUS_BLOCK_SIZE)],
+	LINK_SYSTEM_SPECIFIC_FIELDS
+	tes;
+
+literal
+    LINK_INFO_BLOCK_SIZE = $field_set_size,
+    LINK_INFO_BLOCK_ALLOCATION = $field_set_units;
+
+macro
+    LINK_INFO_BLOCK =
+ block [LINK_INFO_BLOCK_SIZE] field (LINK_INFO_FIELDS) %;
+
+!
+! Definitions needed for debugging
+!
+external
+    ntimo,                 !Decnet timeout in minutes...
+    %debug_data_base;
+
+    %module_name ('NMUNET');
+
+!
+! External routines
+!
+
+external routine
+    NMU$QUEUE_MANAGER,			! Queue management routines
+    NMU$MEMORY_MANAGER,			! Memory management routines
+    NMU$SCHED_MANAGER,			! Scheduler interface
+    NMU$TEXT_MANAGER;			! Text processing facility
+
+%global_routine ('NMU$NETWORK_INITIALIZE') : novalue =
+
+!++
+! Functional description:
+!
+!	This routine initializes the network system interface.
+!
+! Formal parameters: none
+!
+! Routine value: none
+! Side effects:
+!
+!	The local node id is retrieved for NMU$NETWORK_LOCAL.
+!
+!--
+
+    begin
+
+    local
+	NODE_ID;
+!
+! Make the local node id and save it.
+!
+    NODE_ID = ch$ptr (LOCAL_NODE,, 8);
+    LOCAL_NODE_NUMBER (NODE_ID);
+    LOCAL_NODE_NAME (NODE_ID);
+!
+! Reset queue of all link info blocks.
+!
+    NMU$QUEUE_RESET (INFO_QUEUE);
+
+    %debug (NETWORK_TRANSITIONS, (TRACE_INFO ('Network interface reset')));
+
+    end;					! End of NMU$NETWORK_INITIALIZE
+
+%global_routine ('NMU$NETWORK_OPEN', TYPE, CONN_BLK : ref CONNECT_BLOCK,
+		    RESPONSE_PTR, RESPONSE_LEN, RESPONSE_CODE) =
+
+!++
+! Functional description:
+!
+!	This routine opens a logical link.  It blocks the running
+!	task until a successful connect is made or the link connection
+!	is aborted for some explicit reason.
+!
+!	TARGET_LINK:	When this routine returns it will have filled
+!			in the connect block fields: OPTIONAL_DATA,
+!			USER, ACCOUNT and PASSWORD.  The link must
+!			still be accepted or rejected.
+!
+!	SOURCE_LINK:	When this routine returns it will have filled
+!			in the connect block fields: OPTIONAL_DATA,
+!			REJECT_REASON.
+!
+! Formal parameters:
+!
+!	.TYPE	   	Link type to open (SOURCE_LINK, TARGET_LINK).
+!	.CONN_BLK  	Address of a link connect block.
+!	.RESPONSE_PTR	Character pointer to an area in which an error
+!			response message may be built.
+!			if 0, no response is built.
+!	.RESPONSE_LEN	Address of a value containing the maximum length
+!			of the response message.  On return, if an error
+!			message has been built this value will contain
+!			the length of the message.
+!	.RESPONSE_CODE	NICE error code to put into the response message;
+!			usually LCF or MCF.
+!
+! Routine value:
+!
+!	gtr 0	Link id to be used in all future link references.
+!	lss 0	DECnet link failure indication.
+!
+! Side effects: none
+!
+!--
+
+    begin
+
+    local
+	LINK_INFO : ref LINK_INFO_BLOCK,
+	TIME_OUT,
+	CONNECTED;
+
+    %debug (NETWORK_TRANSITIONS, 
+	(begin
+	    if .TYPE eql SOURCE_LINK
+	    then TRACE_INFO ('Opening source link')
+	    else TRACE_INFO ('Opening target link');
+
+	    if .TYPE eql SOURCE_LINK
+	    then
+		begin
+		local PTR, NUMBER, LENGTH;
+		PTR = .CONN_BLK [CB_HOST];
+		NUMBER = GETW (PTR);
+		LENGTH = GETB (PTR);
+		if .LENGTH gtr 0
+		then TRACE_INFO (' to node (%D) %#A', .NUMBER, .LENGTH, .PTR)
+		else TRACE_INFO (' to node (%D)', .NUMBER);
+		end;
+
+	    TRACE_INFO (' object type: %D', .CONN_BLK [CB_OBJECT]);
+
+	    if .CONN_BLK [CB_TASK_LENGTH] gtr 0
+	    then TRACE_INFO (' task: %#A',
+				.CONN_BLK [CB_TASK_LENGTH],
+				.CONN_BLK [CB_TASK]);
+
+	    if .CONN_BLK [CB_DESCRIPTOR_LENGTH] gtr 0
+	    then TRACE_INFO (' descriptor: %#A',
+			     .CONN_BLK [CB_DESCRIPTOR_LENGTH],
+			     .CONN_BLK [CB_DESCRIPTOR])
+	    else
+		begin
+		external routine USER_NAME;
+	 	if .TYPE eql SOURCE_LINK 
+		then
+
+	  	     %debug ((PRIVATE_HOST_LINK and NETWORK_TRANSITIONS),
+			     (TRACE_INFO (' debugging descriptor: %@', USER_NAME)))
+	        else
+               	     %debug ((PRIVATE_SERVER_LINK and NETWORK_TRANSITIONS),
+			     (TRACE_INFO (' debugging descriptor: %@', USER_NAME)));
+		end;
+
+	    if .TYPE eql SOURCE_LINK
+	    then
+		begin
+
+		if .CONN_BLK [CB_USERID_LENGTH] gtr 0
+		then TRACE_INFO (' userid: %#A',
+				 .CONN_BLK [CB_USERID_LENGTH],
+				 .CONN_BLK [CB_USERID]);
+
+		if .CONN_BLK [CB_ACCOUNT_LENGTH] gtr 0
+		then TRACE_INFO (' account: %#A',
+				 .CONN_BLK [CB_ACCOUNT_LENGTH],
+				 .CONN_BLK [CB_ACCOUNT]);
+
+		if .CONN_BLK [CB_PASSWORD_LENGTH] gtr 0
+		then TRACE_INFO (' password: %#A',
+				 .CONN_BLK [CB_PASSWORD_LENGTH],
+				 .CONN_BLK [CB_PASSWORD]);
+
+		if .CONN_BLK [CB_DATA_LENGTH] gtr 0
+		then TRACE_INFO (' optional data: %#B',
+				 .CONN_BLK [CB_DATA_LENGTH],
+				 .CONN_BLK [CB_DATA]);
+		end;
+	 end));	
+
+    if (LINK_INFO = NMU$MEMORY_GET (LINK_INFO_BLOCK_ALLOCATION)) eql 0
+    then
+	begin
+	if .RESPONSE_PTR neq 0
+	then
+	    .RESPONSE_LEN = $RESPONSE (.RESPONSE_PTR, NICE$_REE);
+	return -2			! Fail if we can't get memory
+	end;
+
+    LINK_INFO [LINK_ID] = (NEXT_LINK_ID = .NEXT_LINK_ID + 1);
+
+    %debug (NETWORK_TRANSITIONS,
+	    (TRACE_INFO (' link id assigned: %O', .LINK_INFO [LINK_ID])));
+
+    NMU$SCHED_EVENT (LINK_INFO [LINK_EVENT], $true);
+    LINK_INFO [LINK_TYPE] = .TYPE;
+
+    BUILD_LINK_INFO_BLOCK (.CONN_BLK, .LINK_INFO);
+
+    NMU$QUEUE_INSERT (INFO_QUEUE, LINK_INFO [LINK_QUEUE]);
+
+    if not OPEN_FOR_CONNECTION (.LINK_INFO) then
+    begin
+	%debug (NETWORK_TRANSITIONS,
+		(TRACE_INFO ('Link %O open failed', .LINK_INFO [LINK_ID])));
+
+	if .RESPONSE_PTR neq 0
+	then
+	    .RESPONSE_LEN = $RESPONSE (.RESPONSE_PTR, NICE$_LCF, ,
+			' %J', -1 );
+
+        %if $tops20
+        %then
+             READ_LINK_STATUS (.LINK_INFO);
+             READ_REJECT_CODE (.CONN_BLK, .LINK_INFO);
+             NMU$NETWORK_ABORT (.LINK_INFO [LINK_ID], $SC$ERR_UAB, 0, 0);
+        %fi
+
+        %if $tops10
+        %then
+             NMU$QUEUE_EXTRACT (INFO_QUEUE, .LINK_INFO);
+             NMU$MEMORY_RELEASE (.LINK_INFO, LINK_INFO_BLOCK_ALLOCATION);
+        %fi
+
+	return -2
+	end;
+
+    %if $tops10
+    %then
+	NMU$SCHED_EVENT (LINK_INFO [LINK_EVENT], $true);
+    %fi
+
+    if .TYPE eql SOURCE_LINK		! If source link
+    then TIME_OUT = .ntimo             !  wait for connect.
+    else TIME_OUT = 0;			! If target link, wait forever.
+
+    CONNECTED = $true;                  !Assume we're connected
+
+    READ_LINK_STATUS (.LINK_INFO);
+    if CONNECT_WAIT (.LINK_INFO)        !If we're waiting, do so.
+    then
+	CONNECTED = NMU$SCHED_WAIT (LINK_INFO [LINK_EVENT] , .TIME_OUT);
+
+    if not .CONNECTED
+    then
+	begin
+	if .RESPONSE_PTR neq 0
+	then
+	    .RESPONSE_LEN = $RESPONSE (.RESPONSE_PTR, NICE$_LCF, 10,
+			' Terminated after %D second timeout', .TIME_OUT);
+        NMU$NETWORK_ABORT (.LINK_INFO [LINK_ID], $SC$ERR_UAB, 0, 0);
+	return -2			! Don't retry
+	end;
+
+    READ_LINK_STATUS (.LINK_INFO);
+
+    if LINK_OPEN (.LINK_INFO)
+    then
+	begin
+	READ_HOST_ID (.CONN_BLK, .LINK_INFO);
+	READ_OPTIONAL_DATA (.CONN_BLK, .LINK_INFO);
+
+	%debug (NETWORK_TRANSITIONS,
+		(begin
+		    TRACE_INFO ('Link %O connected', .LINK_INFO [LINK_ID]);
+		    begin
+		    local PTR, NUMBER, LENGTH;
+		    PTR = .CONN_BLK [CB_HOST];
+		    NUMBER = GETW (PTR);
+		    LENGTH = GETB (PTR);
+		    if .LENGTH gtr 0
+		    then TRACE_INFO (' to node (%D) %#A', .NUMBER, .LENGTH, .PTR)
+		    else TRACE_INFO (' to node (%D)', .NUMBER);
+		    end;
+
+		    if .CONN_BLK [CB_DATA_LENGTH] gtr 0
+		    then TRACE_INFO (' optional data: %#B',
+				 .CONN_BLK [CB_DATA_LENGTH],
+				 .CONN_BLK [CB_DATA]);
+
+		    end));
+
+
+	if .LINK_INFO [LINK_TYPE] eql TARGET_LINK
+	then
+	    begin
+	    READ_USER_NAME (.CONN_BLK, .LINK_INFO);
+	    READ_PASSWORD_STRING (.CONN_BLK, .LINK_INFO);
+	    READ_ACCOUNT_STRING (.CONN_BLK, .LINK_INFO);
+	    READ_OBJECT_TYPE (.CONN_BLK, .LINK_INFO);
+	    READ_DESCRIPTOR (.CONN_BLK, .LINK_INFO);
+	    %debug (NETWORK_TRANSITIONS,
+		    (begin
+	    	     TRACE_INFO (' object type: %D', .CONN_BLK [CB_OBJECT]);
+
+	    	     if .CONN_BLK [CB_USERID_LENGTH] gtr 0
+	    	     then TRACE_INFO (' userid: %#A',
+				 .CONN_BLK [CB_USERID_LENGTH],
+				 .CONN_BLK [CB_USERID]);
+
+	    	     if .CONN_BLK [CB_ACCOUNT_LENGTH] gtr 0
+	    	     then TRACE_INFO (' account: %#A',
+				 .CONN_BLK [CB_ACCOUNT_LENGTH],
+				 .CONN_BLK [CB_ACCOUNT]);
+
+	    	     if .CONN_BLK [CB_PASSWORD_LENGTH] gtr 0
+	    	     then TRACE_INFO (' password: %#A',
+				 .CONN_BLK [CB_PASSWORD_LENGTH],
+				 .CONN_BLK [CB_PASSWORD]);
+
+
+	    	     TRACE_INFO (' object type: %D', .CONN_BLK [CB_OBJECT]);
+
+	    	     if .CONN_BLK [CB_DESCRIPTOR_LENGTH] gtr 0
+	    	     then TRACE_INFO (' descriptor: %#A',
+			     .CONN_BLK [CB_DESCRIPTOR_LENGTH],
+			     .CONN_BLK [CB_DESCRIPTOR]);
+
+		     end));
+
+	    end;
+
+	.LINK_INFO [LINK_ID]
+	end
+    else
+	begin
+	READ_REJECT_CODE (.CONN_BLK, .LINK_INFO);
+
+	if .RESPONSE_PTR neq 0
+	then
+	    .RESPONSE_LEN = $RESPONSE (.RESPONSE_PTR, NICE$_LCF,
+			.FAIL_TYPE[.CONN_BLK[CB_REJECT_CODE]] );
+
+	%debug (NETWORK_TRANSITIONS,
+		(begin
+		 TRACE_INFO ('Link %O connect failed', .LINK_INFO [LINK_ID]);
+		 TRACE_INFO (' reject code: %D', .CONN_BLK [CB_REJECT_CODE]);
+		 end));
+
+	if .LINK_INFO [LINK_TYPE] eql SOURCE_LINK
+	then
+	    begin
+	    READ_OPTIONAL_DATA (.CONN_BLK, .LINK_INFO);
+	    %debug (NETWORK_TRANSITIONS,
+		    (if .CONN_BLK [CB_DATA_LENGTH] gtr 0
+		     then TRACE_INFO (' optional data: %#B',
+				 .CONN_BLK [CB_DATA_LENGTH],
+				 .CONN_BLK [CB_DATA])));
+
+	    end;
+
+	CLOSE_LINK (.LINK_INFO, 0, 0);
+	NMU$QUEUE_EXTRACT (INFO_QUEUE, .LINK_INFO);
+	NMU$MEMORY_RELEASE (.LINK_INFO, LINK_INFO_BLOCK_ALLOCATION);
+	.RETRY_CODE[.CONN_BLK[CB_REJECT_CODE]]
+	end
+
+    end;					! End of NMU$NETWORK_OPEN
+%global_routine ('NMU$NETWORK_ACCEPT', LINK_IDENTIFIER, DATA_LENGTH, DATA_PTR) =
+
+!++
+! Functional description:
+!
+!	This routine accepts the connection to a TARGET link
+!	end.  The link was initially opened by a call to the
+!	NMU$NETWORK_TARGET routine.
+!
+! Formal parameters: none
+!
+!	.LINK_IDENTIFIER    Link id for the target link end.
+!	.DATA_LENGTH	    Length of optional accept data
+!	.DATA_PTR	    Pointer to optional accept data
+!
+! Routine value:
+!
+!	$true	Accept done
+!	$false	Invalid link id
+!
+! Side effects: none
+!
+!--
+
+    begin
+
+    local
+	LINK_INFO : ref LINK_INFO_BLOCK;
+
+    if (LINK_INFO = NMU$QUEUE_SCAN (INFO_QUEUE, .LINK_IDENTIFIER, IQ_SCAN)) neq 0
+    then
+	begin
+	%debug (NETWORK_TRANSITIONS,
+		(begin
+		 TRACE_INFO ('Link %O connect accepted', .LINK_IDENTIFIER);
+		 TRACE_INFO (' optional data: %#B', .DATA_LENGTH, .DATA_PTR);
+		 end));
+
+	ACCEPT_NETWORK_CONNECT (.LINK_INFO, .DATA_LENGTH, .DATA_PTR);
+	$true
+	end
+    else
+	begin
+	%debug (NETWORK_TRANSITIONS,
+		(TRACE_INFO ('Invalid link identifier %O', .LINK_IDENTIFIER)));
+	$false
+	end
+    end;					! End of NMU$NETWORK_ACCEPT
+
+%global_routine ('NMU$NETWORK_REJECT', LINK_IDENTIFIER, REASON, DATA_LENGTH, DATA_PTR) =
+
+!++
+! Functional description:
+!
+!	This routine rejects the connection to a TARGET link
+!	end.  The link was initially opened by a call to the
+!	NMU$NETWORK_TARGET routine.
+!
+!	Note that if this routine fails ($false return value)
+!	the NMU$NETWORK_CLOSE still needs to be called to clean
+!	up the link.
+!
+! Formal parameters: none
+!
+!	.LINK_IDENTIFIER    Link id for the target link end.
+!	.REASON		    Reason code for rejection
+!	.DATA_LENGTH	    Length of optional reject data
+!	.DATA_PTR	    Pointer to optional reject data
+!
+! Routine value:
+!
+!	$true	Reject done
+!	$false	Invalid link id
+!
+! Side effects: none
+!
+!--
+
+    begin
+
+    local
+	LINK_INFO : ref LINK_INFO_BLOCK;
+
+    if (LINK_INFO = NMU$QUEUE_SCAN (INFO_QUEUE, .LINK_IDENTIFIER, IQ_SCAN)) neq 0
+    then
+	begin
+	%debug (NETWORK_TRANSITIONS,
+		(begin
+		 TRACE_INFO ('Link %O connect rejected', .LINK_IDENTIFIER);
+		 TRACE_INFO (' reason code: %D', .REASON);
+		 TRACE_INFO (' optional data: %#B', .DATA_LENGTH, .DATA_PTR);
+		 end));
+
+	REJECT_NETWORK_CONNECT (.LINK_INFO, .REASON, .DATA_LENGTH, .DATA_PTR);
+	$true
+	end
+    else
+	begin
+	%debug (NETWORK_TRANSITIONS,
+		(TRACE_INFO ('Invalid link identifier %O', .LINK_IDENTIFIER)));
+	$false
+	end
+    end;					! End of NMU$NETWORK_REJECT
+
+%global_routine ('NMU$NETWORK_READ', LINK_IDENTIFIER, BUFFER_LENGTH, BUFFER_PTR) =
+
+!++
+! Functional description:
+!
+!	This routine reads data from the specified logical link into
+!	the supplied buffer.  This calls blocks until either data is
+!	available or the link is disconnected.
+!
+! Formal parameters:
+!
+!	.LINK_IDENTIFIER Link identifier.
+!	.BUFFER_LENGTH	Number of 8 bit bytes available in buffer.
+!	.BUFFER_PTR	Pointer to buffer to read data into.
+!
+! Routine value:
+!
+!	Number of bytes read in (-2 = link error) (-1 = timeout...)
+!
+! Side effects: none
+!
+!--
+
+    begin
+
+    local
+	LINK_INFO : ref LINK_INFO_BLOCK,
+	LENGTH;
+
+    if (LINK_INFO = NMU$QUEUE_SCAN (INFO_QUEUE, .LINK_IDENTIFIER, IQ_SCAN)) neq 0
+    then
+	begin
+	LENGTH = READ_MESSAGE (.LINK_INFO, .BUFFER_LENGTH, .BUFFER_PTR);
+
+        $TRACE('Read_Message Length is %D',.length);
+	.LENGTH
+	end
+    else
+	begin
+	%debug ((NETWORK_TRANSITIONS or NETWORK_TRACE),
+		(TRACE_INFO ('Invalid link identifier %O', .LINK_IDENTIFIER)));
+	-2
+	end
+    end;					! End of NMU$NETWORK_READ
+
+%global_routine ('NMU$NETWORK_WRITE', LINK_IDENTIFIER, EOM_FLAG, BUFFER_LENGTH, BUFFER_PTR) =
+
+!++
+! Functional description:
+!
+!	This routine writes data to the specified logical link from
+!	the supplied buffer.
+!
+! Formal parameters:
+!
+!	.LINK_IDENTIFIER Link identifier.
+!	.EOM_FLAG	Flag to indicate end of message.
+!	.BUFFER_LENGTH	Number of 8 bit bytes of data in buffer.
+!	.BUFFER_PTR	Pointer to buffer to write data from.
+!
+! Routine value:
+!
+!	$true	Write succeeded
+!	$false	Write failed, link disconnected.
+!
+! Side effects: none
+!
+!--
+
+    begin
+
+    local
+	LINK_INFO : ref LINK_INFO_BLOCK,
+	RESULT;
+
+    if (LINK_INFO = NMU$QUEUE_SCAN (INFO_QUEUE, .LINK_IDENTIFIER, IQ_SCAN)) eql 0
+    then
+	begin
+	%debug ((NETWORK_TRANSITIONS or NETWORK_TRACE),
+		(TRACE_INFO ('Invalid link identifier %O', .LINK_IDENTIFIER)));
+	$false
+	end
+    else
+	if not LINK_CONNECTED (.LINK_INFO)
+	then
+	    begin
+	    %debug ((NETWORK_TRANSITIONS or NETWORK_TRACE),
+		(TRACE_INFO ('Link %O not connected', .LINK_IDENTIFIER)));
+	    $false
+	    end
+	else
+	    begin
+
+	    %debug (NETWORK_TRACE,
+		(begin
+		 local COUNT, PTR, OUTCNT;
+
+		 if .EOM_FLAG
+		 then TRACE_INFO ('Write message on link %O, %D bytes',
+				   .LINK_IDENTIFIER, .BUFFER_LENGTH)
+		 else TRACE_INFO ('Write string on link %O, %D bytes',
+				   .LINK_IDENTIFIER, .BUFFER_LENGTH);
+
+		 PTR = .BUFFER_PTR;
+		 COUNT = .BUFFER_LENGTH;
+
+		 while .COUNT gtr 0 do
+			begin
+			OUTCNT = min (.COUNT, 8);
+			TRACE_INFO (' %#B', .OUTCNT, .PTR);
+			PTR = ch$plus (.PTR, 8);
+			COUNT = .COUNT - 8;
+			end;
+
+		 end));
+
+	    RESULT = (if .EOM_FLAG
+	    then WRITE_MESSAGE (.LINK_INFO, .BUFFER_LENGTH, .BUFFER_PTR)
+	    else WRITE_STRING (.LINK_INFO, .BUFFER_LENGTH, .BUFFER_PTR));
+
+	    %debug ((NETWORK_TRANSITIONS or NETWORK_TRACE),
+		(if not .RESULT
+		 then
+		    TRACE_INFO ('Write failed on link %O', .LINK_IDENTIFIER)));
+
+	    .RESULT
+	    end
+
+    end;					! End of NMU$NETWORK_WRITE
+
+%global_routine ('NMU$NETWORK_ABORT', LINK_IDENTIFIER, REASON, DATA_LENGTH, DATA_PTR) =
+
+!++
+! Functional description:
+!
+!
+! Formal parameters:
+!
+!	.LINK_IDENTIFIER    Identifier of link to abort
+!	.REASON		    Reason code to aborting link
+!	.DATA_LENGTH	    Length of optional abort data
+!	.DATA_PTR	    Pointer to optional abort data
+!
+! Routine value:
+!
+!	$true	Link aborted
+!	$false	Invalid link id
+!
+! Side effects: none
+!
+!--
+
+    begin
+
+    local
+	LINK_INFO : ref LINK_INFO_BLOCK;
+
+    if (LINK_INFO = NMU$QUEUE_SCAN (INFO_QUEUE, .LINK_IDENTIFIER, IQ_SCAN)) neq 0
+    then
+	begin
+	%debug (NETWORK_TRANSITIONS,
+		(begin
+		 TRACE_INFO ('Link %O aborted', .LINK_IDENTIFIER);
+		 TRACE_INFO (' reason code: %D', .REASON);
+		 TRACE_INFO (' optional data: %#B', .DATA_LENGTH, .DATA_PTR);
+		 end));
+
+	ABORT_LINK (.LINK_INFO, .REASON, .DATA_LENGTH, .DATA_PTR);
+	NMU$QUEUE_EXTRACT (INFO_QUEUE, .LINK_INFO);
+	NMU$MEMORY_RELEASE (.LINK_INFO, LINK_INFO_BLOCK_ALLOCATION);
+	$true
+	end
+    else
+	begin
+	%debug ((NETWORK_TRANSITIONS or NETWORK_TRACE),
+		(TRACE_INFO ('Invalid link identifier %O', .LINK_IDENTIFIER)));
+	$false
+	end
+
+    end;					! End of NMU$NETWORK_ABORT
+
+%global_routine ('NMU$NETWORK_CLOSE', LINK_IDENTIFIER, DATA_LENGTH, DATA_PTR) =
+
+!++
+! Functional description:
+!
+!
+! Formal parameters:
+!
+!	.LINK_IDENTIFIER    Identifier of link to close
+!	.DATA_LENGTH	    Length of optional close data
+!	.DATA_PTR	    Pointer to optional close data
+!
+! Routine value:
+!
+!	$true	Link closed
+!	$false	Invalid link id
+!
+! Side effects: none
+!
+!--
+
+    begin
+
+    local
+	LINK_INFO : ref LINK_INFO_BLOCK;
+
+    if (LINK_INFO = NMU$QUEUE_SCAN (INFO_QUEUE, .LINK_IDENTIFIER, IQ_SCAN)) neq 0
+    then
+	begin
+	%debug (NETWORK_TRANSITIONS,
+		(begin
+		 TRACE_INFO ('Link %O closed', .LINK_IDENTIFIER);
+		 TRACE_INFO (' optional data: %#B', .DATA_LENGTH, .DATA_PTR);
+		 end));
+
+
+	CLOSE_LINK (.LINK_INFO, .DATA_LENGTH, .DATA_PTR);
+	NMU$QUEUE_EXTRACT (INFO_QUEUE, .LINK_INFO);
+	NMU$MEMORY_RELEASE (.LINK_INFO, LINK_INFO_BLOCK_ALLOCATION);
+	$true
+	end
+    else
+	begin
+	%debug ((NETWORK_TRANSITIONS or NETWORK_TRACE),
+		(TRACE_INFO ('Invalid link identifier %O', .LINK_IDENTIFIER)));
+	$false
+	end
+
+    end;					! End of NMU$NETWORK_CLOSE
+
+%global_routine ('NMU$NETWORK_STATUS', LINK_IDENTIFIER, STS_BLK) =
+
+!++
+! Functional description:
+!
+!	This routine supplies the status of a logical link.
+!
+! Formal parameters:
+!
+!	.LINK_IDENTIFIER   Link identifier.
+!	.STS_BLK	   Address of status block.
+!
+! Routine value: none
+! Side effects: none
+!
+!--
+
+    begin
+
+    local
+	LINK_INFO : ref LINK_INFO_BLOCK;
+
+    if (LINK_INFO = NMU$QUEUE_SCAN (INFO_QUEUE, .LINK_IDENTIFIER, IQ_SCAN)) neq 0
+    then
+	begin
+	READ_LINK_STATUS (.LINK_INFO);
+	$true
+	end
+    else $false
+
+    end;					! End of NMU$NETWORK_STATUS
+
+global routine %unquote NMU$NETWORK_VALIDATE (CBLK) =
+
+!++
+! Functional description:
+!
+!
+! Formal parameters:
+!
+!	.CBLK  	Address of a link connect block.
+!
+! Routine value:
+!
+!	-2 - JSYS error
+!	-1 - No such user
+!	 0 - Unprivledged user
+!	 1 - WHEEL privledges
+!	 2 - OPERATOR privledges
+!
+! Side effects: none
+!
+!--
+
+    begin
+
+    map
+	CBLK : ref CONNECT_BLOCK;
+
+    %if $TOPS20
+    %then
+
+    begin
+
+    literal AC_PSW = %O'040000000000';
+
+    local
+	USERID : block [ch$allocation (16 + 1)],
+	PASSWORD : block [ch$allocation (8 + 1)],
+	ACCOUNT : block [ch$allocation (16 + 1)],
+	DIRBLK : vector [$CDDAC + 1],
+	DIRECTORY_NUMBER,
+	DIRPSW : block [ch$allocation (8 + 1)],
+	ACCBLK : vector [$ACJOB+1];
+
+    DECLARE_JSYS (RCUSR, RCDIR, GTDIR, ACCES, VACCT, STCMP);
+
+    macro
+	jsys$ptr (ADDR) = ch$ptr (ADDR) %;
+
+    bind
+	USER_NUMBER = DIRECTORY_NUMBER;
+
+    if (.CBLK [CB_USERID_LENGTH] eql 1 ) and
+       (ch$rchar (.CBLK [CB_USERID]) eql 0)
+    then return 0;
+
+    incr I from 0 to $CDDAC
+    do
+	DIRBLK[.I] = 0;
+
+    ch$wchar (0, ch$move (.CBLK [CB_USERID_LENGTH], .CBLK [CB_USERID], ch$ptr (USERID)));
+    %(validate that this is a valid user name)%
+    ch$wchar (0, ch$move (.CBLK [CB_ACCOUNT_LENGTH], .CBLK [CB_ACCOUNT], ch$ptr (ACCOUNT)));
+    ch$wchar (0, ch$move (.CBLK [CB_PASSWORD_LENGTH], .CBLK [CB_PASSWORD], ch$ptr (PASSWORD)));
+
+    if not $$RCUSR (RC_EMO, jsys$ptr (USERID), 0;,, USER_NUMBER)
+    then return -2;
+
+    if .USER_NUMBER eql 0 then return -2;
+
+    if not $$RCDIR (RC_EMO, .USER_NUMBER, 0;,, DIRECTORY_NUMBER)
+    then return -2;
+
+    if .DIRECTORY_NUMBER eql 0 then return -2;
+
+    DIRBLK [$CDLEN] = $CDDAC + 1;
+
+    if not $$GTDIR (.DIRECTORY_NUMBER, DIRBLK, jsys$ptr (DIRPSW))
+    then return -2;
+
+    ACCBLK [$ACDIR] = .DIRECTORY_NUMBER;
+    ACCBLK [$ACPSW] = jsys$ptr (PASSWORD);
+    ACCBLK [$ACJOB] = -1;
+
+    if not $$ACCES ( (AC_PSW + 3), ACCBLK)
+    then return -1;
+
+    if not (.CBLK [CB_ACCOUNT_LENGTH] eql 1 ) and
+       (ch$rchar (.CBLK [CB_ACCOUNT]) eql 0)
+    then 
+	 if not $$VACCT (.DIRECTORY_NUMBER, jsys$ptr (ACCOUNT))
+         then return -1;
+
+    if (.DIRBLK [$CDPRV] and SC_OPR) neq 0
+    then return 2;
+
+    if (.DIRBLK [$CDPRV] and SC_WHL) neq 0
+    then return 1;
+
+    end;
+
+    %fi
+    %if $TOPS10
+    %then
+
+    begin
+
+    builtin
+	UUO;
+
+    register
+	T1;
+
+    literal
+	UGACC$ = %o'24',		! Access control function
+	UGOUP$ = %o'25',		! Obtain user's profile
+	$UGACT = 1,			! Account string argument
+	$UGPPN = 2,			! PPN argument
+	$UGPSW = 3,			! Password argument
+	$ACPRV = 2,			! Privilege word from UGOUP$
+	$ACPRO = 7,			! Profile word from UGOUP$
+	AC$POK = %o'020000000000',	! POKE privilege bit
+	AC$OPR = %o'000000070000';	! Operator privilege byte
+
+    local
+	PPN,
+	PASSWORD,
+	QUEUE_BLOCK: vector [11],
+	USER_PROFILE: vector [20];
+
+    macro
+	DEFAULT_USERID = '' %,
+	DEFAULT_ACCOUNT = '' %,
+	DEFAULT_PASSWORD = '' %;
+
+    !
+    ! Default any missing parts
+    !
+
+    if .CBLK [CB_USERID_LENGTH] eql 0
+    then
+	begin
+	    CBLK [CB_USERID] = ch$ptr (uplit (%asciz DEFAULT_USERID));
+	    CBLK [CB_USERID_LENGTH] = ch$diff (ch$find_ch (17, .CBLK [CB_USERID], 0), .CBLK [CB_USERID]);
+	end;
+
+    if .CBLK [CB_ACCOUNT_LENGTH] eql 0
+    then
+	begin
+	    CBLK [CB_ACCOUNT] = ch$ptr (uplit (%asciz DEFAULT_ACCOUNT));
+	    CBLK [CB_ACCOUNT_LENGTH] = ch$diff (ch$find_ch (17, .CBLK [CB_ACCOUNT], 0), .CBLK [CB_ACCOUNT]);
+	end;
+
+    if .CBLK [CB_PASSWORD_LENGTH] eql 0
+    then
+	begin
+	    CBLK [CB_PASSWORD] = ch$ptr (uplit (%asciz DEFAULT_PASSWORD));
+	    CBLK [CB_PASSWORD_LENGTH] = ch$diff (ch$find_ch (17, .CBLK [CB_PASSWORD], 0), .CBLK [CB_PASSWORD]);
+	end;
+
+    !
+    ! Grant unprivileged access if no user-id
+    !
+
+    if .CBLK [CB_USERID_LENGTH] eql 0
+    then
+	return 0;
+
+
+    if not PARSE_PPN (PPN, .CBLK[CB_USERID])
+    then
+	return -1;
+
+    PASSWORD = PARSE_PASSWORD (.CBLK[CB_PASSWORD]);
+
+    !
+    ! Set up to validate user supplied account information
+    !
+
+    QUEUE_BLOCK [$QUFNC] = QF$RSP + $QUMAE;
+    QUEUE_BLOCK [$QUNOD] = 0;
+    QUEUE_BLOCK [$QURSP] = 20^18 + USER_PROFILE;
+    QUEUE_BLOCK [$QUARG] = QA$IMM + 1^18 + $QBAFN;
+    QUEUE_BLOCK [$QUARV] = UGACC$;
+    QUEUE_BLOCK [$QUARG+2] = QA$IMM + 1^18 + $UGPPN;
+    QUEUE_BLOCK [$QUARV+2] = .PPN;
+    QUEUE_BLOCK [$QUARG+4] = QA$IMM + 1^18 + $UGPSW;
+    QUEUE_BLOCK [$QUARV+4] = .PASSWORD;
+!   QUEUE_BLOCK [$QUARG+6] = ((.CBLK[CB_ACCOUNT_LENGTH]/5)+1)^18 + $UGACT;
+!   QUEUE_BLOCK [$QUARV+6] = .CBLK [CB_ACCOUNT];
+
+    T1 = 9^18 + QUEUE_BLOCK;
+
+    !
+    ! Validate the PPN, account, and password
+    !
+
+    if not uuo (1, QUEUE$ (T1))
+    then
+	return -1;
+
+    !
+    ! Set up to obtain user's profile
+    !
+
+    QUEUE_BLOCK [$QUARV] = UGOUP$;
+
+    T1 = 9^18 + QUEUE_BLOCK;
+
+    !
+    ! Obtain user's profile
+    !
+
+    if not uuo (1, QUEUE$ (T1))
+    then
+	return -1;
+
+    !
+    ! First check for system operator privileges
+    !
+
+    if .POINTR ((USER_PROFILE [$ACPRO+1]), AC$OPR) eql $OBSOP
+    then
+	return 2;
+
+    !
+    ! Also check for user with POKE privileges
+    !
+
+    if .POINTR ((USER_PROFILE [$ACPRV+1]), AC$POK)
+    then
+	return 1;
+
+    end;
+
+    %fi
+
+    return 0
+
+    end;					! End of NMU$NETWORK_VALIDATE
+%if $TOPS10
+%then
+%routine ('PARSE_PPN', PPN, PTR) =
+
+!++
+!
+! Functional description:
+!
+!	This routine parses a PPN from a string.
+!
+! Formal parameters:
+!
+!	PPN	- Address of location to store PPN.
+!	PTR	- Byte pointer to string to be parsed.
+!
+! Routine value:
+!
+!	$true	- PPN parsed correctly
+!	$false	- Error encountered
+!
+!--
+
+begin
+
+    local
+	CHAR,
+	PROJ,
+	PROG,
+	PPN_DELIMETER;
+
+    PROJ = 0;
+    PROG = 0;
+    PPN_DELIMETER = 0;
+
+    if ch$rchar (.PTR) eql %c'['
+    then
+	begin
+	    PTR = ch$plus (.PTR, 1);
+	    PPN_DELIMETER = %c']';
+	end;
+
+    while (CHAR = ch$rchar_a (PTR)) neq 0
+    do
+	begin
+	    if (.CHAR lss %c'0') or (.CHAR gtr %c'7')
+	    then
+		exitloop;
+	    PROJ = .PROJ*8 + .CHAR - %c'0';
+	    if .PROJ gtr %o'777777'
+	    then
+		return $false;
+	end;
+
+    if .CHAR neq %c','
+    then
+	return $false;
+
+    while (CHAR = ch$rchar_a (PTR)) neq 0
+    do
+	begin
+	    if (.CHAR lss %c'0') or (.CHAR gtr %c'7')
+	    then
+		exitloop;
+	    PROG = .PROG*8 + .CHAR - %c'0';
+	    if .PROG gtr %o'777777'
+	    then
+		return $false;
+	end;
+
+    if .CHAR neq .PPN_DELIMETER
+    then
+	return $false;
+
+    if (.PROJ eql 0) or (.PROG eql 0)
+    then
+	return $false;
+
+    .PPN = .PROJ^18 + .PROG;
+
+    $true
+
+end;				! of PARSE_PPN
+%routine ('PARSE_PASSWORD', PTR) =
+
+!++
+!
+! Functional description:
+!
+!	This routine parses a SIXBIT password from a string.
+!
+! Formal parameters:
+!
+!	PTR	- Byte pointer to string to be parsed.
+!
+! Routine value:
+!
+!	SIXBIT password
+!
+!--
+
+begin
+
+    local
+	CHAR,
+	PASSWORD;
+
+    PASSWORD = 0;
+
+    while (CHAR = ch$rchar_a (PTR)) neq 0
+    do
+	begin
+	    if (.CHAR geq %c'a') and (.CHAR leq %c'z')
+	    then
+		CHAR = .CHAR - (%c'a' - %c'A');
+	    PASSWORD = .PASSWORD ^ 6 + ((.CHAR - %c' ') and %o'77');
+	end;
+
+    .PASSWORD
+
+end;				! of PARSE_PASSWORD
+%fi
+%global_routine ('NMU$NETWORK_LOCAL') =
+
+!++
+! Functional description:
+!
+!	This routine returns a pointer to the local node
+!	name string.
+!
+! Formal parameters: none
+!
+! Routine value:
+!
+!	Byte pointer to node name string.
+!
+! Side effects: none
+!
+!--
+
+    begin
+    ch$ptr (LOCAL_NODE,, 8)
+    end;					! End of NMU$NETWORK_LOCAL
+
+%routine ('NETWORK_EVENT') NETWORK_INTERRUPT_ROUTINE novalue =
+
+!++
+! Functional description:
+!
+!	This routine is called whenever there is a network link
+!	event.  The event block associated with the link is flagged to
+!	indicate to any watching task that a link event has occured.
+!
+! Formal parameters:
+!
+!	.LINK_INFO	Address of link info block
+!
+! Routine value: none
+! Side effects: none
+!
+!--
+
+    begin
+	%if $TOPS10 %then
+	local LINK_INFO : ref LINK_INFO_BLOCK;
+
+	if ..CHANNEL_STATUS eql 0 then return;
+
+	LINK_INFO = SEARCH_NETLNK (..CHANNEL_STATUS and %o'777777');
+
+	if .LINK_INFO eql 0 then return;
+
+	%fi
+
+	NMU$SCHED_FLAG (LINK_INFO [LINK_EVENT]);
+	PROCESS_WAKE;
+	NETWORK_INTERRUPT_CLEAR (.LINK_INFO);
+    end;					! End of NETWORK_EVENT
+
+%routine ('IQ_SCAN', LINK_INFO : ref LINK_INFO_BLOCK, LINK_IDENTIFIER) =
+
+!++
+! Functional description:
+!
+!	This routine is called when scanning the INFO_QUEUE by
+!	NMU$QUEUE_SCAN to find the entry associated with a
+!	particular link identifier.
+!
+! Formal parameters:
+!
+!	.LINK_INFO	  address of current entry on the info queue.
+!	.LINK_IDENTIFIER  identifier of link to find data base for.
+!
+! Routine value:
+!
+!	Address of link info block if matched (0 otherwise).
+!
+! Side effects: none
+!
+!--
+
+    begin
+	if .LINK_INFO [LINK_ID] eql .LINK_IDENTIFIER
+	then .LINK_INFO
+	else 0
+    end;					! End of IQ_SCAN
+
+!
+! System specific network service routines
+!
+
+switches
+    list (require);
+
+%if $TOPS20
+%then require 'NETT20';
+%fi
+
+end						! End of module NMUNET
+
+eludom
+
+! Local Modes:
+! Mode:BLISS
+! Auto Save Mode:0
+! Comment Column:40
+! Comment Rounding:+1
+! End:

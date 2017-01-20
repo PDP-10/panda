@@ -1,0 +1,940 @@
+begin "find"
+
+comment This program was developed on WAITS and adapted for use on T(W)ENEX.
+	Where differences between the two versions are required, the following
+	macros are used.  Note that JFNS is pre-declared only in T(W)ENEX SAIL.;
+
+comment Note to WAITS wizards: If you want to try out a new version of FIND without
+	replacing the old one, you can bring it up as SYS:TEST.DMP and use the TEST
+	command.  TEST/O gets you OFIND and TEST/D gets you DFIND.;
+
+comment For a functional description of this program, see FIND.DON[UP,DOC] on WAITS.;
+
+require "{}<>" delimiters;
+
+define	TENEX = declaration(jfns),
+	!!TENEXONLY = {ifc tenex thenc},
+	!!WAITSONLY = {ifc not tenex thenc},
+	!!ENDTENEX = {endc},
+	!!ENDWAITS = {endc},
+	!! = {};
+
+!!WAITSONLY
+!!	require "  (Compiling WAITS version)  " message;
+!!ENDWAITS;
+
+!!TENEXONLY
+!!	require "  (Compiling TENEX version)  " message;
+!!ENDTENEX;
+
+define	! = {comment};
+! Macros and compile-time parameters;
+
+define	 = {begin},
+	S = {startcode},
+	Q = {quickcode},
+	 = {end},
+	TAB = {'11},
+	LF = {'12},
+	FF = {'14},
+	CR = {'15},
+	 = {CR&LF},
+	thru = {step 1 until},
+	exit = {Q ifc TENEX thenc jsys '170 elsec calli '12 endc };
+
+!!WAITSONLY
+!!	require &"	REMEMBER! Must SAVE before starting for first time!"& message;
+!!	! (else INIACS won't get set up for interface from E's DFIND command);
+!!ENDWAITS
+
+define KEYLENG = 3;
+	! KEYLENG*36 is approx the max leng of combined keys.  Current value was
+	  based on upper length of WAITS command lines.  (No sense leaving room for
+	  text that can't be typed!)  Invoking FIND from the editor (see documentation)
+	  makes it possible to exceed this limit, but the space/convenience tradeoff
+	  had to be made somewhere.;
+define MAXUNION = ifc TENEX thenc 786 elsec 1162 endc;
+	! MAXUNION is a measure of the max complexity of the key, should be one less than a
+	  prime.  If much larger than now, runs risk of core overflow from TABLE + BUF.
+	  Smaller value for TENEX is because SAIL bug requires program fit in 256 pages, not 512.;
+define BUFSIZE = (ifc TENEX thenc 160 elsec 800 endc) * 128;	! size of input buffer, must be mult of 128 words;
+define CTVAR = 0;		! random compile-time variable (must be given initial value);
+
+! The basic scheme employed in this program is two-fold: First, the key is parsed and
+  converted into a transition table for a non-deterministic finite-state automaton
+  having at most KEYLENG*36 states.  The achievable unions of states are computed and
+  are made the states of a deterministic FSA, with a maximum of about 0.9*MAXUNION
+  (to avoid over-crowding the hash table involved).  The transition table for this
+  DFSA is what drives the tight inner loop.;
+
+safe integer array WINNERS, INFEQV, BASE, STATE[0:KEYLENG], STATES, INFINS[0:'177,0:KEYLENG], HASH, QUEUE[0:MAXUNION],
+	UNIONS[0:MAXUNION,0:KEYLENG];
+integer LEFT, EOF, EOF2, PRINTING, COUNT, STBIT, STWORD, BUFLEFT, CH, PTR, HITS, COMMAND, INCHAN, OUTCHAN, ONEINF, KY,
+	HASHUSED, QV, QBOT, QTOP, ZERO, DELIM, DEFDELIM, MATCH, LINES, OVERLAP, BUF0, PREVHIT, STAR, SURROUND, OUTOK;
+string S, SSAV, SS, DEVIN, FILEIN, DEVOUT, FILEOUT, DEFFL, OMIT, FIRST, SHORTEST, LAST, OPTSTR;
+
+!!TENEXONLY
+!!	external integer SKIP;
+!!	integer array INFO[0:'37];
+!!	define viaE = false;
+!!ENDTENEX
+
+!!WAITSONLY
+!!	! Hairier command-line parsing applies only to WAITS -- uses various breaktables;
+!!	evaldefine	crlfbreak = 1,			spacecapsbreak = 4,
+!!			nonalphnumbreak = 2,		coloncapsbreak = 5,
+!!			bracketbreak = 3,		colonslashcapsbreak = 6;
+!!
+!!	preloadwith cvsix("godmod"), '26, [5]0;
+!!	safe integer array MTAPEDAT[0:6], INFO[1:'20];
+!!	external integer RPGSW, INIACS;		! RPGSW will be TRUE when invoked from E;
+!!	define AC (n) = {memory[location(INIACS)+n]};	! value of accumulator when started;
+!!	define viaE = {RPGSW};
+!!ENDWAITS
+
+! Some of the special characters recognised in the key are different depending on
+  whether the WAITS "extended ASCII" is available.;
+
+define	QuoteChar = ifc TENEX thenc {"="} elsec {""} endc,
+	NegChar = ifc TENEX thenc {"~"} elsec {""} endc,
+	AnyChar = ifc TENEX thenc {"?"} elsec {""} endc,
+	NondlmChar = ifc TENEX thenc {"!"} elsec {""} endc,
+	InfChar = ifc TENEX thenc {"*"} elsec {""} endc;
+! Exit routines: REPLY, BOMB;
+
+!!WAITSONLY
+!! procedure REPLY (string MSG);	! give final message (maybe to other terminal invoking us via E);
+!! 	integer NUM, I;
+!!	Q setom 1; ttcall 6,1; movem 1,NUM ;	! get our terminal status bits (-1 if detached);
+!!	if NUM  -1 or ac('12) land '777777000000  cvsix("ret   ") or	! E starts us up w/ ac12 = 'ret',,invoker's-tty;
+!!		(I _ call (ac('12) land '777777, "ttyjob"))  0 or 	! make sure said tty has some job on it;
+!!		INFO['17]  call (I + call ('211, "peek"), "peek") then	! and that said job's PPN matches ours;
+!!		print (, MSG, );	! either we weren't called from E, or the caller has gone away;
+!!		exit
+!!	;
+!!	INFO[1] _ cvsix("TTY"&cvos(ac('12) land '777777));	! prepare info block for message-sending;
+!!	NUM _ (length(MSG _ ";;"&MSG) + 4) % 5;			! length of message in words;
+!!	if length(MSG) > 2 then					! don't bother with null message;
+!!		integer array TEXT[1:NUM];
+!!		for I _ 1 thru NUM do TEXT[I] _ cvasc(MSG[I*5-4 for 5]);	! copy text to word boundary;
+!!		INFO[2] _ length(MSG) lsh 18 + location (TEXT[1]);	! complete message-sending command block;
+!!		call (location (INFO[1]), "ttymes")		! send reply to other terminal;
+!!	;
+!!	call (ac('12) land '777777, "beep");	! get the person's attention;
+!!	exit
+!! ;
+!!ENDWAITS;
+
+simple procedure BOMB (string MSG);	! go away mad (after parting shot);
+
+!!WAITSONLY
+!!	if viaE then reply ("** DFIND command aborted ** ERROR ** "&MSG&);
+!!ENDWAITS
+	print (, MSG, );
+	exit
+;
+! Special file-name parsing: DEVICE, HACKS;
+
+!!WAITSONLY
+!! simple string procedure DEVICE (reference string FILE);
+!! 	boolean QUOTE; integer K;
+!!	QUOTE _ false;
+!!	for K _ 1 thru length(FILE) do
+!!		if FILE[K for 1] = "" then QUOTE _ not QUOTE
+!!		else if FILE[K for 1] = ":" and not QUOTE then
+!!			QUOTE _ cvsix(FILE[1 to K-1]);
+!!			FILE _ FILE[K+1 to ];	
+!!			return (cv6str(QUOTE))
+!!		;
+!!	return ("DSK")
+!! ;
+!!ENDWAITS
+
+simple string procedure HACKS (string F; boolean OUTPUT (false));	! parse file name, yield string for LOOKUP/ENTER;
+	integer BRK, EX, PP; string F2, DEV;
+!!WAITSONLY
+!!	if OUTPUT then	! don't allow special files to be used with "writing" clause;
+!!		if length(F) = 7 and cvsix(F) = cvsix("nothin") and F[7 for 1] lor '40 = "g" then
+!!			return (0)	! special string (length=1, string=0) suppresses all hit output;
+!!	
+!!	else if length(F) = 5 and cvsix(F) = cvsix("phone") then F _ "whozat[p,doc]"	! (CVSIX vs EQU to ignore case);
+!!	else if length(F) = 4 and cvsix(F) = cvsix("dict") then F _ "unabrd.dic[lib,doc]"
+!!	else if length(F) = 7 and cvsix(F) = cvsix("forwar") and F[7 for 1] lor '40 = "d" then
+!!		F _ "forwrd.txt[mai,sys]";
+!!		if DELIM = -2 = DEFDELIM then DELIM _ -1	! if no delimiter specified yet, FORWARD implies LINE;
+!!	
+!!	else if F = "" then	! oh good grief, all the crocks for mail-related files;
+!!		BRK _ lop(F);
+!!		while F = " " do BRK _ lop(F);
+!!		if length(F2 _ scan (F, nonalphnumbreak, BRK)) then F2 _ "   " & ("   "&F2)[-2 for 3]
+!!		else if BRK = "*" then  BRK _ lop(F); F2 _ "NOTICE" 
+!!		else F2 _ cvxstr(call(0,"getppn") land '777777);
+!!		while F = " " do BRK _ lop(F);
+!!		if F  "." then F2 _ F2 & (if F2="N" then ".TXT" else ".MSG");
+!!		F2 _ F2 & scan (F, bracketbreak, BRK);
+!!		if DELIM = -2 = DEFDELIM then DELIM _ "";
+!!		F _ F2 & (if BRK = "[" then F else "[2,2]")
+!!	;
+!!	DEV _ device (F);		! extract device name, if any;
+!!	F _ cvxstr(cvfil(F,EX,PP));	! now then, what does SAIL think of this string?;
+!!	while F[ for 1] = " " do F _ F[1 to -1];	! create canonical form--flush trailing blanks;
+!!	if EX land '777777000000 then F _ F & "." & cvxstr(EX)[1 to 3];	! add extension only if non-null;
+!!	while F[ for 1] = " " do F _ F[1 to -1];	! flush trailing blanks from extension;
+!!	if PP then					! add PPN only if non-null;
+!!		F2 _ cvxstr(PP)[1 for 3];		! first half of PPN;
+!!		while F2 = " " do BRK _ lop(F2);	! flush LEADING blanks;
+!!		F _ F & "[" & F2 & ",";
+!!		F2 _ cvxstr(PP)[4 for 3];		! second half;
+!!		while F2 = " " do BRK _ lop(F2);
+!!		F _ F & F2 & "]"
+!!	;
+!!	F _ DEV & ":" & F;
+!!ENDWAITS
+	return (F)	! note that, on TENEX, we just return the string unchanged (at present);
+;
+! First-step scanning: WRITING, OPTIONS;
+
+simple procedure WRITING (reference string INP, INTO);	! scan for " writing <file>" option;
+	integer K;
+	for K _ 1 thru length(INP)-8 do		! look for " writing " not preceded by quoting character;
+		if cvsix(INP[K for 6]) = cvsix(" writi") and cvsix(INP[K+6 for 3]) = cvsix("ng ")
+			and INP[K-1 for 1]  QuoteChar then
+			if not OUTOK then bomb ("Must be logged in to use WRITING feature.");
+			INTO _ INP[K+9 to ];	! extract filename;
+			INP _ INP[1 to K-1];	! flush from end of command text;
+			done
+		
+;
+
+simple procedure OPTIONS (reference string INP, FIL, OMT, INTO; reference integer DLM);	! scan command line for options;
+	integer K;
+	string NEW;
+	for K _ 1 thru length(INP)-3 do		! look for " in <filename>" (not preceded by quoting character);
+		if cvsix(INP[K for 4]) = cvsix(" in ") and INP[K-1 for 1]  QuoteChar then
+			FIL _ INP[K+4 to ];	! override default filename;
+			INP _ INP[1 to K-1];	! flush from end of command text;
+			K _ 0;			! flag that " in " clause was found;
+			done
+		;
+	if K = 0 then writing (FIL, INTO) else writing (INP, INTO);
+	for K _ 1 thru length(INP)-5 do		! look for " omit[ting] <omitchars>";
+		if cvsix(INP[K for 5]) = cvsix(" omit") and INP[K-1 for 1]  QuoteChar and
+			(INP[K+5 for 1] = " " or cvsix(INP[K+5 for 5]) = cvsix("ting ")) then
+			NEW _ INP[K+5 to ];
+			do until lop(NEW) = " ";	! throw away "ting" if "omitting" instead of "omit";
+			INP _ INP[1 to K-1];		! flush from command text;
+			OMT _ (if cvsix(NEW[1 to 5])  cvsix("only ") then OMT&NEW else NEW[6 to ]);
+			done
+		;
+	while INP = " " do K _ lop(INP);	! flush leading blanks;
+	if cvsix(INP[1 for 6]) = cvsix("within") and INP[7 for 1] = " " then	! override default delimiter;
+		INP _ INP[8 to ];	! we'll set up DLM to be <delimvalue>,,<command-word-length>;
+		if cvsix(INP[1 for 5]) = cvsix("line ") then DLM _ (-1) lsh 18 + 6
+!!WAITSONLY
+!!		else if cvsix(INP[1 for 4]) = cvsix("msg ") then DLM _ "" lsh 18 + 5
+!!ENDWAITS
+		else if cvsix(INP[1 for 5]) = cvsix("page ") then DLM _ FF lsh 18 + 6
+		else if cvsix(INP[1 for 5]) = cvsix("graf ") then DLM _ CR lsh 18 + 6
+		else if cvsix(INP[1 for 6]) = cvsix("paragr") and cvsix(INP[7 for 4]) = cvsix("aph ") then
+			DLM _ CR lsh 18 + 11
+		else if INP[2 for 1] = " " then DLM _ lop(INP) lsh 18 + 2
+		else bomb ("Illegal WITHIN clause; must be single char or " &
+			(ifc TENEX thenc null elsec "MSG/" endc) & "LINE/PAGE/GRAF.");
+		INP _ INP[DLM land '777777 to ];	! discard keyword from command;
+		DLM _ DLM ash -18			! bring back delimiter spec;
+	;
+	if cvsix(INP[1 for 6]) = cvsix("surrou") and cvsix(INP[7 for 3]) = cvsix("nd ") then
+		INP _ INP[10 to ];
+		SURROUND _ 0;
+		while "0"  INP  "9" do SURROUND _ SURROUND*10 + lop(INP)-"0";
+		if SURROUND  0 or 0  lop(INP)  " " then bomb ("Illegal SURROUND clause!")
+	
+;
+! Final-step scanning: PARSE;
+
+recursive string procedure PARSE (integer NESTED (0));	! parse single keychar position, return string of matching chars;
+							! uses (and modifies) global string S;
+	own safe integer array BT[0:3];
+	string CS;
+	integer C;
+	if (C _ lop(S)) = QuoteChar then	! quoting -- just grab next char (if any);
+		if length(S) = 0 then bomb ("Can't end key with `" & QuoteChar & "'!")
+		else return (lop(S))
+	else if C = "," then		! comma separates multiple keys -- return special value: null;
+		if NESTED = 0 then
+			return (null)
+		else			! we're inside { or  processing;
+			bomb ("Unquoted comma illegal after `"&NESTED&"'.")
+	else if C = "{" then		! collect set of chars until close-brace;
+		if NESTED  "{" then
+			CS _ null;
+			while length(S)  0 and S  "}" do CS _ CS & parse ("{");
+			if lop(S)  "}" then bomb ("Missing closing brace!");
+			if length(CS) = 0 then bomb ("Empty string between braces can never match anything.");
+			return (CS)
+		
+		else
+			bomb ("Nested braces illegal; quote inner `{' with `" & QuoteChar & "'.")
+	else if C = NegChar then	! negate whatever keychar follows;
+		if length(S) = 0 then bomb ("Can't end key with `" & NegChar & "'!")
+		else
+			CS _ parse (NegChar);
+			arrclr (BT);	! use bit array to save multiple scans of CS;
+			while length(CS) do
+				BT[(C_lop(CS)) lsh -5] _ BT[C lsh -5] lor (1 lsh (C land '37));
+			for C _ 0 thru '177 do
+				if BT[C lsh -5] land (1 lsh (C land '37)) = 0 then
+					CS _ CS & C;
+			if length(CS) = 0 then bomb ("`" & NegChar & AnyChar & "' can never match anything;" &
+				" perhaps you meant `" & NegChar & NondlmChar & "'.");
+			return (CS)
+		
+	else if C = "'" then	! next three chars are octal value of char;
+		for C _ 1 thru 3 do
+			if not "0"  S[C for 1]  "7" then
+				bomb ("Apostrophe must be quoted with " & QuoteChar & " or followed by 3 octal digits.");
+		CS _ cvo(S[1 to 3]);
+		S _ S[4 to ];
+		return (CS)
+	
+	else if C = AnyChar or C = NondlmChar or C = "|" then	! various common multichars;
+		CS _ (if C  NondlmChar then CR&LF&" "&TAB&FF else null);
+		if C  "|" then
+			for C _ 0 thru '177 do
+				if CRCLF and " "CTAB and CFF then CS _ CS & C;
+		return (CS)
+	
+	else if "a"  (C lor '40)  "z" then	! upper- or lower-case yields both;
+		return ((C lor '40) & (C land '137))
+	else			! anything else is just a vanilla single char;
+		return (C)
+;
+! Hit-reporting: DECRPTR, COLLECT, HANDLE, SUMMARY, SHOW, BACK;
+
+define decrptr = {Q movni '13,1; ibp '13,PTR; movem '13,PTR; aos COUNT };	! backs up PTR by 1 byte & adjusts count;
+
+! The next two routines take care of low-level processing of each hit as it occurs.
+  For non-E invokation, COLLECT just prints a string.  For invokation via E with a
+  delimiter other than LINE, it collects the text for shipping to the invoking terminal
+  when we're all done (stopping after the first 3 hits).  In both of these cases COLLECT
+  returns FALSE.  Otherwise it does nothing but return true to tell the caller to take
+  care of first/shortest/last processing if this is HANDLE calling us.  COLLECT is called
+  directly for subsidiary text like the "..." surrounding long hits, and is called via
+  HANDLE for the hit itself.;
+
+simple boolean procedure COLLECT (string X);
+	if FILEOUT then out (OUTCHAN, X);
+	if viaE then
+		if DELIM  -1 then  if HITS  3 then FIRST _ FIRST & X 
+		else return (true)
+	else if length(FILEOUT) = 0 then print (X);
+	return (false)
+;
+
+simple procedure HANDLE (string X);
+	if collect ((if DELIM=-1 then null else if STAR then "*" else ">") & X) and not STAR then
+		if length(FIRST) = 0 then FIRST _ X else LAST _ X;
+		if length(SHORTEST) = 0 or length(SHORTEST) > length(X) then SHORTEST _ X
+	;
+
+simple procedure SUMMARY;	! report total # of hits, including summary if invoked via E;
+	string S;
+	boolean INCLSHORT;
+	S _ (if FILEOUT then (FILEOUT&" contains ") else null) &
+		cvs(HITS) & " hit" & (if HITS=1 then null else "s") & " on " &
+		(if viaE then null else "key ") & """" & SSAV & """";
+	if not viaE then
+		print (, S, (if equ(FILEIN,DEFFL) then null else
+			((if FILEOUT then " from " else " in ")&FILEIN)), ".", )
+!!WAITSONLY
+!!	else
+!!		if HITS = 0 then reply ("** DFIND failed ** " & S & "." & );
+!!		S _ "** DFIND ** " & S;
+!!		if length(FILEOUT)0=FILEOUT then reply (S & "." & );	! "writing nothing"--don't show hits;
+!!		if HITS = 1 then reply (S & ": " & FIRST);
+!!		if DELIM  -1 then reply (S & (if HITS > 3 then ", including:" else ":") & FIRST);
+!!		INCLSHORT _ not equ (FIRST, SHORTEST) and not equ (LAST, SHORTEST);
+!!		if HITS > (if INCLSHORT then 3 else 2) then S _ S & ", including " else S _ S & ": ";
+!!		reply (S & FIRST[1 to -2] & (if INCLSHORT then ", "&SHORTEST[1 to -2]&"," else null) & " and " & LAST)
+!!	
+!!ENDWAITS
+;
+
+! SHOW prints out a hit, starting at the current byte (via global PTR) and continuing
+  until the delimiter ending the text block.  Returns TRUE if the current input buffer
+  ends before the end of the hit, in which case SHOW will again be invoked after more
+  text has been input.;
+
+! DELIM = -1 for LINE (delimit with LF), = CR for paragraph (i.e., CR is first thing
+  on the line), = FF for page (FF is first thing on first line of new page).  Note that
+  FF also acts as delimiter for paragraphs.  Note also that (CR land '176) = FF.;
+
+simple boolean procedure SHOW;
+	while true do
+		if MATCH = LF and DELIM = -1 or MATCH = FF = DELIM land '176 then done;
+			! MATCH is the previous character.;
+		if COUNT = 0 then return (true);
+		if 0  (CH _ ildb(PTR))  FF then SS _ SS & CH;	! global SS accumulates line of hit;
+		COUNT _ COUNT - 1;
+		if (not LF  MATCH  FF) and CH = DELIM then done;	! found DELIM at start of line (or page);
+		if CH  0 and (MATCH _ CH) = LF then	! first half of test keeps us from copying nulls into MATCH;
+			handle (SS);	! end of line, handle this line of the hit;
+			STAR _ true;	! later lines will have "*" instead of ">" prefix;
+			SS _ null;
+			if (LINES _ LINES+1) > SURROUND then	! hit too large, truncate;
+				collect ("*  . . ." & );
+				done
+			
+		
+	;
+	while CR  ldb(PTR)  FF do decrptr;	! ran out of buffer, back up to front of line;
+	decrptr;
+	return (false)
+;
+
+! BACK is called when we find a hit.  It backs up the global PTR to the beginning
+  of the text block (unless that's too far back, in which case it truncates the hit)
+  and prints the line(s) leading up to the hit.  Then it calls SHOW to show the lines
+  following the hit, and returns the value returned by SHOW (= TRUE if there's more
+  to come).;
+
+simple boolean procedure BACK;
+	integer ENDPTR, MAXBACKUP;
+	if PREVHIT = PTR then return (false);	! don't show same hit twice;
+	if ildb(PREVHIT) = '12 and PREVHIT = PTR then return (false);	! found LF after CR;
+	MAXBACKUP _ (OVERLAP * 5 - 10) min ((PTR land '777777 - BUF0) * 5 + (36-(PTR lsh -30)) div 7);
+	! Guarantees that we'll back up to start of BUF ONLY if start of file.;
+	if MAXBACKUP  0 then return (false);	! found bogus hit in initial crlf;
+	HITS _ HITS + 1;
+	PREVHIT _ ENDPTR _ PTR;
+	LINES _ MATCH _ 0;	! MATCH will be TRUE if most recent char backed over was delimiter
+				  (in which case we're done if preceding char is LF or FF);
+	! First we back up to the beginning of the hit (if not too far).;
+	do 	if not FF  (CH_ldb(PTR))  LF then
+			if MATCH or CH = FF = DELIM land '176 then done
+			else if CH = LF and (LINES _ LINES+1) > SURROUND then
+				collect ( & "*  . . .");	! too many lines, truncate;
+				done
+			;
+		MATCH _ (not CH  DELIM  -1) or (MATCH and CH = 0);
+		decrptr
+	 until (MAXBACKUP _ MAXBACKUP-1) = 0;
+	! If we gave up due to too many chars (not too many lines), give truncation warning.;
+	if MAXBACKUP = 0 and PTR land '777777  BUF0 then
+		collect ( & "*  . . .");
+		do 	CH _ ildb(PTR);		! advance PTR to line boundary (give up after 300 chars);
+			COUNT _ COUNT - 1;
+		 until (not FF  CH  LF) or (MAXBACKUP _ MAXBACKUP+1) > 300
+	;
+	if DELIM  -1 then collect ();		! blank lines between hits unless delim = LINE;
+	STAR _ true;				! prefix lines with "*" until "hit" line itself;
+	SS _ null;
+	LINES _ -1;
+	while true do
+		if 0  (CH _ ildb(PTR))  FF then SS _ SS & CH;	! don't print nulls or pagemarks;
+		COUNT _ COUNT - 1;
+		if PTR = ENDPTR then done;	! stop when we hit the byte that ended the hit;
+		if CH = LF then 		! but meanwhile process each accumulated line;
+			if DELIM  CR or (LINES_LINES+1) > 0 or not equ(SS,) then handle (SS);
+			! Ignore initial blank line on paragraphs.;
+			SS _ null
+		
+	;
+	STAR _ false;				! this line gets a ">" prefix;
+	LINES _ 0;				! count for truncation on lines following;
+	if (MATCH _ ldb(PTR)) = LF then		! if hit ended at LF, handle it now (also set up MATCH for SHOW);
+		handle (SS);
+		STAR _ true;
+		SS _ null
+	;
+	return (show)				! show the rest of the hit;
+;
+! Help text and top-level scanning: DESCRIBE, GETCMD, SCANCMD;
+
+simple procedure DESCRIBE;	! this is what you get if you give a null command;
+	print (, "Command format:", ,
+!!WAITSONLY
+"	[D|O]FIND[ WITHIN <delim>][ SURROUND <num>] <key>
+	    [ OMIT[TING] [ONLY ]<omits>][ IN <file>][ WRITING <file>]
+where [] represents an optional field and | separates mutually exclusive
+choices.", ,
+!!ENDWAITS
+!!TENEXONLY
+"	[D]FIND[ WITHIN <delim>][ SURROUND <num>] <key>
+	    [ OMIT[TING] [ONLY ]<omits>][ IN <file>][ WRITING <file>]
+where [] represents an optional field.", ,
+!!ENDTENEX
+"
+Default <file> to search is the people directory (for FIND) or the
+unabridged dictionary word list (for DFIND).  Default <omits> (chars
+to ignore in the file) is '012'000, i.e., ignore linefeeds and nuls.
+Default ""writing"" file is null, i.e., print results at the terminal.", ,
+!!WAITSONLY
+"WRITING NOTHING discards all results except the total number of hits.", ,
+!!ENDWAITS
+"Default <num> (max number of lines printed before/after each hit) is 25.
+<delim> is a single char or one of ",
+!!WAITSONLY
+"MSG, LINE, PAGE, PARAGRAPH, GRAF.
+The OFIND command looks at OPTION.TXT to override these defaults.", ,
+!!ENDWAITS
+!!TENEXONLY
+"LINE, PAGE, PARAGRAPH, GRAF.", ,
+!!ENDTENEX
+"
+In the <key>, the following mappings apply:
+
+	comma	separates two strings to search for simultaneously
+       letter	matches either upper- or lower-case in file
+	'xxx	character with ascii code xxx (octal)
+        {xyz}	any of the characters x, y, and z
+	  " & AnyChar & "	any character
+	  " & NondlmChar & "	any character except CR, LF, tab, space, or formfeed
+	  |	any of: CR, LF, tab, space, FF (complement of " & NondlmChar & ")
+	 " & NegChar & "x	any character except x (x can be {xyz} or whatever)
+	 " & QuoteChar & "x	the character x (used to quote these special chars;
+		can also be used to quote a letter to enforce case)
+	 " & InfChar & "x	any number (including zero) of repetitions of x
+		(x can be {xyz} or whatever)
+	space	equivalent to " & InfChar & "|, i.e., zero or more delimiters; to
+		match precisely one space, quote the space with `" & QuoteChar &"'
+
+All but the """ & InfChar & """ and ""space"" constructs apply also to the <omits>.",
+!!WAITSONLY
+!!	, , "For further details, READ FIND.",
+!!ENDWAITS
+);
+
+! GETCMD fetches the command line and decides what the command was (FIND, DFIND, etc.).;
+
+simple procedure GETCMD;
+	preloadwith cvsix("DF    "), cvsix("DF____"),
+!!WAITSONLY
+!!		     cvsix("OF    "), cvsix("OF____"),
+!!		     cvsix("TES   "), cvsix("TES___"),
+!!ENDWAITS
+		     cvsix("FIND  "), cvsix("FIND__");
+	own safe integer array COMMANDS[1:(ifc TENEX thenc 2 elsec 4 endc),1:2];
+
+!!WAITSONLY
+!!	if viaE then
+!!		open (7, "dsk", 0, 2, 0, 500, CH, EOF_true);	! look in interface file for command text;
+!!		if EOF then bomb ("Couldn't open DSK!");
+!!		! Startup ac's held interface filename in sixbit, use MTAPE for lookup to save re-parsing filename;
+!!		MTAPEDAT[2] _ ac('14);	MTAPEDAT[3] _ ac('13);	MTAPEDAT[4] _ 0;
+!!		MTAPEDAT[5] _ ac('11);	MTAPEDAT[6] _ location (INFO[1]);
+!!		S	movei 1,0;
+!!			mtape 7,MTAPEDAT[0];
+!!			 hrro 1,MTAPEDAT[3];	! MTAPE skips if lookup successful;
+!!			movem 1,EOF
+!!		;
+!!		if EOF then bomb ("Couldn't find interface file!");
+!!		S _ input (7, crlfbreak);	! get one line from file;
+!!		if CH  LF then while length(S)  500 do S _ S & "xxxxx";	! no LF--guarantee overlength line;
+!!		SURROUND _ 3			! less surrounding text permitted on calls from E;
+!!	
+!!	else
+!!		backup;				! rescan most recent command line;
+!!		S _ inchwl;
+!!		SURROUND _ 25
+!!	;
+!!ENDWAITS;
+
+!!TENEXONLY
+!!	Q	setz 1,;
+!!		jsys '500;			! back up over command line;
+!!		 setz 1,;
+!!		movem 1,CH			! number of chars backed up over;
+!!	;
+!!	while (CH_CH-1)  0 do
+!!		if (COMMAND _ inchrw) = "V"-'100 and CH > 0 then	! control-V's are TENEX command-quoters;
+!!			S _ S & inchrw;
+!!			CH _ CH - 1
+!!		
+!!		else if COMMAND  LF or CH  0 then S _ S & COMMAND;
+!!	! can't use inchwl since it mucks up some control chars;
+!!	SURROUND _ 25;
+!!ENDTENEX
+
+	while not " "  S  TAB do CH _ lop(S);	! ignore leading white space;
+	COMMAND _ cvsix(S&"      ");		! pad with blanks, map to uppercase;
+	for CH _ 1 thru arrinfo(COMMANDS,2) do if COMMANDS[CH,1]  COMMAND  COMMANDS[CH,2] then COMMAND _ S land '137;
+	! If we find a winner, set COMMAND to be uppercase of first letter.  Note that
+	  previous cvsix'ed value, if nonzero at all, had nonzero top byte.;
+	if 0 < COMMAND  '177 then
+		while "A"  S land '137  "Z" do CH _ lop(S)	! if we recognise command, skip over letters only;
+	else
+		while (COMMAND_0)  lop(S)  ";" do;		! else wait for semicolon (might be R FIND<semi>...);
+!!WAITSONLY
+!!	if COMMAND = "T" and lop(S) = "/" then COMMAND _ lop(S) land '137;	! TEST/D=DFIND, TEST/O=OFIND, etc.;
+!!	if (COMMAND = "O" or (COMMAND = "D" and viaE)) and lop(S) = "/" then
+!!		OPTSTR _ "/" & scan (S, spacecapsbreak, CH)	! OFIND selection (see documentation);
+!!	else
+!!		OPTSTR _ null;
+!!ENDWAITS
+	while S = " " do CH _ lop(S);	! ignore white space after command name;
+	if length(S) = 0 then
+!!WAITSONLY
+!!		if viaE then	! invoked from E with no text given -- use next line (copied from E text);
+!!			S _ input (7, crlfbreak);
+!!			if EOF then S _ null
+!!			else if CH  LF then while length(S)  500 do S _ S & "xxxxx"
+!!			else while S = " " do CH _ lop(S)
+!!		
+!!		else
+!!ENDWAITS
+			describe;	! otherwise, null text gets summary of syntax;
+			exit
+		;
+!!WAITSONLY
+!!	if viaE then
+!!		rename (7, null, 0, EOF);	! delete interface file;
+!!		release (7);
+!!		if length(S) = 0 then bomb ("Nothing to search for!")
+!!		else if length(S) > 500 then bomb ("Command text too long!")
+!!	
+!!ENDWAITS
+;
+
+! SCANCMD sets up defaults based on the command name -- only hairy part is for OFIND.
+  Then the command line is scanned to override the defaults.  Note DEFDELIM of -2
+  indicates no default delimiter yet.  Eventually defaults to GRAF (DELIM = CR) but
+  can be overridden by use of "" filename (implies default of MSG).  An explicit
+  WITHIN clause or an implicit default (e.g., DFIND implies LINE) prevents "" names
+  from affecting the delimiter.;
+
+simple procedure SCANCMD;
+	OMIT _ "'012'000";	! omit line feeds and nulls;
+	FILEOUT _ null;	! default is to print results directly;
+!!TENEXONLY
+!!	DEFFL _ (if COMMAND = "D" then "MAN:DICTIONARY" else "PS:<CS.PUBLIC>INFO.PTY");
+!!	DEFDELIM _ (if COMMAND = "D" then -1 else -2);
+!!ENDTENEX
+!!WAITSONLY
+!!	if viaE then COMMAND _ "D";
+!!	DEFFL _ (if COMMAND = "D" then "UNABRD.DIC[LIB,DOC]" else "WHOZAT[P,DOC]");
+!!	DEFDELIM _ (if COMMAND = "D" then -1 else -2);
+!!	if COMMAND = "O" or length(OPTSTR)  0 then		! fetch defaults from OPTION.TXT on login area;
+!!		open (2, "dsk", 0, 4, 0, 500, CH, EOF_true);
+!!		if EOF then bomb ("Can't open DSK to examine OPTION.TXT!");
+!!		SS _ cvxstr(call(0,"getppn"));
+!!		lookup (2, "option.txt["&SS[1 to 3]&","&SS[4 to 6]&"]", EOF);
+!!		while not EOF do
+!!			SS _ input (2, crlfbreak);
+!!			if equ (scan (SS, (if length(OPTSTR) then coloncapsbreak
+!!				else colonslashcapsbreak), CH), "FIND" & OPTSTR) then
+!!				if SS[ for 1] = ";" then SS _ SS[1 to -1];
+!!				if CH = "/" then scan (SS, coloncapsbreak, CH);
+!!				while SS = " " do CH _ lop(SS);
+!!				SS _ " " & (SSAV _ SS);
+!!				options (SS, DEFFL, OMIT, FILEOUT, DEFDELIM);
+!!				! if OPTIONS doesn't like SS (leaves it unchanged), try old syntax;
+!!				if equ(SS,SSAV) then options (SS _ " in "&SS, DEFFL, OMIT, FILEOUT, DEFDELIM);
+!!				done
+!!			
+!!		;
+!!		if EOF and not viaE then print ("No FIND", OPTSTR, " line in OPTION.TXT; why'd you use OFIND?", );
+!!		release (2)
+!!	;
+!!ENDWAITS
+	options (S, FILEIN _ null, OMIT, FILEOUT, DELIM _ -2);	! see what defaults overridden by command line;
+!!TENEXONLY
+!!	if length(FILEIN) = 0 then DEFDELIM _ -1;	! use line-delim if either default file is used;
+!!ENDTENEX
+	FILEIN _ hacks (if length(FILEIN) then FILEIN else DEFFL);
+	if length(FILEOUT) then FILEOUT _ hacks (FILEOUT, true);
+	if DELIM = -2 then DELIM _ (if DEFDELIM = -2 then CR else DEFDELIM);
+	DEFFL _ hacks (DEFFL);
+	if length(SSAV _ S) = 0 then bomb ("Null search string not permitted.")
+;
+! Main program;
+
+!!WAITSONLY
+!!	OUTOK _ (call (0, "jbtsts") land (1 lsh 30)  0) or (viaE and call (0, "getppn")  cvsix("100100"));
+!!	! can't write files when not logged in, unless running as phantom via E's DFIND command;
+!!	if not OUTOK then print ();
+!!	setbreak (crlfbreak, LF, CR&FF, "i");
+!!	setbreak (nonalphnumbreak, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", null, "xr");
+!!	setbreak (bracketbreak, "[", null, "ia");
+!!	setbreak (spacecapsbreak, " ", null, "ik");
+!!	setbreak (coloncapsbreak, ":", null, "ik");
+!!	setbreak (colonslashcapsbreak, ":/", null, "ik");
+!!ENDWAITS
+
+!!TENEXONLY
+!!	OUTOK _ true;
+!!ENDTENEX
+
+getcmd;
+scancmd;
+
+ "compute states"
+
+	safe integer array TABLE[0:(9*MAXUNION%10),0:'177];	! predeclare max size to avoid extra pass;
+
+	simple procedure INCRST;
+		! shift multi-word one-bit-on mask indicating state of NDFSA;
+		if (STBIT _ STBIT lsh 1) = 0 then
+			if (STWORD _ STWORD + 1) > KEYLENG then
+				bomb ("Key(s) too long.")
+			else
+				STBIT _ 1
+	;
+
+	simple integer procedure FINDUNION;
+		! Searches UNIONS (hashed table, keys in HASH) for STATE, inserting if
+		  not already there, returns index where found, with sign bit set if newly added.
+		  Coded in assembler since this is a major bottleneck of the preprocessing stage.;
+		integer HS;
+		S	label ntfnd, dffrnt, search, cmplx;
+			move 0,STATE[1];	! compute key = sum of union-words;
+			forc CTVAR _ 2 stepc 1 untilc KEYLENG doc
+			{	add 0,STATE[CTVAR];
+			} endc
+			movm 0,0;		! absolute value;
+			movem 0,HS;		! save for quick testing (detects most hash conflicts);
+		search:	idivi 0,MAXUNION+1;	! initial hash is value mod tablesize;
+			skipge 2,HASH[0](1);	! fetch hash table entry, skip if not empty;
+			 jrst ntfnd;		! it was empty -- add new union;
+			came 2,HS;		! not empty -- does its abs-sum match ours?;
+			 jrst dffrnt;		! no, so it's guaranteed to be a different union;
+			movei 2,(1);		! yes, so check word-by-word to see if same union;
+			imuli 2,KEYLENG+1;
+			forc CTVAR _ 1 stepc 1 untilc KEYLENG doc
+			{	move 0,UNIONS[0,CTVAR](2);
+				came 0,STATE[CTVAR];
+				 jrst dffrnt;	! nope, didn't match;
+			} endc
+			popj '17,;		! yes, we found it -- index is in ac 1;
+
+		dffrnt:	move 2,HS;		! hashing conflict, do secondary hash;
+			idivi 2,79;
+			addi 1,1(3);
+			movei 0,(1);
+			jrst search;
+
+		ntfnd:	move 0,HASHUSED;	! new union to add -- get ordinal for it;
+			hrlm 0,QUEUE[0](1);	! left half of QUEUE used to save TABLE index for UNIONS entries;
+			aos 2,HASHUSED;	! incr ordinal and check for overcrowded hash table;
+			caile 2,9*MAXUNION%10;
+			 jrst cmplx;		! too full;
+			move 0,HS;		! plenty of room -- store abs-sum in HASH;
+			movem 0,HASH[0](1);
+			movei 2,(1);		! copy individual words of union into UNIONS;
+			imuli 2,KEYLENG+1;
+			forc CTVAR _ 1 stepc 1 untilc KEYLENG doc
+			{	move 0,STATE[CTVAR];
+				movem 0,UNIONS[0,CTVAR](2);
+			} endc
+			tlo 1,'400000;		! flag as newly added;
+			popj '17,;		! return;
+
+		cmplx:				! come here to fall through if table gets full;
+		;
+		bomb ("Key(s) too complex.")
+	;
+		
+	! STATES[char] (where "char" indexes a block of KEYLENG words) contains union
+	  of NDFSA states in which "char" as next character would move NDFSA to next state.;
+	! INFINS[char] contains union of NDFSA states in which <char> occurs, i.e.,
+	  "char" leaves NDFSA in same state.  If two  constructs are concatenated, the
+	  state in which the first occurs is considered to imply the next higher state,
+	  which is then the state in which the second  loops.  This is indicated by
+	  turning on the bit for the higher state in INFEQV.  (This is necessary to keep
+	  "ab" from matching "ba".);
+	! WINNERS is union of NDFSA states in which we have reached end of key.;
+
+	arrclr (STATES);
+	arrclr (INFINS);
+	arrclr (INFEQV);
+	arrclr (WINNERS);
+	ONEINF _ PREVHIT _ HITS _ 0;	! ONEINF detects consecutive  constructs;
+	STBIT _ STWORD _ 1;		! bottom state of NDFSA;
+	while length(S) do
+		if not " "  S  InfChar then	! <space> is an implicit  construct;
+			while S = InfChar do CH _ lop(S);
+			if length(S) = 0 then bomb ("Can't end key with `" & InfChar & "'!");
+			if S = " " then S _ "|" & S[2 to ];
+			SS _ parse;	! find out what we're repeating;
+			if ONEINF then	! previous token was also an  construct;
+				incrst;
+				INFEQV[STWORD] _ INFEQV[STWORD] lor STBIT
+			
+			else
+				ONEINF _ true;
+			while length(SS) do INFINS[CH_lop(SS),STWORD] _ INFINS[CH,STWORD] lor STBIT
+		
+		else
+			if length(SS _ parse) = 0 then WINNERS[STWORD] _ WINNERS[STWORD] lor STBIT;
+			! null string from PARSE indicates end of subkey (comma);
+			incrst;
+			ONEINF _ false;
+			while length(SS) do STATES[CH_lop(SS),STWORD] _ STATES[CH,STWORD] lor STBIT
+		;
+	WINNERS[0] _ 1 lsh 35;	! bogus bit "below" bottom NDFSA state to avoid boundary problems;
+	BASE[0] _ STATE[0] _ 0;
+	for KY _ 1 thru KEYLENG do BASE[KY] _ (WINNERS[KY] lsh 1) lor (WINNERS[KY-1] lsh -35);
+	! BASE contains union of NDFSA states representing beginning of key(s).;
+	WINNERS[STWORD] _ WINNERS[STWORD] lor STBIT;
+
+	OMIT  S;	! set OMIT to null and put OMIT string into S for parsing;
+	while length(S) do OMIT _ OMIT & parse;
+
+	! Now we set up a queue of achievable unions of NDFSA states (i.e., DFSA states).
+	  Initially, we know BASE is achievable.  Then take closure: any DFSA state reached
+	  when some char X occurs while in an achievable state, is achievable.;
+	! TABLE entries are in the form of pointers to other TABLE entries, with the
+	  index field set to index with ac 2.  (Ac 2 will have the input character in
+	  the inner search loop.);
+
+	arrclr (QUEUE);
+	arrclr (HASH, -1);
+	arrclr (TABLE);
+	ZERO _ location(TABLE[0,0]) + (2 lsh 18);	! base value for TABLE entries;
+	for KY _ 1 thru STWORD do STATE[KY] _ BASE[KY];
+	QUEUE[QTOP_HASHUSED_0] _ findunion xor (1 lsh 35);	! we know this one will be newly added;
+	QBOT _ -1;
+	while (QBOT_QBOT+1)  QTOP do
+		for CH _ 0 thru '177 do		! see what happens if CH occurs while in this DFSA state;
+		 "x"	PTR _ QUEUE[QBOT] land '777777;	! get index into UNIONS;
+			for KY _ 1 thru STWORD do
+				STBIT _ (((UNIONS[PTR,KY] lsh 1) lor (UNIONS[PTR,KY-1] lsh -35)) land
+					STATES[CH,KY]) lor (UNIONS[PTR,KY] land INFINS[CH,KY]) lor BASE[KY];
+				while ONEINF _ (((STBIT lsh 1) lor (STATE[KY-1] lsh -35))
+					land INFEQV[KY] land lnot STBIT) do
+					STBIT _ STBIT lor ONEINF;
+				if STBIT land WINNERS[KY] then continue "x";	! winning states don't go in table;
+				STATE[KY] _ STBIT
+			;
+			if (PTR _ findunion) < 0 then PTR _ QUEUE[QTOP_QTOP+1] _ QUEUE[QTOP] + (PTR land '777777);	
+			TABLE[QBOT,CH] _ ZERO + (QUEUE[PTR] lsh -18) lsh 7	! create TABLE entries as we go;
+		 "x";
+
+	while length(OMIT) do	! override TABLE entries for omitted chars -- they become no-ops;
+		CH _ lop(OMIT);
+		for PTR _ 0 thru QTOP do
+			TABLE[PTR,CH] _ ZERO + PTR lsh 7
+	;
+
+ "main section"
+
+	safe integer array BUF[0:BUFSIZE-1];
+
+!!WAITSONLY
+!!	open (INCHAN _ getchan, DEVIN _ device (FILEIN), 15, 0, 0, 0, 0, EOF_true);
+!!	if EOF then bomb ("Can't open device "&DEVIN&"!");
+!!	lookup (INCHAN, FILEIN, EOF);
+!!	if EOF then bomb ("Can't find "&FILEIN&"!");
+!!	fileinfo (INFO);
+!!	LEFT _ -(INFO[4] rot 18);			! get size of file;
+!!	arryin (INCHAN, BUF[128], BUFSIZE-128);	! read in first buffer-full;
+!!	if BUF[128] = cvasc("COMME") and BUF[129] = cvasc("NT  ") then	! E directory -- skip past it;
+!!		for PTR _ 256 step 128 until BUFSIZE-1 do if BUF[PTR] land ('177 rot -7) = (FF rot -7) then done;
+!!		! E directory ends at start of second page, which is guaranteed to be on 128-word record boundary;
+!!		if PTR  BUFSIZE then	! couldn't find end of E directory;
+!!			if not viaE then print ("Invalid E directory will be included in the search.", );
+!!			PTR _ 128
+!!		
+!!	
+!!	else
+!!		PTR _ 128;
+!!	call (INCHAN, "showit");	! turn on wholine display of i/o channel status;
+!!	LEFT _ LEFT - (PTR-128);	! number of words left in file (as opposed to this buffer);
+!!	FIRST _ SHORTEST _ LAST _ (if DELIM = -1 then null else );
+!!ENDWAITS
+
+!!TENEXONLY
+!!	INCHAN _ openfile (FILEIN, "REO");
+!!	if SKIP then bomb ("Can't find "&FILEIN&"!");
+!!	gtfdb (INCHAN, INFO);
+!!	LEFT _ (INFO['11] lsh -24) land '77;	! byte size used in this file;
+!!	if 7  LEFT  36 then
+!!		bomb ("Invalid byte-size ("&cvs(LEFT)&") in "&FILEIN&"!");
+!!	LEFT _ (if LEFT = 7 then (INFO['12]+4) div 5 else INFO['12]);	! size of file, in bytes, converted to words;
+!!	arryin (INCHAN, BUF[128], BUFSIZE-128);	! get first buffer-full;
+!!	PTR _ 128;
+!!ENDTENEX
+	BUF0 _ location(BUF[PTR]);	! for use in BACK;
+
+	if FILEOUT then		! we've been told to send results to a file;
+!!WAITSONLY
+!!		open (OUTCHAN _ getchan, DEVOUT _ device (FILEOUT), 0, 0, 19, 0, 0, EOF2_true);
+!!		if EOF2 then bomb ("Can't open device "&DEVOUT&"!");
+!!		enter (OUTCHAN, FILEOUT, EOF2);
+!!		if EOF2 then bomb ("Can't write "&FILEOUT&"!")
+!!	;
+!!ENDWAITS
+!!TENEXONLY
+!!		OUTCHAN _ openfile (FILEOUT, "WNE");
+!!		if SKIP then bomb ("Can't write "&FILEOUT&"!")
+!!	;
+!!ENDTENEX
+
+	BUFLEFT _ BUFSIZE - PTR;		! words left in this buffer;
+	PTR _ point (7, BUF[PTR-1] _ CR lsh 8 + LF lsh 1, 20);	! convert BUF index into byte pointer;
+	ZERO _ STWORD _ location(TABLE[0,0]) + (2 lsh 18);	! initial state of DFSA;
+	PRINTING _ false;			! not in the middle of printing a hit;
+	OVERLAP _ (if DELIM=-1 then 128 else 384);	! overlap between buffers (for BACK t back over), in words;
+	while LEFT > 0 do	! while anything left in the file, process a buffer's worth;
+		COUNT _ LEFT min BUFLEFT;	! max amount left to look at in this buffer;
+		LEFT _ LEFT - COUNT;		! how much will be left in file after we look at this part;
+		COUNT _ COUNT * 5;		! convert to byte count;
+		if PTR lsh -30 = 15 then COUNT _ COUNT + 2;	! account for initial crlf;
+		if PRINTING then PRINTING _ show;	! finish printing hit in progress, if any;
+		define inlinereps = 1 lsh 5;
+		S	label inloop, loop, wins, fini;
+			move 3,STWORD;		! get current DFSA state (indexed pointer into TABLE);
+		inloop:	skipg 1,COUNT;		! anything left?;
+			 jrst fini;		! no, leave loop and go read more;
+			movni 2,(1);		! get negative of byte count;
+			andi 2,inlinereps-1;	! modulo number of inline reps of inner loop;
+			imuli 2,3;		! compute where to enter inline stream so as to;
+			trze 1,inlinereps-1;	! guarantee not running out of chars in middle;
+			 addi 1,inlinereps;	! also round count (in ac 1) up to mult of inline reps;
+			jrst loop(2);		! so count is as if we entered loop from the top;
+
+		loop:	forc ctvar _ 1 stepc 1 untilc inlinereps doc
+			{	ildb 2,PTR;	! inner loop: get next char, then index into TABLE to get;
+				skipn 3,@3;	! next DFSA state (again as indexed ptr), = 0 if winner;
+				 pushj '17,wins;	! executed only if winner found;
+			} endc
+			subi 1,inlinereps;	! decr byte count to account for "inlinereps" chars;
+			jumpg 1,loop;		! if anything left, keep looping;
+			jrst fini;		! else, exit loop and read some more;
+
+		wins:	pop '17,6;		! fetch return addr and compute where in middle of loop we were;
+			movei 6,(6);
+			subi 6,loop;
+			idivi 6,3;
+			subi 1,(6);		! adjust byte count accordingly;
+			movem 1,COUNT;
+			pushj '17,back;		! report this hit;
+			movem 1,PRINTING;	! save returned value as hit-in-progress flag;
+			move 3,ZERO;		! DFSA goes back to initial state;
+			jrst inloop;		! reenter main loop;
+
+		fini:	movem 3,STWORD		! ran out of buffer -- save current state;
+		;
+		arrblt (BUF[0], BUF[BUFSIZE-OVERLAP], OVERLAP);	! save overlap between buffers;
+		arryin (INCHAN, BUF[OVERLAP], BUFSIZE-OVERLAP);	! read next chunk;
+		if PREVHIT land '777777  location(BUF[BUFSIZE-OVERLAP]) then
+			PREVHIT _ PREVHIT - (BUFSIZE-OVERLAP)
+		else
+			PREVHIT _ 0;
+		PTR _ point (7, BUF[OVERLAP], -1);			! set up byte pointer again;
+		BUF0 _ 0;						! beginning of file is now way back there;
+		BUFLEFT _ BUFSIZE-OVERLAP				! amount left to look at in buffer;
+	;
+	if PRINTING and not equ(SS,null) then handle (SS&)	! process any last chunk at end of file;
+
+ "main section"  "compute states";
+
+!!WAITSONLY
+!!	call ('200000, "showit");	! turn off wholine i/o status display;
+!!ENDWAITS
+
+if FILEOUT then release (OUTCHAN);
+summary;
+exit
+
+end "find"

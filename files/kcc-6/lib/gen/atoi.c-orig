@@ -1,0 +1,358 @@
+/*
+**	ATOI - convert strings to numbers
+**
+**	(c) Copyright Ken Harrenstien 1989
+**	Re-written from original version,
+**		(c) Copyright 1987 by Ian Macky, SRI International
+**
+** Note this implementation relies on a non-ANSI <ctype.h> facility,
+** namely toint(c) which converts a character to its numerical value
+** using the same base system as ANSI's strtol().
+*/
+
+#include <stdlib.h>
+#include <ctype.h>
+#include <limits.h>
+#include <float.h>
+#include <errno.h>		/* For ERANGE */
+#include <math.h>		/* For HUGE_VAL */
+
+#if __STDC__
+#define CONST const
+#else
+#define CONST
+#endif
+
+#define LONG_BIT (sizeof(long)*CHAR_BIT)	/* # bits in a long int */
+#define SIGN ((unsigned long)1<<(LONG_BIT-1))	/* Sign bit */
+#define MAXPOSLONG LONG_MAX
+#define ulong unsigned long			/* Convenient abbrev */
+
+static long conv_const(), conv_oct(), conv_dec(), conv_hex(), conv_base();
+
+double (atof)(str)			/* Note parens in case macro */
+CONST char *str;
+{
+    return strtod(str, (char **) NULL);
+}
+
+int (atoi)(str)				/* Note parens in case macro */
+CONST char *str;
+{
+    return (int) atol(str);
+}
+
+long (atol)(str)			/* Note parens in case macro */
+CONST char *str;
+{
+    while (isspace(*str)) str++;	/* Skip leading whitespace */
+    switch (*str) {
+	case '-': str++;
+	    return - conv_dec(&str, (int *)NULL);	/* Negate result */
+	case '+': str++;
+	default:
+	    return conv_dec(&str, (int *)NULL);
+    }
+}
+
+/* STRTOD - Parse a string into a double value
+**
+** This code is one of the few good candidates for an assembly-language
+** substitute.
+*/
+
+double strtod(nptr, endptr)
+CONST char *nptr;
+char **endptr;
+{
+    register CONST char *cp = nptr;
+    register int c;
+    double value = 0.0;			/* the actual value */
+    int negative = 0;			/* negative number? */
+    int exponent = 0;			/* exponent... */
+    double divisor;
+    int expsign;
+    int ovfl = 0;
+    CONST char *savptr, *str;
+
+    while (isspace(*cp)) cp++;	/* skip leading whitespace */
+    switch (*cp) {
+	case '-': negative = 1;		/* leading - means negative # */
+	case '+': cp++;			/* - falls into.  skip the sign */
+    }
+    savptr = cp;			/* Remember where we started */
+
+    /* First do whole-number part.  We use floating arithmetic to avoid
+    ** the possibility of integer overflow.  Slower, but safer.
+    */
+    for (c = *cp; isdigit(c); c = *++cp) {
+	value = (value * 10.0) + (c - '0');
+	if (value && value < 1.0) {	/* If exponent wrapped around, */
+	    ovfl++;			/* we overflowed. */
+	    value = 1.0;
+	}
+    }
+
+    /* Now do fractional part if one was specified */
+    if (c == '.') {
+	divisor = 1.0;		/* Place-value for post-. digits */
+	while (isdigit(*++cp)) {
+	    if ((divisor *= 10.0) > 1.0)	/* Until get too low, */
+		value += (*cp - '0') / divisor;	/* add fraction digits in */
+	    else if (!value) ovfl++;		/* Underflowed */
+	}
+	c = *cp;
+    }
+
+    if (cp != savptr) {			/* Was anything scanned? */
+	str = cp;			/* Yes, update returned ptr now */
+        if (*cp == 'e' || *cp == 'E') {	/* Look for exponent */
+	    expsign = (c = *++cp);	/* Get possible exponent sign */
+	    if (c == '-' || c == '+')
+		c = *++cp;
+	    if (isdigit(c)) {
+		exponent = c - '0';
+		while (isdigit(*++cp)) {
+		    exponent = exponent*10 + (*cp-'0');
+		    if (exponent >= (INT_MAX/10))
+			ovfl++, value = (expsign=='-' ? 0.0 : 1.0);
+		}
+
+		/* EXTREMELY dumb method of scaling value by exponent */
+		/* Fix this up later!! */
+		if (!ovfl) {
+		    double pv;
+		    if (expsign == '-')
+			while (--exponent >= 0) {
+			    pv = value;			/* Remember so can */
+			    if ((value /= 10.0) > pv) {	/* chk for underflow */
+				ovfl++;
+				value = 0;
+				break;
+			    }
+			}
+		    else
+			while (!ovfl && --exponent >= 0) {
+			    pv = value;
+			    if ((value *= 10.0) < pv) {	/* Chk for overflow */
+				ovfl++;
+				value = 1.0;
+				break;
+			    }
+			}
+		}
+		str = cp;		/* Won, update returned ptr again */
+	    }
+	}
+    }
+
+    if (endptr) *endptr = (char *)str;	/* save pointer to after number */
+    if (ovfl) {				/* If overflowed, */
+	errno = ERANGE;
+	value = value ? HUGE_VAL : 0.0;	/* Return either big val or 0 */
+    }
+    return (negative) ? -value : value;	/* return the double value */
+}
+
+/* STRTOL - Parse string as long integer value.
+**	This uses a special flag to share code with strtoul().
+*/
+#define STRTOL_UNSIGNF	010000		/* Use an unlikely bit */
+
+long (strtol)(nptr, endptr, base)
+CONST char *nptr;
+char **endptr;
+int base;
+{
+    register char *str = (char *)nptr;
+    long v;
+    int neg = 0;		/* Flag set if '-' seen */
+    int ovfl = 0;		/* Flag set if overflow detected */
+    int unsignf;		/* Flag set if returning unsigned long */
+    char *sptr;
+
+    while (isspace(*str)) str++;	/* skip leading whitespace */
+    switch (*str) {			/* check for leading sign char */
+	case '-': neg++;		/* yes, negative #.  fall into '+' */
+	case '+': str++;		/* skip the sign character */
+    }
+    sptr = str;				/* Remember current loc */
+    if (unsignf = (base & STRTOL_UNSIGNF))
+	base &= ~STRTOL_UNSIGNF;		/* Ensure flag taken out */
+    switch (base) {
+	case 0:	v = conv_const(&sptr, &ovfl);	break;
+	case 8:	v = conv_oct(&sptr, &ovfl);	break;
+	case 10:v = conv_dec(&sptr, &ovfl);	break;
+	case 16:			/* Check for hex prefix 0X */
+	    if (*sptr == '0' && (*++sptr == 'x' || *sptr == 'X'))
+		str = ++sptr;		/* Update so err if nothing follows */
+	    v = conv_hex(&sptr, &ovfl);
+	    break;
+	default:
+	    if (base <= 36) { v = conv_base(&sptr, &ovfl, base); break; }
+	case 1:				/* Illegal base */
+	    v = 0;
+	    break;
+    }
+
+    /* Now see if anything was parsed, and return appropriate ptr */
+    if (endptr)
+	*endptr = (sptr == str)		/* If pointer hasn't changed, */
+		? nptr			/* then return original ptr! */
+		: sptr;			/* Else use updated ptr */
+
+    /* Now handle overflow if any.
+    ** If we're returning a long, it's also an overflow if the sign bit
+    ** is set prior to negation test.
+    */
+    if (ovfl || ((v & SIGN) && !unsignf)) {
+	errno = ERANGE;
+	return unsignf ? ULONG_MAX
+		: ((neg) ? LONG_MIN : LONG_MAX);
+    }
+    return (neg) ? -v : v;		/* Negate number if needed */
+}
+
+
+/* STRTOUL - Parse string as unsigned long value.
+**	Note flag trickery to share code with strtol().
+*/
+unsigned long (strtoul)(str, ptr, base)		/* Parens in case macro */
+CONST char *str;
+char **ptr;
+int base;
+{
+    return strtol(str, ptr, base | STRTOL_UNSIGNF);
+}
+
+/* CONV_CONST(ptr, retf) - Parse string as C-style integer constant.
+**
+** This routine and all of the CONV_* routines handle their args in 
+** the same way:
+**	ptr - points to char ptr to string; updated by call.
+**	retf - if not NULL, points to overflow flag.  This flag is
+**		incremented if overflow is detected.
+**
+**	There is an ambiguity for the case of "0x" where we could
+** treat it as any of:
+**	(1) Erroneous hex syntax (as it is for C compiler)
+**	(2) Valid hex syntax, value 0
+**	(3) Octal constant 0 with pointer left at "x"
+**
+** Currently we opt for case 3 since that is the strictest interpretation
+** of the dpANS.  Also, note that for base 16, the strtol() code fails
+** if only "0x" is seen; this likewise conforms to a strict interpretation.
+*/
+static long
+conv_const(str, retf)
+char **str;
+int *retf;
+{
+    register char *cp = *str;
+
+    if (*cp != '0')			/* Octal/Hex prefix? */
+	return conv_dec(str, retf);	/* Nope, use decimal */
+    if (*++cp == 'x' || *cp == 'X') {	/* Check for hex */
+	if (!isxdigit(*++cp)) {		/* Next digit valid hex? */
+	    ++(*str);			/* Nope, do case 3 and return 0 */
+	    return 0;
+	}
+	*str = cp;			/* Win, update pointer! */
+	return conv_hex(str, retf);	/* Use hex */
+    }
+    *str = cp;
+    return conv_oct(str, retf);		/* Use octal */
+}
+
+/* CONV_OCT - convert octal string */
+static long
+conv_oct(ptr, retf)
+char **ptr;
+int *retf;
+{
+    register char *cp = *ptr;
+    register ulong v = 0;
+    register int c;
+
+    for (c = *cp; isodigit(c); c = *++cp) {
+	if ((v & (07 << (LONG_BIT-3))) && retf) (*retf)++;
+	v = (v << 3) + c - '0';
+    }
+    *ptr = cp;
+    return v;
+}
+
+/* CONV_HEX - convert hexadecimal string */
+static long
+conv_hex(ptr, retf)
+char **ptr;
+int *retf;
+{
+    register char *cp = *ptr;
+    register ulong v = 0;
+    register int c;
+
+    for (c = *cp; isxdigit(c); c = *++cp) {
+	if ((v & (017 << (LONG_BIT-4))) && retf) (*retf)++;
+	v = (v << 4) + toint(c);
+    }
+    *ptr = cp;
+    return v;
+}
+
+/* CONV_DEC - convert decimal string */
+static long
+conv_dec(ptr, retf)
+char **ptr;
+int *retf;
+{
+    register char *cp = *ptr;
+    register long v = 0;
+    register int c;
+
+    for (c = *cp; isdigit(c); c = *++cp) {
+	if (v < ((MAXPOSLONG-9)/10))		/* If can't overflow, */
+	    v = v*10 + c - '0';			/*   do it fast */
+	else {					/* Can, so use slow */
+	    do {				/*   unsigned mult loop */
+		ulong pv = v;
+		v = ((ulong)v)*10 + c - '0';
+		if ((ulong)v/10 != pv)		/* See if divide restores v */
+		    if (retf) (*retf)++;	/* If not, we overflowed */
+	    } while (isdigit(c = *++cp));
+	    break;				/* Done, leave outer loop */
+	}
+    }
+    *ptr = cp;
+    return v;
+}
+
+/* CONV_BASE - Convert string of arbitrary base (2-36 inclusive)
+**	There is one additional arg -- the base to use.
+*/
+static long
+conv_base(ptr, retf, base)
+char **ptr;
+int *retf;
+int base;
+{
+    register char *cp = *ptr;
+    register long v = 0;
+    long ovtest = LONG_MAX/base;
+    register int c;
+
+    for (c = *cp; isalnum(c); c = *++cp) {
+	c = toint(c);			/* Convert to number */
+	if (c >= base) break;		/* digit out of range for base? */
+	if (v < ovtest)
+	    v = v * base + c;		/* accumulate the digit */
+	else {
+	    ulong pv;
+	    v = (ulong)v * base + c;
+	    if ((ulong)v/base != pv)
+		if (retf) (*retf)++;	/* Overflowed */
+	}
+    }
+    *ptr = cp;
+    return v;
+}

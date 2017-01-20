@@ -1,0 +1,616 @@
+MODULE MXHOST =
+BEGIN
+
+!
+!			  COPYRIGHT (c) 1985 BY
+!	      DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASS.
+!
+! THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND  COPIED
+! ONLY  IN  ACCORDANCE  WITH  THE  TERMS  OF  SUCH  LICENSE AND WITH THE
+! INCLUSION OF THE ABOVE COPYRIGHT NOTICE.  THIS SOFTWARE OR  ANY  OTHER
+! COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY
+! OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE  IS  HEREBY
+! TRANSFERRED.
+!
+! THE INFORMATION IN THIS SOFTWARE IS SUBJECT TO CHANGE  WITHOUT  NOTICE
+! AND  SHOULD  NOT  BE  CONSTRUED  AS  A COMMITMENT BY DIGITAL EQUIPMENT
+! CORPORATION.
+!
+! DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF  ITS
+! SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.
+!
+
+!++
+! FACILITY: Decmail/MS - Message eXchange Host File Parsing Routines
+!
+! ABSTRACT:     This module contains routines to parse files containing
+!   host/routing information.  At present, the only file format understood is
+!   the one used by the DECNET-HOSTS.TXT file.
+!
+! ENVIRONMENT:  Tops-10/Tops-20
+!
+! AUTHOR:   Richard B. Waddington, CREATION DATE:   18-February, 1985
+!
+! MODIFIED BY:
+!
+! 	MX: VERSION 1.0
+! 01	-
+!--
+
+!
+! INCLUDE FILES:
+!
+%IF %SWITCHES(TOPS20) %THEN
+    LIBRARY 'monsym';
+    UNDECLARE time;
+    LIBRARY 'mxjlnk';
+%FI
+LIBRARY 'mxnlib';       ! Our version of NML's utility library
+LIBRARY 'mxlib';
+LIBRARY 'tbl';
+!
+! TABLE OF CONTENTS:
+!
+FORWARD ROUTINE
+    mx$parse_host_file,
+    parse_line,
+    ptext,
+    get_key,
+    get_data,
+    loop_check;
+
+!
+! MACROS:
+!
+    MACRO parse_block =
+            VECTOR[2] INITIAL(0,0) %,
+          parse_blk =
+            VECTOR[] %;
+
+!
+! EQUATED SYMBOLS:
+!
+    LITERAL
+        txt_ptr = 0,
+        txt_cnt = 1;
+
+!
+! OWN STORAGE:
+!
+
+!
+! EXTERNAL REFERENCES:
+!
+EXTERNAL
+    uc_tab,                             !Upper case conversion table
+    nodnam;
+
+EXTERNAL ROUTINE
+    tbl_lookup,
+    tbl_add,
+    nmu$text_manager,
+    nmu$memory_manager,
+    nmu$sched_manager,
+    mx$release_asciz,
+    mx$file_routines,
+    mx$error_routines,
+    mx$database_routines;
+
+%global_routine('MX$PARSE_HOST_FILE', fil_ptr, tab_, format): =	!
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       This routine uses .FIL_PTR as the file spec of the file containing host
+!   name/routing information, and parses that file.  The information contained
+!   in the file is added to the TBLUK table using calls to the MX$DATA_ADD_NODE
+!   routine.
+!
+! FORMAL PARAMETERS:
+!
+!	FIL_PTR:    A CH$PTR to an asciz filespec.
+!
+!       TAB:        An address containing the address of a TBLUK table.
+!
+!       FORMAT:     An integer value which determines which file format to use.
+!   The following formats are defined:
+!
+!       1:          DECNET-HOSTS.TXT file format
+!       Others are undefined.
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	The TBLUK table gets updated and, in fact, a new larger table may be
+!   allocated if necessary.  Consequently the table address may change.
+!
+! ROUTINE VALUE:
+!
+!       1 If successful, 0 otherwise
+!
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+    BIND
+        tab = .tab_: tbl;
+
+    STACKLOCAL
+        buf:    VECTOR[CH$ALLOCATION(132)];
+
+    LOCAL
+        len,
+        fid,
+        line,
+        error,
+        data_block,
+        ndex,
+        pause_flag,
+        node;
+
+    IF .format NEQ mp$decnet_hosts_format
+    THEN
+        RETURN $error(  CODE=mp$uhf,                !Unsupported format
+                        SEVERITY=$severe,
+                        FACILITY=$internal);
+
+    pause_flag = .tab[TBL_ACTUAL_ENTRIES] NEQ 0;
+
+    fid = mx$file_open(.fil_ptr, file_access_read_only, error);
+
+    IF .fid LEQ 0
+    THEN
+        BEGIN
+        %IF %SWITCHES(TOPS20) %THEN IF .error EQL uf$fnf
+                              %ELSE IF .error EQL uf$fpe %FI
+        THEN
+            RETURN $true;
+
+        $error(  CODE=uf$fof,                !File open error
+                 SEVERITY=$warning,
+                 FACILITY=$internal,
+                 MESSAGE_DATA=.fil_ptr,
+                 OPTIONAL_MESSAGE=$error_code,
+                 OPTIONAL_DATA=.error);
+
+        RETURN 2
+        END;
+
+    line = 0;
+
+    WHILE (len = mx$file_read(.fid, CH$PTR(buf), 132, error)) GTR 0 DO
+        BEGIN
+        node = 0;
+        line = .line + 1;
+
+        IF .pause_flag
+        THEN
+            nmu$sched_pause();
+
+        IF NOT parse_line(CH$PTR(buf), format, node, data_block)
+        THEN
+            $error( CODE=mp$syn,                    !Syntax error in file
+                    SEVERITY=$warning,
+                    FACILITY=$internal,
+                    MESSAGE_DATA=(.line, .fil_ptr));
+
+        IF .node GTR 0
+        THEN
+            BEGIN
+            MX$DATA_ADD_NODE(tab, .node, ndex, .data_block);
+            mx$release_asciz(.node);
+            END
+        END;
+
+    IF .len NEQ 0
+    THEN
+        $error( CODE=uf$frf,                        !File read error
+                SEVERITY=$warning,
+                FACILITY=$internal,
+                MESSAGE_DATA=.fil_ptr,
+                OPTIONAL_MESSAGE=$error_code,
+                OPTIONAL_DATA=.error);
+
+    MX$FILE_CLOSE(.fid, file_abort, error);
+    RETURN 1
+    END;			!End of TEMP_EXAMPLE
+%routine('PARSE_LINE', ptr, format, node_, data_) =	!
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       This routine parses a line from a host-name file.  FORMAT is used to
+!   determine the format of the file.  Initially, there will be only one
+!   format, that used in DECNET-HOSTS.TXT.  Eventually other formats may be
+!   added.
+!
+! FORMAL PARAMETERS:
+!
+!       PTR:        A CH$PTR to the line of text in memory to be parsed.
+!
+!	FORMAT:     1 - DECNET-HOSTS.TXT format.  Others are undefined.
+!
+!       NODE:       The address to return the address of the node-name in.
+!
+!       DATA:       The address to return the address of the PMR/synonym block
+!                   in.
+!
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+    BIND
+        node = .node_,
+        data = .data_;
+
+    LOCAL
+        ch,
+        key,
+        nptr,
+        ncnt,
+        bptr,
+        eptr,
+        len,
+        idx,
+        key_block:  parse_block,
+        pmr_block:  parse_block;
+GLOBAL
+        buf: VECTOR[CH$ALLOCATION(132)];
+    STACKLOCAL
+        loops: TBLUK_TABLE(10);             !Use with loop_check ONLY.
+
+    STACKLOCAL
+        swtchs: tbluk_table(0,
+                            'INVALID',$invalid,(),
+                            'STRIP-QUOTES',$strip,()
+                            );
+
+    bptr = CH$PTR(buf);
+    data = len = 0;
+
+    ch = ptext(ptr, key_block);
+
+    SELECTONE .ch OF
+        SET
+        [%C',']:
+            BEGIN
+            ch = ptext(ptr, pmr_block);
+            IF .ch EQL %C':'
+            THEN
+                BEGIN
+                WHILE $true DO
+                    IF loop_check(loops,pmr_block)
+                    THEN
+                        BEGIN
+                        nptr = .pmr_block[txt_ptr];
+                        ncnt = .pmr_block[txt_cnt];
+                        ptr = CH$PLUS(.ptr, 1);
+                        ch = ptext(ptr, pmr_block);
+                        SELECTONE .ch OF
+                            SET
+                            [%C';', %C'!', %O'15', 0]:
+                                EXITLOOP;
+    
+                            [%C':']:
+                                BEGIN
+                                CH$WCHAR_A(%C'@', bptr);
+                                bptr = CH$MOVE(.ncnt, .nptr, .bptr);
+                                CH$WCHAR_A(%C',', bptr);
+                                len = .len + .ncnt + 2;
+                                END;
+    
+                            [OTHERWISE]:
+                                RETURN $error(  CODE=mp$tel,
+                                                SEVERITY=$warning,
+                                                FACILITY=$internal,
+                                                MESSAGE_DATA=.ptr);
+
+                            TES;
+                        END
+                    ELSE
+                        BEGIN
+                        loop_check(loops,0);
+                        RETURN $error(  CODE=mp$pld,
+                                        FACILITY=$internal,
+                                        SEVERITY=$warning,
+                                        MESSAGE_DATA=.pmr_block[txt_ptr]);
+                        END;
+
+                CH$COPY(4,CH$PTR(UPLIT(':%A@')),
+                        .ncnt,.nptr,
+                        0,
+                        4+1+.ncnt, CH$PTR(buf, .len-1));
+
+                data = get_data(CH$PTR(buf), .len+.ncnt+3, mp$pmr);
+                END
+            ELSE
+                RETURN $error(  CODE=mp$tel,
+                                SEVERITY=$warning,
+                                FACILITY=$internal,
+                                MESSAGE_DATA=.ptr);
+
+            END;
+
+        [%C'/']:
+            BEGIN
+            ptext(ptr,pmr_block);
+            CH$WCHAR(0,
+                CH$MOVE(.pmr_block[txt_cnt], .pmr_block[txt_ptr], .bptr));
+
+            IF NOT tbl_lookup(swtchs, .bptr, idx)
+            THEN
+                RETURN $error(  CODE=mp$tel,
+                                SEVERITY=$warning,
+                                FACILITY=$internal,
+                                MESSAGE_DATA=.pmr_block[txt_ptr]);
+
+            !Assuming that the switch is /INVALID or /STRIP-QUOTES...
+            data = .swtchs[.idx, TBL_DATA];            
+            END;
+        [%C';', %C'!', %O'15', 0]:;
+
+        [OTHERWISE]:
+            RETURN $error(  CODE=mp$tel,
+                            SEVERITY=$warning,
+                            FACILITY=$internal,
+                            MESSAGE_DATA=.ptr);
+        TES;
+
+    IF .key_block[txt_cnt] EQL 0
+    THEN                                            !The line had no key
+        IF .pmr_block[txt_cnt] GTR 0
+        THEN
+            RETURN $error(  CODE=mp$mkf,            !Missing key field
+                            SEVERITY=$warning,
+                            FACILITY=$internal)
+        ELSE
+            RETURN 1;                               !Line was blank or comment
+
+    node = GET_KEY(key_block);
+
+    loop_check(loops,0);
+    RETURN 1;
+    END;			!End of TEMP_EXAMPLE
+%routine('LOOP_CHECK',table_, node_) =
+    BEGIN
+    BIND
+        table = .table_: TBL,
+        node = .node_: parse_blk;
+
+    LOCAL
+        key,
+        ndx;
+
+    IF .table[TBL_ACTUAL_ENTRIES] EQL 0
+    THEN
+        tbl_add(table,nodnam,ndx,0);
+
+    IF node NEQ 0
+    THEN
+        BEGIN
+        key = nmu$memory_get(CH$ALLOCATION(.node[txt_cnt]+1));
+        CH$COPY(.node[txt_cnt],.node[txt_ptr],
+                0,
+                .node[txt_cnt]+1,CH$PTR(.key));
+        RETURN tbl_add(table,.key,ndx,CH$ALLOCATION(.node[txt_cnt]+1));
+        END
+    ELSE
+        BEGIN
+        INCR i FROM 1 TO .table[TBL_ACTUAL_ENTRIES] DO
+            IF .table[.i,TBL_DATA] NEQ 0
+            THEN
+                nmu$memory_release(.table[.i,TBL_KEY],.table[.i,TBL_DATA]);
+        table[TBL_ACTUAL_ENTRIES] = 0;
+        END;
+    RETURN 0
+    END;
+%routine('PTEXT', p_, blk_) =	!
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       This routine parses text.  The pointer is advanced until either a
+!   comma, a "=", a ";", a "!", a CR, or a 0 is seen.  Spaces, tabs, and
+!   switches will delimit the text, but will otherwise be ignored.  A count of
+!   the characters in the text and a CH$PTR to the beginning of the text are
+!   returned in the parse block.
+!
+! FORMAL PARAMETERS:
+!
+!	P:      The address of a CH$PTR pointing to the beginning of the switch
+!       BLK:    The address of a parse_block.
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!       The terminator
+!
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+    BIND
+        p = .p_,
+        blk = .blk_: VECTOR[2];
+
+    LOCAL
+        start_flag: INITIAL(0),
+        end_flag:   INITIAL(0),
+        cnt:        INITIAL(0);
+
+    blk[txt_cnt] = 0;
+    WHILE 1 DO
+        BEGIN
+        SELECTONE  CH$RCHAR(.p) OF
+            SET
+            [%C' ',%C'	']:         IF .start_flag THEN end_flag = 1;
+
+            [%C':', %C',', %C'!', %C'=', %C'/',
+            %C';', %o'0', %O'15']:  EXITLOOP;
+
+            [OTHERWISE]:            BEGIN
+                                    IF .start_flag EQL 0
+                                    THEN
+                                        BEGIN
+                                        start_flag = 1;
+                                        blk[txt_ptr] = .p;
+                                        END;
+
+                                    IF NOT .end_flag
+                                    THEN
+                                        blk[txt_cnt] = .blk[txt_cnt] + 1;
+                                    END;
+            TES;
+
+        p = CH$PLUS(.p, 1);
+        END;
+
+    RETURN CH$RCHAR_A(p);
+    END;			!End of PTEXT
+%ROUTINE('GET_KEY', blk_) =	!
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       This routine gets memory for the key string, copys the key string, and
+!   returns the address of the key string to the caller.
+!
+! FORMAL PARAMETERS:
+!
+!       P:  The address the key's parse block.
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+    BIND
+        blk = .blk_: VECTOR[2];
+
+    LOCAL
+        b;
+
+    b = nmu$memory_get(CH$ALLOCATION(.blk[txt_cnt] + 1));
+    IF .b NEQ 0
+    THEN
+        CH$COPY(.blk[txt_cnt], .blk[txt_ptr],
+                0,
+                .blk[txt_cnt] + 1, CH$PTR(.b));
+
+    RETURN .b
+    END;			!End of GET_KEY
+
+%ROUTINE('GET_DATA', ptr, len, typ) =	!
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       This routine gets memory for the data header, and the data string.  It
+!   sets up the data header and returns the address of the data header to the
+!   caller.  
+!
+! FORMAL PARAMETERS:
+!
+!       PBLK:   The address of the pmr string's parse block.
+!       SBLK:   The address of the synonym's parse block.
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+    LOCAL
+        h:      REF list_blk,
+        b;
+
+    IF .len LEQ 0
+    THEN
+        RETURN 0;
+
+    h = nmu$memory_get(list_block_size);
+
+    IF .h NEQ 0
+    THEN
+        BEGIN
+        h[lst_stat] = .typ;
+
+        h[lst_data] = b = nmu$memory_get(CH$ALLOCATION(.len + 1));
+        IF .b NEQ 0
+        THEN
+            CH$COPY(.len, .ptr,
+                    0,
+                    .len + 1, CH$PTR(.b));
+
+        END;
+    RETURN .h;
+    END;    			!End of GET_DATA
+
+END	                        !End of module MXHOST
+ELUDOM

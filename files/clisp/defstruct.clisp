@@ -1,0 +1,503 @@
+;;; -*- Lisp -*-
+;;;
+;;; **********************************************************************
+;;; This code was written as part of the Spice Lisp project at
+;;; Carnegie-Mellon University, and has been placed in the public domain.
+;;; If you want to use this code or any part of Spice Lisp, please contact
+;;; Scott Fahlman (FAHLMAN@CMUC). 
+;;; **********************************************************************
+;;;
+;;; Defstruct structure definition package.
+;;; Written by Skef Wholey.
+;;;
+
+(in-package 'lisp)
+
+(export '(defstruct))
+
+;;; Defstruct options:
+
+(eval-when (compile load eval)
+
+(defvar ds-name ())
+(defvar ds-options ())
+(defvar conc-name ())
+(defvar ds-type ())
+(defvar type-cat ())
+(defvar named ())
+(defvar ds-documentation ())
+(defvar constructor ())
+(defvar copier ())
+(defvar predicate ())
+(defvar include ())
+(defvar print-function ())
+(defvar initial-offset ())
+(defvar callable-accessors ())
+(defvar struct-length ())
+
+;;; Slot information:
+
+(defvar slot-names ())
+(defvar pure-names ())
+(defvar slot-defaults ())
+(defvar slot-options ())
+(defvar slot-numbers ())
+(defvar writable-slots ())
+(defvar new-slot-start ())
+(defvar slot-types ())
+(defvar slot-keywords ())
+
+)
+
+;;; Useful things for DefStructing around:
+
+;20; Who needs the overhead of the full CONCATENATE?  besides,
+;20; this file is loaded before SEQ.
+
+(defun concat-pnames (name1 name2)
+  (if name1
+      (intern (string-concatenate (symbol-name name1)
+			   (symbol-name name2)))
+      name2))
+
+(defun elt-form (object index type)
+  (case type
+    (vector `(svref ,object ,index))
+    (list `(nth ,index ,object))
+    (t (error "Some strange type, ~S crawled in!" type))))
+
+(defun setelt-form (object index newval type)
+  `(setf ,(elt-form object index type) ,newval))
+
+;;; Parse-Name-And-Options sets the Defstruct option variables to the values
+;;; given in the Defstruct.
+
+(defun parse-name-and-options (em)
+  (if (atom em) (setq ds-name em ds-options ())
+		(setq ds-name (car em) ds-options (cdr em)))
+  (setq	conc-name (concat-pnames ds-name '-)
+	ds-type 'vector
+	type-cat 'vector
+	named t
+	constructor (concat-pnames 'make- ds-name)
+	copier (concat-pnames 'copy- ds-name)
+	predicate (concat-pnames conc-name 'p)
+	include ()
+	print-function ()
+	initial-offset 1
+	callable-accessors ())
+  (cond
+   ((listp em)
+    (do ((options (cdr em) (cdr options))
+	 (named-found ())
+	 (unnamed-found ()))
+	((null options)
+	 (cond ((or named-found
+		    (and (eq type-cat 'vector)
+			 (not unnamed-found)))
+		(setq named t)
+		(setq initial-offset 1))
+	       (t
+		(setq named ())
+		(setq initial-offset 0))))
+      (if (listp (car options))
+	  (if (symbolp (caar options))
+	      (case (caar options)
+		(:type (setq ds-type (cadr (car options))
+			     type-cat (if (atom ds-type)
+					  ds-type
+					  (car ds-type))
+			     unnamed-found t))
+		(:include (setq include (cdr (car options))))
+		(:print-function (setq print-function (cadr (car options))))
+		(:initial-offset (setq initial-offset (cadr (car options))))
+		(:conc-name (setq conc-name (cadr (car options))))
+		(:constructor (setq constructor (if (atom (cddr (car options)))
+						    (cadr (car options))
+						    (cdr (car options)))))
+		(:copier (setq copier (cadr (car options))))
+		(:predicate (setq predicate (cadr (car options))))
+		(:callable-accessors
+		 (setq callable-accessors (cadr (car options))))
+		(t (error "~S: Unknown option to DefStruct" (caar options))))
+	      (error "~S: Bad option format for DefStruct" (car options)))
+	  (if (symbolp (car options))
+	      (case (car options)
+		(:conc-name)
+		(:named (setq named-found t))
+		(:unnamed (setq unnamed-found t))
+		(:constructor)
+		(:copier)
+		(:predicate)
+		(:callable-accessors (setq callable-accessors t))
+		(t (error "~S: Unknown option for DefStruct" (car options))))
+	      (error "~S: Bad option format for DefStruct" (car options))))))))
+
+;;; Include-Structure sets up Slot-Names, Slot-Defaults, and Slot-Options from
+;;; an :include'd structure.
+
+(defun include-structure ()
+  (if include
+      (let ((info (get (car include) 'defstruct-description)))
+	(if info
+	    (cond ((equal (defstruct-description-type info) ds-type)
+		   (setq slot-names (defstruct-description-slot-names info)
+			 pure-names
+			  (defstruct-description-slot-pure-names info)
+			 slot-keywords
+			  (defstruct-description-slot-keywords info)
+			 slot-defaults
+			  (append
+			   (defstruct-description-slot-defaults info) nil)
+			 slot-options (defstruct-description-slot-options info)
+			 slot-numbers (defstruct-description-slot-numbers info)
+			 slot-types (defstruct-description-slot-types info)
+			 new-slot-start (length slot-names))
+		   (include-double-slots)  ; [Victor] This is horrible anyway.
+		   (do ((inc-options (cdr include) (cdr inc-options)))
+		       ((null inc-options))
+		     (let ((slot (car inc-options)))
+		       (if (atom slot)
+			   (set-corresponding slot slot-defaults ())
+			   (when (cadr slot)
+			     (set-corresponding (car slot) slot-defaults
+						(cadr slot))
+			     (add-to-options (car slot) (cddr slot)))))))
+		  (t
+		   (error "~S: Included structure is not of the same type"
+			  ds-type)))
+	    (error "~S: Can't find structure to include" (car include))))
+      (setq slot-names () slot-keywords () slot-options () slot-defaults ()
+	    slot-numbers () writable-slots () pure-names () slot-types ()
+	    new-slot-start 0)))
+
+;;; Things to make hacking the Slot-Whatever lists easier:
+
+(defun set-corresponding (thing target-list new-value)
+  (do ((target-list target-list (cdr target-list))
+       (names pure-names (cdr names))
+       (keys slot-keywords (cdr keys)))
+      ((null target-list)
+       (error "Unknown slot name or keyword in include option: ~S" thing))
+    (if (or (eq (car names) thing)
+	    (eq (caar keys) thing))
+	(return (rplaca target-list new-value)))))
+
+(defun add-to-options (thing new-values)
+  (do ((target-list slot-options (cdr target-list))
+       (names pure-names (cdr names))
+       (keys slot-keywords (cdr keys)))
+      ((null target-list)
+       (error "Unknown slot name or keyword in include option: ~S" thing))
+    (if (or (eq (car names) thing)
+	    (eq (caar keys) thing))
+	(return (do ((new-values new-values (cdr new-values)))
+		    ((null new-values))
+		  (if (not (memq (car new-values) (car target-list)))
+		      (push (car new-values) (car target-list))))))))
+
+;;; [Victor]
+;;; This sets up the double-named slots
+(defun include-double-slots ()
+  (let* ((new (mapcar #'(lambda (slot)
+			  (concat-pnames conc-name slot))
+		      pure-names))
+	 (numbers (mapcar #'(lambda (newname oldnum)
+			      (cons newname (cdr oldnum)))
+			  new slot-numbers)))
+    (setq slot-names (append new slot-names)
+	  slot-numbers (append numbers slot-numbers)
+	  writable-slots numbers)))	; Well...
+
+
+;;; Parse-Slot-Info grovels the slot list and puts useful information into
+;;; Slot-Names, Slot-Defaults, and Slot-Options, and builds an association
+;;; list of slot names and indicies into the concrete data structure named
+;;; Slot-Numbers.  An association list of writable (i.e. non-:read-only)
+;;; slots is thrown into Writable-Slots.  A list of pairs of slot-name and
+;;; slot-type (for typed slots) is thrown into Slot-Types.  A association
+;;; list of keywords formed from the slot names and corresponding slot
+;;; numbers in thrown into Slot-Keywords.
+
+(defun parse-slot-info (slots)
+  (do ((slots slots (cdr slots))
+       (index (+ initial-offset new-slot-start) (1+ index)))
+      ((atom slots)
+       (setq struct-length index))
+    (cond ((atom (car slots))
+	   (push (concat-pnames conc-name (car slots)) slot-names)
+	   (push (cons (make-keyword (car slots)) index) slot-keywords)
+	   (push (car slots) pure-names)
+	   (push () slot-defaults)
+	   (push () slot-options)
+	   (push (cons (car slot-names) index) slot-numbers)
+	   (push (car slot-numbers) writable-slots))
+	  ((listp (car slots))
+	   (push (concat-pnames conc-name (caar slots)) slot-names)
+	   (push (cons (make-keyword (caar slots)) index) slot-keywords)
+	   (push (caar slots) pure-names)
+	   (push (cadar slots) slot-defaults)
+	   (push (cddar slots) slot-options)
+	   (push (cons (car slot-names) index) slot-numbers)
+	   (push (car slot-numbers) writable-slots) ; assume writable...
+	   (do ((keywords (car slot-options) (cddr keywords)))
+	       ((null keywords))
+	     (case (car keywords)
+	       (:read-only
+		(if (cadr keywords)		    ; ...until proven wrong
+		    (setq writable-slots (cdr writable-slots))))
+	       (:type
+		(push (cons (car slot-names) (cadr keywords)) slot-types))
+	       (:invisible
+		)
+	       (t
+		(error "~S: Unknown slot option for Defstruct"
+		       (car keywords))))))
+	  (t (error "~S: Bad thing in slot list for DefStruct" (car slots))))))
+
+
+;;; Make-Bare-Structure returns a form which will construct a bare structure.
+
+(defun make-bare-structure (str-type-cat str-length)
+  (case str-type-cat
+    (list `(make-list ,str-length))
+    (vector `(make-array ,str-length))
+    (t (error "~S: Bad type crept into DefStruct" ds-type))))
+
+;;; Make-Initial-Object returns a form which will construct a bare structure
+;;; and name it.
+
+(defun make-initial-object (str-named str-type-cat str-name str-length)
+  (if str-named
+      (let ((temp (gensym)))
+	`(let ((,temp ,(make-bare-structure str-type-cat str-length)))
+	   ,@(if (eq str-type-cat 'vector)
+		 `((%sp-set-vector-subtype ,temp 1)))
+	   ,(setelt-form temp 0 `',str-name str-type-cat)
+	   ,temp))
+      (make-bare-structure str-type-cat str-length)))
+
+;;; The built in copier for the default kind of structure:
+
+(defun built-in-copier (old)
+  (do* ((name (type-of old))
+	(info (get name 'defstruct-description))
+	(type (defstruct-description-type info))
+	(type-cat (if (atom type) type (car type)))
+	(length (defstruct-description-size info))
+	(slots (defstruct-description-slot-numbers info) (cdr slots))
+	(index (cdar slots) (cdar slots))
+	(new (eval (make-initial-object t type-cat name length))))
+       ((null slots)
+	new)
+    (setf (svref new index) (svref old index))))
+
+
+;;; Make-Constructor returns a Defun which defines the constructor function.
+
+(defun make-constructor ()
+  `(defun ,constructor (&rest initial-values)
+     (do ((initial-values initial-values (cddr initial-values))
+	  (object ,(make-initial-object named type-cat ds-name struct-length))
+	  (slots-done ()))
+	 ((null initial-values)
+	  ,@(do ((slots slot-keywords (cdr slots))
+		 (defaults slot-defaults (cdr defaults))
+		 (init-forms ()))
+		((null slots) init-forms)
+	      (if (car defaults)
+		  (push `(if (not (memq ',(caar slots) slots-done))
+			     ,(setelt-form 'object (cdar slots)
+					   (car defaults) ds-type))
+			init-forms)))
+	  object)
+       (let ((slot-number (cdr (assoc (car initial-values) ',slot-keywords))))
+	 (cond (slot-number
+		,(setelt-form 'object 'slot-number '(cadr initial-values)
+			      ds-type)
+		(push (car initial-values) slots-done))
+	       (t
+		(error "Unknown option to DefStruct constructor.")))))))
+
+;;; Make-By-Position-Constructor returns a Defun for a by-position
+;;; constructor function.
+
+(defun make-by-position-constructor ()
+  (do ((arglist (cadr constructor) (cdr arglist))
+       (bound-slots ())
+       (object-name (gensym))
+       (slot-pure-numbers (mapcar #'(lambda (x y) `(,x . ,(cdr y)))
+				  pure-names slot-numbers)))
+      ((null arglist)
+       `(defun ,(car constructor) ,(cadr constructor)
+	  (let ((,object-name ,(make-initial-object named type-cat
+						    ds-name struct-length)))
+	    ,@(mapcar #'(lambda (slot-pair)
+			  (setelt-form object-name (cdr slot-pair)
+				       (car slot-pair) type-cat))
+		      bound-slots)
+	    ,@(do ((slots slot-pure-numbers (cdr slots))
+		   (defaults slot-defaults (cdr defaults))
+		   (sets ()))
+		  ((null slots) sets)
+		(if (not (assq (caar slots) bound-slots))
+		    (push (setelt-form object-name (cdar slots)
+				       (car defaults) type-cat)
+			  sets)))
+	    ,object-name)))
+    (let* ((arg (car arglist))
+	   (mostarg (if (atom arg) arg (car arg))))
+      (if (not (memq arg '(&optional &rest &key &aux)))
+	  (if (memq mostarg pure-names)
+	      (push (cons mostarg
+			  (cdr (assoc mostarg slot-pure-numbers)))
+		    bound-slots)
+	      (error "~S: Not a known slot name." mostarg))))))
+
+;;; Make-Copier returns the definition for a copier function for the given
+;;; defstruct if one is desired.  If the structure is implemented as a 
+;;; vector and is named, we use our Built-In-Copier.
+
+(defun make-copier ()
+  (cond ((and (eq type-cat 'vector)
+	      named)
+	 `(setf (symbol-function ',copier)
+		#'built-in-copier))
+	((eq type-cat 'list)
+	 `(setf (symbol-function ',copier)
+		#'copy-list))
+	(t
+	 `(defun ,copier (structure)
+	    (copy-seq (the ,type-cat structure))))))
+
+
+;;; Make-Accessors returns a list of Defuns which define accessors for the
+;;; structure.  Accessors are defined only for "new" (i.e. non-included) slots.
+
+(defun make-accessors ()
+  (do ((slots (nthcdr new-slot-start (reverse slot-numbers)) (cdr slots))
+       (index 0 (1+ index))
+       (definitions ()))
+      ((null slots) definitions)
+    (push `(eval-when (compile)
+	     (%put ',(caar slots) 'lisp::macro-in-compiler
+		   '(lambda (body)
+		      (elt-form (cadr body) ,(cdar slots) ',type-cat))))
+	  definitions)
+    (push `(defun ,(caar slots) (object)
+	     ,(elt-form 'object (cdar slots) type-cat))
+	  definitions)))
+
+;;; Make-Declarations returns a list of Declare forms which declare the
+;;; function argument and result types of the functions defined by DefStruct,
+;;; and declares the access functions INLINE.
+
+(defun make-declarations ()
+  (do ((slot-types slot-types (cdr slot-types))
+       (declarations ()))
+      ((null slot-types)
+       (cons `(proclaim '(inline ,@slot-names))
+	     declarations))
+    (push `(proclaim '(function ,(caar slot-types)
+				(,ds-name) ,(cdar slot-types)))
+	  declarations)))
+
+;;; Make-Pred returns the definition of the Mumble-P function.
+
+(defun make-pred ()
+  `(defun ,predicate (thing)
+     (let (type)
+       (and ,@(case type-cat
+		(vector '((simple-vector-p thing)
+			  (not (stringp thing))
+			  (= (%sp-get-vector-subtype thing) 1)
+			  (setq type (svref thing 0))))
+		(list '((listp thing)
+			(setq type (car thing))
+			(symbolp type)))
+		(t (error "~S: Bad type for structure" ds-type)))
+	    (or (eq type ',ds-name)
+		(include-chase type ',ds-name))))))
+
+(defun include-chase (have want)
+  (and (setq have (get have 'included-structure))
+       (or (eq have want)
+	   (include-chase have want))))
+
+;;; Make-DefSetfs returns a list of DefSetfs for the structure.
+
+(defun make-defsetfs ()
+  (do ((slots writable-slots (cdr slots))
+       (defsetfs ()))
+      ((null slots) defsetfs)
+    (push `(defsetf ,(caar slots) (structure) (new-value)
+	     (setelt-form structure ,(cdar slots) new-value ',type-cat))
+	  defsetfs)))
+
+;;; Defstruct:
+
+(defmacro defstruct (name+options &rest slots)
+  "Structure defining macro.  See manual for details."
+  (let (;; Defstruct options:
+	ds-name ds-options conc-name ds-type type-cat named
+	ds-documentation constructor predicate include
+	print-function initial-offset callable-accessors
+	struct-length copier
+	;; Slot options:
+	slot-names pure-names slot-defaults slot-options slot-numbers
+	writable-slots new-slot-start slot-types slot-keywords)
+    (parse-name-and-options name+options)
+    (if (stringp (car slots))
+	(setq ds-documentation (car slots)
+	      slots (cdr slots))
+	(setq ds-documentation ()))
+    (include-structure)
+    (parse-slot-info slots)
+    `(progn
+      ,(if (and constructor (atom constructor)) (make-constructor))
+      ,(if (and constructor (listp constructor))
+	   (make-by-position-constructor))
+      ,@(make-declarations)
+      ,@(make-accessors)
+      ,(if copier (make-copier))
+      ,(if (and named predicate) (make-pred))
+      (eval-when (compile load eval)
+	,@(make-defsetfs))
+      ,(if ds-documentation
+	   `(%put ',ds-name '%struct-documentation ,ds-documentation))
+      ,(if print-function
+	   `(%put ',ds-name 'structure-print ',print-function))
+      ,(if include
+	   `(%put ',ds-name 'included-structure ',(car include)))
+      (eval-when (compile load eval)
+	,(catalog-structure))				; [Victor]
+	;,(if named (catalog-structure)))
+      ',ds-name)))
+
+;;; [Victor] Fake definition for the following defstruct
+(defun catalog-structure () ())
+
+;;; Internal structures used to Catalog a structure:
+
+(defstruct (defstruct-description :unnamed)
+  (name ds-name :read-only t)
+  (type ds-type :read-only t)
+  (options ds-options :read-only t)
+  (size struct-length :read-only t)
+  (conc-name conc-name :read-only t)
+  (constructor constructor :read-only t)
+  (slot-names slot-names :read-only t)
+  (slot-pure-names pure-names :read-only t)
+  (slot-defaults slot-defaults :read-only t)
+  (slot-options slot-options :read-only t)
+  (slot-numbers slot-numbers :read-only t)
+  (slot-types slot-types :read-only t)
+  (slot-keywords slot-keywords :read-only t))
+
+;;; Catalog-Structure throws a description of the structure on the
+;;; Defstruct-Description property of the structure name.
+
+(defun catalog-structure ()
+  `(%put ',ds-name
+	 'defstruct-description
+	 ',(make-defstruct-description)))

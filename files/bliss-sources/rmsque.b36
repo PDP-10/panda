@@ -1,0 +1,591 @@
+%TITLE 'Q U E U E   -- ENQ/DEQ interface'
+!<BLF/REQUIRE 'RMSBLF.REQ'>
+MODULE queue (IDENT = '2.0'
+		) =
+BEGIN
+
+GLOBAL BIND
+    quev = 2^24 + 0^18 + 443;			! Edit date: 13-Dec-83
+
+!+
+!
+!
+!    FUNCTION:	THIS MODULE CONTAINS ALL ROUTINES WHICH INTERFACE
+!    TO THE TOPS-10 or TOPS-20 ENQ/DEQ FACILITY.
+!    AUTHOR:	S. BLOUNT
+!
+!
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1977, 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+!
+!
+!
+!    **********	TABLE OF CONTENTS	**************
+!
+!
+!
+!
+!    ROUTINE			FUNCTION
+!    =======			========
+!
+!    FILEQ			LOCK A FILE DURING AN $OPEN MACRO
+!
+!    LOCKIT			LOCK A RECORD FOR ANY ACCESS
+!
+!
+!
+!
+!
+!    REVISION HISTORY:
+!
+!    EDIT	INITIALS	DATE		PURPOSE
+!    ====	========	====		=======
+!
+!    1	JK		16-JUL-76	SETBUSYFLAG IF UNABLE TO LOCK
+!    2	JK		16-JUL-76	CAPABILITIES ARE NOT SHARABLE
+!    3	JK		16-JUL-76	SEPARATE STATUS FOR UNEXPECTED
+!					    ENQUE/DEQUE ERRORS
+!    4	JK		19-JUL-76	ADD 'ACCESS' ARGUMENT TO 'LOCKIT'
+!    5	JK		26-JUL-76	'LOCKIT' NOW SUPPORTS CAPABILITIES
+!    6	JK		26-JUL-76	ALLOW ZERO FOR ID IN 'LOCKIT'.
+!    7	JK		27-JUL-76	'LOCKIT' SHOULDN'T SET 'USRSTS'.
+!    8	SB		3-JAN-77	RETURN ERFLK IN FILEQ
+!    9	SB		24-JAN-77	MAKE FB$UPD,FB$DEL IMPLY
+!					    FB$GET IN FILEQ
+!    10	SB		31-JAN-77	USE QBLKFLAGS IN LOCKIT
+!    11	SB		3-MAY-77	ADD NESTING BIT TO ENQ TO ALLOW OPENING
+!					    OF SAME FILE TWICE.
+!
+!    *************************************************
+!    *						*
+!    *		NEW REVISION HISTORY		*
+!    *						*
+!    *************************************************
+!
+!    PRODUCT	MODULE	 SPR
+!    EDIT	 EDIT	 QAR		DESCRIPTION
+!    ======	======	=====		===========
+!
+!	**  Begin RMS v2 Development **
+!
+!	400	400	xxxxx	    Clean up BLISS code (RL,22-Apr-83)
+!
+!	443	 - 	xxxxx	    (RL,13-Dec-83) Provide separate lock
+!				    requests for UPD and DEL rather than
+!				    lumping UPD in as GET+PUT.
+!
+!    ***** END OF REVISION HISTORY *****
+!
+!
+!
+!
+!
+!-
+
+%IF %SWITCHES(TOPS10)
+%THEN
+LIBRARY 'BLI:UUOSYM';
+UNDECLARE
+    ER$FUL;
+%FI
+
+REQUIRE 'RMSREQ';
+
+REQUIRE 'RMSOSD';
+
+!DO THE APPROPRIATE TYPE OF ENQ FOR THE OBJECT COMPUTER
+!
+%IF %SWITCHES(TOPS20)
+%THEN
+
+MACRO
+    do_enq =
+		do_jsys(enq)
+%;
+
+MACRO
+    then_enq =
+		JSYS(-1,enq,ac1,ac2)
+	THEN	RETURN true
+%;
+
+!
+!   DO THE APPROPRIATE TYPE OF DEQ FOR THE OBJECT COMPUTER
+!
+
+MACRO
+    do_deq =
+		do_jsys(deq)
+%;
+
+MACRO
+    then_deq =
+		JSYS(-1,deq,ac1,ac2)
+	THEN	RETURN true
+%;
+%FI
+%SBTTL 'FILEQ - File queuer'
+
+GLOBAL ROUTINE fileq (lock_opr, fcode) : NOVALUE =
+! FILEQ
+! =====
+!
+! THIS ROUTINE IS USED TO PERFORM ALL FILE
+!	SYNCHRONIZATION OPERATIONS WHEN A FILE
+!	IS OPENED. IT CHECKS THE USER'S FILE ACCESS
+!	FIELD ( FAC ) AND COMPARES IT TO THE SHARABILITY
+!	ACCESS FIELD ( SHR ). IT THEN ISSUES
+!	VARIOUS ENQ CALLS TO THE MONITOR
+!	IN ORDER TO GUARANTEE COMPATIBLE FILE USE.
+!
+!
+!			Note
+!
+!	Under TOPS-10 we do not have the "nesting" of locks
+!	capability that is available under TOPS-20.  As a result,
+!	accessing the same file with two FAB's in RMS-10 will
+!	have a restriction.  Since we will get a duplicate request
+!	error from TOPS-10 when we ENQ the locks for the second
+!	FAB, we must ignore the error.  The fact that we are accessing
+!	these two files from the saem job will assure compatible
+!	access.  The only problem that can be forseen is that if
+!	the first FAB is closed, and another job tries to open the
+!	same file for incompatible access to that of the second FAB
+!	a conflict occurs.  There seems to be no easy way around this.
+!	It should not be a major problem since the record level locking
+!	will still work.
+!
+! INPUT:
+!	A CODE TO INDICATE THE JSYS TO BE PERFORMED
+!		ENQ
+!		DEQ
+!	FUNCTION CODE OF JSYS
+!
+! OUTPUT:
+!	TRUE: FILE LOCKED
+!	FALSE: NOT LOCKED ( FILE WAS NOT AVAILABLE )
+    BEGIN
+%IF %SWITCHES(TOPS20)
+%THEN
+    regs;
+%ELSE
+    REGISTER
+	t1;
+%FI
+
+    LOCAL
+	qblock : VECTOR [qblklength],
+	temp,
+	mask,
+	count,
+	facvalue,				! VALUE OF USER'S FAC FIELD
+	shrvalue,				! VALUE OF USER'S SHR FIELD
+	blkptr;
+
+    MAP
+	qblock : BLOCK [1];
+
+    MAP
+	blkptr : REF BLOCK;
+
+    TRACE ('FILEQ');
+!+
+!    GET THE USER'S FAC AND SHR FIELD AND SET FB$GET IF
+!    HE SPECIFIED FB$UPD OR FB$DEL IN EITHER FIELD.
+!-
+    facvalue = .fab [fabfac, 0];
+    shrvalue = .fab [fabshr, 0];
+
+    IF chkflag (facvalue, axupd + axdel) NEQ 0	!
+    THEN
+	setflag (facvalue, axget);		! Set FB$GET bit
+
+    IF chkflag (shrvalue, axupd + axdel) NEQ 0	!
+    THEN
+	setflag (shrvalue, axget);		! Set FB$GET bit
+
+!+
+!    MASK will contain the current access value.
+!    COUNT will keep track of the # of locks used.
+!-
+    clear(qblock, qblklength);                  ! Clear the arg block     !a572
+
+    blkptr = qblock + qblkhdrsz;		! Q-block pointer (past header)
+    mask = 1;					! Init mask
+    count = 0;					!   and counter
+!+
+!   Loop once for each possible access.
+!   AXTRN can be excluded because TRUNCATE
+!   requires SHR=NIL.
+!-
+
+    WHILE .mask LEQ axdel DO 			! 			!A443
+	BEGIN					! TO SET UP A Q-BLOCK ENTRY
+!d572	blkptr [0, lh] = 0;			! CLEAR FLAGS, LEVEL NUMBER
+	blkptr [qblkjfn] = .userjfn;		! SET JFN
+	blkptr [qblkcode] = rmsqcode + .mask;	! USER CODE
+	blkptr [qblkltype] = ltypefile;		! SET LOCK TYPE
+!d572	blkptr [qblkword3] = 0;			! CLEAR SHARER'S GROUP
+
+	!+
+	!    WE MUST NOW DETERMINE HOW WE ARE GOING TO
+	!    LOCK EACH RESOURCE. IF THE FAC AND SHR
+	!    BITS ARE EQUAL, THEN WE WILL LOCK THE
+	!    RESOURCE "SHARED". THIS EITHER MEANS THAT
+	!    WE WILL DO THE OPERATION AND WE WILL ALLOW
+	!    OTHERS TO ALSO DO IT, OR WE WONT DO IT AND
+	!    WE DONT WANT OTHERS TO DO IT EITHER. IN THE
+	!    LATTER CASE, WE MUST USE A SHARER'S GROUP
+	!    TO MAKE SURE THAT NOBODY DOES THE OPERATION,
+	!    BUT OTHER PEOPLE WHO ALSO DONT WANT IT TO BE
+	!    DONE CAN LOCK THE RESOURCE IN THE SAME MANNER
+	!-
+
+	IF (.facvalue AND .mask) EQL (.shrvalue AND .mask)
+	THEN
+	    BEGIN
+	    blkptr [qblkflags] = enqshr + enqnst;	! SHARABLE AND NESTING
+	    !
+	    !   If both are off, use group #1
+	    !
+
+	    IF (.facvalue AND .mask) EQL 0
+	    THEN
+		blkptr [qblkgroup] = 1		! SET GROUP = 1
+	    END;
+
+	!+
+	!    WE MUST NOW MAKE SURE THAT LEVEL NUMBERS ARE BYPASSED
+	!-
+
+	blkptr [qblkflags] = .blkptr [qblkflags] OR enqbln;
+
+	!+
+	!    NOW, THIS ENTRY IN THE QBLOCK IN SET UP
+	!    BUT, IF WE ARE NOT GOING TO PERFORM THE OPERATION,
+	!    BUT OTHERS MAY DO SO, THEN WE DON'T NEED
+	!    TO EVEN QUEUE FOR IT. IN THAT CASE, WE WILL IGNORE
+	!    THIS ENTRY
+	!-
+
+	IF ((.facvalue AND .mask) NEQ 0) OR 	! If we will do operation
+	    ((.shrvalue AND .mask) EQL 0)	! or others can't do it.
+	THEN
+	    BEGIN
+	    blkptr = .blkptr + qblkntrysz;	! Bump pointer past this entry
+	    count = .count + 1;			! Bump the count of entries
+	    END;
+
+	mask = .mask^1;				! SHIFT MASK
+	END;
+
+    !+
+    !    WE MUST NOW FILL IN THE Q-BLOCK HEADER
+    !-
+
+    qblock [qhdrcount] = .count;		! # OF LOCKS
+    qblock [qhdrlength] = (.count*qblkntrysz) + 2;	! LENGTH
+!   qblock [qhdrpsi] = 0;			! CLEAR PSI CHANNEL #   !d572
+    qblock [qhdrid] = .userjfn;			! ID = JFN
+
+    !+
+    !   Debugging -- dump the q-block
+    !-
+
+%IF dbug
+%THEN
+    begindebug (dbblocks)bugout('DUMP OF FILE-Q:');
+    temp = .qblock [qhdrlength];
+    dump (.temp, .qblock)enddebug;
+%FI
+
+    !+
+    !    NOW, DO THE ENQ/DEQ
+    !-
+
+    SELECT .lock_opr OF
+	SET
+
+	[enqcall] :
+
+	    %IF %SWITCHES(TOPS20)
+            %THEN
+                IF NOT enq (.fcode, qblock) THEN monerr ();
+            %ELSE
+                BEGIN
+                t1 = .fcode ^ 18 + qblock;
+
+                IF NOT ENQ$_UUO(t1)
+                THEN
+                    IF .t1 NEQ ENQDR_ THEN monerr ();
+                END;
+            %FI
+	[deqcall] :
+
+	    %IF %SWITCHES(TOPS20)
+            %THEN
+                 IF NOT deq (.fcode, qblock) THEN monerr ();
+            %ELSE
+                BEGIN
+                t1 = .fcode ^ 18 + qblock;
+
+                IF NOT DEQ$_UUO(t1) THEN monerr ();
+                END;
+            %FI
+	[OTHERWISE] :
+	    rmsbug (msgjsys)			! BAD JSYS CODE
+	TES;
+
+    RETURN;
+    END;					! End routine FILEQ
+
+%SBTTL 'LOCKIT - record/capability locking'
+
+GLOBAL ROUTINE lockit (lock_opr, fcode, id, access, locktype) =
+! LOCKIT
+! ======
+!
+!	     THIS ROUTINE PERFORMS THE LOCKING/UNLOCKING OF RECORDS AND
+!	CAPABILITIES.
+!
+! INPUT:
+!	LOCK_OPR		JSYS CODE FOR ENQ OR DEQ
+!		ENQ		ENQ THIS RESOURCE
+!		DEQ		DEQ THIS RESOURCE
+!	FCODE			FUNCTION CODE FOR JSYS
+!	ID			RESOURCE ID TO ENQ OR DEQ
+!	ACCESS			LOCK ACCESS
+!		ENQXCL		EXCLUSIVE ACCESS (FOR ENQ ONLY)
+!		ENQSHR		SHARED ACCESS (FOR ENQ ONLY)
+!		ENQLTL		LONG-TERM LOCK
+!		(ENQBLN IS ALWAYS SET BY THIS ROUTINE)
+!	LOCKTYPE		LOCK-TYPE CODE
+!
+! OUTPUT:
+!	TRUE:	JSYS TOOK SKIP RETURN
+!	FALSE:	ERROR (JSYS TOOK NON-SKIP RETURN)
+!
+! NOTES:
+!
+!	1.	IF THIS ROUTINE RETURNS "FALSE", THEN USRSTV
+!		WILL CONTAIN THE MONITOR ERROR CODE RETURNED.
+!
+    BEGIN
+
+    LOCAL
+	qblock : VECTOR [qblkntrysz + 2],
+	idtext,					! Debugging text pointer
+	blockptr : REF BLOCK;
+
+    MAP
+	qblock : BLOCK [1];
+
+    TRACE ('LOCKIT');
+
+    !+
+    !    CHECK PARAMETERS
+    !-
+
+    checkinput (id, GEQ, 0);			! ID MUST BE NON-NEGATIVE
+
+    !+
+    !    SET UP THE ENQ BLOCK FORMAT
+    !-
+
+    clear(qblock, qblkntrysz + 2);              ! Clear the enq block     !a572
+
+    qblock [qhdrcount] = 1;			! SET UP HEADER
+    qblock [qhdrlength] = qblkntrysz + qblkhdrsz;
+!   qblock [qhdrpsi] = 0;			! CLEAR PSI CHANNEL NR    !d572
+    qblock [qhdrid] = .rst;			! USE STREAM ID AS REQUEST ID
+    blockptr = qblock + 2;			! SET UP POINTER
+    blockptr [qblkflags] = enqbln + .access;	! SET "BYPASS LEVEL NUMBERS"
+    blockptr [qblkjfn] = .fst [fstjfn];		!
+    blockptr [qblkcode] = rmsqcode + .id;	! SET UP CODE
+    blockptr [qblkltype] = .locktype;		! AND LOCK-TYPE
+!   blockptr [qblkword3] = 0;			! CLEAR POOL COUNT        !d572
+
+%IF dbug
+%THEN
+    begindebug (dbblocks)bugout(%STRING ('	Dump of QBLOCK:', 	!
+	%CHAR (13, 10), ' '));
+    dump (qblkntrysz + qblkhdrsz, .qblock)enddebug;
+%FI
+
+    !+
+    !    DO ALL THIS CODE FOR DEBUGGING ONLY
+    !-
+
+%IF dbug
+%THEN
+    begindebug (dblock)idtext = (
+
+	CASE .locktype FROM 0 TO 3 OF
+	    SET
+
+	    [0] :
+		UPLIT (%ASCIZ' RECORD ');	! Record
+
+	    [1] :
+		UPLIT (%ASCIZ' FILE ');		! File
+
+	    [2] :
+		UPLIT (%ASCIZ' CAP ');		! Capability
+
+	    [3] :
+		UPLIT (%ASCIZ' BUCKET ');	! Bucket
+	    TES);
+
+    txtout (rm$asz, .idtext);
+
+    IF .lock_opr EQL deqcall THEN bugout ('UN');
+
+    printvalue ('LOCKING: ', id);
+    enddebug;
+%FI
+
+    !+
+    !    GENERATE THE ENQ/DEQ FUNCTION CODE AND ADDRESS OF THE BLOCK
+    !-
+
+    IF .lock_opr EQL enqcall
+    THEN
+
+    !+
+    !    ENQ
+    !-
+
+    %IF %SWITCHES(TOPS20)
+    %THEN
+	BEGIN					! Processing of ENQ call
+
+	LOCAL
+	    enq_error;
+
+!+
+!    PERFORM THE ENQ JSYS. IF IT SUCCEEDS, WE
+!    CAN EXIT IMMEDIATELY. IF IT FAILS, WE MUST
+!    DETERMINE IF THE ERROR WAS EXPECTED (I.E.,
+!    THE LOCK IS ALREADY BUSY, OR WE HAVE ALREADY
+!    REQUESTED THE LOCK FOR MULTIPLE STREAMS)
+!-
+
+	IF enq (.fcode, qblock; enq_error)	! Do the JSYS
+	THEN
+	    RETURN true
+	ELSE
+	    BEGIN
+	    usrstv = .enq_error;		! Save system error
+
+	    IF (.usrstv EQL enqx6) OR 		! Requested locks not locked
+		(.usrstv EQL enqx5)		! Lock already requested
+	    THEN
+		usrsts = er$rlk			! Record locked
+	    ELSE
+		usrsts = er$edq;		! Unexpected error
+
+	    					! SET STATUS TO "ENQ/DEQ ERROR"
+	    RETURN false
+	    END
+
+	END
+    %ELSE  !TOPS10                                                       !a572v
+	BEGIN					! Processing of ENQ call
+
+	REGISTER
+	    t1;
+
+!+
+!    PERFORM THE ENQ UUO. IF IT SUCCEEDS, WE
+!    CAN EXIT IMMEDIATELY. IF IT FAILS, WE MUST
+!    DETERMINE IF THE ERROR WAS EXPECTED (I.E.,
+!    THE LOCK IS ALREADY BUSY, OR WE HAVE ALREADY
+!    REQUESTED THE LOCK FOR MULTIPLE STREAMS)
+!-
+
+	t1 = .fcode ^ 18 + qblock;
+
+	IF ENQ$_UUO(t1)				! Do the JSYS
+	THEN
+	    RETURN true
+	ELSE
+	    BEGIN
+	    usrstv = .t1;			! Save system error
+
+	    IF (.usrstv EQL ENQRU_) OR 		! Some resource not available
+		(.usrstv EQL ENQDR_)		! Duplicate request
+	    THEN
+		usrsts = er$rlk			! Record locked
+	    ELSE
+		usrsts = er$edq;		! Unexpected error
+
+	    					! SET STATUS TO "ENQ/DEQ ERROR"
+	    RETURN false
+	    END
+
+	END
+    %FI
+    ELSE
+
+    !+
+    !    DEQ
+    !-
+    %IF %SWITCHES(TOPS20)
+    %THEN
+	BEGIN
+
+	LOCAL
+	    deq_error;
+
+	IF deq (.fcode, qblock; deq_error)
+	THEN
+	    RETURN true
+	ELSE
+	    BEGIN
+	    usrstv = .deq_error;		! Save monitor error
+	    usrsts = er$edq;			! Should not happen
+	    RETURN false
+	    END
+
+	END;
+    %ELSE !TOPS10                                                   !a572vv
+
+	BEGIN
+
+	REGISTER
+	    t1;
+
+	t1 = .fcode ^ 18 + qblock;
+
+	IF DEQ$_UUO(t1)
+	THEN
+	    RETURN true
+	ELSE
+	    BEGIN
+	    usrstv = .t1;			! Save monitor error
+	    usrsts = er$edq;			! Should not happen
+	    RETURN false
+	    END
+
+	END;
+    %FI                                                             !a572^^
+    END;					! End LOCKIT
+
+END
+
+ELUDOM

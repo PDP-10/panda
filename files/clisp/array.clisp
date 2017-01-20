@@ -1,0 +1,741 @@
+;;; -*- Lisp -*-
+;;;
+;;; **********************************************************************
+;;; This code was written as part of the Spice Lisp project at
+;;; Carnegie-Mellon University, and has been placed in the public domain.
+;;; If you want to use this code or any part of Spice Lisp, please contact
+;;; Scott Fahlman (FAHLMAN@CMUC). 
+;;; **********************************************************************
+;;;
+;;; Functions to implement arrays for Spice Lisp 
+;;; Written by Joe Ginder. 
+;;; Rewritten and currently maintained by Skef Wholey.
+;;;
+;;; The array functions are part of the standard Spicelisp environment.
+;;;
+;;; **********************************************************************
+;;;
+
+(in-package 'lisp)
+
+(export '(array-rank-limit make-array array-element-type array-rank
+	  array-dimension array-dimensions array-total-size array-in-bounds-p
+	  array-row-major-index adjustable-array-p bit-and bit-ior
+	  bit-xor bit-eqv bit-nand bit-nor bit-andc1 bit-andc2 bit-orc1
+	  bit-orc2 bit-not array-has-fill-pointer-p fill-pointer vector-push
+	  vector-push-extend vector-pop adjust-array))
+
+;20; get rid of all %primitive's.  We just use them as functions
+
+;20; anything above this will probably blow the stack
+(defconstant array-rank-limit 262144
+  "The maximum number of dimensions an array may have.")
+
+;;; Macros for Make-Array:
+
+(eval-when (compile eval)
+
+(defmacro array-linear-length (dimensions)
+  `(do ((dimensions ,dimensions (cdr dimensions))
+	(length 1))
+       ((null dimensions) length)
+     (declare (fixnum length))
+     (setq length (* length (the fixnum (car dimensions))))))
+
+
+;;; Init-Array-Data initializes the data vector of the Array.  If the Array
+;;; is displaced, its data vector is set to the data vector of the array to
+;;; which it is displaced.  If initial contents are specified, these are used
+;;; to fill the array.  If neither of the above conditions are satisfied,
+;;; the array is filled with the given initial value (or what it defaults to).
+
+(defmacro init-array-data (array size type rank ival icontents disp-to)
+  `(header-set ,array %array-data-slot
+	      (cond ((slisp-array-p ,disp-to)
+		     (header-ref ,disp-to %array-data-slot))
+		    ((arrayp ,disp-to)
+		     ,disp-to)
+		    (,icontents
+		     (copy-initial-contents ,size ,type ,rank ,icontents))
+		    ((eq ,type 'bit)
+		     (U-data-vec ,size '(mod 2) ,ival))
+		    ((and (listp ,type) (eq (car ,type) 'mod))
+		     (U-data-vec ,size ,type ,ival))
+		    (t
+		     (B-data-vec ,size ,type ,ival)))))
+
+)
+
+(defun make-array (dimensions &key
+       (element-type t)
+       (initial-element '%%default)
+       (initial-contents)
+       (adjustable ())
+       (fill-pointer ())
+       (displaced-to ())
+       (displaced-index-offset 0))
+  "Returns a newly constructed array with the dimensions and options 
+   specified.  See manual for details."
+    (if (not (listp dimensions)) (setq dimensions (list dimensions)))
+    (if (eq fill-pointer t) (setq fill-pointer (car dimensions)))
+    (let ((array-rank (length (the list dimensions))))
+      (declare (fixnum array-rank))
+      (if (and (not adjustable) (= array-rank 1)
+	       (not displaced-to) (not fill-pointer))
+	  (if initial-contents
+	      (copy-initial-contents (car dimensions) element-type
+				     1 initial-contents)
+	      (cond
+		((eq element-type 'bit)
+		 (U-data-vec (car dimensions) '(mod 2) initial-element))
+		((and (listp element-type) (eq (car element-type) 'mod))
+		 (U-data-vec (car dimensions) element-type initial-element))
+		(t
+		 (B-data-vec (car dimensions) element-type initial-element))))
+	  (let ((array-size (array-linear-length dimensions))
+		(array (%sp-alloc-array array-rank)))
+	    (init-array-data array array-size element-type array-rank
+			     initial-element initial-contents displaced-to)
+	    (header-set array %array-length-slot array-size)
+	    (header-set array %array-fill-pointer-slot
+		       (if fill-pointer fill-pointer array-size))
+	    (header-set array %array-displacement-slot
+		       (cond ((not (arrayp displaced-to)) 0)
+			     ((integerp displaced-index-offset)
+			      displaced-index-offset)
+			     (T 0)))
+	    (do ((dimensions dimensions (cdr dimensions))
+		 (index %array-first-dim-slot (1+ index)))
+		((null dimensions))
+	      (declare (fixnum index))
+	      (header-set array index (car dimensions)))
+	    array))))
+
+;;; Make-vector is no longer in the language, use Make-array.  To make sure
+;;; set things so that they get make-array if trying to call make-vector.
+
+(setf (symbol-function 'make-vector) #'make-array)
+(%put (quote lisp::make-vector) (quote lisp::%fun-documentation)
+  (quote "Make-vector is obsolete.  Use Make-array."))
+
+;(defun make-vector (length &key
+;       (element-type t)
+;       (initial-element '%%default)
+;       (initial-contents))
+;  "Like Make-Array, but returns a simple vector always."
+;    (cond (initial-contents
+;	   (copy-initial-contents length element-type 1 initial-contents))
+;	  ((eq element-type 'bit)
+;	   (U-data-vec length '(mod 2) initial-element))
+;	  ((and (listp element-type) (eq (car element-type) 'mod))
+;	   (U-data-vec length element-type initial-element))
+;	  (t
+;	   (B-data-vec length element-type initial-element))))
+
+;20; vector is in the kernel
+
+;;; U-Data-Vec returns a data vector of unboxed objects initialized to Ival.
+
+(defun U-data-vec (size type ival)
+  (declare (fixnum size ival))
+  (let* ((access-code (let ((n (cadr type)))
+			(declare (fixnum n))
+			(cond
+			 ((<= n 2) 0)
+			 ((<= n 4) 1)
+			 ((<= n 16) 2)
+			 ((<= n 256) 3)
+			 ((<= n 65536) 4)
+			 (t (error "~S is too big a modulo type." type)))))
+	 (data-vec (%sp-alloc-u-vector size access-code)))
+    (declare (fixnum access-code))
+    (if (and (not (eq ival '%%default)) (< ival (the fixnum (cadr type))))
+	(do ((index 0 (1+ index)))
+	    ((= index size) data-vec)
+	  (declare (fixnum index))
+	  (%sp-saset1 data-vec index ival))
+	data-vec)))
+
+;;; B-Data-Vec returns a data vector of boxed objects initialized to Ival.
+
+(defun b-data-vec (size type ival)
+  (if (eq type 'string-char)
+      (if (eq ival '%%default)
+	  (%sp-alloc-string size)
+	  (make-string size :initial-element ival))
+      (%sp-alloc-b-vector 
+       size
+       (case type
+	 ((t) (if (eq ival '%%default) nil ival))
+	 ((random list cons function closure)
+	  (if (typep ival type) ival ()))
+	 ((fixnum bignum integer rational scalar)
+	  (if (typep ival type) ival
+	    (error "The initial-element, ~s, is not of type ~s" ival type)))
+	 ((float short-float long-float single-float double-float)
+	  (if (typep ival type) ival (coerce 0 type)))
+	 (character (if (characterp ival) ival #\space))
+	 (string (if (stringp ival) ival ""))
+	 (symbol (if (and (symbolp ival) (not (eq ival '%%default)))
+		     ival
+		     NIL))
+	 (vector (if (vectorp ival) ival '#()))
+	 (array (if (arrayp ival) ival '#()))
+	 (complex (error "Complex numbers aren't implemented yet."))
+	 (T (if (typep ival type) ival ()))))))
+
+;;; Copy-Initial-Contents returns a data vector formed by copying the sequences
+;;; in the initial contents, Icontents.  We allocate a data vector using one
+;;; of the above functions, and then spin off to an auxiliary function to
+;;; recursively copy the initial contents into the data vector.
+
+(defun copy-initial-contents (size type rank icontents)
+  (let ((data (cond
+		 ((eq type 'bit)
+		  (u-data-vec size '(mod 2) '%%default))
+		 ((and (listp type) (eq (car type) 'mod))
+		  (u-data-vec size type '%%default))
+		 (t
+		  (b-data-vec size type nil)))))
+    (copy-contents-aux icontents type rank 0 data)
+    data))
+
+(defun copy-contents-aux (icontents type depth index data)
+  (cond ((= depth 0)
+	 (if (typep icontents type)
+	     (%sp-saset1 data index icontents)
+	     (error "~S is not if type ~S, and can't be used as contents."
+		     icontents type))
+	 (1+ index))
+	((listp icontents)
+	 (do ((icontents icontents (cdr icontents)))
+	     ((null icontents) index)
+	   (setq index (copy-contents-aux
+			(car icontents) type (1- depth) index data))))
+	((vectorp icontents)
+	 (do ((i-index 0 (1+ i-index))
+	      (i-end (length icontents)))
+	     ((= i-index i-end) index)
+	   (setq index (copy-contents-aux
+			(aref icontents index) type (1- depth) index data))))
+	(t
+	 (error "~S is a bad thing to initialize array contents with."
+		 icontents))))
+
+;;; A helpful macro:
+
+(eval-when (compile eval)
+
+(defmacro linearize-subscripts (array subscripts)
+  `(do ((subscripts (nreverse (the list ,subscripts)) (cdr subscripts))
+	(dim-index (1- (header-length array)) (1- dim-index))
+	(chunk-size 1)
+	(result 0)
+	(axis))
+       ((= dim-index %array-dim-base)
+	(if (atom subscripts)
+	    (+ (the fixnum (header-ref ,array %array-displacement-slot))
+	       result)
+	    (error "Too many subscripts for array reference.")))
+     (declare (fixnum dim-index chunk-size result axis))
+     (setq axis (header-ref ,array dim-index))
+     (cond ((atom subscripts)
+	    (error "Too few subscripts for array reference."))
+	   ((not (< -1 (the fixnum (car subscripts)) axis))
+	    (error "Subscript (~S) is out of bounds." (car subscripts)))
+	   (t
+	    (setq result (+ result (* (the fixnum (car subscripts))
+				      chunk-size)))
+	    (setq chunk-size (* chunk-size axis))))))
+
+(defmacro linearize-subscripts* (subscripts dim-list)
+  `(do ((subscripts ,subscripts (cdr subscripts))
+	(dim-list ,dim-list (cdr dim-list))
+	(chunk-size 1)
+	(result 0))
+       ((null dim-list) result)
+     (declare (fixnum chunk-size result))
+     (setq result (+ result (* (the fixnum (car subscripts)) chunk-size)))
+     (setq chunk-size (* chunk-size (car dim-list)))))
+
+)
+
+
+;;; Array Accessing functions
+
+;20; aref is in kernel.  %sp-aref handles non-simple arrays only
+(defun %sp-aref (array &rest subscripts)
+  "Returns the element of the Array specified by the Subscripts."
+      (%sp-saref1 (header-ref array %array-data-slot)
+		  (linearize-subscripts array subscripts)))))
+
+;20; aset is in kernel.  %sp-aset handles non-simple arrays only
+
+(defun %sp-aset (array &rest stuff)
+      (let ((rstuff (nreverse (the list stuff))))
+	(do ((subscripts (cdr rstuff) (cdr subscripts))
+	     (dim-index (1- (header-length array)) (1- dim-index))
+	     (chunk-size 1)
+	     (result 0)
+	     (axis))
+	    ((= dim-index %array-dim-base)
+	     (if (atom subscripts)
+		 (aset1 (header-ref array %array-data-slot)
+			    (+ (the fixnum
+				    (header-ref
+				     array %array-displacement-slot))
+			       result)
+			    (car rstuff))
+		 (error "Too many subscripts for array reference.")))
+	  (declare (fixnum dim-index chunk-size result axis))
+	  (setq axis (header-ref array dim-index))
+	  (cond ((atom subscripts)
+		 (error "Too few subscripts for array reference."))
+		((not (< -1 (the fixnum (car subscripts)) axis))
+		 (error "Subscript (~S) is out of bounds."
+			(car subscripts)))
+		(t
+		 (setq result (+ result (* (the fixnum (car subscripts))
+					   chunk-size)))
+		 (setq chunk-size (* chunk-size axis)))))))))))
+
+;20; svref and %svset are in the kernel
+
+;;; Array Information functions
+
+(eval-when (compile eval)
+
+(defmacro internal-array-length (array)
+  `(header-ref ,array %array-length-slot))
+
+)
+
+(defun array-element-type (array)
+  "Returns the type of the elements of the array"
+  (cond ((bit-vector-p array)
+	 '(mod 2))
+	((stringp array)
+	 'string-char)
+	((simple-vector-p array)
+	 t)
+	((slisp-array-p array)
+	 (array-element-type (header-ref array %array-data-slot)))
+	((vectorp array)
+	 (case (%sp-get-vector-access-type array)
+	   (0 '(mod 2))
+	   (1 '(mod 4))
+	   (2 '(mod 16))
+	   (3 '(mod 256))
+	   (4 '(mod 65536))))
+	(t (error "~S is not an array." array))))
+
+(defun array-rank (array)
+  "Returns the number of dimensions of the Array."
+  (if (slisp-array-p array)
+      (- (header-length array) %array-first-dim-slot)
+      1))
+
+(defun array-dimension (array axis-number)
+  (declare (fixnum axis-number))
+  "Returns length of dimension Axis-Number of the Array."
+  (if (slisp-array-p array)
+      (if (and (>= axis-number 0) (< axis-number (array-rank array)))
+	  (header-ref array (+ %array-first-dim-slot axis-number))
+	  (error "~S: Illegal axis number." axis-number))
+      (if (= axis-number 0)
+	  (%sp-get-vector-length array)
+	  (error "~S: Illegal axis number." axis-number))))
+
+(defun array-dimensions (array)
+  "Returns a list whose elements are the dimensions of the array"
+  (if (slisp-array-p array)
+      (do ((index %array-first-dim-slot (1+ index))
+	   (end (header-length array))
+	   (result ()))
+	  ((= index end) (nreverse result))
+	(declare (list result))
+	(push (header-ref array index) result))
+      (list (%sp-get-vector-length array))))
+
+(defun array-total-size (array)
+  "Returns the total number of elements in the Array."
+  (if (slisp-array-p array)
+      (header-ref array %array-length-slot)
+      (%sp-get-vector-length array)))
+
+(defun array-in-bounds-p (array &rest subscripts)
+  "Returns T if the Subscipts are in bounds for the Array, Nil otherwise."
+  (if (slisp-array-p array)
+      (do ((dim-index %array-first-dim-slot (1+ dim-index))
+	   (dim-index-limit (+ %array-first-dim-slot
+			       (the fixnum (array-rank array))))
+	   (subs subscripts (cdr subs)))
+	  ((= dim-index dim-index-limit)
+	   (if (atom subs) T ()))
+	(declare (fixnum dim-index dim-index-limit))
+	(if (atom subs)
+	    (return ())
+	    (let ((subscript (car subs))
+		  (dimension (header-ref array dim-index)))
+	      (declare (fixnum subscript dimension))
+	      (if (not (< -1 subscript dimension))
+		  (return ()) ))))
+      (and (null (cdr subscripts))
+	   (< -1 (the fixnum (car subscripts))
+	      (%sp-get-vector-length array)))))
+
+(defun array-row-major-index (array &rest subscripts)
+  "Returns the index into the Array's data vector for the given subscripts."
+  (if (slisp-array-p array)
+      (do ((subscripts (nreverse (the list subscripts)) (cdr subscripts))
+	   (dim-index (1- (header-length array)) (1- dim-index))
+	   (chunk-size 1)
+	   (result 0)
+	   (axis))
+	  ((= dim-index %array-dim-base)
+	   (if (atom subscripts)
+	       result
+	       (error "Too many subscripts for array reference.")))
+	(setq axis (header-ref array dim-index))
+	(cond ((atom subscripts)
+	       (error "Too few subscripts for array reference."))
+	      ((not (< -1 (car subscripts) axis))
+	       (error "Subscript ~S is out of bounds." (car subscripts)))
+	      (t
+	       (setq result (+ result (* (car subscripts) chunk-size)))
+	       (setq chunk-size (* chunk-size axis)))))
+      (cond ((> (length subscripts) 1)
+	     (error "Too many subscripts for array reference."))
+	    ((null subscripts)
+	     (error "Too few subscripts for array reference."))
+	    ((or (> (car subscripts) (1- (length array)))
+		 (minusp (car subscripts)))
+	     (error "Subscript ~S is out of bounds." (car subscripts)))
+	    (t
+	     (car subscripts)))))  ; for 1-d array, result equals subscript
+
+(defun adjustable-array-p (array)
+  "Returns T if the given Array is adjustable, or Nil otherwise."
+  (slisp-array-p array))
+
+
+;;; Array fill pointer functions
+
+(defun array-has-fill-pointer-p (array)
+  "Returns T if the given Array has a fill pointer, or Nil otherwise."
+  (and (vectorp array) (slisp-array-p array)))
+
+(defun fill-pointer (vector)
+  "Returns the fill pointer of the Vector."
+  (if (and (vectorp vector) (slisp-array-p vector))
+      (header-ref vector %array-fill-pointer-slot)
+      (error "~S is not an array with a fill pointer." vector)))
+
+(defun %set-fill-pointer (vector index)
+  "Sets the fill pointer of the given Vector to Index."
+  (if (and (vectorp vector) (slisp-array-p vector))
+      (if (> index (header-ref vector %array-length-slot))
+	  (error "New fill pointer, ~S, is larger than the length of array."
+		 index)
+	  (header-set vector %array-fill-pointer-slot index))
+      (error "~S is not an array with a fill pointer." vector)))
+
+(defun vector-push (new-el array)
+  "Attempts to set the element of Array designated by the fill pointer
+   to New-El and increment fill pointer by one.  If the fill pointer is
+   too large, () is returned, otherwise the new fill pointer value is 
+   returned."
+  (if (slisp-array-p array)
+      (let ((fill-pointer (header-ref array %array-fill-pointer-slot)))
+	(declare (fixnum fill-pointer))
+	(cond ((= fill-pointer (internal-array-length array)) ())
+	      (t (header-set array %array-fill-pointer-slot (1+ fill-pointer))
+		 (%sp-saset1 (header-ref array %array-data-slot)
+			     (+ fill-pointer
+				(header-ref array %array-displacement-slot))
+			     new-el)
+		 (1+ fill-pointer))))
+      (error "~S: Object has no fill pointer." array)))
+
+(defun vector-push-extend
+  (new-el array &optional (extension (max 10 (min 1000 (length array)))))
+  (declare (fixnum extension))
+  "Like Vector-Push except that if the fill pointer gets too large, the
+   Array is extended rather than () being returned."
+  (if (slisp-array-p array)
+      (let ((length (internal-array-length array))
+	    (fill-pointer (header-ref array %array-fill-pointer-slot))
+	    (data (header-ref array %array-data-slot))) 
+	(declare (fixnum length fill-pointer))
+	(if (= fill-pointer length)
+	    (do* ((new-index 0 (1+ new-index))
+		  (new-length (+ length extension))
+		  (old-index (header-ref array %array-displacement-slot)
+			     (1+ old-index))
+		  (new-data (make-array new-length
+			     :element-type (array-element-type array))))
+		 ((= new-index length)
+		  (header-set array %array-data-slot new-data)
+		  (setq data new-data)
+		  (header-set array %array-length-slot new-length)
+		  (header-set array %array-first-dim-slot new-length))
+	      (%sp-saset1 new-data new-index (%sp-saref1 data old-index))))
+	(header-set array %array-fill-pointer-slot (1+ fill-pointer))
+	(%sp-saset1 data
+		    (+ fill-pointer
+		       (header-ref array %array-displacement-slot))
+		    new-el)
+	(1+ fill-pointer))
+      (error "~S has no fill pointer." array)))
+
+(defun vector-pop (array)
+  "Attempts to decrease the fill-pointer by 1 and return the element
+   pointer to by the new fill pointer.  If the new value of the fill
+   pointer is 0, an error occurs."
+  (if (slisp-array-p array)
+      (let ((fill-pointer (header-ref array %array-fill-pointer-slot)))
+	(declare (fixnum fill-pointer))
+	(cond ((< fill-pointer 1) (error "Fill-pointer reached 0."))
+	      (t (header-set array %array-fill-pointer-slot (1- fill-pointer))
+		 (%sp-saref1 (header-ref array %array-data-slot)
+			     (+ (1- fill-pointer)
+				(header-ref
+				 array %array-displacement-slot))))))
+      (error "~S: Object has no fill pointer." array)))
+
+;;; Changing the size of an array:
+
+(defun shrink-vector (vector new-size)
+  "Destructively alters the Vector, changing its length to New-Size, which
+   must be less than or equal to its current size."
+  (cond ((slisp-array-p vector)
+	 (%sp-shrink-vector (header-ref vector %array-data-slot) new-size)
+	 (header-set vector %array-length-slot new-size))
+	(t
+	 (%sp-shrink-vector vector new-size))))
+
+(defun adjust-array (array dimensions &rest options &key
+       (element-type t)
+       (initial-element '%%default)
+       (initial-contents)
+       (fill-pointer ())
+       (displaced-to ())
+       (displaced-index-offset 0))
+  "Adjusts the Array's dimensions to the given Dimensions.  See manual
+  for details."
+  (declare (ignore displaced-index-offset))
+  (if (atom dimensions) (setq dimensions (list dimensions)))
+  (if (not (= (%sp-type array) %array-type))
+      (error "~S is not an adjustable array." array))
+  (if (not (= (length (the list dimensions)) (array-rank array)))
+      (error "Number of dimensions not equal to rank of array."))
+    (if (and element-type
+	     (not (subtypep element-type (array-element-type array))))
+	(error "New element type, ~S, is incompatible with old." element-type))
+    (cond ((or initial-contents displaced-to)
+	   (apply #'make-array dimensions options))
+	  ((null (cdr dimensions))
+	   (if (eq fill-pointer t) (setq fill-pointer (car dimensions)))
+	   (if fill-pointer
+	       (header-set array %array-fill-pointer-slot fill-pointer))
+	   (let ((old-length (header-ref array %array-length-slot))
+		 (new-length (car dimensions))
+		 (old-data (header-ref array %array-data-slot)))
+	     (declare (simple-vector old-data))
+	     (header-set array %array-length-slot new-length)
+	     (cond ((> old-length new-length)
+		    (%sp-shrink-vector old-data new-length))
+		   ((< old-length new-length)
+		    (let* ((element-type (or element-type
+					     (array-element-type array)))
+			   (data (cond
+				    ((eq element-type 'bit)
+				     (u-data-vec new-length '(mod 2)
+						 initial-element))
+				    ((and (listp element-type)
+					  (eq (car element-type) 'mod))
+				     (u-data-vec new-length element-type
+						 initial-element))
+				    (t
+				     (b-data-vec new-length element-type
+						 initial-element)))))
+		      (replace data old-data)
+		      (header-set array %array-data-slot data))))
+	     (header-set array %array-first-dim-slot new-length)))
+	  (t
+	   (if fill-pointer
+	       (error "Multidimensional arrays can't have fill pointers."))
+	   (let* ((old-length (header-ref array %array-length-slot))
+		  (new-length (array-linear-length dimensions))
+		  (old-data (header-ref array %array-data-slot))
+		  (new-data (if (> new-length old-length)
+				(cond
+				   ((eq element-type 'bit)
+				    (u-data-vec new-length '(mod 2)
+						initial-element))
+				   ((and (listp element-type)
+					 (eq (car element-type) 'mod))
+				    (u-data-vec new-length element-type
+						initial-element))
+				   (t
+				    (b-data-vec new-length element-type
+						initial-element)))
+				old-data)))
+	     (header-set array %array-length-slot new-length)
+	     (header-set array %array-data-slot new-data)
+	     (zap-array-data old-data (array-dimensions array)
+			     new-data dimensions)
+	     (do ((new-dims dimensions (cdr new-dims))
+		  (dim-slot %array-first-dim-slot (1+ dim-slot)))
+		 ((null new-dims))
+	       (header-set array dim-slot (car new-dims))))))
+    array)
+
+;;; Zap-Array-Data does the grinding work for Adjust-Array.  The data is zapped
+;;; from the Old-Data in an arrangement specified by the Old-Dims to the
+;;; New-Data in an arrangement specified by the New-Dims.
+
+;;; Bump-Index-List helps us out:
+
+(eval-when (compile eval)
+
+(defmacro bump-index-list (index limits)
+  `(do ((subscripts ,index (cdr subscripts))
+	(limits ,limits (cdr limits)))
+       ((null subscripts) nil)
+     (cond ((< (car subscripts) (car limits))
+	    (rplaca subscripts (1+ (car subscripts)))
+	    (return ,index))
+	   (t
+	    (rplaca subscripts 0)))))
+
+)
+
+(defun zap-array-data (old-data old-dims new-data new-dims)
+  (declare (list old-dims new-dims))
+  (setq old-dims (nreverse old-dims))
+  (setq new-dims (reverse new-dims))
+  (let ((limits (mapcar #'(lambda (x y)
+			    (1- (min x y)))
+			old-dims new-dims)))
+    (do ((index (make-list (length old-dims) :initial-element 0)
+		(bump-index-list index limits)))
+	((null index))
+      (%sp-saset1 new-data (linearize-subscripts* index new-dims)
+		  (%sp-saref1 old-data
+			      (linearize-subscripts* index old-dims))))))
+
+;;; Bit string hacking functions:
+;20; bit and bit set functions are in the kernel
+
+(defun bit-array-same-dimensions-p (array1 array2)
+  (and (= (header-length array1)
+	  (header-length array2))
+       (do ((index %array-first-dim-slot (1+ index))
+	    (length (- (header-length array1) %array-dim-base)))
+	   ((= index length) t)
+	 (if (/= (header-ref array1 index)
+		 (header-ref array2 index))
+	     (return nil)))))
+
+(defmacro bit-bash (array1 array2 result-array op length)
+  `(do ((index 0 (1+ index)))
+       ((= index ,length) ,result-array)
+     (%sp-sbitset ,result-array index
+		  (boole ,op (%sp-sbit ,array1 index)
+			     (%sp-sbit ,array2 index)))))
+
+(defun bit-array-boole (array1 array2 op result-array)
+  (if (eq result-array t) (setq result-array array1))
+  (cond ((simple-bit-vector-p array1)
+	 (let ((length (%sp-get-vector-length array1)))
+	   (unless (and (simple-bit-vector-p array2)
+			(= (%sp-get-vector-length array2) length))
+	     (error "~S and ~S do not have the same dimensions."
+		    array1 array2))
+	   (if result-array
+	       (unless (and (simple-bit-vector-p result-array)
+			    (= (%sp-get-vector-length result-array) length))
+		 (error "~S and ~S do not have the same dimensions."
+			array1 result-array))
+	       (setq result-array (make-array length :element-type '(mod 2))))
+	   (bit-bash array1 array2 result-array op length)))
+	(t
+	 (unless (bit-array-same-dimensions-p array1 array2)
+	   (error "~S and ~S do not have the same dimensions." array1 array2))
+	 (if result-array
+	     (unless (bit-array-same-dimensions-p array1 result-array)
+	       (error "~S and ~S do not have the same dimensions."
+		      array1 result-array))
+	     (setq result-array (make-array (array-dimensions array1)
+					    :element-type '(mod 2))))
+	 (let ((data1 (header-ref array1 %array-data-slot))
+	       (data2 (header-ref array2 %array-data-slot))
+	       (data3 (header-ref result-array %array-data-slot))
+	       (start1 (header-ref array1 %array-displacement-slot))
+	       (start2 (header-ref array2 %array-displacement-slot))
+	       (start3 (header-ref result-array %array-displacement-slot))
+	       (length (header-ref array1 %array-length-slot)))
+	   (do ((index 0 (1+ index))
+		(index1 start1 (1+ index1))
+		(index2 start2 (1+ index2))
+		(index3 start3 (1+ index3)))
+	       ((= index length) result-array)
+	     (%sp-sbitset data3 index3
+			  (boole op (%sp-sbit data1 index1)
+				    (%sp-sbit data2 index2))))))))
+
+(defun bit-and (bit-array1 bit-array2 &optional result-bit-array)
+  "Performs a bit-wise logical AND on the elements of Bit-Array1 and Bit-Array2
+  putting the results in the Result-Bit-Array."
+  (bit-array-boole bit-array1 bit-array2 boole-and result-bit-array))
+
+(defun bit-ior (bit-array1 bit-array2 &optional result-bit-array)
+  "Performs a bit-wise logical IOR on the elements of Bit-Array1 and Bit-Array2
+  putting the results in the Result-Bit-Array."
+  (bit-array-boole bit-array1 bit-array2 boole-ior result-bit-array))
+
+(defun bit-xor (bit-array1 bit-array2 &optional result-bit-array)
+  "Performs a bit-wise logical XOR on the elements of Bit-Array1 and Bit-Array2
+  putting the results in the Result-Bit-Array."
+  (bit-array-boole bit-array1 bit-array2 boole-xor result-bit-array))
+
+(defun bit-eqv (bit-array1 bit-array2 &optional result-bit-array)
+  "Performs a bit-wise logical EQV  on the elements of Bit-Array1 and
+  Bit-Array2 putting the results in the Result-Bit-Array."
+  (bit-array-boole bit-array1 bit-array2 boole-eqv result-bit-array))
+
+(defun bit-nand (bit-array1 bit-array2 &optional result-bit-array)
+  "Performs a bit-wise logical NAND  on the elements of Bit-Array1 and
+  Bit-Array2 putting the results in the Result-Bit-Array."
+  (bit-array-boole bit-array1 bit-array2 boole-nand result-bit-array))
+
+(defun bit-nor (bit-array1 bit-array2 &optional result-bit-array)
+  "Performs a bit-wise logical NOR  on the elements of Bit-Array1 and
+  Bit-Array2 putting the results in the Result-Bit-Array."
+  (bit-array-boole bit-array1 bit-array2 boole-nor result-bit-array))
+
+(defun bit-andc1 (bit-array1 bit-array2 &optional result-bit-array)
+  "Performs a bit-wise logical ANDC1 on the elements of Bit-Array1 and
+  Bit-Array2 putting the results in the Result-Bit-Array."
+  (bit-array-boole bit-array1 bit-array2 boole-andc1 result-bit-array))
+
+(defun bit-andc2 (bit-array1 bit-array2 &optional result-bit-array)
+  "Performs a bit-wise logical ANDC2 on the elements of Bit-Array1 and
+  Bit-Array2 putting the results in the Result-Bit-Array."
+  (bit-array-boole bit-array1 bit-array2 boole-andc2 result-bit-array))
+
+(defun bit-orc1 (bit-array1 bit-array2 &optional result-bit-array)
+  "Performs a bit-wise logical ORC1 on the elements of Bit-Array1 and
+  Bit-Array2 putting the results in the Result-Bit-Array."
+  (bit-array-boole bit-array1 bit-array2 boole-orc1 result-bit-array))
+
+(defun bit-orc2 (bit-array1 bit-array2 &optional result-bit-array)
+  "Performs a bit-wise logical ORC2 on the elements of Bit-Array1 and
+  Bit-Array2 putting the results in the Result-Bit-Array."
+  (bit-array-boole bit-array1 bit-array2 boole-orc2 result-bit-array))
+
+(defun bit-not (bit-array &optional result-bit-array)
+  "Performs a bit-wise logical NOT in the elements of the Bit-Array putting
+  the results into the Result-Bit-Array."
+  (bit-array-boole bit-array bit-array boole-nor result-bit-array))

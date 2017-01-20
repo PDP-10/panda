@@ -1,0 +1,1252 @@
+
+MODULE TRACE (	!
+		IDENT = '3'
+                %BLISS36(,
+                    ENTRY(
+			  D$STRACE,    ! See if Tracing wanted
+			  D$BTRACE,    ! Output link banner line
+			  D$ZTRACE,    ! Close-link banner
+			  D$CTRACE,    ! Close any trace log
+                          D$TRACE      ! Trace a message
+                         ))
+		) =
+BEGIN
+
+!
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1981, 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+
+!++
+! FACILITY:	RMS-20/RMSFAL
+!
+! ABSTRACT:	Contains main routines to trace incoming and outgoing
+!		DAP messages.
+!
+!		Tracing by either RMS-20 (sending) or the RMSFAL (receiving)
+!		is controlled by the global variable D$GTRACE.  If
+!		D$GTRACE < 0, each DAP message sent or received is traced.
+!		There are currently 4 flavors of tracing:
+!
+!		D$GTRACE = -1  => Full trace: Headers are interpreted,
+!				  and each byte of the DAP message traced.
+!		D$GTRACE = -2  => Only header information and summary fields
+!				  are traced.
+!		D$GTRACE = -3  => Only headers.
+!		D$GTRACE = -4  => Only link connect/disconnect.
+!
+!		NOTE: DAP tracing is an UNSUPPORTED utility.  Its behavior
+!		      and effects may change at any time, or perhaps not
+!		      be provided in the future.
+
+!		D$GTRACE may be turned on or off by the following means:
+!
+!		1) Patch D$GTRACE (in either RMS-20 or RMSFAL) in DDT.
+!		
+!		2) Issue the [NO]TRACE command in DIU-20 or RMSDEB. (Full
+!		   tracing only.)  Note that NOTRACE does not override
+!		   DAP$TRACE.
+!		
+!		3) Issue the RMS $DEBUG JSYS (1013) with an argument of 400000
+!		   in AC1. (Full tracing only.)
+!		
+!		4) For RMS-20 tracing, define the job-wide logical name
+!		   DAP$TRACE: as -1, -2, -3 or -4.  If DAP$TRACE is defined
+!		   but its value cannot be interpreted, the default is full
+!		   tracing.  If DAP$TRACE is defined, the job-wide logical
+!		   name DAP$OUTPUT is examined.  If it has not been defined,
+!		   or if it has been defined but cannot be interpreted as
+!		   a filespec, trace output goes to the terminal; otherwise
+!		   to the file specified by DAP$OUTPUT.  Existing output
+!		   files are appended to.
+!
+!		5) For FAL tracing, define the job-wide logical name
+!		   FAL$LOG: as -1, -2, -3 or -4.  If FAL$LOG is defined
+!		   but its value cannot be interpreted, the default is full
+!		   tracing.  If FAL$LOG is defined, the job-wide logical
+!		   name FAL$OUTPUT is examined.  If it has not been defined,
+!		   or if it has been defined but cannot be interpreted as
+!		   a filespec, trace output goes to PS:[logged-in-directory]
+!		   FAL.LOG; otherwise to the file specified by FAL$OUTPUT.
+!		   Existing output files are appended to.
+!		
+!		   CAUTION: FAL$OUTPUT should not be defined as TTY:, or
+!		   the FAL may hang.  FAL$OUTPUT should not point to
+!		   DAP$OUTPUT.
+!
+!
+! ENVIRONMENT:	TOPS-20, Transportable BLISS DecNet Interface
+!
+! AUTHOR:	Andrew Nourse/Tom Speer
+!
+! 05 [663]- Complete rewrite.
+! 04    - Move all pure data to hiseg and remove FTS command stuff
+! 03    - Hack to let us live without RMS
+! 02    - Put in ENTRY points
+! 01	- The beginning
+!--
+!
+! TABLE OF CONTENTS:
+!
+
+FORWARD ROUTINE
+	D$STRACE: NOVALUE,		! Check if tracing wanted
+	D$BTRACE: NOVALUE,		! Output startup banner
+	D$ZTRACE: NOVALUE,		! Output close-down banner
+	D$CTRACE: NOVALUE,		! Close any trace log
+	D$TRACE: NOVALUE,		! Trace a DAP message
+	OMsg: NOVALUE,			! Output a DAP message
+	Olen;				! Output message length
+!
+! INCLUDE FILES:
+!
+
+%IF %BLISS(BLISS36)                                                  !a572
+    %THEN %IF %SWITCHES(TOPS10)
+          %THEN
+          LIBRARY 'BLI:UUOSYM';
+          UNDECLARE
+              ER$FUL,
+              %QUOTE DATE;
+          %FI
+      %FI
+
+REQUIRE 'RMSREQ';
+REQUIRE 'RMSOSD';
+LIBRARY 'BLISSNET';
+
+!
+! MACROS:
+!
+
+KEYWORDMACRO Put_Trace (Rab, String)=
+    BEGIN
+    BIND Stringd=String: $str_Descriptor();
+
+    %IF %SWITCHES(TOPS20)                                             !m572
+    %THEN
+        Sout(.D$gTrJfn,
+             .stringd[Str$a_Pointer],
+             .stringd[Str$h_Length],
+             0)
+    %ELSE
+        OUTSTR_UUO((CH$PLUS(.stringd[Str$a_pointer], 1))<rh>);
+    %FI
+
+    %(
+    BIND Brab=Rab: $rab_Decl;
+    %IF NOT %NULL(String)
+         %THEN
+         IF Brab EQL -1
+         THEN Sout($priou,
+                   .stringd[Str$a_Pointer],
+                   .stringd[Str$h_Length],
+                   0)
+         ELSE
+             BEGIN
+             Brab[Rab$h_Rsz]=.stringd[Str$h_Length];
+             Brab[Rab$a_Rbf]=CH$PLUS(.stringd[Str$a_Pointer],1)
+                              AND %O'777777';
+             $Put (%QUOTE Rab=Brab )
+             END
+         %FI
+      )%
+    END %;
+
+MACRO $CR_LOGIT(TEXT) =
+           SOUT(.D$GTRJFN,CH$PTR(UPLIT(%ASCIZ %STRING(%CHAR(13,10),TEXT))),0);
+           %;
+MACRO $LOGIT_CR(TEXT) =
+	   SOUT(.D$GTRJFN,CH$PTR(UPLIT(%ASCIZ %STRING(TEXT,%CHAR(13,10)))),0);
+	   %;
+MACRO $LOGIT(TEXT) =
+	   SOUT(.D$GTRJFN,CH$PTR(UPLIT(%ASCIZ TEXT)),0);
+	   %;
+MACRO LOG$IT(POINTER,LENGTH) = 
+	   SOUT(.D$GTRJFN,POINTER,-LENGTH,0);
+	   %;
+MACRO Crlf=%STRING(%CHAR(13),%CHAR(10)) %;
+
+!
+! OWN STORAGE:
+!
+PSECT OWN=$HIGH$;
+PSECT GLOBAL=$HIGH$;
+
+GLOBAL D$GTrMax: INITIAL(4000);         ! Max number of bytes to type out
+GLOBAL D$GTWidth: INITIAL(80);          ! Width of typeout
+GLOBAL D$In_Count;			! # DAP messages received
+GLOBAL D$Out_Count;			! #  "     "     sent
+
+GLOBAL Tbuff: VECTOR[CH$ALLOCATION(135)];
+%IF %SWITCHES(TOPS20)
+%THEN
+GLOBAL D$GTrJfn;
+BIND  TJfn = D$GTrJfn;
+%FI
+
+OWN T_Crlf: INITIAL (%ASCII Crlf),
+    D_Crlf: $str_Descriptor(String=(2,CH$PTR(T_Crlf)));
+
+OWN IByte;				! #  Bytes received
+OWN OByte;				! #  Bytes sent
+OWN Inrec;				! # DAP DATA msgs received
+OWN Outrec;				! #  "   "    "   sent
+
+!
+! EXTERNAL REFERENCES:
+!
+
+EXTERNAL ROUTINE
+	T_Datatype,		! In DAPTRT
+	T_Fop,
+	T_Fac,
+	T_Shr,
+	T_Dsp,
+	T_Ctl,
+	T_Dtm,
+	T_Pro,
+	OTime,
+	GTrJfn,
+	Dap$Get_Header,		! (elsewhere)
+	Dap$Get_Bitvector,
+	Dap$Get_Longword,
+	Dap$Get_Variable_String,
+	Dap$Get_Variable_Counted,
+	Dap$Unget_Header,
+	Dap$Unget_Byte,
+	Dap$Error_Dap_Rms,
+	Dap$Rfa_Dap_Rms,
+	Dap$Get_2Byte;
+
+EXTERNAL
+	D$GTRACE;
+
+! These are the PLIT tables to interpret DAP message fields.
+
+EXTERNAL
+	HdrTab : VECTOR,
+	Ostype  : VECTOR,
+	Filesys : VECTOR,
+	Orgtype : VECTOR,
+	Rfmtype : VECTOR,
+	RATType : VECTOR,
+	Acctype : VECTOR,
+	CtlType : VECTOR,
+	Contype : VECTOR,
+	Accomptype : VECTOR ;
+
+GLOBAL ROUTINE D$STRACE (P_Nodeid : REF $Str_Descriptor(),
+			   P_Nlb_Jfn) :NOVALUE = 
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Called from RMS-20 remote file open processing to see if DAP$TRACE
+!	and DAP$OUTPUT have been defined.  If both are already defined,
+!	output end-of-link stats from any simultaneously open link and return.
+!
+! FORMAL PARAMETERS:
+!
+!	None
+!
+! IMPLICIT INPUTS:
+!
+!       D$GTRACE
+!
+!--
+
+BEGIN
+	BIND Nodeid = .P_Nodeid : $Str_Descriptor();
+	BIND Net_Jfn = .P_Nlb_Jfn;
+	LOCAL Nodename : BLOCK[CH$ALLOCATION(11)];
+
+
+!	If we are already tracing, just return now.
+
+	IF .D$GTRACE NEQ 0 AND .D$GTRJFN NEQ 0 THEN
+	BEGIN
+		IF .D$In_Count NEQ 0 OR .D$Out_Count NEQ 0 THEN
+		BEGIN
+		D$CTrace();
+		D$GTrJfn = GTrJfn();
+		END;
+
+		SOUT(CH$PTR(Nodename),.nodeid[Str$a_Pointer],
+			-.Nodeid[Str$h_Length]);
+		D$BTrace(Nodename,Net_Jfn);
+
+	RETURN;
+	END;
+
+	D$GTrJfn = GTrjfn();
+
+	IF .D$Gtrace LSS 0 THEN	
+	BEGIN
+		SOUT(CH$PTR(Nodename),.nodeid[Str$a_Pointer],
+			-.Nodeid[Str$h_Length]);
+
+		D$BTrace(Nodename,Net_jfn);
+		IByte = Obyte = Inrec = Outrec = 0;
+
+	END;
+
+
+
+END;	! D$STRACE
+
+GLOBAL ROUTINE D$BTRACE (Nodename,Net_Jfn): NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Output a link-startup banner line.
+!
+! FORMAL PARAMETERS:
+!
+!	NODENAME:	Address of remote partner's nodename string
+!	NET_JFN:	NLB's network JFN (Link ID).
+!
+! IMPLICIT INPUTS:
+!
+!       D$GTRJFN
+!
+!--
+
+BEGIN
+	BIND Jfn = D$GTrJfn;
+	LOCAL ptr;
+	ptr = CH$PTR(Tbuff);
+
+	IF .Jfn NEQ $PRIOU THEN Openf(.Jfn,Of_APP+7^30);
+	$Cr_Logit('********************************************');
+	$Cr_Logit('Link ID:');
+	Nout(.Jfn,.Net_Jfn<rh>,8);
+	$logit(' established on ');
+	OTime(.Jfn,0,0,0);
+	IF Node ($NDGln,ptr) THEN
+	BEGIN
+		$Logit('Local: ');
+		Log$it(CH$PTR(Tbuff),0);
+	END;
+	If .Nodename NEQ 0 THEN
+	BEGIN
+		$Logit(', Remote: ');
+		Log$it(CH$PTR(.Nodename),0);
+	END;
+	$Cr_Logit('Trace Level: ');
+	Nout(.Tjfn,.D$Gtrace,10);
+	SOUT(.TJfn,CH$PTR(T_Crlf),2);
+
+	IF .Jfn NEQ $PRIOU THEN Closf(.Jfn+Co_Nrj);
+
+END;
+GLOBAL ROUTINE D$ZTRACE (Net_Jfn) : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Output an end-of-link banner.
+!
+! FORMAL PARAMETERS:
+!
+!	NET_JFN:	NLB's network JFN (Link ID)
+!
+! IMPLICIT INPUTS:
+!
+!       D$GTRJFN
+!
+!--
+
+BEGIN
+
+	IF .Tjfn EQL 0 THEN RETURN;
+	IF .Tjfn NEQ $PRIOU THEN Openf(.Tjfn,OF_APP+7^30);
+	$cr_Logit('Link ID:');
+	Nout(.Tjfn,.Net_Jfn<rh>,8);
+	$logit(' closed on ');
+	OTime(.TJfn,0,0,0);
+	Closf(.Tjfn+Co_Nrj);
+END;
+
+GLOBAL ROUTINE D$CTRACE  :NOVALUE = 
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Close the logfile whose JFN is in D$GTRJFN and write some
+!	end-of-link statistics.  Called by both RMS and the FAL.
+!
+!
+! FORMAL PARAMETERS:
+!
+!
+! IMPLICIT INPUTS:
+!
+!       D$GTRJFN
+!
+!--
+
+BEGIN
+
+
+	IF .Tjfn EQL 0 THEN TJfn = GTrJfn();
+	IF (.D$In_Count+.D$Out_Count) EQL 0 THEN RETURN;
+
+	IF .Tjfn NEQ $PRIOU THEN Openf(.TJfn,Of_APP+7^30);
+	$cr_Logit('=======================================');
+	$cr_Logit('	# DAP msgs  Exchanged: ');
+	Nout(.TJfn,.D$In_Count+.D$Out_Count,10);
+	$cr_Logit('	                 Recd: ');
+	Nout(.TJfn,.D$In_Count,10);
+	$cr_Logit('		         Sent: ');
+	Nout(.TJfn,.D$Out_Count,10);
+	$cr_Logit('	# DAP bytes Exchanged: ');
+	Nout(.TJfn,.IByte+.OByte,10);
+	$cr_Logit('	                 Recd: ');
+	Nout(.TJfn,.IByte,10);
+	$cr_Logit('		         Sent: ');
+	Nout(.TJfn,.Obyte,10);
+
+	IF (.Inrec + .Outrec) NEQ 0 THEN
+	BEGIN
+	$cr_Logit('	# Data msgs Exchanged: ');
+	Nout(.TJfn,.Inrec+.Outrec,10);
+	IF .Inrec NEQ 0 THEN
+	BEGIN
+	$cr_Logit('	                 Recd: ');
+	Nout(.TJfn,.Inrec,10);
+	END;
+	IF .Outrec NEQ 0 THEN
+	BEGIN
+	$cr_Logit('		         Sent: ');
+	Nout(.TJfn,.Outrec,10);
+	END;
+	END;
+
+	$cr_Logit('======================================');
+	$Logit_cr('=');
+	IF .Tjfn NEQ $PRIOU THEN Closf(.Tjfn);
+	TJfn = 0;
+	D$In_Count = D$Out_Count = IByte = Obyte = Inrec = Outrec = 0;
+
+END;	! D$CTRACE
+
+GLOBAL ROUTINE D$TRACE (DD,MESSAGE_TYPE) :NOVALUE =	!
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Trace DAP message
+!
+! FORMAL PARAMETERS:
+!
+!	DD: addr of DAP descriptor
+!       MESSAGE_TYPE: 
+!                   DAP$K_TRACE_INPUT (1): Message is being input
+!                   DAP$K_TRACE_OUTPUT (2): Message is being output
+! [Unused]          DAP$K_TRACE_INTERRUPT_INPUT (5): Interrupt msg input
+! [Unused]          DAP$K_TRACE_INTERRUPT_OUTPUT (6): Interrupt msg output
+!
+!
+! IMPLICIT INPUTS:
+!
+!       D$GTRACE,D$GTRMAX
+!
+!--
+
+    BEGIN
+    MAP Dd: REF $dap_Descriptor;
+
+    LABEL Do_Message;
+    LOCAL
+	Tdd: $dap_Descriptor,   !Temp descriptor
+        Header,
+	Function,
+	Net_Jfn;
+
+    BIND Twidth=D$gtwidth;
+
+! And the temporary Dap Descriptor
+
+    IF .D$GTRACE+4 EQL 0 THEN RETURN;
+
+    $xpn_Desc_Init (Descriptor=Tdd , Class=Bounded );
+
+! Copy in relevant portions of the DAP descriptor
+
+
+    Tdd[Dap$a_Data]=.dd[Dap$a_Data];
+    Tdd[Dap$h_Bytes_Remaining]=.dd[Dap$h_Bytes_Remaining];
+    Tdd[Dap$h_Bytes_Used]=.dd[Dap$h_Bytes_Used];
+    Tdd[Dap$h_Message_Length]=.dd[Dap$h_Message_Length];
+    Tdd[Dap$h_Length]=.dd[Dap$h_Length];
+
+! Brutally and illegally swipe the Nlb's Jfn for an ID.
+
+    Net_Jfn<rh> = .((.dd[Dap$a_Nlb])+30);
+    
+    IF .Tjfn EQL 0 THEN Tjfn = GTrJfn();
+
+    Openf(.Tjfn,Of_App+7^30);
+
+!+
+! Read the whole message, unblocking as we go.  The loop is post-tested
+! to catch and trace spurious messages with a byte-length of zero.
+!-
+
+DO					!DO WHILE
+Do_Message: BEGIN
+    LOCAL filespec: VECTOR[CH$ALLOCATION(255)];	!Store filespec
+
+    LOCAL Header_Len,
+	  Message_Length,
+	  Save_pos;
+
+
+!   Output a directional header
+
+
+    CASE .message_Type FROM 1 TO 7 OF
+         SET
+         [Dap$k_Trace_Input]:
+		BEGIN
+		OTime(.TJfn,Ot_Nda,Dap$k_Trace_Input,.Net_Jfn);
+		IF .dd[Dap$v_Interrupt]
+		THEN 
+		   BEGIN
+			$Logit('Int> ');
+		   END
+		ELSE 
+		   BEGIN
+			$Logit('===> ');
+		   END;
+		D$In_Count = .D$In_Count+1;	! Count msgs in
+		END;
+
+         [Dap$k_Trace_Output]:
+		BEGIN
+		OTime(.Tjfn,Ot_Nda,Dap$k_Trace_Output,.Net_Jfn);
+		IF .dd[Dap$v_Interrupt]
+		THEN 
+		   BEGIN
+			$Logit('<Int ');
+		   END
+		ELSE 
+		   BEGIN
+			$Logit('<=== ');
+		   END;
+
+		D$Out_Count = .D$Out_Count + 1;	! Count msgs out
+		END;
+
+         [Dap$k_Trace_Input_Interrupt]:
+		BEGIN
+		$Cr_Logit('Int> ');
+		END;
+         [Dap$k_Trace_Output_Interrupt]:
+		BEGIN
+		$Cr_Logit('<Int ');
+		END;
+
+         [INRANGE,OUTRANGE]:
+            $xpo_Put_Msg(String='TRACE argument out of range',Severity=Fatal);
+         TES;
+
+
+!   Save full message length before it is decremented by $Get_Header
+
+    Message_Length = .Tdd[Dap$h_Bytes_Remaining];
+
+!   If the message has any DAP data in it at all, we can $Get_Header the
+!   Operator field.  Otherwise, $Get_Header goes off to get a new message!
+!
+    IF .Tdd[Dap$h_Bytes_Remaining] GTR 0
+    THEN
+	BEGIN
+        Header = Dap$Get_Header(Tdd);                 ! Peek at message type
+	END
+    ELSE
+	BEGIN
+	Header = Get_Byte(Tdd);
+	END;
+
+!   Record how many bytes were actually in the header, so blocked messages
+!   can be correctly sized according to the LENGTH field (length of
+!   Operator).
+
+    Header_Len = .Message_Length - .Tdd[Dap$h_Bytes_Remaining];
+
+!   Calculate actual length of this DAP message (as opposed to total
+!   blocked length).
+
+!   If the LENGTH flag is on, this message may be blocked, so we
+!   calculate the total byte-length to output as the remaining
+!   Dap$h_length of this message plus the number of bytes we read
+!   in the header.
+!   If the LENGTH flag  is off, the message length is the Bytes_Remaining
+!   plus the header length.
+
+    IF .Tdd[Dap$v_Mflags_Length]
+    THEN  Message_Length = .Tdd[Dap$h_Length] + .Header_Len
+    ELSE  Message_Length = .Tdd[Dap$h_Bytes_Remaining] + .Header_Len;
+
+!   Keep running total of DAP bytes in and out.
+
+    IF .message_type EQL Dap$k_Trace_Input
+    THEN IByte =  .Ibyte + .Message_Length;
+    IF .message_type EQL Dap$k_Trace_Output
+    THEN OByte = .OByte + .Message_Length;
+
+!   Protect against bogus messages
+
+    IF .Header LSS 0 OR .Header GTR .Hdrtab[-1] THEN Header = 0;
+
+!   Output the corresponding message type, Englished.
+
+    Log$it(CH$PTR(.Hdrtab[.Header]),3);
+    $Logit(' ');
+
+!   If message was really bogus, complete a truncated trace and leave.
+
+    IF .Tdd[Dap$h_Bytes_Remaining] LEQ 0 AND .Header EQL 0
+    THEN
+	BEGIN
+	$Logit('msg');
+	IF NOT Olen(Tdd,0) THEN  SOUT(.TJfn,CH$PTR(T_Crlf),2);
+	Closf(.TJfn+Co_Nrj);
+	RETURN
+	END;
+
+
+!+
+!   Do some special things by message type.
+!-
+
+    CASE .Header FROM 0 TO Dap$k_Acl OF
+    SET
+
+    [Dap$k_Config,
+     Dap$k_Attributes,
+     Dap$k_Name,
+     Dap$k_Status,
+     Dap$k_Date_Time,
+     Dap$k_Protection]:
+
+	BEGIN
+
+	  Save_pos = .Tdd[Dap$h_Bytes_Remaining];	! Save our position
+	  $Logit('msg');
+	  IF Olen(Tdd,.Message_Length) THEN LEAVE Do_Message; ! Write msg Len:
+
+	  $Cr_Logit('      ');
+
+	  SELECTONE .Header OF
+	  SET
+
+          [Dap$k_Config]:		! Englishify upto (not including)
+	  BEGIN				!   the SYSCAP field
+
+	  LOCAL
+		Bufsiz,
+		Ost,
+		Flsys,
+		Dapver,
+		Dapeco;
+
+
+!	Get 6 bytes of interesting stuff
+
+	  Bufsiz = Dap$Get_2Byte(Tdd);
+	  Ost = Get_Byte(Tdd);
+	  Flsys = Get_Byte(Tdd);
+	  Dapver = Get_Byte(Tdd);
+	  Dapeco = Get_Byte(Tdd);
+
+!	Output each item, with a preceding ID tag
+
+!	BUFSIZ:nnnnnn
+
+	  $Logit('Bufsiz:');
+	  Nout(.Tjfn,.Bufsiz,8);
+
+!	OST:
+	  $Logit(' Ost:');
+
+!	Protect against bogus values
+
+	  IF .Ost GTR .Ostype[-1]
+	  THEN Ost = 0;
+
+!	Index into Ostype table for text
+
+	  Log$it(CH$PTR(.Ostype[.Ost]),8);
+
+!	FILESYS:
+
+	  $Logit('Filesys:');
+
+!	Protect against bogus values
+
+	  IF .Flsys GTR .Filesys[-1]
+	  THEN Flsys = 0;
+
+!	Index into Filesys table for text
+
+	  Log$it(CH$PTR(.Filesys[.Flsys]),8);
+
+!	Dap VER:
+
+	  $Logit('Ver:');
+	  Nout(.Tjfn,.Dapver,8);
+
+!	Dap ECO:
+
+	  $Logit(' Eco:');
+	  Nout(.Tjfn,.Dapeco,8);
+
+	  END;	!DAP$K_CONFIG
+
+	  [Dap$k_Attributes]:
+		BEGIN
+		LOCAL attmenu: BITVECTOR[42] INITIAL(0),
+                      org: INITIAL(0),
+                      rfm: INITIAL(0),
+                      rat: BITVECTOR[21] INITIAL(0),
+                      bls: INITIAL(0),
+                      mrs: INITIAL(0),
+		      tmp;
+
+		Dap$Get_Bitvector (Tdd, attmenu, 6);	!Attributes menu bits
+
+		IF .attmenu[Dap$v_Attmenu_Dat]                  ! Datatype?
+                THEN 
+		BEGIN
+			$Logit('Dtp:');
+			T_Datatype(Tdd);
+
+		END;
+
+	  IF .attmenu[Dap$v_Attmenu_Org]    ! File Organization
+                THEN
+                    BEGIN
+                    org=$Dap_Translate_Value(Get_Byte(Tdd),
+                                                        Dap$k_Org_,Fab$k_,
+                                                        Seq,Rel,Idx,Hsh);
+
+		    $logit('Org:');
+		    IF .org GTR .Orgtype[-1] 
+		    THEN org = 0;
+
+		    Log$it(CH$PTR(.orgtype[.org]),3);
+
+		    END;
+
+		IF .attmenu[Dap$v_Attmenu_Rfm]    ! Record Format
+                THEN
+                    BEGIN
+
+                    rfm=Get_Byte(Tdd);
+		    IF .rfm GTR .rfmtype[-1] THEN rfm = 0;
+		    $logit(' Rfm:');
+		    Log$it(CH$PTR(.rfmtype[.rfm]),3);
+
+		    END;
+
+		IF .attmenu[Dap$v_Attmenu_Rat]    ! Record Attributes
+                THEN
+                    BEGIN
+		    LOCAL v: INITIAL(0);
+		    LITERAL Prn = 2;
+
+                    rat=Get_Byte(Tdd);
+                    IF .Rat[Dap$v_Rat_Ftn] THEN v=0;
+                    IF .Rat[Dap$v_Rat_Cr]  THEN v=1;
+                    IF .Rat[Prn]	   THEN v=2;
+                    IF .Rat[Dap$v_Rat_Blk] THEN v=3;
+                    IF .Rat[Dap$v_Rat_Efc] THEN v=4;
+                    IF .Rat[Dap$v_Rat_Cbl] THEN v=5;
+                    IF .Rat[Dap$v_Rat_Lsa] THEN v=6;
+                    IF .Rat[Dap$v_Rat_Macy11] THEN v=7;
+
+		    $Logit(' Rat:');
+		    Log$it(CH$PTR(.RATtype[.v]),4);
+
+		    END;
+
+                IF .attmenu[Dap$v_Attmenu_Bls]
+                THEN 
+		    BEGIN
+		    bls=Dap$Get_2Byte(Tdd);
+
+		    $logit(' Bls:');
+		    Nout(.Tjfn,.Bls,8);
+		    END;
+		
+		IF .attmenu[Dap$v_Attmenu_Mrs]
+                THEN 
+		    BEGIN
+		    $Logit(' Mrs:');
+		    Mrs = Dap$Get_2Byte(Tdd);
+		    Nout(.Tjfn,.Mrs,8);
+		    END;
+
+		IF .attmenu[Dap$v_Attmenu_Alq]
+		THEN 
+		  BEGIN
+			$Logit(' Alq:');
+			Nout(.Tjfn,Dap$get_Longword(Tdd),8);
+		  END;
+
+
+		IF .attmenu[Dap$v_Attmenu_Bks]
+		THEN 
+		  BEGIN
+			$Logit(' Bks:');
+			Nout(.Tjfn,Get_Byte(Tdd),8);
+		  END;
+
+
+		IF .attmenu[Dap$v_Attmenu_Fsz]
+		THEN
+		  BEGIN
+			$Logit(' Fsz:');
+			Nout(.Tjfn,Get_Byte(Tdd),8);
+		  END;
+
+		IF .attmenu[Dap$v_Attmenu_Mrn]
+		THEN 
+		  BEGIN
+			$Logit(' Mrn:');
+			Nout(.Tjfn,Dap$Get_Longword(Tdd),8);
+		  END;
+
+
+		IF .attmenu[Dap$v_Attmenu_Run] THEN
+		BEGIN
+		  LOCAL runsys: VECTOR[CH$ALLOCATION(40)];
+		  Dap$Get_Variable_String(Tdd,CH$PTR(runsys),40);
+		END;
+
+		IF .attmenu[Dap$v_Attmenu_Deq]
+		THEN tmp = Dap$Get_2Byte(Tdd);
+
+		IF .attmenu[Dap$v_Attmenu_Fop] THEN T_Fop(Tdd);
+
+		IF .attmenu[Dap$v_Attmenu_Bsz]
+		THEN
+		  BEGIN
+			$Logit(' Bsz:');
+			Nout(.Tjfn,Get_Byte(Tdd),8);
+		  END;
+
+		IF .attmenu[Dap$v_Attmenu_Dev]
+		THEN
+		  BEGIN
+		  LOCAL dev: BITVECTOR[42] INITIAL(0);
+
+			$Cr_Logit('      Dev:');
+			Dap$Get_Bitvector(Tdd, dev, 6);
+			Nout(.Tjfn,.dev,8);
+		  END;
+
+		IF .attmenu[Dap$v_Attmenu_Sdc]
+                THEN
+                    BEGIN
+		    LOCAL sdc: BITVECTOR[42] INITIAL(0);
+
+		    Dap$Get_Bitvector (Tdd, sdc, 6);	
+		    $Logit(' Sdc:');
+		    Nout(.Tjfn,.sdc,8);
+		    END;
+
+		IF .attmenu[Dap$v_Attmenu_Lrl]
+                THEN 
+		    BEGIN
+		    $Logit(' Lrl:');
+		    Nout(.Tjfn,Dap$Get_2byte(Tdd),8);
+		    END;
+
+		IF .attmenu[Dap$v_Attmenu_Hbk]
+                THEN
+		    BEGIN
+		    $Logit(' Hbk:');
+		    Nout(.Tjfn,Dap$Get_Longword(Tdd),8);
+		    END;
+
+		IF .attmenu[Dap$v_Attmenu_Ebk]
+                THEN 
+		    BEGIN
+		    $Logit(' Ebk:');
+	  	    Nout(.Tjfn,Dap$Get_Longword(Tdd),8);
+		    END;
+
+		IF .attmenu[Dap$v_Attmenu_Ffb]
+                THEN
+		    BEGIN
+		    $Logit(' Ffb:');
+		    Nout(.Tjfn,Dap$get_2byte(Tdd),8);
+		    END;
+			
+		END;	!DAP$K_ATTRIBUTES
+
+	  [Dap$k_Name]:
+	      BEGIN
+		LOCAL
+		      Nametype: BITVECTOR[21],
+		      Save2;
+
+		Dap$Get_Bitvector(Tdd, nametype, 3);
+
+		IF .Nametype[Dap$k_Nametype_Fsp]
+		      THEN $Logit('File: ');
+
+		IF .Nametype[Dap$k_Nametype_Nam]
+		      THEN $logit('Name: ');
+
+		IF .Nametype[Dap$k_Nametype_Dir]
+		      THEN $logit('Directory: ');
+
+		IF .Nametype[Dap$k_Nametype_Str]
+		      THEN $logit('Structure: ');
+
+		IF .Nametype[Dap$k_Nametype_Def]
+		      THEN $logit('Default file: ');
+
+		IF .Nametype[Dap$k_Nametype_Rel]
+		      THEN $logit('Related file: ');
+
+
+		Save2 = Dap$Get_Variable_String(Tdd,CH$PTR(filespec),255);
+
+		Log$it(CH$PTR(Filespec),.Save2);
+
+	   END;  !DAP$K_NAME
+
+          [Dap$k_Status]:
+		BEGIN
+		LOCAL	STV,
+			STS,
+			Rfa: BYTE8VECTOR[9];
+
+
+		STV = Dap$Get_2Byte(Tdd);	! Get Mac/Mic
+		STS = Dap$Error_Dap_Rms(.STV);	! Convert to STS
+
+		$logit('Mac/Mic:');
+
+		Nout(.Tjfn,.STV,8);
+
+		$logit(' [Sts:');
+	  	Nout(.Tjfn,.STS,8);
+		$Logit(']');
+
+		IF .Tdd[Dap$h_Length] GTR 0
+		THEN
+		  BEGIN
+		    Dap$Get_Variable_Counted(Tdd,CH$PTR(rfa,0,8),8);
+		    IF (.rfa[0]) GTR 0
+		    THEN
+			BEGIN
+			LOCAL v;
+			v=Dap$Rfa_Dap_Rms(rfa);
+			v<35,1>=0;
+
+			$logit(' Rfa:');
+			Nout(.Tjfn,.v<lh>,8);
+			$logit(',,');
+			Nout(.Tjfn,.v<rh>,8);
+			END;
+		  END;
+
+          END;	!DAP$K_STATUS
+
+
+          [Dap$k_Date_Time]:
+
+		BEGIN
+		T_Dtm(Tdd);
+		END;  !DAP$K_DATE_TIME
+
+
+          [Dap$k_Protection]:
+
+		BEGIN
+		T_Pro(Tdd);
+		END;  !DAP$K_PROTECTION
+
+	TES;
+
+	Save_Pos = .Save_Pos - .Tdd[Dap$h_Bytes_Remaining];
+	INCR I From 0 to .Save_Pos-1
+	DO Dap$Unget_Byte(Tdd);
+
+	OMsg(Tdd,.Message_Length,Tbuff);	! Output the bytes
+
+	END;
+
+    [Dap$k_Access,
+     Dap$k_Control,
+     Dap$k_Continue,
+     Dap$k_Access_Complete]:
+
+	BEGIN
+
+	Save_Pos = .Tdd[Dap$h_Bytes_Remaining];
+	Function = Get_Byte(Tdd);
+
+	SELECTONE .Header OF
+	SET
+
+    	[Dap$k_Access]:
+	BEGIN
+	   LOCAL
+                Accopt: BITVECTOR[28],
+		Save2;
+	
+	   IF .Function GTR .Acctype[-1]		! Protect vs bogus vals
+	   THEN Function = 0;
+
+	   Log$it(CH$PTR(.Acctype[.Function]),3);
+	   IF Olen(Tdd,.Message_Length) THEN LEAVE Do_Message;
+
+
+	   Dap$Get_Bitvector(Tdd,Accopt,5);		!Access options
+
+           Save2 = Dap$Get_Variable_String(Tdd,CH$PTR(filespec),255);
+
+	   $Cr_logit('      File: ');
+	   Log$it(CH$PTR(Filespec),.Save2);
+
+	   T_Fac(Tdd);
+	   T_Shr(Tdd);
+	   T_Dsp(Tdd);
+
+	   END;	!DAP$K_ACCESS
+
+    	[Dap$k_Control]:
+	BEGIN
+
+	   IF .Function GTR  .Ctltype[-1]
+	   THEN Function = 0;
+
+	   Log$it(CH$PTR(.Ctltype[.Function]),3);
+	   IF Olen(Tdd,.Message_Length) THEN LEAVE Do_Message;
+
+	   T_Ctl(Tdd);
+	   
+	   END;	!DAP$K_CONTROL
+
+	[Dap$k_Continue]:
+	BEGIN
+
+	   IF .Function GTR .Contype[-1]
+	   THEN Function = 0;
+
+	   Log$it(CH$PTR(.Contype[.Function]),3);
+	   IF Olen(Tdd,.Message_Length) THEN LEAVE Do_Message;
+
+	END;	!DAP$K_CONTINUE
+
+    	[Dap$k_Access_Complete]:
+        BEGIN
+
+	 IF .Function GTR .Accomptype[-1]
+	 THEN Function = 0;
+
+	 Log$it(CH$PTR(.Accomptype[.Function]),3);
+	 IF Olen(Tdd,.Message_Length) THEN LEAVE Do_Message;
+
+	 IF .Tdd[Dap$h_Length] GTR 0
+	 THEN
+	 BEGIN
+		$Cr_Logit('     ');
+		T_Fop(Tdd);
+	 END;
+	END;	!DAP$K_ACCESS_COMPLETE
+
+	TES;
+	  
+       Save_Pos = .Save_Pos - .Tdd[Dap$h_Bytes_Remaining];
+       INCR I From 0 to .Save_Pos-1
+       DO Dap$Unget_Byte(Tdd);
+
+       OMsg(Tdd,.Message_Length,Tbuff);	! Output the bytes
+
+    END;
+
+    [INRANGE,
+     OUTRANGE]:
+	BEGIN
+	  $Logit('msg');
+	  IF .Header EQL Dap$k_Data THEN
+	  BEGIN
+		IF .message_type EQL Dap$k_Trace_Input
+		THEN InRec = .InRec +1;
+		IF .message_type EQL Dap$k_Trace_Output
+		THEN OutRec = .OutRec + 1;
+	  END;
+	  IF Olen(Tdd,.Message_Length) THEN LEAVE Do_Message;
+          OMsg(Tdd,.Message_Length,Tbuff);
+	END;
+
+    TES;
+
+ END !DO WHILE 
+
+
+WHILE .Tdd[Dap$h_Bytes_Remaining] GTR 0;
+Closf(.Tjfn+Co_Nrj);
+
+    END;			!End of D$TRACE
+
+ROUTINE OMsg	(P_Dd: REF $Dap_Descriptor,
+			Msg_Len,
+			O_Buff
+			) : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Output-trace a DAP message byte-by-byte.
+!
+! FORMAL PARAMETERS:
+!
+!	P_DD: addr of DAP descriptor
+!	Msg_Len: Length in bytes of the discrete DAP message to output
+!	O_Buff:  Output trace buffer
+!
+! IMPLICIT INPUTS:
+!
+!       D$GTWIDTH,D$GTRMAX
+!
+!--
+
+BEGIN
+
+    LOCAL
+    Odesc: $str_Descriptor(Class=Bounded);  !Output descriptor
+
+    BIND Tdd = .P_dd: $Dap_Descriptor;
+    BIND Tbuff = .O_Buff: VECTOR[CH$ALLOCATION (135)];
+    BIND Twidth=D$gtwidth;
+    BIND Trmax=D$gtrmax;
+
+    LOCAL Noutbuf: VECTOR[CH$ALLOCATION(10)];
+    LOCAL Truncated;
+
+
+    ! Regurgitate the header we have already read
+
+    Dap$Unget_Header(Tdd);
+
+    ! Is there a limit to our patience?
+
+    IF .tdd[Dap$h_Bytes_Remaining] GTR .trmax  ! too long a message?
+    THEN
+        BEGIN
+        Truncated=.Msg_Len-.trmax;  ! # of bytes truncated
+        Msg_Len=.trmax;
+        END
+    ELSE
+        Truncated=0;
+ 
+!   If the DAP debug trace flag is -2, forget about tracing DAP bytes.
+
+    IF (.D$GTRACE + 2) EQL 0
+    THEN
+	BEGIN
+	  DECR I FROM .Msg_Len-1 TO 0
+	  DO Get_Byte(Tdd);
+	  SOUT(.TJfn,CH$PTR(T_Crlf),2);	  
+	  RETURN
+	END;
+
+
+    $str_Desc_Init(Descriptor=Odesc,Class=Bounded,
+                   String=(.twidth+3,Ch$ptr(Tbuff)));
+    $str_Copy(String=%STRING(Crlf,'          '), Target=Odesc); ! Space in
+
+
+!+
+!   The pointers have been backed up to the start, and we have the total
+!   length of this DAP message.  Pump it out.
+!-
+    DECR I FROM .Msg_Len-1 TO 0
+    DO  BEGIN
+        IF (.Odesc[Str$h_Maxlen]-.Odesc[Str$h_Length]) LEQ 7
+        THEN
+            BEGIN                       !Add <CR><LF> & put out
+            $str_Append(String=D_Crlf,Target=Odesc);
+
+            Put_Trace ( String=Odesc);
+
+            $str_Desc_Init(Descriptor=Odesc,Class=Bounded,
+                            String=(.twidth+3,Ch$ptr(Tbuff)));
+
+            $str_Copy(String='          ', Target=Odesc); ! Space in
+            
+            END;
+
+        %IF %SWITCHES(TOPS20)
+        %THEN
+            ! Use NOUT jsys, $Str_Ascii is broken in nonzero sections
+
+            BEGIN
+            Nout( CH$PTR(Noutbuf), Get_Byte(Tdd), No_Lfl+Fld(4,No_Col)+8 );
+            $Str_Append( String=(4,CH$PTR(Noutbuf)), Target=Odesc);
+            END
+
+        %ELSE       ! beware. this won't work outside section 0      !m572
+            $str_Append(String=$str_Ascii(Get_Byte(Tdd),
+                                          Base8,Leading_Blank,Length=4),
+                        Target=Odesc);
+        %FI
+        END;
+
+    $str_Append (String=D_Crlf,Target=Odesc);
+
+    Put_Trace ( String=Odesc );
+
+    IF .truncated NEQ 0                       ! Message was real long
+    THEN Put_Trace ( String=$str_Concat(' ... (',$str_Ascii(.truncated),
+                                      ' more bytes)', D_Crlf));    !m572
+
+END;  !OMsg
+ROUTINE OLen (P_Dd: REF $Dap_Descriptor,Msg_Len) = 
+
+BEGIN
+
+
+    BIND Twidth=D$gtwidth;
+    BIND Tdd = .P_dd: $Dap_Descriptor;
+
+!   Tag and output the decimal number of bytes in this message
+
+    $LOGIT(' Len: ');
+    Nout( .Tjfn, .Msg_Len,10);
+    IF .D$GTRACE+3 EQL 0 THEN
+    BEGIN
+	  DECR I FROM .Msg_Len-1 TO 0
+	  DO Get_Byte(Tdd);
+	  RETURN 1
+   END
+   ELSE RETURN 0;
+
+END;	!OLen
+
+END				!End of module
+ELUDOM
+   

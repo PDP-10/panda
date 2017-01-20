@@ -1,0 +1,457 @@
+MODULE M11FIL (	! MACY11 file service for RMS
+		IDENT = '2',
+                ENTRY(
+                      RL$GMACY11,              ! Get a record from macy11 file
+                      RL$PMACY11,              ! Put a record to macy11 file
+                      RL$CMACY11,              ! Connect RAB to FAB for MACY11
+                      RL$CLMACY11              ! Close MACY11 file
+                      )
+		) =
+BEGIN
+
+!  COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1981, 1986.
+!  ALL RIGHTS RESERVED.
+!  
+!  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!  COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!  THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!  ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!  AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!  SOFTWARE IS HEREBY TRANSFERRED.
+!  
+!  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!  NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!  EQUIPMENT CORPORATION.
+!  
+!  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!  ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+
+!++
+! FACILITY:  DAP
+!
+! ABSTRACT:  Routines to transfer records or blocks of file data.
+!            Process MACY11 files
+!
+! ENVIRONMENT:
+!
+! AUTHOR:	Andrew Nourse, CREATION DATE:  3-Mar-82
+!
+! 02    - Put in ENTRY points
+! 01	- The beginning
+!--
+!
+! INCLUDE FILES:
+!
+
+ LIBRARY 'RMS';
+ LIBRARY 'RMSBLK';                      ! Internal RMS defs
+ LIBRARY 'BLISSNET';
+ LIBRARY 'CONDIT';
+ LIBRARY 'DAP';
+ LIBRARY 'TWENTY';
+ REQUIRE 'JSYSDEF.R36';
+!
+! TABLE OF CONTENTS:
+!
+
+FORWARD ROUTINE
+               RL$GMACY11,              ! Get a record from macy11 file
+               RL$PMACY11,              ! Put a record to macy11 file
+               M11GBY,                  ! Get a byte from MACY11 file
+               M11PBY,                  ! Put a byte to MACY11 file
+               RL$CMACY11,              ! Connect RAB to FAB for MACY11
+               RL$CLMACY11;             ! Close MACY11 file
+
+!
+! MACROS:
+!
+
+MACRO SAVED_BYTE=RST$H_RECORD_SIZE_WORDS %;
+
+!
+! EQUATED SYMBOLS:
+!
+
+LITERAL NO_BYTE=%O'777777';
+LITERAL END_OF_PAGE_MASK=%O'770000000777';
+!
+! OWN STORAGE:
+!
+
+
+!
+! EXTERNAL REFERENCES:
+!
+EXTERNAL ROUTINE
+                RMS$READ,
+                RMS$WBUCKET;
+
+GLOBAL ROUTINE RL$GMACY11 (RAB,ERR)  =	! Get a MACY11 record
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Get a record from an open MACY11 file.
+!
+! FORMAL PARAMETERS:
+!
+!       RAB: A RAB as defined by RMS
+!       ERR: Address of error routine
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! COMPLETION CODES:
+!
+!	Standard RMS codes
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+    MAP RAB: REF $RAB_DECL;
+    BIND FAB=.RAB[RAB$A_FAB]: $FAB_DECL;
+    BIND FST=.FAB[FAB$A_IFI]: $RMS_FST;          ! File status table
+    BIND RST=.FST[FST$A_FLINK]: $RMS_RST;        ! Record status table
+    BIND CBKD=RST[RST$Z_CURRENT_BUCKET]: $RMS_BUCKET_DESCRIPTOR;
+    BIND ROUTINE $$ERRRTN=.ERR: RMS_ERCAL;
+    LOCAL BUFPTR;
+    LOCAL LEFT;
+
+    BUFPTR=CH$PTR(.RAB[RAB$A_UBF],0,8);     ! Use user's buffer
+
+    LEFT=.RST[RST$G_HIGHEST_BYTE]       ! counts bytes left in file
+         -(((.CBKD[BKT$H_BUCKET_NUMBER]+1)*512*4)-.RST[RST$H_BYTE_COUNT]);
+
+    SELECT .FAB[FAB$Z_RFM] OF
+        SET
+        [FAB$K_RFM_FIX]:
+            BEGIN
+            RAB[RAB$H_RSZ]=.FAB[FAB$H_MRS];
+            IF (.LEFT LSS .RAB[RAB$H_RSZ]) THEN SIGNAL(RMS$_EOF,0,FAB[$]);
+            ! EOF if not enough bytes for one full record.
+            END;
+        [FAB$K_RFM_VAR]:
+            BEGIN
+            IF .LEFT LSS 4 THEN SIGNAL(RMS$_EOF,0,FAB[$]);
+            ! Don't be fooled by up to 3 filler bytes at end.
+            IF M11GBY(RAB[$],.ERR) NEQ 1 THEN (RAB[RAB$H_STS]=RMS$_UDF;
+                                               $$ERROR(GET,RAB[$]));
+            M11GBY(RAB[$],.ERR); ! Filler
+            RAB[RAB$H_RSZ]=M11GBY(RAB[$],.ERR)+(M11GBY(RAB[$],.ERR)^8)-4;
+            ! Record size including header
+            END;
+        TES;
+
+    DECR I FROM .RAB[RAB$H_RSZ]-1 TO 0
+    DO CH$WCHAR_A(M11GBY(RAB[$],.ERR),BUFPTR);
+
+    IF .FAB[FAB$Z_RFM] EQL FAB$K_RFM_VAR
+    THEN (DECR I FROM 6 TO 0 DO M11GBY(RAB[$],.ERR)); ! Eat checksum & filler
+
+    .RAB[RAB$H_STS]                     ! Return status
+    END;			!End of RL$GMACY11
+
+GLOBAL ROUTINE RL$PMACY11 (RAB,ERR) =	! Put a MACY11 record 
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Put a record to an open MACY11 file.
+!
+!
+! FORMAL PARAMETERS:
+!
+!       RAB: A RAB as defined by RMS
+!       ERR: Address of error routine
+!
+! COMPLETION CODES:
+!
+!	Standard RMS codes
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!--
+
+    BEGIN
+    MAP RAB: REF $RAB_DECL;
+    BIND FAB=.RAB[RAB$A_FAB]: $FAB_DECL;
+    BIND ROUTINE $$ERRRTN=.ERR: RMS_ERCAL;
+    LOCAL BUFPTR;
+    LOCAL CKSM;
+
+    BUFPTR=CH$PTR(.RAB[RAB$A_RBF],0,8); ! Make byte pointer of it
+
+    SELECT .FAB[FAB$Z_RFM] OF
+        SET
+        [FAB$K_RFM_FIX]: RAB[RAB$H_RSZ]=.FAB[FAB$H_MRS];
+        [FAB$K_RFM_VAR]:
+            BEGIN                            ! Put out the header
+            LOCAL RSZ;
+            RSZ=.RAB[RAB$H_RSZ]+4;           ! MACY11 record size includes hdr
+            M11PBY(RAB[$],1,.ERR);           ! sync
+            M11PBY(RAB[$],0,.ERR);           ! sync
+            M11PBY(RAB[$],(.RSZ AND %O'377'),.ERR);        ! Record length
+            M11PBY(RAB[$],((.RSZ^-8) AND %O'377'),.ERR);   ! 
+            CKSM=.RSZ+(.RSZ^-8)+1;           ! Checksum so far
+            END;
+        TES;
+
+    DECR I FROM .RAB[RAB$H_RSZ]-1 TO 0
+    DO  BEGIN
+        LOCAL C;
+
+        M11PBY(RAB[$],(C=CH$RCHAR_A(BUFPTR)),.ERR);
+        CKSM=.CKSM+.C;                  ! count in checksum
+        END;
+
+    IF .FAB[FAB$Z_RFM] EQL FAB$K_RFM_VAR
+    THEN
+        BEGIN
+        M11PBY(RAB[$],((-.CKSM) AND %O'377'),.ERR); ! Put out negative checksum
+
+        DECR I FROM 5 TO 0
+        DO M11PBY(RAB[$],0,.ERR);            ! and 6 bytes of 0
+        END;
+    .RAB[RAB$H_STS]
+    END;			!End of RL$PMACY11
+ROUTINE M11GBY (RAB,ERR) =            ! Get MACY11 byte
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Get byte to MACY11 file
+!
+! FORMAL PARAMETERS:
+!
+!       RAB: A RAB as defined by RMS
+!       ERR: Address of error routine
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+    MAP RAB: REF $RAB_DECL;
+    BIND RST=.RAB[RAB$A_ISI]: $RMS_RST;
+    BIND FAB=.RAB[RAB$A_FAB]: $FAB_DECL;
+    BIND ROUTINE $$ERRRTN=.ERR: RMS_ERCAL;
+
+    IF .RST[SAVED_BYTE] EQL NO_BYTE
+    THEN
+        BEGIN
+        BIND PAGPTR=RST[RST$G_PAGE_POINTER];    ! Byte pointer in bucket
+        BIND CBKD=RST[RST$Z_CURRENT_BUCKET]: $RMS_BUCKET_DESCRIPTOR;
+
+        IF .RST[RST$H_BYTE_COUNT] LEQ 0         ! bucket used up?
+        THEN
+            BEGIN
+            LOCAL RSZ;
+            RSZ=.RAB[RAB$H_RSZ];        ! Save recordsize
+            RAB[RAB$G_BKT]=.RAB[RAB$G_RFA]+1; ! Next page
+            RMS$READ(RAB[$],.ERR);
+            PAGPTR=%O'442200000000'+.CBKD[BKT$A_BUCKET_ADDRESS]; ! Point to it
+            RST[RST$H_BYTE_COUNT]=512*4;    ! This many will fit on a page
+            RAB[RAB$H_RSZ]=.RSZ;        ! Restore recordsize
+            END;
+
+        RST[SAVED_BYTE]=CH$RCHAR_A(PAGPTR);
+
+        RST[RST$H_BYTE_COUNT]=.RST[RST$H_BYTE_COUNT]-1;
+
+        RETURN (.RST[SAVED_BYTE] AND %O'377')
+        END
+    ELSE 
+        BEGIN
+        LOCAL V;
+
+        RST[RST$H_BYTE_COUNT]=.RST[RST$H_BYTE_COUNT]-1;
+        V=(.RST[SAVED_BYTE] ^ -8) AND %O'377';    ! Other half
+        RST[SAVED_BYTE]=NO_BYTE;
+
+        RETURN .V
+        END
+    END;			!End of M11GBY
+ROUTINE M11PBY (RAB,CHAR,ERR) =            ! Put MACY11 byte
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Put byte to MACY11 file
+!
+! FORMAL PARAMETERS:
+!
+!       RAB: A RAB as defined by RMS
+!       CHAR: byte to put
+!       ERR: Address of error routine
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	Standard RMS codes
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+    MAP RAB: REF $RAB_DECL;
+    BIND FAB=.RAB[RAB$A_FAB]: $FAB_DECL;
+    BIND ROUTINE $$ERRRTN=.ERR: RMS_ERCAL;
+    BIND RST=.RAB[RAB$A_ISI]: $RMS_RST;
+    BIND PAGPTR=RST[RST$G_PAGE_POINTER];    ! Byte pointer in bucket
+    BIND CBKD=RST[RST$Z_CURRENT_BUCKET]: $RMS_BUCKET_DESCRIPTOR;
+
+    IF .RST[RST$H_BYTE_COUNT] LEQ 0         ! bucket used up?
+    THEN
+        BEGIN                                           ! we need a new one
+        LOCAL RSZ;
+        RSZ=.RAB[RAB$H_RSZ];
+        RMS$WBUCKET(RAB[$],.ERR);             ! Put out this page
+        RAB[RAB$G_BKT]=.RAB[RAB$G_RFA]+1; ! Next page
+        RMS$READ(RAB[$],.ERR);
+        PAGPTR=%O'442200000000'+.CBKD[BKT$A_BUCKET_ADDRESS]; ! Point to bucket
+        RST[RST$H_BYTE_COUNT]=512*4;    ! This many will fit on a page
+        RAB[RAB$H_RSZ]=.RSZ;        ! Restore recordsize
+        END;
+
+    IF .RST[SAVED_BYTE] NEQ NO_BYTE
+    THEN
+        BEGIN
+        CH$WCHAR_A(.RST[SAVED_BYTE]+(.CHAR^8),PAGPTR);
+        RST[SAVED_BYTE]=NO_BYTE;
+        END
+    ELSE 
+        BEGIN
+        RST[SAVED_BYTE]=.CHAR;
+        CH$WCHAR(.CHAR, .PAGPTR)      ! In case EOF comes immediately
+        END;
+
+    RST[RST$H_BYTE_COUNT]=.RST[RST$H_BYTE_COUNT]-1;
+
+    .RAB[RAB$H_STS]                     ! Return status
+    END;			!End of M11PBY
+
+GLOBAL ROUTINE RL$CMACY11(RAB: REF $RAB_DECL, ERR)=
+!++
+! FUNCTIONAL DESCRIPTION
+!
+!       Special CONNECT-time setup for MACY11 files
+!
+! FORMAL PARAMETERS:
+!
+!       RAB: A RAB as defined by RMS
+!       CHAR: byte to put
+!       ERR: Address of error routine
+!--
+    BEGIN
+    $CONNECT(RAB=RAB[$],ERR=.ERR);      ! Do regular connect
+    IF .RAB[RAB$H_STS] EQL RMS$_SUC
+    THEN
+        BEGIN
+        BIND FAB=.RAB[RAB$A_FAB]: $FAB_DECL;
+        BIND RST=.RAB[RAB$A_ISI]: $RMS_RST;
+        BIND CBKD=RST[RST$Z_CURRENT_BUCKET]: $RMS_BUCKET_DESCRIPTOR;
+        BIND PAGPTR=RST[RST$G_PAGE_POINTER];    ! Byte pointer in bucket
+        LOCAL RSZ;
+        LOCAL FDBBUF: VECTOR[$FBLEN];
+
+        ! Make 18 bit bytesize
+        RST[RST$H_BYTE_COUNT]=0;        ! No bytes available now
+        RST[SAVED_BYTE]=NO_BYTE;        ! No saved byte yet
+
+        ! Set up byte count, and adjust if 36-bit bytes
+        JSYS_GTFDB(.FAB[FAB$H_JFN],$FBLEN^18,FDBBUF);
+
+        RST[RST$G_HIGHEST_BYTE]=.FDBBUF[$FBSIZ];
+        IF (.POINTR((FDBBUF[$FBBYV]),FB_BSZ)) EQL 36
+        THEN RST[RST$G_HIGHEST_BYTE]=.RST[RST$G_HIGHEST_BYTE]*4;
+
+        RSZ=.RAB[RAB$H_RSZ];            ! Save recordsize
+        RAB[RAB$G_BKT]=1;               ! First page
+        RMS$READ(RAB[$],.ERR);
+        PAGPTR=%O'442200000000'+.CBKD[BKT$A_BUCKET_ADDRESS]; ! Point to it
+        RST[RST$H_BYTE_COUNT]=512*4;    ! This many bytes will fit on a page
+        RAB[RAB$H_RSZ]=.RSZ;            ! Restore recordsize
+        END;                            ! 
+    .RAB[RAB$H_STS]                     ! Returned value
+    END;
+
+
+GLOBAL ROUTINE RL$CLMACY11(FAB: REF $FAB_DECL, ERR)=
+!++
+! FUNCTIONAL DESCRIPTION
+!
+!       Special $CLOSE for MACY11 files
+!
+! FORMAL PARAMETERS:
+!
+!       FAB: A FAB as defined by RMS
+!       ERR: Address of error routine
+!--
+BEGIN
+BIND FST=.FAB[FAB$A_IFI]: $RMS_FST;    ! File status table
+BIND RST=.FST[FST$A_FLINK]: $RMS_RST;        ! Record status table
+BIND CBKD=RST[RST$Z_CURRENT_BUCKET]: $RMS_BUCKET_DESCRIPTOR;
+LOCAL SIZE;
+
+IF .FAB[FAB$V_FAC_PUT]                  ! If writing this file
+THEN                                    !  then fix up byte count
+    BEGIN                               !  and byte size
+    SIZE=(.CBKD[BKT$H_BUCKET_NUMBER]+1)*512*4 ! Buckets times bytes per bucket
+         -.RST[RST$H_BYTE_COUNT];       ! Less unused bytes at end
+
+    SIZE=(.SIZE+3)/4;                   ! convert to words to satisfy NFT.
+
+    RMS$WBUCKET(RST[$],.ERR);           ! Write out current bucket
+
+    JSYS_CHFDB(CF_NUD OR ($FBSIZ^18) OR .FAB[FAB$H_JFN],-1,.SIZE);
+    JSYS_CHFDB(CF_NUD OR ($FBBYV^18) OR .FAB[FAB$H_JFN],FB_BSZ,FLD(36,FB_BSZ));
+    ! Fix the FDB up
+    RST[RST$H_BYTE_COUNT]=0;            ! Keep RMS from changing EOF
+    END;
+
+$CLOSE(FAB=FAB[$], ERR=.ERR);      ! Do normal close
+
+.FAB[FAB$H_STS]                         ! Return status
+END;
+
+! Keep old names around
+
+GLOBAL BIND RMS$GMACY11=RL$GMACY11;
+GLOBAL BIND RMS$PMACY11=RL$PMACY11;
+GLOBAL BIND RMS$CMACY11=RL$CMACY11;
+END				!End of module
+ELUDOM

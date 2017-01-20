@@ -1,0 +1,451 @@
+%TITLE 'I M A G E   -- IMAGE record routines'
+!<BLF/REQUIRE 'RMSBLF.REQ'>
+MODULE Image (IDENT = '3.0'
+		) =
+BEGIN
+!
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1984, 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+!++
+! FACILITY:	RMS
+!
+! ABSTRACT:
+!
+!	IMAGE contains all routines dealing with
+!       I/O to Local IMAGE (RFM=UDF) files
+!
+! ENVIRONMENT:	User Mode, Interrupts deferred until return
+!
+! AUTHOR: Andrew Nourse , CREATION DATE:  19-Jun-84
+!         Cloned out of RMSASC, by Ron Lusk
+!--
+
+!
+! TABLE OF CONTENTS
+!
+!
+!	PUTIMAGE -- Process $PUT macro for IMAGE file
+!	GETIMAGE -- Process $PUT macro for IMAGE file
+!
+! INCLUDE FILES:
+!
+
+REQUIRE 'rmsreq';
+
+!
+! EQUATED SYMBOLS:
+!
+
+GLOBAL BIND
+    imagev = 3^24 + 0^18 + 575;			! Edit number
+
+EXTERNAL ROUTINE
+FindIma;
+
+%SBTTL 'PUTIMAGE -- $PUT for IMAGE'
+
+GLOBAL ROUTINE putimage : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!	This routine processes the $PUT macro for IMAGE files.
+!
+! FORMAL PARAMETERS
+!
+!	NONE.
+!
+! IMPLICIT INPUTS
+!
+!	RAB: Address of User RAB
+!       RST: Address of User RST
+!
+! ROUTINE VALUE:
+!
+!	NONE.
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	filepointer,				! Byte pointer to file buffer
+    	userpointer: $byte_pointer,             !  ..    to user buffer !m502
+        bytesperpage,                           ! # of bytes in page    !a504 
+	destsize,				! Size of destination buffer
+	recordsize,				! Size of current record
+	bytestomove,				! Count of bytes to be
+						!   moved to user buffer
+	bytesleft,				! Free bytes in file buffer
+        bytesize;                               ! Byte size to use 
+
+    TRACE ('PUTIMAGE');
+
+    bytesize = .Fst[Fst$h_Bsz];                                           !m575
+    bytesperpage = ( %BPVAL / .bytesize ) * pagesize;			  !m575
+
+    !
+    ! If RFA access is being used, find our place
+    ! 
+    IF rfaadr                       ! If RFA access                  !a573v
+    THEN                            ! Fetch File Page Into User Window
+        BEGIN
+        ! If last oper was Seq $Put, flush buffer
+        IF .Rst[Rst$v_Last_Sequential]
+        AND (.Rst[Rst$v_Last_Operation] EQL C$Put)
+        THEN FluBuf();
+
+        PosAscFil( .Fst[Fst$h_Jfn],
+                   Rst[Rst$g_Data_Rfa] = .Rab[Rab$g_Rfa] );
+        END
+    ELSE                                                             !a573^
+        Rab[Rab$g_Rfa]
+        = Rst[Rst$g_Data_Rfa]
+        = .Rst[Rst$g_Data_Rfa] + .Rst[Rst$h_Record_Size];
+
+    !+
+    !	Set up file and user buffer pointers
+    !-
+
+    userpointer = .Rab[Rab$a_Rbf];      ! User's Ptr to buffer            !m504
+    TGUPointer( userpointer, .bytesize ); ! Make 2-word global if needed  !m504
+    recordsize = .rab [Rab$h_Rsz];		! Get # bytes to write
+
+    !+
+    !	This is the main loop. It continues until the
+    !	entire user record has been written to the file.
+    !-
+
+    WHILE .recordsize GTR 0 DO
+	BEGIN
+
+	!+
+	!   Is our buffer full?
+	!-
+
+	IF .rst [rstbytecount] EQL .bytesperpage        		 !m504 
+	THEN
+            BEGIN
+	    writebuffer ();			! Output full buffer
+            END;
+
+	filepointer = .rst [rstpagptr];		! Fetch file pointer
+
+	bytesleft = .bytesperpage - .rst [rstbytecount];
+
+	!+
+	!   Use the record size or the buffer space left, whichever
+	!   is smaller.
+	!-
+
+	destsize = bytestomove = MIN( .recordsize, .bytesleft );
+
+	!+
+	!   Debugging
+	!-
+
+	lookat ('	FILEPTR: ', filepointer);
+	lookat ('	# BYTES: ', bytestomove);
+	lookat ('	BYTES: ', bytesleft);
+
+	!+
+	!   Do a Move-String With Left Justification to file
+	!-
+
+	BEGIN
+
+	LOCAL
+	    usrbp: $byte_pointer,		! Temporary user ptr !m502
+	    filbp: $byte_pointer,               ! Temporary file ptr
+	    src_len,				! Temporary source length
+	    dst_len;				! Temporary dest. length
+
+	!
+	!   Set up for MOVSLJ instruction
+	!
+
+        ! byte pointer to user buffer
+	usrbp[ptr$a_pointer] = .userpointer[ptr$a_pointer];
+	usrbp[ptr$a_global_address] = .userpointer[ptr$a_global_address];
+
+	filbp = .filepointer;                   ! Local BP to page
+	src_len = .bytestomove;
+	dst_len = .destsize;
+
+	IF moveleft_ea (			! Move the record
+		usrbp, 				! Source
+		filbp, 				! Destination
+		src_len, 			! Size of source
+		dst_len) EQL false		! Size of destination
+	THEN
+	    rmsbug (msgmovestring);		! Move-String failed
+
+	!
+	!   Update our file and buffer pointers
+	!
+	filepointer = .filbp;			! Update pointers
+	userpointer[ptr$a_pointer] = .usrbp[ptr$a_pointer];
+	userpointer[ptr$a_global_address] = .usrbp[ptr$a_global_address];
+
+	recordsize = .recordsize - .bytestomove;
+	rst [rstpagptr] = .filepointer;		! Update pointer
+	END;					! End MOVSLJ block
+	!
+	!   Update # of bytes left in buffer
+	!
+	rst [rstbytecount] = .rst [rstbytecount] + .bytestomove;
+	END;					! Of WHILE loop
+
+    !+
+    !   We have now moved the entire record from the user's buffer
+    !   into the internal RMS-20 file buffer.  We must also reset
+    !   RSTHYBYTE to reflect the highest byte in the file.
+    !-
+    rst [rst$g_highest_byte] = MAX( .rst [rst$g_highest_byte],
+                                    .rab[rab$g_rfa] + .rab [Rab$h_Rsz] ) ;
+
+    Rst[Rst$h_Record_Size] = .Rab[Rab$h_Rsz];
+
+    IF rfaadr THEN WriteBuffer();              ! Write buffer out now.    !a575
+
+    RETURN
+    END;					! End of PUTIMAGE
+
+
+
+%SBTTL 'GETIMAGE -- $GET for IMAGE files'
+GLOBAL ROUTINE getimage (moveflag) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine processes the $GET macro for IMAGE files (UDF record
+!	format).  It transfers one record into the user's buffer, where a
+!	record is defined as (MRS) bytes of (BSZ) size.
+!
+! FORMAL PARAMETERS
+!
+!	MOVEFLAG --	Flag for record transfer:
+!			    True: move the record ($GET)
+!			    False: skip the record (last $GET was partial)
+!
+! IMPLICIT INPUTS
+!
+!	?
+!
+! ROUTINE VALUE:
+!
+!	Number of bytes in record, or number moved if PARTIALFLAG has been set.
+!
+! SIDE EFFECTS:
+!
+!	This routine sets  RSTRHSIZE, which  is the  record header  size.
+!	For IMAGE files the size is zero (no record header).  This  field
+!	is used by the $TRUNCATE processor  to know how much to  subtract
+!	from RSTDATARFA to  find the  beginning of  the current  physical
+!	record.
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	tty_eof,				! EOF on TTY: (^Z seen)	!A441
+	userpointer: $byte_pointer,             ! 2-word Pointer to user buffer
+        bytestomove,                            ! bytes to move this MOVSLJ 
+	exitflag,				! Flag for leaving the loop
+	recordsize,				! Current length of record
+        bytesleft,                              ! # bytes left in buffer 
+	nextword,				! Next file word for LSA files
+	movestatus,				! Temporary variable
+	buffersize,				! Size of user's buffer
+        bytesize;                               ! Byte size to use	!a504 
+
+    TRACE ('GETIMAGE');
+
+    bytesize = .Fab[Fab$v_Bsz];                                         !a504 
+
+    !+
+    !	If unit record device, reset buffer
+    !   Otherwise, check for end of file
+    !-
+
+    IF tty OR llpt				![3] Make LPT work
+    THEN
+	BEGIN					! To reset buffer
+	rst [rstbytecount] = 0;			! Clear buffer
+	rst [rstpagptr] = CH$PTR (.curentbufferadr,	! Clear buffer
+                                  ,                    ! with new pointer 
+                                  .bytesize );    ! File byte size
+	END
+    ELSE
+	BEGIN
+
+	IF endoffile THEN usererror (er$eof);
+
+	END;
+
+    !+
+    !	Set up user buffer pointer, etc.
+    !-
+
+    userpointer = .Rab[Rab$a_Rbf];      				!m504 
+    TGUPointer( userpointer, .bytesize );        			!m504 
+
+    buffersize = 				! Remember size of his buffer
+     .rab [Rab$h_Usz] * ( %BPVAL / .Fab[Fab$v_Bsz] ); ! in bytes
+    recordsize = 0;				! Clear total size
+    rab [Rab$h_Rsz] = 0;			! Clear his record size
+    tty_eof = 0;				! Clear TTY: EOF flag	!A441
+    exitflag = false;				! Loop forever
+
+    !+
+    !	If we are skipping a record, then don't use a user pointer
+    !-
+
+    IF .moveflag EQL false THEN userpointer = 0;	! No data will be moved
+
+
+    rst [rstrhsize] = 0;		! Set record header size to 0
+
+    !+
+    !	This is the main loop. it continues until
+    !	user's buffer is filled, or MRS is reached.
+    !-
+
+    UNTIL .exitflag DO
+	BEGIN
+        !+
+        !   We will now move the entire record
+        !   until we come to either the end
+        !   of the file, or have read (MRS) bytes,
+        !   or filled the user's buffer.
+        !-
+
+	!+
+	!   If buffer is empty, then re-fill it.
+	!-
+
+	IF .rst [rstbytecount] EQL 0 THEN readbuffer ();
+
+	IF endoffile THEN usererror(er$eof)
+	ELSE                                                             !d575
+	    BEGIN                                ! Set up MOVSLJ
+            LOCAL
+                usrbp: $byte_pointer,
+                filbp: $byte_pointer,
+                src_len,
+                dst_len;
+
+            bytestomove = MIN( .Fab[Fab$h_Mrs],
+                               .Rst[Rst$h_byte_count],
+                               .buffersize );                             !m575
+
+            src_len = dst_len = .bytestomove;
+
+            usrbp[ptr$a_pointer] = .userpointer[ptr$a_pointer];
+            usrbp[ptr$a_global_address]
+                  = .userpointer[ptr$a_global_address];
+            filbp = .Rst[Rst$g_Page_Pointer];
+
+            IF MoveLeft_ea(
+                            filbp,
+                            usrbp,
+                            src_len,
+                            dst_len
+                           ) EQL false
+            THEN
+                RmsBug( msgmovestring );            ! Oops, it failed
+
+            userpointer[ptr$a_pointer] = .usrbp[ptr$a_pointer];
+            userpointer[ptr$a_global_address] = .usrbp[ptr$a_global_address];
+            Rst[Rst$g_Page_Pointer] = .filbp;
+
+            recordsize = .recordsize + .bytestomove;
+            buffersize = .buffersize - .bytestomove;                  !a561
+            Rst[Rst$h_byte_count]
+                = .Rst[Rst$h_byte_count] - .bytestomove;              !a572
+            END;                        ! End of MOVSLJ code
+
+
+        IF .recordsize EQL .Fab[Fab$h_Mrs]                            !m561
+        THEN exitflag = true;	! Exit from loop
+
+!++
+!
+!   At this point, we have done the following:
+!
+!	1) moved a full record, or
+!	2) filled the user's buffer, or
+!	3) exhausted the current file buffer.
+!	4) Reached EOF, partial record in user's buffer
+!
+!--
+
+        !+
+        !	Set up the record size field and check for
+        !	a record which is too big for the user's buffer.
+        !-
+
+        IF .moveflag
+        THEN
+            BEGIN
+            rab [Rab$h_Rsz] = .recordsize;	! Update user's record size
+
+            !+
+            !	If we are still trying to process the
+            !	record,  but the buffer is full then
+            !	we have filled the user's buffer.
+            !-
+
+            IF (.exitflag EQL false) AND (.buffersize LEQ 0)
+            THEN
+                BEGIN
+                usrsts = er$rtb;		! Set partial record
+                usrstv = .recordsize;		! Return partial record size
+                setflag (rst [rstflags], flgpartial);	! Remember this
+                exitflag = true			! Leave
+                END
+
+            END;
+
+        END;
+
+    !+
+    !   Store the size of this record in the user's RAB
+    !-
+
+    rst [rstrsz] = .recordsize;			! Pass the record size back
+    !
+    !	Set the RST flag bit which tells FINDIMA that
+    !	the file pointer (PAGPTR) must be updated before
+    !	the next operation can be done.
+    !
+    setflag (rst [rstflags], flgupdptr);
+    !									!A441
+    !   Check that we didn't receive EOF from TTY:			!A441
+    !									!A441
+
+    IF .tty_eof THEN usererror (er$eof);				!A441
+
+    !
+    !	We have now done everything and we can exit.
+    !
+    RETURN .recordsize
+    END;					! End of GETIMAGE
+END ELUDOM                                      ! END OF MODULE
+ 

@@ -1,0 +1,1087 @@
+MODULE comand (					! DOES COMND JSYS
+		IDENT = '13',
+                ENTRY(
+                      comand,           ! Parse a command line
+                      rcline,           ! Read the EXEC's command line
+                      cmdmsg            ! Print vanilla flavored messages
+                      )
+		) =
+BEGIN
+
+!
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1977, 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+!
+
+!++
+! FACILITY: TOPS-20/10 COMND interface for BLISS programs
+!
+! ABSTRACT:
+!   This module interfaces a BLISS  program to the COMND  JSYS.
+!   This is  done by  specifying a  state table  with macros  in
+!   COMAND.R36. This   table is  passed  to the  COMAND  routine
+!   (defined  herein),  which   then  drives   the  COMND   JSYS
+!   accordingly. Automatic  (but  optional)  error  recovery  is
+!   provided, along with  a method  for the  action routines  to
+!   specify "semantic feedback".
+!
+! ENVIRONMENT: To be loaded with a TOPS-20 user mode BLISS program.
+!	Or, to be loaded with a TOPS-10 user mode BLISS program that
+!	has already MERGE'd and initialized GLXLIB.
+!
+! AUTHOR: Bruce Dawson , CREATION DATE: 12-Sep-78
+!
+! MODIFIED BY: Doug Rayner, April, 1984
+!
+! B. Dawson, 7-Oct-78 VERSION 2
+! 02	- Made extensive changes to RCLINE. Turns out that I didn't
+!	have to do everything that I did. Also, PRETTY'ed it up some.
+!
+! 03	- Made COMAND return a value.
+!
+!    B. Dawson, 21-Oct-79
+! 04	- Made RCLINE smarter about reading the EXEC command line.
+!
+!    L. Campbell 7-Feb-82
+! 05    - Fixed RSCAN bugs (typeahead discarded if RCLINE failed), and
+!         improved error message.
+! 06    - Added global CMDNPT, state to go to on a no-parse.
+! 07    - Added magic next state -2 (meaningful for switch/keyword entries
+!         only) which says to take next state from FLDDB block instead
+!         of switch/keyword "dummy FLDDB" block.
+!
+!    L. Campbell 16-Mar-82
+! 08    - Merged in Ray Marshall's $COMAND_OPTION enhancements, made
+!         some names symbolic, added BREAK argument to $COMAND_STATE.
+!
+!    R. Marshall 16-Mar-82
+! 09	- Converted from old to new JSYS linkage
+!
+!    R. Marshall 19-Mar-82
+! 10	- Added CMDRPR.
+!	- Added magical value of -2 for action routines on switch and keyword
+!	  lists.  This will cause the action routine of the calling FLDDB to
+!	  be used instead.
+!	- Fixed bug in testing for the -2 magical value for the "next" value
+!	  in switch and keyword lists.
+!
+!    A. Nourse 11-Aug-82
+! 11    - Print out entire rest of line (not just atom buffer) on error
+! 12    - Put in ENTRY points
+!
+!    D. Rayner 25-Apr-84
+! 13    - Add TOPS-10 support
+!
+!    S. Clemens  3-Dec-85
+! 14    - Add /VARIANT code for DIU "TAKE/ECHO" support.  Compile with
+!         /VARIANT for DIU, without for RMS.
+!--
+
+!
+! TABLE OF CONTENTS:
+!
+FORWARD ROUTINE
+    comand,				! Parse a command line
+    rcline,				! Read the EXEC's command line
+    get_program_name : NOVALUE,         ! Gets the programs name into OWN
+    discard_rscan_buffer,               ! Empties the RSCAN buffer
+    comand_error : NOVALUE,             ! Types an error message
+    move_ASCIZ,                         ! Move an ASCIZ string
+    s_esout : NOVALUE,			! Do an ESOUT JSYS, or simulate one
+    cmdmsg : NOVALUE;			! Print vanilla flavored messages
+!
+! INCLUDE FILES:
+!
+%IF %SWITCHES(TOPS20)
+%THEN
+LIBRARY 'BLI:MONSYM';
+%IF %VARIANT
+%THEN
+LIBRARY 'BLI:XPORT';
+LIBRARY 'FAO';
+LIBRARY 'DIU';
+UNDECLARE
+         %QUOTE lh, %QUOTE rh;
+LIBRARY 'DIUCOMMAND';
+%FI
+%ELSE
+LIBRARY 'bli:uuosym';
+%IF %DECLARED($CMFLG)
+%THEN
+    UNDECLARE
+	$CMFLG;
+%FI
+%FI
+
+LIBRARY 'bli:tendef';
+
+%IF %SWITCHES(TOPS20)
+%THEN
+REQUIRE 'jsysdef.r36';
+%ELSE
+LIBRARY 'uuodef';
+%FI
+
+!
+! MACROS:
+!
+%IF %SWITCHES (TOPS10) %THEN
+BUILTIN
+    UUO;
+%FI
+
+MACRO
+    lh =				! Left half of a word
+	18,18 %,
+    rh =				! Right half of a word
+	0,18 %,
+
+    cmderror (sev, abv, txt) =		! Creates error message
+	cmdmsg (
+	    %IF %IDENTICAL(sev,F) %THEN 2 %ELSE
+	    %IF %IDENTICAL(sev,W) %THEN 0 %ELSE
+	    %IF %IDENTICAL(sev,I) %THEN 1 %ELSE
+	    %ERRORMACRO('First parm to CMDERROR must be either F, W, or I.')
+	    %FI %FI %FI,
+	CH$PTR (UPLIT (%ASCIZ %STRING (abv))),
+	CH$PTR (UPLIT (%ASCIZ %STRING (txt, %REMAINING))) ) %;
+
+%(	Template for CMDERROR macro:
+
+CMDERROR(F,REP,'');
+
+)%
+!
+! EQUATED SYMBOLS:
+!
+%IF %SWITCHES(TOPS10)
+%THEN
+LITERAL
+    CR$RES = 1,				! These should come from GLXMAC
+    CR$PDB = 2,				! but it causes many, many compiler
+    CR$SIZ = 4,				! diagnostics if we LIBRARY GLXMAC
+    RD_NEC = 1,
+
+    $CMBRK = 4,				! These should come from MONSYM
+    $CMFLG = 0,				! but it causes many compiler
+    $CMPTR = 4,				! diagnostics if we LIBRARY both
+    $CMFNP = 0,				! UUOSYM and MONSYM
+    $CMKEY = 0,
+    $CMSWI = 3,
+    CM_RPT = %O'040000000000',
+    CM_NOP = %O'200000000000',
+    $RDDBC = 4,
+    RD_JFN = %O'004000000000',
+    RD_RIE = %O'002000000000',
+    RD_RAI = %O'000200000000',
+    $PRIIN = %O'377776',
+    $PRIOU = %O'377777',
+
+    EREOF$ = 1,			! GLXLIB EOF error code
+    IOX4 = %O'600220';		! TOPS-20 EOF error code
+%FI
+LITERAL
+    extra_word_1 = $CMBRK + 1,          ! Extra words appended to FLDDB block
+    extra_word_2 = $CMBRK + 2;          ! by COMAND.R36 (contain ACTION,
+                                        ! NEXT, and CONTEXT args)
+!
+! OWN STORAGE:
+!
+OWN
+    dbused : REF VECTOR [6],            ! FLDDB actually used by COMND
+    dbgiven : REF VECTOR [6],		! FLDDB given to COMND
+    %IF %SWITCHES(TOPS10)
+    %THEN
+    cmrblk : REF VECTOR [CR$SIZ],	! S%SMND response block
+    %FI
+    oldstate,                           ! state coming from
+    data,				! AC2 on return from COMND
+    program_name : VECTOR [CH$ALLOCATION (7)],
+    program_name_gotten : INITIAL (0),
+    t1,                                ! Temporary storage locations
+    t2,
+    t3;
+
+
+!
+! EXTERNAL REFERENCES:
+!
+GLOBAL
+    cmdsta,			! next state to parse
+    cmderp,			! error message for no parse
+    cmderr,			! return on error flag
+    cmdrpt,             	! State to restart at on reparse
+    cmdrpr,			! Addr. of routine to execute on reparse
+    cmdnpt,             	! State to restart at on noparse
+    cmdcji,			! Continuation of JFN Information
+    cmdcjw;			! Continuation JFN Work area
+
+%IF %VARIANT
+%THEN
+EXTERNAL
+    takeswitches,
+    takeflag;
+%FI
+
+%IF %SWITCHES(TOPS10)
+%THEN
+LINKAGE
+    GLXLIB = PUSHJ (REGISTER=1,REGISTER=2 ; REGISTER=1,REGISTER=2) :
+	LINKAGE_REGS(15,14,0)
+	NOPRESERVE(0,1,2,3,4,5,6)
+	PRESERVE(7,8,9,10,11,12,13);
+
+EXTERNAL ROUTINE
+    %NAME('S%CMND') : GLXLIB,	! CMND JSYS simulator in GLXLIB-10
+    %NAME('S%ERR')  : GLXLIB,	! Get last error message from GLXLIB-10
+    %NAME('K%TPOS') : GLXLIB,	! RFPOS JSYS simulator in GLXLIB-10
+    %NAME('K%BOUT') : GLXLIB,	! PBOUT JSYS simulator in GLXLIB-10
+    %NAME('K%SOUT') : GLXLIB,	! PSOUT JSYS simulator in GLXLIB-10
+    %NAME('K%TXTI') : GLXLIB;	! TEXTI JSYS simulator in GLXLIB-10
+
+BIND ROUTINE
+    S$CMND = %NAME('S%CMND') : GLXLIB,	! CMND JSYS simulator in GLXLIB-10
+    S$ERR  = %NAME('S%ERR')  : GLXLIB,	! Get last error message from GLXLIB-10
+    K$TPOS = %NAME('K%TPOS') : GLXLIB,	! RFPOS JSYS simulator in GLXLIB-10
+    K$BOUT = %NAME('K%BOUT') : GLXLIB,	! PBOUT JSYS simulator in GLXLIB-10
+    K$SOUT = %NAME('K%SOUT') : GLXLIB,	! PSOUT JSYS simulator in GLXLIB-10
+    K$TXTI = %NAME('K%TXTI') : GLXLIB;	! TEXTI JSYS simulator in GLXLIB-10
+%FI
+
+
+GLOBAL ROUTINE comand (start, stateblock, table) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   This routine performs the COMND JSYS. It uses a state table
+!   to describe the various  tokens to parse, where  to go on a
+!   correct parse, action routines to call for each token, etc.
+!   The routine automatically  prints an error  message on a No
+!   Parse JSYS return, and will restart at a specified state on
+!   a reparse  return.  (The  initial  state  is  the parameter
+!   START).
+!      The state  table  defines the  FLDDBs to use, the action
+!   routines to invoke for each FLDDB, the next state to go  to
+!   on a correct parse, and some context to pass to the  action
+!   routine.
+!      Each action routine is user defined and should have three
+!   parameters.  COMAND invokes these  action routines with  the
+!   first parameter being  the contents of  AC2 after the  JSYS,
+!   the second parameter is the current state the parser is  in,
+!   and the third parameter  is the context information  defined
+!   with the FLDDBs. The context information is user defined and
+!   is specified  when  the  state  table  is  designed.  It  is
+!   intended  for  use  by  the  action  routines  so  they  can
+!   precisely determine which state they are in.
+!     If a  reparse occurs,  the  JSYS is  started at  the  state
+!   specified in CMDRPT.  This is  to prevent  execution of  the
+!   $CMINI function so the  user can utilize  the ^H feature  of
+!   the COMND JSYS.
+!
+! FORMAL PARAMETERS:
+!
+!   START:  This is the state number of which to start at.  Usually this state
+!	    contains only the $CMINI function.
+!
+!   STATEBLOCK:	This is the address of the block containing data such as the
+!	    prompt string, atom buffer pointer, etc., and is specified in AC1
+!	    when calling the COMND JSYS.
+!
+!   TABLE:  This is the address of the command state table.  It is a UPLIT of
+!	    chained FLDDB addresses.  Each entry in this table corresponds to a
+!	    state number.  This table is specified with the macros in
+!	    COMAND.R36.
+!
+! IMPLICIT INPUTS:
+!
+!   CMDERP: This contains either zero or a CH$PTR to a string that the user 
+!	    wants printed when a No Parse is returned by the JSYS. If zero is
+!	    specified, then a canned error message is printed, (see the
+!	    defintion of ERRMSG). In either case, the ESOUT JSYS is used to
+!	    output the error message.
+!
+!   CMDERR: This contains either 1 or 0. 1 means to RETURN when either a No
+!	    Parse, or a Reparse is returned by the JSYS. This feature helps
+!	    when interfacing to an existing top-level command processor (such
+!	    as the EXEC).
+!
+!   CMDSTA: A user action routine can set this to the next state he wants
+!	    executed. However, this is done automatically by following the
+!	    State table provided in the call. In either case, if this is ever
+!	    set to -1 (by either the state table, or an action routine), then
+!	    the COMAND routine will RETURN.
+!
+!   CMDRPT: Contains the state number to restart at if Reparse is returned.
+!	    This should NOT point to the state containing $CMINI and MUST be
+!	    specified if CMDERR equals zero.
+!
+!   CMDNPT: Contains the state number to restart at if Noparse is returned.
+!	    During rescanned commands, this should be set to -1.  Otherwise,
+!	    it should be the start state.
+!
+!   CMDRPR: If non-zero, contains the address of a routine to executed on a
+!	    Reparse.
+!
+!   CMDCJI: Contains initial control information for Continuation JFN
+!	    Information.  The format is:
+!
+!		+------------+------------+------------------------+
+!		|   length   |      n     |  information  pointer  |
+!		+------------+------------+------------------------+
+!
+!	    Where "information pointer" points to an option argument block for
+!	    the JFN block; "n" is the number of options in the block; and
+!	    "length" is the number of words in each option.  A typical option
+!	    block might look like this:
+!	    
+!		+-------------------------+   <--- pointer points to here
+!		|     .GJGEN (word 0)     |-\
+!		+-------------------------+  \		length = 6
+!		|     .GJSRC (word 1)     |   |
+!		+-------------------------+   |		     n = 3
+!		|     .GJDEV (word 2)     |   \
+!		+-------------------------+    > first option
+!		|     .GJDIR (word 3)     |   /
+!		+-------------------------+   |
+!		|     .GJNAM (word 4)     |   |
+!		+-------------------------+  /
+!		|     .GJEXT (word 5)     |-/
+!		+-------------------------+
+!		|     .GJGEN (word 0)     |-\
+!		+-------------------------+  \
+!		|     .GJSRC (word 1)     |   |
+!		+-------------------------+   |
+!		|     .GJDEV (word 2)     |   \
+!		+-------------------------+    > second option
+!		|     .GJDIR (word 3)     |   /
+!		+-------------------------+   |
+!		|     .GJNAM (word 4)     |   |
+!		+-------------------------+  /
+!		|     .GJEXT (word 5)     |-/
+!		+-------------------------+
+!		|     .GJGEN (word 0)     |-\
+!		+-------------------------+  \
+!		|     .GJSRC (word 1)     |   |
+!		+-------------------------+   |
+!		|     .GJDEV (word 2)     |   \
+!		+-------------------------+    > third option
+!		|     .GJDIR (word 3)     |   /
+!		+-------------------------+   |
+!		|     .GJNAM (word 4)     |   |
+!		+-------------------------+  /
+!		|     .GJEXT (word 5)     |-/
+!		+-------------------------+
+!
+!
+!   CMDCJW: Contains fields for Continuation JFN Working area.  Its format is:
+!
+!		+-------------------------+------------------------+
+!		|		    n     |    working  pointer    |
+!		+-------------------------+------------------------+
+!
+! IMPLICIT OUTPUTS:
+!
+!   CMDSTA: This is set to the next state that will be executed when the action
+!	    routine returns. It is set before the action routine is called.
+!
+! ROUTINE VALUE:
+!
+!   0  if a transition to state -1 happens.  Otherwise a TOPS-20 error code.
+!
+! SIDE EFFECTS:
+!
+!   Monitor Calls:
+!
+!	COMND
+!       ERSTR
+!	ESOUT
+!
+!   Routine Calls:
+!
+!	The action routines are called.
+!       If a noparse occurs, comand_error is called.
+!--
+
+    BEGIN
+    MAP
+	stateblock : REF VECTOR [10],
+	table : REF VECTOR;
+
+    %IF %VARIANT %THEN
+    LOCAL seen_init : INITIAL (0);
+    %FI
+
+    IF NOT .program_name_gotten
+    THEN
+        get_program_name ();            ! Get name of program from monitor
+    cmdsta = .start;
+    UNTIL .cmdsta<rh, 1> EQL -1 DO
+	BEGIN        
+	%IF %SWITCHES(TOPS20)
+	%THEN
+	    IF NOT jsys_comnd( .stateblock, .table[.cmdsta] ; t1, data, t3 )
+ 	    THEN
+		BEGIN
+		LOCAL
+		error_code;
+		jsys_geter( $FHSLF; error_code);
+		RETURN (.error_code<rh>);
+		END;
+            %IF %VARIANT %THEN
+            IF ( (.stateblock[$CMIOJ]<rh> EQL $NULIO)
+               AND .takeflag
+               AND (.takeswitches EQL TAK_ECHO)
+               AND .(dbgiven[$CMFNP])<27, 9> EQL $CMINI )
+               THEN $MSG_FAO ('!AD!AD',
+                              ASCIZ_LEN(.stateblock[$CMRTY]),
+                              .stateblock[$CMRTY],
+                              ASCIZ_LEN(.stateblock[$CMBFP])-2,
+                              .stateblock[$CMBFP]);
+	    dbgiven = .t3<lh>;
+	    dbused = .t3<rh>;
+            IF .(dbused [$CMFNP])<27, 9> EQL $CMINI
+            THEN seen_init = 1;
+            %ELSE
+	    dbgiven = .t3<lh>;
+	    dbused = .t3<rh>;
+            %FI
+
+	%ELSE
+	    !
+	    !Call GLXSCN routine to simulate CMND
+	    !
+	    IF NOT S$CMND(.stateblock, .table[.cmdsta] ; t1,cmrblk)
+	    THEN
+		BEGIN
+		IF .t1 EQL EREOF$
+		THEN
+		    t1 = IOX4;		! Change GLXLIB EOF to T-20 EOF
+		RETURN(.t1);
+		END;
+
+	    dbgiven = .(cmrblk[CR$PDB])<lh>;
+	    dbused = .(cmrblk[CR$PDB])<rh>;
+	    data = .cmrblk[CR$RES];
+	%FI
+
+	SELECTONE 1 OF
+	    SET
+
+	    ! Noparse
+
+	    [.pointr ((stateblock [$cmflg]), cm_nop)] :
+		BEGIN
+                !
+                ! If user is handling errors, return the error code.
+                !
+		IF .cmderr
+		THEN RETURN (.data);
+                !
+                ! Either output the user's message, or call our fancy routine.
+                !
+                IF .cmderp EQL 0
+                THEN
+                    comand_error (.stateblock)
+                ELSE
+		    s_esout(.cmderp);
+
+		cmdsta = .cmdnpt
+		END;
+
+	    ! Reparse
+	    [.pointr ((stateblock [$cmflg]), cm_rpt)] :
+
+		BEGIN
+
+                IF .cmdrpr NEQ 0 THEN	! If a reparse routine is specified by
+		    (.cmdrpr)		!   the user, invoke it with:
+			(.data,		!     AC2 returned from COMND JSYS,
+			 .cmdsta,	!     Current state number, and
+			 stateblock);	!     pointer to state block
+
+		IF .cmderr THEN		! If user is handling errors,
+		    RETURN (.data)	!   return with the value from AC2
+		ELSE			! Otherwise,
+		    cmdsta = .cmdrpt	!   set (cmdrpt) becomes the next state
+                END;
+
+	    [OTHERWISE] :
+		BEGIN
+                LOCAL
+                    action,             ! Action routine address
+                    next_state,         ! Next state
+                    context_arg;        ! Context arg for action routine
+                !
+                ! If switch or keyword, action info comes not from FLDDB blk,
+                ! but from associated switch/keyword table.
+                !
+		IF .(dbused [$cmfnp])<27, 9> EQL $cmkey OR
+		    .(dbused [$cmfnp])<27, 9> EQL $cmswi
+		THEN
+		    BEGIN
+		    LOCAL
+			blk : REF VECTOR [2],
+			l_switch : REF VECTOR [1];
+                    !
+                    ! Fetch context block address from switch data
+                    !
+		    l_switch = .data;
+		    blk = .(l_switch [0])<rh>;
+                    !
+                    ! See if user wants action routine to come from FLDDB
+                    ! block instead of switch block.
+                    !
+		    IF (action = .(blk [0])<rh,1>) EQL -2
+                    THEN
+                        action = .(dbused[extra_word_1])<rh>;
+                    !
+                    ! See if user wants next state to come from FLDDB
+                    ! block instead of switch block.
+                    !
+		    IF (next_state = .(blk [0])<lh,1>) EQL -2
+                    THEN
+                        next_state = .(dbused[extra_word_1])<lh>;
+		    context_arg = .blk [1];
+		    END
+                ELSE
+                    BEGIN
+                    !
+                    ! Ordinary field, action info lives right in the FLDDB
+                    !
+                    action = .(dbused[extra_word_1])<rh>;
+                    next_state = .(dbused[extra_word_1])<lh>;
+                    context_arg = .dbused[extra_word_2]
+                    END;
+		oldstate = .cmdsta;
+		cmdsta = .next_state;
+                !
+                ! Call action routine if any
+                !
+                IF .action NEQ 0
+		THEN
+		    (.action) (.data, .oldstate, .context_arg);
+		END;
+	    TES;
+
+	END;
+
+    %IF %VARIANT %THEN
+    seen_init = 0;
+    %FI
+    RETURN 0;
+    END;				! End of Routine COMAND
+
+GLOBAL ROUTINE rcline =		! Read command line
+!++
+! FUNCTIONAL DESCRIPTION:
+!  This routine rescans the command  line.  It deletes the  leading
+! filespec from the command line, and  leaves the rest of the  line
+! in the buffer for the COMND JSYS to pick up.  Furthermore, if the
+! filename does  not  match the  program  name, then  there  is  no
+! command, and zero is returned.
+!
+! FORMAL PARAMETERS:
+!
+!	None
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!   1 is returned if there was data for the program 
+! in the command line. 0 is returned if there was an
+! error or if there was no data.
+!
+! SIDE EFFECTS:
+!   The RSCAN and TEXTI JSYSs are performed.
+!
+!--
+    BEGIN
+
+    LITERAL
+	buflen = 325;
+
+    LOCAL
+        char,
+	char_count,			! Count of chars in COMMAND
+	namptr,				! CH$PTR to program name from monitor
+	bufptr;				! CH$PTR to program name in BUF
+
+    OWN
+	onceonly : initial (0),         ! If =1, then don't run again
+	buf : VECTOR [CH$ALLOCATION (BUFLEN)],	! Input buffer
+	break_mask : VECTOR [4] INITIAL (	! Character scanner breakset
+	    !  000000000011111111112222222222333333
+	    !  012345678901234567890123456789012345
+
+%IF %SWITCHES (TOPS20)
+%THEN
+	    %B'000000000010110000000000001100000000',
+%ELSE
+	    %B'000000000010100000000000001100000000',
+%FI
+	    %B'111100111101100100000000000001000000',
+	    %B'100000000000000000000000000000000000',
+	    %B'000000000000000000000000000000000000'),
+
+	    !  44444444555555556666666677777777
+	    !  00000000111111112222222233333333
+	    !  01234567012345670123456701234567
+
+%IF %SWITCHES (TOPS20) %THEN
+	texti_blk : VECTOR [8] INITIAL (7, rd_jfn + rd_rie + rd_rai,
+	    $cttrm^18 + $priou, CH$PTR(buf), BUFLEN, 0,    ![72] job c.t.
+%ELSE
+	texti_blk : VECTOR [8] INITIAL (7, rd_jfn + rd_rie + rd_rai + rd_nec,
+	    $priin^18 + $priou, CH$PTR(buf), BUFLEN, 0,
+%FI
+	    CH$PTR(buf), break_mask);	! Parameters for the TEXTI JSYS
+
+    IF .onceonly THEN return 0;
+    onceonly = 1;
+
+    IF NOT .program_name_gotten
+    THEN
+        get_program_name ();
+
+    ! Read the command line
+
+    %IF %SWITCHES(TOPS20)
+    %THEN
+	IF NOT jsys_rscan($rsini)
+	THEN
+	    RETURN 0;
+    %ELSE
+	IF RESCAN_UUO(1)
+	THEN
+	    RETURN 0;
+    %FI
+
+    ! Read the filespec of the program.
+    %IF %SWITCHES(TOPS20)
+    %THEN
+	IF NOT jsys_texti(texti_blk)
+	THEN
+	    RETURN (discard_rscan_buffer ());
+    %ELSE
+	IF NOT K$TXTI(texti_blk)
+	THEN
+	    RETURN (discard_rscan_buffer ());
+    %FI
+
+    !	If the first token of the command line is not the name of the
+    ! program, then we weren't invoked via @<filename> <commands>,
+    ! in which case, there isn't a command line.
+    namptr = CH$PTR (program_name);
+    bufptr = CH$PTR (buf);
+    INCR i FROM 1 TO MIN (6, (char_count = buflen - .texti_blk[$RDDBC] - 1))
+    DO
+        BEGIN
+        !
+	! Compare each character of the program name, stopping on null.
+        !
+        IF (char = CH$RCHAR_A (namptr)) EQL 0
+        THEN
+            EXITLOOP;
+	IF CH$RCHAR_A (bufptr) NEQ .char
+	THEN 
+	    !
+	    ! Now, if the buffer is terminated with CRLF then there
+	    !  are no program commands.
+	    !
+	    IF CH$RCHAR(CH$PLUS(CH$PTR(buf),.char_count - 1)) NEQ %O'15'
+	    THEN
+            RETURN (discard_rscan_buffer ())
+	ELSE
+	    RETURN(0);
+        END;
+    !
+    ! Read the number of characters left in the command line.
+    ! If there are none, then return 0, otherwise return 1.
+    !
+    BEGIN
+    %IF %SWITCHES(TOPS20)
+    %THEN
+	IF NOT jsys_rscan($RSCNT ; t1)
+	THEN
+	    RETURN (discard_rscan_buffer ());
+	IF .t1 EQL 0 THEN
+	    RETURN (0);
+    %ELSE
+	IF (NOT SKPINC_UUO(0) OR CH$RCHAR(.bufptr) EQL %O'15')
+	THEN
+	    RETURN (0);
+    %FI
+    END;
+
+    RETURN (1);				! Say there is data.
+    END;
+
+ROUTINE get_program_name : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Gets the SIXBIT name of the program from the monitor, and copies
+!   an ASCIZ version of it to PROGRAM_NAME.
+!
+! FORMAL PARAMETERS:
+!   NONE
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   program_name        - gets ASCIZ program name
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   NONE
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+    BEGIN
+
+%IF %SWITCHES (TOPS10) %THEN
+    REGISTER
+	ac;		! Argument pointer #1
+%FI
+
+    LOCAL
+        sixnam,
+        char,
+        src_ptr,
+        dst_ptr;
+
+    %IF %SWITCHES(TOPS20)
+    %THEN
+	jsys_getnm( ; sixnam);
+    %ELSE
+	ac = (-1 ^ 18 + $GTPRG);
+	GETTAB_UUO(ac);
+	sixnam = .ac;
+    %FI
+    src_ptr = CH$PTR (sixnam, 0, 6);
+    dst_ptr = CH$PTR (program_name);
+    INCR i FROM 1 TO 6
+    DO
+        BEGIN
+        char = CH$RCHAR_A (src_ptr);
+        IF .char EQL 0
+        THEN
+            EXITLOOP;
+        CH$WCHAR_A ((.char + %O'40'), dst_ptr);
+        END;
+    CH$WCHAR (0, .dst_ptr);             ! Insure ASCIZ
+    program_name_gotten = 1             ! Remember we've been here
+    END;                                ! End of get_program_name
+
+ROUTINE discard_rscan_buffer =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Discards the input in the RSCAN buffer.
+!
+! FORMAL PARAMETERS:
+!   NONE
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   Returns 0, so failures in RCLINE can RETURN (discard_rscan_buffer).
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+    BEGIN
+    %IF %SWITCHES(TOPS20)
+    %THEN
+	jsys_rscan(CH$PTR(UPLIT(0)));
+    %ELSE
+	WHILE 1 DO
+	BEGIN
+	    !
+	    ! Until we exhaust the input stream, or we see a break
+	    ! character (<BELL>, <LF>, <FF>, <ESC>), eat all characters.
+	    !
+	    IF NOT INCHRS_UUO(t1)
+	    THEN
+		EXITLOOP;
+	    IF .t1 EQL %O'7' OR .t1 EQL %O'10' OR .t1 EQL %O'12'
+		OR .t1 EQL %O'27'
+	    THEN
+		EXITLOOP;
+	END;
+    %FI
+    0
+    END;                                ! discard_rscan_buffer
+
+ROUTINE comand_error (P_stateblock) : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Prints a message of the form:
+!
+!   ?<progname> command error: <TOPS-20 error string>: "<atom-buffer-contents>"
+!
+!   For a typical invalid command, this becomes, (assuming PROG is the program
+!   name):
+!
+!   ?PROG command error:  Unrecognized switch or keyword:  "FOO"
+!
+! FORMAL PARAMETERS:
+!   P_stateblock        - pointer to COMND JSYS state block
+!
+! IMPLICIT INPUTS:
+!   The last error code for this fork.
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   NONE
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+    BEGIN
+
+    BIND
+        stateblock = .P_stateblock : VECTOR [10];
+
+    LOCAL
+        error_message_buffer : VECTOR [CH$ALLOCATION (255)],
+        error_message_pointer,
+        char;
+
+    error_message_pointer = CH$PTR (error_message_buffer);
+    move_ASCIZ (%REF (CH$PTR (program_name)),
+                error_message_pointer);
+    move_ASCIZ (%REF (CH$PTR (UPLIT (%ASCIZ ' command error:  '))),
+                error_message_pointer);
+
+    %IF %SWITCHES(TOPS20)
+    %THEN
+	jsys_erstr( .error_message_pointer, ($FHSLF^18 + %O'777777'), 0 ;
+		error_message_pointer  );
+    %ELSE
+	S$ERR(;t1);
+	move_ASCIZ (%REF (CH$PTR (.t1)),
+		error_message_pointer );
+    %FI
+
+    move_ASCIZ (%REF (CH$PTR (UPLIT (%ASCIZ ': "'))),
+                error_message_pointer);
+    move_ASCIZ (%REF (.stateblock[$CMPTR]),     ![11] Print out all the trash
+                error_message_pointer);
+    !
+    ! Strip off vertical format effectors (CR, LF, FF) and escapes if present
+    !
+    WHILE ((char = CH$RCHAR (CH$PLUS (.error_message_pointer, -1))) EQL 13)
+        OR .char EQL 10
+        OR .char EQL 12
+        OR .char EQL 27
+    DO
+        error_message_pointer = CH$PLUS (.error_message_pointer, -1);
+    CH$WCHAR_A (%C'"', error_message_pointer);
+    CH$WCHAR_A (0, error_message_pointer);
+
+    s_esout(CH$PTR (error_message_buffer))
+
+    END;                                !End of comand_error
+
+ROUTINE move_ASCIZ (sptr, dptr) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Copies and ASCIZ string.
+!
+! FORMAL PARAMETERS:
+!   sptr        - pointer to source byte pointer (returned untouched)
+!   dptr        - pointer to destination byte pointer (returned updated)
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   Returns the number of characters copied, not counting the trailing null.
+!
+! SIDE EFFECTS:
+!    NONE
+!
+!--
+    BEGIN
+
+    LOCAL
+        sp,
+        c;
+
+    sp = ..sptr;                        !Make a copy of source pointer
+    INCR len FROM 0 BY 1
+    DO
+	BEGIN
+	IF (c =CH$RCHAR_A (sp)) EQL 0
+        THEN
+	    BEGIN
+            CH$WCHAR (0, ..dptr);
+            RETURN (.len)
+            END;
+        !
+	! Make ASCIZ string of dest, but don't bump DPTR past null byte
+        !
+	CH$WCHAR_A (.c, .dptr)
+	END
+    END;                                !move_ASCIZ
+%SBTTL 'CMDMSG -- Output error message'
+GLOBAL ROUTINE CMDMSG ( SEVERITY, ABVPTR, TXTPTR) : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!    This routine outputs a TOPS-20 standard error message. If the error is
+!    fatal, any type-ahead is also cleared.  The CMDERROR macro is usually used
+!    to call this routine.
+!
+! FORMAL PARAMETERS:
+!
+!    SEVERITY:	Contains number indicating the seriousness of the error
+!    ABVPTR:	A CH$PTR to the 3 character abbreviation of the error message
+!    TXTPTR:	A CH$PTR to the text of the error message
+!
+! IMPLICIT INPUTS:	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!    CMDSTA:	Set to the initial state on a fatal error to emulate a noparse.
+!
+! ROUTINE VALUE:	NONE
+!
+! SIDE EFFECTS:
+!
+!    RFPOS is called to see if the cursor is at the left margin.
+!    PSOUT is called to type strings.
+!    CFIBF is called to clear typeahead on fatal errors.
+!    PBOUT is called to output the severity prefix character.
+!
+!--
+    BEGIN
+
+    ! Get to column 1 of the terminal.
+    %IF %SWITCHES(TOPS20)
+    %THEN
+	JSYS_RFPOS($priou ; t2);
+
+	IF (.t2 AND %O'777777') NEQ 0
+	THEN
+	    JSYS_PSOUT( CH$PTR(UPLIT(%ASCIZ %CHAR(13, 10))) );
+    %ELSE
+	K$TPOS(;t1);
+	IF .t1 NEQ 0
+	THEN
+	    K$SOUT(UPLIT(%ASCIZ %CHAR(13, 10)));
+    %FI
+    ! Determine message prefix character based on severity:
+
+    CASE .SEVERITY FROM 0 TO 7 OF
+	SET
+	[0]: t1 = %C'%';
+	[1]: t1 = %C'[';
+	[2, INRANGE]: t1 = %C'?';
+	TES;
+
+    ! Output the various pieces of the error message:
+
+    %IF %SWITCHES(TOPS20)
+    %THEN
+	JSYS_PBOUT(.t1);		! leading error indicator character,
+	JSYS_PSOUT( CH$PTR (UPLIT(%ASCIZ 'COMAND-')) );  ! processor prefix,
+	JSYS_PSOUT(.ABVPTR);		! error abbreviation,
+	JSYS_PBOUT( %C' ');		! the space before the error message,
+	JSYS_PSOUT( .TXTPTR );		! the error message and terminating,
+	JSYS_PSOUT( CH$PTR(UPLIT (%ASCIZ %CHAR(13,10))) );	! CRLF.
+    %ELSE
+	K$BOUT(.t1);			! leading error indicator character,
+	K$SOUT(CH$PTR (UPLIT(%ASCIZ 'COMAND-'))) ;  ! processor prefix,
+	K$SOUT(.ABVPTR);		! error abbreviation,
+	K$BOUT(%C' ');			! the space before the error message,
+	K$SOUT(.TXTPTR);		! the error message and terminating,
+	K$SOUT(CH$PTR(UPLIT (%ASCIZ %CHAR(13,10)))) ;	! CRLF.
+    %FI
+
+    ! Check the severity. If it is Fatal, then clear typeahead and
+    ! set the next parser state to 0 (Initialize)
+    IF .SEVERITY EQL 2
+    THEN
+	BEGIN
+	%IF %SWITCHES(TOPS20)
+	%THEN
+	    JSYS_CFIBF( $priin );
+	%ELSE
+	    CLRBFI_UUO(0);
+	%FI
+	CMDSTA = 0;
+	END;
+    END;		! End of routine CMDMSG
+ROUTINE s_esout (sptr) : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Do an ESOUT JSYS or simluate one
+!
+! FORMAL PARAMETERS:
+!   sptr        - pointer to error text
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   NONE
+!
+! SIDE EFFECTS:
+!    NONE
+!
+!--
+    BEGIN
+    %IF %SWITCHES(TOPS20)
+    %THEN
+	jsys_esout(.sptr);
+    %ELSE
+	CLRBFI_UUO(0);
+	OUTSTR_UUO(UPLIT(%ASCIZ %CHAR(13,10,%C'?')));
+	OUTSTR_UUO((CH$PLUS(.sptr,1))<rh>);
+    %FI
+    END;			! s_esout
+
+END
+ELUDOM
+   

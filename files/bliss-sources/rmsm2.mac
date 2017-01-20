@@ -1,0 +1,1080 @@
+TITLE	RMSM2 - Formatted message outputter
+SUBTTL	D. WRIGHT/RL
+;
+;	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1984, 1986.
+;	ALL RIGHTS RESERVED.
+;
+;	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+;	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+;	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+;	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+;	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+;	SOFTWARE IS HEREBY TRANSFERRED.
+;
+;	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+;	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+;	EQUIPMENT CORPORATION.
+;
+;	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+;	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+;
+
+;++
+; FACILITY:	RMSUTL
+;
+; ABSTRACT:
+;
+;	RMSM2 formats messages for RMSUTL and RMS.
+;
+; ENVIRONMENT:	User mode
+;
+; AUTHOR: Dave Wright, CREATION DATE: 1982
+;
+; MODIFIED BY:
+;
+;	Ron Lusk, 6-Feb-84 : VERSION 2.0
+;
+; 455	-	Add support for all RMS key datatypes to the ^S routine
+; 456	-	TXURFA writes out an RFA as "ID / BUCKET"; it should be
+;		written as "BUCKET / ID".
+;--
+SEARCH	 RMSMAC,RMSINT
+
+
+
+
+IFN TOP$20,<
+	SEARCH	MONSYM,MACSYM
+>
+IFE TOP$20,<
+	SEARCH	UUOSYM,MACTEN
+>
+
+SALL
+
+$PROLOG
+
+DEFINE $GETA,<		;Get next arg
+	MOVE	T1,(AP)
+	AOJ	AP,
+>
+
+DEFINE $PUTA,<		;[455] Put an argument back
+	SOJ	AP,
+	MOVEM	T1,(AP)
+>
+
+OPDEF	PJRST	[JRST]
+OPDEF	IFIW	[1B0]
+
+AP==T4+1	;Arg pointer
+
+SIZDST==^D100*5-1	;Output buffer size (ASCII bytes)
+TMPBSZ==^D20*5-1	;Max size of string in temp buffer
+
+ENTRY	TX$OUT		;Output to terminal
+ENTRY	TX$SET		;Setup buffer output routine
+ENTRY	TX$RPT		;Output to alternate destination
+
+;Datatype MOVST conversion tables included here:
+; For converting strings to/from ASCII.
+
+INTERN	A.TO.S, S.TO.A, E.TO.A, A.TO.E
+
+;Common formats
+
+INTERN	MF$ASZ		;Type ASCIZ string, no interpretation
+INTERN  FFMT		;Format control for FLOUT, DFOUT
+
+;Locations used (in RMS globals area)
+
+EXTERN	NOCRFL,NOOUTF,STRBP,NARGS,TEMPBP,TEMPCC,RETAD
+EXTERN	TTYBP,TTYCC,ALTBFP,ALTCC,DSTBP,DSTCC,OUTBUF
+EXTERN	TEMPBF,ALTOUT,ALTBCC,BUFDMP,BUFINT,SVT34,SVT56
+
+PACMAX==^D22	;Maximum packed-decimal field length
+
+;TX$OUT: Call: (BLISS-36 usage)
+;	PUSH P,arg1
+;	PUSH P,arg2
+;	PUSH P,[addr of string] ;local section addr
+;	PUSHJ P,TX$OUT
+;	<return here>
+;
+;or use $CALLB (arg1,arg2..[addr of string]) ;In MACRO
+;
+;Special sequences in the text (Keyed on up-arrow character):
+
+DEFINE UPDISP,<
+XLIST
+UPDS	"^",UPA		;^^ - one up-arrow
+UPDS	"A",ASZ,1	;^A - insert ASCIZ string
+UPDS	"B",ASC,2	;^B - ASCII string (2 args, 1=len)
+UPDS	"C",NCC		;^C - Message to continue (Don't type CRLF, don't output
+			;     it either)
+UPDS	"D",DAT,1	;^D - Output a date and time
+UPDS	"J",JSS,1	;^J - Output JSYS error number
+UPDS	"L",CRF		;^L - Type a CRLF here
+UPDS	"N",NOC		;^N - Don't append CRLF to this message
+UPDS	"R",RFA,1	;^R - Output RFA as page#/ID#
+UPDS	"S",STR,1	;^S - String (any flavor) with len
+			;  one argument is [EXP bp,len,datatype]
+UPDS	"1",DEC,1	;^1 - Output decimal number
+UPDS	"2",OCT,1	;^2 - Output octal number
+UPDS	"P",PAC,1	;^P - Output packed-decimal number
+UPDS	"E",DOU,1	;^E - Output Double-Floating-point number
+UPDS	"F",FLO,1	;^F - Output Floating-point number
+UPDS	"G",GFL,1	;^G - Output GFloating number
+UPDS	"8",LON,1	;^8 - Output Long Integer in Decimal
+UPDS	"5",R50,1	;^5 - Output RADIX-50 number
+UPDS	"U",UNS,1	;^U - Output Unsigned number
+LIST
+>;END UPDISP MACRO
+
+
+$PURE
+
+;Format word for TOPS-20 FLOUT% and DFOUT% JSYS
+FFMT:	Z		;Default to free form floating point output
+
+;Simple message formats
+
+MF$ASZ:	ASCIZ/^A/	;No frills
+
+;TX$RPT is the same as TX$OUT except outputs to altenate destination
+; buffer, with alternate routine to signal buffer full.
+;You must have called TX$SET first
+
+TX$RPT:	SETOM	ALTOUT		;Output to alternate buffer
+	JRST	TXOUT0		;Go on
+
+;TX$OUT is the TTY output routine
+
+TX$OUT:	SETZM	ALTOUT		;Output to TTY
+TXOUT0:	PUSHJ	P,GETARG	;Get args, resolve addresses
+	SKIPE	NOOUTF		;Is this a continued message?
+	 JRST	TXYCON		;Yes
+	SKIPN	ALTOUT		;Skip if alternate output init
+	 JRST	TXOUT1		;No
+	PUSHJ	P,@BUFINT	;Init buffer pointers
+	MOVE	T1,ALTBCC	;Get address of where user stored BP, CC
+	DMOVE	T1,(T1)		;Fetch it
+	DMOVEM	T1,DSTBP	;Save dest BP, char count.
+	JRST	TXYGO		; and go.
+
+TXOUT1:	PUSHJ	P,INIBF		;Init buffer pointer, char count
+	JRST	TXYGO		; and go.
+
+;Previous message continued.
+
+TXYCON:	DMOVE	T1,TTYBP	;Assume TTY stuff
+	SKIPE	ALTOUT		; Unless this was a call of TX$RPT
+	 DMOVE	T1,ALTBFP	;. .
+	DMOVEM	T1,DSTBP	;Setup initial dest BP, CC to continue.
+
+;Initialize Per-call variables
+
+TXYGO:	SETZM	NOOUTF		;String not continued.
+	SETZM	NOCRFL		;Clear "no crlf" flag.
+
+;Come here to interpret next character of message format.
+
+TXLUP:	ILDB	T1,STRBP	;Get char from string
+	JUMPE	T1,TXOUTD	;Done, do something
+	CAIN	T1,"^"		;Up-arrow?
+	 JRST	TXUP		;Yes, do something funny.
+TXUUPA:	PUSHJ	P,PUTC		;Put char in dest string
+	JRST	TXLUP		;Loop
+
+;Here if up-arrow seen and we care.
+
+DEFINE UPDS (CHAR,NAM,ARGS<0>),<
+	CAIN	T1,CHAR
+	 JRST	TXU'NAM
+>
+
+TXUP:	ILDB	T1,STRBP	;Get next char
+	UPDISP			;Dispatch
+	MOVEI	T1,[ASCIZ/?? RMS message error ??/]
+	JRST	TXASZO		;Output like this
+
+;Append ASCIZ string
+
+TXUASZ:	$GETA			;Fetch arg
+TXASZO:	TLNN	T1,770000	;BP?
+	 HRLI	T1,(POINT 7,)	;No, make local BP
+	MOVEM	T1,TEMPBP	;Save BP
+TXASZ1:	ILDB	T1,TEMPBP
+	JUMPE	T1,TXLUP	;Jump if null seen
+	PUSHJ	P,PUTC		;Output character
+	JRST	TXASZ1		;Loop
+
+TXUNCC:	SETOM	NOOUTF		;Message continues past end.
+TXUNOC:	SETOM	NOCRFL		;Set "No CRLF" flag
+	JRST	TXLUP		;Go on.
+
+;Append JSYS error
+
+TXUJSS:	$GETA			;Get jsys number (-1 if last)
+IFN TOP$10,	HALT .		;?No can do for TOPS-10
+IFN TOP$20,<
+	HRLI	T1,.FHSLF	;My fork
+	MOVE	T2,T1		;Put in T2
+	MOVE	T1,[POINT 7,TEMPBF] ;Output place
+	MOVEI	T3,TMPBSZ	;Size of buffer
+	ERSTR%			;Get the error text
+	 JFCL
+	  JFCL
+	MOVEI	T1,TEMPBF	;Append ASCII string
+	PUSHJ	P,APPASZ
+>;END IFN TOP$20
+	JRST	TXLUP		;Go on
+
+;Append ASCII string with len as arg.
+
+TXUASC:	$GETA			;Get ptr to string
+	TLNN	T1,770000	;BP?
+	 HRLI	T1,(POINT 7,)	;No, make local BP
+	MOVEM	T1,TEMPBP	;Save it
+	$GETA			;Get char count
+	MOVEM	T1,TEMPCC	;Save it
+TXAS1L:	SOSGE	TEMPCC		;String exhausted?
+	 JRST	TXLUP		;Yes, go on
+	ILDB	T1,TEMPBP	;Get char
+	PUSHJ	P,PUTC		;Store it
+	JRST	TXAS1L		;Loop
+
+;Append CRLF
+
+TXUCRF:	MOVEI	T1,.CHCRT
+	PUSHJ	P,PUTC
+	MOVEI	T1,.CHLFD
+	PUSHJ	P,PUTC
+	JRST	TXLUP
+
+;Append Date/time string
+
+TXUDAT:	$GETA			;Get t1= internal date/time
+	SETZ	T3,		;Set flag saying both date and time
+	JRST	PUTDT
+
+;Routine to append date/time to string
+;Call:	T3/ flags (TOPS20: OD%NTM,OD%NDA, or 0)
+;	T1/ Date-time in internal format
+;	returns to TXLUP when done
+
+PUTDT:
+IFN TOP$20,<
+	MOVE	T2,T1		;Get date/time in T2
+	MOVE	T1,[POINT 7,TEMPBF] ;Get ptr to temp buffer
+	MOVEM	T1,TEMPBP
+	ODTIM%			;DO it
+	 ERJMP	EROWE		;?Couldn't put it out
+PUTDT1:	ILDB	T1,TEMPBP	;Get char
+	JUMPE	T1,TXLUP	;Return when done
+	PUSHJ	P,PUTC		;Output char
+	JRST	PUTDT1		;Loop until null
+
+EROWE:	MOVEI	T1,[ASCIZ/** Bad date-time **/]
+	JRST	TXASZO		;Output error message instead
+>;END TOP$20
+
+IFN TOP$10,<
+	MOVEI	T1,[ASCIZ/** Date-time output NYI **/]
+	JRST	TXASZO
+>;END TOP$10
+
+;Append random string
+
+TXUSTR:	$GETA			;Get addr of [EXP BP,len,datatype]
+	MOVE	T3,2(T1)	;Get T3= datatype
+	DMOVE	T1,(T1)		;Get t1= BP, t2= len
+	MOVEM	T1,TEMPBP
+	MOVEM	T2,TEMPCC
+	MOVE	T1,[XWD -NDTPS,TXUSTD]	;AOBJN word to datatype table
+TXUST1:	HLRZ	T2,(T1)		;Get datatype
+	CAIN	T2,(T3)		;This the one?
+	 JRST	TXUST2		;Yes, go dispatch
+	AOBJN	T1,TXUST1	;Loop till found
+	MOVEI	T1,[ASCIZ/*** Message error - datatype not supported /]
+	JRST	TXASZO		;Put error in message
+TXUST2:	HRRZ	T2,(T1)		;Get dispatch address
+	JRST	(T2)		;Dispatch
+
+TXUSTD:	DT%SIX,,TXUS6		;Sixbit
+	DT%ASC,,TXUS7		;ASCII
+	DT%EBC,,TXUS9		;EBCDIC
+	DT%PAC,,TXUSP		;[455] Packed Decimal
+	DT%FL1,,TXUSF1		;[455] One-word floating
+	DT%FL2,,TXUSF2		;[455] Two-word floating
+	DT%GFL,,TXUSGF		;[455] G-floating
+	DT%IN4,,TXUSI4		;[455] One-word integer
+	DT%AS8,,TXUS7		;[455] Hope standard ASCII works
+	DT%IN8,,TXUSI8		;[455] Two-word integer
+	DT%UN4,,TXUSU4		;[455] Unsigned word
+NDTPS==.-TXUSTD			;Number of supported datatypes
+
+;
+; TXUSU4 - Unsigned integer output
+;
+; There is a 36-bit byte pointer to the data in TEMPBP on entry.
+; Put the integer out in octal, using TXUOCT.
+;
+TXUSU4:	HRRZ	T1,TEMPBP	;[455] Get address of data
+	MOVE	T1,(T1)		;[455] Get data itself
+	$PUTA			;[455] Throw it on stack
+	JRST	TXUOCT		;[455] Output in octal
+
+;
+; TXUSI8 - Two-word integer output
+;
+; A 36-bit byte-pointer to the data is in TEMPBP on entry.
+; The output routine requires the address of the doubleword
+; as an argument, so oblige it.
+;
+TXUSI8:	HRRZ	T1,TEMPBP	;[455] Get address of doubleword
+	$PUTA			;[455] Put it back as an argument
+	JRST	TXULON		;[455] Output a doubleword
+
+;
+; TXUSI4 - One-word integer
+;
+; A 36-bit byte pointer to data is in TEMPBP on entry.
+; Throw the data itself back on the argument list and
+; call the decimal output routine.  First, however, put
+; out a sign if appropriate.
+;
+TXUSI4:	HRRZ	T1,TEMPBP	;[455] Get the address
+	MOVE	T1,(T1)		;[455] Get the number proper
+	JUMPGE	T1,TXUS4I	;[455] Leave positive numbers alone
+	MOVNS	T1		;[455] Make it negative
+	$PUTA			;[455] Put it on the stack
+	MOVEI	T1,"-"		;[455] Put out a minus sign
+	PUSHJ	P,PUTC		;[455] ...
+	JRST	TXUDEC		;[455] Output in decimal
+TXUS4I:	$PUTA			;[455] Put positive number on stack
+	JRST	TXUDEC		;[455] Go do the output
+
+;
+; TXUSGF - G-floating output
+;
+; A 36-bit byte pointer to data is in TEMPBP on entry.
+; Take only the data's address from it and "replace" 
+; that as an argument, then jump to TXUGFL.
+;
+TXUSGF:	HRRZ	T1,TEMPBP	;[455]
+	$PUTA			;[455]
+	JRST	TXUGFL		;[455]
+;
+; TXUSF2 - Two-word floating output
+;
+; A 36-bit byte pointer to data is in TEMPBP on entry.
+; Take only the data's address from it and "replace" 
+; that as an argument, then jump to TXUDOU.
+;
+TXUSF2:	HRRZ	T1,TEMPBP	;[455]
+	$PUTA			;[455]
+	JRST	TXUDOU		;[455]
+
+;
+; TXUSF1 - One-word floating output
+;
+; A 36-bit byte pointer to data is in TEMPBP on entry.
+; Use it to fetch the data and put the data on the stack,
+; then enter TXUFLO.
+;
+TXUSF1:	HRRZ	T1,TEMPBP	;[455] Get address of data
+	MOVE	T1,(T1)		;[455] Get floating-point number
+	$PUTA			;[455] Shove it back on the stack
+	JRST	TXUFLO		;[455] Put the number out
+
+;
+; TXUSP - Packed decimal output
+;
+; Byte pointer is in TEMPBP on entry.  Put it back on the
+; stack and enter TXUPAC as a normal entry.
+;
+TXUSP:	MOVE	T1,TEMPBP	;[455] Get pointer back
+	$PUTA			;[455] Put argument "back"
+	JRST	TXUPAC		;[455] Output packed number
+
+;Sixbit string
+
+TXUS6:	SOSGE	TEMPCC		;Any more chars?
+	 JRST	TXLUP		;No, go on
+	ILDB	T1,TEMPBP	;Get char
+	ADDI	T1,40		;Make ASCII
+	PUSHJ	P,PUTC		;Output the character
+	JRST	TXUS6		;Loop for whole string
+
+;7-bit ASCII string
+TXUS7:	SOSGE	TEMPCC		;Any more chars?
+	 JRST	TXLUP		;No, go on
+	ILDB	T1,TEMPBP	;Get char
+	PUSHJ	P,PUTC		;Output the character
+	JRST	TXUS7		;Loop for whole string
+
+;EBCDIC string
+; Have to use MOVST to get ASCII string.
+
+TXUS9:	DMOVEM	T3,SVT34	;Save some acs
+	DMOVEM	5,SVT56		;For EXTEND to use
+TXUS9L:	MOVE	T1,TEMPCC	;Get source length
+	MOVE	T2,TEMPBP	;Source BP
+	SETZB	T3,6		;[455] Zero extra ACs
+	MOVEI	4,TMPBSZ	;[455] Get dest length
+	MOVE	5,[POINT 7,TEMPBF] ;dest BP
+	EXTEND	1,[EXP <MOVST E.TO.A>,<0>] ;[455] Translate, no fill
+	 JFCL			;Source too long, we'll see that in a min.
+	TLZ	T1,777000	;[455] Zero significance bits before saving
+	PUSH	P,T1		;Save # chars not moved
+	PUSH	P,T2		; updated source ptr.
+	SETZ	T1,		;Insure null at end of string
+	IDPB	T1,5
+	MOVEI	T1,TEMPBF	;Get addr of ASCIZ string
+	PUSHJ	P,APPASZ	;Append ASCIZ string
+	POP	P,TEMPBP	;TEMPBP
+	POP	P,TEMPCC
+	SKIPE	TEMPCC		;Any more to do?
+	 JRST	TXUS9L		;Yes, loop
+
+TXUS9D:	DMOVE	5,SVT56		;Restore acs
+	DMOVE	T3,SVT34
+	JRST	TXLUP
+
+;Routine to append an ASCIZ string
+;Uses TEMPBP
+;Call: T1/ addr of ASCIZ string
+
+APPASZ:	HRLI	T1,(POINT 7,)	;Ptr to string
+	MOVEM	T1,TEMPBP
+APPAS1:	ILDB	T1,TEMPBP
+	JUMPE	T1,APPAS2
+	PUSHJ	P,PUTC
+	JRST	APPAS1
+APPAS2:	POPJ	P,
+
+;Append decimal numbers
+
+TXUDEC:	MOVEI	T1,^D10		;Get decimal			;m512
+	MOVEM	T1,TEMPCC	;Save temp radix
+	$GETA			;Get number
+	PUSHJ	P,TXUBAS	;Output number
+	JRST	TXLUP		;And loop.
+
+; Unsigned Octal
+
+TXUOCT:	$GETA			;Get the number				;a512vv
+	MOVE	T2,T1		;Put the number in a safer place
+	MOVE	T3,[440300,,T2]	;Make byte pointer		
+	MOVSI	T4,^D-12	;Counter in LH
+TXUOLP:	ILDB	T1,T3		;Get a digit
+	TRNN	T4,200000	;Significant?
+	 JUMPE	T1,TXUOC1	;Maybe not
+	TRO	T4,200000	;Yes, a significant digit
+	ADDI	T1,"0"		;Ascisize
+	PUSHJ	P,PUTC		;Output it
+TXUOC1:	AOBJN	T4,TXUOLP	;Loop
+	JRST	TXLUP		;Continue				;a512^^
+
+;Append RFA
+
+TXURFA:	$GETA			;Get P#,,id#
+	PUSH	P,T1		;Save that a sec.
+	MOVEI	T2,^D10		;Output dec number
+	MOVEM	T2,TEMPCC
+	HRRZ	T1,T1		;[456] Get page #
+	PUSHJ	P,TXUBAS
+	MOVEI	T1,"/"
+	PUSHJ	P,PUTC
+	POP	P,T1
+	HLRZ	T1,T1		;[456] Get id #
+	PUSHJ	P,TXUBAS	;Put it out
+	JRST	TXLUP		; and loop back
+
+;Routine to append a number in a base.
+; Number in t1, base in TEMPCC.
+
+TXUBAS:	IDIV	T1,TEMPCC	;Divide by base
+	PUSH	P,T2
+	SKIPE	T1
+	PUSHJ	P,TXUBAS	;Recurse
+	POP	P,T1
+	ADDI	T1,"0"		;Make ASCIZ character
+	PJRST	PUTC		;Output it and unwind
+
+
+TXOLON:				;Type out a long integer in decimal
+	DMOVE	T4,(T1)		;Get the number into T2-T3-T4-T5
+	JUMPGE	T4,TXOLO0	;Is it positive
+	 MOVEI	T1,"-"		;Type minus sign
+	 PUSHJ	P,PUTC		;
+	 DMOVN	T4,T4		;Get absolute value
+	
+TXOLO0:	SETZB	T2,T3		;Zero two high-order ACs
+	DDIV	T2,[EXP 0,^D10]	;Divide it by the radix
+	PUSH	P,T5		;Save remainder
+	DMOVE	T4,T2		;Move quotient back down
+	JUMPN	T3,.+2		;Not done unless both
+	JUMPE	T2,TXOLO1	;registers are zero
+	 PUSHJ	P,TXOLO0	;Recurse
+TXOLO1:	POP	P,T1		;Retrieve a remainder
+	MOVEI	T1,"0"(T1)	;Ascisize it
+	PJRST	PUTC		;Output character & return
+
+
+TXODOU: SKIPA	T2,[CVTDL##]	;Type Double precision floating in decimal
+TXOGFL:  MOVEI	T2,CVTGL##	;Type out a G-Floating integer in decimal
+	ADJSP	P,2		;Make room for the result
+	PUSH	P,T1 		;Addr of Gfloat
+	MOVEI	T1,-2(P)	;Addr of local storage we just created
+	PUSH	P,T1		;Pass this also to the routine
+	PUSHJ	P,(T2)		;Convert to Long integer with scale factor
+	ADDI	T1,^D19		;Adjust scale factor for decimal point
+	MOVEM	T1,(P)		;addr containing long int <> Scale factor
+	DMOVE	T4,-3(P)	;Get it
+	JUMPGE	T4,TXOGL1	;Is it positive
+	 DMOVN	T4,T4		;No, negate it
+	 MOVEI	T1,"-"		;Type minus sign
+	 PUSHJ	P,PUTC		;
+TXOGL1:	SETZB	T2,T3
+	DDIV	T2,[2126,,162140
+		 221172,,0]	;Divide by 10**19
+	DMOVEM	T4,-3(P)	;Put remainder back
+	MOVEI	T1,"0"(T3)	;Convert quotient into first digit
+	PUSHJ	P,PUTC		;Type first digit
+	MOVEI	T1,"."		;Type decimal point
+	PUSHJ	P,PUTC		;
+	MOVEI	T1,-3(P)	;Addr of long integer
+	PUSHJ	P,TXOLON	;type rest of it
+	MOVEI	T1,"E"		;Introduce the exponent
+	PUSHJ	P,PUTC		;
+	SKIPL	(P)		;Is exponent negative?
+	 SKIPA	T1,["+"]	;Type plus sign
+	MOVEI	T1,"-"		;Type minus sign
+	PUSHJ	P,PUTC		;
+	MOVEI	T1,^D10		;Set to base 10
+	MOVEM	T1,TEMPCC	;
+	POP	P,T1		;Get back scale factor
+	MOVM	T1,T1		;Make it absolute
+	PUSHJ	P,TXUBAS	;Type it
+	ADJSP	P,-3		;Return local storage
+	POPJ	P,		;Return
+
+
+;RADIX50 arg.
+
+TXUR50:	$GETA			;Fetch the arg.
+	TLZ	T1,740000	;Insure the flag bits are off
+	MOVEI	T4,6		;Len of R50 field
+R50PLP:
+	IDIVI	T1,50		;Get current low-order digit
+	SETZ	T3,		;Start with null match
+	CAIL	T2,1		;In digit range?
+	 MOVEI	T3,"0"-1(T2)	;Yes
+	CAIL	T2,13		;In alpha range?
+	 MOVEI	T3,"A"-13(T2)	;Yes
+	CAIN	T2,45		;Match "."?
+	 MOVEI	T3,"."		;Yes
+	CAIN	T2,46		;Match "$"?
+	 MOVEI	T3,"$"		;Yes
+	CAIN	T2,47		;Match "%"?
+	 MOVEI	T3,"%"		;Yes
+	JUMPE	T3,R50PLE	;Exit on nul
+	PUSH	P,T3		;Save till end
+	SOJG	T4,R50PLP	;Loop back if more left
+R50PLE:
+	HRREI	T4,-6(T4)	;Get neg # chars processed by R50PLP
+R50CLP:	POP	P,T1		;Get char back
+	PUSHJ	P,PUTC		;Write it out
+	AOJL	T4,R50CLP
+	JRST	TXLUP		; And loop
+
+TXUFLO:				;Floating Point				;A411
+	$GETA			;Get number
+	PUSH	P,T1		;Make it double
+	ASH	T1,-^D35	;Make the second word look like the sign bit
+	PUSH	P,T1		;
+	MOVEI	T1,-1(P)	;Addr of the now-double floating number
+	PUSHJ	P,TXODOU	;Type it out
+	ADJSP	P,-2		;Restore stack
+	JRST	TXLUP		;And loop.
+TXUDOU:				;Double Floating Point			;A411
+	$GETA			;Get number
+	PUSHJ	P,TXODOU	;Print it
+	JRST	TXLUP		;And loop.
+TXUGFL:				;G-Floating Point			;A411
+	$GETA			;Get addr of number
+	PUSHJ	P,TXOGFL	;Print it				;A411
+	JRST	TXLUP		;And loop.
+TXUUNS:				;Unsigned Integer			;A411
+	$GETA			;Get number				;A411
+	PUSH	P,[0]		;Make long integer			;A411
+	PUSH	P,T1		;on stack				;A411
+	MOVEI	T1,-1(P)	;Get addr of it				;A411
+	PUSHJ	P,TXOLON	;Type it out				;A411
+	ADJSP	P,-2		;Fix stack				;A411
+	JRST	TXLUP		;And Loop
+TXULON:				;Long Integer				;A411
+	$GETA			;Get number
+	PUSHJ	P,TXOLON	;Print it				;A411
+	JRST	TXLUP		;And loop.
+TXUPAC:				;Packed Decimal				;A411
+	MOVEI	T1,PACMAX	;Max packed field size			;A411
+	CAML	T1,DSTCC	;Enough room in buffer?
+	 PUSHJ	P,PUTCDM	;No, dump what we got.
+	$GETA			;Get byte pointer to packed number	;A411
+	MOVEM	T1,TEMPBP	;Routine wants				;A411
+	MOVEI	T1,TEMPBP	; addr of byte pointer			;A411
+	MOVEI	T2,DSTBP	; addr of dest byte pointer		;A411
+	$CALLB	CVTPS##,<T1,T2>	;Print it				;A411
+	MOVNS	T1		;Negate 
+	ADDM	T1,DSTCC	;Subtract from char count
+	JRST	TXLUP		;And loop.
+
+;Here when done outputting string.
+
+TXOUTD:	SKIPE	NOOUTF		;Don't output string?
+	 JRST	TXRET		;Right, return and let him append to string.
+	SKIPE	NOCRFL		;Unless flag set
+	 JRST	TXOUTE
+	MOVEI	T1,.CHCRT	;He wants CRLF
+	PUSHJ	P,PUTC
+	MOVEI	T1,.CHLFD	;. .
+	PUSHJ	P,PUTC
+TXOUTE:	SKIPN	ALTOUT		;Skip if alternate output routine
+	 PJRST	DMPBUF		;No, just dump buffer and return to caller
+	JRST	@BUFDMP		;Yes, dump alternate buffer and return to caller
+
+;Return but don't output string Yet.
+; We have to store the BP and char count where we are.
+
+TXRET:	DMOVE	T1,DSTBP	;Get BP, CC
+	SKIPE	ALTOUT		;Skip if regular output.
+	 JRST	TXRETA
+	DMOVEM	T1,TTYBP	; TTY output
+	POPJ	P,
+TXRETA:	DMOVEM	T1,ALTBFP	;Save alternate BP, CC
+	POPJ	P,		;Return to user.
+
+;Routine to output character
+;Uses only T1
+
+PUTC:	SOSGE	DSTCC		;Any room?
+	 JRST	PUTCDM		;No, dump what we got.
+	IDPB	T1,DSTBP
+	POPJ	P,
+
+;Buffer is full, dump it.
+
+PUTCDM:	PUSH	P,T1		;Save char
+	SKIPE	ALTOUT		;Alternate output?
+	 JRST	PUTCDA		;Yes
+	PUSHJ	P,DMPBUF	;Dump buffer
+	PUSHJ	P,INIBF		;Re-Init buffer
+	POP	P,T1		;Restore char
+	JRST	PUTC		;Try outputting char now.
+
+PUTCDA:	PUSH	P,T2		;Allow user to smash any temp ac's.
+	PUSH	P,T3
+	PUSH	P,T4
+	PUSHJ	P,@BUFDMP	;Call user's routine to dump buffer
+	PUSHJ	P,@BUFINT	;Call user's routine to re-init buffer
+	MOVE	T1,ALTBCC	;Get address of char count,,byte ptr
+	DMOVE	T1,(T1)		;Get new stuff
+	DMOVEM	T1,DSTBP	;Save new dest BP, char count
+	POP	P,T4
+	POP	P,T3
+	POP	P,T2
+	POP	P,T1
+	JRST	PUTC		;Try outputting char now.
+
+;Routine to dump TTY buffer
+
+DMPBUF:	MOVEI	T1,0
+	IDPB	T1,DSTBP	;Store null
+IFN TOP$10,<
+	OUTSTR	OUTBUF
+>
+IFN TOP$20,<
+	HRROI	1,OUTBUF
+	PSOUT%
+>
+	POPJ	P,
+
+;Routine to init TTY buffer pointer and char count
+; Just stores directly into DSTBP and DSTCC
+
+INIBF:	MOVE	T1,[POINT 7,OUTBUF]
+	MOVEM	T1,DSTBP	;Save dest. BP
+	MOVEI	T1,SIZDST	;# chars in buffer
+	MOVEM	T1,DSTCC	;Save char count
+	POPJ	P,		;Return
+
+;Routine to get args, put string BP in STRBP.
+
+GETARG:	MOVE	T1,-2(P)	;Fetch string arg.
+	TLNN	T1,770000	;Is it a byte ptr?
+	 HRLI	T1,(POINT 7,)	;No, make local BP
+	MOVEM	T1,STRBP	;Save string Byte ptr.
+	MOVEM	T1,TEMPBP	;And put in mem loc for this routine too
+	SETZM	NARGS		;Count args..
+CPYLP:	ILDB	T1,TEMPBP	;Get character
+	JUMPE	T1,CPYCPY	;Null ends string.
+	CAIE	T1,"^"		;Uparrow?
+	 JRST	CPYLP		;No, loop.
+
+;Up-arrow in text string
+
+	ILDB	T1,TEMPBP	;Get next char.
+	JUMPE	T1,CPYCPY	;Null ends string.
+
+DEFINE UPDS(CHAR,NAM,NUMARG<0>),<
+IFG NUMARG,<
+	CAIN	T1,CHAR
+	 JRST	C'NUMARG'ARG
+>>
+	UPDISP			;Do the work.
+	JRST	CPYLP		;No args or unknown letter, Continue
+
+C2ARG:	AOS	NARGS		;Count args
+C1ARG:	AOS	NARGS
+	JRST	CPYLP		;Continue
+
+;Here when scanned string and know how many args there are.
+
+CPYCPY:	XMOVEI	AP,-2(P)	;Place where args are.
+	SUB	AP,NARGS	;Point to first arg.
+	POPJ	P,		;Done, return
+
+;TX$SET sets up the alternate output parameters.
+;Call:
+;	PUSH P,[address of [EXP buffer pointer,char count]
+;	PUSH P,[address of buffer full routine]
+;	PUSH P,[address of routine to init buffer pointer, char count]
+
+TX$SET:	MOVE	T1,-3(P)	;Get address of [EXP pointer, char count]
+	MOVEM	T1,ALTBCC	;Save this address
+	MOVE	T1,-2(P)	;Get address of buffer dump routine
+	XMOVEI	T1,(T1)
+	MOVEM	T1,BUFDMP	;Save it
+	MOVE	T1,-1(P)	;Get address of init buffer routine
+	XMOVEI	T1,(T1)
+	MOVEM	T1,BUFINT	;Save it
+	POPJ	P,		;Return
+
+;SUBTTL	MOVST tables
+
+A.TO.S:	;ASCII TO SIXBIT CONVERSION
+
+XWD	000074,400074
+XWD	400074,400074
+XWD	400074,400074
+XWD	400074,400074
+XWD	400074,400000
+XWD	400074,400074
+XWD	400074,400074
+XWD	400074,400074
+XWD	000074,400074
+XWD	400074,400074
+XWD	400074,400074
+XWD	400074,400074
+XWD	400074,400074
+XWD	400074,400074
+XWD	400074,400074
+XWD	400074,400074
+XWD	400000,000001
+XWD	400002,400003
+XWD	400004,400005
+XWD	400006,400007
+XWD	400010,400011
+XWD	400012,400013
+XWD	400014,400015
+XWD	400016,400017
+XWD	000020,400021
+XWD	400022,400023
+XWD	400024,400025
+XWD	400026,400027
+XWD	400030,400031
+XWD	000032,400033
+XWD	400034,400035
+XWD	400036,000037
+XWD	000040,400041
+XWD	400042,400043
+XWD	400044,400045
+XWD	400046,400047
+XWD	400050,400051
+XWD	400052,400053
+XWD	400054,400055
+XWD	400056,400057
+XWD	400060,400061
+XWD	400062,400063
+XWD	400064,400065
+XWD	400066,400067
+XWD	400070,400071
+XWD	400072,000073
+XWD	400074,000075
+
+XWD	400076,400077
+XWD	000074,400041
+XWD	400042,400043
+XWD	400044,400045
+XWD	400046,400047
+XWD	400050,400051
+XWD	400052,400053
+XWD	400054,400055
+XWD	400056,400057
+XWD	400060,400061
+XWD	400062,400063
+XWD	400064,400065
+XWD	400066,400067
+XWD	400070,400071
+XWD	400072,000073
+XWD	400074,000075
+XWD	400074,400074
+
+
+S.TO.A:	;SIXBIT TO ASCII
+
+XWD	400040,400041
+XWD	400042,400043
+XWD	400044,400045
+XWD	400046,400047
+XWD	400050,400052
+XWD	400052,400053
+XWD	400054,400055
+XWD	400056,400057
+XWD	400060,400061
+XWD	400062,400063
+XWD	400064,400065
+XWD	400066,400067
+XWD	400070,400071
+XWD	400072,400073
+XWD	400074,400075
+XWD	400076,400077
+XWD	400100,400101
+XWD	400102,400103
+XWD	400104,400105
+XWD	400106,400107
+XWD	400110,400111
+XWD	400112,400113
+XWD	400114,400115
+XWD	400116,400117
+XWD	400120,400121
+XWD	400122,400123
+XWD	400124,400125
+XWD	400126,400127
+XWD	400130,400131
+XWD	400132,400133
+XWD	400134,400135
+XWD	400136,400137
+
+
+E.TO.A:	;EBCDIC TO ASCII
+
+XWD	300000,700001
+XWD	700002,700003
+XWD	700024,700011
+XWD	700016,700177
+XWD	700134,700134
+XWD	700134,700013
+XWD	700014,700134
+XWD	700134,700134
+XWD	300134,700134
+XWD	700134,700034
+XWD	700021,700015
+XWD	700010,700026
+XWD	700134,700031
+XWD	700032,700134
+XWD	700134,700134
+XWD	700134,700134
+XWD	300036,700035
+XWD	700037,700134
+XWD	700020,700012
+XWD	700027,700033
+XWD	700134,700134
+XWD	700030,700134
+XWD	700134,700005
+XWD	700006,700007
+XWD	300134,700134
+XWD	700134,700134
+XWD	700022,700023
+XWD	700017,700004
+XWD	700134,700134
+XWD	700134,700134
+XWD	700134,700025
+XWD	700134,700134
+XWD	400040,700134
+XWD	700134,700134
+XWD	700134,700134
+XWD	700134,700134
+XWD	700134,700134
+
+XWD	700134,700056
+XWD	700074,700050
+XWD	700053,700174
+XWD	300046,700134
+XWD	700134,700134
+XWD	700134,700134
+XWD	700134,700134
+XWD	700134,700134
+XWD	700041,700044
+XWD	700052,700051
+XWD	700073,700136
+XWD	700055,700057
+XWD	700134,700134
+XWD	700134,700134
+XWD	700134,700134
+XWD	700134,700134
+XWD	700134,700054
+XWD	700045,700137
+XWD	700076,700077
+XWD	300134,700134
+XWD	700134,700134
+XWD	700134,700134
+XWD	700134,700134
+XWD	700134,700140
+XWD	700072,700043
+XWD	700100,700047
+XWD	700075,700042
+XWD	300134,400141
+XWD	400142,400143
+XWD	400144,400145
+XWD	400146,400147
+XWD	400150,400151
+XWD	700134,700134
+XWD	700134,700134
+XWD	700134,700134
+XWD	300134,400152
+XWD	400153,400154
+XWD	400155,400156
+XWD	400157,400160
+XWD	400161,400162
+XWD	700134,700134
+XWD	700134,700134
+XWD	700134,700134
+XWD	300134,700176
+XWD	400163,400164
+XWD	400165,400166
+XWD	400167,400170
+XWD	400171,400172
+XWD	700134,700134
+XWD	700134,700133
+XWD	700134,700134
+XWD	300134,700134
+XWD	700134,700134
+XWD	700134,700134
+XWD	700134,700134
+
+XWD	700134,700134
+XWD	700134,700134
+XWD	700134,700135
+XWD	700134,700134
+XWD	300173,400101
+XWD	400102,400103
+XWD	400104,400105
+XWD	400106,400107
+XWD	400110,400111
+XWD	700134,700134
+XWD	700134,700134
+XWD	700134,700134
+XWD	300175,400112
+XWD	400113,400114
+XWD	400115,400116
+XWD	400117,400120
+XWD	400121,400122
+XWD	700134,700134
+XWD	700134,700134
+XWD	700134,700134
+XWD	300134,700134
+XWD	400123,400124
+XWD	400125,400126
+XWD	400127,400130
+XWD	400131,400132
+XWD	700134,700134
+XWD	700134,700134
+XWD	700134,700134
+XWD	300060,700061
+XWD	700062,700063
+XWD	700064,700065
+XWD	700066,700067
+XWD	700070,700071
+XWD	700134,700134
+XWD	700134,700134
+XWD	700134,700134
+
+
+A.TO.E:	;ASCII TO EBCDIC
+
+XWD	000000,400001
+XWD	400002,400003
+XWD	400067,400055
+XWD	400056,400057
+XWD	400026,400005
+XWD	400045,400013
+XWD	400014,400025
+XWD	400006,400066
+XWD	000044,400024
+XWD	400064,400065
+XWD	400004,400075
+XWD	400027,400046
+XWD	400052,400031
+XWD	400032,400047
+XWD	400023,400041
+XWD	400040,400042
+XWD	400100,000132
+XWD	400177,400173
+XWD	400133,400154
+XWD	400120,400175
+XWD	400115,400135
+XWD	400134,400116
+XWD	400153,400140
+XWD	400113,400141
+XWD	000360,400361
+XWD	400362,400363
+XWD	400364,400365
+XWD	400366,400367
+XWD	400370,400371
+XWD	000172,400136
+XWD	400114,400176
+XWD	400156,000157
+XWD	000174,400301
+XWD	400302,400303
+XWD	400304,400305
+XWD	400306,400307
+XWD	400310,400311
+XWD	400321,400322
+XWD	400323,400324
+XWD	400325,400326
+XWD	400327,400330
+XWD	400331,400342
+XWD	400343,400344
+XWD	400345,400346
+XWD	400347,400350
+XWD	400351,000255
+
+XWD	400340,000275
+XWD	400137,400155
+XWD	000171,400201
+XWD	400202,400203
+XWD	400204,400205
+XWD	400206,400207
+XWD	400210,400211
+XWD	400221,400222
+XWD	400223,400224
+XWD	400225,400226
+XWD	400227,400230
+XWD	400231,400242
+XWD	400243,400244
+XWD	400245,400246
+XWD	400247,400250
+XWD	400251,000300
+XWD	400117,000320
+XWD	400241,400007
+
+XLIST		;Expand literals in hiseg
+LIT
+LIST
+
+END
+ 

@@ -1,0 +1,786 @@
+%TITLE 'FALTOP - Top Level for RMSFAL'
+
+MODULE FALTOP (MAIN=FALTOP,
+               VERSION='3(666)',
+               IDENT='3(666) 20-May-87') =
+!++
+!
+!			    RMSFAL Top Level
+!
+!--
+!
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1984, 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+!
+!++
+!
+! FUNCTIONAL DESCRIPTION
+!
+!       This is the File Access Listener program.   It can be run by any  user,
+!       for debugging, or it can be started as a detached not logged in job  by
+!       NETSERVER, in which  case it also  takes NETWORK.CMD in  PS:<logged-in>
+!       and communicates with NETJOB via a named IPCF PID (NETSERVER).  Logging
+!       of actions taken  and errors is  done.  Attempts to  connect (good  and
+!       bad) are sent to NETSERVER if this job is being controlled.
+!
+!       AUTHORS: Peter Mierswa, Andrew Nourse
+!
+!       HISTORY: This module, the top-level routine of FAL-20, was adapted from
+!       RDS.BLI, which is  the top-level routine  of the DATATRIEVE-20  server,
+!       written by  Peter  Mierswa.   The  architecture  of  both  servers  was
+!       originally suggested to him  by Andrew Nourse, so  I guess we're  about
+!       even. (I take no credit or blame for this "design"--Greg Scott)
+!
+!--
+%SBTTL 'Revision History'
+!++
+! REVISION HISTORY:
+!
+!  663	Trace DAP msgs based on the logical definition of FAL$LOG and
+!	FAL$OUTPUT.
+!
+!  634  Make RMSFAL's version number track with RMS.  Minor cleanups.
+!       Gregory A. Scott  18-Jul-86
+!
+!    2  Set version number properly.  Don't try to type anything on the
+!       terminal on an error.  Use DEFAULT-EXEC: for the exec.  Delete the
+!       temp file with the take of network.cmd after it is used.
+!       Gregory A. Scott 13-Jul-86
+!
+!    1  Creation.
+!       Andrew Nourse  --no date--
+!--
+%SBTTL 'Environment'
+BEGIN
+!
+! LINKAGE DECLARATIONS
+!
+
+LINKAGE Fatal_Linkage = PUSHJ : LINKAGE_REGS(15,15,0)
+	NOPRESERVE(1,2,3,4,5,6,7,8,9,10,11,12,13,14);
+
+!
+! TABLE OF CONTENTS
+!
+
+FORWARD ROUTINE
+    Fatal		: NOVALUE FATAL_LINKAGE,
+    Faltop		: NOVALUE,
+    Establish_Connection : NOVALUE,
+    Shut_Down		: NOVALUE,
+    Find_File		,
+    Call_Exec		: NOVALUE,
+    TopHandle           ,
+    Maybe_Log		,				! 663
+    Fallout		;				! 663
+
+!
+! LIBRARY DECLARATIONS
+!
+
+REQUIRE 'rmsreq';
+REQUIRE 'rmsosd';
+LIBRARY 'BLISSNET';
+LIBRARY 'CONDIT';
+
+!
+! MACROS
+!
+UNDECLARE %QUOTE Type;                  ! XPN cannot coexist with this
+
+MACRO Banner_string= 'RMSFAL version 3.0, DAP Protocol version 7.0' %;
+
+
+! Since this is a main program, signalling doesn't go over well for
+! handling errors, so...
+
+! Macro to cause a jump to the fatal error processing routine
+!	for any errors. The machine instruction is
+!	PUSHJ P,FATAL. Its a PUSHJ so that the PC of the caller
+!	can be found on the stack.
+
+MACRO DIE =
+      BEGIN
+      BUILTIN MACHOP;
+      MACHOP(%O'260',15,FATAL,0,0);
+      END %;
+
+! This macro sends literal text to the user log
+MACRO $USER_LOG(TEXT) =
+      IF .LOG_JFN NEQ 0
+      THEN BEGIN
+	   IF NOT OPENF(.LOG_JFN,OF_APP+7^30) THEN DIE;
+           ODTIM(.LOG_JFN,-1,0);
+           BOUT(.LOG_JFN,%C' ');
+           SOUT(.LOG_JFN,CH$PTR(UPLIT(TEXT)),0);
+	   IF NOT CLOSF(.LOG_JFN+CO_NRJ) THEN DIE;
+           END %,
+
+! This macro sends a string to the user log
+
+      $USER_LOG_STRING(POINTER,LENGTH) =
+      IF .LOG_JFN NEQ 0
+      THEN BEGIN
+           ODTIM(.LOG_JFN,-1,0);
+           BOUT(.LOG_JFN,%C' ');
+           SOUT(.LOG_JFN,POINTER,-LENGTH);
+           SOUT(.LOG_JFN,CH$PTR(UPLIT(%STRING(%CHAR(13),%CHAR(10)))));
+           END %,
+
+! This macro sends a string to the user log and dies
+
+      $DIE(TEXT) =
+      BEGIN
+      $USER_LOG(TEXT);
+      DIE;
+      END %;
+%SBTTL 'Module Storage'
+!
+! Job and IPCF info
+!
+OWN
+    FalNlb: $xpn_Nlb(),                 ! NLB for the link
+    JOB_NUMBER,				! My job number
+    NS_PID, MY_PID,			! PIDs for IPCF
+    PDESC : VECTOR [9],			! IPCF descriptor block
+    PDATA : REF VECTOR[],		! Address of IPCF data block
+    PDBLOCK : BLOCK [2000],		! IPCF data page
+    LOG_JFN : INITIAL (0),		! JFN of user log file
+    USER : BLOCK[CH$ALLOCATION(40)],	! User id of connection
+    ACCOUNT : BLOCK[CH$ALLOCATION(40)],	! Account string of connection
+    PASSWORD : BLOCK[CH$ALLOCATION(40)], ! Password of connection
+    LOGGED_IN,				! True if we are logged in
+    SAVED_PC,				! PC for interrupt system
+    LAST_PACKET,
+    PRINT_FIND_MSG;
+
+!
+! EXTERNALS
+!
+
+EXTERNAL
+    D$GTrJfn,						! 663
+    D$Gtrace,						! 663
+    D$In_Count,						! 663
+    D$Out_Count,					! 663
+    UsrSts,
+    UsrStv,
+    FalObj;
+
+EXTERNAL ROUTINE
+    D$BTrace,						! 663
+    D$Ztrace,						! 663
+    D$Ctrace,						! 663
+    Fal$Do;
+
+!
+! GLOBAL DATA 
+!
+
+GLOBAL BlkSec: INITIAL(0);              ! What section Fabs, etc in
+GLOBAL UstOsF;                          ! Error to give if JSYS fails
+
+%SBTTL 'Routine FATAL'
+GLOBAL ROUTINE FATAL : FATAL_LINKAGE NOVALUE =
+!+++++++++++++++++++++++++++++++++++++++++++++++++++
+!
+!	F A T A L
+!
+!    FUNCTIONAL DESCRIPTION
+!	This routine handles all fatal errors.
+!
+!    FORMAL PARAMETERS
+!	None
+!
+!    IMPLICIT PARAMETERS
+!	The address of the instruction which called us
+!	is on the stack as the return address.
+!
+!    RETURNED VALUE
+!	It doesn't return
+!
+!------------------------------------------------------
+BEGIN
+
+BUILTIN MACHOP;
+
+OWN
+    POINTER,
+    TEXT : BLOCK[CH$ALLOCATION(132)];
+
+! Begin the error message
+$USER_LOG(' ');
+POINTER = CH$MOVE(32,CH$PTR(UPLIT(%ASCIZ '?RMSFAL Fatal error near PC = ')),
+          CH$PTR(TEXT));
+
+! Output the PC of the error
+NOUT(.POINTER,(%O'777777' AND MACHOP(%O'200',0,0,15,0)) - 1, 8;POINTER);
+CH$WCHAR_A(0,POINTER);
+$USER_LOG_STRING(CH$PTR(TEXT),CH$DIFF(.POINTER,CH$PTR(TEXT)));
+
+! Title for last JSYS error
+POINTER = CH$MOVE(35,
+	CH$PTR(UPLIT(%ASCIZ '	Last JSYS error in this process = ')),
+	CH$PTR(TEXT));
+
+! Output the last JSYS error
+ERSTR(.POINTER,($FHSLF ^ 18) + %O'777777',0;POINTER);
+CH$WCHAR_A(0,POINTER);
+$USER_LOG_STRING(CH$PTR(TEXT),CH$DIFF(.POINTER,CH$PTR(TEXT)));
+
+! Close the log file
+IF .LOG_JFN NEQ 0 AND .LOG_JFN NEQ $PRIOU THEN
+    BEGIN
+	D$Ctrace;				! 663
+	LOG_JFN = 0;
+    END;
+
+! Halt.  If not logged in or we have been CRJOBed then we will logout
+
+WHILE TRUE DO HALTF();
+
+END;	!fatal!
+%SBTTL 'Routine FALTOP'
+ROUTINE FALTOP : NOVALUE =
+!+++++++++++++++++++++++++++++++++++++++++++++++++
+!
+!	FALTOP
+!
+!   FUNCTIONAL DESCRIPTION
+!	FALTOP is the root module of the FAL remote server.
+!       The remote server is a standalone program,
+!	to service remote requests.
+!
+!   FORMAL PARAMETERS
+!	None.
+!
+!   RETURNED VALUE (R0)
+!	None.
+!
+!-------------------------------------------------
+BEGIN
+ENABLE TopHandle;
+
+	BIND	FTRACE = D$GTrace;		! 663
+	BIND	TJfn  = D$GTrJfn;		! 663
+	LOCAL	LOG_OPTIONS;
+
+! Enable all of our capabilities
+IF NOT EPCAP($FHSLF,-1,-1) THEN DIE;
+
+! Is this user logged in already?
+IF NOT GETJI(-1,-1^18+LOGGED_IN,$JILNO) THEN DIE;
+IF .LOGGED_IN<0,18,0> NEQ 0 THEN
+    LOGGED_IN = TRUE
+ELSE
+    LOGGED_IN = FALSE;
+
+! If we are not logged in, set our name
+IF NOT .LOGGED_IN THEN
+    IF NOT SETSN(%SIXBIT 'RMSFAL', %SIXBIT 'RMSFAL') THEN DIE;
+
+! Get my job number
+IF NOT GETJI(-1,-1^18+JOB_NUMBER,$JIJNO) THEN DIE;
+
+! Bring in RMS
+$Init;
+
+! Start by establishing connection
+Establish_Connection( FalNlb );
+
+! Establish this users job context by making an EXEC take NETWORK.CMD
+
+Call_Exec();
+
+! Go and read messages and do things until the link dies
+
+! Bring the log file into being, maybe
+FTRACE = LOG_OPTIONS = MAYBE_LOG();		! 663
+
+IF .LOG_OPTIONS NEQ 0 THEN
+	BEGIN				! FAL$LOG was defined
+	TJFN = LOG_JFN = Fallout();	! See where output should go
+	D$IN_COUNT = D$OUT_COUNT = 0;
+	END;
+
+
+! Output banner to the log file
+
+$USER_LOG(Banner_string);
+IF .LOG_JFN NEQ 0 THEN
+BEGIN
+	LOCAL Nodename : BLOCK[CH$ALLOCATION(11)];	! 663
+
+	Mtopr(.FalNlb[Nlb$h_Jfn],$MOrhn,CH$PTR(Nodename));
+	D$BTRACE(Nodename,.FalNlb[Nlb$h_Jfn]);
+END;
+
+Fal$do(FalNlb);
+
+! Shut down server and logout (CRJOB detached) or exit (interactive debugging)
+
+Shut_Down();
+
+END;                                    ! FALTOP
+%SBTTL 'Routine Establish_Connection'
+ROUTINE Establish_Connection ( P_NLB ) : NOVALUE =
+!+++++++++++++++++++++++++++++++++++++++++++++++++
+!
+!	E S T A B L I S H _ C O N N E C T I O N
+!
+!   FUNCTIONAL DESCRIPTION
+!	Establish a connection to a HOST.
+!
+!   FORMAL PARAMETERS
+!	P_NLB: Address of NLB
+!
+!   RETURNED VALUE (R0)
+!	None.
+!
+!-------------------------------------------------
+BEGIN
+BIND Nlb=.P_Nlb: $Xpn_Nlb();
+
+LITERAL Pc_Usr = 1^30; ! PC%USR FROM MACREL
+
+LOCAL
+    Connected,
+    Levtab : VECTOR [3],
+    Chntab : VECTOR [36];
+
+! Set up the IPCF system
+
+IF NOT .logged_In THEN
+    BEGIN
+	Pdata = (((Pdblock AND %O'777777') + 777) ^ -9) * 512;
+	! Get NETSERVER's PID
+	Pdesc[$ipcfl] = Ip_Cpd;
+	Pdesc[$ipcfs] = 0;
+	Pdesc[$ipcfr] = 0;
+	Pdesc[$ipcfp] = 4^18 + .pdata;
+	Pdata[0] = $ipciw;
+	Pdata[1] = 0;
+	Pdata[2] = %ASCII 'NETSE';
+	Pdata[3] = %ASCIZ 'RVER';
+	IF NOT MSend(4,Pdesc) THEN Die;
+	My_Pid = .pdesc[$ipcfs];
+	Pdesc[$ipcfl] = 0;
+	Pdesc[$ipcfs] = 0;
+	Pdesc[$ipcfr] = .My_Pid;
+	Pdesc[$ipcfp] = 512^18 + .Pdata;
+	IF NOT MRecv(7,Pdesc) THEN Fatal();
+	Ns_Pid = .Pdata[1];
+    END;
+
+! Try over and over again until we are connected
+Connected = False;
+WHILE NOT .Connected DO
+    BEGIN
+    ! Set up the NLB
+    $Xpn_Nlb_Init( Nlb=Nlb );
+
+    ! Open a passive task, wait for somebody to connect to us
+    $Xpn_Open( Nlb=Nlb, Type=Passive, Option=Wait , Object=.FalObj );
+
+    ! If the user is already logged in, then succeed
+    IF .Logged_In
+    THEN Connected = True
+    ELSE
+        BEGIN
+	LOCAL
+	    Directory;
+	! Get the user id
+	IF NOT Mtopr(.Nlb[Nlb$h_Jfn],$Morus,CH$PTR(User)) THEN Die;
+
+	! Get the password
+	IF NOT Mtopr(.Nlb[Nlb$h_Jfn],$Morpw,CH$PTR(Password)) THEN Die;
+
+	! Get the account
+	IF NOT Mtopr(.Nlb[Nlb$h_Jfn],$Morac,CH$PTR(Account)) THEN Die;
+
+	! Turn the user name into a directory number
+	!	log him in, and report to NETSERVER
+	Pdesc[$Ipcfl] = 0;
+	Pdesc[$Ipcfs] = .My_Pid;
+	Pdesc[$Ipcfr] = .Ns_Pid;
+	Pdesc[$Ipcfp] = 10^18 + .Pdata;
+	! The IPCF packet has job number and user id
+	Pdata[1] = .Job_Number;
+	CH$MOVE(40,CH$PTR(User),CH$PTR(Pdata[2]));
+	IF NOT Rcusr(0,CH$PTR(User),0;Directory) OR
+	    NOT Login(.Directory,(%O'777777000000' OR Password),
+	    (IF CH$RCHAR(CH$PTR(Account)) EQL 0 THEN 0 ELSE CH$PTR(Account)))
+	    THEN BEGIN
+		! Log this failure to NETSERVER
+		Pdata[0] = -1;
+		IF NOT MSend(4,PDesc) THEN Die;
+		$Xpn_Disconnect ( Nlb=Nlb , Type=Reject,
+                                  Code=Xpn$k_NoAccess );
+                $Xpn_Close ( Nlb=Nlb );
+	    END
+	ELSE
+	    BEGIN
+		! Log this successful connection to NETSERVER
+		Pdata[0] = -2;
+                IF NOT Msend(4,Pdesc) THEN Die;
+		Connected = True;
+	    END;
+    END;
+END;
+
+! Accept the connection
+$xpn_Put ( Nlb=Nlb, Type=Accept );
+
+! Turn off the interrupt system
+IF NOT Dir($Fhslf) THEN Die;
+
+RETURN;
+
+END;
+%SBTTL 'Routine Shut_Down'
+ROUTINE Shut_Down (P_Nlb) : NOVALUE =
+!+++++++++++++++++++++++++++++++++++++++++++++++++
+!
+!	S H U T _ D O W N
+!
+!   FUNCTIONAL DESCRIPTION
+!	SHUT_DOWN closes down the Server.  Shutdown
+!	just causes the server to go away, cleanly if possible,
+!	but mostly just away.
+!
+!   FORMAL PARAMETERS
+!	P_Nlb: Address of NLB
+!
+!   RETURNED VALUE
+!	none
+!-------------------------------------------------
+BEGIN
+BIND Nlb=.P_Nlb: $Xpn_Nlb();
+LOCAL NJfn;
+
+Njfn = .Nlb[Nlb$h_Jfn];
+
+$xpn_Close( Nlb=Nlb );
+
+$USER_LOG('FAL terminates normally');
+
+! Close the log file
+IF .LOG_JFN NEQ 0 AND .LOG_JFN NEQ $PRIOU THEN
+    BEGIN
+	D$Ztrace(.Njfn);			! 663
+	D$Ctrace();				! 663
+	LOG_JFN = 0;
+    END;
+
+! Time to push up daisies
+
+WHILE TRUE DO HALTF()
+
+END; !shut_down!
+%SBTTL 'Routine Find_File'
+ROUTINE Find_File (POINTER, LENGTH, FLAGS) =
+!+++++++++++++++++++++++++++++++++++++++++++++++++++
+!
+!	F I N D _ F I L E
+!
+!    FUNCTIONAL DESCRIPTION
+!	This routine looks to see if a file exists in
+!	PS:<logged-in-directory>
+!
+!    FORMAL PARAMETERS
+!	POINTER - to file name.
+!	LENGTH - of file name.
+!	FLAGS - for GTJFN.
+!
+!    RETURNED VALUE
+!	JFN of file if it exists.
+!	0 if it doesn't.
+!
+!------------------------------------------------------
+BEGIN
+LOCAL
+    JFN,
+    DIRECTORY,
+    TEMP_PTR,
+    LOCAL_TEXT : BLOCK[CH$ALLOCATION(80)];
+
+! Initialize the temporary descriptor
+TEMP_PTR = CH$PTR(LOCAL_TEXT);
+
+! Get the user's logged in directory number
+IF NOT GETJI(-1,(-1 ^ 18) OR DIRECTORY,$JILNO) THEN DIE;
+
+! Convert the directory number to a string
+IF NOT DIRST(.TEMP_PTR,.DIRECTORY;TEMP_PTR) THEN DIE;
+
+! Add the file name and compute total string length
+TEMP_PTR = CH$MOVE(.LENGTH,.POINTER,.TEMP_PTR);
+CH$WCHAR_A(0,TEMP_PTR);
+
+! Now check to see if the file exists
+IF GTJFN(.FLAGS,CH$PTR(LOCAL_TEXT);JFN)
+THEN RETURN .JFN
+ELSE RETURN 0;
+
+END;
+%SBTTL 'Routine Maybe_Log'
+ROUTINE Maybe_Log =					! 663
+!+++++++++++++++++++++++++++++++++++++++++++++++++++
+!
+!	M A Y B E _ L O G
+!
+!    FUNCTIONAL DESCRIPTION
+!	This routine determines whether a job-wide logical name
+!	called FAL$LOG exists.  If it does, its value is returned
+!	as an integer.  If the logical name exists but its value
+!	is not NINable, the default value of -1 is returned. If
+!	no such logical exists, returns 0.
+!
+!    FORMAL PARAMETERS
+!	None.
+!
+!    RETURNED VALUE
+!	The integer value of FAL$LOG, or zero if the logical name
+!	does not exist.
+!
+!------------------------------------------------------
+BEGIN
+	BIND	FALLOG_LN = CH$PTR(UPLIT(%ASCIZ'FAL$LOG'));
+	BIND	FALOUT_LN = CH$PTR(UPLIT(%ASCIZ'FAL$OUTPUT'));
+	LOCAL	LN_BUF : BLOCK[CH$ALLOCATION(80)],
+		V;
+
+! See if FAL$LOG has been defined
+
+
+	v = 0;			! Assume no logging
+	IF Lnmst ($Lnsjb, Fallog_Ln, CH$PTR(Ln_Buf))
+	THEN 						
+	   BEGIN		! FAL$LOG is defined to something
+
+	   IF NOT Nin(CH$PTR(Ln_Buf),8 ;Ln_Buf,v)  ! Try to NIN a value
+	   THEN v = -1;		! Not NIN-able, default to full trace
+	   END;
+
+	RETURN .v
+END;
+
+%SBTTL 'Routine Fallout'
+ROUTINE Fallout =					! 663
+!+++++++++++++++++++++++++++++++++++++++++++++++++++
+!
+!	F A L L O U T
+!
+!    FUNCTIONAL DESCRIPTION
+!	This routine is called iff FAL$LOG has been defined as a logical
+!	name.  The routine determines whether FAL$OUTPUT has been defined
+!	as a job-wide logical name.  If so, it returns a JFN on this
+!	filespec.  If the GTJFN fails, or if FAL$OUTPUT has not been
+!	defined, a JFN for PS:[logged-in-directory]FAL.LOG is returned.
+!
+!    FORMAL PARAMETERS
+!	None.
+!
+!    RETURNED VALUE
+!	A JFN.
+!
+!------------------------------------------------------
+BEGIN
+
+	BIND	FALOUT_LN = CH$PTR(UPLIT(%ASCIZ'FAL$OUTPUT'));
+	LOCAL	TXT_BUF : BLOCK[CH$ALLOCATION(80)],
+		Jfn : INITIAL(0),
+		Directory,
+		Temp_Ptr;
+
+
+	IF Lnmst ($Lnsjb, Falout_ln, CH$PTR(Txt_Buf))
+	THEN
+	BEGIN					! FAL$OUTPUT is defined
+
+
+
+	IF NOT Gtjfn(GJ_Sht+GJ_Old,CH$PTR(Txt_Buf);Jfn) THEN	
+	IF NOT Gtjfn(GJ_Sht+GJ_Fou,CH$PTR(Txt_Buf);Jfn)
+	THEN Jfn = 0;
+	END;
+
+! If the above didn't get us a JFN, try getting one on PS:[logged-in-
+! directory]FAL.LOG
+
+	IF .Jfn EQL 0 THEN
+	BEGIN
+
+	Temp_Ptr = CH$PTR(Txt_Buf);	! Reinitialize the string ptr
+
+	! Get the user's logged in directory number
+		IF NOT Getji(-1,(-1 ^ 18) OR Directory,$JILNO) THEN Die;
+
+	! Convert the directory number to a string
+		IF NOT Dirst(.Temp_Ptr,.Directory;Temp_Ptr) THEN Die;
+
+	! Add the file name 
+		TEMP_PTR = CH$MOVE(8,
+				CH$PTR(UPLIT(%ASCIZ'FAL.LOG')),
+				.Temp_Ptr);
+		CH$WCHAR_A(0,Temp_Ptr);
+
+	IF NOT Gtjfn(GJ_Sht+GJ_Old,CH$PTR(Txt_Buf);Jfn) THEN	
+	IF NOT Gtjfn(GJ_Sht+GJ_Fou,CH$PTR(Txt_Buf);Jfn)
+	THEN Die;
+
+	END;
+
+.Jfn			! Return JFN 
+END;
+%SBTTL 'Routine Call_Exec'
+ROUTINE Call_Exec : NOVALUE =
+!+++++++++++++++++++++++++++++++++++++++++++++++++++
+!
+!	C A L L _ E X E C
+!
+!    FUNCTIONAL DESCRIPTION
+!	This routine forces an exec in a lower fork to
+!	take NETWORK.CMD, if it exists.
+!
+!    FORMAL PARAMETERS
+!	None.
+!
+!    RETURNED VALUE
+!	None.
+!
+!------------------------------------------------------
+BEGIN
+
+LOCAL
+    TEMP_JFN,
+    FORK_HANDLE,
+    EXEC_JFN,
+    FILE_JFN,
+    POINTER,
+    RSCAN_BUFFER : BLOCK[CH$ALLOCATION(200)];
+
+! Does network.cmd exist?
+FILE_JFN = FIND_FILE(CH$PTR(UPLIT(%ASCII 'NETWORK.CMD')),11,GJ_SHT+GJ_OLD);
+IF .FILE_JFN EQL 0 THEN RETURN;
+
+! Tell user what we are doing
+$USER_LOG('TAKEing PS:NETWORK.CMD =>');
+! Now put the necessary command in a temp file
+IF NOT GTJFN(GJ_SHT,CH$PTR(UPLIT(%ASCIZ '--rmsfal--.TMP;T'));TEMP_JFN)
+THEN DIE;
+IF NOT OPENF(.TEMP_JFN,OF_WR+7^30) THEN DIE;
+
+! "TAKE "
+POINTER = CH$MOVE(5,CH$PTR(UPLIT(%ASCII 'TAKE ')),CH$PTR(RSCAN_BUFFER));
+
+! "filename"
+IF NOT JFNS(.POINTER,.FILE_JFN,0;POINTER) THEN DIE;
+
+! Release the JFN
+IF NOT RLJFN(.FILE_JFN) THEN DIE;
+
+! "<CRLF>POP<CRLF>"
+POINTER = CH$MOVE(17,CH$PTR(UPLIT(%STRING(
+	%ASCII ',',
+	%CHAR(13),%CHAR(10),
+	%ASCII 'ECHO',
+	%CHAR(13),%CHAR(10),
+	%CHAR(13),%CHAR(10),
+	%ASCII 'POP',
+	%CHAR(13),%CHAR(10),%CHAR(0)))),.POINTER);
+
+! Now copy the text to the temp file
+IF NOT SOUT(.TEMP_JFN,CH$PTR(RSCAN_BUFFER),0) THEN DIE;
+IF NOT CLOSF(.TEMP_JFN+CO_NRJ) THEN DIE;
+IF NOT OPENF(.TEMP_JFN,OF_RD+7^30) THEN DIE;
+ 
+! Start up a lower level exec
+IF NOT CFORK(0;FORK_HANDLE) THEN DIE;
+ 
+! Give the fork our privs minus logout
+IF NOT EPCAP(.FORK_HANDLE,NOT SC_LOG,NOT SC_LOG) THEN DIE;
+ 
+! Get a JFN for the EXEC
+IF NOT GTJFN(GJ_SHT+GJ_OLD,CH$PTR(UPLIT(%ASCIZ 'SYSTEM:EXEC.EXE'));EXEC_JFN)
+THEN DIE;
+ 
+! Get the exec file into the fork
+IF NOT GET(.FORK_HANDLE^18 + .EXEC_JFN) THEN DIE;
+ 
+! Make sure the exec doesnt write anything to the tty
+IF NOT SPJFN(.FORK_HANDLE,.TEMP_JFN^18 +
+    (IF .LOG_JFN NEQ 0 THEN .LOG_JFN ELSE $NULIO)) THEN DIE;
+
+! Start the EXEC
+IF NOT SFRKV(.FORK_HANDLE,0) THEN DIE;
+ 
+! Wait for the EXEC to finish
+IF NOT WFORK(.FORK_HANDLE) THEN DIE;
+ 
+! Kill the fork and release the execs JFN
+IF NOT KFORK(.FORK_HANDLE) THEN DIE;
+
+! Close then and delete and expunge the temp file
+
+IF NOT CLOSF(.temp_jfn+CO_NRJ) THEN DIE;
+IF NOT DELF(.temp_jfn+DF_EXP) THEN DIE;
+
+END;
+%SBTTL 'Routine MonErr'
+GLOBAL ROUTINE MonErr : ExitSub =
+
+! Monitor Call Failed, Get error code into USRSTV
+
+BEGIN
+
+GetEr( $FhSlf ; UsrStv );
+
+IF .UstOsF NEQ 0
+THEN UsrSts=.UstOsF
+ELSE UsrSts=Rms$_Bug;
+
+UsrErr()
+END;
+%SBTTL 'Routine TopHandle'
+
+ROUTINE TopHandle ( Signal_Args: REF VECTOR,
+                    Mech_Args:   REF VECTOR,
+                    Enable_Args: REF VECTOR ) =
+BEGIN
+
+IF .signal_args[1] NEQ SS$_UNWIND       ! Nothing if unwinding
+THEN BEGIN                              ! Any other signal
+     LOCAL pointer;                     ! Pointer to error text
+     pdata[0] = -3;                     ! Indicate error message
+     pointer = CH$MOVE(29,              ! Start the text string
+                       CH$PTR(UPLIT(%ASCII'Unexpected fatal error, code ')),
+                       CH$PTR(pdata[2]));
+     NOUT(.pointer, .signal_args[1], 10; pointer);
+     IF .logged_in                      ! Are we running detached?
+     THEN PSOUT(CH$PTR(pdata[2]))       ! Yes, type on terminal
+     ELSE IF NOT MSEND(4,pdesc)         ! No, send message to NETJOB
+          THEN die;                     ! Die if can't MSEND
+     END;
+
+SS$_CONTINUE                            ! Continue
+
+END;
+END
+ELUDOM
+   

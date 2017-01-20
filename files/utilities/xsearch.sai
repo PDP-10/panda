@@ -1,0 +1,2021 @@
+comment	AJS 4/16/80
+	Defined ABORT!TC and changed it from ^Q to DEL to avoid
+getting in the way of flow control (XON/XOFF) protocols. Changed 
+"show list" function from ^S to ^L for the same reason.
+
+;
+
+
+comment
+
+	This program has grown out of an algorithm developed  by  Scott
+Daniels and Pentti Kanerva of the Institute for Mathematical Studies in
+the Social Sciences, Stanford University,  California.   The  algorithm
+was previously developed (and subsequently  published)  by  Alfred  Aho
+and Margaret J. Corasick of Bell Laboratories.   The  two  developments
+of the algorithm were independent, but they are substantially the  same
+algorithm.   Briefly, the program achieves its speed  because  it  pre-
+processes the strings to be searched for,  and builds  a  Finite  State
+Machine which does the actual searching.
+
+;
+
+BEGIN "subsearch"
+
+REQUIRE "<><>" DELIMITERS; 
+DEFINE	!    = <COMMENT>,	DESR = <COMMENT>;
+
+ifc not DEclaration( cardstuff ) thenc
+	DEFINE	cardstuff = false;	! true for library searcher;
+endc
+DEFINE	boolstuff = true;	! boolean expression of search words;
+DEFINE  debug			= FALSE;
+DEFINE  debug!machine!code	= FALSE;
+DEFINE  debug!booleans		= FALSE;
+
+define	eol  = <('37 & null)>,	cr   = <('15 & null)>,
+	lf   = <('12 & null)>,	esc  = <('33 & null)>,
+	tab  = <('11 & null)>,	ff   = <('14 & null)>,
+	bell = <( '7 & null)>,	crlf = <('15 & '12)>,
+	ctrl( x ) = <((x land '37)&null)>;
+DEFINE	form	= <(crlf & ff)>;
+DEFINE	append( x, y ) = < x _ x & y >;
+DEFINE	EIF	= <ELSE IF>; 
+
+define	abort!tc = <28>;	! decimal terminal code for ATI JSYS;
+
+IFC boolstuff THENC
+ DEFINE	boolnot   = true;	! boolean expression includes NOT;
+ DEFINE	bool!or   = 119,	bool!and   = 113, 
+	bool!open = 110,	bool!close = 109;
+IFC boolnot THENC   
+ DEFINE	bool!not  = 118;	! ????? choose the proper number;
+ DEFINE max!not!depth = 128;	! maximum expression evaluation stack;
+ENDC
+
+ DEFINE maxwords  = 100;	! maximum possible number in the queue;
+ELSEC
+ DEFINE maxwords  = 127;	! maximum possible number in the queue;
+ENDC
+
+DEFINE max$state$loc	= '100000; ! maximum state value;
+DEFINE nice!name	= '221110000001;  ! file name printed nicely; 
+DEFINE short!name	= '221110000001;  ! name, extension, version;
+DEFINE exact!name	= '211110000001;  ! full file name;
+
+STRING ARRAY targets[ 1 : maxwords ];
+		! list of strings being searched for;
+SAFE INTEGER ARRAY hitcount[ 0 : maxwords ];
+	! number of times word was found
+	! element 0 is count of recognition units (lines or pages)
+	! that fulfilled the pseudo-boolean expression;
+
+IFC boolstuff THENC 
+SAFE INTEGER ARRAY matchcount[ 1 : maxwords ];
+	! count of recognitions in "displayed" lines
+	! (lines that fulfilled the pseudo-boolean expression);
+ENDC
+
+SAFE INTEGER ARRAY class$mat[ 0 : '177 ]; 
+! equivalence classes for characters ('177 is the maximum character #);
+INTEGER class$count;		! number of character classes (<129);
+INTEGER top$state;		! maximum assigned state in drivetable;
+BOOLEAN abortsearch;		! switch to abort search of one file;
+
+IFC boolstuff THENC 
+ STRING qualifier;		! holds boolean expression for analysis;
+ENDC 
+
+PRELOAD!WITH 0;	! this is a kludge to save initial array clear by SAIL;
+SAFE INTEGER ARRAY drivetable[-131 : max$state$loc]; 
+	! state table for searching;
+
+DEFINE neg$state	= < LOCATION( drivetable[ -130 ] ) >;
+DEFINE zero$state	= < LOCATION( drivetable[ 0 ] ) >;
+DEFINE inc$state	= < class$count + 2 >;
+DEFINE dispat( s, x )	= < MEMORY[ s + x ] >;
+DEFINE wordof( s )	= < MEMORY[ s ] >; 
+			! largest word recognized by this state;
+DEFINE backptr( s )	= < MEMORY[ s - 1 ] >;
+! means either 
+!	the state number of greatest common tail for this state
+!   or  the state number of the next shorter recognized word;
+DEFINE assert(x) =  IFC debug 
+		     THENC < IF NOT( x ) THEN 
+				USERERR( 0,1, "assertion failed" ); >
+		     ELSEC <> ENDC;
+			! notations about invariant relationships;
+
+INTEGER linbrk;	  ! break table to read in a recognition unit at a time;
+INTEGER exp!brk;  ! break table to read in one boolean expression;
+integer file!n!i; ! break on "@" or a file name character;
+integer file!n!x; ! break on anything but "@" or a file name character;
+
+SIMPLE PROCEDURE makebreaks; 
+BEGIN "makebreaks" 
+setbreak( file!n!i_getbreak, crlf & eol & ff & tab & " ,", "", "XNR");
+setbreak( file!n!x_getbreak, crlf & eol & ff & tab & " ,", "", "INR");
+setbreak( exp!brk_getbreak,	"()&v-0123456789 "&cr&lf&ff&eol&tab&ff,
+				" "&cr&lf&ff&eol&tab&ff, "XNS" );
+			! break table to read in one boolean expression;
+IFC cardstuff THENC
+	SETBREAK( linbrk_GETbreak, ff, 0, "INS" );
+ELSEC
+	SETBREAK( linbrk_GETbreak, lf & eol, cr, "INS" );
+ENDC
+END "makebreaks"; 
+REQUIRE makebreaks INITIALIZATION;
+
+BOOLEAN jumptop, escoff;	! special input function variables;
+INTEGER trash;	! never safe over a procedure call, use local to block;
+
+! compile time messages;
+
+IFC cardstuff THENC
+  REQUIRE " card search   " MESSAGE;
+ELSEC
+  REQUIRE " substring search   " MESSAGE;
+ENDC
+REQUIRE " maxwords = " & CVS( maxwords ) & crlf & tab MESSAGE;
+IFC debug THENC
+  REQUIRE " DEBUGGING:general - checks ""assert"" " MESSAGE;
+ELSEC
+  REQUIRE " ""assert"" NOT checked " MESSAGE;
+ENDC
+IFC debug!booleans THENC
+  REQUIRE " DEBUGGING:booleans " MESSAGE;
+ENDC
+IFC debug!machine!code THENC
+  REQUIRE " DEBUGGING:machine!code " MESSAGE;
+ENDC
+IFC boolstuff THENC
+  REQUIRE " using:boolstuff:( &, v" MESSAGE;
+ IFC boolnot THENC
+  REQUIRE ", -" MESSAGE;
+ ENDC
+  REQUIRE " ) " MESSAGE;
+ELSEC
+  REQUIRE " NO booleans " MESSAGE;
+ENDC
+
+SIMPLE PROCEDURE error ;
+desr	simply prints a nicely formatted error message ;
+BEGIN "error"
+print( "  " ); ERSTR( -1, '400000 );
+END "error" ;
+SIMPLE INTEGER PROCEDURE comand( STRING prompt, clist, helpmes (null) );
+desr	"get characters out quietly" It does the following:
+	(1) prompt is output (preceded by crlf) if it exists.
+	(2) a character is read in
+	(3) if the character is "?", and helpmes exists,
+		output helpmes, and loop to (1)
+	(4) check to see if the character is in string clist
+	    if it is, return the character number of character in 
+	    clist  (ie clist[retval for 1] = character)
+	(5) if the character is not in the list, replace the
+		character in the buffer, and return 0.
+	this is very good for case statements to follow.
+;
+BEGIN "command" 		INTEGER crhack, t, cht, result;
+DO    BEGIN 
+	IF LENGTH( prompt ) THEN print( crlf, prompt );
+	t _ INCHRW;
+	IF t = "?" AND LENGTH( helpmes ) THEN OUTSTR( crlf & helpmes );
+      END
+  UNTIL NOT( t = "?" AND LENGTH( helpmes ) );
+
+crhack _ (if t = eol then cr else t);
+result _ 1;
+WHILE (cht _ LOP( clist )) 
+   do if crhack = cht
+	 then begin
+		if t = cr	! tops-10 cr, eat lf thats coming;
+		then if (t_inchrw) neq lf
+			then usererr( 0,1, "cr & '" & cvos(t) & "?");
+		return( result );
+	      end
+	 else result _ result+1;
+
+BKJFN( '101 );		! replace character in tty buffer;
+RETURN( 0 );
+END "command"; 
+SIMPLE BOOLEAN PROCEDURE 
+	agree( STRING proposition, helptext; BOOLEAN default ); 
+WHILE TRUE DO 
+ BEGIN "agree"
+  print( crlf, proposition, 
+		(IF default THEN " YES//" ELSE " NO//") );
+  case comand( null, " " & tab & "?YyNn^" & esc & cr & lf ) 
+   of begin "agcase"
+	begin ! unk; inchrw; print(tab & "try a ""?""")	end;
+	begin ! " "; ! ignore spaces;			end;
+	begin ! tab; ! ignore tabs;			end;
+	begin ! "?"; print( "
+Type:	""Y"" or ""N""	to answer the question yes or no respectively, 
+	RET or LF	to accept this default (only),
+	ESC		to accept this and all subsequent defaults,
+	""^""		to go back to the first question. ",
+			crlf, helptext )		end;
+	begin ! "Y"; return( true )			end;
+	begin ! "y"; return( true )			end;
+	begin ! "N"; return( false )			end;
+	begin ! "n"; return( false )			end;
+	begin ! "^"; jumptop _ true; return( default )	end;
+	begin ! esc; escoff _ false; return( default )	end;
+	begin !  cr; return( default )			end;
+	begin !  lf; return( default )			end
+      end "agcase"
+ END "agree"; 
+SIMPLE STRING PROCEDURE jfname( INTEGER chan, flags(exact!name) );
+desr	returns a file name for chan, with *'s in the proper fields, 
+	the string is intended to allow you to do an "OPENFILE" later
+	on in your program, and get a jfn that will access all files
+	initially available on chan.  [a TENEX-oriented routine] 
+	the following should be possible: (":" means a semicolon)
+		BEGIN		STRING s: ! INTEGER i:
+		  i _ OPENFILE( NULL, "RO*C" ):
+		  s _ jfname( i ): 
+			...process...
+		  CFILE( i ):
+			...process...
+		  i _ OPENFILE( s, "RO*C" ): 
+	comment "i" should now behave just as it did after line 2:
+		END:	
+;
+START!CODE "jfname"	EXTERNAL INTEGER ZSETST, ZADJST;
+	move	2,ACCESS( CVJFN( chan ) );	! ac2 _ true jfn;
+	push	'17,[400]	; ! maximum string size;
+	pushj	'17,ZSETST	; ! ac1 _ a safe byte pointer;
+				  ! (destroys string space temporarily);
+	move	3,flags		; ! ac3 _ flags (argument 2);
+	jfns;
+	
+	push	'17,[400]	; ! number of bytes that were reserved;
+	push	'17,1		; ! byte pointer returned by "JFNS"; 
+	pushj	'17,ZADJST	; ! fix up string space (leaves string 
+				  ! at top of string stack);
+	sub	'17,['3000003]	; ! unwind return stack;
+	jrst	@3('17)		; ! and return;
+END "jfname"; 
+SIMPLE STRING PROCEDURE litstr( STRING s; BOOLEAN usename (true) );
+BEGIN "litstr" 
+     PRESET!WITH				   "DEL",
+	"'0", "^A", "^B", "^C",   "^D", "^E", "^F", "BEL",
+	"^H", "TAB","LF", "^K",   "FF", "CR", "^N", "^O",
+	"^P", "^Q", "^R", "^S",   "^T", "^U", "^V", "^W",
+	"^X", "^Y", "^Z", "ESC",  "'34","'35","'36","EOL";
+     OWN SAFE STRING ARRAY name[ -1 : '37 ];
+	BOOLEAN quoteoff;
+	INTEGER ch;
+	STRING result;
+
+result _ NULL; quoteoff _ TRUE;
+WHILE LENGTH( s ) 
+   DO IF (ch _ ((1+LOP(s)) LAND '177) - 1) < '40
+	THEN BEGIN "special"
+		result _ result & 
+			(IF quoteoff THEN " & " ELSE """ & " ) &
+			(IF usename THEN name[ ch ] 
+				    ELSE "'" & CVOS(ch LAND '177) );
+		quoteoff _ TRUE;
+	      END "special"
+	 ELSE BEGIN "normal"
+		result _ result & (IF quoteoff  THEN " & """ & ch 
+						ELSE ch);
+		IF ch = '42 THEN result _ result & '42;
+		quoteoff _ FALSE;
+	      END "normal";
+
+IF NOT quoteoff THEN result _ result & '42;
+
+RETURN( result[ 4 TO INF ] );
+
+END "litstr";
+
+SIMPLE STRING PROCEDURE 
+   manyfiles( STRING jfn$queue, askline, helptext(NULL), modes("ROH") );
+ BEGIN "manyfiles"
+   DEFINE help!text = <"
+TYPE: file name		to add a file to the list
+			(can have *'s) (TENEX recognition available),
+      @indirect file name	to add an indirect file to the list 
+			(can have *'s) (TENEX recognition available),
+      ""^""  to recover the default list,
+      ^X   to re-input entire list,
+      ^W   to remove last file from existing list, 
+      ^L   to show existing list, 
+      LF   to continue file list input on next line, 
+      CR   to accept list as is,
+      ESC  to accept list as is, and default all further options, or
+      ?	   to show this list
+sample:		*.FOO;*, @FOO.SAM;*, FOO.SAM
+would search all files with an extension of ""FOO"", followed by all files
+listed on all versions of ""FOO.SAM"", followed by the most recent version
+of ""FOO.SAM"".  (yes Virginia, indirect files can include indirect files)
+">;
+
+IF LENGTH( jfn$queue ) 
+ THEN print( crlf, "Default list: ", jfn$queue );
+
+print( crlf, askline, (if LENGTH( jfn$queue ) 
+			then "(continued) : " else "" ) );
+while true do
+  case comand( null, "^" & esc & cr & lf & ctrl("X") & ctrl("W") & 
+			ctrl("L") & "@?" & " ," & tab ) 
+of
+   begin "mnfcase"
+    begin ! unk; INTEGER ch;
+		IF 0 > (ch _ OPENFILE( NULL, modes & "*E" ))
+		   THEN error
+		   else BEGIN 
+			  append( jfn$queue, crlf & jfname(ch) );
+			  CFILE( ch );
+			  BKJFN( '101 );
+			  IF (ch _ INCHRW) = cr OR ch = eol
+			   THEN RETURN( jfn$queue );
+			END;
+		BKJFN( '101 );
+		IF INCHRW = lf
+		 THEN print( crlf, askline, (if LENGTH( jfn$queue ) 
+				then "(continued) : " else "" ) )
+		 else print( ", " )				end;
+    begin ! "^"; jumptop _ true; return( jfn$queue )		end;
+    begin ! esc; escoff _ false; return( jfn$queue )		end; 
+    begin !  cr; return( jfn$queue )				end;
+    begin !  lf; print( crlf, askline, (IF LENGTH( jfn$queue ) 
+			 THEN "(continued) : " ELSE "") )	end;
+    begin !  ^X; jfn$queue _ NULL;
+		print( "  ...starting over...", crlf, askline )	end;
+    begin !  ^W; FOR trash _ LENGTH( jfn$queue )
+			STEP -1 UNTIL 1 
+			DO IF jfn$queue[trash FOR 1] = cr THEN DONE;
+		print( "(", jfn$queue[ trash+2 FOR INF ], " removed)" );
+		jfn$queue _ jfn$queue[ 1 FOR trash-1 ];
+		print( crlf, askline, (IF LENGTH( jfn$queue ) 
+				THEN "(continued) : " ELSE ""))	end;
+    begin !  ^L; print( crlf, askline, jfn$queue, crlf, 
+			askline, (IF LENGTH( jfn$queue ) 
+				THEN "(continued) : " ELSE ""))	end;
+    begin ! "@"; INTEGER ch; 
+		IF 0 > (ch _ OPENFILE( NULL, "RO*E"))
+		   THEN error
+		   else BEGIN 
+			  append( jfn$queue, 
+				crlf & "@" & jfname(ch) );
+			  CFILE( ch );
+			  BKJFN( '101 );
+			  IF (ch _ INCHRW) = cr OR ch = eol
+			   THEN RETURN( jfn$queue );
+			END;
+		BKJFN( '101 );
+		IF INCHRW = lf
+		 THEN print( crlf, askline, (if LENGTH( jfn$queue ) 
+				then "(continued) : " else "" ) )
+		 else print( ", " )				end;
+    begin ! "?"; print( help!text, helptext, crlf, askline, 
+			(IF LENGTH( jfn$queue ) 
+			 THEN "(continued) : " ELSE "") )	end;
+    begin ! " "; ! ignore leading spaces;			end;
+    begin ! ","; ! ignore leading commas;			end;
+    begin ! tab; ! ignore leading tabs;				end;
+   end "mnfcase"
+ END "manyfiles"; 
+
+SIMPLE STRING PROCEDURE nextname( REFERENCE STRING s );
+ WHILE TRUE DO
+   BEGIN "nextname"		STRING result;
+     scan( s, file!n!i, trash );
+     result _ scan( s, file!n!x, trash );
+     IF result NEQ "@" 
+	THEN RETURN( result )	! normal file name, return it;
+	ELSE BEGIN "indirectfile" ! indirect file, "prepend" it to list;
+			INTEGER tempjfn, trash; EXTERNAL INTEGER !SKIP!;
+		trash _ LOP( result );
+		IF -1 < tempjfn _ OPENFILE( result, "ROE*" )
+		 THEN BEGIN "addindirect"	STRING t; 
+			t _ NULL;
+			DO DO t _ t & SINI( tempjfn, 1000, cr ) 
+			      UNTIL !SKIP! NEQ cr
+			   UNTIL NOT INDEXFILE( tempjfn );
+			CFILE( tempjfn ); 
+			s _ t & s;
+		      END "addindirect";
+	     END "indirectfile";
+   END "nextname"; 
+SIMPLE INTEGER PROCEDURE next$state( INTEGER state, row );
+   BEGIN "next$state"		INTEGER retstate;
+     IF ( retstate _ dispat(state, row) ) NEQ zero$state
+	THEN RETURN( retstate )
+	ELSE BEGIN "new$state"		INTEGER ch;
+		dispat(state, row) _ top$state _ top$state + inc$state;
+		IF top$state + inc$state > max$state$loc
+		   THEN USERERR(0, 1, "Exceeded allotted memory size.");
+		backptr( top$state ) _ neg$state;
+		wordof( top$state ) _ 0;
+		FOR ch _ 1 STEP 1 UNTIL class$count DO 
+			dispat( top$state, ch ) _ zero$state;
+		RETURN( top$state );
+	     END "new$state";
+   END "next$state"; 
+SIMPLE PROCEDURE state$clean; 
+   BEGIN "state$clean"		INTEGER state;
+
+     backptr( neg$state ) _ zero$state;
+     backptr( zero$state ) _ neg$state;
+
+     FOR state _ zero$state STEP inc$state UNTIL top$state DO
+       BEGIN "perstate"		INTEGER backstate, row, t; 
+	 backstate _ backptr(state);
+
+	 FOR row _ 1 STEP 1 UNTIL class$count DO
+	    IF (t _ dispat(state, row)) > state   AND
+		backptr(t) = neg$state
+	      THEN BEGIN "forward"	INTEGER lrow, gctail;
+		     gctail _ dispat( backstate, row );
+		     backptr(t) _ gctail;
+		     IF wordof(t) = 0 THEN 
+			wordof(t) _ wordof(gctail);
+		     FOR lrow _ 1 STEP 1 UNTIL class$count DO
+		        IF dispat(t, lrow) = zero$state THEN
+			   dispat(t, lrow) _ dispat( gctail, lrow );
+		   END "forward";
+
+	 IF wordof(state) = wordof(backstate) OR 
+	    wordof(backstate) = 0 
+	   THEN backptr(state) _ backptr(backstate);
+       END "perstate";
+   END "state$clean"; 
+SIMPLE PROCEDURE state$make( STRING queue ); 
+		DESR constructs the state matrix (state$mat);
+   BEGIN "state$make"	OWN SAFE INTEGER ARRAY loadstate[1 : maxwords ];
+  			OWN SAFE STRING  ARRAY targcop[  1 : maxwords ];
+			INTEGER ch;
+     ARRTRAN( targcop, targets );
+     top$state _ zero$state;		! set topstate to 0;
+     ARRCLR( loadstate, zero$state );	! set all loadstates to state 0;
+
+! set up states -1 and 0: ;
+     wordof( neg$state ) _ wordof( zero$state ) _ 0;
+     FOR ch _ 1 STEP 1 UNTIL class$count DO 
+	dispat( neg$state, ch ) _ dispat( zero$state, ch ) _ zero$state;
+! this can be done with an arrblt;
+
+     WHILE LENGTH(queue) DO
+	BEGIN "addstate"		INTEGER char, word;
+	  word _ LOP( queue );
+
+	  ASSERT( LENGTH( TARGCOP[word] ) > 0 )
+
+	  DO char _ class$mat[ LOP( TARGCOP[word] ) ] LAND '777777
+		UNTIL char OR LENGTH( TARGCOP[word] ) = 0;
+		! don't process ignore characters in the strings;
+	  IF char THEN loadstate[word] _ 
+				next$state(loadstate[word], char );
+	  IF LENGTH( TARGCOP[word] ) 
+		THEN append( queue, word )
+		ELSE IF loadstate[word] = zero$state
+		      THEN print( crlf & "Warning: ",
+				litstr( targets[word], TRUE ),
+				" (word ", word, ") is now NULL!" )
+		      ELSE wordof( loadstate[word] ) _ word;
+	END "addstate";
+
+   END "state$make"; 
+SIMPLE STRING PROCEDURE 
+    make$character$table( STRING ARRAY stlist; 
+				SAFE INTEGER ARRAY identities );
+DESR	transfers strings from stlist into "targets", and builds a 
+!	unique character table (class$mat). (number of strings 
+!	transferred is min( maxwords, first empty string in stlist)
+!	identities is an array that has circular lists of characters 
+!	that are to be regarded as equivalent during the search.
+!	Sets global "class$count" to be 
+!		the number of distinct "classes".
+!	Returns a queue containing one entry for every string in 
+!	"targets", (the entry is the index into "targets" for the
+!	string);
+
+BEGIN "make$character$table"		STRING str, queue; 
+					INTEGER word, ignore$chars;
+IFC debug THENC
+	INTEGER i;
+  FOR i _ 0 STEP 1 UNTIL '177
+   DO BEGIN "verify"	INTEGER j, chain;
+	chain _ i;
+	FOR j _ 0 STEP 1 UNTIL '177 
+		DO IF (chain _ identities[ chain ]) = i 
+			THEN CONTINUE "verify";
+	USERERR( i, 2, "bad equivalence loop, it is not a circle" );
+      END "verify";
+ENDC
+
+ARRCLR( class$mat, 1 ); class$count _ 1; queue _ NULL;
+ignore$chars _ 0;
+DO class$mat[ ignore$chars ] _ 0	! NULL (ie ignore) characters;
+   UNTIL (ignore$chars _ identities[ ignore$chars ]) = 0;
+
+FOR word _ 1 STEP 1 UNTIL maxwords 
+   DO BEGIN "newstring" 
+	IF LENGTH( str _ targets[ word ] _ stlist[ word ] ) = 0
+		 THEN DONE "newstring";
+	append( queue, word );
+	WHILE LENGTH( str ) 
+	   DO BEGIN "perchar"		INTEGER mate, char;
+		char _ mate _ LOP(str); 
+		IF class$mat[ char ] = 1 
+		 THEN BEGIN 
+			class$count _ class$count + 1;
+			DO class$mat[ mate ] _ class$count
+			  UNTIL char = (mate _ identities[ mate ]);
+		      END;
+	      END "perchar";
+      END "newstring";
+IF word = 1 THEN USERERR( 0, 1, "You are searching for nothing!" );
+
+IFC cardstuff THENC
+ class$mat[ ff] _ (-1 LSH 18) + (class$mat[ ff] LAND '777777);
+ELSEC
+ class$mat[ lf] _ (-1 LSH 18) + (class$mat[ lf] LAND '777777);
+ class$mat[eol] _ (-1 LSH 18) + (class$mat[eol] LAND '777777);
+ class$mat[ ff] _ (-2 LSH 18) + (class$mat[ ff] LAND '777777);
+ENDC
+RETURN( queue ); 
+
+END "make$character$table"; 
+BOOLEAN foundany;	! true if any words found on the current file;
+INTEGER ind$jfn, eof;	! source of characters and associated eof;
+
+	! local to here through the end of "DEMON";
+
+DEFINE bufsiz = 512; ! page size for TENEX;
+OWN SAFE INTEGER ARRAY rdbuf[1:bufsiz];
+INTEGER lstbuf;		! number of buffers passed already;
+INTEGER lstwrd;		! "AOBJN" pointer to word (in rdbuf) containing 
+			  "line feed" (or whatever reporting unit);
+INTEGER lstret;		! "JSP" return address from demon for the call 
+			  to spechn that found the reporting unit; 
+INTEGER bytoffset;	! spechan's return address (right half only)
+			  if byte 0 was being worked on;
+INTEGER bytfactor;	! number of instructions between byte handling
+			  pieces of code;
+			
+INTEGER lastsos;	! last sos line number found on this "line";
+INTEGER ind$jfn$copy;	! duplicate of ind$jfn for reporting;
+INTEGER output$jfn;	! where to put list of matches;
+INTEGER page, line;	! current page and line being looked at;
+STRING prinlist;	! list of word numbers found but not reported;
+INTEGER jfn$for$pl;	! if	 > 0 then output chan for .PL file,
+				 = 0 means do .PL file, no match yet
+				 < 0 means no .PL file wanted;
+IFC cardstuff THENC
+
+	INTEGER eof$copy; ! eof for ind$jfn$copy;
+	INTEGER lfpage;	! special break table for looking at cards;
+
+SIMPLE PROCEDURE set$lfpage;
+   BEGIN "set$lfpage" 
+     lfpage _ GETBREAK; 
+     SETBREAK( lfpage, '12 & '14, NULL, "INA" );
+     BREAKSET( lfpage, NULL, "O" );
+   END "set$lfpage"; 
+REQUIRE set$lfpage INITIALIZATION;
+
+SIMPLE STRING PROCEDURE docard( INTEGER injfn );
+BEGIN "docard"	STRING result, s; INTEGER l;
+    PRESET!WITH   "Reference number:",	"Title:",	"Author:",  
+			"Journal:",	"Date:",	"Volume:", 
+			"Indices:",	"Comments:",	"Location:";
+	   OWN SAFE STRING ARRAY linename[ 0:8 ];
+result _ NULL;
+DO 	s _ CHARIN(injfn) & CHARIN(injfn)
+  UNTIL NOT EQU( crlf, s );	! eat extraneous blank lines;
+
+DO    BEGIN "aline"
+	IF  s[2 TO 2] = ":" 
+	 THEN FOR l _ 0 STEP 1 UNTIL 8
+		DO IF s = linename[l] 
+			THEN BEGIN s _ linename[l]; DONE; END
+	 ELSE IF s[2 TO 2] = '14 THEN RETURN( result & LOP( s ) );
+	result _ result & s & INPUT( injfn, lfpage ); 
+	IF result[INF TO INF] = '14 THEN RETURN( result[1 TO INF-1] );
+      END "aline"
+  UNTIL (s _ CHARIN(injfn) & CHARIN(injfn)) = '14 OR eof$copy;
+
+RETURN( result );
+	
+END "docard"; 
+
+ENDC
+IFC boolstuff THENC   
+	SAFE BOOLEAN ARRAY hitbox[0:maxwords];   
+			! true if word found in last search;
+
+SIMPLE PROCEDURE scanfor( REFERENCE STRING str; INTEGER other );
+BEGIN "scanfor"			INTEGER depth, ch;
+depth _ 0;
+WHILE LENGTH( str )
+     DO IF str = bool!close
+	  THEN IF (depth_depth-1) < 0 
+		THEN RETURN
+		ELSE ch _ LOP(str) 
+	eif (ch _ LOP(str)) = bool!open	
+	  THEN depth _ depth + 1
+	eif depth = 0 AND ch = other
+	  THEN RETURN;
+END "scanfor"; 
+
+ IFC boolnot THENC 
+	BOOLEAN hadnot; INTEGER notdepth; 
+	PRELOAD!WITH FALSE;
+	OWN SAFE BOOLEAN ARRAY notstack[ 0 : max!not!depth ];
+
+  SIMPLE BOOLEAN PROCEDURE popnot;
+  RETURN( IF notdepth	THEN notstack[ (notdepth _ notdepth-1) ] 
+			ELSE FALSE );
+
+  SIMPLE PROCEDURE pushnot( BOOLEAN stackelement );
+  IF notdepth OR stackelement
+   THEN BEGIN
+	  notstack[ notdepth ] _ stackelement;
+	  IF notdepth < max!not!depth
+	   THEN notdepth _ notdepth + 1
+	   ELSE USERERR( 0, 1, "boolean stack overflow" );
+	END;
+
+ ENDC
+ENDC
+IFC boolstuff THENC   
+
+SIMPLE BOOLEAN PROCEDURE checkbool( STRING qualcop );
+BEGIN "checkbool"	INTEGER k; BOOLEAN fitscrit;
+
+fitscrit _ TRUE;
+IFC boolnot THENC	notdepth _ 0; hadnot _ FALSE;	ENDC
+
+WHILE k _ LOP( qualcop )
+    DO	IF 1 LEQ k LEQ maxwords		
+	 THEN BEGIN "wasword"
+		fitscrit _ hitbox[k];
+IFC boolnot THENC
+		IF hadnot THEN fitscrit _ NOT fitscrit;
+		hadnot _ FALSE;
+ENDC
+	      END "wasword" 
+	eif k = bool!or
+	 THEN BEGIN "wasor"
+		IF fitscrit 
+		 THEN scanfor(qualcop, 0);
+	      END "wasor" 
+	eif k = bool!and
+	 THEN BEGIN "wasand"
+		IF NOT fitscrit THEN scanfor(qualcop, bool!or);
+	      END "wasand" 
+IFC boolnot THENC 
+	eif k = bool!not THEN hadnot _ NOT hadnot
+	eif k = bool!close 
+	 THEN BEGIN "wasclose"
+		hadnot _ FALSE;
+		IF popnot THEN fitscrit _ NOT fitscrit;
+	      END "wasclose" 
+	eif k = bool!open 
+	 THEN BEGIN "wasopen"
+		pushnot( hadnot );
+		hadnot _ FALSE;
+	      END "wasopen";
+
+IF notdepth THEN fitscrit _ NOT fitscrit;
+
+ELSEC
+	eif k = bool!open OR k = bool!close THEN CONTINUE;
+ENDC
+RETURN( fitscrit ); 
+
+END "checkbool";
+ENDC
+STRING search$name;	! "nice!name" of file currently being searched;
+BOOLEAN nottty;		! TRUE if output device is not "TTY:";
+
+SIMPLE PROCEDURE showline;
+BEGIN "showline"	EXTERNAL INTEGER !SKIP!; INTEGER wordnum; 
+
+IF LENGTH( prinlist ) = 0 THEN RETURN;
+
+IFC boolstuff THENC 
+ IF LENGTH( qualifier ) 
+  THEN BEGIN "evalexp"
+	IF NOT checkbool( qualifier ) 
+	 THEN BEGIN
+		prinlist _ NULL; 
+		ARRCLR( hitbox, FALSE );
+		RETURN;
+	      END;
+	ARRCLR( hitbox, FALSE );
+      END "evalexp";
+ENDC
+HITCOUNT[0] _ HITCOUNT[0] + 1; 
+! recognized units (lines or pages) count (number that fit criteria);
+
+
+IF ind$jfn$copy = 0 
+ THEN BEGIN "makecopy"
+	IF nottty 
+	 THEN cprinT( output$jfn, crlf, search$name ); 
+	foundany _ TRUE;
+ifc cardstuff thenc
+	if  0 > (ind$jfn$copy _ 
+			OPENFILE( jfns(ind$jfn, exact!name), "ROHE" ) ) 
+	and 0 > (ind$jfn$copy _
+			OPENFILE( jfns(ind$jfn, exact!name), "ROE" ) ) 
+elsec
+	if  0 > (ind$jfn$copy _ 
+			OPENFILE( jfns(ind$jfn, exact!name), "ROE" ) ) 
+	and 0 > (ind$jfn$copy _
+			OPENFILE( jfns(ind$jfn, exact!name), "ROHE" ) ) 
+endc
+	 then BEGIN		! file failed to open properly;
+		ind$jfn$copy _ -1;
+		USERERR(0,1, "can't access " & search$name & " twice.");
+	      END
+IFC cardstuff THENC
+	 ELSE SETINPUT( ind$jfn$copy, 200, 0, eof$copy )
+ENDC
+      END "makecopy";
+
+IFC cardstuff THENC
+ cprinT( output$jfn, crlf & crlf, line, ". {" );
+ELSEC
+ cprinT( output$jfn, crlf & crlf & "(", 
+		(IF nottty THEN NULL ELSE search$name), " ",
+		page, ".", line );
+ IF lastsos
+  THEN cprinT( output$jfn, " {SOS='", CVOS(lastsos), "}) {" ) 
+  else cprinT( output$jfn, ") {" );
+ENDC
+
+WHILE wordnum _ LOP( prinlist ) DO 
+      BEGIN
+IFC boolstuff THENC
+	matchcount[ wordnum ] _ matchcount[ wordnum ] + 1;
+ENDC 
+	cprinT( output$jfn, targets[wordnum],
+			(IF prinlist THEN "," ELSE "}") );
+      END;
+
+IF jfn$for$pl = 0 
+ THEN BEGIN "setpljfn" 			STRING pl$name, extpart;
+	extpart _ JFNS( ind$jfn, 1 LSH 24 );
+			! '26=^V (quote file name character) for TWENEX;
+	pl$name _ ( '26 & "#" & JFNS( ind$jfn, 1 LSH 27 ) & 
+		    (IF LENGTH(extpart) THEN "-" ELSE NULL) &
+		    extpart )[1 FOR 39] & ".PL";
+	  IF 0 > (jfn$for$pl _ OPENFILE( pl$name, "wE" )) then
+	    BEGIN
+	      jfn$for$pl _ -2;
+	      USERERR( 0, 1, "COULDN'T MAKE .PL FILE" );
+	    END;
+      END "setpljfn";
+IF ind$jfn$copy > 0 
+ THEN BEGIN "copyline"	
+		INTEGER oldpoint; STRING theline;
+
+	oldpoint _ ( ( bufsiz*lstbuf - LOCATION(rdbuf[1]) + lstwrd ) 
+		     LAND '777777 ) * 5 +
+		   (((lstret LAND '777777) - bytoffset) % bytfactor)+1;
+	SCHPTR( ind$jfn$copy, oldpoint );
+
+! set filecopy's char ptr just past reporting unit (lf or whatever);
+
+      IFC cardstuff THENC
+	theline _ docard( ind$jfn$copy );
+      ELSEC
+	theline _ INPUT( ind$jfn$copy, linbrk ); 
+	IF theline = ff THEN theline _ theline[ 2 FOR INF ];
+      ENDC
+
+	cprinT( output$jfn, crlf, theline );
+      END "copyline";
+
+IF jfn$for$pl > -1
+  THEN cprinT( jfn$for$pl, IFC cardstuff 
+		THENC line, ".", 1 ELSEC page, ".", line ENDC, " " );
+
+END "showline"; 
+
+
+SIMPLE INTEGER PROCEDURE noteword( INTEGER wordknown );
+	append( prinlist, wordknown ); 
+SIMPLE BOOLEAN PROCEDURE demon( BOOLEAN plwanted );
+	! INTEGER ojfn, ijfn; ! REFERENCE INTEGER ijfn$eof;
+BEGIN "demon"
+		INTEGER bufbeg, zstval; ! kluges to help code;
+		BOOLEAN first$match, foundflag;
+		EXTERNAL INTEGER !skip!;
+bufbeg _ LOCATION(rdbuf[1]);	! use a define???;
+
+first$match _ TRUE; 
+ind$jfn$copy _ 0;		! indicate no copy of jfn exists yet;
+jfn$for$pl _ (IF plwanted THEN 0 ELSE -1);
+				! arrange flag to create .PL if wanted;
+prinlist _ NULL; 
+IFC boolstuff THENC   ARRCLR(hitbox, FALSE);   ENDC 
+foundflag _ FALSE;		! no words recognized at first;
+
+page _ 1;			! defined start of file values;
+LINE _ lastsos _ 0;		! no SOS line numbers yet;
+zstval _ zero$state;		! ??? setup state _ nothing recognized;
+
+START!CODE "looklup"	
+	LABEL	nxtwd, wbyt1, wbklu, GETWRD, dembck, sosbck, spechn, 
+		repwrd, reclup, getbuf;
+	LABEL	klugebase, kluge1, kluge2;
+	LABEL	byptr0, byptr1, byptr2, byptr3, byptr4, bufval, finout;
+	LABEL	specbk, dondmn, linhnd, formfd, linfed, 
+		spctab, linret;
+		!	nxtch, normal, specbk, getbyt, dondmn, linhnd,
+		!	finout, spechn, formfd, linfed, reclup, repwrd,
+		!	linret, saveacs, restoreacs;
+	INTEGER	gtbfrt;			! return address for "getwrd";
+	INTEGER	chnhed;			! temporary for reporting loop;
+	OWN INTEGER ARRAY aca[0:'17];	! ac storage during sail calls;
+DEFINE chnwrd = -1;	! backpointer for state (like backptr);
+DEFINE recwrd = 0;	! word associated with state (like wordof);
+
+!	registers: 	;
+DEFINE	linflg	= 0;	! mask to check for SOS line number word;
+DEFINE	state	= 1;	! current finite machine state;
+DEFINE	ch	= 2;	! character from buffer, must be 0 before ;
+			!	getting the next character, ;
+			! also is: class of character from buffer;
+DEFINE	ch1	= ch+1; ! word from buffer (lshc gets next byte);
+			! also is: general calculation register;
+DEFINE	bufwrd	= 4;	! "AOBJN" pointer to word in buffer;
+DEFINE	bufersused = 5;	! count of buffers used (to identify line);
+DEFINE	dret	= 6;	! "JSP" register for demonic use;
+DEFINE	dspt	= 7;	! dispatch register for specials;
+DEFINE	bltac	= 7;	! "BLT" register for saving and restoring ACs;
+DEFINE	p	= '17;	! SAIL main stack register;
+
+! setup stored locations: ;
+	MOVEI	dembck		; ! reset the getbuffer return address;
+	MOVEM	gtbfrt		; !	to go into the demon;
+	movei	wbyt1		; ! store corection values to decode;
+	subi	nxtwd		; ! store corection values to decode;
+	movem	bytfactor	; !	the byte stuff;
+
+	move	klugebase	; ! set kluge1 and kluge2 to ;
+	subi	wbklu		;
+	HRRM	kluge1		; !	"jrst wbyt1-wbklu(dret)";
+	HRRM	kluge2		;
+	movei	wbklu		; ! byte number is: ;
+	movem	bytoffset	; !  (RH(lstret)-bytoffset) % bytfactor;
+	sub	bytfactor	; ! set byte of last "eol" to -1, ;
+	movem	lstret		;
+	move	bufbeg		; ! set word of last "eol" to rdbuf[1],;
+	movem	lstwrd		;
+	setzm	lstbuf		; ! and set buffer of last "eol" to 0;
+! setup AC's: ;
+	movei	linflg,1	; ! bit to check for sos line number;
+	seto	bufersused,	; ! will become 0 buffers used so far;
+	move	state,zstval	; ! machine starts out in state 0;
+	SETZ	ch,		; ! clear character gotten first;
+	jrst	getbuf		; ! start the demon as if buffer fault;
+
+klugebase: jrst wbyt1(dret)	; ! used as a constant to set up the
+				  ! value of "jrst wbyt1-wbklu(dret)",
+				  ! which "START!CODE" won't do;
+
+bufval:	-bufsiz LSH 18 rdbuf[1]	; ! AOBJN for buffer;
+
+! MEANING OF LABELS:
+!	nxtwd:	process first byte from word in ch
+!	 wbyt1:	process second byte in word pointed to by bufwrd
+!		used for address calc in spechn, and as sos post-tab ret
+!	 wbklu:	kluge to give proper return displacement for spechn
+!	GETWRD:	read another word from the data file, ignore sos-numbers
+!	 dembck: return address to use for getwrd to go back into demon
+!	 sosbck: return address to use for getwrd return to SOS handling
+!	GETbuf:	read another buffer-full from the data file
+!	spechn:	execute the special in the left half of ch (if any),
+!		if RH(ch) then return +1 with ch set to RH(ch), 
+!			  else return +(1+wbyt1-wbklu) with ch undefined
+!				[+(1+wbyt1-wbklu) = process next byte] 
+!	repwrd:	report all words recognized in the current state, 
+!			starting with word number ch.
+!	  reclup: (internal to repwrd) report next word in chain.
+;
+nxtwd:
+! first byte in word;
+      IFC debug!machine!code THENC
+	skipe	ch		; ! note this word must be 0 for LSHC;
+	  0			; ! it wasn't, cause a run-time error;
+      ENDC
+	LSHC	ch,7		; ! word in ch1, shift next byte in;
+	SKIPG	ch,class$mat[0](ch); ! translate character;
+	  JSP	dret,spechn	; ! was special or null;
+wbklu:	ADDI	state,0(ch)	;
+      IFC debug!machine!code THENC
+	skipe	ch		; ! nulls should have been skipped;
+	skipn	0(state)	; ! and the state should be an address;
+	  1			; ! will cause an illegal instruction;
+      ENDC
+	MOVE	state,0(state)	; ! get next state;
+	SKIPE	ch,recwrd(state); ! if something recognized,;
+	  JSP	dret,repwrd	; !   then record it;
+
+wbyt1:				; ! ch _ second byte in word;
+! second byte in word;
+      IFC debug!machine!code THENC
+	skipe	ch		; ! ! note this word must be 0 for LSHC;
+	  0			; ! ! it wasn't, cause a run-time error;
+      ENDC
+	LSHC	ch,7		; ! word in ch1, shift next byte in;
+	SKIPG	ch,class$mat[0](ch); ! IF (ch _ class$mat[ ch ]) > 0 OR;
+	  JSP	dret,spechn	; ! 	  (ch _ spechn( ch ));
+	ADDI	state,0(ch)	; !	THEN BEGIN;
+      IFC debug!machine!code THENC
+	skipe	ch		; ! nulls should have been skipped;
+	skipn	0(state)	; ! and the state should be an address;
+	  2			; ! will cause an illegal instruction;
+      ENDC
+	MOVE	state,0(state)	; !	  state _ nextstate(state, ch);
+	SKIPE	ch,recwrd(state); !	  if (ch _ recwrd(state));
+	  JSP	dret,repwrd	; !	   then repwrd( ch, state );
+				  !	  END;
+
+! third byte in word;
+      IFC debug!machine!code THENC
+	skipe	ch		; ! ! note this word must be 0 for LSHC;
+	  0			; ! ! it wasn't, cause a run-time error;
+      ENDC
+	LSHC	ch,7		; ! word in ch1, shift next byte in;
+	SKIPG	ch,class$mat[0](ch); ! translate character;
+	  JSP	dret,spechn	; ! was special or null;
+	ADDI	state,0(ch)	;
+      IFC debug!machine!code THENC
+	skipe	ch		; ! nulls should have been skipped;
+	skipn	0(state)	; ! and the state should be an address;
+	  3			; ! will cause an illegal instruction;
+      ENDC
+	MOVE	state,0(state)	; ! get next state;
+	SKIPE	ch,recwrd(state); ! if something recognized,;
+	  JSP	dret,repwrd	; !   then record it;
+
+! fourth byte in word;
+      IFC debug!machine!code THENC
+	skipe	ch		; ! ! note this word must be 0 for LSHC;
+	  0			; ! ! it wasn't, cause a run-time error;
+      ENDC
+	LSHC	ch,7		; ! word in ch1, shift next byte in;
+	SKIPG	ch,class$mat[0](ch); ! translate character;
+	  JSP	dret,spechn	; ! was special or null;
+	ADDI	state,0(ch)	;
+      IFC debug!machine!code THENC
+	skipe	ch		; ! nulls should have been skipped;
+	skipn	0(state)	; ! and the state should be an address;
+	  4			; ! will cause an illegal instruction;
+      ENDC
+	MOVE	state,0(state)	; ! get next state;
+	SKIPE	ch,recwrd(state); ! if something recognized,;
+	  JSP	dret,repwrd	; !   then record it;
+
+! fifth (and last) byte in word;
+      IFC debug!machine!code THENC
+	skipe	ch		; ! ! note this word must be 0 for LSHC;
+	  0			; ! ! it wasn't, cause a run-time error;
+      ENDC
+	LSHC	ch,7		; ! word in ch1, shift next byte in;
+	SKIPG	ch,class$mat[0](ch); ! translate character;
+	  JSP	dret,spechn	; ! was special or null;
+	ADDI	state,0(ch)	;
+      IFC debug!machine!code THENC
+	skipe	ch		; ! nulls should have been skipped;
+	skipn	0(state)	; ! and the state should be an address;
+	  5			; ! will cause an illegal instruction;
+      ENDC
+	MOVE	state,0(state)	; ! get next state;
+	SKIPE	ch,recwrd(state); ! if something recognized,;
+	  JSP	dret,repwrd	; !   then record it;
+
+      IFC debug!machine!code THENC
+	skipe	ch		; ! ! note this word must be 0 for LSHC;
+	  0			; ! ! it wasn't, cause a run-time error;
+      ENDC
+
+getwrd:	AOBJP	bufwrd,getbuf	; ! get new buffer if necessary;
+dembck:	SKIPN	ch1,0(bufwrd)	; ! if null, ;
+	  JRST	getwrd		; !    then get another word;
+	TDNN	linflg,ch	; ! check for sos number;
+	  JRST	nxtwd		; ! not sos, return to demon;
+	MOVEM	ch1,lastsos	; ! it was an sos line num, save a copy;
+	MOVEI	ch1,sosbck	; ! set local return for;
+	MOVEM	ch1,gtbfrt	; !   getbuf;
+	AOBJP	bufwrd,getbuf	; ! and get new buffer entry;
+sosbck:	MOVEI	ch1,dembck	; ! reset the return address;
+	MOVEM	ch1,gtbfrt	;
+	MOVE	ch1,0(bufwrd)	; ! pick up the word, skip over the ;
+	LSH	ch1,7		; !	tab that follows SOS numbers;
+	JRST	wbyt1		; ! and return to the demon;
+getbuf:		! PROCEDURE getbuf  BEGIN "getbuf";
+	aos	bufersused	; ! bufersused _ bufersused + 1;
+				  ! !	get next buffer (if any);
+	MOVE	bufwrd,bufval	; ! wordsinbuffer _ -bufsiz;
+				  ! bufferindex _ 0;
+	push	p,ind$jfn	; ! ARRYIN(ind$jfn, rdbuf[1], bufsiz );
+	push	p,bufbeg	; 
+	push	p,[bufsiz]	; 
+	pushj	p,ARRYIN	; 
+	skipn	eof 		; ! IF NOT eof THEN RETURN;
+	 JRST	@gtbfrt		; 
+	movn	ch1,eof		; 
+	hrl	bufwrd,ch1	; ! bufferindex _ - RH( eof );
+				  ! ! RH(eof) has number of words read;
+ 	jumpL	bufwrd,@gtbfrt	; ! IF bufferindex < 0 THEN RETURN;
+
+finout:	skipe	foundflag	; ! ! here if end-of-file;
+	  pushj	p,showline	; ! if foundflag THEN showline;
+	setzm	foundflag	; ! foundflag _ FALSE; ! (unnecessary);
+	jrst	dondmn		; ! DONE "looklup"; ! RETURN from demon;
+				  ! END "getbuf";
+repwrd:		! PROCEDURE repwrd( INTEGER  firstword, state );
+	movem	bltac,aca[bltac]; ! BEGIN "repwrd" (saveacs);
+	movei	bltac,aca[0]	;
+	blt	bltac,aca[bltac-1];
+	aos	foundflag	; ! foundflag _ TRUE;
+reclup:	movem	state,chnhed	; ! DO BEGIN "perword";
+	aos	hitcount[0](ch) ; !	hitcount[ firstword ] _ + 1;
+IFC boolstuff THENC   
+	aos	hitbox[0](ch)	; !	hitbox[ firstword ] _ TRUE;
+ENDC
+	push	p,ch		; !	noteword( firstword );
+	pushj	p,noteword	; 
+	move	state,chnhed	; !	state _ chnwrd( state ); 
+	move	state,chnwrd(state); 
+	skipe	ch,recwrd(state); !    END "perword";
+	 jrst	reclup		; ! UNTIL 0 = (firstword_recwrd(state));
+
+	HRLZI	bltac,aca[0]	;
+	blt	bltac,bltac	; ! END "repwrd" (restoreacs);
+	setz	ch,		; ! ! note: this must return ch=0;
+	jrst	0(dret)		;
+	jrst	specbk		; ! special -6 (unassigned);
+	jrst	specbk		; ! special -5 (unassigned);
+	jrst	specbk		; ! special -4 (unassigned);
+	jrst	specbk		; ! special -3 (unassigned);
+	jrst	formfd		; ! special -2 (form feed);
+	jrst	linfed		; ! special -1 (line feed);
+spctab:				; ! pseudo-special 0 (ignore byte);
+spechn:
+kluge1:	jumpe	ch,wbyt1(dret)	; ! address (RH) will be replaced at ;
+				  ! run time by "wbyt1-wbklu(dret)";
+	hlrO	dspt,ch		; ! get special case number;
+	jrst	@spctab(dspt)	; ! go handle the case;
+
+formfd:     ! here whenever a form feed is encountered (special -2);
+	setzm	line		; ! line _ 0;
+	aos	page		; ! page _ page + 1;
+	jrst	specbk		; ! end of form-feed handling;
+
+linfed:     ! here whenever a line feed is encountered (special -1);
+	aos	line		; ! line _ line + 1;
+	skipn	foundflag	; ! if foundflag;
+	  jrst	linret		; ! THEN BEGIN;
+	movem	bltac,aca[bltac]; ! ! (saveacs);
+	movei	bltac,aca[0]	;
+	blt	bltac,aca[bltac-1];
+	pushj	p,showline	; !   showline;
+	HRLZI	bltac,aca[0]	;
+	blt	bltac,bltac	; ! ! (restoreacs);
+	setzm	foundflag	; !	   foundflag _ FALSE;
+				  !	 END;
+linret:	movem	bufwrd,lstwrd	; ! save current word in buffer,;
+	movem	dret,lstret	; ! function of (current byte in word),;
+	movem	bufersused,lstbuf; ! and buffer number containing eol;
+	setzm	lastsos		; ! lastsos _ 0;
+	skipe	abortsearch	; ! IF abortsearch ; ! "abort!tc" received;
+	  jrst	dondmn		; !  THEN DONE "looklup";
+
+specbk:	hrrzi	ch,0(ch)	; ! right half is normal value;
+	jumpn	ch,0(dret)	; ! if normal character, analyze it, ;
+				; ! else (ignore character) next ch;
+kluge2:	JRST	wbyt1(dret)	; ! note that ch is 0 in ignore case;
+				  ! address (RH) will be replaced at ;
+				  ! run time by "wbyt1-wbklu(dret)";
+
+dondmn:				; ! finished this run of demon;
+     END "looklup";
+
+ IF abortsearch THEN OUTchr( bell ); ! ring a bell;
+ IF ind$jfn$copy > 0 THEN CFILE( ind$jfn$copy );
+ IF jfn$for$pl > 0 THEN CFILE( jfn$for$pl ); 
+END "demon"; 
+SIMPLE PROCEDURE setuptable(	STRING ARRAY searchlist; 
+				SAFE INTEGER ARRAY equivalence$table );
+DESR set up a finite state machine to search for the words in 
+! "searchlist" (up to the first NULL entry in "searchlist").
+! if "equivalence$cases" is TRUE set up so "a" works like "A";
+
+BEGIN "setuptable"	STRING $queue$;		INTEGER word;
+
+$queue$ _ make$character$table( searchlist, equivalence$table );
+
+state$make( $queue$ );	
+
+state$clean;
+
+END "setuptable"; 
+IFC boolstuff THENC
+
+SIMPLE STRING PROCEDURE shortexp( STRING exp; INTEGER maxval );
+BEGIN "shortexp"	STRING result; INTEGER ch;
+result _ NULL;
+WHILE ch _ LOP( exp ) 
+   DO BEGIN "onechar"
+	IF	ch = bool!and		THEN result _ result & " & "
+	eif	ch = bool!or		THEN result _ result & " V "
+IFC boolnot THENC
+	eif	ch = bool!not		THEN result _ result & " -"
+ENDC
+	eif	ch = bool!open		THEN result _ result & "("
+	eif	ch = bool!close		THEN result _ result & ")"
+	eif	0 < ch < maxval		THEN result _ result & CVS( ch )
+	 ELSE	USERERR( 0, 1, "unrecognized string element" );
+      END "onechar";
+RETURN( result );
+END "shortexp"; 
+
+
+SIMPLE STRING PROCEDURE 
+	longexp( STRING exp; STRING ARRAY names; INTEGER maxval );
+BEGIN "longexp"		STRING result; INTEGER ch;
+result _ NULL;
+WHILE ch _ LOP( exp ) 
+   DO BEGIN "onechar"
+	IF	ch = bool!and	THEN result _ result & " AND "
+	eif	ch = bool!or	THEN result _ result & " OR "
+IFC boolnot THENC
+	eif	ch = bool!not	THEN result _ result & "NOT "
+ENDC
+	eif	ch = bool!open	THEN result _ result & "( "
+	eif	ch = bool!close	THEN result _ result & " )"
+	eif	0 < ch < maxval	
+	 THEN result _ result & litstr( names[ch], TRUE )
+	 ELSE	USERERR( 0, 1, "unrecognized element: " & litstr(ch) ); 
+      END "onechar";
+RETURN( result );
+END "longexp"; 
+
+ENDC
+IFC boolstuff THENC
+
+SIMPLE STRING PROCEDURE makexp( STRING normal; INTEGER maxval );
+BEGIN "makexp"				STRING result;
+result _ NULL;
+WHILE LENGTH( normal )
+   DO BEGIN "onetoken"		INTEGER junk, ch;
+	IF "0" LEQ normal LEQ "9"
+	 THEN IF 0 < (ch _ INTSCAN( normal, junk )) < maxval 
+		 THEN result _ result & ch
+		 ELSE BEGIN 
+			print( crlf, "invalid word number: ", ch );
+			RETURN( NULL );
+		      END
+	eif (ch _ LOP(normal)) = ")" THEN result _ result & bool!close
+	eif 		    ch = "(" THEN result _ result & bool!open
+	eif		    ch = "&" THEN result _ result & bool!and 
+	eif	ch = "v" OR ch = "V" THEN result _ result & bool!or 
+IFC boolnot THENC
+	eif		    ch = "-" THEN result _ result & bool!not
+ENDC
+	eif NOT( ch = " " OR ch = cr OR ch = lf OR ch = eol OR 
+		 ch = tab OR ch = ff)
+	 THEN BEGIN 
+		print( crlf, "stopping on character: ", litstr(ch) );
+		RETURN( result );
+	      END;
+      END "onetoken";
+RETURN( result );
+END "makexp"; 
+ 
+ENDC
+IFC boolstuff THENC
+
+SIMPLE STRING PROCEDURE 
+	getexp( STRING oldval; STRING ARRAY targs; BOOLEAN askhim );
+BEGIN "getexp"
+	STRING s, tempexp, orexp; 
+	INTEGER specs, maxtarg; 
+	OWN INTEGER oldmaxtarg;
+
+orexp _ 1;
+FOR maxtarg _ 2 STEP 1 UNTIL maxwords
+  DO IF LENGTH( targs[ maxtarg ] ) 
+	THEN orexp _ orexp & bool!or & maxtarg 
+	ELSE DONE;
+IF maxtarg = 2 then return( null );  ! only reasonable with one target;
+IF oldmaxtarg NEQ maxtarg OR LENGTH( oldval ) = 0
+ THEN oldval _ orexp;	! if the number of words has changed,
+			 or no default yet, reset default;
+oldmaxtarg _ maxtarg;
+IF NOT askhim THEN RETURN( IF EQU(orexp, oldval) THEN NULL ELSE oldval);
+s _ oldval;
+
+WHILE TRUE DO
+BEGIN "getinput"
+  print( crlf, crlf, "current expression: ", shortexp( s, maxtarg ) );
+  case comand( "Expression: ", "@^" & esc & crlf & ctrl("R"), 
+ "TYPE: 
+  ""@"" file name	read boolean expression from named file
+CR or LF  accept current expression and go on to next question
+  ESC	  accept current expression and default further questions
+  ^R	  retype the English equivalent of the current expression 
+  ""^""	  return to the first question 
+OR Input a boolean expression to specify the lines that will be included
+ use word numbers to identify words to use, the character ""&"" to 
+ indicate ""AND"", the character ""V"" to indicate ""OR"", " & 
+
+IFC boolnot THENC
+
+"the character 
+""-"" to indicate ""NOT"", and parentheses to indicate grouping.  Note
+ that the logical function ""NOT"" has precedence over ""AND"" which has
+ precedence over ""OR"" as seen in the example.
+
+EXAMPLE: 1 & -2 V -3 & 1 & -(4 V 5)  means the same thing as  
+	( (1 & (-2)) V ((-3) & 1) ) & (-4) & (-5)
+	ie. accept all lines with either 
+	(A) word 1 found, but not any of words 2, 4, or 5  found  OR  
+	(B) word 1 found, but not any of words 3, 4, or 5  found "
+
+ELSEC
+
+"and parentheses
+ to indicate grouping.  Note that the logical function ""AND"" has 
+ precedence over ""OR"" as seen in the example.
+
+EXAMPLE: 1 & 2 V 3 & 1  means the same thing as  (1 & 2) V (3 & 1) 
+	ie. accept all lines with either (A) words 1 and 2 found  OR  
+					 (B) words 3 and 1 found " 
+
+ENDC
+) of
+  begin "boolcase"
+   begin ! unk;	    EXTERNAL INTEGER !SKIP!; string tempexp;
+		tempexp _ INTTY; 
+		IF !SKIP! = esc THEN escoff _ FALSE;
+		IF LENGTH( tempexp ) and 
+		   LENGTH( tempexp _ makexp( tempexp, maxtarg ) )
+			THEN s _ tempexp			END; 
+   begin ! "@";	    INTEGER tempjfn; string t;
+		t _ NULL;
+		if -1 < tempjfn _ openfile( null, "ROE" )
+		 then begin		INTEGER brk; 
+			setinput( tempjfn, 1000, brk, 0 );
+			DO t _ t & input( tempjfn, exp!brk ) 
+			      UNTIL brk < 1;
+			CFILE( tempjfn ); 
+			IF LENGTH( t ) and 
+			  LENGTH( t_ makexp( t, maxtarg ) )
+			    THEN s _ tempexp
+		      END
+		 else print( " xxx " )				END;
+   begin ! "^"; jumptop _ true; return( oldval )		end;
+   begin ! esc; escoff _ false;
+		RETURN( IF EQU(orexp, s) THEN NULL ELSE s )	END;
+   begin !  cr; return( IF EQU(orexp, s) THEN NULL ELSE s )	end;
+   begin !  lf; return( IF EQU(orexp, s) THEN NULL ELSE s )	end;
+   begin !  ^r; print( crlf & tab, longexp(s, targs, maxtarg))	end
+  end "boolcase"
+END "getinput";
+END "getexp"; 
+
+ENDC
+PRELOAD!WITH
+	  '0,   '1,   '2,   '3,   '4,   '5,   '6,   '7,
+	 '10,  '11,  '12,  '13,  '14,  '15,  '16,  '17,
+	 '20,  '21,  '22,  '23,  '24,  '25,  '26,  '27,
+	 '30,  '31,  '32,  '33,  '34,  '35,  '36,  '37,
+	 '40,  '41,  '42,  '43,  '44,  '45,  '46,  '47,
+	 '50,  '51,  '52,  '53,  '54,  '55,  '56,  '57,
+	 '60,  '61,  '62,  '63,  '64,  '65,  '66,  '67,
+	 '70,  '71,  '72,  '73,  '74,  '75,  '76,  '77,
+	'100, '101, '102, '103, '104, '105, '106, '107,
+	'110, '111, '112, '113, '114, '115, '116, '117,
+	'120, '121, '122, '123, '124, '125, '126, '127,
+	'130, '131, '132, '133, '134, '135, '136, '137,
+	'140, '141, '142, '143, '144, '145, '146, '147,
+	'150, '151, '152, '153, '154, '155, '156, '157,
+	'160, '161, '162, '163, '164, '165, '166, '167,
+	'170, '171, '172, '173, '174, '175, '176, '177;
+SAFE INTEGER ARRAY unique[ 0 : '177 ];
+
+PRELOAD!WITH
+	  '0,   '1,   '2,   '3,   '4,   '5,   '6,   '7,
+	 '10,  '11,  '12,  '13,  '14,  '15,  '16,  '17,
+	 '20,  '21,  '22,  '23,  '24,  '25,  '26,  '27,
+	 '30,  '31,  '32,  '33,  '34,  '35,  '36,  '37,
+	 '40,  '41,  '42,  '43,  '44,  '45,  '46,  '47,
+	 '50,  '51,  '52,  '53,  '54,  '55,  '56,  '57,
+	 '60,  '61,  '62,  '63,  '64,  '65,  '66,  '67,
+	 '70,  '71,  '72,  '73,  '74,  '75,  '76,  '77,
+	'100, 
+	      '141, '142, '143, '144, '145, '146, '147,
+	'150, '151, '152, '153, '154, '155, '156, '157,
+	'160, '161, '162, '163, '164, '165, '166, '167,
+	'170, '171, '172, 
+			  '133, '134, '135, '136, '137,
+	'140, 
+	      '101, '102, '103, '104, '105, '106, '107,
+	'110, '111, '112, '113, '114, '115, '116, '117,
+	'120, '121, '122, '123, '124, '125, '126, '127,
+	'130, '131, '132, 
+			  '173, '174, '175, '176, '177;
+SAFE INTEGER ARRAY upper$lower[ 0 : '177 ];
+
+SAFE INTEGER ARRAY special$equiv[0:'177];
+SIMPLE STRING PROCEDURE 
+displaytable( SAFE INTEGER ARRAY eqvtab; BOOLEAN litbol, showsingles );
+BEGIN "displaytable"		INTEGER i; STRING result;
+result _ NULL;
+FOR i _ 0 STEP 1 UNTIL 127 
+   DO BEGIN "show equivalences"		INTEGER ch; STRING equ$set; 
+	equ$set _ ch _ i;
+	WHILE (ch _ special$equiv[ ch ]) NEQ i 
+	   DO IF ch < i 
+		THEN CONTINUE "show equivalences" 
+		ELSE equ$set _ equ$set & ch;
+	IF showsingles OR LENGTH( equ$set ) > 1
+	 THEN result _ result & " " & litstr( equ$set, litbol ) & ";";
+      END "show equivalences";
+RETURN( result );
+END "displaytable";
+SIMPLE PROCEDURE abortint;	abortsearch _ TRUE; 
+	! abort interrupt procedure (immediate);
+
+
+PROCEDURE performsearch( INTEGER outfile; STRING filelist; 
+			 INTEGER eqnum; BOOLEAN make$pl 
+IFC boolstuff THENC				    ; STRING boolexpr 
+ENDC								     );
+DESR performs a search on all files in "filelist", 
+	using a previously produced search table (FSM)
+		outfile:  channel for search results (or -1 for TTY:)
+		filelist: list of file names to search
+		eqnum:	  number of equivalence table used 
+				(note: this is only used for output!)
+		make$pl:  if true should make ".pl" files
+;
+BEGIN "performsearch" 
+STRING currentname;	! file-index name currently being searched;
+record!class msfile  ( record!pointer (msfile) link; STRING name );
+record!pointer (msfile) miss!head, miss!tail; 
+			! file names: fake head no recognized lines;
+INTEGER i; 
+INTEGER tot!searched, aborted;
+define bprint( outdata ) = <begin cprint( outfile, outdata );
+				  if nottty then print( outdata ) end>;
+
+tot!searched_ aborted_ 0;
+miss!tail _ miss!head _ new!record (msfile); ! set top of missed files;
+msfile:name [miss!head] _ "(None)";	     ! fake file name for list;
+if outfile > -1 then NOTtty _ NOT EQU( "TTY:", JFNS( outfile, 0 ) )
+		else begin nottty _ false; outfile _ -1 end;
+
+ARRCLR( hitcount );	! counts of various word matches;
+IFC boolstuff THENC
+  ARRCLR( matchcount );	
+  qualifier _ boolexpr;   
+ENDC 
+
+print( crlf, "Type DEL or RUBOUT to abort any particular file search." );
+PSIMAP( 1, abortint, 0, 3 ); ENABLE( 1 ); ATI( 1, abort!tc );
+	! set up "abort!tc" to cause immediate interrupt to "abortint"; 
+
+output$jfn _ outfile; ! kludge to allow "showline" to acess output file;
+
+WHILE (currentname _ nextname( filelist ))
+DO BEGIN "perindex"		! this occurs once per name in filelist;
+	INTEGER indexjfn;
+ifc cardstuff thenc
+! card libraries supposed to be accessed in thawed mode (if possible);
+    if	0 > (indexjfn _ OPENFILE( currentname, "ROHE*")) ! try thawed, ;
+    and 0 > (indexjfn _ OPENFILE( currentname, "ROE*" )) ! then normal;
+elsec
+    if	0 > (indexjfn _ OPENFILE( currentname, "ROE*" )) ! try normal, ;
+    and 0 > (indexjfn _ OPENFILE( currentname, "ROHE*")) ! then thawed;
+endc
+	 then BEGIN "filetrouble" 
+		bprint(<crlf, "Couldn't access ", currentname >);
+		CONTINUE "perindex";
+	      END "filetrouble";
+    SETINPUT( indexjfn, 200, 0, eof ); 
+
+    DO BEGIN "do$demon"	! this occurs once per file to be searched;
+	 search$name _ JFNS( indexjfn, (IF nottty THEN exact!name 
+						  ELSE short!name ) ); 
+	 print( crlf, "Searching ", JFNS( indexjfn, exact!name ) ); 
+	 ind$jfn _ indexjfn;
+	 tot!searched_ tot!searched + 1;
+	 foundany _ abortsearch _ FALSE;
+		! turn off abort indicator and words on file indicator;
+	 demon( make$pl );			! perform search;
+	    ! side effects: globals page & line are set, 
+		eof is used to determine when done, 
+		abortsearch is checked after every line;
+	 IF abortsearch 
+	  THEN BEGIN
+		 aborted_ aborted + 1;
+		 bprint(<crlf, crlf, tab, search$name,
+			" aborted at ", page, ".", line>); 
+	       END;
+	 CLOSF( indexjfn );
+	 IF foundany 
+	  THEN cprinT( outfile, form )		! page mark;
+	  else begin
+		msfile:link [miss!tail] _ new!record (msfile); 
+		miss!tail _ msfile:link [miss!tail];
+		msfile:name [miss!tail] _ search$name; 
+	       end;
+	 WHILE TRUE 
+	   DO BEGIN "anindex"		EXTERNAL INTEGER !SKIP!;
+		IF NOT GNJFN( indexjfn )
+		 THEN DONE "do$demon";	! NO files left on index jfn;
+ifc cardstuff thenc
+! card libraries supposed to be accessed in thawed mode (if possible);
+		OPENF( indexjfn, '440000202000);	! 36-bit,"rh";
+		IF !SKIP!		! opening error, try other mode;
+		  then OPENF( indexjfn, '440000200000);	! 36-bit,"r";
+elsec
+		OPENF( indexjfn, '440000200000);	! 36-bit,"r";
+		IF !SKIP!		! opening error, try other mode;
+		  then OPENF( indexjfn, '440000202000);	! 36-bit,"rH";
+endc
+		IF !SKIP! 
+		 THEN BEGIN "openproblem"
+			bprint(<crlf, "Can't OPEN: ", 
+				JFNS( indexjfn, nice!name ) & " ">);
+			error; ! show error to user;
+		      END "openproblem" 
+		 ELSE DONE "anindex";
+	      END "anindex"; 
+       END "do$demon" 
+     UNTIL FALSE; ! almost an INDEXFILE( indexjfn ), but verifies safety;
+
+    CFILE( indexjfn );		! this is probably unnecessary;
+   END "perindex";
+
+bprint(<crlf & crlf & tab & IFC cardstuff THENC "Pages" 
+				ELSEC "Lines" ENDC &" recognized = ",
+		hitcount[0], crlf & "   String    Matches"
+		IFC boolstuff THENC  & "  Unrecognized Matches"	ENDC>);
+
+FOR i _ 1 STEP 1 UNTIL maxwords DO
+	IF LENGTH( targets[i] ) 
+	 THEN bprint(< crlf, i, ") ", litstr( targets[i], TRUE ),
+			tab, hitcount[i]
+		       IFC boolstuff THENC
+			 , tab, hitcount[i]-matchcount[i] ENDC>)
+	ELSE DONE;
+
+bprinT(<CASE eqnum OF 
+	      ( (crlf & "Exact match search performed."),
+		(crlf & "Letter case ignored (""Ab"" = ""aB"")."),
+		(crlf & "The active equivalences were:" & crlf & 
+		 displaytable( special$equiv, TRUE, FALSE) & ";" ) )>);
+
+IFC boolstuff THENC
+IF LENGTH( boolexpr ) 
+ THEN bprinT(<crlf, crlf, "The boolean expression was: ",
+			shortexp( boolexpr, maxwords )>); 
+ENDC
+
+bprinT(<crlf, crlf, "Files with no matches: ">);
+begin	integer fcount;
+fcount _ 0;
+while miss!head _ msfile:link [ miss!head ]
+   do begin
+	fcount _ fcount + 1;
+	if nottty
+	 then cprint(outfile, (if (fcount mod 3)= 0 then crlf else tab),
+				msfile:name [miss!head] );
+	if fcount < 3 and msfile:link[miss!head] 
+	 then print( msfile:name [miss!head], ", " )
+      end;
+
+print( (if fcount<3 then "" else "... "), msfile:name [miss!tail], ".");
+
+bprint(<crlf, tot!searched, " file", 
+	(if tot!searched=1 then "" else "s"), " searched">);
+if fcount  then bprint(<", ", fcount, " without matches">); 
+if aborted then bprint(<", ", aborted, " stopped during search">);
+bprint( "." );
+end;
+
+cprinT( outfile, crlf & ff ); ! page mark;
+
+END "performsearch"; 
+SIMPLE INTEGER PROCEDURE getfile( STRING defaultname; BOOLEAN mustreply);
+BEGIN "getfile"		INTEGER output$jfn;
+
+simple integer procedure afile( reference string fname );
+      begin		integer channel;
+	if equ( "TTY:", fname ) then RETURN( -1 );
+
+	if  0 > (channel _ OPENFILE( fname, "WOAE" ))
+	and 0 > (channel _ OPENFILE( fname, "WAE"  ))
+	 THEN begin defaultname _ "TTY:"; return( -2 ) end
+	 else RETURN( channel )
+      end;
+
+IF LENGTH( defaultname ) = 0 THEN defaultname _ "TTY:";
+IF NOT mustreply and -2 < output$jfn _ afile( defaultname )
+			 THEN RETURN( output$jfn );
+
+WHILE TRUE do 
+  case comand(	crlf & "Output goes to: * " & defaultname & " //",
+		esc & crlf & "^",
+		"
+Type:	RET or LF	to accept this default,
+	ESC		to accept this and all subsequent defaults,
+	""^""		to go back to the first question. 
+	TENEX file name	to choose another output file
+(results of search will be appended to the file if it exists already)")
+of
+ begin "getcase"
+  begin ! unk; IF -1 < (output$jfn _ OPENFILE( NULL, "WACE" ))
+			THEN RETURN( output$jfn );		end;
+  begin ! esc; 	escoff _ false;		! actually extraneous set;
+		IF -2 < output$jfn _ afile( defaultname )
+			 then RETURN( output$jfn )		end;
+  begin !  cr;	IF -2 < output$jfn _ afile( defaultname )
+			 then RETURN( output$jfn )		end;
+  begin !  lf;	IF -2 < output$jfn _ afile( defaultname )
+			 then RETURN( output$jfn )		end;
+  begin ! "^"; jumptop _ true; return( -2 )			end
+ end "getcase"
+END "getfile"; 
+SIMPLE INTEGER PROCEDURE pseudoLOP( INTEGER source; REFERENCE STRING s);
+BEGIN "pseudoLOP" 
+IF LENGTH( s ) < 2 
+ THEN BEGIN "getmoresource"	EXTERNAL INTEGER !SKIP!; INTEGER temp;
+	temp _ ";";
+	DO s _ s & SINI(source, 100, temp)   ! This will include if$tty;
+		UNTIL (LENGTH(s) > 1) OR (!SKIP! NEQ temp);
+      END "getmoresource";
+RETURN( LOP(s) );
+END "pseudoLOP";
+SIMPLE INTEGER PROCEDURE getnumber( INTEGER chan; REFERENCE STRING s );
+BEGIN "getnumber"			INTEGER RESULT;
+RESULT _ 0;
+WHILE "0" LEQ s LEQ "9" 
+	DO RESULT _ RESULT * 10 + ( pseudoLOP(chan, s) - "0" );
+IF s = "." THEN pseudoLOP(chan, s);
+RETURN( result );
+END "getnumber";
+SIMPLE STRING PROCEDURE dequote( INTEGER chan; REFERENCE STRING s );
+BEGIN "dequote"				STRING result; INTEGER k;
+result _ NULL;
+WHILE TRUE 
+   DO BEGIN "toquote" 
+	WHILE (k _ pseudoLOP(chan, s)) NEQ '42 AND K NEQ 0 
+		DO result _ result & k;
+	IF k = 0 
+	 THEN BEGIN
+		USERERR( 0, 1, "toquote got a null!" );
+		RETURN( NULL );
+	      END
+	eif s NEQ '42 THEN RETURN( result );
+	result _ result & pseudoLOP(chan, s);
+      END "toquote"; 
+END "dequote";
+SIMPLE STRING PROCEDURE getstring( INTEGER chan; REFERENCE STRING s; 
+					BOOLEAN keepnulls );
+BEGIN "getstring"	STRING two!cap, result; INTEGER k;
+result _ NULL;
+WHILE TRUE
+   DO BEGIN "longloop"
+	WHILE s=" " OR s=tab OR s=lf OR s=cr OR s=eol OR s=ff  
+		DO pseudoLOP(chan, s);			! gobbleblanks;
+	IF  "0" LEQ s LEQ "9" 
+	 THEN IF ( 0 < (k _ getnumber(chan, s)) < '200 ) OR
+		 (keepnulls AND k = 0)
+	       THEN result _ result & k
+	       ELSE BEGIN 
+		      print( crlf & "decimal character ", cvs(k) );
+		      RETURN( NULL );
+		    END
+	eif (k _ pseudoLOP(chan, s)) = "'"
+	 THEN IF ( 0 < (k _ CVO(CVS( getnumber(chan, s) ))) < '200 ) OR
+		 (keepnulls AND k = 0)
+		 THEN result _ result & k
+		 ELSE BEGIN 
+			print( crlf & "octal character '", CVOS(k) );
+			RETURN( NULL );
+		      END
+	eif k = "^"
+	 THEN IF ((k _ pseudoLOP(chan, s)) LAND '37) OR keepnulls
+		 THEN BEGIN
+			result _ result & (k LAND '37);
+			IF k LAND '140 NEQ '100
+			 THEN print( (tab & "interpreting ^"), k & null,
+				" ('", CVOS(k), ")  as ^", 
+				((k LAND '37) + '100) & null );
+		      END
+		 ELSE print( (tab & "^"), k & null, " ('", CVOS(k), 
+				") is null ('0), it will be ignored.")
+	eif k = ";" THEN RETURN( result )
+	eif k = "&" THEN print( "..unexpected ""&"" (CONTINUING)" ) 
+	eif k = '42 THEN result _ result & dequote(chan, s)
+					! read a quoted string;
+	eif equ( (two!cap _ (k land '137) & (s land '137)), "CR" )
+		 THEN BEGIN "cr" 
+			result _ result & cr;
+			pseudoLOP(chan, s);	! gobble the r of "cr";
+		      END "cr"
+	eif equ( two!cap, "LF" )
+		 THEN BEGIN "lf" 
+			result _ result & lf;
+			pseudoLOP(chan, s);	! gobble the f of "lf";
+		      END "lf"
+	eif equ( two!cap, "FF" )
+		 THEN BEGIN "ff" 
+			result _ result & ff;
+			pseudoLOP(chan, s);	! gobble the f of "ff";
+		      END "ff"
+	eif equ( two!cap, "HT" )
+		 THEN BEGIN "ht" 
+			result _ result & tab;
+			pseudoLOP(chan, s);	! gobble the t of "ht";
+		      END "ht"
+	eif equ( two!cap, "TA" )
+		 THEN BEGIN "tab"
+			pseudoLOP(chan, s);	! gobble the t of "tab";
+			k _ pseudoLOP(chan, s); ! gobble the b;
+			IF (k = "b" OR k = "B") 
+			 THEN result _ result & tab
+			 ELSE BEGIN
+				print( crlf & "ta", (0+s) & "?" );
+				RETURN( NULL );
+			      END;
+		      END "tab"
+	eif equ( two!cap, "EO" )
+		 THEN BEGIN "eol"
+			pseudoLOP(chan, s);	! gobble the o of "eol";
+			k _ pseudoLOP(chan, s); ! gobble the l;
+			IF (k = "l" OR k = "L") 
+			 THEN result _ result & '37  ! an end-of-line;
+			 ELSE BEGIN
+				print( crlf & "eo", (0+s) & "?" );
+				RETURN( NULL );
+			      END;
+		      END "eol"
+	eif equ( two!cap, "ES" )
+		 THEN BEGIN "esc"
+			pseudoLOP(chan, s);	! gobble the s of "esc";
+			k _ pseudoLOP(chan, s); ! gobble the c;
+			IF (k = "c" OR k = "C") 
+			 THEN result _ result & '33	! an escape;
+			 ELSE BEGIN
+				print( crlf & "es", (0+s) & "?" );
+				RETURN( NULL );
+			      END;
+		      END "esc"
+	eif equ( two!cap, "DE" )
+		 THEN BEGIN "del"
+			pseudoLOP(chan, s);	! gobble the d of "del";
+			k _ pseudoLOP(chan, s); ! gobble the l;
+			IF (k = "l" OR k = "L") 
+			 THEN result _ result & '177	! a delete;
+			 ELSE BEGIN
+				print( crlf & "de", (0+s) & "?" );
+				RETURN( NULL );
+			      END;
+		      END "del"
+	eif equ( two!cap, "BE" )
+		 THEN BEGIN "bel"
+			pseudoLOP(chan, s);	! gobble the b of "bel";
+			k _ pseudoLOP(chan, s); ! gobble the e;
+			IF (k = "l" OR k = "L") 
+			 THEN BEGIN
+				IF (s = "l" OR s = "L")	! "bell";
+				 THEN k _ pseudoLOP(chan, s); 
+				result _ result & '7	! a delete;
+			      END
+			 ELSE BEGIN
+				print( crlf & "be", (0+s) & "?" );
+				RETURN( NULL );
+			      END;
+		      END "bel"
+	 ELSE BEGIN
+		print( crlf & "unexpected character: '", 
+					CVOS(k), " = " & k ); 
+		RETURN( NULL );
+	      END;
+
+	WHILE s=" " OR s=tab OR s=lf OR s=cr OR s=eol OR s=ff  
+		DO pseudoLOP(chan, s);			! gobbleblanks;
+
+	IF s = ";" 
+	 THEN BEGIN pseudoLOP(chan, s); RETURN( result ); END
+	eif S = "&" 
+	 THEN pseudoLOP(chan, s)
+	 ELSE print( crlf & "missing ampersand ...continuing..." );
+      END "longloop";
+END "getstring"; 
+SIMPLE STRING PROCEDURE obtainstrings( INTEGER jfn, storeword;
+					STRING ARRAY wordmat );
+desr	"jfnstr" is constantly associated with "jfn", and holds that
+	part of the text from "jfn" that has been read in but not 
+	analyzed.  It is the mechanism that allows one-character 
+	lookahead, and is guaranteed to hold at least one character 
+	as long as there exists data yet to be read on "jfn"
+;
+BEGIN "obtainstrings"		STRING jfnstr, temp;
+jfnstr _ "*";	! never analyzed, a kludge to start "pseudolop";
+pseudoLOP(jfn, jfnstr);		! read in a string from the channel;
+
+IF LENGTH( jfnstr ) > 0 
+ THEN WHILE temp _ getstring( jfn, jfnstr, FALSE )
+	   DO BEGIN
+		wordmat[ storeword ] _ temp;
+		IF (storeword _ storeword + 1) > maxwords 
+		 THEN BEGIN
+			print( crlf & "maximum string count reached," &
+				 " ignoring rest of file!" );
+			DONE;
+		      END;
+	      END;
+
+CFILE( jfn );
+RETURN( storeword );
+
+END "obtainstrings"; 
+SIMPLE BOOLEAN PROCEDURE getwords( STRING ARRAY wordlist ); 
+BEGIN "getwords"	STRING reply; INTEGER word, i;
+
+IF LENGTH( wordlist[1] ) THEN print( crlf, "	Old word list:" );
+
+FOR word _ 1 STEP 1 UNTIL maxwords 
+       DO IF LENGTH( wordlist[ word ] )
+	   THEN print( crlf, word, ") ", wordlist[ word ] )
+	   ELSE DONE;
+
+word _ word MIN maxwords;	! allows input if list full;
+
+WHILE word LEQ maxwords DO
+ case comand(	"Target " & CVS( word ) & ") ", 
+		"@^" & esc & crlf & ctrl("X") & ctrl("L") & ctrl("W"),
+"	target words: (the strings you are searching for)
+Type:	RET  to keep the existing list,
+	ESC  to keep the existing list and accept subsequent defaults,
+	""^""  to go back to the first question. 
+	^X   to erase the existing list,
+	^W   to erase the last word of the existing list,
+	^L   to show the existing list, or
+	a string to be searched for, OR
+	@FILE NAME	to add the words stored on a file
+" ) of
+  begin "reply"
+   BEGIN ! unk;			EXTERNAL INTEGER !SKIP!;
+		reply _ INTTY;
+		WHILE !SKIP! = "}" DO reply _ reply & "}" & INTTY;
+			! This is a kludge to get around INTTY ALT-MODE;
+		IF !SKIP! = esc THEN escoff _ FALSE;
+		wordlist[ word ] _ reply;
+		IF LENGTH( reply ) THEN word _ word + 1;
+		IF NOT escoff
+		 THEN BEGIN
+			wordlist[ word ] _ NULL; 
+			RETURN( TRUE );
+		      END					END;
+   begin ! "@";		INTEGER word$chan;
+		IF 0 > (word$chan _ OPENFILE( NULL, "ROE" ))
+		 THEN error
+		 ELSE begin
+			word _ obtainstrings(word$chan, word, wordlist);
+			cfile( word$chan )
+		      END					end; 
+   begin ! "^"; jumptop _ true; return( true )			end;
+   begin ! esc; escoff _ false;
+		wordlist[ word ] _ NULL; return( true )		end;
+   begin !  cr; wordlist[ word ] _ NULL; return( true )		end;
+   begin !  lf; IF LENGTH( wordlist[word] ) THEN word _ word+1	END;
+   begin !  ^X; word _ 1					end;
+   begin !  ^L; FOR i _ 1 STEP 1 UNTIL word-1 
+			DO print( crlf, i, ") ", wordlist[i] )	end;
+   begin !  ^W; word _ 1 MAX (word - 1)				end
+  END "reply"; 
+
+END "getwords"; 
+SIMPLE PROCEDURE getspecial;
+BEGIN "getspecial"	   INTEGER i, spechan; STRING specstr, equ$set;
+
+spechan _ -1;
+DO case comand( "Get specials from file: ", "^" & esc & crlf, "
+Type:	FILE NAME  to add equivalences  to the special table,
+		equivalences are specified in the same way as string
+		lists are specified on files, with all characters in 
+		each string set equivalent.  Any character that is 
+		equivalent to the character '0 is ignored, just as 
+		null bytes in a file are ignored.
+	RET or LF  to leave without changing the special table.
+	ESC	   same as above, but accept all subsequent defaults,
+	""^""	   to go back to the first question. " ) of
+  begin "spcase"
+   begin ! unk; IF 0 > (spechan _ OPENFILE( NULL, "ROE" ))
+		 THEN error					end; 
+   begin ! "^"; jumptop _ true; return				end;
+   begin ! esc; escoff _ false; return				end; 
+   begin !  cr; return						end;
+   begin !  lf; return						end
+  END "spcase"  UNTIL spechan > -1;
+specstr _ "*";	! kluge to start up pseudolop;
+pseudolop( spechan, specstr );
+
+WHILE LENGTH( equ$set _ getstring( spechan, specstr, TRUE ) )
+   DO BEGIN "equivalence set" 	INTEGER ch, new;
+			! make all characters in equ$set equivalent;
+	new _ ch _ LOP( equ$set );
+	WHILE LENGTH( equ$set )
+	   DO BEGIN "equiv"	INTEGER old, neweqv;
+		old _ new;
+		neweqv _ new _ LOP( equ$set );
+		DO IF neweqv = old
+		    THEN BEGIN		! verify old =/= new;
+			   print( crlf, old & " <=> " & new, 
+					" is REDUNDANT" );
+			   CONTINUE "equiv";	! old = new, next eqv;
+			 END
+		  UNTIL (neweqv _ special$equiv[ neweqv ]) = new;
+		! old =/= new, make them equivalent;
+		special$equiv[ new ] SWAP special$equiv[ old ];
+	      END "equiv";
+      END "equivalence set";
+CFILE( spechan );
+
+END "getspecial";
+SIMPLE INTEGER PROCEDURE geteqv( STRING prompt; INTEGER default );
+WHILE TRUE DO 
+case comand(	prompt & " " & cvs( default ) & "// ",
+		"012AaDdRrSs^" & esc & crlf, "
+Type:	""0"" 	   to treat all ASCII characters uniquely, 
+	""1"" 	   to treat upper and lower case letters identically,
+	""2""	   to use the special (definable) equivalence table,
+	""A""	   to Alter (add equivalences to) the special table,
+	""D""	   to Display the current special equivalence table,
+	""R""	   to Reset the special equivalence table to table 0,
+	""S""	   to Set the special equivalence table to table 1,
+	RET or LF  to accept this default (only),
+	ESC	   to accept this and all subsequent defaults,
+	""^""	   to go back to the first question. " ) of
+  BEGIN "geteqv"
+   begin ! unk; inchrw; print( "  try a ""?""" )		end;
+   begin ! "0"; print( " (unique) " ); return( 0 )		end;
+   begin ! "1"; print( " (upper = lower) " ); return( 1 )	end;
+   begin ! "2"; print( " (special table) " ); return( 2 )	end;
+   begin ! "A"; print( "dd" ); getspecial; default _ 2		end;
+   begin ! "a"; print( "dd" ); getspecial; default _ 2		end;
+   begin ! "D"; print( "isplay", crlf,
+		   displaytable( special$equiv, TRUE, false ),
+		   ";" & crlf ); default _ 2			end;
+   begin ! "d"; print( "isplay", crlf,
+		   displaytable( special$equiv, TRUE, false ),
+		   ";" & crlf ); default _ 2			end;
+   begin ! "R"; print( "eset specials (each character unique)" );
+		ARRTRAN(special$equiv, unique); default _ 2	end;
+   begin ! "r"; print( "eset specials (each character unique)" );
+		ARRTRAN(special$equiv, unique); default _ 2	end;
+   begin ! "S"; print( "et specials: (upper = lower)" ); 
+		ARRTRAN(special$equiv, upper$lower); default_ 2	end;
+   begin ! "s"; print( "et specials: (upper = lower)" ); 
+		ARRTRAN(special$equiv, upper$lower); default_ 2	end;
+   begin ! "^"; jumptop _ true; return( default )		end;
+   begin ! esc; escoff _ false; return( default )		end; 
+   begin !  cr; return( default )				end; 
+   begin !  lf; return( default )				end; 
+  END "geteqv";
+
+	BOOLEAN dopls;
+	INTEGER equiv$set;
+	INTEGER outfile;
+	STRING oldfilename;
+	LABEL topofquestions;
+	STRING filelist, tempstr;
+	STRING ARRAY wordlist[1:maxwords];
+
+IFC boolstuff THENC
+	STRING boolexp;
+boolexp _ NULL;
+ENDC
+
+outfile _ -1;
+ARRTRAN( special$equiv, unique );
+wordlist[1] _ filelist _ NULL; equiv$set _ 1; dopls _ FALSE;
+
+topofquestions:	escoff _ TRUE; jumptop _ FALSE; 
+
+print( crlf & crlf,
+	IFC cardstuff THENC " LIBRARY" ELSEC " SUBSTRING" ENDC,
+	" search routine (compiled", compiler!banner[6 to 15],
+	") ? for help" );
+
+IFC debug!booleans THENC
+ print( crlf & "		debugging the booleans" );
+ELSEC
+ tempstr _ manyfiles( filelist, "Files to search: ", null,
+			ifc cardstuff thenc "ROH" elsec "RO" endc );
+ IF jumptop THEN GO TO topofquestions; 
+ IF LENGTH( tempstr ) THEN filelist _ tempstr; 
+ENDC
+
+IF escoff THEN getwords( wordlist );
+
+WHILE LENGTH(wordlist[1]) = 0 
+   DO IF jumptop THEN GO TO topofquestions 
+		 ELSE getwords( wordlist ); 
+ IF jumptop THEN GO TO topofquestions; 
+
+IFC NOT debug!booleans THENC
+ IF escoff 
+ THEN equiv$set _ geteqv( "Equivalences: ", equiv$set );
+ IF jumptop THEN GO TO topofquestions; 
+ENDC
+
+IFC boolstuff THENC
+ boolexp _ getexp( boolexp, wordlist, escoff );
+ IF jumptop THEN GO TO topofquestions; 
+ENDC
+
+IFC debug!booleans THENC
+BEGIN "dotable" 		INTEGER numwrds, i;
+
+FOR numwrds _ 0 STEP 1 UNTIL 34 DO
+	IF LENGTH( wordlist[ numwrds+1 ] ) = 0 THEN DONE;
+
+print( crlf & "truth table for: ", shortexp( boolexp, numwrds+1 ),
+	crlf & crlf );
+FOR i _ 1 STEP 1 UNTIL numwrds DO
+	print( ("   " & CVS( i ) & " ")[ INF-2 FOR INF] );
+print( "	RESULT" &
+crlf & "------------------------------------------------------------" );
+
+FOR i _ (1 LSH numwrds) - 1 STEP -1  UNTIL 0
+ DO BEGIN		INTEGER j;
+      print( crlf ); 
+      FOR j _ 1 STEP 1 UNTIL numwrds DO
+	hitbox[j] _ i LAND (1 LSH (j-1));
+
+      FOR j _ 1 STEP 1 UNTIL numwrds DO
+	print( IF hitbox[j] THEN " * " ELSE " - ");
+
+      print( tab, IF checkbool( boolexp ) THEN "TRUE" ELSE "FALSE" );
+    END;
+END "dotable";
+START!CODE HALTF; END;
+GO TO topofquestions; 
+ENDC
+
+
+WHILE LENGTH( filelist ) = 0
+  DO  BEGIN
+	filelist _ manyfiles( NULL, "Files to be searched: ", NULL, 
+			ifc cardstuff thenc "ROH" elsec "RO" endc );
+	 IF jumptop THEN GO TO topofquestions; 
+      END;
+
+IF escoff 
+ THEN dopls _ agree( "Create .PL files?", 
+		     ".PL files are editor-interface files, " &
+			"YES means create them.", 
+		     dopls );
+IF jumptop THEN GO TO topofquestions; 
+
+outfile _ getfile( oldfilename, TRUE );		! could use escoff here;
+IF jumptop THEN begin 
+		if outfile > -1 then cfile( outfile );
+		GO TO topofquestions; 
+		end;
+oldfilename _ (if outfile > -1
+		then JFNS( outfile, exact!name ) else "TTY:" );
+
+CASE equiv$set OF BEGIN
+		    setuptable( wordlist, unique ); 
+		    setuptable( wordlist, upper$lower );
+		    setuptable( wordlist, special$equiv )
+		  END;
+
+IFC boolstuff THENC
+ performsearch( outfile, filelist, equiv$set, dopls, boolexp ); 
+ELSEC
+ performsearch( outfile, filelist, equiv$set, dopls ); 
+ENDC
+
+IF outfile > -1 THEN BEGIN CFILE( outfile ); outfile _ -1; END;
+
+print( crlf & crlf & "	...DONE...   continue to start over" );
+	START!CODE HALTF; END; 
+	GO TO topofquestions; 
+require " done " message;
+END "subsearch" .
+
+require " too far " message;
+

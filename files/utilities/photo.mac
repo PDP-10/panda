@@ -1,0 +1,749 @@
+Title PHOTO - Record a Terminal Session
+Subttl Definitions
+
+comment \
+     Original program by William L. Donner, 19-Jan-76.
+     Numerous improvements by members of the Stanford LOTS user community.
+     Substantially rewritten by Kirk Lougheed, 20-Apr-81.
+     Converted to MACRO from FAIL and random bugfixes by Mark Crispin.
+\
+
+search monsym,macsym
+.require sys:macrel.rel
+sall
+
+;ACs used herein
+
+a=1				;temporary AC's
+b=2
+c=3
+d=4
+
+ch=5				;number of bytes left in buffer
+pt=6				;byte pointer into buffer
+p=17				;stack pointer
+
+;software interrupt channel assignments
+
+cnychn==1			;CTRL-Y toggle
+cncchn==2			;CTRL-C trap
+ptychn==4			;PTY typein
+
+
+
+;EMSG
+;pretty print a general error message
+
+define emsg (str) <
+	 jrst [ hrroi a,[asciz/str/]
+	 	call abort ]
+>
+
+
+;JMSG
+;informative error messages for JSYS failure returns
+
+define jmsg (str) <
+	 erjmp [ ifdif <str>,<>,<hrroi a,[asciz/str/]>
+		 ifidn <str>,<>,<hrroi a,[asciz/JSYS error/]>
+		 call abort ]
+>
+
+
+Subttl Impure Storage
+
+pdlen==20			;length of pushdown stack
+gtjlen==20			;length of GTJFN% buffers
+tmplen==20			;length of temporary buffer
+maxchr==^d300			;buffer is this many characters long
+buflen==maxchr/5+1		;length of buffer in words
+
+firstf:				;first place to clear
+pdlist:	block pdlen		;pushdown stack
+buffer:	block buflen		;PTY output buffer
+jfnbuf:	block gtjlen		;buffer for long form GTJFN% call
+tmpbuf:	block tmplen		;temporary buffer
+lev1pc:	block 1			;level 1 interrupts store their PC's here
+lev2pc:	block 1			;level 2...
+lev3pc: block 1			;level 3...
+ttynum:	block 1			;the tty number of this pty
+ptyjfn:	block 1			;pty jfn
+forkh:	block 1			;inferior fork handle goes here
+dskjfn:	block 1			;where to put the disk jfn
+logflg: block 1			;flag to say we are logging (-1 if we are)
+errflg:	block 1			;zero this means fork halted normally
+ttytyp:	block 1			;our original tty type, -1 if not changed
+ttymod:	block 1			;original tty mode word
+ttypag:	block 1			;original tty page word
+lastf==.-1
+
+dmbtyp:	.ttadm			;an ADM-3 is a good dumb terminal
+
+
+;argument block for long form GTJFN
+
+jfnarg:	gj%fou!gj%acc!gj%cfm!gj%xtn ; flag bits
+	.priin,,.priou		; i/o jfns
+	block 2			; default dev/dir
+	point 7,[asciz/PHOTO/]	; default name
+	point 7,[asciz/LOG/]	; default ext
+	block 3			; junk
+	 4			; extend block by 4
+	point 7,jfnbuf		; copy of typescript
+	^d130			; allowable #bytes
+	point 7,[asciz/Log File: /]
+	point 7,jfnbuf		; destination ptr.
+
+
+;PRARG% argument
+
+prgblk: 2			;two words long, not counting this one
+	1B0+3B6+2B12+CR%PRA	;lie to it--say we're the CRJOB jsys
+	1b0+2			;tell it not to print its banner
+prglen==.-prgblk		;length of argument block
+
+
+Subttl The Main Program
+
+start:	reset%			;clean up the world
+	setzm firstf
+	move a,[xwd firstf,firstf+1]
+	blt a,lastf		;clear impure storage
+	move p,[iowd pdlen,pdlist] ;set up the main stack
+	call chkcap		;check and enable capabilities
+	call getpty		;get a jfn for pty
+	call efork		;create an inferior fork
+	call getlog		;get a log file
+	call opelog		;now open the log file
+	call settyp		;adjust terminal type if necessary
+	call setpty		;set up pty parameters, links, etc.
+	call setint		;set up our interrupt system
+	call beglog		;begin logging
+	call runfrk		;run our inferior EXEC
+	call endlog		;finish logging session
+	call exit		;we shut down
+	jrst .-1		;and can't continue
+
+Subttl Setting Up Routines
+
+;CHKCAP
+;check and enable capabilties
+;interrogate user if SC%LOG is turned off
+;returns +1 always
+
+chkcap:	movei a,.fhslf		;a/ for the current process
+	rpcap%			;report capabilities
+	move c,b		;c/ set up capablities mask
+	epcap%			;enable capabilities
+	ret
+
+
+;EFORK
+;create an inferior fork and get a copy of the EXEC into it
+;returns +1 always with fork handle in FORKH
+
+efork:	movx a,cr%cap			;nothing special
+	cfork%				;just create a fork
+	 jmsg <Can't create a fork>
+	movem a,forkh			;remember the fork handle
+	ffork%				;freeze the inferior fork
+	movx a,gj%old!gj%sht		;old file,short form
+	hrroi b,[asciz/SYSTEM:EXEC.EXE/]
+	gtjfn%				;get a jfn for it
+	 jmsg <Can't get the EXEC!>
+	hrl a,forkh			;get fork handle,,jfn
+	get%				;and map the exec into it
+	move a,forkh			;reget the fork handle
+	rpcap%				;get possible capabilities
+	txz b,sc%log			;deny logout capability
+	epcap%
+	ret				;return quietly
+
+
+;RUNFRK
+;run the EXEC in an inferior fork
+;returns +1 always, with ERRFLG set if the fork terminated abnormally
+
+runfrk:	hrli a,.prast		;a/ want to send arguments..
+	hrr a,forkh		;... to inferior exec
+	movei b,prgblk		;b/ address of argument block
+	movei c,prglen		;c/ length of argument block
+	prarg%			;set the arguments
+	hrrz a,forkh		;a/ get inferior handle
+	setz b,			;b/ normal entry
+	sfrkv%			;c/ start the fork
+	rfork%			;resume frozen fork
+	wfork%			;wait for user to type POP
+	move a,forkh		;a/ fork handle
+	rfsts%			;get its status
+	hlrzs a			;isolate status bits
+	cain a,.rfhlt		;normal, unfrozen halt?
+	setom errflg		;no, abnormal termination
+	hrrz a,forkh		;a/ get inferior handle
+	kfork%			;kill inferior fork
+	ret			;return to caller
+
+
+;GETLOG
+;get a jfn on a disk log file
+;returns +1 always with JFN  in DSKJFN
+
+getlog:	tmsg <
+Log file: >
+	movei a,jfnarg		;a/ argument block
+	setz b,			;b/ unused
+	gtjfn%			;parse a file specification
+	 erjmp [ camn a,gjfx33	;no file specified?
+		  jrst getlog	;yes, quietly reprompt
+		 tmsg <?Bad filename -- try again>
+		 jrst getlog ]
+	movem a,dskjfn		;save jfn of logfile
+	dvchr%			;get device characteristics
+	ldb a,[point 8,b,17]	;what type of device
+	caie a,.dvdsk		;disk?
+	 jrst [ tmsg <?File must be on disk>
+		 move a,dskjfn
+		 rljfn%
+		  jfcl
+		 jrst getlog ]
+	hrroi a,tmpbuf		;a/ pointer to a buffer
+	move b,dskjfn		;b/ the jfn
+	movx c,1b11		;c/ want just the file type
+	jfns%			;get a file extension
+	hrroi a,tmpbuf		;a/ pointer to extension
+	hrroi b,[asciz/LOG/]	;b/ pointer to default extension
+	stcmp%			;compare
+	jumpe a,r		;if .LOG, assume it's ok to overwrite.
+	hrroi a,tmpbuf		;a/ buffer
+	move b,dskjfn		;b/ jfn
+	move c,[1b2+1b5+1b8+1b11+1b35] ;c/ full file spec
+	jfns%			;put a file spec in the buffer
+	movx a,gj%old!gj%sht	;a/ old file, short form GTJFN%
+	hrroi b,tmpbuf		;b/ file spec
+	gtjfn%			;does this file exist?
+	 erjmp r		;nope, assume we can use this file
+	rljfn%			;release that JFN
+	 jfcl			;ignore an error
+	ret
+
+;OPELOG
+;open the log file
+;returns +1 always
+
+opelog:	move a,dskjfn		;a/ jfn of log file
+	move b,[7b5!of%wr]	;b/ access mode
+	openf%			;open the file
+	 skipa			;skip on an error
+	  ret			;return now on success
+	emsg <Can't open file>	;no, something else
+	ret			;should never get here
+
+
+;SETTYP
+;change terminal type to a reasonable dumb type (DMBTYP)
+;this avoids cursor control characters in log file
+
+settyp:	setom ttytyp		;flag that we haven't changed the tty type
+	movei a,.priou		;a/ our tty
+	gttyp%			;get the terminal type
+	camn b,dmbtyp		;are we already on a dumb terminal? 
+	 ret			;yes, quit now
+	movem b,ttytyp		;save our type to set back later
+	rfmod%			;read tty mode word
+	movem b,ttymod		;save it
+	movei b,.morxo		;b/ want terminal pause state
+	mtopr%			;read it
+	movem c,ttypag		;save it
+	move b,dmbtyp		;b/ fetch dumb terminal type
+	sttyp%			;set it 
+	move b,ttymod		;fetch back tty mode
+	stpar%			;set it
+	sfmod%			;set it
+	movei b,.moxof		;b/ read terminal pause state
+	move c,ttypag		;c/ get value
+	mtopr%			;set XON/XOFF handling desired
+	ret			;return to caller
+
+
+;GETPTY
+;get a jfn on a pty
+;returns +1 with pty jfn in PTYJFN, tty number in TTYNUM
+
+getpty:	stkvar <firpty,numpty,<devnam,2>> ;declare local storage
+	movei a,.ptypar		;a/ get # of ptys,,# of first pty
+	getab%			;get word from table
+	 jmsg <>		;some error
+	hrrzm a,firpty		;store tty correspondence for ptys
+	hlrzm a,numpty		;store number of ptys
+	movn d,numpty		;form ABOJN word
+	hrlzs d			;for use in the following loop
+getpa:	movsi a,.dvdes+.dvpty	;PTY designator
+	hrr a,d			;unit number
+	dvchr%			;get its characteristics
+	txnn b,dv%av		;is it available?
+	 jrst getpb		;no, we can't use it
+	move b,a		;get device designator in b
+	hrroi a,devnam		;place to stash the mogrified string
+	devst%			;that we turn it into
+	 erjmp getpb		;bad
+	movei b,":"		;put a colon
+	idpb b,a		;on the end
+	movei b,.chnul		;and a null
+	idpb b,a		;to make it asciz
+	movx a,gj%sht!gj%acc	;short form of the jsys
+	hrroi b,devnam		;and the magic
+	gtjfn%			;jsys
+	 erjmp getpb		;not available
+	movem a,ptyjfn		;save jfn
+	move b,[7b5!of%rd!of%wr!of%rtd]
+	openf%			;open the file
+	 erjmp getpc		;device not available
+	movei d,.ttdes(d)	;make pty number into a terminal designator
+	add d,firpty		;make it into a real tty number 
+	movem d,ttynum		;store this away
+	ret			;return to caller
+
+
+getpc:	move a,ptyjfn		;reget the jfn
+	rljfn%			;and release it since we can't have it
+	 jfcl			;ignore an error
+getpb:	aobjn d,getpa		;try for another pty and return
+	emsg <No free PTYs; try again later>
+	ret			;never gets here
+
+
+;SETPTY
+;set up PTY mode, links, etc.
+
+setpty:	skipn ttynum		;do we have a PTY yet?
+	 emsg <No PTY yet>	;no..
+	move a,ttynum		;a/ tty number of pty
+	setz b,			;b/ set a binary data mode for the pty
+	sfmod%			;do it
+	 jmsg <>		;die
+	move b,[525252525252]	;b/ don't format anything.  just send as is
+	move c,b
+	sfcoc%			;do it.
+	 jmsg <>
+	movei a,.priou		;a/ our terminal
+	rfmod%			;get mode word
+	txo b,tt%osp		;turn on CTRL-O 
+	sfmod%			;suppress [LINK from.... banner
+	movx a,tl%abs!tl%sab
+	hrr a,ttynum
+	tlink%			;make the PTY receive links
+	 jmsg <>
+	hrloi a,(tl%eor)
+	hrrz b,ttynum
+	tlink%			;link to PTY
+	  jmsg <>
+	movx a,tl%sab
+	hrr a,ttynum
+	tlink%			;now set refuse links on PTY
+	 jmsg <>
+	movei a,.priou		;a/ our terminal
+	rfmod%			;get mode word
+	txz b,tt%osp		;turn off CTRL-O 
+	sfmod%			;resume typeout
+	ret			;return to caller
+
+
+;SETINT
+;set up our interrupt system
+
+setint:	skipn forkh		;do we have an inferior yet?
+	 emsg <Don't have an inferior fork yet>	;no...
+	skipn ptyjfn		;do we have a PTY yet?
+	 emsg <Don't have a PTY yet> ;no...
+	movei a,.fhslf		;a/ our fork handle
+        move b,[xwd levtab, chntab] ;b/ table addresses
+	sir%			;set up PSI
+	eir%			;enable interrupt system
+	move a,[xwd .ticcy,cnychn]	
+	ati%			;attach CTRL-Y to its channel
+	move a,[xwd .ticcc,cncchn]	
+	ati%			;attach CTRL-C to its channel
+	 erjmp .+1		;ignore an error here
+	move a,forkh		;a/ our inferior's handle
+	rircm%			;read interrupt word
+	txon b,<1b<.icqta>>	;b/ mask off quota exceeded trapping
+	 sircm%			;don't let inferior trap quota exceeded
+	  erjmp .+1
+	move a,ptyjfn		;a/ jfn for PTY
+	move b,[mo%oir!<ptychn-1,,.moapi>] ;b/ establish output-ready interrupt
+	mtopr%			;enable it
+	movei a,.fhslf		;a/ our fork handle
+	move b,[1b<cncchn>+1b<cnychn>+1b<.icqta>+1b<.icili>] ;b/ channel mask
+	aic%			;activate these channels
+	ret			;return to caller
+
+Subttl Logging Routines
+
+;PTYOUT
+;here on a type-in interrupt from the PTY
+
+ptyout:	push p,a		;save some AC's
+	push p,b
+	push p,c
+	push p,d
+ptyou1:	move a,ttynum		;get tty number of pty
+	sobe%			;is there anything there?
+	 caia			;yes
+	jrst ptyou3		;no, go dismiss the interrupt
+	move a,ptyjfn		;a/ reading from the pty
+	bin%			;get a byte
+	andi b,177		;clear any parity or meta bits
+	move c,b		;put current character into C
+	skipn logflg		;are we logging?
+	 jrst ptyou1		;no, flush this character
+	movei a,-1		;a/ current terminal
+	rfmod%			;fetch mode word
+	jumpl b,ptyou1		;flush character if CTRL-O has been typed
+	caie c,.chdel		;delete?
+	cain c,.chbsp		;backspace?
+	 jrst bcksp		;yes, go handle specially
+	caie c,.chlfd		;linefeed?
+	cain c,.chcrt		;carriage return?
+	 jrst ptyou2		;yes, let them in
+	caie c,.chtab		;tab?
+	cain c,.chffd		;formfeed?
+	 jrst ptyou2		;accept these.
+	caige c,.chspc		;some random control character?
+	 jrst ptyou1		;yes, flush it
+ptyou2:	idpb c,pt		;add the character to our buffer
+	sosg ch			;decrement buffer count
+	 call bufout		;dump buffer if it's full
+	jrst ptyou1		;go check if we have another byte
+
+
+;here to return from the type-in interrupt
+
+ptyou3:	pop p,d			;retore the AC's
+	pop p,c
+	pop p,b
+	pop p,a			;....
+	debrk%			;and dismiss
+
+
+;BUFOUT, BUFINI
+;here to dump and reinitialize our buffer
+
+bufout: push p,a		;save some AC's
+	push p,b
+	push p,c		;....
+	movei c,.chnul		;get a NUL
+	idpb c,pt		;tie off our buffer
+	move a,dskjfn		;a/ jfn of output file
+	hrroi b,buffer		;b/ pointer to full buffer
+	setz c,			;c/ end on a NUL
+	sout%			;print the buffer
+	pop p,c			;restore the AC's
+	pop p,b
+	pop p,a			;....
+bufini:	move pt,[point 7,buffer] ;set up the byte pointer
+	movei ch,maxchr		;set up the character count
+	ret			;return to caller
+
+
+;BCKSP
+;here to process a backspace or a delete
+
+bcksp:	move a,pt		;fetch the byte pointer
+	movni b,1		;want to back up once
+	adjbp b,a		;and move the pointer that far
+	move pt,b		;restore the pointer
+	addi ch,1		;fix up the byte count as well
+	jrst ptyou1		;get next character
+
+
+
+;MESOUT
+;routine to send string to the tty and to the log file
+;takes b/ string pointer
+;returns +1 always
+
+mesout:	push p,b		;save the string pointer
+	skipn logflg		;logging?
+	 jrst mesou1		;no, just print on the TTY
+	hrli b,(<point 7,0>)	;make string pointer into a byte pointer
+mesou0:	ildb a,b		;fetch a byte
+	jumpe a,mesou1		;we're done if it's a NUL
+	idpb a,pt		;stash it in the buffer
+	sosg ch			;buffer full?
+	 call bufout		;yes, force it out and reset the world
+	jrst mesou0		;go back for more characters
+mesou1:	pop p,a			;get string pointer back in place
+	psout%			;print on the user's screen
+	ret			;return to caller
+
+
+;TIMOUT
+;routine to put a time stamp in the log file and on the tty
+;returns +1 always
+
+timout:	hrroi a,tmpbuf		;a/ dump time string here
+	seto b,			;b/ -1 is the current time
+	movx c,ot%scl!ot%12h!ot%nsc!ot%day ;c/ format flags
+	odtim%			;print the time stamp
+	setz b,
+	idpb b,a		;ensure a null
+	hrroi b,tmpbuf		;string pointer
+	call mesout		;handle like any other string
+	ret			;return to caller
+
+
+;BEGLOG
+;initialize logging buffer, turn on PTY output interrupts, time stamp
+;returns +1 always
+
+beglog:	call bufini		;initialize logging buffer
+	setom logflg		;logging begins now
+	hrroi b,[asciz/
+[PHOTO:  Recording initiated  /]
+	call mesout		;first part of banner
+	call timout		;time stamp
+	hrroi b,[asciz/]
+
+/]
+	call mesout		;finish up logging banner
+	movei a,.priou		;a/ our terminal
+	dobe%			;wait until all output is done
+	move a,ttynum		;a/ tty number of our PTY
+	cfibf%			;clear input buffer
+	cfobf%			;clear output buffer
+	movei a,.fhslf		;a/ our fork handle
+	move b,[1b<ptychn>]	;b/ channel mask
+	aic%			;activate pty output interrupts
+	ret			;return to caller
+
+
+
+;ENDLOG
+;finish up logging session, close files, break links, add time stamp
+;returns +1 always
+
+endlog:	move a,ttynum		;a/ get the pty number
+	cfibf%			;clear input buffer
+	cfobf%			;clear output buffer
+	hrloi a,(tl%cor)	;clear object to remote
+	hrrz b,ttynum		;pty is remote, above -1 for tty
+	tlink%			;close PTY link
+	 erjmp .+1		;ignore an error now
+	movx a,cz%abt		;set flag to abort any file operations 
+	hrr a,ptyjfn		;a/ jfn of pty
+	closf%			;close the PTY
+	  jfcl			;ignore an error
+	hrroi b,[asciz/
+[PHOTO:  Recording terminated /]
+	call mesout
+	hrroi b,[asciz/by EXEC error /]
+	skipn errflg		;any errors?
+	 call mesout		;yes, print the addendum
+	call timout		;time stamp
+	movei a,.chspc		;a blank to the user
+	pbout%			;so that everything looks nice
+	movei a,.priou		;tell the user at tty
+	move b,dskjfn		;where he put the stuff
+	setz c,			;in the usual format
+	jfns%
+	hrroi b,[asciz/]
+/]
+	call mesout		;that's it for the message
+	call bufout		;make sure our buffer is empty
+	move a,dskjfn		;a/ jfn of output file
+	closf%			;close the file
+	  jfcl			;ignore an error here
+	ret			;return to caller
+
+
+Subttl Interrupt Processing
+
+;CNTRLC
+;To prevent an inferior fork from hanging the job by trapping ^C without
+;clearing inout and output buffers, PHOTO traps it itself and clears the
+;PTY's buffers, the passes the interrupt to the inferior Exec.
+
+cntrlc:	push p,a
+	push p,b
+	push p,c
+	movei a,.fhslf		;disable interrupts
+	dir%
+	move a,ttynum		;a/ tty number of pty
+	cfibf%			;clear input buffer
+	cfobf%			;clear output buffer
+	movei a,.fhslf		;allow interrupts
+	eir%
+	move a,forkh		;get EXEC's handle
+	movx b,1b1		;fake a channel 1 (^C) interrupt
+	iic%
+	 jmsg <Can't pass ^C interrupt to Exec>
+	pop p,c
+	pop p,b
+	pop p,a
+	debrk%			;done processing the interrupt
+
+
+;CNTRLY
+;routine to handle CTRL-Y at interrupt level
+;acts like a flip flop to enable and disable logging
+
+cntrly:	push p,a
+	push p,b
+	push p,c
+	move a,ttynum		;get tty number of pty
+	dobe%			;wait until it is empty
+	movei a,.fhslf
+	dir%			;turn off interrupts
+	hrroi b,[asciz/[PHOTO: Logging disabled /]
+	skipn logflg		;we are toggling
+	hrroi b,[asciz/[PHOTO: Logging enabled /]
+	call mesout
+	call timout		;time stamp
+	hrroi b,[asciz/]
+/]
+	call mesout		;a CRLF for pretty
+	movei a,-1		;wait for terminal output
+	dobe%			;to finish at a higher level
+	setcmm logflg		;change our state
+	movei a,.fhslf		;back to consistency
+	eir%			;enable interrupt system again
+	pop p,c			;restore AC's
+	pop p,b
+	pop p,a
+	debrk%			;return from the interrupt
+
+
+;QUOTA
+;violent death on a quota exceeded error to prevent hung jobs
+
+quota:	emsg <Disk quota exceeded, PHOTO session aborted> ;die
+
+
+
+;ILLINS
+;here on an illegal instruction interrupt
+
+illins:	hrroi a,tmpbuf
+	hrroi b,[asciz/Illegal instruction at /]
+	setz c,
+	sout%
+	hrrz b,lev1pc
+	movei c,10
+	nout%
+	 jfcl
+	setz b,
+	idpb b,a		;tie off buffer with a null
+	hrroi a,tmpbuf		;a/ error string
+	call abort		;abort the PHOTO session
+	debrk%			;should never get here
+
+
+Subttl Miscellaneous Subroutines
+
+;PMSG
+;here to pretty print an error message
+;takes	a/ pointer to error string
+;returns +1 always
+
+pmsg:	push p,a
+	movei a,.priou		;a/ reading from the tty
+	rfpos%			;get cursor position
+	hrroi a,[byte(7) 15,12,0] ;a/ a CRLF
+	trne b,-1		;skip if against left margin
+	psout%			;print a CRLF otherwise
+	pop p,a			;restore the string pointer
+	esout%			;print the message
+	ret			;return to caller
+
+
+;ABORT
+;abort a PHOTO session
+;takes	a/ pointer to error string
+;never returns
+
+abort:	push p,a		;save string pointer
+	hrloi a,(tl%cor)	;clear object to remote
+	hrrz b,ttynum		;pty is remote, above -1 for tty
+	tlink%			;break PTY link
+	 erjmp .+1
+	move a,ttynum		;a/ get the pty number
+	cfibf%			;clear input buffer
+	 erjmp .+1
+	cfobf%			;clear output buffer
+	 erjmp .+1
+	pop p,a			;restore string pointer
+	call pmsg		;print the string
+	tmsg < - >		;print the separator
+	movei a,.priou		;a/ to the terminal
+	hrloi b,.fhslf		;b/ most recent error for this process
+	setz c,			;c/ no string length limit
+	erstr%			;print the error string
+	 jfcl			;ignore errors
+	  jfcl			;...
+	tmsg <
+[You are leaving PHOTO]
+>
+	call exit		;normal exit routine
+	ret			;should never get here
+
+
+;EXIT
+;leave PHOTO normally
+
+exit:	movei a,.priou		;a/ our terminal
+	move b,ttytyp		;b/ recover the terminal type
+	jumpl b,exit0		;we never changed it, so don't reset it
+	sttyp%			;reset terminal type
+	move b,ttymod		;b/ recover TTY mode word
+	sfmod%			;reset it
+	stpar%			;reset it
+	movei b,.moxof		;b/ function is set terminal pause state
+	move c,ttypag		;c/ old value
+	mtopr%			;reset it
+exit0:	reset%			;kill inferior forks, close jfns, etc.
+	haltf%			;shut us down
+	jrst .-1		;pointless to continue
+
+
+Subttl Invariant Storage
+
+;LEVTAB
+;level table for PSI
+
+levtab:	lev1pc			;where to stuff pc on lev 1
+	lev2pc			;level 2
+	lev3pc			;and level 3 interrupts
+
+
+
+define chan (level,routin,chanl) <
+	.org chntab+chanl
+	xwd level,routin
+>
+
+define begchn <
+	block ^d36
+>
+
+define endchn <
+	.org chntab+^d35
+>
+
+
+;CHNTAB
+;channel table for PSI
+
+chntab:	begchn
+	chan (1,cntrlc,cncchn)	;CTRL-C
+	chan (3,cntrly,cnychn)	;CTRL-Y
+	chan (2,ptyout,ptychn)	;PTY output
+	chan (1,quota,.icqta)	;quota exceeded
+	chan (1,illins,.icili)	;illegal instruction
+	endchn
+
+	xlist
+	lit
+	list
+
+	end start
+

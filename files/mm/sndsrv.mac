@@ -1,0 +1,1042 @@
+	TITLE SNDSRV -- Stanford SEND Server
+	SUBTTL Kirk Lougheed/KSL/DE/MRC/WHP4
+
+	SEARCH MONSYM,MACSYM,SNDDEF
+	.REQUIRE SYS:MACREL
+	.TEXT "SNDSRV/SAVE"	;Save as SNDSRV.EXE
+	ASUPPRESS
+
+; Version information
+
+	VMAJOR==6		;Major version (matches monitor's)
+	VMINOR==1		;Minor version
+	VEDIT==^D36		;Edit number
+	VWHO==0			;Who last edited (0 = developers)
+
+SUBTTL Definitions
+
+; Accumulator definitions
+
+F=:0				;Flag word
+	F%WHL==1B0		;Requestor has WHEEL privileges
+	F%NLI==1B1		;Requestor is not logged in
+	F%DET==1B2		;Indicates possible detached jobs
+	F%BELL==1B3		;Only allow one bell through per message
+	F%ALL==1B4		;We are sending to everyone
+	F%HDR==1B5		;Header already supplied, don't make our own
+	F%RSYS==1B6		;Obey REFUSE SYS even if privileged
+
+A=:1				;Temporary AC's, for JSYSes etc
+B=:2
+C=:3
+D=:4
+
+N=:6				;AOBJN index for SNDUSR
+T=:7				;Current terminal number
+
+CHT=:10				;Number of chars left in message buffer
+CHL=:11				;Chars left on current line
+PTR=:12				;Byte pointer into current buffer
+
+FP=:15				;TRVAR frame pointer
+CX=:16				;Scratch for MACREL
+P=:17				;Control PDL pointer
+
+; Miscellaneous symbols
+
+	TIMTIM==^D20000		;20 second timeout for normal messages
+	ALLTIM==^D10000		;10 seconds for SEND *
+	ERRTRY==10		;try 10 times to talk to INFO in SETIPC
+	ERRTIM==^D30000		;waiting 30 seconds between each try
+
+	PDLEN==100		;Length of pushdown stack
+	TMPLEN==20		;Length of temporary buffer
+	MAXLIN==^D79		;Maximum chars per line (see CPYSTR)
+
+
+	INPPAG==400		;IPCF input page
+	INPADR==INPPAG*1000	;Address of input page
+
+
+DEFINE BLTACS <			;;Save the contents of the accumulators:
+	MOVEM 17,ERRACS+17	;;  Save 17 for use as a BLT pointer
+	MOVEI 17,ERRACS+0	;;  Set up BLT pointer
+	BLT 17,ERRACS+16	;;  Save all the AC's for later examination
+	MOVE 17,ERRACS+17	;;  Restore the AC we just clobbered
+>
+
+SUBTTL Impure Storage
+
+; Uninitialized impure storage
+
+BEGZER:!			;Beginning of storage to zero on startup
+
+PDLIST: BLOCK PDLEN		;Subroutine pushdown stack
+FILBUF:	BLOCK MAXCHR/5+1	;Message buffer for SENDS.TXT
+TMPBUF:	BLOCK TMPLEN		;Temporary storage for minor subroutines
+GETBLK:	BLOCK .JIMAX		;Storage for GETJI%
+ERRACS:	BLOCK 20		;Holds ACs of crashed daemon
+P1IPC:	BLOCK 1			;PC for level 1 software interrupts
+P2IPC:	BLOCK 1			;PC for level 2 software interrupts
+P3IPC:	BLOCK 1			;PC for level 3 software interrupts
+MYPID:	BLOCK 1			;PID for the server program
+SNDTTY:	BLOCK 1			;TTY number of current requestor
+JOBAOB:	BLOCK 1			;AOBJN pointer for doing GETJI%'s
+TOWHOM:	BLOCK 1			;User number of recipient
+NOSNDF:	BLOCK 1			;Count of send failures
+$START:	BLOCK 1			;TAD of startup
+$SNDUS:	BLOCK 1			;Number of sends to a user
+$SNDLN:	BLOCK 1			;Number of sends to a line
+$SNDAL:	BLOCK 1			;Sends to *
+$SNDST:	BLOCK 1			;Requests for statistics
+$FILES:	BLOCK 1			;How many SENDS.TXT files written
+$ABORT:	BLOCK 1			;Number of aborted requests
+$SENT:	BLOCK 1			;Messages successfully sent
+$REFUS:	BLOCK 1			;Messages refused
+$TIMED:	BLOCK 1			;Messages not sent because of timeout
+$INACT:	BLOCK 1			;Messages not sent because of inactive line
+
+ENDZER:!			;End of storage to be cleared on startup
+
+; IPCF argument blocks
+
+; RCVPDB - argument block for MRECV%
+
+RCVPDB:	IP%CFR!IP%CFV		;.IPCFL - flags (paged data, use PID at .IPCFR)
+SNDPID:	0			;.IPCFS - sender's PID
+	MYPID			;.IPCFR - receiver's PID
+	1000,,INPPAG		;.IPCFP - length,,address of message
+RCVUSR:	0			;.IPCFD - usernumber of sender
+RCVCAP: 0			;.IPCFC - enabled capabilities of sender
+	0			;.IPCSD - directory number of connect directory
+	0			;.IPCAS - account string of sender
+RCVLEN==.-RCVPDB		;Length of argument block
+
+
+; SNDPDB - argument block for MSEND%
+
+SNDPDB:	IP%TTL!IP%CFP!IP%CFV!IP%CFS ;.IPCFL - flags
+	MYPID			;.IPCFS - sender's PID
+	0			;.IPCFR - receiver's PID
+	1000,,INPPAG		;.IPCFP - length,,page number
+SNDLEN==.-SNDPDB		;Length of argument block
+
+SUBTTL Pure Storage
+
+; Assemble literals here, don't CREF them
+
+	XLIST
+	LIT
+	LIST
+
+
+DEFINE X (VALUE,SYMBOL,STRING) <POINT 7,[ASCIZ\STRING\]>
+UCODE:	SNDERRS			; Table of error codes and strings
+
+SUBTTL Startup, IPCF Handling, and Main Loop
+
+EVEC:	JRST START		;Main start address
+	JRST REENT		;Reentry address
+	BYTE (3)VWHO (9)VMAJOR (6)VMINOR (18)VEDIT
+EVECL==.-EVEC
+
+
+; Startup code
+
+START:	RESET%			;Clean up the world
+	MOVE P,[IOWD PDLEN,PDLIST] ;Set up stack
+	SETZM BEGZER		;Clear first word of storage
+	MOVE A,[BEGZER,,BEGZER+1] ;Fetch a BLT pointer
+	BLT A,ENDZER-1		;Clear storage
+	GTAD%			;Get current TAD
+	MOVEM A,$START		;Store it
+	MOVEI A,.FHSLF		;A/current fork
+	RPCAP%			;Fetch capabilities
+	TXNE B,SC%WHL+SC%OPR	;WHEEL or OPERATOR?
+	IFSKP.
+	  HRROI A,[ASCIZ/Insufficient privileges to run SNDSRV/]
+	  ESOUT%		;Not privileged, complain
+	  JRST .HALTF		;Shut down permanently
+	ENDIF.
+	MOVE C,B		;B/mask capabilities to be set
+	EPCAP%			;Enable capabilites
+;;;	MOVX B,FLD(1,JP%MNQ)!FLD(2,JP%MXQ) ;Always staying in queue 1
+;;;	SPRIW%			;Set process priority
+	HRROI A,.JOBTT		;A/want minus length of JOBTTY table
+	GETAB%			;Get the table entry
+	 ERCAL FATAL		;Some error, we're dead without this entry
+	HRLZS A			;Form an aobjn pointer in A
+	ADDI A,1		;Start with job 1
+	MOVEM A,JOBAOB		;Store the aobjn pointer for looping over jobs
+	CALL SETIPC		;Set up IPCF protocols
+	CIS%			;Clear any pending interrupts
+	MOVEI A,.FHSLF		;On ourself
+	MOVE B,[LEVTAB,,CHNTAB]	;With level table and channel table
+	SIR%			;Set up interrupt system
+	EIR%			;Enable interrupt system
+	MOVX B,ACTCHN		;B/activate masked channels
+	AIC%			;Activate interrupts
+MAIN:	MOVE P,[IOWD PDLEN,PDLIST] ;Reset the stack just in case
+	MOVEI A,RCVLEN		;A/length of argument block
+	MOVEI B,RCVPDB		;B/address of argument block
+	MRECV%			;Receive the IPCF packet
+	 ERJMP MAIN		;Some error, try next PDB
+	CALL DOFUNC		;Process request
+	CALL ANSWER		;Send results back to user
+	JRST MAIN		;Repeat forever
+
+
+; Here to re-enter the program without re-initializing data structures
+
+REENT:	CIS%			;Clear pending interrupts
+	MOVEI A,.FHSLF		;A/our fork
+	EIR%			;Enable interrupt system again
+	JRST MAIN		;Jump into main loop
+
+; SETIPC - set up the IPCF system (gets our PID, sets systemwide server name)
+; returns +1/always, PID in MYPID
+
+SETIPC:	STKVAR <<PACKET,4>,<MESSAG,4>>
+	MOVX A,IP%CPD		;Want to create a PID
+	MOVEM A,.IPCFL+PACKET	;So set flag saying so
+	SETZM .IPCFS+PACKET	;We have no PID yet
+	SETZM .IPCFR+PACKET	;Sending to INFO
+	MOVEI A,MESSAGE		;Get pointer to message block
+	MOVEM A,.IPCFP+PACKET	;Save as IPCF data
+	MOVX A,.IPCII		;Want to associate a name with our PID
+	MOVEM A,.IPCI0+MESSAG	;So set word in block to tell INFO
+	SETZM .IPCI1+MESSAG	;Don't tell anyone else
+	DMOVE A,[ASCIZ/SNDSRV/]	;Get string for our name
+	DMOVEM A,.IPCI2+MESSAG	;Save in block
+	MOVEI C,ERRTRY		;try this many times to talk to INFO
+SETIP1:	MOVEI A,4		;A/four words long
+	HRLM A,.IPCFP+PACKET	;That is also the length of the message block
+	MOVEI B,PACKET		;B/address of argument block
+	MSEND%			;Go talk to INFO
+	IFJER.			;well, we tried
+	 MOVX A,ERRTIM		;wait a bit before trying again
+	 DISMS%
+	 SOJG C,SETIP1		;maybe try again
+	 CALL FATAL		;give up
+	ENDIF.
+	MOVE A,.IPCFS+PACKET	;Get back PID system created for us
+	MOVEM A,MYPID		;Stash it
+	MOVEM A,.IPCFR+PACKET	;Set up receiver to be us
+	SETZM .IPCFL+PACKET	;No special flags
+	MOVEI A,4		;A/four words long
+	MOVEI B,PACKET		;B/address of argument block
+	MRECV%			;What did INFO say?
+	 ERCAL FATAL
+	LDB A,[POINT 6,.IPCFL+PACKET,29] ;ERROR code from INFO?
+	JUMPE A,R		;No, all done
+	CAIN A,.IPCDN		;Some error.  Duplicate name?
+	 SKIPA A,[-1,,[ASCIZ/Another copy of SNDSRV is active/]]
+	  HRROI A,[ASCIZ/Error returned by INFO/]
+	MOVEI B,.		;Use our current PC
+	JRST ERHALT		;Roll over and die
+
+; ANSWER - send the input page back to the requestor
+
+ANSWER:	MOVE A,SNDPID
+	MOVEM A,SNDPDB+.IPCFR	;Set up receiver's PID
+	MOVEI A,SNDLEN		;A/length of argument block
+	MOVEI B,SNDPDB		;B/address of argument block
+	MSEND%			;Send back the information
+	IFNJE.
+	  RET			;Succeeded, return to caller
+	ENDIF.
+	CAIE A,IPCFX4		;Receiver's PID invalid
+	 CAIN A,IPCF27		;PID is not defined
+	  RET			;Yes, just assume sender went away
+	CAIE A,IPCFX3		;Data too long for user's buffer
+	 CAIN A,IPCFX7		;Receiver quota exceeded
+	  RET			;Unimportant lossage
+	HRROI A,[ASCIZ/MSEND% failure/]
+	MOVEI B,ANSWER		;Get reasonable value for PC
+	JRST ERWARN		;Complain and return to caller
+
+SUBTTL Set up for an error reply
+
+; SETERR - Set up error reply
+; call with C/error code
+; returns +1/always, SN$ERR and SN$STR set up
+
+SETERR:	AOS $ABORT		;Count an aborted request
+	SETOM INPADR+SN$HDR	;Set flag indicating errors
+	CAILE C,MAXTTX		;Legal error code?
+	MOVEI C,TTXIEC		;No, tell user that SNDSRV is screwed up
+	HRRZM C,INPADR+SN$ERR	;Store error code
+	MOVE A,UCODE(C)		;Fetch pointer to the error string
+	MOVE B,[POINT 7,INPADR+SN$STR] ;Form destination byte pointer
+	DO.
+	  ILDB C,A		;Fetch a byte
+	  IDPB C,B		;Dump it
+	  JUMPN C,TOP.		;Loop until a NUL is found
+	ENDDO.
+	RET
+
+SUBTTL Error Processing
+
+;ERHALT & ERWARN - proclaim the death or sickness of the server on the console
+;call with A/pointer to string, B/PC where error was thought to occur
+
+ERHALT:	CALL ERWARN		;Type error printout
+.HALTF:	HALTF%			;Shut us down
+	JRST .HALTF		;Permanently
+
+ERWARN:	CALL TSTAMP		;Start timestamp
+	PSOUT%			;Type out error message given us
+	TMSG < at PC >		;More message
+	MOVEI A,.PRIOU		;Send to the tty
+	MOVEI C,^D8		;Octal
+	NOUT%			;Print PC from B
+	 NOP
+	CALL TSTAMP		;Another line
+	TMSG <Last JSYS error: >
+	MOVEI A,.PRIOU		;To the terminal again
+	HRLOI B,.FHSLF		;Last error in current process
+	SETZ C,			;No character limit
+	ERSTR%			;Type error message
+	 NOP
+	 NOP
+	TMSG <, Requestor: >
+	MOVEI A,.PRIOU		;Again to the terminal
+	MOVE B,RCVUSR		;Get user number
+	DIRST%			;Say who crashed us
+	IFJER.
+	  TMSG <Unknown>	;DIRST failed, give up
+	ENDIF.
+	TMSG <
+>				;Finish line
+	RET			;All done
+
+
+; Start line on console in standard format
+
+TSTAMP:	SAVEAC <A,B,C>		;Don't mung any ACs
+	MOVEI A,.PRIOU		;On the terminal (probably console))
+	RFPOS%			;Read position
+	HRROI A,[ASCIZ/
+/]				;Get ready with CRLF
+	TRNE B,-1		;Are we at margin?
+	 PSOUT%			;No, put us there
+	MOVEI A,.PRIOU		;To the terminal
+	SETO B,			;Current time
+	SETZ C,			;In usual format
+	ODTIM%			;Type date and time
+	TMSG < SNDSRV: >	;Show who done it
+	RET
+
+SUBTTL Interrupt Handling
+
+; Level table for PSI
+
+LEVTAB:	P1IPC			;Level 1 interrupts: Panic
+	P2IPC			;Level 2 interrupts: (none set)
+	P3IPC			;Level 3 interrupts: Timer
+
+
+; Channel table for PSI
+
+DEFINE PSI (LEV,CH,DISP) <
+	ACTCHN==ACTCHN!1B<CH>
+.ORG CHNTAB+^D<CH>
+	LEV,,DISP
+>
+	ACTCHN==0		;Bit mask of active channels
+	TIMCHN==0		;Channel for timer interrupt
+
+CHNTAB:	PSI 3,TIMCHN,TIMINT	;Watchdog timer interrupt
+	PSI 1,.ICPOV,PANIC	;Pushdown overflow
+	PSI 1,.ICDAE,PANIC	;Data error
+	PSI 1,.ICQTA,PANIC	;Quota exceeded or disk full
+	PSI 1,.ICILI,PANIC	;Illegal instruction
+	PSI 1,.ICIRD,PANIC	;Illegal memory read
+	PSI 1,.ICIWR,PANIC	;Illegal memory write
+	PSI 1,.ICMSE,PANIC	;Machine size exceeded
+
+.ORG CHNTAB+^D36
+
+; FATAL & PANIC - show error condition and die
+; CALL FATAL on a fatal JSYS error or other problem, PANIC is panic PSI channel
+
+FATAL:	BLTACS			;Save AC's
+	HRROI A,[ASCIZ/Fatal JSYS error/] ;Say what hit us
+	HRRZ B,(P)		;Fetch PC
+	SUBI B,2		;adjust it
+	JRST ERHALT		;Die...
+
+PANIC:	BLTACS			;Save AC's
+	HRROI A,[ASCIZ/Panic channel interrupt/] ;Say what hit us
+	HRRZ B,P1IPC		;Fetch PC
+	JRST ERHALT		;Die...
+
+; TIMINT - process TIMER% interrupt
+
+TIMINT:	PUSH P,A		;Save an AC
+	MOVE A,P3IPC		;Fetch PC when interrupt occured
+	MOVE A,-1(A)		;Fetch instruction at PC-1
+	CAME A,[BOUT%]		;Is it a BOUT%?
+	 CAMN A,[SOUT%]		;Is it a SOUT%?
+	 IFNSK.
+	   MOVEI A,R		;Get address to return from the routine
+	   MOVEM A,P3IPC	;And set it as main process address
+	   MOVEI A,1		;Yes, must be in SNDMSG.  Set error ret value
+	   ADJSP P,-1		;Flush top of stack
+	   AOS $TIMED		;Count the timeout
+	 ELSE.
+	   POP P,A		;Restore AC
+	 ENDIF.
+	DEBRK%			;Return from the interrupt
+
+Subttl DOFUNC - Process a request
+
+DOFUNC:	SETZ F,			;Clear all flags
+	MOVE A,RCVCAP		;Fetch sender's capabilities
+	TXNE A,SC%WHL+SC%OPR	;A wizard?
+	 TXO F,F%WHL		;Yes, set the flag
+	MOVE A,RCVUSR		;Fetch usernumber
+	TRNN A,-1		;Logged in?
+	 TXO F,F%NLI		;Yes, set flag
+	MOVE A,INPADR+SN$HDR	;Fetch header word
+	SETZM INPADR+SN$HDR	;and clear it
+	MOVSI B,-FNCLEN		;Form AOBJN pointer in B
+	DO.
+	  CAME A,FNCTYP(B)	;Compare against known function	types
+	   AOBJN B,TOP.		;Loop over function table
+	ENDDO.
+	IFGE. B			;Unrecognized packet header?
+	  MOVEI C,TTXUNK	;Yes, get code
+	  JRST SETERR		;Return after setting error
+	ENDIF.
+	MOVE A,INPADR+SN$FLG	;Fetch flag word
+	TXNN A,T%RSYS		;Obey refuse system-messages?
+ 	 TXNN F,F%WHL		;Or not privileged?
+	  TXO F,F%RSYS		;Yes...
+	TXNE F,F%NLI		;Not logged in?
+	 TXO F,F%RSYS		;Yes, must refuse sys
+	TXNN A,T%HDR		;Wants to suppress header line?
+	IFSKP.
+	  CALL CHKWHL		;Yes, make sure user is privileged
+	   RET			;No, propagate fail return
+	  TXO F,F%HDR		;Set the flag
+	ENDIF.
+	JRST @FNCDSP(B)		;Call to appropriate subroutine
+
+; Tables of SIXBIT function names and dispatch macros for major functions
+; Each function dispatches to the routine of the same name
+
+DEFINE FNCTAB <
+	X SNDLIN		;;Send to specified line number
+	X SNDUSR		;;Send to the specified user
+	X SNDALL		;;Send to everyone
+	X SNDSTA		;;Send statistics back to requestor
+>
+
+DEFINE X (FNC) <SIXBIT/FNC/>
+FNCTYP:	FNCTAB			;List of codes for major function types
+FNCLEN==.-FNCTYP		;How many codes are possible
+
+DEFINE X (FNC) <IFIW!FNC>
+FNCDSP:	FNCTAB			;Major function dispatch table
+
+; CHKWLI - Check if WHEEL and logged in
+; CHKNLI - Check if logged in
+; CHKWHL - Check if WHEEL
+; all return +1/Failure, error codes set up
+;	     +2/Success
+
+CHKWLI:	CALL CHKNLI		;Must be logged in
+	 RET
+CHKWHL:	TXNE F,F%WHL		;Wizard?
+	 RETSKP			;Yes
+	MOVEI C,TTXCAP		;No, get error code
+	JRST SETERR		;And go set up error
+
+CHKNLI:	TXNN F,F%NLI		;Logged in?
+	 RETSKP			;Yes
+	MOVEI C,TTXNLI		;No, get error code
+	JRST SETERR		;And go set up error
+
+SUBTTL SNDLIN - Sending to a Terminal Line
+
+SNDLIN:	AOS $SNDLN		;Tick off the request
+	SETZM INPADR+SN$TTY	;Clear TTY list header
+	AOS INPADR+SN$TTY	;Say just one tty
+	SKIPLE T,INPADR+SN$DAT	;Fetch the line number, check if normal
+	IFSKP.
+	  MOVEI C,TTXNST	;Can't send to TTY0, or negative terminals
+	  JRST SETERR		;So complain and return
+	ENDIF.
+	HRRM T,INPADR+SN$TTY+1	;Set up tty list
+	HRROI A,TMPBUF		;A/destination
+	MOVEI B,.TTDES(T)	;B/terminal designator
+	DEVST%			;Is this a real terminal?
+	IFJER.
+	  MOVEI C,TTXNST	;No, no such terminal
+	  JRST SETERR		;So complain and return
+	ENDIF.
+	MOVEI A,.TTDES(T)	;A/terminal designator
+	MOVE B,[XWD -.JIMAX,GETBLK] ;B/dump data into standard place
+	MOVEI C,.JIJNO		;C/start with job number
+	GETJI%			;Get job information
+	IFJER.
+	  MOVEI C,TTXACT	;Say line inactive on an error
+	  JRST SETERR
+	ENDIF.
+	SKIPL GETBLK+.JIJNO	;Check if line is active (has a job)
+	IFSKP.
+	  MOVEI C,TTXACT	;Isn't, return line inactive error
+	  JRST SETERR
+	ENDIF.
+	SKIPL GETBLK+.JIBAT	;Skip if it's a Batch job
+	 SKIPN GETBLK+.JICPJ	;Skip if not controlled by SYSJOB
+	  IFNSK.
+	    MOVEI C,TTXBAT	;Line is a batch job, don't send there
+	    JRST SETERR
+	  ENDIF.
+	MOVE A,GETBLK+.JIUNO	;Fetch usernumber
+	MOVEM A,TOWHOM		;And stash it
+SNDLN1:	CALL BLDMSG		;Build message in FILBUF
+	 RET			;Propagate fail return
+SNDLN2:	CALL SNDMSG		;Send the message
+	IFE. A			;If we succeeded
+	  MOVE B,TOWHOM		;B/usernumber of recipient
+	  JRST SNDFIL		;Write the sends file and return
+	ENDIF.
+	HRLM A,INPADR+SN$TTY+1	;Set status information
+	IFL. A			;-1 means refused, go set error
+	  MOVEI C,TTXREF	;Set up error code
+	  JRST SETERR
+	ENDIF.
+	MOVEI C,TTXTIM		;Get expected error code
+	CAIN A,1		;+1 = Timeout
+	 JRST SETERR
+	MOVEI C,TTXACT		;+2 = Line is inactive
+	JRST SETERR
+
+SUBTTL SNDUSR - Send to a single user
+
+SNDUSR:	AOS $SNDUS		;Tick off the request
+	HRROI A,TMPBUF		;Write username string into a temporary buffer
+	MOVE B,INPADR+SN$DAT	;Fetch the usernumber
+	DIRST%			;Write the string
+	IFJER.
+	  MOVEI C,TTXNSU	;Failure, get error code
+	  JRST SETERR		;And set it up
+	ENDIF.
+	MOVEM B,TOWHOM		;Stash the good usernumber
+	SETZM INPADR+SN$TTY	;Clear count and header for tty list
+  	TXZ F,F%DET		;Say no detached jobs seen yet
+	MOVE D,JOBAOB		;Put AOBJN pointer in D
+	DO.
+	  CALL JOBDAT		;Get user number and tty number
+	  IFSKP.		;Must have someone there
+	    CAME A,TOWHOM	;Go on if we match
+	  ANSKP.
+	    TXO F,F%DET		;Flag a possible detached job
+	  ANDGE. B		;Ignore a detached job
+	    AOS A,INPADR+SN$TTY	;Mark that we've found a tty
+	    HRRM B,INPADR+SN$TTY(A) ;Store the tty on our list
+	  ENDIF.
+	  AOBJN D,TOP.		;May have more jobs
+	ENDDO.
+	SKIPE A,INPADR+SN$TTY	;If we didn't find any jobs
+	IFSKP.
+	  MOVEI C,TTXDET	;Set up error code
+	  TXNE F,F%DET		;Detached jobs only?
+	   JRST SETERR		;Yes, that's the error
+	  MOVEI C,TTXNLG	;Else must be user not logged in
+	  JRST SETERR		;Go send it off
+	ENDIF.
+	CAIE A,1		;Just one job?
+	IFSKP.
+	  MOVE T,INPADR+SN$TTY+1 ;Yes, get terminal number
+	  JRST SNDLN1		;Go send it off
+	ENDIF.
+	CALL BLDMSG		;Build message in FILBUF
+	 RET			;Failed, don't try to send anything
+;	JRST SDLOOP		;Go send off to terminal list
+
+; SDLOOP - send to list of ttys in SN$TTY (returns +1 always)
+
+SDLOOP:	SETZM NOSNDF		;Clear the failure counter
+	MOVN N,INPADR+SN$TTY	;Get negative number of terminals to send to
+	HRLZS N			;In left half
+	HRRI N,INPADR+SN$TTY+1	;Set up an AOBJN pointer in N
+	DO.
+	  HRRZ T,(N)		;Fetch a tty number
+	  CALL SNDMSG		;Send the message
+	  IFN. A		;On failure
+	    HRLM A,(N)		;Failure, store the state flag
+	    AOS NOSNDF		;Count the failure
+	  ENDIF.
+	  AOBJN N,TOP.		;Loop over all lines
+	ENDDO.
+	SKIPN A,NOSNDF		;Skip if we had some failures
+	IFSKP.
+	  SUB A,INPADR+SN$TTY	;Subtract from failures the number of tries
+	ANDE. A			;Unable to send message?
+	  MOVEI C,TTXUSM	;Yes, get error code
+	  JRST SETERR		;And go set it up
+	ENDIF.
+	MOVE B,TOWHOM		;B/user number of recipient
+	JRST SNDFIL		;Write the sends file and return
+
+SUBTTL SNDALL - Sending to all users (requires WOPR)
+
+SNDALL:	CALL CHKWLI		;Must be logged-in wizard
+	 RET			;Not, propagate fail return
+	AOS $SNDAL		;Tick off the request
+	TXO F,F%ALL		;Remember this is to everyone
+	CALL BLDMSG		;Build message
+	 RET			;Propagate fail return
+	SETZM INPADR+SN$TTY	;Clear tty list header
+	MOVE D,JOBAOB		;Fetch out AOBJN pointer
+	DO.
+	  CALL JOBDAT		;Get information on a job
+	  IFSKP.		;Don't do anything unless there's a job there
+	  ANDGE. B		;Must have a terminal
+	    AOS A,INPADR+SN$TTY	;Count a terminal number
+	    HRRM B,INPADR+SN$TTY(A) ;Store the tty number
+	  ENDIF.
+	  AOBJN D,TOP.		;Loop until done
+	ENDDO.
+	SKIPE INPADR+SN$TTY	;Were there any active terminals?
+	 JRST SDLOOP		;Found someone, go send message off
+	MOVEI C,TTXNBD		;Set up error code
+	JRST SETERR		;Nobody here to send to
+
+SUBTTL SNDSTA - Send back statistics to requestor
+
+SNDSTA:	AOS $SNDST		;Tick off the request
+	CALL BLDSTA		;Build the message
+	 RET			;Propagate fail return
+	CALL GETTTY		;Get terminal of sender in SNDTTY
+	 RET			;Propagate fail return
+	MOVE A,RCVUSR		;Back to the user that sent to us
+	MOVEM A,TOWHOM		;Set who to write SENDS.TXT for
+	MOVE T,SNDTTY		;And which terminal to send it to
+	JRST SNDLN2		;Go send it off
+
+SUBTTL Gathering Job Information
+
+; GETTTY - figure out what tty the requestor is on
+; returns +1/invalid PID or similar lossage, TTXUIR error set
+;	  +2/success, terminal number in SNDTTY
+
+GETTTY:	MOVEI A,.MUFOJ		;Function code
+	MOVEM A,TMPBUF+0
+	MOVE A,SNDPID		;Requestor's PID
+	MOVEM A,TMPBUF+1
+	MOVEI A,3		;A/length of argument block
+	MOVEI B,TMPBUF		;B/address of argument block
+	MUTIL%			;Get that job number
+	IFNJE.			;Continue if that succeeded
+	  MOVE A,TMPBUF+2	;A/job number
+	  MOVE B,[XWD -.JIMAX,GETBLK] ;B/dump data into GETBLK
+	  MOVEI C,.JIJNO	;C/start with job number
+	  GETJI%		;Get job information
+	  IFNJE.		;Continue if succeeded
+	    MOVE A,GETBLK+.JITNO ;Fetch tty number
+	    MOVEM A,SNDTTY	;Store it
+	    RETSKP		;Skip return on success
+	  ENDIF.
+	ENDIF.
+	MOVEI C,TTXUIR		;Unable to identify requestor
+	JRST SETERR		;Send off error and return +1
+
+; JOBDAT - get information on a job
+; call with D/job number
+; returns +1/no such job
+;	  +2/job exists, with a/ usernumber, b/ tty number
+
+JOBDAT:	HRRZ A,D		;A/job number
+	MOVE B,[XWD -.JIMAX,GETBLK] ;B/dump data into buffer
+	MOVEI C,.JIJNO		;C/first offset is job number
+	GETJI%			;Get job information
+	 ERJMP R		;Error means no such job
+	SKIPL GETBLK+.JIBAT	;If it's a batch job
+	 SKIPN GETBLK+.JICPJ	;or controlled by SYSJOB
+	  RET			;Pretend no such job
+	MOVE A,GETBLK+.JIUNO	;Get user number in place
+	MOVE B,GETBLK+.JITNO	;Get terminal number in place
+	RETSKP
+
+SUBTTL Assembling the message
+
+; INIBLD - set up pointers etc for making message
+
+INIBLD:	MOVE PTR,[POINT 7,FILBUF] ;Set up pointer
+	MOVEI CHT,MAXCHR	;Initialize total byte count
+	MOVEI CHL,MAXLIN	;Initialize byte count per line
+	MOVEI B,.CHESC
+	CALL CPYCHR		;Drop in an escape to delimit SENDS.TXT entries
+	 RET			;Overflow??
+	CALL CPYEOL		;Initial CRLF
+	 RET			;Overflow??
+	RET
+
+
+; BLDMSG - build the message into FILBUF
+; returns +1/failure, +2/success
+
+BLDMSG:	CALL GETTTY		;Get requestor's terminal
+	 RET			;Propagate fail return
+	TXZ F,F%BELL		;No bell seen yet
+	CALL INIBLD		;Set up for building message
+	TXNE F,F%HDR		;Do we want a header line?
+	IFSKP.
+	  MOVE B,RCVUSR		;Get username of sender
+	  CALL CPYUSR		;Copy into buffer
+	   RET			;Overflow, give up
+	  CALL BLDTTY		;Add the terminal number and time stamp
+	   RET			;Overflow, give up
+	  TXNN F,F%ALL		;Sending to everyone?
+	  IFSKP.
+	    HRROI A,[ASCIZ/ (to *)/]
+	    CALL CPYSTR		;Yes, add more message and a bell
+	     RET		;Overflow, give up
+	  ENDIF.
+	  CALL CPYEOL		;Finish with a crlf
+	   RET			;Overflow, give up
+	ENDIF.
+	HRROI A,INPADR+SN$MSG	;A/pointer to user's message
+	CALL CPYSTR		;Add user's message
+	 RET			;Overflow, give up
+	CALL CKCRLF		;Make sure it ends with a CRLF
+	 RET
+	MOVEI B,.CHNUL
+	JRST CPYCHR		;End message with a null
+
+; CKCRLF - make sure string pointed to by PTR ends with CRLF
+; returns +1/failure, +2/success
+
+CKCRLF:	LDB B,PTR		;Get last character
+	CAIN B,.CHCRT		;If not CR
+	IFSKP.
+	  CAIE B,.CHLFD		;If a linefeed
+	  IFSKP.
+	    SETO A,		;Get -1
+	    ADJBP A,PTR		;Back up byte pointer
+	    LDB B,A		;Get byte there
+	    CAIN B,.CHCRT	;If carriage return
+	     RETSKP		;Have newline, done
+	  ENDIF.
+	  MOVEI B,.CHCRT	;Get carriage return
+	  CALL CPYCHR		;Drop it in
+	   RET
+	ENDIF.
+	MOVEI B,.CHLFD		;Now a linefeed
+	JRST CPYCHR		;Go add that
+
+; BLDSTA - build a statistics message
+; returns +1/failure, +2/assembled message in FILBUF
+
+BLDSTA:	CALL INIBLD		;Set up to build message
+	HRROI A,[ASCIZ/The SNDSRV Daemon/]
+	CALL CPYSTR		;Who the message is from
+	 RET
+	GJINF%			;Get our terminal number
+	MOVEM D,SNDTTY		;Save for BLDTTY
+	CALL BLDTTY		;Add our terminal number, if any
+	 RET
+	HRROI A,[ASCIZ/
+Statistical Summary:
+/]
+	CALL CPYSTR		;A header line
+	 RET
+	HRROI A,[ASCIZ/Startup time was /]
+	CALL CPYSTR
+	 RET
+	MOVE B,$START		;Time and date of start up
+	CALL CPYTIM		;Add it into the stat message
+	 RET			;Overflow, give up
+	CALL CPYEOL
+	 RET
+	HRROI A,[ASCIZ/To users:  /]
+	MOVE B,$SNDUS		;Get number of SNDUSR requests processed
+	CALL CPYSTA		;Copy in
+	 RET
+	HRROI A,[ASCIZ/To lines:  /]
+	MOVE B,$SNDLN		;Number of SNDLIN requests
+	CALL CPYSTA
+	 RET
+	HRROI A,[ASCIZ/All Other: /]
+	MOVE B,$SNDALL		;Number of SNDALL requests
+	ADD B,$SNDST		;And number of statistics requests
+	CALL CPYSTA		;Both fall into "other" category
+	 RET
+	HRROI A,[ASCIZ/Sent:      /]
+	MOVE B,$SENT		;Number of messages actually sent
+	CALL CPYSTA
+	 RET
+	HRROI A,[ASCIZ/Aborted:   /]
+	MOVE B,$ABORT		;Number of times we returned an error
+	CALL CPYSTA
+	 RET
+	HRROI A,[ASCIZ/Refused:   /]
+	MOVE B,$REFUS		;Number of times a line was refusing messages
+	CALL CPYSTA
+	 RET
+	HRROI A,[ASCIZ/Timed out: /]
+	MOVE B,$TIMED		;Number of times we timed out a message
+	CALL CPYSTA
+	 RET
+	HRROI A,[ASCIZ/No job:    /]
+	MOVE B,$INACT		;Number of sends to inactive lines
+	CALL CPYSTA
+	 RET
+	HRROI A,[ASCIZ/Appends:   /]
+	MOVE B,$FILES		;Number of times we wrote a SENDS.TXT
+	CALL CPYSTA
+	 RET
+	MOVEI B,.CHNUL		;Get a null
+	JRST CPYCHR		;To tie off the message
+
+; BLDTTY - copy a terminal number (in SNDTTY) or detached string into buffers
+; returns +1/failure, error code set up
+;	  +2/success, tty number and time added to header
+
+BLDTTY:	HRROI A,[ASCIZ/, Detached, /]
+	SKIPG SNDTTY		;If detached use above string.  Otherwise...
+	IFSKP.
+	  HRROI A,[ASCIZ/, TTY/]
+	  CALL CPYSTR		;Copy in start of terminal number string
+	   RET
+	  MOVE A,SNDTTY		;Fetch the sender's terminal number
+	  CALL CPYOCT		;Put it in the buffer
+	   RET			;Overflow, give up
+	  HRROI A,[ASCIZ/, /]	;Comma before the date and time
+	ENDIF.
+	CALL CPYSTR		;Copy string in
+	 RET			;Overflow, give up
+	SETO B,			;B/-1 for current time
+;	JRST CPYTIM		;Put a time stamp on and return
+
+; CPYTIM - copy the time and date into the buffer
+; call with B/internal TAD or -1 for current time
+; returns +1/failure, +2/success
+
+CPYTIM:	HRROI A,TMPBUF		;A/dump string into TMPBUF
+	MOVX C,OT%NSC!OT%12H!OT%SCL ;C/Format flags: no seconds, 12 hour time
+	ODTIM%			;Write it
+	HRROI A,TMPBUF		;Point to the string we just made
+;	JRST CPYSTR		;Copy time stamp and return
+
+; CPYSTR - string ASCIZ string, ignoring random control chars
+; call with A/source string pointer, PTR/destination byte pointer
+; returns +1/failed, +2/success
+
+CPYSTR:	HRLI A,(POINT 7,)	;Make sure we have a byte pointer
+	DO.
+	  ILDB B,A		;Fetch a character
+	  JUMPE B,RSKP		;A null means we're done
+	  CAIL B,.CHSPC		;Some special character?
+	  IFSKP.
+	    CAIE B,.CHTAB	;A tab?
+	    IFSKP.
+	      TRZ CHL,7		;Yes, clear out bits (depends on MAXLIN = 79)
+	      SOJL CHL,CPYSTE	;If no more space in line, break instead of tab
+	      IDPB B,PTR	;Else drop the tab in
+	      SOJLE CHT,CPYOVR	;Count off against buffer size
+	      LOOP.		;And go back for more
+	    ENDIF.
+	    CAIE B,.CHCRT	;Let CR or LF through
+	     CAIN B,.CHLFD
+	  ANSKP.
+	    CAIN B,.CHBEL	;A bell?
+	     TXOE F,F%BELL	;Yes, flag it and let through only if the first
+	      LOOP.
+	  ENDIF.
+	  IDPB B,PTR		;Deposit the byte in the buffer
+	  SOJLE CHT,CPYOVR	;Count off character against buffer size
+	  CAIE B,.CHCRT		;If it's a CR
+	  IFSKP.
+	    MOVEI CHL,MAXLIN	;Reset char per line count
+	    LOOP.
+	  ENDIF.
+	  CAIN B,.CHLFD		;If it's a linefeed
+	   LOOP.		;Go back for the next without changing count
+	  SOJG CHL,TOP.		;Else count off against line length
+CPYSTE:	  CALL CPYEOL		;Filled line, add CRLF
+	   RET			;Propagate fail return
+	  LOOP.			;Back for the next character
+	ENDDO.
+
+; CPYSTA - copy a string in A and a decimal number in B into the message buffer
+; returns +1/failure, +2/success
+
+CPYSTA:	PUSH P,B		;Save the number
+	CALL CPYSTR		;Copy the string into the buffer
+	IFNSK.
+	  POP P,B		;Failed, restore stack
+	  RET			;And propagate failure
+	ENDIF.
+	POP P,A			;Get the number back
+	CALL CPYDEC		;Copy it into the buffer
+	 RET			;Overflow, give up
+;	JRST CPYEOL		;Add a CRLF and return
+
+; CPYEOL - append end-of-line
+; return +1/failure, +2/success
+
+CPYEOL:	MOVEI CHL,MAXLIN	;Reset line count
+	MOVEI B,.CHCRT		;Get a CR
+	CALL CPYCHR		;Add it
+	 RET			;Propagate fail return
+	MOVEI B,.CHLFD		;Get a LF
+;	JRST CPYCHR		;Go copy it in too
+
+; CPYCHR - copy a character in A into PTR (not counting against line length)
+; return +1/failure, +2/success
+
+CPYCHR:	IDPB B,PTR		;Add the character to buffer
+	SOJLE CHT,CPYOVR	;Jump on overflow
+	RETSKP			;Else return success
+
+; CPYOCT, CPYDEC - copy octal or decimal number from A into the buffer
+; return +1/failure, +2/success
+
+CPYOCT:	SKIPA D,[10]		;Get octal base
+CPYDEC:	 MOVEI D,12		;Or decimal base
+CPYNUM:	IDIV A,D		;Split off digit
+	IFN. A			;If more digits
+	  PUSH P,B		;Save the digit we made
+	  CALL CPYNUM		;Call self recursively
+	   RET			;Propagate fail return
+	  POP P,B		;Get saved digit back
+	ENDIF.
+	MOVEI B,"0"(B)		;Turn into ASCII character
+	IDPB B,PTR		;Drop into the buffer
+	SOJLE CHT,CPYOVR	;Count off
+	SOJA CHL,RSKP		;Decrement count and give good return
+
+
+; CPYUSR - copy user name into buffer from number in B
+; returns +1/failure, +2/success
+
+CPYUSR:	TRNE B,-1		;Not logged in?
+	IFSKP.
+	  HRROI A,[ASCIZ/Not logged in/]
+	  JRST CPYSTR		;Yes, say so
+	ENDIF.
+	HRROI A,TMPBUF		;Point to termporary buffer
+	DIRST%			;Write the string
+	IFNJE.
+	  MOVEI B,.CHNUL	;Succeeded, get a null
+	  IDPB B,A		;To terminate the string
+	  HRROI A,TMPBUF	;And use the username
+	  JRST CPYSTR		;Go copy it in
+	ENDIF.
+	HRROI A,[ASCIZ/Unknown user/]
+	JRST CPYSTR		;DIRST% failed, get a readable string
+
+
+; Here when any of the copy routines overflowed
+
+CPYOVR:	MOVEI C,TTXLNG		;Overflow
+	RET			;So set error
+
+SUBTTL Writing a SENDS.TXT file
+
+; SNDFIL - write the send to a file in the recipient's directory
+; call with B/ usernumber (0 for not-logged-in, no file written)
+; returns +1/Always, TTXFIL set if error
+
+SNDFIL:	JUMPE B,R		;No-op if no usernumber
+	TXNE F,F%ALL		;To everyone?
+	 RET			;Yes, don't write SENDS.TXT
+	SETZM A
+	RCDIR%			;Convert to logged-in directory number
+	IFJER.
+	 MOVEI C,TTXFIL		;Get error code for failure to write SENDS.TXT
+	 JRST SETERR		;Set error
+	ENDIF.	
+	MOVE B,C		;B/ logged in directory number
+	HRROI A,TMPBUF		;A/pointer to buffer
+	DIRST%			;Write the directory string
+	IFNJE.
+	  MOVE B,[POINT 7,[ASCIZ/SENDS.TXT.0;P770606;T/]]
+	  DO.
+	    ILDB C,B		;Fetch a byte
+	    IDPB C,A		;Deposit it
+	    JUMPN C,TOP.	;Loop over string until a null is found
+	  ENDDO.
+	  MOVX A,GJ%SHT		;A/short form
+	  HRROI B,TMPBUF	;B/pointer to file spec we just built
+	  GTJFN%		;Look for the file
+	ANSKP.			;If it succeeded...
+	  MOVE D,A		;Save jfn in D
+	  MOVX B,FLD(7,OF%BSZ)!OF%APP ;B/7 bit bytes, append access
+	  OPENF%		;Open the file
+	  IFNJE.
+	    HRROI B,FILBUF	;B/pointer to message
+	    SETZ C,		;C/end on a NUL
+	    SOUT%		;Write it to the file
+	    IFNJE.
+	      CLOSF%		;Close the file
+	      IFNJE.
+		AOS $FILES	;Mark that a SENDS.TXT was written
+		RET		;All done writing it
+	      ENDIF.
+	    ENDIF.
+	  ENDIF.
+	  EXCH A,D		;Error after GTJFN, get JFN back
+	  RLJFN%		;Flush it
+	   NOP
+	ENDIF.
+	MOVEI C,TTXFIL		;Get error code for failure to write SENDS.TXT
+	JRST SETERR		;Set error
+
+SUBTTL SNDMSG - Sending a Message to a Terminal
+
+; SNDMSG - send the message to a terminal
+; call with T/dest tty, FILBUF/message (leading ESC not sent)
+; returns +1/always, A: -1  line is refusing system messages
+;			 0  message was successfully sent
+;			+1  timeout occured while trying to send message
+;			+2  line was inactive
+
+SNDMSG:	TXNN F,F%RSYS		;Obeying REFUSE SYS?
+	IFSKP.
+	  MOVEI A,.TTDES(T)	;A/line number
+	  MOVEI B,.MORNT	;B/function is return sys msg status
+	  MTOPR%		;Check out the terminal
+	ANDN. C			;If line is refusing messages,
+	  SETO A,		;Set return value of -1
+	  AOS $REFUS		;Increment count of refused messages
+	  RET			;And return to caller
+	ENDIF.
+	MOVX A,<.FHSLF,,.TIMEL>	;A/fork handle (ourself),,function
+	MOVX B,TIMTIM		;B/default elapsed time
+	TXNE F,F%ALL		;Sending to everyone?
+	 MOVX B,ALLTIM		;Yes, smaller elapsed time
+	MOVEI C,TIMCHN		;C/interrupt on this channel
+	TIMER%			;Set timeout
+	 ERCAL FATAL
+	MOVEI A,.TTDES(T)	;A/terminal designator
+	MOVEI B,.CHBEL		;Output bell first
+	BOUT%
+	IFNJE.
+	  MOVE B,[POINT 7,FILBUF,6] ;B/assume verbose, don't want leading ESC
+	  SETZ C,		;C/we end on NULs
+	  SOUT%			;Write to the terminal
+	  IFNJE.
+	    SETZ D,		;Success, clear return value
+	    AOS $SENT		;Mark that a message was sent
+	  ELSE.
+	    MOVEI D,2		;SOUT% failure, set error return value
+	    AOS $INACT		;Count the failure
+	  ENDIF.
+	ELSE.
+	  MOVEI D,2		;BOUT% failure (too bad no ANNJE.)
+	  AOS $INACT		;Count the failure
+	ENDIF.
+	MOVX A,<.FHSLF,,.TIMAL> ;This process, clear pending interrupts
+	TIMER%			;Clear the interrupts
+	 ERCAL FATAL
+	MOVE A,D		;Get return value from where we put it
+	RET
+
+	END <EVECL,,EVEC>

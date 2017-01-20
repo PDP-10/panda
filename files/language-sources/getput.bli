@@ -1,0 +1,812 @@
+MODULE GETPUT (	! GET, PUT, and CONNECT service
+		IDENT = '7'
+                %BLISS36(,ENTRY(
+                                R$GET,
+                                R$PUT,
+                                R$CONNECT,
+                                DAP$GET,
+                                DAP$PUT
+                                ))
+		) =
+BEGIN
+
+!  COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1981, 1986.
+!  ALL RIGHTS RESERVED.
+!  
+!  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!  COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!  THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!  ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!  AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!  SOFTWARE IS HEREBY TRANSFERRED.
+!  
+!  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!  NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!  EQUIPMENT CORPORATION.
+!  
+!  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!  ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+
+!++
+! FACILITY:  DAP
+!
+! ABSTRACT:  Routines to transfer records or blocks of file data.
+!
+!
+! ENVIRONMENT:  RMS, BLISSNET, XPORT, Transportable code.
+!
+! AUTHOR:	Andrew Nourse, CREATION DATE:  3-Jan-82
+!
+! 07    - Eat residue of message if data-overrun
+! 06    - improve record size checking
+! 05    - Adjust message size to account for byte size
+! 04    - Put in ENTRY points
+! 03    - Don't reinit descriptor after setting it up for ASCII
+! 02    - Workaround RMS-20/FAL-20 habit of leaving CRLFs on records
+! 01	- The beginning
+!--
+!
+! INCLUDE FILES:
+!
+
+!LIBRARY 'BLI:XPORT';
+ LIBRARY 'RMS';
+ LIBRARY 'BLISSNET';
+ LIBRARY 'CONDIT';
+ LIBRARY 'DAP';
+
+!
+! TABLE OF CONTENTS:
+!
+
+FORWARD ROUTINE
+	R$GET,
+        R$PUT,
+        R$CONNECT,
+        DAP$GET,
+        DAP$PUT,
+        DAP$CONNECT;
+
+
+!
+! MACROS:
+!
+
+MACRO   BREAK_CHARACTERS= %O'12' TO %O'14', %O'20' TO %O'24', %O'32', %O'33' %;
+                          ! <ESC><^Z><DC1-4><DLE><FF><VT> and <LF>
+
+MACRO   ROTC(LOW_AC,BITS)=MACHOP(%O'245',LOW_AC,BITS) %;   
+! Rotate-combined (LOW_AC is the lower of 2 contiguous accumulators)
+
+!
+! EQUATED SYMBOLS:
+!
+
+LITERAL $CHCRT=%O'15',                                ! Carriage return
+        $CHLFD=%O'12';                                ! Linefeed
+
+LITERAL LOAC=6,                            ! Ac's to user for
+        HIAC=7;                            ! ROTC
+!
+! OWN STORAGE:
+!
+
+OWN T_CRLF: INITIAL (%ASCII %STRING(%CHAR(13),%CHAR(10))),
+    D_CRLF: $STR_DESCRIPTOR(STRING=(2,CH$PTR(T_CRLF)));
+
+
+!
+! EXTERNAL REFERENCES:
+!
+EXTERNAL ROUTINE
+                DAP$GET_BYTE,
+                DAP$PUT_BYTE,
+                DAP$GET_MESSAGE,
+                DAP$PUT_MESSAGE,
+                DAP$GET_STRING,
+                DAP$GET_STATUS,
+                DAP$PUT_STRING,
+                DAP$PUT_CONTROL,
+                DAP$GET_ACK,
+                DAP$ERROR_DAP_RMS,
+                DAP$EAT_MESSAGE,
+                RL$GMACY11,
+                RL$PMACY11,
+                RL$CMACY11,
+                DAP$HANDLE;             ! Condition handler
+
+GLOBAL ROUTINE R$GET (RAB,ERR)  =	! Get a record
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Get a record from an open file.
+!       Use RMS if file is local, DAP (via DAP$GET) if remote.
+!
+! FORMAL PARAMETERS:
+!
+!       RAB: A RAB as defined by RMS
+!       ERR: Address of error routine
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+    MAP RAB: REF $RAB_DECL;
+    BIND FAB=.RAB[RAB$A_FAB]: $FAB_DECL;
+    LOCAL V;
+
+    V=(IF .FAB[FAB$V_REMOTE]
+       THEN DAP$GET(RAB[$],.ERR)
+       ELSE
+           BEGIN
+           BIND TYP=.FAB[FAB$A_TYP]: $TYP_DECL;
+           LOCAL CLASS;
+
+           IF TYP NEQ 0 THEN CLASS=.TYP[TYP$H_CLASS]
+           ELSE CLASS=TYP$K_CLASS_ASCII;
+
+           CASE .TYP[TYP$H_CLASS] FROM 0 TO TYP$K_CLASS_MAX OF
+               SET
+               [TYP$K_CLASS_ASCII,
+                TYP$K_CLASS_IMAGE]: $GET(RAB=RAB[$],ERR=.ERR);
+               [TYP$K_CLASS_MACY11]: RL$GMACY11(RAB[$],.ERR);
+               [INRANGE, OUTRANGE]: SIGNAL(DAP$_AOR);
+               TES
+           END);
+
+%(
+    IF (.FAB[FAB$Z_RFM] EQL FAB$K_RFM_STM) AND (.RAB[RAB$H_RSZ] GEQ 2)
+    THEN
+        BEGIN
+        LOCAL PT;                       ! Character pointer
+
+        PT=CH$PTR(.RAB[RAB$A_RBF],.RAB[RAB$H_RSZ]-2);
+
+        IF CH$RCHAR_A(PT) EQL $CHCRT
+        THEN (IF CH$RCHAR_A(PT) EQL $CHLFD
+              THEN RAB[RAB$H_RSZ]=.RAB[RAB$H_RSZ]-2);
+        END
+)%
+    .V
+    END;			!End of R$GET
+
+GLOBAL ROUTINE R$PUT (RAB,ERR) =	! Put a record
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Put a record to an open file.
+!       Use RMS if file is local, DAP (via DAP$PUT) if remote.
+!
+! FORMAL PARAMETERS:
+!
+!       RAB: A RAB as defined by RMS
+!       ERR: Address of error routine
+!
+! COMPLETION CODES:
+!
+!	Standard RMS codes
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!--
+
+    BEGIN
+    MAP RAB: REF $RAB_DECL;
+    BIND FAB=.RAB[RAB$A_FAB]: $FAB_DECL;
+    IF .FAB[FAB$V_REMOTE]
+    THEN DAP$PUT(RAB[$],.ERR)
+    ELSE
+        BEGIN
+        IF (.FAB[FAB$Z_RFM] EQL FAB$K_RFM_STM)
+        THEN
+            BEGIN                       ! Make sure any stream record 
+            LOCAL PTR;                  ! is terminated
+
+            PTR=CH$PTR(.RAB[RAB$A_RBF],.RAB[RAB$H_RSZ]-1);
+            SELECT CH$RCHAR_A(PTR) OF
+                SET   !Break characters: <ESC><^Z><DC1-4><DLE><FF><VT> and <LF>
+                [BREAK_CHARACTERS]: ;   ! Leave it alone
+                [OTHERWISE]:
+                    BEGIN
+                    IF (.RAB[RAB$A_RBF] NEQ .RAB[RAB$A_UBF]) 
+                    THEN                        ! He just pointed to the record
+                        BEGIN                   ! so we will have to copy it
+                        $STR_COPY(STRING=(.RAB[RAB$H_RSZ],
+                                          CH$PTR(.RAB[RAB$A_RBF])),
+                                  TARGET=(.RAB[RAB$H_RSZ],
+                                          CH$PTR(.RAB[RAB$A_UBF])));
+                        RAB[RAB$A_RBF]=.RAB[RAB$A_UBF];
+                        PTR=CH$PTR(.RAB[RAB$A_RBF],.RAB[RAB$H_RSZ]);
+                        END;
+
+                    CH$WCHAR_A($CHCRT,PTR);             ! Add a CR
+                    CH$WCHAR_A($CHLFD,PTR);             ! and a LF
+                    RAB[RAB$H_RSZ]=.RAB[RAB$H_RSZ]+2;   ! and count them both
+                    END;
+                TES;
+            END;
+
+            BEGIN
+            BIND TYP=.FAB[FAB$A_TYP]: $TYP_DECL;
+            LOCAL CLASS;
+
+            IF TYP NEQ 0 THEN CLASS=.TYP[TYP$H_CLASS]
+            ELSE CLASS=TYP$K_CLASS_ASCII;
+
+            CASE .CLASS FROM 0 TO TYP$K_CLASS_MAX OF
+                SET
+                [TYP$K_CLASS_ASCII,
+                 TYP$K_CLASS_IMAGE]:  $PUT(RAB=RAB[$],ERR=.ERR);
+                [TYP$K_CLASS_MACY11]: RL$PMACY11(RAB[$],.ERR);
+                [INRANGE, OUTRANGE]: SIGNAL(DAP$_AOR);
+               TES;
+            END;
+        END;
+    .RAB[RAB$H_STS]                     ! Return status
+    END;			!End of PUT
+GLOBAL ROUTINE R$CONNECT (RAB,ERR) =	! Connect RAB to FAB
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Connect FAB to RAB
+!       Use RMS if file is local, DAP (via DAP$CONNECT) if remote.
+!
+! FORMAL PARAMETERS:
+!
+!       RAB: A RAB as defined by RMS
+!       ERR: Address of error routine
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	RAB[RAB$Z_RAC] set to SEQ if (BFT or TRA) and local
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+    MAP RAB: REF $RAB_DECL;
+    BIND FAB=.RAB[RAB$A_FAB]: $FAB_DECL;        ! FAB for this RAB
+    BIND TYP=.FAB[FAB$A_TYP]: $TYP_DECL;        ! Data type block
+
+    LOCAL STATUS;
+    LOCAL RAC;
+
+    IF ((RAC=.RAB[RAB$Z_RAC]) EQL RAB$K_RAC_BFT)
+    THEN RAB[RAB$Z_RAC]=RAB$K_RAC_TRA;  ! RMS & most FALs
+                                        ! won't accept BFT or TRA on $CONNECT
+
+    IF .FAB[FAB$V_REMOTE]
+    THEN STATUS=DAP$CONNECT(RAB[$],.ERR)
+    ELSE
+        BEGIN
+        IF .RAB[RAB$Z_RAC] EQL RAB$K_RAC_TRA
+        THEN RAB[RAB$Z_RAC]=RAB$K_RAC_SEQ;    ! RMS won't like TRA either
+        IF .RAC EQL RAB$K_RAC_TRA
+        THEN RAC=RAB$K_RAC_SEQ;         ! Change permanently if TRA
+
+        IF (TYP NEQ 0)
+        AND (.TYP[TYP$H_CLASS] EQL TYP$K_CLASS_MACY11)
+        THEN STATUS=RL$CMACY11(RAB[$],.ERR)     ! MACY11 has some special setup
+        ELSE STATUS=$CONNECT(RAB=RAB[$],ERR=.ERR);
+        END;
+
+    RAB[RAB$Z_RAC]=.RAC;          ! Restore RAC field after hiding from RMS/FAL
+    RAB[RAB$A_RBF]=.RAB[RAB$A_UBF]; ! Init pointer to user buffer
+    .STATUS
+    END;			!End of CONNECT
+
+
+
+GLOBAL ROUTINE DAP$GET (RAB,ERR)  =	! Get a record (remote)
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Get a record from an open file on another system
+!
+! FORMAL PARAMETERS:
+!
+!       RAB: A RAB as defined by RMS
+!       ERR: Address of error routine
+!
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+    MAP RAB: REF $RAB_DECL;
+    BIND FAB=.RAB[RAB$A_FAB]: $FAB_DECL;
+    BIND DIB=.FAB[FAB$A_DIB]: $DIB;
+    BIND IDD=.DIB[DIB$A_I_DD]: $DAP_DESCRIPTOR,
+         ODD=.DIB[DIB$A_O_DD]: $DAP_DESCRIPTOR;
+    BIND TYP=.FAB[FAB$A_TYP]: $TYP_DECL;
+    BIND ROUTINE $$ERRRTN=.ERR: RMS_ERCAL;
+
+    LOCAL CLASS;
+    LOCAL ADATA: $STR_DESCRIPTOR(),
+          BDATA: $XPO_DESCRIPTOR();
+    LOCAL DISPLAY: BITVECTOR[28];
+    LOCAL RABSAV: VOLATILE;
+    LOCAL ERRSAV: VOLATILE;
+
+    ENABLE DAP$HANDLE(RABSAV,ERRSAV);
+    ERRSAV=.ERR;
+    RABSAV=.RAB;                        ! Handler will need this
+
+    CLEARV(DISPLAY);
+
+    IF TYP NEQ 0 THEN CLASS=.TYP[TYP$H_CLASS]
+                 ELSE CLASS=TYP$K_CLASS_ASCII;
+
+    DO  BEGIN
+        IF .DIB[DIB$V_NO_SEND_CONTROL] EQL 0   ! Send control on first GET only
+        THEN                                   ! if file transfer mode, 
+            BEGIN                              ! otherwise, on every GET
+            DAP$PUT_CONTROL(ODD[$],RAB[$],DAP$K_GET,DISPLAY);        
+            DAP$PUT_MESSAGE(ODD[$]);
+            DIB[DIB$V_NO_SEND_CONTROL]=1;          !? File transfer mode only
+            END;
+
+        SELECT GET_HEADER(IDD[$]) OF
+        SET
+        [DAP$K_DATA]:   BEGIN                  ! Process data from remote
+                        RAB[RAB$G_RFA]=GET_VBN(IDD[$]);
+
+                        RAB[RAB$A_RBF]=.RAB[RAB$A_UBF]; ! Use user's buffer
+
+
+                        CASE .CLASS FROM 0 TO TYP$K_CLASS_MAX OF
+                        SET
+                        [TYP$K_CLASS_ASCII]:
+                            BEGIN       ! 7bit Ascii File
+                            IF .IDD[DAP$H_LENGTH] GTR (.RAB[RAB$H_USZ]*5)
+                            THEN        ![6] record too big
+                                BEGIN
+                                DAP$EAT_MESSAGE(IDD[$]);        ![7]
+                                RAB[RAB$H_STS]=RMS$_RTB;
+                                $$ERROR(GET,RAB[$]);
+                                RETURN RMS$_RTB;
+                                END;
+
+                            RAB[RAB$H_RSZ]=.IDD[DAP$H_LENGTH]; ! Record length
+                            $STR_DESC_INIT(DESCRIPTOR=ADATA,
+                                           STRING=(.RAB[RAB$H_USZ]*5,
+                                                   CH$PTR(.RAB[RAB$A_UBF])));
+                            DAP$GET_STRING(IDD[$],ADATA);      
+                            END;
+                        [TYP$K_CLASS_IMAGE]:
+                            BEGIN              ! Binary file
+                            REGISTER A=LOAC;
+                            REGISTER B=HIAC;
+                            LOCAL PTR: REF VECTOR;       ! Pointer to buffer
+
+                            PTR=.RAB[RAB$A_UBF];
+                            RAB[RAB$H_RSZ]=((.IDD[DAP$H_LENGTH]+4)/9)*2;
+                            !9 bytes for every 2 words packed:
+                            !========================================!
+                            !..5!   4    !   3    !   2    !    1    !
+                            !========================================!
+                            !   9    !   8    !   7    !   6    ! 5...
+                            !========================================!
+                            DECR I FROM (.IDD[DAP$H_LENGTH]/9)-1 TO 0
+                            DO  BEGIN
+                                A=B=0;
+
+                                DECR J FROM 8 TO 0
+                                DO  BEGIN
+                                    A=.A+DAP$GET_BYTE(IDD[$]); ! Get a byte
+                                    ROTC(A,-8);                ! Rotate
+                                    END;
+                                PTR[0]=.A;        ! Write to user's buffer
+                                PTR[1]=.B;        ! two words
+                                PTR=.PTR+2;       ! Increment the pointer
+                                END;
+
+                            A=B=0;
+
+                            ! If the DAP buffer is not even multiple of 9 bytes
+                            ! do the last few, and rotate the doubleword
+                            ! back to its original orientation
+
+                            IF .IDD[DAP$H_LENGTH] GTR 0
+                            THEN
+                                BEGIN
+                                LOCAL ROTATES;    ! To make 72 bits of rotation
+                                                  ! when all the data is read
+
+                                ROTATES=(.IDD[DAP$H_LENGTH]-9)*8;
+
+                                DECR I FROM .IDD[DAP$H_LENGTH]-1 TO 0
+                                DO  BEGIN
+                                    A=.A+DAP$GET_BYTE(IDD[$]); ! Get a byte
+                                    ROTC(A,-8);                ! Rotate
+                                    END;
+
+                                ROTC(A,.ROTATES); ! Rotate the bytes
+                                                  ! the rest of the way
+                                PTR[0]=.A;        ! Write to user's buffer
+                                PTR[1]=.B;        ! two words
+                                END;
+                            END;
+                        [TYP$K_CLASS_MACY11]:
+                            BEGIN       ! Just copy into buffer
+                            LOCAL PTR;
+                            IF .IDD[DAP$H_LENGTH] GTR (.RAB[RAB$H_USZ]*4)
+                            THEN        ![6] record too big
+                                BEGIN
+                                DAP$EAT_MESSAGE(IDD[$]);        ![7]
+                                RAB[RAB$H_STS]=RMS$_RTB;
+                                $$ERROR(GET,RAB[$]);
+                                RETURN RMS$_RTB;
+                                END;
+
+                            RAB[RAB$H_RSZ]=.IDD[DAP$H_LENGTH]; ! Msg length
+                            PTR=CH$PTR(.RAB[RAB$A_UBF],0,8);
+
+                            DECR I FROM .RAB[RAB$H_RSZ] TO 0
+                            DO CH$WCHAR_A(DAP$GET_BYTE(IDD[$]),PTR);
+                            END;
+                        [INRANGE,OUTRANGE]: SIGNAL(DAP$_AOR);
+                        TES;
+
+                        RETURN RAB[RAB$H_STS]=RMS$_SUC;    ! WIN
+                        END;
+
+        [DAP$K_STATUS]: BEGIN
+                        LOCAL E;
+                        E=DAP$GET_STATUS(IDD[$]);  ! End of file or error
+                        RAB[RAB$H_STS]=DAP$ERROR_DAP_RMS(.E);
+                        RAB[RAB$H_STV]=.E<DAPCODE>;
+                        $$ERROR(GET, RAB[$]);
+                        IF .RAB[RAB$H_STS] NEQ RMS$_SUC ! Continue if handler
+                        THEN RETURN .RAB[RAB$H_STS];    ! fixed it, else return
+                        END;                            ! error code
+
+        [OTHERWISE]:    BEGIN
+                        RAB[RAB$H_STS]=RMS$_DPE;
+                        RAB[RAB$H_STV]=(DAP$K_MAC_SYNC^12)+
+                                       .IDD[DAP$B_OPERATOR];
+                        $$ERROR(GET,RAB[$]);
+                        IF .RAB[RAB$H_STS] NEQ RMS$_SUC
+                        THEN RETURN .RAB[RAB$H_STS];
+                        END;
+                                               ! Somebody screwed up
+        TES
+        END WHILE 1;
+
+    STS$K_NORMAL                               ! Success
+    END;			!End of DAP$GET
+
+GLOBAL ROUTINE DAP$PUT (RAB,ERR)  =	! Put a record (remote)
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Put a record to an open file on another system.
+!
+! FORMAL PARAMETERS:
+!
+!       RAB: A RAB as defined by RMS
+!       ERR: Address of error routine
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+
+!--
+
+    BEGIN
+    MAP RAB: REF $RAB_DECL;                    ! RMS RAB
+    BIND FAB=.RAB[RAB$A_FAB]: $FAB_DECL;       ! RMS FAB pointed to by above
+    BIND DIB=.FAB[FAB$A_DIB]: $DIB;            ! Data Interchange info
+    BIND TYP=.FAB[FAB$A_TYP]: $TYP_DECL;        ! Data type
+    BIND ODD=.DIB[DIB$A_O_DD]: $DAP_DESCRIPTOR; ! our message descriptor
+    BIND CONFIG=.DIB[DIB$A_CONFIG]: $CONFIG;   ! Configuration message data
+    BIND ROUTINE $$ERRRTN=.ERR: RMS_ERCAL;
+
+    LOCAL CLASS;
+    LOCAL BDATA: $XPO_DESCRIPTOR();            ! this will point to binary data
+    LOCAL S;
+    LOCAL ADATA: $STR_DESCRIPTOR();            ! this will point to ascii data
+    LOCAL DISPLAY: BITVECTOR[28] INITIAL(0);
+    LOCAL UNTERMINATED_RECORD: INITIAL(0);     ! Ascii record has no terminator
+
+    LOCAL RABSAV:VOLATILE;
+    LOCAL ERRSAV: VOLATILE;
+
+    ENABLE DAP$HANDLE(RABSAV,ERRSAV);
+    ERRSAV=.ERR;
+    RABSAV=.RAB;                        ! Handler will need this
+
+    IF TYP NEQ 0 THEN CLASS=.TYP[TYP$H_CLASS]
+                 ELSE CLASS=TYP$K_CLASS_ASCII;
+
+    IF .DIB[DIB$V_NO_SEND_CONTROL] EQL 0       ! Send control on first PUT only
+    THEN                                       ! if file transfer mode, 
+        BEGIN                                  ! otherwise, on every PUT
+        DAP$PUT_CONTROL(ODD[$],RAB[$],DAP$K_PUT,DISPLAY);        
+        DIB[DIB$V_NO_SEND_CONTROL]=1;          !? File transfer mode only
+        END;
+
+    INIT_MESSAGE(ODD[$]);                       ! Initialize descriptor
+
+    ODD[DAP$B_OPERATOR]=DAP$K_DATA;             ! Set up a DATA message
+    ODD[DAP$V_MFLAGS_LENGTH]=1;                 ! Always send length field
+
+    IF .RAB[RAB$Z_RAC] EQL RAB$K_RAC_BFT        
+    THEN                                        ! Block mode 
+        BEGIN
+        ODD[DAP$H_LENGTH]=((.RAB[RAB$H_RSZ]/2)*9)    ! 9 bytes each 2 words
+                          +(%BPVAL/8)+1;             ! + RECNUM field
+        ODD[DAP$V_MFLAGS_BITCNT]=1;                  ! We will send bit count
+
+        IF .RAB[RAB$H_RSZ] ! is odd number of words
+        THEN
+            BEGIN
+            ODD[DAP$H_BITCNT]=4;            ! Last byte is only half a byte
+            ODD[DAP$H_LENGTH]=.ODD[DAP$H_LENGTH]+5; ! 5  bytes for last word
+            END
+        ELSE ODD[DAP$H_BITCNT]=0;
+        END                             ! End block mode
+    ELSE
+        BEGIN                           ! Record mode
+        LOCAL TPTR,
+              SECOND_LAST,              ! 2nd-last char
+              LAST;                     ! last char
+
+        TPTR=CH$PTR(.RAB[RAB$A_RBF],0,.FAB[FAB$Z_BSZ]);
+        $STR_DESC_INIT(DESCRIPTOR=ADATA, STRING=(.RAB[RAB$H_RSZ],.TPTR));
+             
+        TPTR=CH$PLUS(.TPTR,.RAB[RAB$H_RSZ]-2);
+        SECOND_LAST=CH$RCHAR_A(TPTR);
+        LAST=CH$RCHAR_A(TPTR);
+
+        SELECT .LAST OF
+        SET
+        [BREAK_CHARACTERS]: UNTERMINATED_RECORD=0;  ! Terminator on record
+        [$CHLFD]:
+            IF .SECOND_LAST EQL $CHCRT
+            THEN UNTERMINATED_RECORD=2;             ! Default terminator
+        [OTHERWISE]: UNTERMINATED_RECORD=1;         ! No terminator
+        TES;
+
+        ! If Implied CRLF, and CRLF is the terminator, then strip it off
+        IF .FAB[FAB$V_RAT_CR] AND (.UNTERMINATED_RECORD EQL 2)
+        THEN ADATA[STR$H_LENGTH]=.ADATA[STR$H_LENGTH]-2;
+
+        ! For image files we must determine how many 8-bit bytes are required
+        ! to send a record of (RSZ) (BSZ)-bit bytes, at 9 bytes per 2 words.
+        ! 
+
+        IF .CLASS EQL TYP$K_CLASS_IMAGE
+        THEN
+            BEGIN
+            LOCAL RSIZW;                ! Record size in words
+            RSIZW=.ADATA[STR$H_LENGTH]/(%BPVAL/.FAB[FAB$Z_BSZ]);
+            ODD[DAP$H_LENGTH]=1+        ! Null recnum
+                                ((.RSIZW/2)*9)+ ! 9 bytes per 2 words
+                                ((.RSIZW AND 1)*5); ! 5 bytes for last word
+            END
+        ELSE ODD[DAP$H_LENGTH]=.ADATA[STR$H_LENGTH]+1;  ! Length of record
+                                                       ! + null RECNUM field
+
+        ! ASCII STREAM wants CRLFs in record, adjust count if necessary
+        IF (.FAB[FAB$Z_RFM] EQL FAB$K_RFM_STM) AND .UNTERMINATED_RECORD
+        THEN ODD[DAP$H_LENGTH]=.ODD[DAP$H_LENGTH]+2;
+        END;                            ! End record mode
+
+
+    IF .ODD[DAP$H_LENGTH] GTR .ODD[DAP$H_MESSAGE_LENGTH]
+    THEN                                ![6] Record is too big
+        BEGIN
+        RAB[RAB$H_STS]=RMS$_RTB;
+        $$ERROR(PUT,RAB[$]);     
+        RETURN RMS$_RTB
+        END;
+
+    PUT_HEADER(ODD[$]);                         ! Build the message header
+
+    IF (.RAB[RAB$Z_RAC] EQL RAB$K_RAC_BFT)      ! If block mode
+    THEN PUT_VBN(ODD[$],.RAB[RAB$G_BKT])        ! Build record number
+    ELSE PUT_BYTE(ODD[$],0);                    ! 0 length if not used
+    ! Note that DAP Bucket numbers start at 1, RMS-36 starts at 0
+
+    !Now! At Last!!! The Data!!!!!
+    CASE .CLASS FROM 0 TO TYP$K_CLASS_MAX OF
+    SET
+    [TYP$K_CLASS_ASCII]:
+        BEGIN
+        DAP$PUT_STRING(ODD[$],ADATA);          ! Put the data in
+
+        ! ASCII STREAM wants records terminated
+        IF .UNTERMINATED_RECORD AND (.FAB[FAB$Z_RFM] EQL FAB$K_RFM_STM)
+        THEN DAP$PUT_STRING(ODD[$],D_CRLF);    ! Put back the CRLF
+
+        END;
+    [TYP$K_CLASS_IMAGE]:
+        BEGIN                                  ! Binary Data
+        LOCAL PTR: REF VECTOR;                 ! Pointer to buffer
+
+        PTR=.RAB[RAB$A_RBF];
+
+        !9 bytes for every 2 words (round up), packed:
+        !========================================!
+        !..5!   4    !   3    !   2    !    1    !
+        !========================================!
+        !   9    !   8    !   7    !   6    ! 5...
+        !========================================!
+
+        DECR I FROM (.RAB[RAB$H_RSZ]/2)-1 TO 0
+        DO  BEGIN
+            REGISTER A=LOAC;
+            REGISTER B=HIAC;
+
+            A=.PTR[0];                     ! Get a word of data
+            B=.PTR[1];                     ! and another word
+            PTR=.PTR+2;                    ! Increment the pointer
+
+            DECR J FROM 8 TO 0
+            DO  BEGIN
+                ! B is passed to Put-byte to convince the BLISS compiler
+                ! not to trash the register.  BLISS does not know what
+                ! ROTC does, so it 'optimizes' and steps on register B
+                DAP$PUT_BYTE(.B,ODD[$],.A);! Put out a byte
+                ROTC(A,-8);                ! Rotate to next one
+                END;
+            END;
+
+        IF .RAB[RAB$H_RSZ]                  ! If the record length is odd
+        THEN
+            BEGIN
+            REGISTER A=LOAC;
+
+            A=.PTR[0];                      ! Get the last word
+
+            DECR I FROM 4 TO 0
+            DO  BEGIN
+                PUT_BYTE(ODD[$],.A);        ! Put out a byte
+                A=.A^-8;                    ! Shift to next one
+                END;
+            END;
+        END;
+    [TYP$K_CLASS_MACY11]:
+        BEGIN
+        ! Conversion has already been done, just send this
+        LOCAL PTR;
+        PTR=CH$PTR(.RAB[RAB$A_RBF],0,8);
+
+        DECR I FROM .RAB[RAB$H_RSZ]-1 TO 0
+        DO DAP$PUT_BYTE(ODD[$],CH$RCHAR_A(PTR));
+        END;
+    [INRANGE,OUTRANGE]: SIGNAL(DAP$_AOR);
+    TES;
+ 
+    IF NOT .FAB[FAB$V_FOP_DFW]          ! If write is not deferred
+    THEN DAP$PUT_MESSAGE(ODD[$]);               ! Send out the message
+
+    RAB[RAB$H_STS]=RMS$_SUC                    ! WIN
+    END;			!End of DAP$PUT
+ROUTINE DAP$CONNECT (RAB,ERR)  =	! Connect RAB to FAB
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Connect RAB to FAB for an open file on another system.
+!
+! FORMAL PARAMETERS:
+!
+!       RAB: A RAB as defined by RMS
+!       ERR: Address of error routine
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+
+!--
+
+    BEGIN
+    MAP RAB: REF $RAB_DECL;                    ! RMS RAB
+    BIND FAB=.RAB[RAB$A_FAB]: $FAB_DECL;       ! RMS FAB pointed to by above
+    BIND DIB=.FAB[FAB$A_DIB]: $DIB;            ! Data Interchange info
+    BIND ODD=.DIB[DIB$A_O_DD]: $DAP_DESCRIPTOR;! our output message descriptor
+    BIND IDD=.DIB[DIB$A_I_DD]: $DAP_DESCRIPTOR;! our input message descriptor
+    BIND ROUTINE $$ERRRTN=.ERR: RMS_ERCAL;
+    local s; !?temp
+    LOCAL BDATA: $XPO_DESCRIPTOR();            ! this will point to binary data
+    LOCAL ADATA: $STR_DESCRIPTOR();            ! this will point to ascii data
+    LOCAL DISPLAY: BITVECTOR[28];
+
+    LOCAL RABSAV: VOLATILE;
+    LOCAL ERRSAV: VOLATILE;
+
+    ENABLE DAP$HANDLE(RABSAV,ERRSAV);
+    ERRSAV=.ERR;
+    RABSAV=.RAB;                        ! Handler will need this
+
+    CLEARV(DISPLAY);
+
+    DAP$PUT_CONTROL(ODD[$],RAB[$],DAP$K_CONNECT,DISPLAY);        
+    DAP$PUT_MESSAGE(ODD[$]);
+    
+    DIB[DIB$V_NO_SEND_CONTROL]=0;       ! Send control on first Get or Put
+
+    IF (S=DAP$GET_ACK(IDD[$]))
+    THEN
+        BEGIN
+        RAB[RAB$H_STS]=RMS$_SUC;               ! WIN
+        STS$K_NORMAL                           ! Win
+        END
+    ELSE
+        BEGIN
+        RAB[RAB$H_STS]=DAP$ERROR_DAP_RMS(.S);
+        RAB[RAB$H_STV]=.S<DAPCODE>;        ! Extract DAP code from status
+        $$ERROR(CONNECT,RAB[$])
+        END
+    END;			!End of DAP$CONNECT
+
+END				!End of module
+ELUDOM

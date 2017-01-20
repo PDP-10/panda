@@ -1,0 +1,1868 @@
+TITLE SYSJOB - Job 0 Fork Controller for TOPS-20
+SUBTTL Definitions
+
+SEARCH MONSYM,MACSYM
+ASUPPRESS
+SALL
+
+; Version number definitions 
+
+VMAJOR==5			; major version of SYSJOB
+VMINOR==5			; minor version number
+VEDIT==^D10			; edit number
+VWHO==4				; 4 = PANDA
+
+VSYSJB== <VWHO>B2+<VMAJOR>B11+<VMINOR>B17+VEDIT
+
+F=0				; flags
+A=1				; temporary
+B=2
+C=3
+D=4				; ...
+Q1=5				; less temporary
+Q2=6				; ...
+NX=14				; fork name index
+P=17				; pointer to control stack
+
+PDLEN==100			; length of control stack
+BUFLEN==^D200			; length of COMND% buffers
+NFORKS==40			; max number of subforks
+FILLEN==^D26			; length of a file spec area in FRKFIL
+SYSFKL==NFORKS			; length of SYSFK table
+NPTYS==15			; max number of PTY subjobs
+NWSBUF==^D200			; number of words per string buffer
+STSLEN==10			; length of RFTST% argument block
+
+SHRPAG==500			; page used to map in an inferior process page
+SHRADR==SHRPAG*1000		; base address of that page
+
+PTCHN==2			; channels (2 and 3) used by PTYs
+
+;flags in F
+
+FRKTMF==1B0			; fork termination noted by interrupt
+
+;flags in FRKATT
+
+FK%EPH==1B0			; fork is ephemeral - don't worry if it halts
+
+
+
+;CMSG - pretty printing on the console
+;assembles to one instruction, first argument is error string, second
+;is the address to jump to, if any
+
+DEFINE CMSG (STR,JMP) <
+	JRST	[CALL TIMSMP
+		 TMSG <STR
+>
+		 IFB <JMP>,<JRST .+1>
+		 IFNB <JMP>,<JRST JMP>]
+>
+
+
+
+;PMSG - handle a COMND% parsing error
+;returns control to top of parse loop
+
+DEFINE PMSG (STR) <
+	JRST [ CALL TIMSMP	; print a timestamp
+	       TMSG <STR - >	; print the error message
+	       JRST .PMSG ]	; join central error handling code
+>
+
+Subttl Impure Storage
+
+; Start assembling this code on page 0
+
+LOC 200
+
+STGBGN::BLOCK 0			; clear from here to STGEND on startup
+STSBLK:	BLOCK STSLEN		; fork status info returned by RFSTS%
+ATMBUF:	BLOCK BUFLEN		; COMND% atom buffer
+CMDBUF: BLOCK BUFLEN		; COMND% command buffer
+TMPBUF:	BLOCK BUFLEN		; very temporary buffer
+PDLIST:	BLOCK PDLEN		; pushdown stack
+LEV1PC:	BLOCK 1			; level 1 interrupts
+LEV2PC:	BLOCK 1			; level 2...
+LEV3PC:	BLOCK 1			; level 3...
+PDELAY:	BLOCK 1			; next time to try for a PTY
+BRKJOB: BLOCK 4			; break mask built to parse JOB argument
+JBPTR1:	BLOCK 1			; pointer to start of JOB text
+JBPTR2: BLOCK 1			; pointer to end of JOB text
+FORKID:	BLOCK 1			; SIXBIT fork ID returned by IDENTk
+INJFN:	BLOCK 1			; JFN of input file
+RUNJFN:	BLOCK 1			; file jfn in RUN command
+DMPJFN:	BLOCK 1			; jfn of file we are DUMPing into
+DMPFRK:	BLOCK 1			; fork we are DUMPing
+SAVPDL: BLOCK 1			; save stack pointer for reparses
+FLDTYP:	BLOCK 1			; current field type in COMND% parse
+DBUGSW:	BLOCK 1			; value of DBUGSW in monitor
+PTYONE:	BLOCK 1			; TTY number of first PTY
+PTYCNT:	BLOCK 1			; number of PTYs system is configured fork
+PCWORD:	BLOCK 1			; storage used by symbolic PC printer
+PCSYM:	BLOCK 1			; ....
+SILENT:	BLOCK 1			; non-zero for silent startup
+OFFSET:	BLOCK 1			; offset into process entry vector
+$SYSFK:	BLOCK 1			; address of SYSFK table in JSB
+$FKTAB:	BLOCK 1			; address of FKTAB table in PSB
+$NUFKS: BLOCK 1			; maximum number of user forks
+$NLFKS:	BLOCK 1			; maximum number of process inferiors
+SYSFK:	BLOCK SYSFKL		; copy of SYSFK table obtained by PEEK%
+FKTAB:	BLOCK SYSFKL		; copy of FKTAB table....
+FRKHND:	BLOCK NFORKS		; fork handle
+FRKNUM: BLOCK NFORKS		; absolute system fork numbers
+FRKATT:	BLOCK NFORKS		; fork attributes
+FRKFIL: BLOCK NFORKS*FILLEN	; file specs of programs we are running
+FRKNAM:	BLOCK NFORKS		; SIXBIT name
+GETBLK:	BLOCK .JIMAX		; GETJI% information for a PTY job
+JOBPTY:	BLOCK NPTYS		; tty desig,,pty jfn
+JOBISP:	BLOCK NPTYS		; byte pointer to pty input
+JOBISE:	BLOCK NPTYS		; byte ptr to end of pty input
+JOBOSP:	BLOCK NPTYS		; byte pointer to pty output
+SBUF:	BLOCK NPTYS*2*NWSBUF	; string buffers
+BUGBUF:	BLOCK BUFLEN		; buffer for local commands
+BUGFLG:	BLOCK 1			; -1 if debugging inferior needs restarting
+BUGFRK:	BLOCK 1			; handle for local input fork
+STGEND::BLOCK 0			; clear from STGBGN to here on startup
+
+
+; Locations from here on are not cleared on startup
+
+TESTSW:	 0			; non-zero if testing SYSJOB
+
+
+;COMND% argument block
+
+CSB:	CM%RAI+CM%XIF+REPARS	; .CMFLG - raise input, no @, reparse address
+	0			; .CMIOJ - I/O jfns
+	-1,,[ASCIZ//]		; .CMRTY - pointer to prompt
+	-1,,CMDBUF		; .CMBFP - holds whole command being assembled
+	-1,,CMDBUF		; .CMPTR - pointer to next field
+	BUFLEN*5-1		; .CMCNT - number of bytes in CMDBUF
+	0			; .CMINC - count of unparsed characters
+	-1,,ATMBUF		; .CMABP - pointer to atom buffer
+	BUFLEN*5-1		; .CMABC - number of bytes in ATMBUF
+	JFNBLK			; .CMGJB - address of GTJFN% block
+
+
+;GTJFN% argument block
+
+JFNBLK:	0			; .GJGEN - flags
+	0			; .GJSRC - source
+	-1,,[ASCIZ/SYSTEM/]	; .GJDEV - device
+	0			; .GJDIR - directory
+	0			; .GJNAM - file name
+	-1,,[ASCIZ/EXE/]	; .GJEXT - extension
+	0			; .GJPRO - protection
+	0			; .GJACT - account
+	0			; .GJJFN - JFN number
+	0			; .GJF2 - extension block
+	BLOCK 5			; assorted nonsense we don't use
+
+CRJBLK:	-1,,[ASCIZ/OPERATOR/]	; OPERATOR
+	0			; no password
+	0			; no account
+	-1,,[ASCIZ/SYSTEM:SYSJB1.EXE/] ; program to load
+	0			; start offset in entry vector
+	.NULIO			; start job detached
+	0			; no time limit
+	0			; nothing loaded in AC's
+	0			; no EXEC flag bits
+	0			; primary I/O
+	0			; no runtime limit
+	-1			; no capability mask
+	0			; no IPCF PID
+
+Subttl Startup Code and Main Loop
+
+LOC <.!777>+1			; move to a new page for pure code
+PURBEG==.			; first location of pure code
+
+
+;DSTRT - detach and start
+;make primary output for this job be job 0's logging tty
+
+DSTRT:	RESET%			; initialize the world
+	DTACH%			; detach from our controlling tty
+	MOVE A,[XWD 1,.LOGDE]	; job 0 logging designator 
+	GETAB%			; read it from the monitor
+	 MOVEI A,.NULIO		; if can't get job 0 tty, use NUL:
+	HRLI A,-1		; should never do primary input
+	MOVE B,A		; get jfns into place
+	MOVEI A,.FHSLF		; for this process
+	SPJFN%			; make primary output to job 0 tty
+;	JRST START		; join main startup code
+
+
+; START - normal start
+; do various initializations before entering main loop at WAITI
+
+START:	RESET%			; initialize the world
+	MOVE P,[IOWD PDLEN,PDLIST] ; set up our stack pointer
+	SKIPA A,[PURBEG]	; get address of first pure location
+START1: ADDI A,1000		; increment page number
+	SKIP (A)		; touch the page
+	CAIGE A,PUREND		; have we touched the last page?
+	 JRST START1		; no, go touch some more
+	MOVE A,[XWD .FHSLF,<PURBEG/1000>] ; my process,,first pure page
+	MOVX B,<PA%RD!PA%EX>	; read/execute access only
+START2:	SPACS%			; so we can't get zapped by buggy code
+	 ERJMP .+1		; ignore errors
+	CAME A,[XWD .FHSLF,<PUREND/1000>] ; at last pure page?
+	 AOJA A,START2		; no, loop for next page
+	SETZM STGBGN		; clear first word of impure storage
+	MOVE A,[XWD STGBGN,STGBGN+1] ; set up blt pointer
+	BLT A,STGEND-1		; clear all storage
+	SETZ F,			; no flags set yet
+	MOVEI A,.FHSLF		; our fork handle
+	RPCAP%			; read capabilities mask into B
+	MOVE C,B		; set up mask
+	EPCAP%			; enable all possible capabilities
+	CMSG <SYSJOB started.>	; tell the world we're running
+	CALL SETLOC		; set job location if under job 0
+	CALL SETPSI		; setup PSI system
+	CALL SNPSYM		; SNOOP% some symbols from the monitor
+	MOVEI A,.DBUGS		; want first word of DBUGSW table
+	GETAB%			; get it 
+	 SETZ A,		; assume normal startup value
+	MOVEM A,DBUGSW		; store value
+	MOVEI A,.PTYPA		; want # of ptys,,# of first pty
+	GETAB%			; ask the monitor
+	 CMSG <Unable to obtain PTY information, behavior unpredictable>
+	HRRZM A,PTYONE		; stash number of first PTY
+	HLRZM A,PTYCNT		; stash number of PTYs on system
+
+; fall through to next page
+
+
+; continued...
+
+	MOVEI A,.SFCDE		; see if OK to start
+	TMON%			; read monitor flags
+	JUMPN B,[CMSG (<Startup deferred due to file system errors>,WAITI)]
+	MOVE A,[1,,.LOGDE]	; job 0 logging designator 
+	GETAB%			; read it from the monitor
+	 MOVX A,.NULIO		; if can't get job 0 tty, use NUL:
+	HRLI A,.NULIO		; should never do primary input
+	MOVEM A,CRJBLK+.CJPRI
+	MOVX A,CJ%LOG!CJ%NAM!CJ%FIL!CJ%NPW!CJ%SPJ!CJ%CAM
+	MOVX B,CRJBLK
+	CRJOB%			; make the job
+	 CMSG (<Can't start SYSJB1.>)
+	MOVX A,GJ%OLD+GJ%SHT	; looking for an old file
+	HRROI B,[ASCIZ/SYSTEM:SYSJOB.RUN/] ; default command file
+	MOVE C,DBUGSW		; get value of DBUGSW
+	CAIL C,2		; coming up standalone?
+	HRROI B,[ASCIZ/SYSTEM:SYSJOB.DEBUG/] ; yes, use other file
+	SKIPE TESTSW		; testing SYSJOB?
+	HRROI B,[ASCIZ/SYSJOB.TEST0/] ; yes, use local file
+	GTJFN%			; get jfn for desired file
+	 CMSG (<SYSJOB command file not found.>,START3)
+	MOVEM A,INJFN		; save the jfn
+	MOVE B,[7B5+OF%RD]	; 7-bit bytes, read access
+	OPENF%			; open the file
+	 ERJMP [ MOVE A,INJFN
+		 RLJFN%
+		  NOP
+		 CMSG (<Unable to open SYSJOB command file>,START3) ]
+	SETOM SILENT		; don't type out cruft when starting up
+	CALL DOCMND		; read and process all commands in the file
+	SETZM SILENT		; okay to type stuff out now
+	MOVE A,INJFN		; jfn for initial command file
+	CLOSF			; close the file
+	 NOP			; ignore an error here
+START3:	CALL FRKINF		; create debugging inferior, if appropriate
+	CALL CHKPTY		; do initial PTY I/O
+WAITI:	MOVE P,[IOWD PDLEN,PDLIST] ; reset up our stack pointer, just in case
+	MOVE A,[SIXBIT/SYSJOB/]	; fetch our jobname
+	SETNM%			; reset it
+	TXZE F,FRKTMF		; fork terminated?
+	 JRST WAIT1		; yes, go look for it
+	MOVEI A,^D15		; stay in THIBR% for 15 seconds at most
+	THIBR%			; wait until signal from '^ESPEAK'
+	 NOP			; we never take this return
+WAIT1:	CALL FILINP		; read any command file input
+	CALL CHKFRK		; check subforks, report any crashes
+	CALL CHKPTY		; check for PTY output
+	SKIPE BUGFLG		; do we have a debugging inferior fork?
+	 CALL FRKRST		; yes, and it needs restarting
+	JRST WAITI		; return to top of main loop
+
+
+Subttl Fork and Job Checking Routines
+
+;FILINP - read SYSJOB commands from an input file
+;returns +1 always
+
+FILINP:	MOVX A,GJ%SHT+GJ%OLD	; looking for an existing file
+	HRROI B,[ASCIZ/SYSTEM:SYSJOB.COMMANDS/]	; default command file
+	SKIPE TESTSW		; testing SYSJOB?
+	HRROI B,[ASCIZ/SYSJOB.TEST1/] ; yes, use local file
+	GTJFN%			; is there a file?
+	 ERJMP R		; no, return right now
+	MOVEM A,INJFN		; stash the jfn
+	MOVE B,[7B5+OF%RD]	; 7-bit, read access
+	OPENF%			; open the file
+	 ERJMP DELINP		; file won't open, so flush it
+	HRRZ A,INJFN		; jfn of input file
+	HRROI B,TMPBUF		; temporary buffer
+	GFUST%			; get author of file
+	 ERJMP .+1		; ignore an error
+	CALL TIMSMP		; print a time stamp on the CTY
+	TMSG <SPEAK by >	; we are listening...
+	HRROI A,TMPBUF
+	PSOUT%			; to this user
+	TMSG <
+>
+	CALL DOCMND		; do the commands
+	CALL DELINP		; delete input file
+	RET			; return to caller
+
+
+;DELINP - flush input file, if it exists
+;takes INJFN - jfn of input file
+;returns +1 always
+
+DELINP:	MOVE A,INJFN		; jfn for current fie
+	GTSTS%			; get file status
+	TXNN B,GS%NAM		; is jfn legal?
+	RET			; no, so don't do anything
+	TXNN B,GS%OPN		; is the file open?
+	JRST DELIN0		; no, don't try to close it
+	TXO A,CO%NRJ		; don't want to release jfn
+	CLOSF%			; close the file
+	 NOP			; ignore an error ere
+DELIN0:	HRROI A,TMPBUF		; temporary buffer 
+	MOVE B,INJFN		; jfn for file
+	MOVX C,<FLD(.JSAOF,JS%DIR)>+JS%PAF ; output directory field only
+	JFNS%			; get directory for current file
+	 ERJMP R		; probably no such file, quit now
+	MOVE A,INJFN		; jfn for current file
+	SETZ B,			; no versions to be saved
+	DELNF%			; delete files, release the jfn
+	 NOP			; ignore an error here
+	MOVE A,INJFN		; get jfn back
+	RLJFN%			; release it just in case
+	 NOP			; ignore an error here
+	MOVX A,RC%EMO		; use exact match only
+	HRROI B,TMPBUF		; pointer to directory name
+	RCDIR%			; convert name to number
+	 ERJMP R		; can't do expunge, so return
+	MOVE B,C		; directory number
+	SETZ A,			; no flags
+	DELDF%			; expunge the directory
+	 ERJMP R		; ignore an error here
+	RET			; return to caller
+
+
+;CHKFRK - check status of forks
+;if one has died and FK%EPH is not set, print a message and dump it.
+;All terminated forks are removed from the fork tables
+;returns +1 always
+
+CHKFRK:	MOVSI NX,-NFORKS	; form aobjn pointer for fork name table
+	SKIPN A,FRKHND(NX)	; fork exists?
+CHKFR0:	AOBJN NX,.-1		; no, go on to next
+	JUMPGE NX,R		; return when all forks examined
+	MOVE A,FRKHND(NX)	; get fork handle
+	TXO A,RF%LNG		; set flag that we are using long form RFTST%
+	MOVEI B,STSLEN		; fetch length of status block
+	MOVEM B,STSBLK		; set up status block
+	MOVEI B,STSBLK		; address of status block
+	RFSTS%			; read fork status
+	 ERJMP CHKFR0		; error, try next fork
+	LDB A,[POINT 16,STSBLK+.RFPSW,17] ; pick out status code
+	CAIE A,.RFHLT		; halted?
+	 CAIN A,.RFFPT		; or forced process termination?
+	  SKIPA			; yes, go play with the corpse
+	   JRST CHKFR0		; fork is okay, go look at next one
+	MOVE A,FRKATT(NX)	; fetch attribute flags
+	TXNE A,FK%EPH		; ephemeral fork?
+	 JRST CHKFR1		; yes, quietly kill it
+	CALL TIMSMP		; time stamp
+	TMSG <Process crashed: >
+	MOVEI A,.PRIOU		; to the console
+	CALL PSTAT		; print its status
+	MOVE A,FRKHND(NX)	; fork handle
+	CALL LSTERR		; print last error for that process
+	MOVE A,FRKHND(NX)	; fork handle
+	MOVE B,FRKNAM(NX)	; fork name
+	CALL DMPINF		; dump the fork to a file
+CHKFR1:	MOVE A,FRKHND(NX)	; fork handle
+	KFORK%			; kill it
+	 ERJMP .+1		; ignore an error
+	SETZM FRKHND(NX)	; fork has no handle... 
+	SETZM FRKNUM(NX)	; no system fork number
+	SETZM FRKNAM(NX)	; and no name
+	SETZM FRKATT(NX)	; and no attributes
+	JRST CHKFR0		; go look at next fork
+
+
+;CHKPTY - check our PTY's for input or output needed
+;returns +1 always
+
+CHKPTY:	MOVSI NX,-NPTYS		; form aobjn pointer
+	SKIPN JOBPTY(NX)	; skip if we own this PTY
+CHKPT1:	AOBJN NX,.-1		; else loop over table
+	JUMPGE NX,R		; if done, return to caller
+	CALL CHKPIN		; check input
+	CALL CHKPOU		; check output
+	JRST CHKPT1		; go look at next PTY
+
+
+SUBTTL Inferior Fork for Debugging
+
+;FRKINF - here to ascertain if we should create an inferior fork for
+;the purpose of debugging SYSJOB.  Creates a fork with the same process
+;map as SYSJOB itself.  Enter at FRKRST to restart the fork
+
+FRKINF:	SKIPN TESTSW		; are we debugging?
+	RET			; no, so quit right now
+	GJINF%			; get job information
+	JUMPE C,R		; no debugging if job zero
+	JUMPL D,R		; or if detached
+	MOVX A,CR%CAP+CR%MAP	; same capabilities and same process map
+	CFORK%			; create the fork
+	 ERJMP R		; quit on an error
+	MOVEM A,BUGFRK		; save fork handle
+FRKRST:	MOVE A,BUGFRK		; get back fork handle
+	MOVEI B,FRKBGN		; starting address for lower fork
+	SFORK%			; start fork to read first line
+	 ERJMP .+1		; ignore errors
+	SETZM BUGFLG		; we don't need to be restarted yet
+	RET			; return to caller
+
+
+;FRKBGN - fork to gather input from local tty and write SYSJOB.TEST1
+;Note: This routine is run only in the lower fork.  It reads input
+;from the primary input device, writes SYSJOB.TEST1, and sets BUGFLG
+;to cause the mother fork to restart the debugging fork
+
+FRKBGN:	HRROI A,[ASCIZ/SYSJOB>/] ; debugging prompt
+	MOVE C,A		; stash pointer for use by RDTTY%
+	PSOUT%			; prompt the user
+	HRROI A,BUGBUF		; dump type in to local buffer
+	MOVE B,[RD%BRK+RD%RAI+BUFLEN*5-1] ; break on CTRL-Z, number of bytes
+	RDTTY%			; read from terminal
+	 ERJMP FRKBGN		; try again on error
+	MOVEI B,.CHLFD
+	DPB B,A			; make sure string ends with a linefeed
+	MOVEI B,.CHNUL
+	IDPB B,A		; tie off string with a null
+	MOVX A,GJ%SHT+GJ%FOU	; want an output file
+	HRROI B,[ASCIZ/SYSJOB.TEST1/] ; file spec
+	GTJFN%			; get a handle on the file
+	 ERCAL ERRET		; some error
+	MOVE B,[7B5+OF%WR]	; 7 bits, write access
+	OPENF%			; open the file
+	 ERCAL ERRET		; some error
+	HRROI B,BUGBUF		; pointer to input buffer
+	SETZ C,			; terminate on a null
+	SOUT%			; write out the buffer
+	CLOSF%			; close the file
+	 NOP			; ignore an error here
+	SETOM BUGFLG		; turn on restart flag 
+	HALTF%			; fork will be restarted for next command
+
+Subttl Parsing Routines
+
+;DOCMND - parse the command file
+;takes	INJFN - jfn of command file
+;returns +1 on end of file
+
+DOCMND:	HRL A,INJFN		; get input jfn on left side
+	HRRI A,.NULIO		; output jfn on right side
+	MOVEM A,CSB+.CMIOJ	; set up I/O jfns for COMND%
+	MOVEM P,SAVPDL		; save stack pointer
+PARNXT:	MOVEI B,[FLDDB. .CMINI] ; function is initialize state block
+	CALL .COMND		; initialize state block
+	 CMSG (<Unable to initialize command parser>,R) ;something very wrong
+REPARS:	MOVE P,SAVPDL		; restore stack pointer in case of reparse
+	MOVEI B,[FLDDB. .CMKEY,,COMTAB] ; address of function block
+	CALL .COMND		; parse a keyword
+	 PMSG <Unrecognized command> ; bad parse
+	HRRZ B,(B)		; fetch dispatch address
+ 	CALL (B)		; call subroutine
+	JRST PARNXT		; get next command
+
+
+
+;COMTAB - SYSJOB Command Table
+
+DEFINE CM (NAME,ADDR) <
+	XWD [ASCIZ /NAME/],ADDR	;; standard TBLUK% format table entry
+>
+
+COMTAB:	XWD COMLEN, COMLEN
+	CM (CCJOB,.CCJOB)	; send two CTRL-C's to a PTY job
+	CM (DUMP,.DUMP)		; dump a fork to a file
+	CM (ERUN,.ERUN)		; run fork as ephemeral, don't worry if crashes
+	CM (FREEZE,.FREEZ)	; freeze a fork
+	CM (JOB,.JOB)		; talk to a PTY job
+	CM (KILL,.KILL)		; kill a fork
+	CM (KILLJOB,.KJOB)	; synonym for KJOB
+	CM (KJOB,.KJOB)		; release a PTY job
+	CM (PURGE,.KILL)	; synonym for KILL
+	CM (REENTER,.RENTR)	; restart a fork at its REENTER address
+	CM (RELOAD,.RLOAD)	; reload SYSJOB
+	CM (RERUN,.RERUN)	; rerun a program in the same fork
+	CM (RESTART,.RSTRT)	; restart a fork at its START address
+	CM (RESUME,.RESUM)	; resume a frozen fork
+	CM (RUN,.RUN)		; run a program
+	CM (STATUS,.STAT)	; fork status
+COMLEN==.-COMTAB-1
+
+
+
+;.COMND - COMND% jacket routine
+;takes	b/ address of function descriptor block
+;returns +1 no parse
+;	 +2 good parse
+
+.COMND:	MOVEI A,CSB		; address of state block
+	LDB C,[POINT 9,(B),8]	; get type of field we are parsing.
+	MOVEM C,FLDTYP		; stash it for later error analysis
+	COMND%			; parse something
+	 ERJMP COMNDX		; some error, go check it out
+	TXNN A,CM%NOP		; no parse?
+	AOS (P)			; no, skip return
+	RET			; return to caller
+
+
+;COMNDX - here on a fatal COMND% error
+;We only log CMDBUF if EOF was unexpected
+
+COMNDX:	MOVEI A,.FHSLF		; our fork
+	GETER%			; get the last error
+	HRRZS B			; clear spurious bits
+	CAIE B,IOX4		; end of file reached?
+	CAIN B,COMNX9		; end of input file?
+	 SKIPA			; yes, close the take file
+	  JRST COMDX2		; something bad, go analyze it further
+	MOVE A,FLDTYP		; get type of field we were trying to parse
+	CAIN A,.CMKEY		; keyword?
+	 JRST COMDX1		; yes, we were expecting perhaps eof
+	CALL LOGCTY		; log what's left in CMDBUF
+	CMSG <Unexpected end of command file> ; complain to user
+COMDX1:	MOVE P,SAVPDL		; restore our stack pointer
+	RET			; return to caller of DOCMND routine
+
+COMDX2:	CALL LOGCTY		; dump CMDBUF onto comsole
+	CMSG <Error other than end of file while parsing command file>
+	MOVEI A,.FHSLF		; our process handle
+	CALL LSTERR		; print last error
+	JRST COMNDX1		; join exit code
+
+
+
+;CONFRM - parse command confirmation
+;returns +1 always, no AC's clobbered
+
+CONFRM:	PUSH P,A		; save AC's
+	PUSH P,B
+	PUSH P,C
+	MOVEI B,[FLDDB. .CMCFM] ; function block
+	CALL .COMND		; parse confirmation
+	 PMSG <Command not confirmed> ; bad parse
+	POP P,C			; restore AC's
+	POP P,B
+	POP P,A
+	RET			; return to caller
+
+
+;LOGCTY - log CMDBUF on the CTY unless silence is desired
+;returns +1 always
+
+LOGCTY:	SKIPE SILENT		; shut up?
+	RET			; yes, return now
+	CALL TIMSMP		; no, put out timestamp
+	HRROI A,CMDBUF		; ..and contents of CMDBUF
+	PSOUT%
+	RET			; return to caller
+
+
+;.PMSG - handle a parsing error in a graceful fashion
+;called by the PMSG macro, returns to top of main parse loop
+
+.PMSG: HRROI A,CMDBUF
+       PSOUT%			; print the command buffer to this point
+       MOVEI A,.FHSLF		; this process
+       CALL LSTERR		; print last error on console
+       MOVEI B,[FLDDB. .CMTXT]	; flush until a CRLF
+       CALL .COMND		; do so
+	 NOP			; shouldn't fail
+       JRST PARNXT		; rejoin main code
+
+
+
+Subttl General Error Handling and Reporting Routines
+
+;ERRET - print informative error message for a JSYS failure
+;use as ERCAL ERRET or CALL ERRET
+;returns +1 to caller of caller
+
+ERRET:	CALL TIMSMP		; time stamp
+	TMSG <JSYS error at >	; what it is
+	HRRZ A,(P)		; fetch PC from stack
+	SUBI A,2		; find the JSYS call
+	CALL PRNTPC		; print its location symbolically
+	MOVEI A,.FHSLF		; our fork handle
+	CALL LSTERR		; print last error
+	ADJSP P,-1		; trim stack
+	RET			; return to caller of our caller
+	
+
+;LSTERR - print last error of a process on the console
+;takes	A/ process handle
+;returns +1 always
+
+LSTERR:	PUSH P,A		; save fork handle on stack
+	CALL TIMSMP		; another timestamp, just in case
+	TMSG <Last error - >	; say what we're printing
+	MOVEI A,.PRIOU		; send to the console
+	POP P,B			; restore fork handle
+	HRLOS B			; swap sides, want most recent error
+	SETZ C,			; no length limit
+	ERSTR%			; print the error string
+	 NOP			; ignore an error here
+	  NOP			; likewise
+	TMSG <
+>				; end with a crlf
+	RET			; return to caller
+
+
+
+;R50DOP - print a RADIX50 symbol in ASCII
+;used by the PRNTPC routine
+;returns +1 always
+
+R50DOP:	IDIVI A,50		; carve off a digit
+	PUSH P,B		; save the remainder
+	SKIPE A			; skip if done carving
+	CALL R50DOP		; else keep on carving, recursively
+	POP P,B			; restore a RADIX50 character
+	ADJBP B,[POINT 7,[ASCIZ/ 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ.$%/],6]
+	LDB A,B			; fetch corresponding ascii character
+	PBOUT%			; print it on the tty
+	RET			; return to caller
+
+
+;PRNTPC - print a 30 bit PC symbolically
+;uses PCWORD and PCSYM for storage, outputs to .PRIOU
+;takes	A/ PC word
+;returns +1 always
+
+PRNTPC:	HRRZM A,PCWORD		; save 18 bits of the PC
+	HLRZ B,A		; fetch global section number
+	JUMPE B,PRNTP0		; section zero, so no section number
+	MOVEI A,.PRIOU		; to the tty
+	MOVEI C,10		; octal radix
+	NOUT%			; print the section number
+	 NOP			; ignore an error
+	TMSG <,,>		; separating commas	
+PRNTP0:	SETZB C,PCSYM		; no current program name or best symbol
+	MOVE D,.JBSYM##		; fetch pointer to our symbol table
+	HLRO A,D
+	SUB D,A			; -count,,ending address+1
+PRNTP1:	LDB A,[400400,,-2(D)]	; get symbol type
+	JUMPE A,PRNTP2		; program names are uninteresting
+	CAILE A,2		; 0=program name, 1=global, 2=local
+	 JRST PRNTP2		; we want only global and local symbols
+	MOVE A,-1(D)		; fetch symbol's value
+	CAMN A,PCWORD		; compare
+	 JRST [ MOVEM D,PCSYM
+		JRST PRNTP3 ]	; exact match, use it
+	CAML A,PCWORD		; smaller than value we're looking for?
+	 JRST PRNTP2		; too large
+	SKIPE B,PCSYM		; get best one so far if there is one
+	 CAML A,-1(B)		; compare to previous best
+	  MOVEM D,PCSYM		; current symbol is best match so far
+PRNTP2:	ADD D,[2,,-2]		; add two to left, subtract two from right
+	JUMPL D,PRNTP1		; loop unless control count exhausted
+	SKIPN D,PCSYM		; did we find anything useful?
+	 JRST PRNTP4		; no, just print the number
+PRNTP3:	MOVE A,PCWORD		; desired value
+	SUB A,-1(D)		; less symbol's value = offset
+	CAIL A,200		; reasonable offset?
+	 JRST PRNTP4		; no, print the number
+	MOVE D,PCSYM		; get symbol's address
+	MOVE A,-2(D)		; get symbol name
+	TLZ A,740000		; clear type flags
+	CALL R50DOP		; print radix50 as ascii
+	MOVE A,PCWORD		; fetch desired value again
+	SUB A,-1(D)		; calculate the offset
+	JUMPE A,R		; if no offset, quit now
+	HRRZM A,PCWORD		; fudge up the value of pcword
+	MOVEI A,"+"		; plus sign...
+	PBOUT%			; just like DDT
+PRNTP4:	MOVEI A,.PRIOU		; to the tty
+	MOVE B,PCWORD		; value of offset
+	MOVEI C,10		; octal radix
+	NOUT%			; print the number
+	 NOP			; ignore an error
+	RET			; return to caller
+
+SUBTTL RUN and ERUN Commands
+
+;RUN Command - 'RUN FILESPEC'
+;Creates a fork and runs the file 'FILESPEC' in it
+;A fork run by the ERUN command is expected to terminate and is garbage
+;collected without any fuss.
+
+.ERUN:	SKIPA Q1,[FK%EPH]	; flag that means ephemeral
+.RUN:	SETZ Q1,		; no special flags
+	SETZM RUNJFN		; JFN of file we're trying to run
+	SETZ NX,		; no index yet
+	MOVX B,GJ%OLD		; set GJ%OLD in GTJFN% block
+	MOVEM B,JFNBLK
+	MOVEI B,[FLDDB. .CMFIL]	; parsing a file spec.
+	CALL .COMND		; do so
+	 PMSG <Unable to parse file specification> ;some error
+	CALL CONFRM		; user must confirm
+	MOVEM B,RUNJFN		; save jfn
+	CALL LOGCTY		; dump this line to the console
+	MOVSI NX,-NFORKS	; form aobjn pointer in NX
+	SKIPE FRKHND(NX)	; run for a fork here?
+	AOBJN NX,.-1		; no, loop for more
+	JUMPGE NX,[CMSG (<Fork table full.>,RUNX)] ; complain and return
+	HRROI A,TMPBUF		; pointer to temporary buffer
+	MOVE B,RUNJFN		; jfn of file to run
+	MOVSI C,(1B8)		; want name field only
+	JFNS%			; write a string to be used as a fork ID
+	HRRZ A,NX		; get local table index
+	IMULI A,FILLEN		; calculate offset into FRKFIL
+	HRROI A,FRKFIL(A)	; pointer to string destination
+	MOVE C,[1B2+1B5+1B8+1B11+JS%PAF] ; device, directory, name, type
+	JFNS%			; write string to remember the file
+	MOVX A,CR%CAP		; want fork with superior's caps
+	CFORK%			; create the fork
+	 ERJMP [CMSG (<CFORK% Failure>,RUNX)] ; failure, go release jfn
+	MOVEM A,FRKHND(NX)	; put fork handle into table
+	HRLS A			; slosh fork handle to left side
+	HRR A,RUNJFN		; get file jfn into place
+	GET%			; GET% the file into the new fork
+	 ERJMP [CMSG (<GET% Failure>,RUNX)] ; failure, go release jfn and fork
+	SETZM RUNJFN		; no longer own this jfn
+	MOVEM Q1,FRKATT(NX)	; set up fork attributes
+	SETZM FRKNAM(NX)	; no name for this fork yet
+	MOVEI D,FRKNAM(NX)
+	HRLI D,(<POINT 6,0>)	; D - pointer into name table field
+	MOVE C,[POINT 7,TMPBUF]	; C - pointer to name field of file spec
+	MOVEI B,6		; only six characters
+RUN4:	ILDB A,C		; fetch character from file spec
+	JUMPE A,RUN3		; end of string
+	SUBI A,40		; convert to SIXBIT
+	IDPB A,D		; deposit in name table entry
+	SOJG B,RUN4		; loop over entire string
+RUN3:	MOVE A,FRKHND(NX)	; fork handle
+	SETZ B,			; use START address
+	SFRKV%			; start the fork
+	 ERJMP [CMSG (<SFRKV% Failure>,RUNX)] ; can't, kill it off
+	CALL .PEEK		; return SYSFK and FKTAB tables for our job
+	MOVE A,FRKHND(NX)	; fetch back fork handle
+	TXZ A,.FHSLF		; clear this bit
+	IDIVI A,2		; calculate offset of word in FKTAB
+	MOVE C,[HLRZ A,FKTAB(A)] ; even handles are in the left halfword
+	SKIPE B			; skip if no remainder (even handle)
+	MOVE C,[HRRZ A,FKTAB(A)] ; odd handles are in the right halfword
+	XCT C			; fetch offset into SYSFK table
+	HRRZ A,SYSFK(A)		; get system fork number from SYSFK table
+	MOVEM A,FRKNUM(NX)	; stash it
+	RET			; return to parse loop
+
+
+;RUNX - Here on an error while trying to RUN or ERUN a program
+;reports last error, then releases RUNJFN, kills fork and clears tables
+;returns +1 always
+
+RUNX:	MOVEI A,.FHSLF		; our process handle
+	CALL LSTERR		; print last error on console
+	SKIPE A,RUNJFN		; do we have a jfn?
+	RLJFN%			; yes, release it
+	 NOP			; ignore errors
+	SKIPE FRKHND(NX)	; skip if we didn't have a fork yet
+	CALL .KFORK		; else kill the fork, clear tables
+	RET			; return to caller
+
+
+Subttl RESTART, REENTER, and RERUN Commands
+
+;RESTART and REENTER Commands - 'RESTART <fork ID>' or 'REENTER <fork ID>'
+;Freezes fork, then restarts it at its START or REENTER address
+;returns +1 always
+
+.RSTRT:	TDZA A,A		; RESTART uses offset 0 in entry vector
+.RENTR:	MOVEI A,1		; REENTER uses offset 1 in entry vector
+	MOVEM A,OFFSET		; stash the offset
+	CALL IDENT		; get fork ID
+	 CMSG (<No such fork>,R) ; bad ID, quit now
+	CALL NAMAMB		; ambiguous?
+	 CMSG (<Ambiguous fork name, use fork number instead>,R) ;yes, complain
+	MOVE A,FRKHND(NX)	; fetch fork handle
+	FFORK%			; freeze the fork
+	 ERCAL ERRET		; some error
+	MOVE B,OFFSET		; get entry vector offset into place
+	SFRKV%			; start or reenter the fork
+	 ERCAL ERRET		; some error
+	RFORK%			; resume the frozen fork
+	 ERCAL ERRET		; some error
+	RET			; return to caller
+
+
+;RERUN Command - 'RERUN <fork ID>'
+;Unmap pages of specified fork, close any files, and get and start a new copy
+;of the program that was previously running in the fork.  Kills the fork and
+;removes it from SYSJOB tables if any error occurs.
+;returns +1 always
+
+.RERUN:	CALL IDENT		; get fork ID
+	 CMSG (<No such fork>,R) ; bad ID, quit now
+	CALL NAMAMB		; ambiguous?
+	 CMSG (<Ambiguous fork name, use fork number instead>,R) ;yes, complain
+	MOVX A,GJ%SHT+GJ%OLD	; want an old file
+	MOVEI B,FILLEN
+	IMULI B,(NX)		; calculate offset into FRKFIL table
+	HRROI B,FRKFIL(B)	; pointer to file spec
+	GTJFN%			; get a handle on the file
+	 ERCAL ERRET		; failure, return now, but leave fork alone
+	MOVEM A,RUNJFN		; stash the jfn
+	MOVE A,FRKHND(NX)	; get fork handle
+	FFORK%			; freeze the fork
+	 ERCAL RERUNX		; some error
+	SETO A,			; -1 to unmap
+	HRLZ B,FRKHND(NX)	; fork handle,,first page
+	MOVE C,[PM%CNT+777]	; every page
+	PMAP%			; unmap the program running in that fork
+	 ERCAL RERUNX		; some error
+	HRRZ A,FRKHND(NX)	; get fork handle
+	CLZFF%			; close files and release jfns
+	 ERCAL RERUNX		; some error
+	HRL A,FRKHND(NX)	; fork handle
+	HRR A,RUNJFN		; jfn of new file to run
+	SETZB B,C		; not used
+	GET%			; map in the new program
+	 ERCAL RERUNX		; some error
+	SETZM RUNJFN		; clear jfn in case of an error further on
+	MOVE A,FRKHND(NX)	; get fork handle again
+	SETZ B,			; want to start the fork
+	SFRKV%			; do so
+	 ERCAL RERUNX		; some error
+	RFORK%			; resume the frozen fork
+	 ERCAL RERUNX		; some error
+	RET			; all done, return to caller
+
+
+;here on an error during the RERUN command
+
+RERUNX:	CALL TIMSMP		; time stamp
+	TMSG <JSYS error at >	; what it was that hit us
+	HRRZ A,(P)		; fetch error PC
+	SUBI A,2		; adjust to point to jsys call
+	CALL PRNTPC		; print PC symbolicaly
+	MOVEI A,.FHSLF		; this fork
+	CALL LSTERR		; print our last error
+	CMSG <Unable to rerun program in specified fork, killing fork> ; warn
+	SKIPE A,RUNJFN		; skip if no stray jfn
+	RLJFN%			; else release it
+	 NOP			; ignore an error here
+	CALL .KFORK		; kill fork and remove table entries
+	ADJSP P,-1		; we got here with an ERCAL, must trim stack
+	RET			; return to caller of our caller
+
+
+Subttl KILL, FREEZE, and RESUME Commands
+
+;KILL Command - 'KILL NAME' or 'KILL #'
+;Kills the fork that is running the program 'NAME' or has fork number '#'
+;PURGE is a synonym
+;returns +1 always
+
+.KILL:	CALL IDENT		; get fork ID
+	 CMSG (<No such fork>,R) ; bad ID, quit now
+	CALL NAMAMB		; ambiguous?
+	 CMSG (<Ambiguous fork name, use fork number instead>,R) ;yes, complain
+.KFORK:	MOVE A,FRKHND(NX)	; fork handle
+	KFORK%			; kill the fork
+	 ERCAL ERRET		; some error, complain
+	SETZM FRKHND(NX)	; no handle
+	SETZM FRKNAM(NX)	; no name
+	SETZM FRKATT(NX)	; no attributes
+	SETZM FRKNUM(NX)	; no system number
+	RET			; return to caller
+
+
+;FREEZE Command - 'FREEZE NAME' or 'FREEZE #'
+;Freezes the specified fork
+;returns +1 always
+
+.FREEZ:	CALL IDENT		; read fork ID, return local index in NX
+	 CMSG (<No such fork>,R) ; bad ID, quit now
+	CALL NAMAMB		; ambiguous?
+	 CMSG (<Ambiguous fork name, use fork number instead>,R) ;yes, complain
+	MOVE A,FRKHND(NX)	; fork handle
+	FFORK%			; freeze the fork
+	 ERCAL ERRET		; some error, complain and return
+	RET			; return to caller
+
+
+;RESUME Command - 'RESUME NAME' or 'RESUME #'
+;Resumes the previously frozen fork
+;returns +1 always
+
+.RESUM:	CALL IDENT		; read fork ID, return local index in NX
+	 CMSG (<No such fork>,R) ; bad ID, quit now
+	CALL NAMAMB		; ambiguous?
+	 CMSG (<Ambiguous fork name, use fork number instead>,R) ;yes, complain
+	MOVE A,FRKHND(NX)	; fork handle
+	RFORK%			; resume the fork
+	 ERCAL ERRET		; some error, complain and return
+	RET			; return to caller
+
+
+
+;IDENT - read a fork identifier followed by confirmation
+;identifier may be either a name or a system fork number
+;returns +1 identifier was not found or not specified
+;	 +2 local fork index in NX
+
+IDENT:	SETZM ATMBUF		; clear this to catch null fork names
+	SETZM FORKID		; storage for SIXBIT fork name, if any
+	MOVEI B,[FLDDB. .CMNUM,,10,,,[
+		 FLDDB. .CMTXT]] ; want an octal number or some text
+	CALL .COMND		; parse something
+	 PMSG <Expecting octal fork number or fork name> ; parse failed
+	LDB Q1,[POINT 9,(C),8]	; get type of field parsed
+	CAIN Q1,.CMNUM		; octal number?
+	CALL CONFRM		; yes, must confirm it
+	MOVE Q2,B		; save fork number in Q2
+	CALL LOGCTY		; log this line on the console
+	CAIE Q1,.CMNUM		; a number?
+	JRST IDNAM		; no, a name, go off and look for it
+	MOVSI NX,-NFORKS	; form an aobjn pointer
+	SKIPN A,FRKNUM(NX)	; skip if we have a fork in our table
+IDNUM:	AOBJN NX,.-1		; else loop over table
+	JUMPGE NX,R		; didn't find a match
+	CAME Q2,A		; do the fork numbers match?
+	JRST IDNUM		; no, try the next entry
+	RETSKP			; a match, give a good return
+
+
+IDNAM:	SKIPN ATMBUF		; skip if the user typed something
+	 RET			; else return right now
+	MOVEI D,6		; limit of 6 characters in name
+	MOVE B,[POINT 6,FORKID]	; pointer into forkname buffer
+	MOVE C,[POINT 7,ATMBUF]	; pointer into atom buffer
+IDNAM1:	ILDB A,C		; fetch byte from atom buffer
+	JUMPE A,IDNAM2		; we're done if it's a null
+	SUBI A,40		; convert to SIXBIT
+	IDPB A,B		; add to fork name
+	SOJG D,IDNAM1		; go get next character
+
+IDNAM2:	MOVSI NX,-NFORKS	; form aobjn pointer in NX
+	MOVE A,FORKID		; get fork name into place
+	CAME A,FRKNAM(NX)	; name match?
+	AOBJN NX,.-1		; no, keep looking
+	JUMPGE NX,R		; quit if possibilities exhausted
+	RETSKP			; found it, return to caller
+
+
+;GETNXT - get next fork of the current name
+;assumes we have already called IDENT and have a local index in NX
+;returns +1 no next fork of the same name
+;	 +2 found another fork, index in NX
+
+GETNXT:	SKIPN A,FORKID		; did the user specify a fork name?
+	 RET			; no, so no next fork
+	  SKIPA			; increment NX before making first comparison
+	CAME A,FRKNAM(NX)	; does the fork match?
+	AOBJN NX,.-1		; no, keep looking
+	JUMPGE NX,R		; exhausted possibilities, single return
+	RETSKP			; found one
+
+
+;NAMAMB - test if a fork name is ambiguous
+;returns +1 there is a second occurence of the fork name
+;	 +2 forkname is not ambiguous
+
+NAMAMB:	PUSH P,NX		; save current fork index
+	CALL GETNXT		; see if we have another fork of this name
+	 AOS -1(P)		; we don't, prepare skip return
+	POP P,NX		; restore fork index
+	RET			; return to caller
+
+SUBTTL STATUS Command
+
+;STATUS Command
+;either 'STATUS <RETURN>' or 'STATUS <ID> <RETURN>'
+
+.STAT:	CALL IDENT		; parse fork ID
+	  JRST STAT1		; bad ID, go check if user typed a crlf
+STAT0:	MOVEI A,.PRIOU		; send information to primary output
+	CALL PSTAT		; print the status of fork indexed by NX
+	CALL GETNXT		; get next fork of the same name 
+	 RET			; all done, return to caller
+	JRST STAT0		; go print status of next fork
+
+;here to type out status of all forks, 'STATUS <RETURN>'
+
+STAT1:	SKIPE ATMBUF		; atom buffer is zero if user typed a crlf
+	 CMSG (<No such fork>,R) ; was indeed a bad ID, return now
+	MOVSI NX,-NFORKS	; form aobjn pointer
+	SKIPN FRKHND(NX)	; skip if slot in use
+STAT2:	AOBJN NX,.-1		; if not, try next one
+	JUMPGE NX,STAT3		; if all done, go look at job table
+	MOVEI A,.PRIOU		; send info to primary output
+	CALL PSTAT		; print the status
+	JRST STAT2		; loop over all slots
+
+;here to search table of jobs started via job commands
+
+STAT3:	MOVSI NX,-NPTYS	; form aobjn pointer
+	SKIPN JOBPTY(NX)	; skip if PTY job exists
+STAT4:	AOBJN NX,.-1		; else loop over table
+	JUMPGE NX,R		; if done, return to caller
+	MOVEI A,.PRIOU		; to the console
+	CALL PJSTAT		; print status of this job
+	JRST STAT4		; go look at next job
+
+
+
+;PJSTAT - Print status for one PTY job
+;TAKES 	A/ output designator
+;	NX/ index into PTY table
+;RETURNS +1 always
+
+PJSTAT:	PUSH P,A		; save output designator 
+	HLRZ A,JOBPTY(NX)	; terminal designator
+	MOVE B,[XWD -.JIMAX,GETBLK] ; put info here
+	MOVEI C,.JIJNO		; want all information
+	GETJI%			; get job information
+	 ERCAL ERRET		; some error, complain and return
+	POP P,A			; restore output designator
+	HRRZ B,NX		; index number
+	MOVE C,[NO%LFL+3B17+^D10] ; 3 columns, decimal number
+	NOUT%			; print SYSJOB index number
+	 ERCAL ERRET		; some error
+	SETZ C,			; end strings on a null
+	SKIPGE GETBLK+.JIJNO	; do we have a job number there?
+	 JRST [	HRROI B,[ASCIZ/: No job
+/]
+		SOUT%
+		RET	]	; no, say so and quit
+	HRROI B,[ASCIZ/: Job /]
+	SOUT%
+	MOVE B,GETBLK+.JIJNO
+	MOVEI 3,^D10
+	NOUT%			; print decimal job number 
+	 ERCAL ERRET
+	HRROI B,[ASCIZ/, TTY/]
+	SETZ C,
+	SOUT%
+	MOVE B,GETBLK+.JITNO
+	MOVEI 3,^D8
+	NOUT%			; print octal tty number
+	 ERCAL ERRET
+	HRROI B,[ASCIZ/, /]
+	SETZ C,
+	SOUT%
+	MOVE B,GETBLK+.JIUNO
+	DIRST%			; print user name
+	 ERCAL ERRET
+	HRROI B,[ASCIZ/, /]
+	SETZ C,
+	SOUT%
+	MOVE C,GETBLK+.JIPNM
+	CALL SIXOUT		; print job name
+	MOVE B,GETBLK+.JIRT
+	CALL RUNOUT		; print job runtime
+	HRROI B,[ASCIZ/
+/]
+	SETZ C,
+	SOUT%
+	RET
+
+
+;PSTAT - Print status for a single fork
+;takes	A/ output designator
+;	NX/ pointer into fork tables
+;returns +1 always
+
+PSTAT:	HRRZ B,FRKNUM(NX)
+	MOVE C,[NO%LFL+NO%AST+3B17+10]
+	NOUT%			; print system fork number
+	 ERCAL ERRET
+	MOVEI B,.CHSPC
+	BOUT%
+	MOVE C,FRKNAM(NX)
+	CALL SIXOUT		; print SIXBIT forkname
+	MOVEI B,.CHSPC
+	BOUT
+	PUSH P,A		; save output designator
+	MOVE A,FRKHND(NX)	; get fork handle
+	TXO A,RF%LNG		; set flag that we are using long form RFTST%
+	MOVEI B,STSLEN		; fetch length of status block
+	MOVEM B,STSBLK		; set up status block
+	MOVEI B,STSBLK		; address of status block
+	RFSTS%			; read fork status
+	 ERJMP .+1		; ignore error
+	POP P,A			; restore jfn
+	MOVE D,STSBLK+.RFPSW	; get process status word
+	TXZN D,RF%FRZ		; frozen?
+	 JRST PSTAT1
+	HRROI B,[ASCIZ/Frozen, /] ; yes, indicate that
+	SETZ C,
+	SOUT%
+PSTAT1:	HLRZS D
+	HRRO B,FSTAB(D)
+	SETZ C,
+	SOUT%			; print fork status
+	HLRZ B,STSBLK+.RFPPC	; get PC LH (section #)
+	JUMPE B,PSTAT2
+	MOVE C,[NO%MAG!NO%LFL!NO%AST!^D3B17+^D8]
+	NOUT%
+	 ERCAL ERRET
+	SKIPA B,[-1,,[ASCIZ/,,/]]
+PSTAT2:	 HRROI B,[ASCIZ/     /]
+	SETZ C,
+	SOUT%
+	HRRZ B,STSBLK+.RFPPC	; get PC RH
+	MOVE C,[NO%MAG!NO%LFL!NO%ZRO!^D6B17+^D8]
+	NOUT%			; print the PC
+	 ERCAL ERRET
+	PUSH P,A		; save output designator
+	MOVE A,FRKHND(NX)
+	RUNTM%			; get fork runtime
+	MOVE B,A		; get runtime into place
+	POP P,A			; restore output jfn
+	CALL RUNOUT		; print it
+	CALL PAGINF		; print number of page faults
+	HRROI B,[ASCIZ/
+/]
+	SETZ C,
+	SOUT%			; end line with a crlf
+	RET			; return to caller
+
+
+;SIXOUT - print SIXBIT name
+;takes	A/ output designator
+;	C/ SIXBIT name
+;returns +1 always
+
+SIXOUT:	MOVSI D,-6		; exactly six characters
+SIXOT1:	SETZ B,			; clear contents of B
+	LSHC B,6		; shift six bits into B
+	ADDI B,40		; convert to SIXBIT from ASCII
+	BOUT%			; print it
+	AOBJN D,SIXOT1		; repeat until done
+	RET			; return to caller
+
+
+;RUNOUT - print runtime in [MM:SS]
+;takes	A/ output designator	
+;	B/ milliseconds of runtime
+;returns +1 always
+
+RUNOUT:	IDIVI B,^D1000		; convert to seconds from millisecs
+	IDIVI B,^D60		; minutes in B -- seconds in C
+	MOVE D,C		; preserve seconds
+	MOVE C,[NO%LFL+NO%OOV+6B17+12]
+	NOUT%			; out minutes
+	 NOP
+	MOVEI B,":"
+	BOUT%			; separating colon
+	MOVE B,D		; get back the seconds
+	MOVE C,[NO%LFL+NO%ZRO+NO%AST+2B17+12]
+	NOUT%			; out seconds
+	 NOP
+	RET			; return to caller
+
+;PAGINF - print number of page faults per second of runtime for a process
+;takes	NX/ fork index
+;	A/ output designator
+;returns +1 always
+
+PAGINF:	PUSH P,A		; save output designator
+	MOVE A,FRKHND(NX)	; get fork handle
+	RUNTM%			; get process runtime
+	IDIV A,B		; convert MS to S
+	MOVE D,A		; save seconds of runtime in D
+	MOVE A,FRKHND(NX)	; get fork handle
+	GTRPI%			; get pager information, faults in B
+	IDIV B,D		; compute page faults per second of runtime
+	POP P,A			; restore output designator
+	MOVE C,[NO%LFL+NO%AST+^D6B17+^D10] ; decimal number, field of 6.
+	NOUT%			; print it
+	 NOP			; ignore an error here
+	RET			; return to caller
+
+Subttl RELOAD Command
+
+;RELOAD Command - 'RELOAD'
+;restarts the world, GET%'s a new copy of SYSJOB.EXE
+
+.RLOAD:	CALL CONFRM		; confirm the command
+	CALL LOGCTY		; log it
+	CALL DELINP		; flush input file
+	CMSG <Attempting reload of self...> ; tell the world
+	RESET%			; kill forks, release PTY's
+	MOVX A,GJ%SHT+GJ%OLD	; want an old file
+	HRROI B,[ASCIZ/SYSTEM:SYSJOB.EXE/] ; default file spec.
+	SKIPE TESTSW		; debugging?
+	HRROI B,[ASCIZ/SYSJOB.EXE/] ; yes, use this file spec instead
+	GTJFN%			; get a handle on the file
+	 CMSG (<Unable to find SYSJOB.EXE - attempting to restart.>,START)
+	HRLI A,.FHSLF
+	MOVE 0,A		; 0 := .fhslf,,jfn of program
+	MOVE B,[XWD RERUN, RERAC]
+	BLT B,RERAC+LCD-1
+	SETO A,
+	MOVSI B,.FHSLF		; process handle,,first page
+	MOVE C,[PM%CNT+777]	; page count -- the whole world
+	JRST RERAC		; now go run the code in the AC's
+
+
+RERAC==4			; the first AC used for code
+RERUN:
+PHASE RERAC
+	PMAP%			;  4 unmap what's there
+	MOVE A,0		;  5 1 := .fhslf,,jfn
+	GET%			;  6 load this fork
+	MOVEI A,.FHSLF		;  7 this fork
+	GEVEC%			; 10 pick up starting address
+	HRRZ A,.JBSA##		; 11 assume 10/50 format
+	TLNN B,777000		; 12 is it? (actually has 254000,,addr)
+	 HRRZ A,B		; 13  no.  TENEX format
+	JRST (A)		; 14 go!
+DEPHASE
+LCD==.-RERUN
+
+Subttl DUMP Command
+
+;DUMP Command - 'DUMP <ID>', where ID is a fork number or name
+;saves core image of a process in a dump file
+;AC's are saved as well
+
+.DUMP:	CALL IDENT		; read a fork ID
+	 CMSG (<No such fork>,R) ; bad ID
+	CALL NAMAMB		; is the ID ambiguous?
+	 CMSG (<Ambiguous fork name, use fork number instead>,R) ; yes...
+	MOVE A,FRKHND(NX)	; fork handle
+	MOVE B,FRKNAM(NX)	; SIXBIT fork name
+	CALL DMPINF		; make a dump file
+	RET			; return to caller
+
+
+;DMPINF - dump a process and its AC's into a file
+;takes	A/ fork handle
+;	B/ SIXBIT fork name
+;returns +1 always
+
+DMPINF:	CAIN A,.FHSLF		; is the fork us?
+	CMSG (<Dumping of mother process has not been implemented>,R) ; yes..
+	MOVEM A,DMPFRK		; stash fork handle
+	PUSH P,B		; save sixbit name on stack
+	HRROI A,TMPBUF		; using TMPBUF to build file spec
+	HRROI B,[ASCIZ/SYSTEM:SYSJOB-CRASH./] ; default file name
+	SKIPE TESTSW		; debugging?
+	HRROI B,[ASCIZ/SYSJOB-CRASH./] ; yes, dump to a local file
+	SETZ C,			; end on a null
+	SOUT%			; add it
+	POP P,C			; get SIXBIT name into place
+	CALL SIXOUT		; add it as the extension
+	MOVEI B,.CHNUL		; get a null
+	IDPB B,A		; tie off the string
+	MOVX A,GJ%SHT+GJ%NEW+<-1> ; make a new file, don't delete old ones
+	HRROI B,TMPBUF		; file spec
+	GTJFN%			; get a handle on the file
+	 ERCAL ERRET		; failed, return to caller
+	MOVEM A,DMPJFN		; save jfn
+	MOVE A,DMPFRK		; get fork handle into place
+	FFORK%			; freeze the process
+	 ERJMP .+1		; ignore any erros
+	HRLZ A,DMPFRK		; page 0 of inferior
+	MOVE B,[XWD .FHSLF, SHRPAG] ; has same map as SHRPAG of .fhslf
+	MOVE C,[PM%CNT+PM%RWX+PM%CPY+1]	; all access, one page
+	PMAP%			; make the page shared
+	 ERCAL ERRET		; some error
+	MOVE A,DMPFRK		; process handle
+	MOVEI B,SHRADR+20	; destination of AC block
+	RFACS%			; read fork AC's
+	 ERJMP .+1		; ignore an error
+	MOVE A,DMPJFN		; get jfn into place
+	HRL A,DMPFRK		; fork handle,,file jfn
+	MOVE B,[XWD -1000, SS%CPY+SS%RD+SS%EXE+SS%WR] ; everything, all access
+	SETZ C,			; reserved for DEC
+	SSAVE%			; dump core image into a file, release jfn
+	 ERCAL ERRET		; some error
+	SETO A,			; want to unmap
+	MOVE B,[XWD .FHSLF, SHRPAG] ; the shared page
+	MOVE C,[PM%CNT+1]	; just one page
+	PMAP%			; unmap it
+	 ERJMP .+1		; ignore an error
+	MOVE A,DMPFRK		; get fork handle for inferior
+	RFORK%			; resume frozen fork
+	 ERJMP .+1		; ignore an error
+	CALL TIMSMP		; timestamp
+	TMSG <Dump file written to > ; what we did
+	HRROI A,TMPBUF		; pointer to file spec
+	PSOUT%			; name of dump file
+	CMSG <Process AC's saved in locations 20-37 of dump file> ; more info.
+	RET			; return to caller
+
+
+Subttl JOB Command
+
+;JOB Command - 'JOB n /text/'
+;Transmit text to job identified by n. First occurrence creates a new 
+;job on a PTY. Delimiters can be anything not in text.
+;This routine copies the text to a buffer to be transmitted later by CHKPIN/
+
+.JOB:	MOVEI B,[FLDDB. .CMNUM,,12] ; want a number  
+	CALL .COMND		; parse it
+	 PMSG <Expecting job number> ; parsing error
+	MOVE NX,B		; stash number in index ac
+JOB0:	MOVEI B,[FLDDB. .CMUQS,,BRKALL] ; parse up to a break character
+	CALL .COMND		; do so
+	 PMSG <Failed to parse argument to JOB command>	; some error
+	MOVE B,CSB+.CMPTR	; fetch copy of pointer into command buffer 
+	ILDB A,B		; pick up the break character
+	CAIN A,.CHSPC		; space?
+	 JRST JOB0		; yes, try this again
+	SETZM Q1		; clear storage for job delimiter
+	DPB A,[POINT 7,Q1,6]	; stash it
+	MOVEM B,JBPTR1		; save this pointer
+	MOVEI B,[FLDDB. .CMTOK,,<POINT 7,Q1>] ; parse a token
+	CALL .COMND		; eat the first delimiter
+	 PMSG <Unable to parse first delimiter of JOB string> ; some error
+	SETZM BRKJOB		; clear first word of break mask
+	MOVE A,[XWD BRKJOB,BRKJOB+1] ; form blt pointer
+	BLT A,BRKJOB+3		; allow everything
+	LDB A,[POINT 7,Q1,6]	; get the char
+	IDIVI A,^D32		; break mask has 32 bits/word
+	MOVNS B			; negate the remainder
+	MOVX C,1B0		; get a left bit
+	LSH C,(B)		; move the bit over
+	IORM C,BRKJOB(A)	; set the bit in the break mask
+	MOVEI B,[FLDDB. .CMUQS,,BRKJOB]
+	CALL .COMND		; parse up to next delimiter or null
+	 PMSG <Unable to parse argument to JOB command>	; sigh...
+	MOVE A,CSB+.CMPTR	; point to the end of the parsed stuff
+	MOVEM A,JBPTR2		; save it away
+	MOVEI B,[FLDDB. .CMTOK,,<POINT 7,Q1>] ; parse a token
+	CALL .COMND		; eat the delimiter
+	 PMSG <Unable to parse end delimiter of JOB command>
+	CALL CONFRM		; parse confirmation
+	CALL LOGCTY		; dump all the cruft on the CTY
+
+; fall through to next page
+
+; continued....
+
+	CAIL NX,0		; reasonable index value?
+	CAILE NX,NPTYS		; ...
+	 CMSG (<Illegal job index>,R) ; no, return now
+	SKIPE JOBPTY(NX)	; do we have a PTY here?
+	 JRST JOB00		; yes, skip this code
+	CALL GETPTY		; no, get one
+	 CMSG (<Unable to get a PTY>,R)	; failed
+JOB00:	CALL GETBUF		; set up PTY input buffer, return count in D
+	 CMSG (<Internal SYSJOB buffer already full.>,R) ; no room
+	MOVE B,JBPTR1		; fetch pointer to start of string
+JOB1:	CAMN B,JBPTR2		; are we at the end of the string?
+	 JRST JOB3		; yes, go finish up
+	ILDB A,B		; fetch a byte from command buffer
+	IDPB A,JOBISE(NX)	; append to buffer
+	SOJG D,JOB1		; loop over string
+JOB2:	SETZM JOBISP(NX)	; overflow, flush string pointer
+	SETZM JOBISE(NX)	; ...
+	CMSG (<JOB command too long for internal SYSJOB buffer.>,R)
+
+JOB3:	MOVEI A,.CHNUL		; get a null
+	MOVE B,JOBISE(NX)	; we don't want to update buffer pointer
+	IDPB A,B		; append the null using copy of said pointer
+	RET			; return to command loop
+
+
+; break mask for JOB command.  Break on everything except space
+
+BRKALL:	BRINI. 0,0,0,0
+	BRKCH. (1,177)
+	UNBRK. " "
+	EXP W0.,W1.,W2.,W3.
+
+
+;GETBUF - set up pointers to string buffer
+;takes	NX/ job index
+;returns +1 no room
+;	 +2 success, byte count in D, pointers set up
+
+GETBUF:	MOVEI D,NWSBUF*5-1	; initial byte count in string buffer
+	SKIPE JOBISP(NX)	; do we have existing input?	
+	 JRST GETBF0		; yes, don't have to reinit the buffer
+	MOVEI A,(NX)		; fetch job index
+	IMULI A,NWSBUF		; calculate offset into string buffer
+	ADDI A,SBUF		; add base of string buffer
+	HRLI A,(<POINT 7,0>)	; form byte pointer
+	MOVEM A,JOBISP(NX)	; save pointer to start of PTY input
+	MOVEM A,JOBISE(NX)	; it's also the end of PTY input
+	RETSKP			; good return
+
+GETBF0:	HRRZ A,JOBISE(NX)	; get address of last word of PTY input
+	SUBI A,SBUF		; subtract off base of buffer
+	IDIVI A,NWSBUF		; split into single buffer
+	IMULI A,5		; convert to character count
+	SUB D,5(B)		; reduce free count by amount already used
+	JUMPLE D,R		; fail if no room
+	RETSKP			; good return
+
+Subttl CCJOB and KILLJOB commands
+
+;CCJOB Command - 'CCJOB n'
+;Forces double CTRL-C to job
+
+.CCJOB:	MOVEI B,[FLDDB. .CMNUM,,12] ; want a number  
+	CALL .COMND		; parse it
+	 PMSG <Expecting job index> ; parsing error
+	MOVE NX,B		; stash number in index ac
+	CALL CONFRM		; wait for confirmation
+	CALL LOGCTY		; log this on the console
+	CAIL NX,0		; reasonable index value?
+	CAILE NX,NPTYS		; ...
+	 CMSG (<Illegal job index>,R) ; no, return now
+	SKIPN JOBPTY(NX)	; have PTY here?
+	 CMSG (<No job for that index value>,R)	; no, complain
+	HRRZ A,JOBPTY(NX)	; terminal designator
+	MOVEI B,.CHCNC		; a CTRL-C
+	BOUT%			; send first CTRL-C
+	 ERCAL ERRET		; catch errors
+	BOUT%			; send second
+	 ERCAL ERRET		; catch error again
+	RET			; return to caller
+
+
+;KILLJOB Command - 'KILLJOB n'
+;Closes PTY and releases buffers if any
+;Monitor will treat job if the carrier dropped and will eventually log it out
+
+.KJOB:	MOVEI B,[FLDDB. .CMNUM,,12] ; want a number  
+	CALL .COMND		; parse it
+	 PMSG <Expecting job index> ; parsing error
+	MOVE NX,B		; stash number in index ac
+	CALL CONFRM		; wait for confirmation
+	CALL LOGCTY		; log this on the console
+	CAIL NX,0		; reasonable index value?
+	CAILE NX,NPTYS		; ...
+	 CMSG (<Illegal job index>,R) ; no, return now
+	SKIPN JOBPTY(NX)	; have PTY here?
+	 CMSG (<No job for that index value>,R)	; no, complain
+	HRRZ A,JOBPTY(NX)	; terminal designator
+	CLOSF%			; close the PTY - will detach job if any
+	 CMSG (<Unable to close JFN for PTY job>,R) ; complain and return
+	SETZM JOBPTY(NX)	; note no PTY here now
+	SETZM JOBISP(NX)	; note gone
+	SETZM JOBOSP(NX)	; note gone
+	RET			; return to caller
+
+Subttl PTY Handling Routines
+
+;GETPTY - find a free PTY and open it
+;returns +1 none available
+;	 +2 PTY opened
+
+GETPTY:	MOVN D,PTYCNT		; get negative of PTY count
+	HRLZS D			; swap sides to form aobjn pointer
+GETPT1:	HRROI A,TMPBUF		; construct a PTY ident string in TMPBUF
+	HRROI B,[ASCIZ/PTY/]	; start with name
+	SETZ C,
+	SOUT%
+	MOVEI B,(D)
+	MOVEI C,10
+	NOUT%			; octal PTY number
+	 ERCAL ERRET
+	MOVEI B,":"
+	IDPB B,A		; terminate name with a colon
+	MOVEI B,.CHNUL
+	IDPB B,A		; end string with a null
+	MOVX A,GJ%SHT+GJ%OLD	; want an existing 'file'
+	HRROI B,TMPBUF		; pointer to file spec.
+	GTJFN%			; try to get this PTY
+	 ERJMP GETPT2		; failed, probably already assigned
+	MOVEM A,JOBPTY(NX)	; saved jfn
+	MOVE B,[7B5+OF%RD+OF%WR] ; 7 bit, read and write access
+	OPENF%			; open the file
+	 ERJMP [ HRRZ A,JOBPTY(NX) ; failed, can't use this one
+		 RLJFN%
+		  NOP
+		 JRST GETPT2 ]	; go try next one
+	ADD D,PTYONE		; PTY okay, compute related tty number
+	MOVEI A,.TTDES(D)	; construct tty designator
+	HRLM A,JOBPTY(NX)	; save it for various jsyses
+	MOVEI B,.TTL36		; LA36, just like the console
+	STTYP%			; set terminal type 
+	HRRZ A,JOBPTY(NX)	; PTY designator
+	MOVE B,[MO%WFI+MO%OIR+<PTCHN>B17+.MOAPI] ; input and output channels
+	MTOPR%			; assign PTY interrupt channels
+	 ERCAL ERRET		; single return on error
+	HRRZ A,JOBPTY(NX)	; PTY designaotr
+	MOVEI B,.CHCNC		; send a CTRL-C to startup job
+	BOUT%			; do it
+	 ERJMP RSKP		; ignore failure, presence of job checked later
+	RETSKP			; good return
+
+GETPT2:	AOBJN D,GETPT1		; look for next PTY
+	RET			; search fails, single return
+
+
+
+;CHKPIN - check PTY for input needed
+;writes buffered JOB command input to PTY if PTY is in input wait
+;takes	NX/ PTY index number
+;returns +1 always
+
+CHKPIN:	CALL CHKPOU		; always empty the output buffer first
+	SKIPN A,JOBISP(NX)	; input waiting?
+	RET			; no, nothing to do
+	ILDB A,A		; maybe, get first character
+	JUMPE A,CHKPIX		; null, go zero pointer and return
+	HLRZ A,JOBPTY(NX)	; PTY designator
+	MOVEI B,.MOPIH		; function is test for input wait
+	MTOPR%			; test PTY
+	 ERJMP R		; if fails, assume not hungry
+	JUMPE B,R		; return if not hungryk
+	CALL PTYINI		; see if have to create a job on PTY
+	 RET			; can't make a job, wait till later
+	HRRZ A,JOBPTY(NX)	; PTY is hungry, give it a line
+CHKPI1:	ILDB B,JOBISP(NX)	; get next character of input
+	JUMPE B,CHKPIX		; all done if null, go zero pointer and return
+	CAIN B,.CHCRT		; carriage return?
+	 JRST CHKPI1		; yes, flush it. Don't clutter CTY with CRLFs
+	CAIE B,"^"		; control character wanted?
+	 JRST CHKPI2		; no, this is easy
+	ILDB B,JOBISP(NX)	; get character after the up-arrow
+	SUBI B,100		; convert to control char
+	CAIL B,0
+	CAIL B," "
+	 ADDI B,100		; if not a control char, send as was
+CHKPI2:	BOUT%			; send the character to the PTY
+	 ERJMP CHKPIB		; some error, go handle it
+	CAIE B,.CHLFD		; was that the end of line?
+	JRST CHKPI1		; no, keep sending
+	JRST CHKPIN		; yes, see if PTY is still hungry
+
+;here on end of input buffer
+
+CHKPIX: SETZM JOBISP(NX)	; note no more input string
+	RET			; return to caller
+
+;the PTY burped, backup pointer and quit for now
+
+CHKPIB:	MOVNI A,1		; just one byte
+	ADJBP A,JOBISP(NX)	; backup pointer
+	DPB B,A			; put back the byte (it might have been "^chr")
+	MOVEM A,JOBISP(NX)	; stash new pointer
+	RET			; quit, check again later
+
+
+
+;CHKPOU - check for output available on PTY
+;takes	NX/ job index
+;returns +1 always
+
+CHKPOU:	HLRZ A,JOBPTY(NX)	; get tty designator
+	SOBE%			; anything in output buffer?
+	 SKIPA			; yes, get it
+	RET			; no, return now
+	HRRZ A,JOBPTY(NX)	; jfn of PTY
+	BIN%			; get one output character
+	JUMPE B,CHKPOU		; ignore nulls
+	SKIPN JOBOSP(NX)	; have a buffer for output?
+	CALL [	MOVEI A,NPTYS(NX)
+		IMULI A,NWSBUF
+		ADDI A,SBUF
+		HRLI A,(<POINT 7,0>)
+		MOVEM A,JOBOSP(NX)
+		RET ]		; no, setup the pointer now
+	IDPB B,JOBOSP(NX)	; put in output buffer
+	CAIE B,.CHLFD		; end of line?
+	JRST CHKPOU		; no, try to get more
+	SETZ B,.CHNUL		; yes, fetch a null
+	IDPB B,JOBOSP(NX)	; to terminate string with a null
+	CALL TIMSMP		; make a timestamp
+	TMSG <Job >		; begin the header
+	MOVEI A,.PRIOU
+	HRRZ B,NX
+	MOVEI C,^D10
+	NOUT%			; print job index
+	 ERCAL ERRET		; some error
+	TMSG <: >
+	MOVEI A,.PRIOU		; send to the console
+	MOVEI B,NPTYS(NX)	; for this line
+	IMULI B,NWSBUF		; compute offset into string buffer
+	ADDI B,SBUF		; add base address of buffer
+	HRROS B			; make into string pointer
+	SETZ C,			; end on a null
+	SOUT%			; output the job's line
+	SETZM JOBOSP(NX)	; clear pointer to output buffer
+	JRST CHKPOU		; go check for more output
+
+
+
+;PTYINI - Routine to create a job on a PTY if necessary.
+;returns +1 if failure
+;	 +2 there is a job on the PTY
+
+PTYINI:	CALL PTYJBC		; see if a job is already on the PTY
+	 RETSKP			; yes, good return
+	SKIPN C,PDELAY		; get delay time
+	JRST PTYING		; proceed if no delay
+	TIME%			; get current time
+	CAMGE A,C		; time for another attempt?
+	RET			; no, return now
+	SETZM PDELAY		; yes, clear delay
+PTYING:	HRRZ A,JOBPTY(NX)	; get jfn on PTY
+	MOVEI B,.CHCNC		; and a CTRL-C
+	BOUT%			; send to PTY to create a job
+	 ERJMP .+1		; ignore failure, checked below
+	CALL PTYJBC		; see if job was created
+	 RETSKP			; yes, return okay
+	TIME%			; get current time
+	ADDI A,^D15000		; add 15 seconds to it
+	MOVEM A,PDELAY		; save as next allowable time
+	RET			; return bad for now
+
+
+;PTYJBC - see if a job exists on a PTY.
+;If the job is in the process of being initialized, we wait for it to complete.
+;returns +1 job exists
+;	 +2 no job on PTY
+
+PTYJBC:	HLL A,JOBPTY(NX)	; get tty designator
+	TLZ A,.TTDES		; turn it into a tty number
+	HRRI A,.TTYJO		; get table number for TTYJOB
+	GETAB%			; see if logged in
+	 ERJMP RSKP		; failed, assume no job
+	JUMPGE A,R		; if job number set up, then okay
+	HLRZ A,A		; get left half
+	CAIE A,-2		; unassigned?
+	RETSKP			; yes, good return
+	MOVEI A,^D250		; no, being assigned
+	DISMS%			; give it a chance to finish
+	JRST PTYJBC		; and check again
+
+Subttl PSI Routines
+
+;SETPSI - initialize the PSI system
+;returns +1 always
+
+SETPSI:	MOVEI A,.FHSLF		; for this fork
+	MOVE B,[XWD LEVTAB,CHNTAB] ; table addresses
+	SIR%			; set up PSI
+	MOVE B,CHNMSK		; channel mask
+	AIC%			; activate appropriate channels
+	EIR%			; enable those channels
+	RET			; return to caller
+
+
+; Level table
+
+LEVTAB:	LEV1PC			; PC of level 1 interrupts
+	LEV2PC			; level 2...
+	LEV3PC			; level 3...
+
+
+; Channel table
+
+CHNTAB: BLOCK 2			;0 - 1
+	3,,PTYINT		;2		PTY input
+	3,,PTYINT		;3		PTY output
+	BLOCK 5			;4 - 8
+	1,,PANIC		;9		PDL overflow
+	BLOCK 1			;10
+	1,,PANIC		;11		File error
+	1,,PANIC		;12		Quota exceeded
+	BLOCK 2			;13 - 14
+	1,,PANIC		;15		Illegal instruction
+	1,,PANIC		;16		Illegal memory reference
+	1,,PANIC		;17		Illegal memory write
+	BLOCK 1			;18
+	3,,FRKTRM		;19		Fork termination
+	1,,PANIC		;20		Machine size
+	BLOCK 17		;21 - 35
+
+; mask of channels to enable
+
+CHNMSK:	1B2!1B3!1B9!1B11!1B12!1B15!1B16!1B17!1B19!1B20
+
+
+
+;PANIC - catch and report a panic channel interrupt
+;returns control to top on main loop
+
+PANIC:	CIS%			; clear all pending interrupts
+	CALL TIMSMP		; print a timestamp
+	TMSG <Panic channel interrupt at > ; what is going on
+	HRRZ A,LEV1PC		; get the PC
+	SUBI A,1		; correct it slightly
+	CALL PRNTPC		; print symbolic PC
+	MOVEI A,.FHSLF		; our fork handle
+	CALL LSTERR		; print last error on the console
+	CMSG <Flushing any input file and reentering main loop.>
+	CALL DELINP		; clobber any input file
+	JRST WAITI		; decamp to top of main loop
+
+
+
+;FRKTRM - fork terminated
+;wake up right away to report it
+
+FRKTRM:	TXO F,FRKTMF		; set the flag
+	PUSH P,A		; save an accumulator
+	HRRZ A,LEV3PC		; get PC at interrupt
+	MOVE A,-1(A)		; fetch instruction at PC-1
+	CAME A,[THIBR%]		; are we in a THIBR% wait?
+	 JRST FRKT1		; no, running, will notice flag later on
+	MOVE A,[PC%USR+WAITI]	; make up a new PC
+	MOVEM A,LEV3PC		; fix up PC word
+FRKT1:	POP P,A			; restore AC
+	DEBRK%			; return from interrupt
+
+
+
+;PTYINT - do PTY service at interrupt level if main program is in THIBR%
+;all AC's except for A are clobberable if in hibernation
+
+PTYINT:	PUSH P,A		; save A
+	TXO F,FRKTMF		; set flag in case no PTY service is done
+	HRRZ A,LEV3PC		; fetch interrupt PC
+	MOVE A,-1(A)		; fetch instruction at PC-1
+	CAMN A,[THIBR%]		; are we in a THIBR% wait?
+	 CALL CHKPTY		; yes, do PTY service.  Don't reset flag.
+	POP P,A			; restore A
+	DEBRK%			; return from interrupt
+
+
+Subttl Miscellaneous Subroutines
+
+;SETLOC - routine to set job location to local node if under job 0
+;done because job 0 is created before the local node name is known
+;returns +1 always
+
+SETLOC:	GJINF%			; get our job number
+	JUMPN C,R		; quit now if not running under job 0
+	MOVX A,.NDGLN		; get local node name function
+	MOVEI B,C		; argument block starts in C
+	HRROI C,TMPBUF		; point to where local name goes
+	NODE%			; get local node name
+	 ERJMP R		; failed, must not be a DECNET system
+	SETO A,			; this job
+	MOVX B,.SJLLO		; set location function
+	HRROI C,TMPBUF		; pointer to name
+	SETJB%			; set our location
+	 ERJMP [CMSG (<Cannot set job location>,R)]
+	RET			; done
+
+
+;TIMSMP - output a timestamp on the console
+;returns +1 always
+
+TIMSMP:	PUSH P,B		; save these two AC's
+	PUSH P,C		; ...
+	MOVEI A,.PRIOU		; our tty
+	RFPOS%			; read the cursor postion
+	TRNN B,-1		; at left margin?
+	 JRST TIMSM1		; yes, skip this
+	TMSG <
+>				; no, print a crlf
+TIMSM1:	MOVEI A,.PRIOU		; to the tty
+	SETO B,			; now
+	SETZ C,			; standard format
+	ODTIM%			; timestamp
+	TMSG < SYSJOB: >	; it's us
+	POP P,C			; restore AC's
+	POP P,B			; ...
+	RET			; return to caller
+
+
+;SNPSYM - called once to SNOOP% symbol values from the monitor
+;returns +1 always
+
+SNPSYM:	SETZ C,			; search entire monitor symbol table
+	MOVSI D,-SNPLEN		; form aobjn pointer
+SNPSY0:	MOVEI A,.SNPSY		; want a symbol value
+	HLR B,SNPTAB(D)		; get address of symbol
+	MOVE B,(B)		; get radix50 value of symbol into place
+	SNOOP%			; lookup symbol
+	 ERCAL ERRET		; some error
+	HRR A,SNPTAB(D)		; get address of storage for symbol value
+	MOVEM B,(A)		; stash symbol in appropriate place
+	AOBJN D,SNPSY0		; loop over entire table
+	RET			; return to caller
+
+
+DEFINE SNP (SYM) <
+	XWD [RADIX50 0,SYM], $'SYM ;; RADIX50 symbol,,local storage
+>
+
+SNPTAB:	SNP (NUFKS)		; maximum number of user forks
+	SNP (SYSFK)		; map of job handle to system fork number
+	SNP (NLFKS)		; maximum number of inferiors
+	SNP (FKTAB)		; map of local to job fork handle
+SNPLEN==.-SNPTAB
+
+
+
+;.PEEK - return SYSFK table from our JSB
+;returns +1 always
+
+.PEEK:	HRL A,$NUFKS		; number of possible user forks
+	HRR A,$SYSFK		; address of SYSFK table in JSB
+	MOVEI B,SYSFK		; address of our copy of SYSFK 
+	PEEK%			; get SYSFK - job fork handle to system handle
+	 ERCAL ERRET		; some error
+	MOVE A,$NLFKS		; number of inferior forks
+	IDIVI A,2		; table is half that size
+	HRLS A			; swap count to left side
+	HRR A,$FKTAB		; address of FKTAB table in PSB
+	MOVEI B,FKTAB		; address of our copy of FKTAB
+	PEEK%			; get FKTAB - process handle to job handle
+	 ERCAL ERRET		; some error
+	RET			; return to caller
+
+
+; But for absolute assembly, this would be in MACREL
+
+RSKP:	AOS (P)			; skip return
+R:	RET			; single return
+
+
+; Fork state description messages
+
+FSTAB:	Z [ASCIZ /Running  /]	; running
+	Z [ASCIZ /IO wait  /]	; I/O wait
+	Z [ASCIZ /Halted   /]	; normal termination, HALTF%
+	Z [ASCIZ /Crashed  /]	; forced termination
+	Z [ASCIZ /Fork wait/]	; in a WFORK%
+	Z [ASCIZ /Sleep    /]	; in a WAIT% or DISMS%
+	Z [ASCIZ /Trap wait/]	; dismissed because of a TFORK% call
+	Z [ASCIZ /ADBRK wait/]	; dismissed because of an ADBRK% call
+NFSTAB==.-FSTAB
+
+
+; Dump literals here
+
+	XLIST			; 'LIT' follows
+	LIT			; keep literals with code
+	LIST			; end of 'LIT'
+
+; Entry vector
+
+EVEC:	JRST START		; normal start
+	JRST DSTRT		; detach and start
+	VSYSJB			; version number
+EVECL==.-EVEC
+
+PUREND==.			; end of pure code
+
+
+	END <EVECL,,EVEC>

@@ -1,0 +1,5319 @@
+	UNIVERSAL	TTTUNV	DECnet Task-to-Task Interface for COBOL and FORTRAN
+
+
+COMMENT		#
+
+  COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1983, 1986.
+  ALL RIGHTS RESERVED.
+  
+  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+  COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+  THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+  ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+  AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+  SOFTWARE IS HEREBY TRANSFERRED.
+  
+  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+  NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+  EQUIPMENT CORPORATION.
+  
+  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+  ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+
+			#
+
+	SALL
+
+	T0=0		;Function value return
+	T1=1		;These ACs are saved and restored by this subroutine
+	T2=2		;...
+	T3=3		;...
+	T4=4		;...
+	T5=5		;...
+
+	ARG=16		;Argument list pointer
+	P=17		;Push down stack pointer
+
+; Compile-time switches:
+
+TCK==-1			;Include type-checking code
+MAXLL==^D20		;Maximum number of logical links allowed at one time
+DISTIM==^D5000		;Period between checks for lost interrupts
+TSIZE==^D1000		;Size of temporary strings (used for DECnet file
+			;... specifications and for binary-mode data
+			;... movement)
+OTSFNC==-1		;[35] Try to use FUNCT. in OTS
+			;[35] Turn this off only if there is no OTS
+
+
+IFNDEF FTT10,<FTT10==0>	;Non-zero if TOPS-10 support
+IFNDEF FTT20,<FTT20==0>	;Non-zero if TOPS-20 support
+IFN FTT20,<IFN FTT10,<PRINTX ?Cannot have FTT10 and FTT20 both turned on!>>
+IFE FTT20,<IFE FTT10,<PRINTX ?Must have one of FTT10 or FTT20 turned on!>>
+
+; Interrupt system (TOPS-20 only):
+
+; Note that we have to avoid getting clobbered by PA1050 if we are called by
+; a compatible program.  See LEVTAB, CHNTAB, and PSITAB in PAT.MAC.
+;[35] See PSINIT, below.  The following are attempted to get an interrupt
+;[35] channel to use:  get one from the OTS via FUNCT. (only if OTSFNC
+;[35] switch is on), get one from PA1050 if it is in memory via COMPT.
+;[35] function code 6, get one from the existing table of interrupts if
+;[35] there is one, or make interrupt tables and then use an interrupt
+;[35] from them.
+;[46] To read the interrupt tables, we will attempt to do a RIR%.  If that
+;[46] fails, we will do an XRIR%.  However, to SET them ourselves, if they do
+;[46] not already exist, we will try the XSIR% first, doing a SIR% if that
+;[46] fails.  This is done because the monitor will let us do an XRIR% of tables
+;[46] set by a SIR%, causing chaos, but will not let us do a RIR% of tables set
+;[46] by XSIR%.  The tables are incompatible.
+
+PSILEV==^D3		;Use level PSILEV (must be 3 to cooperate with PA1050)
+PSINUM==^D2		;Use number PSINUM (PA1050 requires <= 2)
+
+IFN	OTSFNC,<	;[35] FUNCT. codes for handling interrupt channels:
+	GPSI==17		;[35] Get TOPS20 interrupt channel from the OTS
+	RPSI==20		;[35] Return TOPS20 interrupt channel to OTS
+>			;[35] end of IFN OTSFNC
+
+
+; Event flag definitions:
+
+EV.CON==1		;Connect event has occurred
+EV.ABT==2		;Abort event has occurred
+EV.INT==4		;Interrupt message is available
+EV.DAT==10		;Data is available
+EV.DIS==20		;A disconnect event has occurred
+
+; Externals:
+
+EXTERN	DILRET		;Return kludge for COBOL
+IFN	OTSFNC,<	;[35] If OTS is used for FUNCT.
+EXTERN	FUNCT.		;[35] OTS interface port
+>			;[35] End of IFN OTSFNC
+
+; Macro to save T1 through T4 at the beginning of subroutine execution
+; and restore them just prior to returning to caller.
+
+DEFINE	SAVAC,	<
+	PUSH	P,T1			;Save T1
+	PUSH	P,T2			;Save T2
+	PUSH	P,T3			;Save T3
+	PUSH	P,T4			;Save T4
+	XMOVEI	T1,[	POP	P,T4	;[51]Return
+			POP	P,T3	;   from
+			POP	P,T2	;   subroutine
+			POP	P,T1	;   comes
+			POPJ	P,]	;[51]   here to restore registers.
+	PUSH	P,T1			;[51]
+>
+
+; Macro used to return from a subroutine.
+
+DEFINE	RETURN (B), <
+	JRST	[PUSH	P,[<B>]		;Status code
+		 CALL 	DILRET		;Call COBOL return kludge
+		 POP	P,0		;Set up function return value
+		 RET	]		;Return
+>
+
+
+; Macro to facilitate system dependant code isolation
+
+DEFINE T10,<IFN FTT10>
+
+DEFINE T20,<IFN FTT20>
+
+
+
+; Macro to use DISMS% JSYS call to simulate HIBER UUO if TOPS-10 version
+
+T10,<DEFINE DISMS%,<
+	TLO	T1,(HB.RIO)	;; Wake on I/O complete
+	HIBER	T1,		;; Hibernate
+	  JFCL			;; Should never happen
+>>
+; Version number control
+
+; "version" macro in Bliss modules:
+; who updated:     bits 33-35  ( 3 bits) Who updated (0=DEC)
+; major verion:    bits 24-32  ( 9 bits) Major verison number
+; minor version:   bits 18-23  ( 6 bits) Minor version number
+; edit number:     bits  0-17  (18 bits) Edit number
+
+DEFINE	VERSIO (who,maj,min,num),<
+	BYTE (3)who(9)maj(6)min(18)num
+>
+
+; "new_version" macro in Bliss modules:
+
+DEFINE	NEW%VE (major,minor),<
+	%%%MAJ==major
+	%%%MIN==minor
+>
+
+; "edit" macro in Bliss modules
+
+DEFINE	EDIT (number,date,maker),<
+	%%%EDT==number
+>
+
+; "mark_versions" macro in Bliss modules
+
+DEFINE	MARK%V (fac),<
+	EXTERN	fac'VER		;; (fac'$k_version)
+				;; ... Defined in DITHST.BLI
+	fac'MVR==VERSIO (0,%%%MAJ,%%%MIN,%%%EDT)	;; (fac'$module_version)
+	fac'GVR==fac'VER		;;(fac'$g_version)
+>
+; Edit History:
+
+new%ve	1,0
+
+edit	1,'14-Oct-82','Charlotte L. Richardson'
+; %( Change version and revision standards.  All modules.  )%
+
+edit	4,'27-Oct-82','Charlotte L. Richardson'
+; %( Remove CLOSF% workaround in NFCLS.  TTT.MAC )%
+
+edit	7,'29-Oct-82','Charlotte L. Richardson'
+; %( Check that character strings are only ASCII.  TTT.MAC and DAPPER.B36 )%
+
+edit	12,'5-Nov-82','Charlotte L. Richardon'
+; %( Check interrupts before stealing one.  TTT.MAC )%
+
+edit	13,'5-Nov-82','Charlotte L. Richardson'
+; %( Fix edit 12!  TTT.MAC )%
+
+edit	16,'16-Nov-82','Charlotte L. Richardson'
+; %( Fix typo in OBJID processing of NFOPP.  QAR 4.  TTT.MAC )%
+
+edit	17,'17-Nov-82','Charlotte L. aRichardson'
+; %( Correct AIC% JSYS in interrupt setup when PA1050 is not involved.
+;    QAR 4.  TTT.MAC )%
+
+edit	30,'23-Nov-82','Charlotte L. Richardson'
+; %( Modify TTT.MAC to code around bug in field-image MACRO.  QAR 18.
+;    TTT.MAC  )%
+
+edit	35,'1-Dec-82','Charlotte L. Richardson'
+; %( Use FUNCT. to get an interrupt channel if possible.  QAR 13.  TTT.MAC )%
+
+edit	37,'9-Dec-82','Charlotte L. Richardson'
+; %( Use XRIR%/XSIR% JSYSes in the interrupt code and do RIR%/SIR% if these
+;    fail to avoid being burned by FOROTS v. 7.  TTT.MAC )%
+
+edit	41,'17-Dec-82','Charlotte L. Richardson'
+; %( If node name is missing in call to active open routine, create network
+;    file specification with a leading dash.  QAR 27.  TTT.MAC )%
+
+edit	46,'5-Jan-83','Charlotte L. Richardson'
+; %( More of edit 37.  QAR 29.  TTT.MAC )%
+
+edit	47,'6-Jan-83','Charlotte L. Richardson'
+;%( Prefix JSYS errors with an explanation.  TTT.MAC )%
+
+edit	51,'17-Jan-83','Charlotte L. Richardson'
+;%( Change MOVEIs to XMOVEIs so that this code can run in a nonzero
+;   section.  TTT.MAC )%
+
+edit	56,'24-Jan-83','Charlotte L. Richardson'
+;%( Correct file names created for TOPS-20 tasks.  NFOPU and NFOPP in TTT.MAC )%
+
+edit	60,'2-Feb-83','Charlotte L. Richardson'
+;%( Fix typo in edit 56.  TTT.MAC )%
+
+edit	61,'9-Mar-83','Charlotte L. Richardson'
+;%( Declare version 1.  All modules. )%
+
+edit	63,'11-Mar-83','Charlotte L. Richardson'
+;%( Allow non-word-aligned character strings in TTT.MAC )%
+
+edit	64,'15-Mar-84','Charlotte L. Richardson'
+;%( Do not write JSYS errors to the user's terminal in .JSER. )%
+
+new%ve	2,0
+
+edit	65,'11-Apr-84','Sandy Clemens'
+;%( Add DIT V2 files to DT2:.  Files: DITHST.BLI, DAPPER.B36, TTT.MAC )%
+
+edit	72,'16-May-84','Doug Rayner'
+;%( Fix NFINT and NFRCI for TOPS-10.  FILES: TTT.MAC, DITHST.BLI )%
+
+edit	111, '04-June-84', 'Doug Rayner'
+; %(  Code to make sure that NFSND in binary mode would not overflow
+;     internal buffer TEMPST was not quite right.  We didn't overflow
+;     the buffer, but we gave the user's byte count instead of the
+;     truncated byte count to the monitor.  FILES: TTT.MAC, DILHST.BLI
+; )%
+
+edit	104, '8-Oct-84', 'Sandy Clemens'
+;%( Add new format of COPYRIGHT notice.  FILES:  ALL )%
+
+edit	110, '20-Nov-84', 'Sandy Clemens'
+;%( On TOPS-10, if a remote node is down, the TTT code (1) in NFOP*
+;   to open the link (with WAITLY) or (2) await the confirmation of
+;   the connect (with WAITLY) in NFGND will wait indefinitely.  Add
+;   a check for status .NSSCM (which indicates "no communication") to
+;   correct this problem.   FILES:  TTT.MAC. )%
+
+new%ve	2,1
+
+edit	112,'1-Jun-86','Sandy Clemens'
+;%( Add sources for version 2.1.  Update copyright notices. )%
+
+; End of revision history
+
+mark%v	DIT
+
+; Status values:
+
+	WARN==0				; Warning message
+	SUCC==1				; Success message
+	ERR==2				; Error message
+	INFO==3				; Informational message
+	SEVERE==4			; Severe (fatal) error message
+
+; Facility code:
+
+	DITFAC==^D233			; DIT facility code (actually decimal)
+
+; Build status value:
+
+; Bits 32 - 35 ( 4): unused
+;(Bit  31      ( 1): custdf)
+; Bits 18 - 31 (14): facno
+; Bit  17      ( 1): facsp
+; Bits  3 - 16 (14): code
+; Bits  0 -  2 ( 3): sever
+
+DEFINE	STACOD (SEVER,FACSP,CODE,FACNO,CUSTDF),<
+	BYTE (4)0(1)^D<CUSTDF>(13)^D<FACNO>(1)^D<FACSP>(14)^D<CODE>(3)^D<SEVER>
+>
+
+	SSSUCC==STACOD	SUCC,0,0,0,0
+
+; Type checking codes:
+
+.TYPEM==001740,,0			;Type field mask
+.TYPE==270500				;Type field LDB pointer left half
+
+.OK==0					;Not specified, always OK
+.LG==1					;Fortran logical
+.I1==2					;One-word integer
+.T3==3					;...
+.R1==4					;One-word real
+.T5==5					;...
+.O1==6					;One-word octal
+.LB==7					;label/procedure address
+.R2==10					;Two-word real
+.I2==11					;Two-word integer
+.O2==12					;Two-word octal
+.T13==13					;...
+.CP==14					;Complex
+.ST==15					;Byte string pointer (ILDB ptr, count)
+.T16==16					;...
+.AZ==17					;ASCIZ string
+; Status values for return values:
+
+	SYSERR==STACOD	SEVERE,1,1,DITFAC,0	; Same as DAPPER
+	TOOMNY==STACOD	SEVERE,1,2,DITFAC,0	; Same as DAPPER
+	INVARG==STACOD	SEVERE,1,3,DITFAC,0	; Same as DAPPER
+						; codes 4-9 not used by TTT
+	OVRRUN==STACOD	WARN,1,10,DITFAC,0	; Same as DAPPER
+						; Up to 100 reserved for DAPPER
+	CONEVT==STACOD	INFO,1,101,DITFAC,0	; Connect event
+	ARJEVT==STACOD	INFO,1,102,DITFAC,0	; Abort or reject event
+	INTEVT==STACOD	INFO,1,103,DITFAC,0	; Interrupt event
+	DATEVT==STACOD	INFO,1,104,DITFAC,0	; Data event
+	DSCEVT==STACOD	INFO,1,105,DITFAC,0	; Disconnect event
+						; Up to 150 reserved for events
+	ABRTRJ==STACOD	SEVERE,1,151,DITFAC,0	; Abort or reject
+	INTRCV==STACOD	WARN,1,152,DITFAC,0	; Interrupt data to read first
+	NOTENF==STACOD	ERR,1,153,DITFAC,0	; Not enough data available
+	NODATA==STACOD	ERR,1,154,DITFAC,0	; No data available
+	NOTAVL==STACOD	ERR,1,155,DITFAC,0	; Information is not available
+	INFOUR==STACOD	SEVERE,1,156,DITFAC,0	; Information is out of range
+; Routine return values:
+
+; For anything:
+
+	HORROR==SYSERR		; Awful error
+
+; For NFGND:
+
+	GDWRNG==INVARG		; Argument is of wrong type
+	GDOK..==SSSUCC		; No errors
+	GDCONN==CONEVT		; Connect event
+	GDABRJ==ARJEVT		; Abort or reject
+	GDINT.==INTEVT		; Interrupt data available
+	GDDATA==DATEVT		; Data available
+	GDDC..==DSCEVT		; Disconnect
+
+; For NFOPA:
+
+	OAWRNG==INVARG		; Argument is of wrong type
+	OAOK..==SSSUCC		; No errors
+	OA2MNY==TOOMNY		; Too many links or no more interrupt channels
+	OAABRJ==ABRTRJ		; Abort or reject
+
+; For NFOPB: same as NFOPA
+
+; For NFOP8: same as NFOPA
+
+; For NFOPP: same as NFOPA
+
+; For NFACC:
+
+	ACWRNG==INVARG		; An argument is of the wrong type
+	ACOK..==SSSUCC		; No errors
+
+; For NFRCV:
+
+	RCWRNG==INVARG		; Argument is of the wrong type
+	RCOK..==SSSUCC		; No errors
+	RCABRJ==ABRTRJ		; Link disconnected or aborted
+	RCINT.==INTRCV		; Interrupt data received must be read first
+	RCOVRN==OVRRUN		; Data overrun
+	RCNENF==NOTENF		; This much data not available
+
+; For NFSND:
+
+	SNWRNG==INVARG		; Argument is of the wrong type
+	SNOK..==SSSUCC		; No errors
+
+; For NFREJ:
+
+	RJWRNG==INVARG		; Argument is of the wrong type
+	RJOK..==SSSUCC		; No errors
+
+; For NFINT:
+
+	IDWRNG==INVARG		; Argument is of the wrong type
+	IDOK..==SSSUCC		; No errors
+
+; For NFRCI:
+
+	RIWRNG==INVARG		; Argument is of the wrong type
+	RIOK..==SSSUCC		; No errors
+	RINONE==NODATA		; No data available
+
+; For NFCLS:
+
+	CLWRNG==INVARG		; Argument is of the wrong type
+	CLOK..==SSSUCC		; No errors
+
+; For NFINF:
+
+	INWRNG==INVARG		; Argument is of the wrong type
+	INOK..==SSSUCC		; No errors
+	INNOTA==NOTAVL		; Information not available
+	INOUTR==INFOUR		; Type is out of range
+
+; Other codes:
+
+	WAITLY==1		; Wait for link
+	WAITLN==0		; Do not wait for link
+	LASCII==0		; ASCII link type (for NFACC)
+	LBIN==1			; Binary link type (for NFACC)
+	L8BIT==2		; 8-bit link type (for NFACC)
+	MSGMSG==1		; Message-mode transfer
+	MSGSTM==0		; Stream-mode transfer
+
+; Information types:
+
+	IMIN==^D1		; Minimum information offset
+	INODE==^D1		; Remote node name
+	IOBJ==^D2		; Remote object type
+	IDESCF==^D3		; Remote object descriptor format
+	IDESC==^D4		; Remote object descriptor
+	IUSER==^D5		; Remote process user id
+	IPASS==^D6		; Remote process password
+	IACT==^D7		; Remote process account
+	IOPT==^D8		; Optional data
+	ISEG==^D9		; Maximum segment size for the link
+	IABTCD==^D10		; Maximum segment size for the link
+	IMAX==^D10		; Maximum information offset
+
+; Field sizes:
+
+	SUSRID==^D39		; Size of USERID field
+	SPASWD==^D39		; Size of PASSWORD field
+	SACCNT==^D39		; Size of ACCOUNT field
+	SHOSTN==^D16		; Size of HOSTNAME field
+T10,<	SHOSTN==^D6>		; Size of HOSTNAME field
+	SOBJID==^D16		; Size of OBJECTID field
+	SDESCF==^D16		; Size of DECnet DESCRIPTOR field
+	STASKN==^D16		; Size of TASKNAME field
+	SOPTDT==^D16		; Size of OPTIONAL DATA field
+	SINTDT==^D16		; Size of INTERRUPT DATA field
+
+;; Local Storage
+
+;; Here are stored the canonical forms of all parameters passed
+;; between the calling module and the called module.  This
+;; structure facilitates the use of these subroutines by many
+;; higher-level languages.
+;; Currently only FORTRAN and COBOL have been tested.
+
+DEFINE	LOWSEG,<		;;Impure data definitions
+	X	NETLN,1		;;Address of network logical name,  the
+				;;   offset into the logical link tables.
+	X	TYPE,1		;;Address of subroutine-dependent variable
+	X	DESC,1		;;Byte pointer to ASCIZ representation
+				;;   of complete TOPS20 file spec for
+				;;   the network file
+	X	WAIT,1		;;Address of WAIT variable:  1=WAIT 0=NOWAIT
+	X	COUNT,1		;;Address of byte count for message transfers
+	X	DATA,1		;;Byte pointer for data and status messages
+	X	USIZE,1		;;Storage for message length unit size
+	X	EOM,1		;;Address of end of msg flag:  1=END 0=STREAM
+	X	CODE,1		;;Address of subroutine-dependent variable
+	X	TEMPST,TSIZE	;;Temporary string storage
+
+	X	NEXT,1		;;Fairness word for NFGND
+	X	CHAN,1		;;Channel number chosen for all logical links
+	X	START,1		;;Set to -1 after PSI initialization
+	X	SLOP,1		;;Save left-over unused bits (receive binary)
+
+
+;; Here are stored other local variables.
+
+IFN	OTSFNC,<		;;[35] Locations used if FUNCT. is used in OTS
+	X	FNCBLK,7	;;[35] Argument block for the FUNCT.
+	X	FNCFNC,1	;;[35] FUNCT. function code
+	X	FNCCOD,1	;;[35] FUNCT. error code prefix
+	X	FNCSTS,1	;;[35] FUNCT. return status
+	X	FNCLEV,1	;;[35] FUNCT. interrupt level number
+	X	FNCINT,1	;;[35] FUNCT. interrupt address
+>				;;[35] End of IFN OTSFNC
+
+
+T20,<				;; TOPS-20 dependant storage
+
+	X	T1T2,2		;;Save ACs during interrupts
+	X	T3T4,2		;;...
+	X	XBLOCK,3	;;[37] XSIR%/XRIR% block:
+				;;[37]  word 0: length of block (3)
+				;;[37]  word 1: address of level table
+				;;[37]  word 2: address of channel table
+	X	PC,2		;;[46] Save PC during interrupts
+				;;[46] If extended interrupt JSYSes are used:
+				;;[46]  word 0: flags
+				;;[46]  word 1: real PC
+	X	XFLAG,1		;;[46] Extended interrupt JSYS flag:
+				;;[46]  if 0, not XSIR%; if -1, use XSIR%
+	X	PCPTR,1		;;[35] Pointer to PC location
+	X	LEVTAB,3	;;Priority level table: 0, 0, PC for ints.
+	X	CHNTAB,^D36	;;Interrupt channel table: nothing at first
+;[37]	X	LEVCHN,1	;;Save level and channel table addresses
+	X	LLJFN,MAXLL	;;JFN of this logical link
+
+;; Per-link data tables:
+
+;**; [63] Change at LLEVNT	CLR	11-Mar-83
+	X	LLEVNT,MAXLL	;;[63] 0,,event flags
+	X	LLSTAT,MAXLL	;;Logical link status word
+	X	CODES,MAXLL	;;Byte sizes of links
+> ;; End of TOPS-20 dependant storage
+
+
+
+T10,<				;;Start of TOPS-10 dependant storage
+	X	BL$NSP,.NSAA3+1	;;Sapce for NSP. UUO arg block
+	X	BL$CON,.NSCUD+1	;;Space for NSP. connect block
+	X	BL$SPD,.NSDPN+1 ;;Space for NSP. source process desc. blk.
+	X	BL$DPD,.NSDPN+1 ;;Space for NSP. dest. process desc. blk.
+
+	X	BL$BEG,0	;;Mark beginning of string area
+	X	BL$NOD,<1+<<SHOSTN+3>/4>> ;; Space for host name
+	X	BL$USR,<1+<<SUSRID+3>/4>> ;; Space for user ID
+	X	BL$PAS,<1+<<SPASWD+3>/4>> ;; Space for password
+	X	BL$ACC,<1+<<SACCNT+3>/4>> ;; Space for account
+	X	BL$OPT,<1+<<SOPTDT+3>/4>> ;; Space for optional user data
+	X	BL$DPT,<1+<<STASKN+3>/4>> ;; Space for dst. prc. name
+	X	BL$SPT,<1+<<STASKN+3>/4>> ;; Space for src. prc. name
+	X	BL$END,0	;; Mark end of string area
+
+	Y	BL$IND,<<SHOSTN+1+4>/5>	;;Space to hold remote host name
+	Y	BL$IOB,0		;;Space to hold remote object type (LH)
+	Y	BL$IFM,1		;;Space to hold remote format type (RH)
+	Y	BL$IPP,1		;;Space to hold remote PPN
+	Y	BL$ITK,<<STASKN+1+4>/5>	;;Space to hold remote task name
+	Y	BL$IUS,<<SUSRID+1+4>/5>	;;Space to hold remote user id
+	Y	BL$IPS,<<SPASWD+1+4>/5>	;;Space to hold remote password
+	Y	BL$IAC,<<SACCNT+1+4>/5>	;;Space to hold remote account
+	Y	BL$IOP,<<SOPTDT+1+4>/5>	;;Space to hold remote user data
+	Y	BL$ILN,0		;;Length of remote info area
+
+	X	BL$INF,<BL$ILN*<MAXLL>> ;; Space for NFINF blocks
+
+;; Per-link data tables:
+
+	X	LLEVNT,MAXLL+1	;;Byte pointer,,event flags
+	X	LLSTAT,MAXLL+1	;;Logical link status word
+	X	CODES,MAXLL+1	;;Byte sizes of links
+
+	X	NUMLL,1		;;Number of active logical links
+	X	VECTOR,.PSVIS+1	;;Location of PSI interrupt vector
+
+>;; End of TOPS-10 dependant storage
+
+>				;End of LOWSEG macro
+
+
+
+DEFINE	TTTINI,<		;;Module initialization
+	EXTERN	TTTLOW		;;Cause the low segment to appear
+	TWOSEG	400000		;;High-segment code (for now)
+T20,<	SEARCH	MONSYM,MACSYM>	;;Search the TOPS-20 universal files
+T10,<	SEARCH	UUOSYM,MACSYM>	;;Search the TOPS-10 universal files
+	RELOC	400000		;;Into the high segment (for now)
+
+DEFINE	X (A,B),<		;;Macro to expand the low segment
+;[30] This is done to get around bug in Polish processing in Macro 53.1.
+	A==TTTLOW+I		;;[30] Set up address
+	I==I+B			;;Increment address used up
+>				;;End of X macro
+
+DEFINE	Y (SYM,SIZ),<		;;Macro to generate offsets in BL$INF
+	SYM==II
+	II==II+SIZ
+>				;;End of Y macro
+
+;[30] This is done to get around bug in Polish processing in Macro 53.1.
+
+	I==0			;;[30] Start off the addresses
+	II==0			;; Start off the offsets
+
+	LOWSEG			;;Into the low segment
+
+>				;End of TTTINI macro
+
+	PRGEND			;End of TTTUNV
+
+	TITLE	NFGND Get event information
+	ENTRY	NFGND
+	SEARCH	TTTUNV
+	TTTINI
+	EXTERN	.UPEVT
+T10,<	EXTERN	.GTINF>
+; NFGND (1A)
+;
+; Get information on asynchronous network events.  Wait for any network
+; event to occur.
+;
+; CALL NFGND USING NETLN, WAIT.
+; RETCOD = NFGND (NETLN, WAIT)
+;
+; NETLN	integer network logical name, set by the NFOPA,
+;	NFOPB, NFOP8, or NFOPP routine, or -1 for ALL.
+; WAIT	integer WAITLY: wait for an event
+;	WAITLN: return current status.
+; Return code and function value:
+;	GDWRNG: an argument is of the wrong type
+;	GDOK..: no errors
+;	GDCONN: connect event, should call NFINF, then NFACC or NFREJ
+;		active: connect request accepted
+;		passive: connect request received
+;	GDABRJ: link aborted or rejected, call NFCLS
+;	GDINT.: interrupt message available to read, call NFRCI
+;	GDDATA: data may have been received, call NFRCV
+;	GDDC..: link disconnected, call NFCLS
+;	HORROR: JSYS error.
+
+NFGND:	SAVAC				;Save ACs
+
+; Parameter set-up code:
+
+; NETLN (0) setup:
+
+	IFN	TCK,<			;Type-checking code
+	HRLI	T1,.TYPE		;Get NETLN's type
+	HRRI	T1,0(ARG)		;...
+	LDB	T1,T1			;...
+	CAIN	T1,.OK			;Unspecified is always OK
+	 JRST	L.4			;...
+	CAIE	T1,.I1			;One-word integer is correct
+	 RETURN	GDWRNG			;Anything else is trouble
+>; End IFN TCK
+L.4:	XMOVEI	T1,@0(ARG)		;[51]Address of NETLN
+	MOVEM	T1,NETLN		;Save it
+	MOVE	T1,@NETLN		;Get value given
+	CAML	T1,[EXP -2]		;Can not be less than -1
+	 CAILE	T1,MAXLL		;Or greater than MAXLL
+	 RETURN	GDWRNG			;Return error
+
+; WAIT (1) setup:
+
+	IFN	TCK,<			;Type-checking code
+	HRLI	T1,.TYPE		;Get WAIT's type
+	HRRI	T1,1(ARG)		;...
+	LDB	T1,T1			;...
+	CAIN	T1,.OK			;Unspecified is always OK
+	 JRST	L.5			;...
+	CAIE	T1,.I1			;One-word integer is correct
+	 RETURN	GDWRNG			;Anything else is trouble
+>; End IFN TCK
+L.5:	XMOVEI	T1,@1(ARG)		;[51]Address of WAIT flag
+	MOVEM	T1,WAIT			;Save it
+
+; End of parameter set-up code.
+; GNDCHK (1.1)
+
+; (Also NXTWAT (1.1.2))
+
+; Get network event information.
+
+; NETLN:	link number, of -1 for ALL
+; WAIT:		WAITLN to return current status, or WAITLY to wait for an event
+; RETCOD:	return code for NFGND
+
+GNDCHK:	MOVE	T1,@NETLN		;Get link id
+	JUMPL	T1,CHKALL		;If -1, check all links
+	CALL	CHKEVT			;Anything happen?
+	JUMPN	T2,0(T2)		;Yes, process it
+	MOVE	T1,@WAIT		;Get wait code
+	CAIE	T1,WAITLY		;Waiting?
+	 RETURN	GDOK..			;No, return nothing
+	MOVEI	T1,DISTIM		;Yes, wait
+	DISMS%				;
+	JRST	GNDCHK			;Go look again
+
+CHKALL:	MOVE	T1,NEXT			;Get next logical link to look at
+
+CHKA.1:	CALL	CHKEVT			;Anything happen
+	JUMPN	T2,[MOVEM T1,@NETLN	;Return link number
+		 AOS	T1		;Increment next counter
+		 CAIN	T1,MAXLL	;End of list?
+		  SETZ	T1,		;Yes, start over
+		 MOVEM	T1,NEXT		;Save it
+		 MOVE	T1,@NETLN	;Retrieve the offset
+		 JRST	0(T2)]		;Process the event
+	AOS	T1			;Look at next link
+	CAIN	T1,MAXLL		;End of list?
+	 SETZ	T1,			;Yes, start at beginning
+	CAME	T1,NEXT			;Seen entire list?
+	 JRST	CHKA.1			;No, look again
+	SKIPN	@WAIT			;Waiting?
+	 RETURN	GDOK..			;No
+	MOVEI	T1,DISTIM		;
+	DISMS%				;
+	JRST	CHKALL			;Check again
+; CHKEVT (1.1.1)
+
+; Return current status.
+
+; T1:		index of JFN of the link to check
+
+CHKEVT:
+T20,<	SKIPN	T2,LLJFN(T1)>		;Is JFN assigned?
+T10,<	SKIPN	T2,LLSTAT(T1)>		;Is channel assigned?
+	 RET				;No
+	HRRZ	T2,LLEVNT(T1)		;Get event flags
+	JUMPN	T2,CHKEV1		;Did they get updated at INT level?
+	  CALL	.UPEVT			;No, update event word in case lost INT
+	HRRZ	T2,LLEVNT(T1)		;Get event flags back
+	JUMPE	T2,[RET]		;Report nothing happened
+CHKEV1:	TXNE	T2,EV.CON		;Connect?
+	 JRST	[MOVEI	T2,GND.C	;
+		 RET]			;
+	TXNE	T2,EV.ABT		;Abort?
+	 JRST	[MOVEI	T2,GND.A	;
+		 RET]			;
+	TXNE	T2,EV.INT		;Interrupt message?
+	 JRST	[MOVEI	T2,GND.I	;
+		 RET]			;
+	TXNE	T2,EV.DAT		;Data available?
+	 JRST	[MOVEI	T2,GND.DA	;
+		 RET]			;
+	TXNE	T2,EV.DIS		;Disconnect event?
+	 JRST	[MOVEI	T2,GND.DC	;
+		 RET]			;
+	SETZ	T2,			;
+	RET				;
+
+; Connect event occurred:
+
+GND.C:	MOVEI	T2,EV.CON		;Connect event bit
+	ANDCAM	T2,LLEVNT(T1)		;Turn it off
+T10,<	CALL	.GTINF>			;Get connect info
+	RETURN	GDCONN			;Return with connect status
+
+; Abort occurred:
+
+GND.A:	RETURN	GDABRJ			;Return with abort status
+
+; Disconnect occurred:
+
+GND.DC:	MOVEI	T2,EV.DIS		;Disconnect event bit
+	ANDCAM	T2,LLEVNT(T1)		;Turn it off
+	RETURN	GDDC..			;Return with disconnect status
+
+; Interrupt message available:
+
+GND.I:	RETURN	GDINT.			;Return with interrupt status
+
+; Data available:
+
+GND.DA:	RETURN	GDDATA			;Return with data available status
+
+	PRGEND				;End of NFGND
+
+	TITLE	NFOPU Active link open routines
+	ENTRY	NFOPA
+	SEARCH	TTTUNV
+	TTTINI
+	EXTERN	.LOPEN
+T10,<	EXTERN	.NSPIN>
+; NFOPA (2A)
+;
+; Open an active logical link (DCN:), establishing a connection for
+; the transmission of ASCII data only.
+;
+; A passive link should be used by a server process which waits for
+; other programs to link to it and request its services.  An active
+; link should be used by a program which wants to link to a server
+; program and request its services.  Once a link is established, there
+; is no distinction between the active and passive tasks: both can
+; send data, receive data, send interrupts, receive interrupts, and
+; end the link.
+;
+; On TOPS20, a nonprivileged job can have only four open links.  The
+; system quota of open links depends on the amount of monitor free
+; core available.
+;
+; On TOPS10 and TOPS20, the data is in 7-bit bytes, actually transmitted
+; through the network as 8-bit bytes.  On VMS systems, the data is in
+; 8-bit bytes.
+;
+; CALL NFOPA USING NETLN, HOSTN, OBJID, DESC, TASKN, USERID,
+;	PASSWD, ACCT, USERD, WAIT.
+; RETCOD = NFOPA (NETLN, HOSTN, OBJID, DESC, TASKN, USERID,
+;	1 PASSWD, ACCT, USERD, WAIT)
+;
+; NETLN	identifies the logical link, set by this routine.
+; HOSTN	1 to SHOSTN character ASCII hostname.  This is the name of the
+;	system where the passive task to be connected to is running.
+; OBJID	Optional ASCII DECnet objectid.  This is the nonzero
+;	object type expressed as a decimal number or, for TOPS-20 only,
+;	an object name (1 to SOBJID ASCII characters).
+;	It identifies the generic service offered by the passive
+;	DECnet object being connected to (see Appendix C of the
+;	Functional Specification).  See Appendix B of the Functional
+;	Specification for examples of how the active task specifies
+;	a particular passive task to be connected to.
+; DESC	DECnet descriptor, a 1 to SDESCF character ASCII string which
+;	may optionally be given if an objectid is specified (DECnet VAX
+;	and DECnet-10 do not allow descriptors for nonzero objectids).
+;	If the objectid is type 0 or object name TASK, this is the unique
+;	taskname of the passive task.  For TOPS-20 only, if the objectid
+;	identifies some other object type other than TASK, this field
+;	must match the descriptor specified by the passive task.
+;
+; NOTE: HOSTN, OBJID, and DESC cannot exceed a total of thirty-seven
+; characters (TOPS-20 only restriction).
+;
+; TASKN	DECnet taskname, a 1 to STASKN character ASCII string by which this
+;	process is known to the network.  If this parameter is omitted,
+;	the monitor will assign a taskname.
+;	There is never any real reason for an active task to specify
+;	its taskname.
+; USERID
+;	Optional 1 to SUSRID character ASCII userid.
+; PASSWD
+;	Optional 1 to SPASWD ASCII character password.
+; ACCT	Optional 1 to SACCNT ASCII character account.
+; USERD	Optional 1 to SOPTDT ASCII characters of user data.
+; WAIT	wait code:
+;	WAITLN: return now, use NFGND to check for completion
+;	WAITLY: wait.
+; Return code and function value:
+;	OAWRNG: an argument is of the wrong type
+;	OAOK..: success
+;	OA2MNY: too many links or no more interrupt channels
+;	OAABRJ: target rejected link or aborted, use NFINF to find out
+;	HORROR: JSYS error.
+
+NFOPA:	SAVAC				;Save ACs
+
+; Set up parameters:
+
+	MOVEI	T1,^D7			;Use 7-bit ASCII bytes
+	JRST	OPACT			;Join common code
+
+	ENTRY	NFOPB
+; NFOPB (2B)
+;
+; Open an active logical link (DCN:), establishing a connection for
+; the transmission of records or blocks of data.
+;
+; A passive link should be used by a server program which waits for other
+; programs to link to it and request its services.  An active link
+; should be used by a program which wants to link to a server program
+; and request its services.  Once a link is established, there is no
+; distinction between the active and passive tasks: both can send data,
+; receive data, send interrupts, receive interrupts, and end the link.
+;
+; On TOPS20, a nonprivileged job can have only four open links.  The
+; system quota of open links depends on the amount of monitor free
+; core available.
+;
+; Data is moved as a string of bits (transmitted 8 bits at a time by the
+; network) suitable for input to the data conversion routines,
+; although for convenience the user may specify that his data contains
+; so many bytes of a specified size.  For details of how the bit
+; transport is done for use by the DCR, see Appendix H of the
+; Functional Specification.
+;
+; CALL NFOPB USING NETLN, HOSTN, OBJID, DESC, TASKN, USERID,
+;	PASSWD, ACCT, USERD, WAIT.
+; RETCOD = NFOPB (NETLN, HOSTN, OBJID, DESC, TASKN, USERID,
+;	1 PASSWD, ACCT, USERD, WAIT)
+;
+; NETLN	identifies the logical link, set by this routine.
+; HOSTN	1 to SHOSTN character ASCII hostname.  This is the name of
+;	the system where the passive task to be connected to is running.
+; OBJID	Optional ASCII DECnet objectid.  This is the nonzero
+;	object type expressed as a decimal number or, for TOPS-20 only,
+;	an object name (1 to SOBJID ASCII characters).
+;	It identifies the generic service offered by the passive
+;	DECnet object being connected to (see Appendix C of the
+;	Functional Specification).  See Appendix B of the Functional
+;	Specification for examples of how the active task specifies
+;	a particular passive task to be connected to.
+; DESC	DECnet descriptor, a 1 to SDESCF character ASCII string which
+;	may optionally be given if an objectid is specified (DECnet VAX
+;	and DECnet-10 do not allow descriptors for nonzero objectids).
+;	If the objectid is type 0 or object name TASK, this is the unique
+;	taskname of the passive task.  For TOPS-20 only, if the objectid
+;	identifies some other object type other than TASK, this field
+;	must match the descriptor specified by the passive task.
+;
+; NOTE: HOSTN, OBJID, and DESC cannot exceed a total of thirty-seven
+; characters (TOPS-20 only restriction).
+;
+; TASKN	DECnet taskname, a 1 to STASKN character ASCII string by which this
+;	process is known to the network.  If this parameter is omitted,
+;	the monitor will assign a taskname.
+;	There is never any real reason for an active task to specify
+;	its taskname.
+; USERID
+;	Optional 1 to SUSRID character ASCII userid.
+; PASSWD
+;	Optional 1 to SPASWD character ASCII password.
+; ACCT	Optional 1 to SACCNT character ASCII account.
+; USERD	Optional 1 to SOPTDT ASCII characters of user data.
+; WAIT	wait code:
+;	WAITLN: return now, use NFGND to check for completion
+;	WAITLY: wait.
+; Return code and function value:
+;	OAWRNG: an argument is of the wrong type
+;	OAOK..: success
+;	OA2MNY: too many links or no more interrupt channels
+;	OAABRJ: target rejected link or aborted, use NFINF to find out
+;	HORROR: JSYS error.
+
+NFOPB:	SAVAC				;Save ACs
+
+; Set up parameters:
+
+	MOVEI	T1,^D36			;Use image bytes
+	JRST	OPACT			;Join common code
+
+	ENTRY	NFOP8
+; NFOP8 (2F)
+;
+; Open an active logical link (DCN:), establishing a connection for
+; the transmission of 8-bit bytes of data, stored in the usual manner
+; in which the local system stores 8-bit bytes (see Appendix H of the
+; Functional Specification).
+;
+; A passive link should be used by a server program which waits for other
+; programs to link to it and request its services.  An active link should
+; be used by a program which wants to link to a server and request its
+; services.  Once a link is established, there is no distinction
+; between the active and passive tasks: both can send data, receive
+; data, send interrupts, receive interrupts, or end the link.
+;
+; On TOPS20, a nonprivileged job can have only four open links.  The system
+; quota of open links depends on the amount of monitor free core available.
+;
+; Data is moved as a string of 8-bit bytes, stored as the local system
+; usually stores 8-bit bytes.  No unused bits are transferred.  For
+; details of how the bit transport is done, see Appendix H of the
+; Functional Specification.
+;
+; CALL NFOP8 USING NETLN, HOSTN, OBJID, DESC, TASKN, USERID,
+;	PASSWD, ACCT, USERD, WAIT.
+; RETCOD = NFOP8 (NETLN, HOSTN, OBJID, DESC, TASKN, USERID,
+;	1 PASSWD, ACCT, USERD, WAIT)
+;
+; NETLN	identifies the logical link, set by this routine.
+; HOSTN	1 to SHOSTN ASCII character hostname.  This is the name of the
+;	system where the passive task to be connected to is running.
+; OBJID	Optional ASCII DECnet objectid.  This is the nonzero
+;	object type expressed as a decimal number or, for TOPS-20 only,
+;	an object name (1 to SOBJID ASCII characters).
+;	It identifies the generic service offered by the passive
+;	DECnet object being connected to (see Appendix C of the
+;	Functional Specification).  See Appendix B of the Functional
+;	Specification for examples of how the active task specifies
+;	a particular passive task to be connected to.
+; DESC	DECnet descriptor, a 1 to SDESCF character ASCII string which
+;	may optionally be given if an objectid is specified (DECnet VAX
+;	and DECnet-10 do not allow descriptors for nonzero objectids).
+;	If the objectid is type 0 or object name TASK, this is the unique
+;	taskname of the passive task.  For TOPS-20 only, if the objectid
+;	identifies some other object type other than TASK, this field
+;	must match the descriptor specified by the passive task.
+;
+; NOTE: HOSTN, OBJID, and DESC cannot exceed a total of thirty-seven
+; characters (TOPS-20 only restriction).
+;
+; TASKN	DECnet taskname, a 1 to STASKN character ASCII string by which this
+;	process is known to the network.  If this parameter is omitted,
+;	the monitor will assign a taskname.
+;	There is never any real reason for an active task to specify
+;	its taskname.
+; USERID
+;	Optional 1 to SUSRID character ASCII userid.
+; PASSWD
+;	Optional 1 to SPASWD character ASCII password.
+; ACCT	Optional 1 to SACCNT character ASCII account.
+; USERD	Optional 1 to SOPTDT ASCII characters of user data.
+; WAIT	wait code:
+;	WAITLN: return now, use NFGND to check for completion
+;	WAITLY: wait.
+; Return code and function value:
+;	OAWRNG: an argument is of the wrong type
+;	OAOK..: success
+;	OA2MNY: too many links or no more interrupt channels
+;	OAABRJ: target rejected link or aborted, use NFINF to find out
+;	HORROR: JSYS error.
+
+NFOP8:	SAVAC				;Save ACs
+
+; Set up parameters:
+
+	MOVEI	T1,^D8			;Use 8-bit bytes
+;	JRST	OPACT			;Fall through to OPACT routine
+; OPACT (2Z)
+
+; Common code to set up active task parameters.
+
+OPACT:	MOVEM	T1,CODE			;Remember the byte size
+	MOVEI	T1,1			;Make us active
+	MOVEM	T1,TYPE			;Remember this information
+
+; NETLN (0) setup:
+
+	IFN	TCK,<			;Type-checking code
+	HRLI	T1,.TYPE		;Get NETLN's type
+	HRRI	T1,0(ARG)		;...
+	LDB	T1,T1			;...
+	CAIN	T1,.OK			;Unspecified is always OK
+	 JRST	L.6			;...
+	CAIE	T1,.I1			;One-word integer is correct
+	 RETURN	OAWRNG			;Anything else is trouble
+>; end IFN TCK
+L.6:	XMOVEI	T1,@0(ARG)		;[51]Address of NETLN
+	MOVEM	T1,NETLN		;Save it
+T10,<	CALL	.NSPIN>			;Initialize NSP. associated blocks
+; HOSTN (1) setup:
+
+	HRLI	T1,.TYPE		;Get HOSTN's type
+	HRRI	T1,1(ARG)		;...
+	LDB	T1,T1			;...
+T20,<	MOVE	T4,[POINT 7,TEMPST]	;Build DECnet descriptor
+	MOVEI	T2,"D"			;Form
+	IDPB	T2,T4			;... device
+	MOVEI	T2,"C"			;... DCN:
+	IDPB	T2,T4			;... for
+	MOVEI	T2,"N"			;... the
+	IDPB	T2,T4			;... active
+	MOVEI	T2,":"			;... task's
+	IDPB	T2,T4			;... device.
+>; End of T20
+T10,<	MOVE	T4,[POINT 8,BL$NOD+.NSAST]> ;Byte pointer for host name string desc.
+	CAIN	T1,.OK			;Unspecified, assume FORTRAN
+	 JRST	L.52			;...
+	CAIE	T1,.ST			;[7] COBOL byte string is correct
+	 JRST	L.52			;[7] For now, anything else is FORTRAN
+
+; COBOL code:
+
+	XMOVEI	T1,@1(ARG)		;[51][7] Address of two-word descriptor
+	MOVE	T2,0(T1)		;Byte pointer
+	LDB	T3,[POINT 6,T2,11]	;[7] Get byte pointer
+	CAIE	T3,7			;[7] Must be ASCII
+	 RETURN	OAWRNG			;[7] Wrong type
+	HRRZ	T3,1(T1)		;Byte count
+	JUMPE	T3,.E10A			;[41] No bytes, skip this field
+	CAILE	T3,SHOSTN		;Check for valid count
+	 MOVEI	T3,SHOSTN		;Too big, use maximum
+T10,<	HRLM	T3,BL$NOD+.NSASL>	;Save byte count in string desc. block
+	ILDB	T1,T2			;Get a byte
+	JUMPE	T1,.E10A			;[41] Null?  Yes, skip this field
+	CAIN	T1,40			;Or blank?
+	 JRST	.E10A			;[41] Yes, skip this field
+	JRST	L.7			;Do not load new byte first time in loop
+
+L.57:	ILDB	T1,T2			;Get a byte
+	SKIPE	T1			;Null?  Yes, end string
+	 CAIN	T1,40			;Or blank?
+T20,<	  JRST	.E10>			;Yes, end string
+T10,<	  JRST	[HLRZ T1,BL$NOD+.NSASL	;Get the COBOL string length
+		SUBI  T1,(T3)		;Subtract the excess 
+		HRLM  T1,BL$NOD+.NSASL	;Since NSP. does not tolerate spaces
+		JRST  .E10]
+>; End T10
+L.7:	IDPB	T1,T4			;Otherwise store byte
+	SOJG	T3,L.57			;Loop
+	JRST	.E10			;End of string
+
+; FORTRAN code:
+
+L.52:	XMOVEI	T2,@1(ARG)		;[51]Characters in array
+	HLL	T2,[POINT 7,0]		;Make byte pointer
+	MOVEI	T3,1			;Count a byte
+	ILDB	T1,T2			;Get a byte
+	JUMPE	T1,.E10A			;[41] Null?  Yes, skip this field
+	CAIN	T1,40			;Or blank?
+	 JRST	.E10A			;[41] Yes, skip this field
+	JRST	L.11			;Do not load new byte first time in loop
+
+L.58:	ILDB	T1,T2			;Get a byte
+	JUMPE	T1,L.59			;Null?  Yes, end string
+	CAIN	T1,40			;Or blank?
+	 JRST	L.59			;Yes, end string
+	AOS	T3			;Increment byte count
+L.11:	IDPB	T1,T4			;Otherwise store byte
+	CAIGE	T3,SHOSTN		;Check for valid count
+	 JRST	L.58			;Loop
+L.59:
+T10,<	HRLM	T3,BL$NOD+.NSASL	;Save byte count in string desc. block
+	JRST	.E10			;Continue on
+>; End of T10
+.E10A:					;Here if node name blank or null
+T10,<	MOVE	T1,[DN.FLE+<.DNLNN,,3>]	;DNET. function to get local node name
+	SETZB	T2,T3			;Clear for good measure
+	MOVEI	T0,T1			;Arg pointer
+	DNET.	T0,			;Do it
+	  SETZ	T3,			;Failed?  Clear node name
+	MOVE	T2,[POINT 6,T3]		;SIXBIT pointer to node name
+	MOVEI	T0,6			;Number or characters
+.E10B:	ILDB	T1,T2			;Get a SIXBIT character
+	JUMPE	T1,.E10C		;Stop if blank
+	ADDI	T1,40			;Make it ASCII
+	IDPB	T1,T4			;Save in BL$NOD block
+	SOJG	T0,.E10B		;Do it for whole node name
+.E10C:	MOVEI	T1,6			;Char count
+	SUB	T1,T0			;Minus the spaces
+	HRLM	T1,BL$NOD+.NSASL	;Save in string pointer
+>; End of T10
+
+; End of HOSTN, insert "-"
+
+.E10:
+T20,<	MOVEI	T1,"-"			;Get the character
+	IDPB	T1,T4			;... and store it.
+>; End of T20
+; OBJID (2) setup:
+
+	HRLI	T1,.TYPE		;[41] Get OBJID's type
+	HRRI	T1,2(ARG)		;...
+	LDB	T1,T1			;...
+T10,<	MOVEI	T4,1			;Assume for now FORMAT type 1
+	MOVEM	T4,BL$DPD+.NSDFM
+	HRRZS	BL$DPT+.NSASL		;And zero length TASK name
+	SETZ	T4,			;TOPS-10 requires integer OBJID
+					;So, we will build the integer as we go
+>; End of T10
+	CAIN	T1,.OK			;Unspecified, assume FORTRAN
+	 JRST	L.61			;...
+	CAIE	T1,.ST			;[7] COBOL byte string
+	 JRST	L.61			;[7] For now, anything else is FORTRAN
+
+; COBOL code:
+
+	XMOVEI	T1,@2(ARG)		;[51][7] Address of two-word descriptor
+	MOVE	T2,0(T1)		;Byte pointer
+	LDB	T3,[POINT 6,T2,11]	;[7] Get byte size
+	CAIE	T3,7			;[7] Must be ASCII
+	 RETURN	OAWRNG			;[7] Wrong type
+	HRRZ	T3,1(T1)		;Byte count
+	CAILE	T3,SOBJID		;Check for valid count
+	 MOVEI	T3,SOBJID		;Too big, use maximum
+
+;[56] The objectid is required, so use "0" if none is given.
+	ILDB	T1,T2			;[56] Get first byte of objectid
+	CAIE	T1,40			;[56] Is it blank
+	 CAIN	T1,0			;[56] ... or null?
+	  JRST	[MOVEI	T1,"0"		;[56] Yes, must use "0" instead
+T20,<		 IDPB	T1,T4>		;[56] Store the zero
+	 JRST	.E12	]	;[56] And go to end of objectid code
+	JRST	L.63A			;Join the loop late
+
+L.63:	ILDB	T1,T2			;Get a byte
+	JUMPE	T1,.E12			;Null?  Yes, end string
+	CAIN	T1,40			;Or blank?
+	 JRST	.E12			;Yes, end string
+L.63A:
+T20,<	IDPB	T1,T4>			;Otherwise, store byte
+T10,<	CAIL	T1,"0"			;If decimal digit
+	 CAILE	T1,"9"
+	  JRST	.E12			;Not digit, done
+	IMULI	T4,^D10			;Prepare current accumulated integer
+	SUBI	T1,"0"			;Convert ASCII to binary
+	ADDI	T4,(T1)			;Add in this digit
+>; End of T10
+	SOJG	T3,L.63			;Count this byte
+	 JRST	.E12			;End of string
+
+; FORTRAN code:
+
+L.61:	XMOVEI	T2,@2(ARG)		;[51]Characters in array
+	HLL	T2,[POINT 7,0]		;Make byte pointer
+	SETZM	T3			;Byte count
+
+;[56] The objectid is required, so use "0" if none is given.
+	ILDB	T1,T2			;[56] Get first byte of objectid
+	CAIE	T1,40			;[56] Is it blank
+	 CAIN	T1,0			;[56] ... or null?
+	  JRST	[MOVEI	T1,"0"		;[56] Yes, use "0".
+T20,<		 IDPB	T1,T4>		;[56] Store the zero
+		 JRST	.E12	]	;[56] Go to end of objectid code
+	JRST	L.64A			;Join the loop late
+
+L.64:	ILDB	T1,T2			;Get a byte
+	AOS	T3			;Count byte
+	JUMPE	T1,.E12			;Null?  Yes, end string
+	CAIN	T1,40			;Or blank?
+	 JRST	.E12			;Yes, end string
+L.64A:
+T20,<	IDPB	T1,T4>			;Otherwise, store byte
+T10,<	CAIL	T1,"0"			;If decimal digit
+	 CAILE	T1,"9"
+	  JRST	.E12			;Not a digit, done
+	IMULI	T4,^D10			;Prepare current accumulated integer
+	SUBI	T1,"0"			;Convert ASCII to binary
+	ADDI	T4,(T1)			;Add in this digit
+>; End of T10
+	CAIGE	T3,SOBJID		;Check for valid count
+	 JRST	L.64			;Loop
+
+; End of OBJID, insert "-"
+
+;[56] Do not insert the "-" after the objectid unless there is a descriptor
+.E12:
+;[56]	MOVEI	T1,"-"			;Get the character
+;[56]	IDPB	T1,T4			;... and store it.
+T10,<	MOVEM	T4,BL$DPD+.NSDOB	;Save away the object number
+	SKIPE	T4			;And, if non-zero
+	  SETZM	BL$DPD+.NSDFM		;Then this is a FORMAT type 0
+	SKIPE	T4			;If non-zero object type
+	  JRST	.E13			;DECnet-10 will not accept a
+					; task name, so skip this
+>; End of T10
+; DESC (3) setup:
+
+	HRLI	T1,.TYPE		;Get DESC's type
+	HRRI	T1,3(ARG)		;...
+	LDB	T1,T1			;...
+T10,<	MOVE	T4,[POINT 8,BL$DPT+.NSAST]> ;Start TASK string
+	CAIN	T1,.OK			;Unspecified, assume FORTRAN
+	 JRST	L.65			;...
+	CAIE	T1,.ST			;[7] COBOL byte string
+	 JRST	L.65			;[7] For now, anything else is FORTRAN
+
+; COBOL code:
+
+	XMOVEI	T1,@3(ARG)		;[51]Address of two-word descriptor
+	MOVE	T2,0(T1)		;Byte pointer
+	LDB	T3,[POINT 6,T2,11]	;[7] Get byte size
+	CAIE	T3,7			;[7] Must be ASCII
+	 RETURN	OAWRNG			;[7] Wrong type
+	HRRZ	T3,1(T1)		;Byte count
+	CAILE	T3,SDESCF		;Check for valid count
+	 MOVEI	T3,SDESCF		;Too big, use maximum
+T10,<	HRLM	T3,BL$DPT+.NSASL>	;Save byte count in string desc. block
+
+;[56] Insert "-" after the objectid if there is a descriptor
+	ILDB	T1,T2			;[56] Get first byte of descriptor
+	CAIE	T1,40			;[56] Is it blank
+	 CAIN	T1,0			;[56] ... or null?
+	  JRST	.E13			;[56] Yes, skip all this
+T20,<	PUSH	P,T1			;[56] Otherwise, save this character
+	MOVEI	T1,"-"			;[56] ... and get a "-"
+	IDPB	T1,T4			;[56] Store the "-"
+	POP	P,T1			;[56] Restore the character
+>; End of T20
+	IDPB	T1,T4			;[56] ... and insert it
+	SOS	T3			;[56] Account for one character
+
+L.67:	ILDB	T1,T2			;Get a byte
+	JUMPE	T1,.E13			;Null?  Yes, end string
+	CAIN	T1,40			;Or blank?
+	 JRST	.E13			;Yes, end string
+	IDPB	T1,T4			;Otherwise, store byte
+	SOJG	T3,L.67			;Count this byte
+	 JRST	.E13			;End of string
+
+; FORTRAN code:
+
+L.65:	XMOVEI	T2,@3(ARG)		;[51]Characters in array
+	HLL	T2,[POINT 7,0]		;Make byte pointer
+	SETZM	T3			;Byte count
+
+;[56] Insert "-" after the objectid if there is a descriptor.
+	ILDB	T1,T2			;[56] Get first byte of descriptor
+	CAIE	T1,40			;[56] Is it blank
+	 CAIN	T1,0			;[56] ... or null?
+	  JRST	.E13			;[56] Yes, skip to end of desc. code
+T20,<	PUSH	P,T1			;[56] otherwise, save this byte
+	MOVEI	T1,"-"			;[56] ... and get a "-"
+	IDPB	T1,T4			;[56] Store the "-"
+	POP	P,T1			;[56] Restore the character
+>; End of T20
+	IDPB	T1,T4			;[56] ... and store it
+	AOS	T3			;[56] Account for one character
+
+L.68:	ILDB	T1,T2			;Get a byte
+	JUMPE	T1,L.68A		;Null?  Yes, end string
+	CAIN	T1,40			;Or blank?
+	 JRST	L.68A			;Yes, end string
+	AOS	T3			;Count byte
+	IDPB	T1,T4			;Otherwise, store byte
+	CAIGE	T3,SDESCF		;Check for valid count
+	 JRST	L.68			;Loop
+L.68A:
+T10,<	HRLM	T3,BL$DPT+.NSASL>	;Save byte counter
+
+; End of DESC, insert "."
+
+;[56] Do not insert a "." after the descriptor unless there is a taskname.
+.E13:
+;[56]	MOVEI	T1,"."			;Get the character
+;[56]	IDPB	T1,T4			;... and store it.
+; TASKN (4) setup:
+
+	HRLI	T1,.TYPE		;Get TASKN's type
+	HRRI	T1,4(ARG)		;...
+	LDB	T1,T1			;...
+T10,<	MOVEI	T4,1			;Assume for now FORMAT type 1
+	MOVEM	T4,BL$SPD+.NSDFM
+	HRRZS	BL$SPT+.NSASL		;And zero length TASK name
+	MOVE	T4,[POINT 8,BL$SPT+.NSAST] ;Start TASK string
+>; End of T10
+	CAIN	T1,.OK			;Unspecified, assume FORTRAN
+	 JRST	L.69			;...
+	CAIE	T1,.ST			;[7] COBOL byte string
+	 JRST	L.69			;[7] For now, anything else is FORTRAN
+
+; COBOL code:
+
+	XMOVEI	T1,@4(ARG)		;[51][7] Address of two-word descriptor
+	MOVE	T2,0(T1)		;Byte pointer
+	LDB	T3,[POINT 6,T2,11]	;[7] Get byte size
+	CAIE	T3,7			;[7] Must be ASCII
+	 RETURN	OAWRNG			;[7] Wrong type
+	HRRZ	T3,1(T1)		;Byte count
+	CAILE	T3,STASKN		;Check for valid count
+	 MOVEI	T3,STASKN		;Too big, use maximum
+T10,<	HRLM	T3,BL$SPT+.NSASL>	;Save byte count in string desc. block
+
+;[56] Insert "." if there is a taskname.
+	ILDB	T1,T2			;[56] Get first character of taskname
+	CAIE	T1,40			;[56] Is it blank
+	 CAIN	T1,0			;[56] ... or null?
+	  JRST	.E14A			;[56] Yes, skip to end of taskname
+T20,<	PUSH	P,T1			;[56] Otherwise, save this character
+	MOVEI	T1,"."			;[56] Get "."
+	IDPB	T1,T4			;[56] ... and store it
+	POP	P,T1			;[56] Restore the character
+>; End of T20
+	IDPB	T1,T4			;[56] ... and store it
+	SOS	T3			;[56] Account for the character
+
+L.71:	ILDB	T1,T2			;Get a byte
+	JUMPE	T1,.E14			;Null?  Yes, end string
+	CAIN	T1,40			;Or blank?
+	 JRST	.E14			;Yes, end string
+	IDPB	T1,T4			;Otherwise, store byte
+	SOJG	T3,L.71			;Count this byte
+	JRST	.E14			;End of string
+
+; FORTRAN code:
+
+L.69:	XMOVEI	T2,@4(ARG)		;[51]Characters in array
+	HLL	T2,[POINT 7,0]		;Make byte pointer
+	SETZM	T3			;Byte count
+
+;[56] Insert "." if there is a taskname.
+	ILDB	T1,T2			;[56] Get first character of taskname
+	CAIE	T1,40			;[56] Is it blank
+	 CAIN	T1,0			;[56] ... or null?
+	  JRST	.E14A			;[60][56] Yes, go to end of taskname
+T20,<	PUSH	P,T1			;[56] Otherwise, save this character
+	MOVEI	T1,"."			;[56] Get the "."
+	IDPB	T1,T4			;[56] ... and store it
+	POP	P,T1			;[56] Restore the character
+>; End of T20
+	IDPB	T1,T4			;[56] ... and store it
+	AOS	T3			;[56] Account for one character
+
+L.72:	ILDB	T1,T2			;Get a byte
+	JUMPE	T1,L.72A		;Null?  Yes, end string
+	CAIN	T1,40			;Or blank?
+	 JRST	L.72A			;Yes, end string
+	AOS	T3			;Count byte
+	IDPB	T1,T4			;Otherwise, store byte
+	CAIGE	T3,STASKN		;Check for valid count
+	 JRST	L.72			;Loop
+L.72A:
+T10,<	HRLM	T3,BL$SPT+.NSASL	;Save byte count
+	JRST	.E14			;Done with task name
+>; End of T10
+
+.E14A:					;TOPS-10 special hack
+T10,<	SETZM	BL$SPD+.NSDFM		;Here if no active task name given
+	MOVEI	T1,345			;Must make a format type zero proc
+	MOVEM	T1,BL$SPD+.NSDOB	; desc with obj type non-zero to keep
+					; VMS happy (345 is an arbitrary OBJ!)
+>; End of T10
+; USERID (5) setup:
+
+.E14:	HRLI	T1,.TYPE		;Get USERID's type
+	HRRI	T1,5(ARG)		;...
+	LDB	T1,T1			;...
+T10,<	MOVE	T4,[POINT 8,BL$USR+.NSAST]> ;Start USERID string
+	CAIN	T1,.OK			;Unspecified, assume FORTRAN
+	 JRST	L.81			;...
+	CAIE	T1,.ST			;[7] COBOL byte string
+	 JRST	L.81			;[7] For now, anything else is FORTRAN
+
+; COBOL code:
+
+	XMOVEI	T1,@5(ARG)		;[51]Address of two-word descriptor
+	MOVE	T2,0(T1)		;Byte pointer
+	LDB	T3,[POINT 6,T2,11]	;[7] Get byte size
+	CAIE	T3,7			;[7] Must be ASCII
+	 RETURN	OAWRNG			;[7] Wrong type
+	HRRZ	T3,1(T1)		;Byte count
+	JUMPE	T3,.E17			;No bytes?  Skip this field
+	CAILE	T3,SUSRID		;Check for valid count
+	 MOVEI	T3,SUSRID		;Too big, use maximum
+T10,<	HRLM	T3,BL$USR+.NSASL>	;Save byte count in string desc. block
+	ILDB	T1,T2			;Get a byte
+	JUMPE	T1,.E17			;Null?  Yes, skip this field
+	CAIN	T1,40			;Or blank?
+	 JRST	.E17			;yes, skip this field
+T20,<	PUSH	P,T1			;Save the first byte
+	PUSH	P,T2			;... the byte pointer
+	PUSH	P,T3			;... and the byte count
+	MOVE	T2,[POINT 7,[ASCIZ /;USERID:/]]
+	MOVEI	T3,^D8			;8 characters in the prefix
+
+L.83:	ILDB	T1,T2			;Get a character
+	IDPB	T1,T4			;Store it in the DECnet descriptor
+	SOJG	T3,L.83			;Get all of the prefix
+	POP	P,T3			;Retrieve byte count
+	POP	P,T2			;... byte pointer
+	POP	P,T1			;... and the first byte.
+>; End of T20
+	JRST	L.105			;Skip getting a byte
+
+L.84:	ILDB	T1,T2			;Get a byte
+	JUMPE	T1,.E17			;Null?  Yes, end string
+	CAIN	T1,40			;Or blank?
+	 JRST	.E17			;Yes, end string
+L.105:	IDPB	T1,T4			;Otherwise, store the byte
+	SOJG	T3,L.84			;Count this byte
+	 JRST	.E17			;End of string
+
+; FORTRAN code:
+
+L.81:	XMOVEI	T2,@5(ARG)		;[51]Characters in array
+	HLL	T2,[POINT 7,0]		;Make a byte pointer
+	MOVEI	T3,1			;Count a byte
+	ILDB	T1,T2			;Get a byte
+	JUMPE	T1,.E17			;Null?  Yes, skip this field
+	CAIN	T1,40			;Or blank?
+	 JRST	.E17			;Yes, skip this field
+T20,<	PUSH	P,T1			;Save the first byte
+	PUSH	P,T2			;... and the byte pointer
+	MOVE	T2,[POINT 7,[ASCIZ /;USERID:/]]
+	MOVEI	T3,^D8			;8 characters in the prefix
+
+L.85:	ILDB	T1,T2			;Get a character
+	IDPB	T1,T4			;Store it in the DECnet descriptor
+	SOJG	T3,L.85			;Get all of the prefix
+	POP	P,T2			;Retrieve the byte pointer
+	POP	P,T1			;... and the first byte
+>; End of T20
+	JRST	L.107			;Skip getting another byte
+
+L.86:	ILDB	T1,T2			;Get a byte
+	JUMPE	T1,L.107A		;Null?  Yes, end string
+	CAIN	T1,40			;Or blank?
+	 JRST	L.107A			;Yes, end string
+	AOS	T3			;Increment byte count
+
+L.107:	IDPB	T1,T4			;Otherwise, store byte
+	CAIGE	T3,SUSRID		;Check for valid count
+	 JRST	L.86			;End loop
+L.107A:
+T10,<	HRLM	T3,BL$USR+.NSASL>	;Save byte count in string desc. block
+; PASSWD (6) setup:
+
+.E17:	HRLI	T1,.TYPE		;Get PASSWD's type
+	HRRI	T1,6(ARG)		;...
+	LDB	T1,T1			;...
+T10,<	MOVE	T4,[POINT 8,BL$PAS+.NSAST]> ;Start USERID string
+	CAIN	T1,.OK			;Unspecified, assume FORTRAN
+	 JRST	L.87			;...
+	CAIE	T1,.ST			;[7] COBOL byte string
+	 JRST	L.87			;[7] For now, anything else is FORTRAN
+
+; COBOL code:
+
+	XMOVEI	T1,@6(ARG)		;[51][7] Address of two-word descriptor
+	MOVE	T2,0(T1)		;Byte pointer
+	LDB	T3,[POINT 6,T2,11]	;[7] Get byte size
+	CAIE	T3,7			;[7] Must be ASCII
+	 RETURN	OAWRNG			;[7] Wrong type
+	HRRZ	T3,1(T1)		;Byte count
+	JUMPE	T3,.E18			;No bytes?  Skip this field
+	CAILE	T3,SPASWD		;Check for valid count
+	 MOVEI	T3,SPASWD		;Too big, use maximum
+T10,<	HRLM	T3,BL$PAS+.NSASL>	;Save byte count in string desc. block
+	ILDB	T1,T2			;Get a byte
+	JUMPE	T1,.E18			;Null?  Yes, skip this field
+	CAIN	T1,40			;Or blank?
+	 JRST	.E18			;yes, skip this field
+T20,<	PUSH	P,T1			;Save the first byte
+	PUSH	P,T2			;... the byte pointer
+	PUSH	P,T3			;... and the byte count
+	MOVE	T2,[POINT 7,[ASCIZ /;PASSWORD:/]]
+	MOVEI	T3,^D10			;Ten characters in the prefix
+
+L.89:	ILDB	T1,T2			;Get a character
+	IDPB	T1,T4			;Store it in the DECnet descriptor
+	SOJG	T3,L.89			;Get all of the prefix
+	POP	P,T3			;Retrieve byte count
+	POP	P,T2			;... byte pointer
+	POP	P,T1			;... and the first byte.
+>; End of T20
+	JRST	L.108			;Skip getting a byte
+
+L.90:	ILDB	T1,T2			;Get a byte
+	JUMPE	T1,.E18			;Null?  Yes, end string
+	CAIN	T1,40			;Or blank?
+	 JRST	.E18			;Yes, end string
+L.108:	IDPB	T1,T4			;Otherwise, store the byte
+	SOJG	T3,L.90			;Count this byte
+	 JRST	.E18			;End of string
+
+; FORTRAN code:
+
+L.87:	XMOVEI	T2,@6(ARG)		;[51]Characters in array
+	HLL	T2,[POINT 7,0]		;Make a byte pointer
+	MOVEI	T3,1			;Count a byte
+	ILDB	T1,T2			;Get a byte
+	JUMPE	T1,.E18			;Null?  Yes, skip this field
+	CAIN	T1,40			;Or blank?
+	 JRST	.E18			;Yes, skip this field
+T20,<	PUSH	P,T1			;Save the first byte
+	PUSH	P,T2			;... and the byte pointer
+	MOVE	T2,[POINT 7,[ASCIZ /;PASSWORD:/]]
+	MOVEI	T3,^D10			;Ten characters in the prefix
+
+L.91:	ILDB	T1,T2			;Get a character
+	IDPB	T1,T4			;Store it in the DECnet descriptor
+	SOJG	T3,L.91			;Get all of the prefix
+	POP	P,T2			;Retrieve the byte pointer
+	POP	P,T1			;... and the first byte
+>; End of T20
+	JRST	L.109			;Skip getting another byte
+
+L.92:	ILDB	T1,T2			;Get a byte
+	JUMPE	T1,L.109A		;Null?  Yes, end string
+	CAIN	T1,40			;Or blank?
+	 JRST	L.109A			;Yes, end string
+	AOS	T3			;Increment byte count
+
+L.109:	IDPB	T1,T4			;Otherwise, store byte
+	CAIGE	T3,SPASWD		;Check for valid count
+	 JRST	L.92			;End loop
+L.109A:
+T10,<	HRLM	T3,BL$PAS+.NSASL>	;Save byte count in string desc. block
+; ACCT (7) setup:
+
+.E18:	HRLI	T1,.TYPE		;Get ACCT's type
+	HRRI	T1,7(ARG)		;...
+	LDB	T1,T1			;...
+T10,<	MOVE	T4,[POINT 8,BL$ACC+.NSAST]> ;Start USERID string
+	CAIN	T1,.OK			;Unspecified, assume FORTRAN
+	 JRST	L.93			;...
+	CAIE	T1,.ST			;[7] COBOL byte string
+	 JRST	L.93			;[7] For now, anything else is FORTRAN
+
+; COBOL code:
+
+	XMOVEI	T1,@7(ARG)		;[51][7] Address of two-word descriptor
+	MOVE	T2,0(T1)		;Byte pointer
+	LDB	T3,[POINT 6,T2,11]	;[7] Get byte size
+	CAIE	T3,7			;[7] Must be ASCII
+	 RETURN	OAWRNG			;[7] Wrong type
+	HRRZ	T3,1(T1)		;Byte count
+	JUMPE	T3,.E19			;No bytes?  Skip this field
+	CAILE	T3,SACCNT		;Check for valid account
+	 MOVEI	T3,SACCNT		;Too big, use maximum
+T10,<	HRLM	T3,BL$ACC+.NSASL>	;Save byte count in string desc. block
+	ILDB	T1,T2			;Get a byte
+	JUMPE	T1,.E19			;Null?  Yes, skip this field
+	CAIN	T1,40			;Or blank?
+	 JRST	.E19			;Yes, skip this field
+T20,<	PUSH	P,T1			;Save the first byte
+	PUSH	P,T2			;... the byte pointer
+	PUSH	P,T3			;... and the byte count
+	MOVE	T2,[POINT 7,[ASCIZ /;CHARGE:/]]
+	MOVEI	T3,^D8			;8 characters in the prefix
+
+L.95:	ILDB	T1,T2			;Get a character
+	IDPB	T1,T4			;Store it in the DECnet descriptor
+	SOJG	T3,L.95			;Get all of the prefix
+	POP	P,T3			;Retrieve byte count
+	POP	P,T2			;... byte pointer
+	POP	P,T1			;... and the first byte.
+>; End of T20
+	JRST	L.111			;Skip getting another byte
+
+L.96:	ILDB	T1,T2			;Get a byte
+	JUMPE	T1,.E19			;Null?  Yes, end string
+	CAIN	T1,40			;Or blank?
+	 JRST	.E19			;Yes, end string
+L.111:	IDPB	T1,T4			;Otherwise, store the byte
+	SOJG	T3,L.96			;Count this byte
+	 JRST	.E19			;End of string
+
+; FORTRAN code:
+
+L.93:	XMOVEI	T2,@7(ARG)		;[51]Characters in array
+	HLL	T2,[POINT 7,0]		;Make a byte pointer
+	MOVEI	T3,1			;Count a byte
+	ILDB	T1,T2			;Get a byte
+	JUMPE	T1,.E19			;Null?  Yes, skip this field
+	CAIN	T1,40			;Or blank?
+	 JRST	.E19			;Yes, skip this field
+T20,<	PUSH	P,T1			;Save the first byte
+	PUSH	P,T2			;... and the byte pointer
+	MOVE	T2,[POINT 7,[ASCIZ /;CHARGE:/]]
+	MOVEI	T3,^D8			;8 characters in the prefix
+
+L.97:	ILDB	T1,T2			;Get a character
+	IDPB	T1,T4			;Store it in the DECnet descriptor
+	SOJG	T3,L.97			;Get all of the prefix
+	POP	P,T2			;Retrieve the byte pointer
+	POP	P,T1			;... and the first byte
+>; End of T20
+	JRST	L.112			;Skip getting another byte
+
+L.98:	ILDB	T1,T2			;Get a byte
+	JUMPE	T1,L.112A		;Null?  Yes, end string
+	CAIN	T1,40			;Or blank?
+	 JRST	L.112A			;Yes, end string
+	AOS	T3			;Increment byte count
+
+L.112:	IDPB	T1,T4			;Otherwise, store byte
+	CAIGE	T3,SACCNT		;Check for valid count
+	 JRST	L.98			;End loop
+L.112A:
+T10,<	HRLM	T3,BL$ACC+.NSASL>	;Save byte count in string desc. block
+; USERD (10) setup:
+
+.E19:	HRLI	T1,.TYPE		;Get USERID's type
+	HRRI	T1,10(ARG)		;...
+	LDB	T1,T1			;...
+T10,<	MOVE	T4,[POINT 8,BL$OPT+.NSAST]> ;Start USERID string
+	CAIN	T1,.OK			;Unspecified, assume FORTRAN
+	 JRST	L.99			;...
+	CAIE	T1,.ST			;[7] COBOL byte string
+	 JRST	L.99			;[7] For now, anything else is FORTRAN
+
+; COBOL code:
+
+	XMOVEI	T1,@10(ARG)		;[51][7] Address of two-word descriptor
+	MOVE	T2,0(T1)		;Byte pointer
+	LDB	T3,[POINT 6,T2,11]	;[7] Get byte pointer
+	CAIE	T3,7			;[7] Must be ASCII
+	 RETURN	OAWRNG			;[7] Wrong type
+	HRRZ	T3,1(T1)		;Byte count
+	JUMPE	T3,.E20			;No bytes?  Skip this field
+	CAILE	T3,SOPTDT		;Check for valid count
+	 MOVEI	T3,SOPTDT		;Too big, use maximum
+T10,<	HRLM	T3,BL$OPT+.NSASL>	;Save byte count in string desc. block
+	ILDB	T1,T2			;Get a byte
+	JUMPE	T1,.E20			;Null?  Yes, skip this field
+	CAIN	T1,40			;Or blank?
+	 JRST	.E20			;Yes, skip this field
+T20,<	PUSH	P,T1			;Save the first byte
+	PUSH	P,T2			;... the byte pointer
+	PUSH	P,T3			;... and the byte count
+	MOVE	T2,[POINT 7,[ASCIZ /;DATA:/]]
+	MOVEI	T3,^D6			;6 characters in the prefix
+
+L.101:	ILDB	T1,T2			;Get a character
+	IDPB	T1,T4			;Store it in the DECnet descriptor
+	SOJG	T3,L.101		;Get all of the prefix
+	POP	P,T3			;Retrieve byte count
+	POP	P,T2			;... byte pointer
+	POP	P,T1			;... and the first byte.
+>; End of T20
+	JRST	L.113			;Skip getting another byte
+
+L.102:	ILDB	T1,T2			;Get a byte
+	JUMPE	T1,.E20			;Null?  Yes, end string
+	CAIN	T1,40			;Or blank?
+	 JRST	.E20			;Yes, end string
+L.113:	IDPB	T1,T4			;Otherwise, store the byte
+	SOJG	T3,L.102		;Count this byte
+	 JRST	.E17			;End of string
+
+; FORTRAN code:
+
+L.99:	XMOVEI	T2,@10(ARG)		;[51]Characters in array
+	HLL	T2,[POINT 7,0]		;Make a byte pointer
+	MOVEI	T3,1			;Count a byte
+	ILDB	T1,T2			;Get a byte
+	JUMPE	T1,.E20			;Null?  Yes, skip this field
+	CAIN	T1,40			;Or blank?
+	 JRST	.E20			;Yes, skip this field
+T20,<	PUSH	P,T1			;Save the first byte
+	PUSH	P,T2			;... and the byte pointer
+	MOVE	T2,[POINT 7,[ASCIZ /;DATA:/]]
+	MOVEI	T3,^D6			;6 characters in the prefix
+
+L.103:	ILDB	T1,T2			;Get a character
+	IDPB	T1,T4			;Store it in the DECnet descriptor
+	SOJG	T3,L.103		;Get all of the prefix
+	POP	P,T2			;Retrieve the byte pointer
+	POP	P,T1			;... and the first byte
+>; End of T20
+	JRST	L.114			;Skip getting another byte
+
+L.104:	ILDB	T1,T2			;Get a byte
+	JUMPE	T1,L.114A		;Null?  Yes, end string
+	CAIN	T1,40			;Or blank?
+	 JRST	L.114A			;Yes, end string
+	AOS	T3			;Increment byte count
+
+L.114:	IDPB	T1,T4			;Otherwise, store byte
+	CAIGE	T3,SOPTDT		;Check for valid count
+	 JRST	L.104			;End loop
+L.114A:
+T10,<	HRLM	T3,BL$OPT+.NSASL>	;Save byte count in string desc. block
+
+
+; End of DECnet descriptor.  Make it ASCIZ by adding a null.
+
+.E20:
+T20,<	SETZ	T1,			;Get a null byte
+	IDPB	T1,T4			;... and store it in the string
+	MOVE	T2,[POINT 7,TEMPST]	;Get DECnet string address
+	MOVEM	T2,DESC			;... and store it
+>; End of T20
+; WAIT (11) setup:
+
+	IFN	TCK,<			;Type-checking code
+	HRLI	T1,.TYPE		;Get WAIT's type
+	HRRI	T1,11(ARG)		;...
+	LDB	T1,T1			;...
+	CAIN	T1,.OK			;Unspecified is always OK
+	 JRST	L.10			;...
+	CAIE	T1,.I1			;One-word integer is correct
+	 RETURN	OAWRNG			;Anything else is trouble
+>; End IFN TCK
+L.10:	XMOVEI	T1,@11(ARG)		;[51]Get WAIT code's address
+	MOVEM	T1,WAIT			;Save it
+
+; End of parameter set-up.
+
+	JRST	.LOPEN			;Join common code
+
+	PRGEND				;End of NFOPU
+
+	TITLE	NFOPP Open a passive link
+	ENTRY	NFOPP
+	SEARCH	TTTUNV
+	TTTINI
+	EXTERN	.LOPEN
+T10,<	EXTERN	.NSPIN>
+; NFOPP
+;
+; Open a passive logical link (SRV:), declaring a server task ready to
+; accept connections from active tasks.
+;
+; A passive link should be used by a server program which waits for other
+; programs to link to it and request its services.  An active link should
+; be used by a program which wants to link to a server program and
+; request its services.  Once a link is established, there is no distinction
+; between the active and passive tasks: both can send data, receive
+; data, send interrupts, receive interrupts, and end the link.
+;
+; On TOPS20, a nonprivileged job can have only four open links.  The system
+; quota of open links depends on the amount of monitor free core
+; available.
+;
+; How data is actually moved through the link is established when a
+; connection to this passive task is accepted.  The passive task
+; should accept the link for the same type of data transfer the active
+; task opened the link for.  If some other type of data transfer is
+; used instead, the results are undefined.  See Appendix H of the
+; Functional Specification for details of how the bit transport is
+; done for the various modes.
+;
+; CALL NFOPP USING NETLN, OBJID, DESC, TASKN, WAIT.
+; RETCOD = NFOPP (NETLN, OBJID, DESC, TASKN, WAIT)
+;
+; NETLN	identifies the logical link, set by this routine.
+;
+; OBJID	Optional DECnet objectid.  This is the nonzero type expressed as
+;	a decimal number or, for TOPS-20 only, an object name (1 to SOBJID
+;	ASCII characters).  It identifies the generic service
+;	offered by this passive DECnet object (see Appendix C of the Functional
+;	Specification).  See Appendix B of the Functional Specification for
+;	examples of how the active task specifies a particular passive task
+;	to be connected to.
+;
+; NOTE: OBJID and DESC cannot exceed a total of thirty-eight characters.
+;	(TOPS-20 only restriction)
+;
+; DESC	DECnet descriptor, a 1 to SDESCF character ASCII string which may
+;	optionally be given if an objectid is specified (DECnet-10 and VAX do
+;	not allow descriptors for nonzero objectids.  In fact, TOPS-10
+;	ignores this argument entirely).  If a descriptor is
+;	used by the passive task, it must be used by an active task in
+;	order to access the passive task.
+; TASKN	DECnet taskname, a 1 to STASKN character ASCII string by which this
+;	process is known to the network.
+;	If this parameter is omitted, the monitor will assign a
+;	taskname.  For objectid 0 (object name TASK), this taskname
+;	may be specified as the descriptor by an active task
+;	desiring to connect to this passive task.
+;	The taskname of a passive task is thus only important if the
+;	objectid is zero (object name TASK), because the active task
+;	will be using the taskname to refer to the passive task.
+; WAIT	wait code:
+;	WAITLN: return now, use NFGND to check for completion
+;	WAITLY: wait.
+; Return code and function value:
+;	OAWRNG: an argument is of the wrong type
+;	OAOK..: success
+;	OA2MNY: too many links or no more interrupt channels
+;	OAABRJ: target rejected link or aborted, use NFINF to find out
+;	HORROR: JSYS error.
+
+NFOPP:	SAVAC				;Save ACs
+
+; Set up parameters:
+
+	SETZM	TYPE			;Remember this is passive
+	SETZM	CODE			;No bytesize yet
+
+; NETLN (0) setup:
+
+	IFN	TCK,<			;Type-checking code
+	HRLI	T1,.TYPE		;Get NETLN's type
+	HRRI	T1,0(ARG)		;...
+	LDB	T1,T1			;...
+	CAIN	T1,.OK			;Unspecified is always OK
+	 JRST	L.106			;...
+	CAIE	T1,.I1			;One-word integer is correct
+	 RETURN	OAWRNG			;Anything else is trouble
+>; end IFN TCK
+L.106:	XMOVEI	T1,@0(ARG)		;[51]Address of NETLN
+	MOVEM	T1,NETLN		;Save it
+T10,<	CALL	.NSPIN			;Initialize the NSP. connect block
+	MOVEI	T1,.NSCDD+1		;Passive block is shorter
+	MOVEM	T1,BL$CON+.NSCNL	;So we don't check access info
+	SETZM	BL$CON+.NSCND		;Accept from any NODE
+	SETZM	BL$CON+.NSCSD		;Accept from any TASK
+>; End of T10
+; Set up DECnet description:
+
+T20,<	MOVE	T4,[POINT 7,TEMPST]	;Build up DECnet description
+	MOVEI	T2,"S"			;Form
+	IDPB	T2,T4			;... SRV:
+	MOVEI	T2,"R"			;... for
+	IDPB	T2,T4			;... the
+	MOVEI	T2,"V"			;... passive
+	IDPB	T2,T4			;... task's
+	MOVEI	T2,":"			;... device.
+	IDPB	T2,T4			;...
+>; End of T20
+
+; OBJID (1) setup:
+
+	HRLI	T1,.TYPE		;Get OBJID's type
+	HRRI	T1,1(ARG)		;...
+	LDB	T1,T1			;...
+T10,<	MOVEI	T4,1			;Assume for now FORMAT type 1
+	MOVEM	T4,BL$DPD+.NSDFM
+	HRRZS	BL$DPT+.NSASL		;And zero length TASK name
+	SETZ	T4,			;TOPS-10 requires integer OBJID
+					;So, we will build the integer as we go
+>; End of T10
+	CAIN	T1,.OK			;Unspecified, assume FORTRAN
+	 JRST	L.9			;...
+	CAIE	T1,.ST			;[7] COBOL byte string
+	 JRST	L.9			;[7] or now, anything else is FORTRAN
+
+; COBOL code:
+
+	XMOVEI	T1,@1(ARG)		;[51][7] Address of two-word descriptor
+	MOVE	T2,0(T1)		;Byte pointer
+	LDB	T3,[POINT 6,T2,11]	;[7] Get byte size
+	CAIE	T3,7			;[7] Must be ASCII
+	 RETURN	OAWRNG			;[7] Wrong type
+	HRRZ	T3,1(T1)		;Byte count
+	CAILE	T3,SOBJID		;Check for valid count
+	 MOVEI	T3,SOBJID		;Too big, use maximum
+
+T20,<					;This is a restriction only on TOPS-20
+;[56] There cannot be a descriptor if there is no objectid
+	ILDB	T1,T2			;[56] Get first character in objectid
+	CAIE	T1,40			;[56] Is it blank
+	 CAIN	T1,0			;[56] ... or null?
+	  JRST	.E15			;[56] Yes, go to end of descriptor code
+;[56] If the descriptor is 0 or TASK, it must not appear, so remove it
+;[56] if the user supplied it!
+	CAIN	T1,"0"			;[56] Is it "0"?
+	 JRST	.E15			;[56] If so, skip to end of descriptor
+	PUSH	P,T2			;[56] otherwise, save source pointer
+	PUSH	P,T1			;[56] ... and this byte
+	CAIE	T1,"T"			;[56] Check for "T"
+	 CAIN	T1,"t"			;[56] ...
+	  SKIPA				;[56] ...
+	   JRST	L.1			;[56] Neither, quit looking
+	ILDB	T1,T2			;[56] Get next byte
+	CAIE	T1,"A"			;[56] Check for "A"
+	 CAIN	T1,"a"			;[56] ...
+	  SKIPA				;[56] ...
+	   JRST	L.1			;[56] Neither, quit looking
+	ILDB	T1,T2			;[56] Get next byte
+	CAIE	T1,"S"			;[56] Check for "S"
+	 CAIN	T1,"s"			;[56] ...
+	  SKIPA				;[56] ...
+	   JRST	L.1			;[56] Neither, quit looking
+	ILDB	T1,T2			;[56] Get next byte
+	CAIE	T1,"K"			;[56] Check for "K"
+	 CAIN	T1,"k"			;[56] ...
+	  SKIPA				;[56] ...
+	   JRST	L.1			;[56] ...
+	ILDB	T1,T2			;[56] Get next byte
+	CAIE	T1,40			;[56] Check for blank
+	 CAIN	T1,0			;[56] ... or null
+	  JRST	[POP	P,T1		;[56] Found "TASK", so restore
+		 POP	P,T2		;[56] ... registers and go to
+		 JRST	.E15	]	;[56] ... end of descriptor code
+
+L.1:	POP	P,T1			;[56] Not "TASK", so do normal process
+	POP	P,T2			;[56] ... restoring character
+	JRST	L.59A			;Join loop
+>; End of T20
+
+L.59:	ILDB	T1,T2			;Get a byte
+	JUMPE	T1,.E11			;Null?  Yes, end string
+	CAIN	T1,40			;Or blank?
+	 JRST	.E11			;Yes, end string
+L.59A:
+T20,<	IDPB	T1,T4>			;Store byte
+T10,<	CAIL	T1,"0"			;If decimal digit
+	 CAILE	T1,"9"
+	  JRST	.E11			;Not a digit, done
+	IMULI	T4,^D10			;Prepare current accumulated integer
+	SUBI	T1,"0"			;Convert ASCII to binary
+	ADDI	T4,(T1)			;Add in this digit
+>; End of T10
+	SOJG	T3,L.59			;Do all bytes
+	 JRST	.E11			;End string
+
+; FORTRAN code:
+
+L.9:	XMOVEI	T2,@1(ARG)		;[51]Get array address
+	HLL	T2,[POINT 7,0]		;Make a byte pointer
+	SETZM	T3			;Byte count
+
+T20,<					;This is a restriction only on TOPS-20
+;[56] There cannot be a descriptor if there is no objectid.
+	ILDB	T1,T2			;[56] Get first character in objectid
+	CAIE	T1,40			;[56] Is it blank
+	 CAIN	T1,0			;[56] ... or null?
+	  JRST	.E15			;[56] Yes, go to end of descriptor code
+;[56] If objectid is "0" or "TASK", it is supposed to be left out,
+;[56] so remove it for the monitor's benefit!
+	CAIN	T1,"0"			;[56] Is it "0"?
+	 JRST	.E15			;[56] Yes, skip to end of descriptor
+;[56] Now check for "TASK"
+	PUSH	P,T2			;[56] Save byte pointer
+	PUSH	P,T1			;[56] ... and current character
+	CAIE	T1,"T"			;[56] Is it "T"?
+	 CAIN	T1,"t"			;[56] ...
+	  SKIPA				;[56] ...
+	   JRST	L.2			;[56] Neither, quit this
+	ILDB	T1,T2			;[56] Get next character
+	CAIE	T1,"A"			;[56] Is it "A"?
+	 CAIN	T1,"a"			;[56] ...
+	  SKIPA				;[56] ...
+	   JRST	L.2			;[56] Neither, quit this
+	ILDB	T1,T2			;[56] Get next character
+	CAIE	T1,"S"			;[56] Is it "S"
+	 CAIN	T1,"s"			;[56] ...
+	  SKIPA				;[56] ...
+	   JRST	L.2			;[56] Neither, quit this
+	ILDB	T1,T2			;[56] Get next character
+	CAIE	T1,"K"			;[56] Is it "K"?
+	 CAIN	T1,"k"			;[56] ...
+	  SKIPA				;[56] ...
+	   JRST	L.2			;[56] Neither, quit this
+	ILDB	T1,T2			;[56] Get next character
+	CAIE	T1,40			;[56] Is it blank
+	 CAIN	T1,0			;[56] ... or null?
+	  JRST	[POP	P,T1		;[56] Yes, so ignore the objectid
+		 POP	P,T2		;[56] ... clean up, and go to end of
+		 JRST	.E15	]	;[56] ... descriptor code
+
+L.2:	POP	P,T1			;[56] Objectid is not "TASK" or "0"
+	POP	P,T2			;[56] Restore state and process it
+	JRST	L.60A			;Join loop
+>; End of T20
+
+L.60:	ILDB	T1,T2			;Get a byte
+	AOS	T3			;Count byte
+	JUMPE	T1,.E11			;Null?  Yes, end string
+	CAIN	T1,40			;Or blank?
+	 JRST	.E11			;Yes, end string
+L.60A:
+T20,<	IDPB	T1,T4>			;Store byte
+T10,<	CAIL	T1,"0"			;If decimal digit
+	 CAILE	T1,"9"
+	  JRST	.E11			;Not a digit, done
+	IMULI	T4,^D10			;Prepare current accumulated integer
+	SUBI	T1,"0"			;Convert ASCII to binary
+	ADDI	T4,(T1)			;Add in this digit
+>; End of T10
+	CAIGE	T3,SOBJID		;[16] Check for valid count
+;[16]	CAILE	T3,SOBJID		;Check for valid count
+	 JRST	L.60			;Loop
+
+; End OBJID string, insert "-"
+
+;[56] Only insert "-" after objectid if there is a descriptor.
+.E11:
+;[56]	MOVEI	T1,"-"			;Get the character
+;[56]	IDPB	T1,T4			;Store it
+T10,<	MOVEM	T4,BL$DPD+.NSDOB	;Save away object type
+	SKIPE	T4			;If non-zero
+	  SETZM	BL$DPD+.NSDFM		;Then FORMAT type 0
+	SKIPE	T4			;Of non-zero object type
+	  JRST	.E16			;DECnet-10 won't allow a
+					; task name, so skip that
+>; End of T10
+
+T20,<					;DECnet-10 will not allow descriptors
+; DESC (2) setup:
+
+	HRLI	T1,.TYPE		;Get DESC's type
+	HRRI	T1,2(ARG)		;...
+	LDB	T1,T1			;...
+	CAIN	T1,.OK			;Unspecified, assume FORTRAN
+	 JRST	L.73			;...
+	CAIE	T1,.ST			;[7] COBOL byte string
+	 JRST	L.73			;[7] For now, anything else is FORTRAN
+
+; COBOL code:
+
+	XMOVEI	T1,@2(ARG)		;[51][7] Address of two-word descriptor
+	MOVE	T2,0(T1)		;Byte pointer
+	LDB	T3,[POINT 6,T2,11]	;[7] Get byte size
+	CAIE	T3,7			;[7] Must be ASCII
+	 RETURN	OAWRNG			;[7] Wrong type
+	HRRZ	T3,1(T1)		;Byte count
+	CAILE	T3,SDESCF		;Check for valid count
+	 MOVEI	T3,SDESCF		;Too big, use maximum
+
+;[56] Only insert a "-" after the objectid if there is a descriptor
+	ILDB	T1,T2			;[56] Get first character in descriptor
+	CAIE	T1,40			;[56] Is it blank
+	 CAIN	T1,0			;[56] ... or null?
+	  JRST	.E15			;[56] Yes, go to end of descriptor code
+	PUSH	P,T1			;[56] Otherwise, save this character
+	MOVEI	T1,"-"			;[56] Get a "-"
+	IDPB	T1,T4			;[56] ... and store it
+	POP	P,T1			;[56] Restore the character
+	IDPB	T1,T4			;[56] ... and store it
+	SOS	T3			;[56] Account for this character
+
+L.75:	ILDB	T1,T2			;Get a byte
+	JUMPE	T1,.E15			;Null?  Yes, end string
+	CAIN	T1,40			;Or blank?
+	 JRST	.E15			;Yes, end string
+	IDPB	T1,T4			;Store byte
+	SOJG	T3,L.75			;Do all bytes
+	 JRST	.E15			;End of string
+
+; FORTRAN code:
+
+L.73:	XMOVEI	T2,@2(ARG)		;[51]Get array address
+	HLL	T2,[POINT 7,0]		;Make a byte pointer
+	SETZM	T3			;Byte count
+
+;[56] Only insert a "-" after the objectid if there is a descriptor
+	ILDB	T1,T2			;[56] Get first character in descriptor
+	CAIE	T1,40			;[56] Is it blank
+	 CAIN	T1,0			;[56] ... or null?
+	  JRST	.E15			;[56] Yes, go to end of descriptor code
+T20,<	PUSH	P,T1			;[56] Otherwise, save this character
+	MOVEI	T1,"-"			;[56] Get a "-"
+	IDPB	T1,T4			;[56] ... and store it
+	POP	P,T1			;[56] Restore the character
+>; End of T20
+	IDPB	T1,T4			;[56] ... and store it
+	AOS	T3			;[56] Account for this character
+
+L.76:	ILDB	T1,T2			;Get a byte
+	AOS	T3			;Increment byte count
+	JUMPE	T1,.E15			;Null?  Yes, end string
+	CAIN	T1,40			;Or blank?
+	 JRST	.E15			;Yes, end string
+	IDPB	T1,T4			;Store byte
+	CAIGE	T3,SDESCF		;Check for valid count
+	 JRST	L.76			;Loop
+
+; End of DESC, store a "."
+
+.E15:
+;[56]	MOVEI	T1,"."			;Get the character
+;[56]	IDPB	T1,T4			;... and store it.
+>; End of T20
+; TASKN (3) setup:
+
+	HRLI	T1,.TYPE		;Get TASKN's type
+	HRRI	T1,3(ARG)		;...
+	LDB	T1,T1			;...
+T10,<	MOVE	T4,[POINT 8,BL$DPT+.NSAST]> ;Start TASK string
+	CAIN	T1,.OK			;Unspecified, assume FORTRAN
+	 JRST	L.77			;...
+	CAIE	T1,.ST			;[7] COBOL byte string
+	 JRST	L.77			;[7] For now, anything else is FORTRAN
+
+; COBOL code:
+
+	XMOVEI	T1,@3(ARG)		;[51][7] Address of two-word descriptor
+	MOVE	T2,0(T1)		;Byte pointer
+	LDB	T3,[POINT 6,T2,11]	;[7] Get byte size
+	CAIE	T3,7			;[7] Must be ASCII
+	 RETURN	OAWRNG			;[7] Wrong type
+	HRRZ	T3,1(T1)		;Byte count
+	CAILE	T3,STASKN		;Check for valid count
+	 MOVEI	T3,STASKN		;Too big, use maximum
+T10,<	HRLM	T3,BL$DPT+.NSASL>	;Save byte count in string desc. block
+
+;[56] Only insert a "." if there is a taskname.
+	ILDB	T1,T2			;[56] Get first character in taskname
+	CAIE	T1,40			;[56] Is it blank
+	 CAIN	T1,0			;[56] ... or null?
+	  JRST	.E16			;[56] Yes, go to end of taskname code
+T20,<	PUSH	P,T1			;[56] Otherwise, save this character
+	MOVEI	T1,"."			;[56] Get a "."
+	IDPB	T1,T4			;[56] ... and store it
+	POP	P,T1			;[56] Restore the character
+>; End of T20
+	IDPB	T1,T4			;[56] ... and store it
+	SOS	T3			;[56] Account for this character
+
+L.79:	ILDB	T1,T2			;Get a byte
+	JUMPE	T1,.E16			;Null?  Yes, end string
+	CAIN	T1,40			;Or blank?
+	 JRST	.E16			;Yes, end string
+	IDPB	T1,T4			;Store byte
+	SOJG	T3,L.79			;Do all bytes
+	 JRST	.E16			;End of string
+
+; FORTRAN code:
+
+L.77:	XMOVEI	T2,@3(ARG)		;[51]Get array address
+	HLL	T2,[POINT 7,0]		;Make a byte pointer
+	SETZM	T3			;Byte count
+
+;[56] Only insert a "." if there is a taskname.
+	ILDB	T1,T2			;[56] Get first character in taskname
+	CAIE	T1,40			;[56] Is it blank
+	 CAIN	T1,0			;[56] ... or null?
+	  JRST	.E16			;[56] Yes, go to end of taskname code
+T20,<	PUSH	P,T1			;[56] Otherwise, save this character
+	MOVEI	T1,"."			;[56] Get a "."
+	IDPB	T1,T4			;[56] ... and store it
+	POP	P,T1			;[56] Restore the character
+>; End of T20
+	IDPB	T1,T4			;[56] ... and store it
+	AOS	T3			;[56] Account for the character
+
+L.80:	ILDB	T1,T2			;Get a byte
+	JUMPE	T1,L.80A		;Null?  Yes, end string
+	CAIN	T1,40			;Or blank?
+	 JRST	L.80A			;Yes, end string
+	AOS	T3			;Increment byte count
+	IDPB	T1,T4			;Store byte
+	CAIGE	T3,STASKN		;Check for valid byte count
+	 JRST	L.80			;Loop
+L.80A:
+T10,<	HRLM	T3,BL$DPT+.NSASL>	;Save byte counter
+
+; End of TASKN, store a null to make ASCIZ
+
+.E16:
+T20,<	SETZ	T1,			;Get a null
+	IDPB	T1,T4			;... and store it.
+	MOVE	T1,[POINT 7,TEMPST]	;Get DECnet descriptor
+	MOVEM	T1,DESC			;... and store it.
+>; End of T20
+; WAIT (4) setup:
+
+	IFN	TCK,<			;Type-checking code
+	HRLI	T1,.TYPE		;Get WAIT's type
+	HRRI	T1,4(ARG)		;...
+	LDB	T1,T1			;...
+	CAIN	T1,.OK			;Unspecified is always OK
+	 JRST	L.110			;...
+	CAIE	T1,.I1			;One-word integer is correct
+	 RETURN	OAWRNG			;Anything else is trouble
+>; End IFN TCK
+L.110:	XMOVEI	T1,@4(ARG)		;[51]Get WAIT code's address
+	MOVEM	T1,WAIT			;Save it
+
+; End of parameter set-up.
+
+	JRST	.LOPEN			;Join common code
+
+	PRGEND				;End of NFOPP
+
+	TITLE	.LOPEN Open a logical link
+	ENTRY	.LOPEN
+	SEARCH	TTTUNV
+	TTTINI
+T10,<	ENTRY	.NSPIN
+	EXTERN	.UPEVT,.CNEVT,.NSPER,XPN$DPSI
+>; End of T10
+T20,<	EXTERN	.JSER,.UPEVT>
+; LOPEN (2)
+
+; Open a logical link.
+
+; NETLN:	link number
+; CODE:		byte size (if active)
+; TYPE:		link type
+; WAIT:		wait code
+
+.LOPEN:	SKIPN	START			;Interrupt system started yet?
+	 CALL	PSINIT			;No, go do it
+T20,<	MOVE	T2,[-MAXLL,,0]		;Check logical link tables for room
+
+FINDLL:	MOVE	T3,LLJFN(T2)		;In use?
+	JUMPE	T3,GOTLL		;Got a free slot?
+	AOBJN	T2,FINDLL		;Keep looking
+	RETURN	OA2MNY			;Fatal error, no slots
+
+GOTLL:	HRRZM	T2,@NETLN		;Save slot number
+	HRRZ	T2,T2			;Get slot number
+	MOVE	T1,CODE			;Get byte size
+	MOVEM	T1,CODES(T2)		;Save it
+	MOVX	T1,GJ%SHT		;Short form
+	MOVE	T2,DESC			;File spec pointer
+	GTJFN%				;Get a JFN
+	 ERJMP	.JSER			;JSYS error
+	MOVE	T2,@NETLN		;Get slot number
+	HRRZM	T1,LLJFN(T2)		;Save JFN
+;**; [63] Remove code starting GOTLL + 12	CLR	11-Mar-83
+;[63]	MOVE	T3,CODE			;Byte size
+;[63]	CAIN	T3,^D36			;If 36, image mode, so use 8
+;[63]	 MOVEI	T3,^D8			;...
+;[63]	ADDI	T3,4400			;Make a byte pointer
+;[63]	LSH	T3,^D24			;Shift it
+;[63]	HLLM	T3,LLEVNT(T2)		;Save byte pointer
+	MOVE	T3,CODE			;Byte size again
+	SKIPE	T3			;If passive or
+	 CAIN	T3,^D36			;... if 36 (image mode),
+	  MOVEI	T3,^D8			;... use 8 for bytesize in OPENF%.
+	LSH	T3,^D30			;Shift again
+	MOVX	T2,<OF%RD+OF%WR>	;Read and write n bit bytes
+	ADD	T2,T3			;Include in T2
+>; End of T20
+; LNKOPN (2.1)
+
+; Open the link.
+
+; NETLN:	slot number
+; TYPE:		link type
+; WAIT:		wait code
+
+LNKOPN:
+T20,<	OPENF%				;Open the logical link
+	 ERJMP	.JSER			;Failure
+	MOVE	T1,@NETLN		;Get slot number
+	MOVE	T3,[MO%SRV+MO%WFC]	;Fake status for passive task
+	MOVE	T2,TYPE			;Get type
+	CAIE	T2,0			;Skip if passive
+	 MOVE	T3,[MO%WCC]		;Fake status for active task
+	MOVEM	T3,LLSTAT(T1)		;Save it
+	MOVE	T1,@NETLN		;Our JFN
+	MOVE	T1,LLJFN(T1)		;Our JFN
+	MOVEI	T2,.MOACN		;Set up interrupts
+	MOVE	T4,@NETLN		;
+	MOVE	T4,CHAN			;Channel number
+	SETZ	T3,			;This makes the bit mask for MTOPR:
+	LSH	T4,^D9			;Connect, interrupt, and data
+	ADD	T3,T4			; all on channel CHAN (PSINUM)
+	LSH	T4,^D9			;...
+	ADD	T3,T4			;...
+	LSH	T4,^D9			;...
+	ADD	T3,T4			;...
+	MTOPR%				;Do it
+	 ERJMP	.JSER			;Error?
+	MOVE	T1,@NETLN		;Get offset
+	CALL	.UPEVT			;Update event word
+>; End of T20
+
+
+
+T10,<	MOVE	T1,NUMLL		;Get current active LL
+	CAIL	T1,MAXLL		;Already to max?
+	 RETURN	TOOMNY			;Must stop here
+	SKIPE	TYPE			;Active or passive?
+	SKIPA	T1,[XWD .NSFEA,.NSAA1+1] ;Active
+	MOVE	T1,[XWD .NSFEP,.NSAA1+1] ;Passive
+	MOVEM	T1,BL$NSP+.NSAFN	;Store in NSP. arg blk
+	SETZM	BL$NSP+.NSACH		;Zero channel for now
+	MOVEI	T1,BL$CON		;Save connect block location
+	MOVEM	T1,BL$NSP+.NSAA1
+	MOVEI	T1,BL$NSP
+	SETZM	@NETLN			;In case error
+	NSP.	T1,			;Open Task
+	  JRST	.NSPER			;Check error code
+	MOVE	T1,BL$NSP+.NSACH	;Get assigned channel number
+	HRRZ	T2,T1			;Just channel number
+	CAILE	T2,MAXLL		;Too high for us?
+	  JRST	[MOVEM T2,BL$NSP+.NSACH	;Yes, must release this channel
+		MOVE T2,[XWD .NSFAB,.NSACH+1]
+		MOVEM T2,BL$NSP+.NSAFN
+		MOVEI T2,BL$NSP
+		NSP. T2,
+		  JFCL
+		RETURN TOOMNY]		;And stop user
+	MOVEM	T1,LLSTAT(T1)		;Save away
+	HRRZM	T1,@NETLN		;Tell user
+	MOVE	T3,CODE			;Byte size
+	MOVEM	T3,CODES(T1)		;Save it for later
+	CAIN	T3,^D36			;If 36, image mode, so use 8
+	 MOVEI	T3,^D8			;...
+	ADDI	T3,4400			;Make a byte pointer
+	LSH	T3,^D24			;Shift it
+	HLLM	T3,LLEVNT(T1)		;Save byte pointer
+	MOVEI	T2,BL$ILN		;Size of a saved info block
+	IMULI	T2,-1(T1)		;Offset of this links info block
+	ADDI	T2,BL$INF		;Location of this links info block
+	MOVE	T3,T2			;Save it
+	HRL	T2,T2			;In both halves
+	SETZM	(T2)			;Clear first word
+	ADDI	T2,1			;Make a BLT pointer
+	BLT	T2,BL$ILN(T3)		;BLT it to zeros
+	MOVE	T1,[XWD .NSFPI,.NSAA1+1] ;Assign PSI reason NSP. function
+	MOVEM	T1,BL$NSP+.NSAFN
+	MOVEI	T1,(NS.STA!NS.IDA!NS.NDA) ;All reasons
+	MOVEM	T1,BL$NSP+.NSAA1
+	MOVEI	T1,BL$NSP
+	NSP.	T1,			;Enable PSI ints for this link
+	  JRST	.NSPER			;Check error code
+	AOS	NUMLL			;One more active link
+>; End of T10
+	MOVE	T1,@WAIT		;Get wait code
+	CAIE	T1,WAITLY		;Wait for the open?
+	 RETURN	OAOK..			;No, return OK
+; CHKCON (2.1.1)
+
+; Wait for a connection.
+
+; NETLN:	slot number
+
+CHKCON:	MOVE	T1,@NETLN		;Get event word
+	MOVE	T2,LLEVNT(T1)		;Connected yet?
+CHKCN1:	TRZE	T2,EV.CON		;Turn off event bit
+	 JRST	[MOVEM	T2,LLEVNT(T1)	;Turn off event bit
+		 RETURN	OAOK..]		;   and return
+	TRNE	T2,EV.ABT+EV.DIS	;Abort or disconnect?
+	 RETURN	OAABRJ			;Yes, error return
+	CALL	.UPEVT			;Update event word in case lost INT
+	HRRZ	T2,LLEVNT(T1)		;Get event info back
+	JUMPN	T2,CHKCN1		;If something there, go check it
+	MOVEI	T1,DISTIM		;Else, go to sleep
+	DISMS%				;
+	JRST	CHKCON			;Got an interrupt, was it for us?
+
+T10,<
+; .NSPIN
+; Initialize the NSP. Connect block
+;	Source and Destination Process Descriptor Blocks
+;	Various String Pointers (Node Name, User ID, etc.)
+;
+.NSPIN:	MOVE	T1,[XWD BL$BEG,BL$BEG+1] ;Zero string area
+	SETZM	BL$BEG
+	BLT	T1,BL$END-1
+	MOVEI	T1,.NSCUD+1		;Initialize connect block
+	MOVEM	T1,BL$CON+.NSCNL	;Length
+	MOVEI	T1,BL$NOD
+	MOVEM	T1,BL$CON+.NSCND	;Host string pointer
+	MOVEI	T1,BL$SPD
+	MOVEM	T1,BL$CON+.NSCSD	;Source process desc. blk.
+	MOVEI	T1,BL$DPD
+	MOVEM	T1,BL$CON+.NSCDD	;Destination process desc. blk.
+	MOVEI	T1,BL$USR
+	MOVEM	T1,BL$CON+.NSCUS	;User ID string pointer
+	MOVEI	T1,BL$PAS
+	MOVEM	T1,BL$CON+.NSCPW	;Password string pointer
+	MOVEI	T1,BL$ACC
+	MOVEM	T1,BL$CON+.NSCAC	;Account string pointer
+	MOVEI	T1,BL$OPT
+	MOVEM	T1,BL$CON+.NSCUD	;Optional user data string pointer
+	MOVE	T1,[XWD BL$DPD,BL$DPD+1] ;Clear dest. proc. desc. blk.
+	SETZM	BL$DPD
+	BLT	T1,BL$DPD+.NSDPN-1
+	MOVEI	T1,.NSDPN+1		;Initialize block length
+	MOVEM	T1,BL$DPD+.NSDFL
+	MOVEI	T1,BL$DPT		;Pointer to task name
+	MOVEM	T1,BL$DPD+.NSDPN	;Store in desc. blk.
+	MOVE	T1,[XWD BL$SPD,BL$SPD+1] ;Clear src. proc. desc. blk.
+	SETZM	BL$SPD
+	BLT	T1,BL$SPD+.NSDPN-1
+	MOVEI	T1,.NSDPN+1		;Initialize block length
+	MOVEM	T1,BL$SPD+.NSDFL
+	MOVEI	T1,BL$SPT		;Pointer to task name
+	MOVEM	T1,BL$SPD+.NSDPN	;Store in desc. blk.
+	MOVE	T1,[XWD SHOSTN,1+<<SHOSTN+3>/4>]
+	MOVEM	T1,BL$NOD+.NSASL	;Intialize NODE sting pointer
+	MOVE	T1,[XWD SUSRID,1+<<SUSRID+3>/4>]
+	MOVEM	T1,BL$USR+.NSASL	;Intialize USERID sting pointer
+	MOVE	T1,[XWD SPASWD,1+<<SPASWD+3>/4>]
+	MOVEM	T1,BL$PAS+.NSASL	;Intialize PASSWORD sting pointer
+	MOVE	T1,[XWD SACCNT,1+<<SACCNT+3>/4>]
+	MOVEM	T1,BL$ACC+.NSASL	;Intialize ACCOUNT sting pointer
+	MOVE	T1,[XWD SOPTDT,1+<<SOPTDT+3>/4>]
+	MOVEM	T1,BL$OPT+.NSASL	;Intialize USRDATA sting pointer
+	MOVE	T1,[XWD STASKN,1+<<STASKN+3>/4>]
+	MOVEM	T1,BL$DPT+.NSASL	;Intialize DEST TASK NAME sting pointer
+	MOVEM	T1,BL$SPT+.NSASL	;Intialize SRC TASK NAME sting pointer
+	RET
+>; End of T10
+
+; PSINIT (2.2)
+;
+; Initialize the interrupt system.
+;[46]
+;[46] First, try to use FUNCT. in the OTS. to get a channel.
+
+PSINIT:
+T20,<	SETOM	START			;Indicate that we have begun
+	XMOVEI	T1,PC			;[51][35] Set up PC pointer
+	MOVEM	T1,PCPTR		;[35] Will change if FUNCT. succeeds
+IFN	OTSFNC,<			;[35] Code to get an interrupt from OTS
+	HRLZI	T1,-6			;[35] -count,,0
+	MOVEM	T1,FNCBLK		;[35] ... to addr-1
+	MOVE	T1,[Z 2,FNCFNC]		;[35] Function code
+	TLO	T1,400000		;[51] Set sign bit!
+	MOVEM	T1,FNCBLK+1		;[35] ... to addr
+	MOVEI	T1,GPSI			;[35] Set function code
+	MOVEM	T1,FNCFNC		;[35] ... in parameter
+	MOVE	T1,[Z 17,FNCCOD]	;[51][35] Error code prefix (not used)
+	TLO	T1,400000		;[51] Set sign bit!
+	MOVEM	T1,FNCBLK+2		;[35] ... to addr+1
+	XMOVEI	T1,[ASCIZ 'DIT']	;[51][35] But set it up anyways
+	MOVEM	T1,FNCCOD		;[35] ... for the future
+	MOVE	T1,[Z 2,FNCSTS]		;[35] Return status
+	TLO	T1,400000		;[51] Set sign bit!
+	MOVEM	T1,FNCBLK+3		;[35] ... to addr+2
+	MOVE	T1,[Z 2,CHAN]		;[35] Interrupt channel number
+	TLO	T1,400000		;[51] Set sign bit!
+	MOVEM	T1,FNCBLK+4		;[35] ... to addr+3
+	SETZM	CHAN			;[35] Use -1 to get any user channel
+	MOVE	T1,[Z 2,FNCLEV]		;[35] Level number
+	TLO	T1,400000		;[51] Set sign bit!
+	MOVEM	T1,FNCBLK+5		;[35] ... to addr+4
+	MOVEI	T1,PSILEV		;[35] Get our level number
+	MOVEM	T1,FNCLEV		;[35] ... and store it
+	MOVE	T1,[Z 2,FNCINT]		;[35] Address of interrupt routine
+	TLO	T1,400000		;[51] Set sign bit!
+	MOVEM	T1,FNCBLK+6		;[35] ... to addr+5
+	XMOVEI	T1,INT			;[51][35] Get interrupt routine address
+	MOVEM	T1,FNCINT		;[35] ... and store it
+	XMOVEI	ARG,FNCBLK+1		;[51][35] Set up parameter block
+	PUSHJ	P,FUNCT.		;[35] Call the OTS routine
+	MOVE	T1,FNCSTS		;[35] Check status
+	JUMPL	T1,NOFNC.		;[35] No FUNCT. for this
+	HRLZI	T2,400000		;[35] Get a bit
+	MOVN	T1,CHAN			;[35] Get -channel
+	LSH	T2,0(T1)		;[35] Move bit to channel position
+	MOVEI	T1,.FHSLF		;[35] This process
+	AIC%				;[35] Activate this interrupt channel
+	 ERJMP	[POP	P,0(P)		;[46] Pop the stack
+		 JRST	.JSER	]	;[46] Go to JSYS error handler
+	MOVEI	T1,.FHSLF		;[46] This process
+	RIR%				;[46] Try to get chn,,lev tables
+	 ERJMP	TRYX			;[46] Failed, try it with XRIR%
+	SETOM	XFLAG			;[46] Remember that RIR% worked
+	HLRZ	T2,T2			;[46] Get level table address
+	JRST	RIRCOM			;[46] Join common code
+TRYX:	SETZM	XFLAG			;[46] Remember to use XRIR%
+	MOVEI	T1,.FHSLF		;[37] This process
+	MOVEI	T2,3			;[37] Size of block
+	MOVEM	T2,XBLOCK		;[37] ... store it
+	MOVEI	T2,XBLOCK		;[37] Argument block address
+	XRIR%				;[37] Try XRIR%
+	 ERJMP	[POP	P,0(P)		;[46] Clean up stack
+		 JRST	.JSER	]	;[46] Go to JSYS error handler
+	AOS	PCPTR			;[46] PC address is in second word
+	MOVE	T2,XBLOCK+1		;[37] Get level table address
+
+RIRCOM:	MOVE	T1,<PSILEV-1>(T2)	;[37] [35] Get OTS's PC address
+	MOVEM	T1,PCPTR		;[35] Save as our PC
+	SKIPN	XFLAG			;[46] Skip if non-extended interrupts
+	 AOS	PCPTR			;[46] Otherwise, address is in next word
+	MOVEI	T1,.FHSLF		;[35] This process
+	EIR%				;[35] Make sure interrupts enabled
+	 ERJMP	[POP	P,0(P)		;[46] Clean up stack
+		 JRST	.JSER	]	;[46] Go to JSYS error handler
+	RET				;[35] Return
+NOFNC.:		>			;[35] End of INF OTSFNC
+;[46] Next, try to use PA1050, if it is around.
+
+	MOVEI	T1,.FHSLF		;For this process
+	GCVEC%				;... see if PA1050 is here!
+	 ERJMP	[POP	P,0(P)		;[46] Clean up stack
+		 JRST	.JSER	]	;[46] Go to JSYS error handler
+	JUMPL	T2,NOPAT		;No. Good!  Do it ourselves.
+	JUMPE	T3,NOPAT		;...
+	MOVEI	T1,.FHSLF		;[46] Try RIR% to check available chans
+	RIR%				;[46] Try to get level,,channel tables
+	 ERJMP	NORIR.			;[46] Not RIR%, try XRIR%
+	SETOM	XFLAG			;[46] Remember RIR% worked
+	HRRZ	T1,T2			;[46] Put channel table in T1
+	JRST	NOFNCC			;[46] Join common code
+;[46] We should never get here at present: PA1050 does a SIR%.
+NORIR.:	SETZM	XFLAG			;[46] Remember that this is XRIR%
+	MOVEI	T1,.FHSLF		;[37] This process
+	MOVEI	T2,3			;[37] Size of argument block
+	MOVEM	T2,XBLOCK		;[37] ... store it
+	XMOVEI	T2,XBLOCK		;[51][37] Argument block address
+	XRIR%				;[37] Do XRIR%
+	 ERJMP	[POP	P,0(P)		;[46] Clean up stack
+		 JRST	.JSER	]	;[46] Go to JSYS error handler
+	MOVE	T1,XBLOCK+2		;[37] Get channel table address in T1
+
+NOFNCC:	SKIPN	0(T1)			;[37] [12] Channel zero in use?
+	 HRLI	T4,0			;[12] No, use it
+	SKIPN	1(T1)			;[12] Channel one in use?
+	 HRLI	T4,1			;[12] No, use it in preference
+	SKIPN	2(T1)			;[12] Channel two in use?
+	 HRLI	T4,2			;[12] No, use it in preference
+;[12] This code should be changed if PA1050 is changed to allow more
+;[12] user interrupt channels.
+	HLRZM	T4,CHAN			;[12] Store channel used in CHAN
+	MOVEI	T2,6			;[12] COMPT.: function code 6
+	MOVE	T3,[PSILEV,,INT]	;[12]         PSI level,,trap address
+	HRRI	T4,PC			;[12]         channel,,trap PC
+	MOVE	T1,[3,,T2]		;[12]         Address of block (T2-T4)
+;[12]	MOVE	T1,[3,,[6		;Yes, cooperate with COMPT. 6
+;[12]		    PSILEV,,INT		;... level,, trap address
+;[12]		    PSINUM,,PC]]	;... number,, PC
+	COMPT.	T1,			;Do horrors
+	 JRST	[POP	P,0(P)		;[46] Something awful happened!
+		 RETURN	HORROR	]	;[46] Give up!
+	RET				;[13] Leave
+;[13]	JRST	PSIRET			;Leave
+
+;[46] There is no PA1050 in memory.  That is probably just as well.
+;[46] Use an interrupt from the already-set-up channel table, if any.
+
+NOPAT:	MOVEI	T1,.FHSLF		;[46] This process
+	RIR%				;[46] Try RIR% first
+	 ERJMP	NOPAT1			;[46] No
+	SETOM	XFLAG			;[46] Remember that RIR% worked
+	JUMPE	T2,FIRST		;[46] No tables set up; go do it
+	JRST	CONPSI			;[46] Already set up, join common code
+NOPAT1:	SETZM	XFLAG			;[46] Remember that this is XRIR%
+	MOVEI	T1,.FHSLF		;[37] This process
+	MOVEI	T2,3			;[37] Length of block
+	MOVEM	T2,XBLOCK		;[37] ... store in block
+	XRIR%				;[37] Try XRIR% first
+	 ERJMP	[POP	P,0(P)		;[46] Clean up stack
+		 JRST	.JSER	]	;[46] Go to JSYS error handler
+	AOS	PCPTR			;[46] PC address is in second word
+	MOVE	T3,XBLOCK+1		;[37] Get level table address
+	JUMPE	T3,FIRST		;[37] Nothing, so set it up
+
+;[46] Set up our entry for extened JSYS-type tables:
+CONX:	XMOVEI	T1,PC			;[51][37] Where to hold our PC
+	MOVE	T3,XBLOCK+1		;[37] Level table address
+	MOVEM	T1,<PSILEV-1>(T3)	;[37] Use level 2
+	MOVE	T2,XBLOCK+2		;[37] Address of channel table
+	MOVE	T1,[BYTE (6)PSILEV(12)0(18)INT]	;[46] Level and routine
+	MOVEM	T1,PSINUM(T2)		;[37] Save it
+	MOVEI	T1,.FHSLF		;[37] This process
+	MOVX	T2,1B<PSINUM>		;[37] Channel PSINUM
+	AIC%				;[37] Activate this interrupt channel
+					;[37] Note that PA1050 will do this
+					;[37] for us by itself if it is involved
+	 ERJMP	[POP	P,0(P)		;[46] Clean up stack
+		 JRST	.JSER	]	;[46] Go to JSYS error handler
+	EIR%				;[37] Enable interrupts
+	 ERJMP	[POP	P,0(P)		;[46] Clean up stack
+		 JRST	.JSER	]	;[46] Go to JSYS error handler
+	JRST	PSIRET			;[37] Return
+
+;[46] Set up our own tables for non-extended type interrupts:
+CONPSI:	XMOVEI	T1,PC			;[51]Where to hold our PC
+	HLRZ	T3,T2			;Level table address
+	MOVEM	T1,<PSILEV-1>(T3)	;Use level 2
+	HRRZ	T2,T2			;Address of channel table
+	MOVE	T1,[PSILEV,,INT]	;Level,,Routine
+	MOVEM	T1,PSINUM(T2)		;Save it
+	MOVEI	T1,.FHSLF		;This process
+;[17] Note: PA1050 does an AIC% for us (in SETPSI) if it is involved.
+	MOVX	T2,1B<PSINUM>		;[17] Channel PSINUM
+;[17]	MOVEI	T2,1			;Channel PSINUM
+	AIC%				;Activate this interrupt channel
+	 ERJMP	[POP	P,0(P)		;[46] Clean up stack
+		 JRST	.JSER	]	;[46] Go to JSYS error handler
+	EIR%				;Enable interrupts (doesn't hurt)
+	 ERJMP	[POP	P,0(P)		;[46] Clean up stack
+		 JRST	.JSER	]	;[46] Go to JSYS error handler
+
+PSIRET:	MOVEI	T1,PSINUM		;Channel PSINUM
+	MOVEM	T1,CHAN			;Remember it
+	RET				;
+;[46] Final possibility: NO ONE has already set up interrupts, so do
+;[46] so ourselves!
+
+FIRST:	MOVEI	T1,.FHSLF		;[37] This process
+	MOVEI	T2,3			;[37] 3-word block
+	MOVEM	T2,XBLOCK		;[37] ... store size in block
+	XMOVEI	T2,LEVTAB		;[51][37] Level table address
+	MOVEM	T2,XBLOCK+1		;[37] ... store it in block
+	XMOVEI	T2,CHNTAB		;[51][37] Channel table address
+	MOVEM	T2,XBLOCK+2		;[37] ... store it in block
+	XSIR%				;[37] Try XSIR% first
+	 ERJMP	NOXSIR			;[37] ...must be a KS
+	SETZM	XFLAG			;[46] Remember that XSIR% worked
+	AOS	PCPTR			;[46] PC address is in second word
+	JRST	CONX			;[37] Go on
+
+NOXSIR:	MOVEI	T1,.FHSLF		;[37] For this process
+	MOVE	T2,[LEVTAB,,CHNTAB]	;
+;[37]	MOVEM	T1,LEVCHN		;Save it
+	SIR%				;Set up level and channel tables
+	 ERJMP	[POP	P,0(P)		;[46] Clean up stack
+		 JRST	.JSER	]	;[46] Go to JSYS error handler
+	SETOM	XFLAG			;[46] Remember that SIR% worked
+	JRST	CONPSI			;Go on
+>; End of T20
+
+
+; TOPS-10 PSI initialization
+;
+;	Notes: COBOL-10 V12B and FORTRAN-10 V7.0 do not use PSI
+;
+;	Hopefully, no users do either.  We must have it, but it is
+;	very hard to share between non-cooperating routines.  In
+;	7.01 they added a new PSI UUO (PISAV.) to get the PSI vector
+;	address if it was already set up.  This is useful, but not
+;	totally sufficient.  Which offset can we use?  We could look
+;	for a free one (four words of zeros), but that may be
+;	allocated to some other uninitialized routine.  We could put
+;	ourselves into the interrupt chain on the first interrupt
+;	block (each interrupt comes to us, we see it if is for us
+;	(DECnet), if not, pass it to the previous owner of this
+;	interrupt block).  But someone might overwrite that block,
+;	then we stop getting interrupts!  So, until we can solve this
+;	dilema, we will initialize the PSI system, and use it all
+;	by ourselves!
+
+
+T10,<	SETOM	START			;Indicate that we have begun
+	PUSH	P,[EXP INT]		;Put address of INT handler on stack
+	CALL	XPN$DPSI		;Call the external routine to setup
+					;Everything.  This routine is part
+					; of BLISSnet-10 and will arbitrate
+					; between us and any other DECnet users
+	POP	P,(P)			;Clear the stack
+	RET				;All done
+>; End of T10
+
+; INT
+;
+; Process interrupts.
+
+; This routine is called whenever an interrupt is seen on
+; channel CHAN.
+
+INT:
+T20,<	DMOVEM	T1,T1T2			;Save T1 and T2
+	MOVE	T1,@PCPTR		;[35] Address of interrupted code
+	MOVE	T2,-1(T1)		;Get the instruction
+	CAME	T2,[DISMS%]		;Wait instruction
+	 JRST	GOBACK			;DEBRK
+	TXO	T1,1B5			;User mode flag
+	 MOVEM	T1,@PCPTR		;[35] Replace
+
+GOBACK:	DMOVE	T1,T1T2			;Restore ACs
+	DEBRK%				;Go back
+>; End of T20
+
+
+T10,<
+	MOVE	T1,-1(P)		;Get link status from XPN$DPSI
+	HRRZ	T2,T1			;Get just channel number
+	CAIG	T2,MAXLL		;Is it one of ours?
+	 SKIPN	LLSTAT(T2)
+	  CAIA				;No, skip it
+	CALL	.CNEVT			;Interpret it
+	RET				;Return to XPN$DPSI and dismiss
+>; End of T10
+
+	PRGEND				;End of .LOPEN
+
+	TITLE	NFACC Accept a link connection
+	ENTRY	NFACC
+	SEARCH	TTTUNV
+	TTTINI
+T20,<	EXTERN	.JSER,.UPEVT>
+T10,<	EXTERN	.NSPER>
+; NFACC (3A)
+;
+; Accept a connection received on a passive link which
+; has been opened and which has had a connect event.
+;
+; Note: A connection could be implicitly accepted by writing to the
+; network JFN, reading from the network JFN, or going into an input
+; or output wait state.
+;
+; CALL NFACC USING NETLN, TYPE, COUNT, DATA.
+; RETCOD = NFACC (NETLN, TYPE, COUNT, DATA)
+;
+; NETLN	network logical name, set by the NFOPP routine.
+; TYPE	Type of data to be transmitted by this link:
+;	LASCII: ASCII (active task opened link with NFOPA)
+;	LBIN: binary (active task opened link with NFOPB)
+;	L8BIT: 8-bit byte (active task opened link with NFOP8).
+; COUNT	number of characters of optional data sent.
+; DATA	optional ASCII data.
+; Return code and function value:
+;	ACWRNG: an argument is of the wrong type
+;	ACOK..: connection accepted
+;	HORROR: JSYS error.
+
+NFACC:	SAVAC				;Save ACs
+
+; Set up parameters:
+
+; NETLN (0) setup:
+
+	IFN	TCK,<			;Type-checking code
+	HRLI	T1,.TYPE		;Get NETLN's type
+	HRRI	T1,0(ARG)		;...
+	LDB	T1,T1			;...
+	CAIN	T1,.OK			;Unspecified is always OK
+	 JRST	L.12			;...
+	CAIE	T1,.I1			;One-word integer is correct
+	 RETURN	ACWRNG			;Anything else is trouble
+>; End IFN TCK
+L.12:	XMOVEI	T1,@0(ARG)		;[51]Address of NETLN
+	MOVEM	T1,NETLN		;Save it
+	SKIPL	T1,@NETLN		;Get value given. Can not be negative
+	CAILE	T1,MAXLL		;Or greater than MAXLL
+	 RETURN	ACWRNG			;Return error
+
+; TYPE (1) setup:
+
+	IFN	TCK,<			;Type-checking code
+	HRLI	T1,.TYPE		;Get TYPE's type
+	HRRI	T1,1(ARG)		;...
+	LDB	T1,T1			;...
+	CAIN	T1,.OK			;Unspecified is always OK
+	 JRST	L.53			;...
+	CAIE	T1,.I1			;One-word integer is correct
+	 RETURN	ACWRNG			;Anything else is trouble
+>; End IFN TCK
+
+L.53:	MOVE	T1,@1(ARG)		;Get TYPE
+	MOVEI	T2,^D8			;Assume 8-bit bytes
+	CAIN	T1,LASCII		;ASCII?
+	 MOVEI	T2,^D7			;Yes, remember it
+	CAIN	T1,LBIN			;Binary?
+	 MOVEI	T2,^D36			;Yes, remember it
+	CAILE	T1,L8BIT		;8-bit?
+	 RETURN	ACWRNG			;None of the above is no good
+	MOVEM	T2,CODE			;Store data mode
+	MOVE	T1,@NETLN		;Get slot number
+	MOVEM	T2,CODES(T1)		;Save byte size
+;**; [63] Remove code starting at L.53 + 13	CLR	11-Mar-83
+;[63]	CAIN	T2,^D36			;If 36 bits,
+;[63]	 MOVEI	T2,^D8			;... use 8 bits
+;[63]	ADDI	T2,4400			;Make byte pointer
+;[63]	LSH	T2,^D24			;... and shift into position
+;[63]	HLLM	T2,LLEVNT(T1)		;Store the byte pointer for this slot
+
+; COUNT (2) setup:
+
+	IFN	TCK,<			;Type-checking code
+	HRLI	T1,.TYPE		;Get COUNT's type
+	HRRI	T1,2(ARG)		;...
+	LDB	T1,T1			;...
+	CAIN	T1,.OK			;Unspecified is always OK
+	 JRST	L.13			;...
+	CAIE	T1,.I1			;One-word integer is correct
+	 RETURN	ACWRNG			;Anything else is trouble
+>; End IFN TCK
+L.13:	XMOVEI	T1,@2(ARG)		;[51]Address of byte count
+	MOVEM	T1,COUNT		;Save it
+
+; DATA (3) setup:
+
+	HRLI	T1,.TYPE		;Get DATA's type
+	HRRI	T1,3(ARG)		;...
+	LDB	T1,T1			;...
+	CAIN	T1,.OK			;Unspecified, assume FORTRAN
+	 JRST	L.15			;...
+	CAIE	T1,.ST			;[7] COBOL byte string
+	 JRST	L.15			;[7] Otherwise, assume FORTRAN for now
+
+; COBOL code:
+
+	XMOVEI	T1,@3(ARG)		;[51][7] Address of two-word descriptor
+	MOVE	T1,0(T1)		;Byte pointer
+	LDB	T3,[POINT 6,T1,11]	;[7] Get byte size
+	CAIE	T3,7			;[7] Must be ASCII
+	 RETURN	ACWRNG			;[7] Wrong type
+	JRST	.E2			;...
+
+; End of COBOL code.
+
+; FORTRAN code:
+
+L.15:	XMOVEI	T1,@3(ARG)		;[51]String address
+	HLL	T1,[POINT 7,0]		;Make a byte pointer
+
+; End of FORTRAN code.
+
+.E2:	MOVEM	T1,DATA			;Save it
+
+; End of parameter set-up code.
+; ACC (3)
+
+; Accept a connection.
+
+; NETLN:	link number
+; COUNT:	count of optional data
+; DATA:		optional data
+
+ACC:
+T20,<	MOVE	T1,@NETLN		;Get slot number
+	MOVE	T1,LLJFN(T1)		;Get the JFN
+	MOVEI	T2,.MOCC		;Accept the connection
+	MOVE	T3,DATA			;Get byte pointer
+	MOVE	T4,@COUNT		;Character count for data
+	CAILE	T4,SOPTDT		;Check for valid size
+	 MOVEI	T4,SOPTDT		;Too big, use maximum
+	MTOPR%				;Accept it
+	 ERJMP	.JSER			;Error?
+	MOVE	T1,@NETLN		;Offset
+	CALL	.UPEVT			;Update event word
+	RETURN	ACOK..			;
+>; End of T20
+
+T10,<	MOVE	T1,@NETLN		;Get channel number
+	HRRZM	T1,BL$NSP+.NSACH	;Save in NSP. arg block
+	MOVE	T1,@COUNT		;Get user byte count
+	MOVEI	T2,.NSACH+1		;Assume short arg type
+	SKIPN	T1			;Zero bytes?
+	  JRST	ACC2			;Don't send it then
+	CAILE	T1,SOPTDT		;More than the max?
+	  MOVEI	T1,SOPTDT		;Make it the max
+	HRLM	T1,BL$OPT+.NSASL	;Save in string desc.
+	MOVE	T2,DATA			;Pointer to user data
+	MOVE	T3,[POINT 8,BL$OPT+.NSAST] ;Pointer to string block
+ACC1:	ILDB	T4,T2			;Get a char
+	IDPB	T4,T3			;Store a char
+	SOJG	T1,ACC1			;Loop
+	MOVEI	T1,BL$OPT		;Update NSP. arg blk.
+	MOVEM	T1,BL$NSP+.NSAA1
+	MOVEI	T2,.NSAA1+1		;Long block length
+ACC2:	HRLI	T2,.NSFAC		;Function code (ACCEPT)
+	MOVEM	T2,BL$NSP+.NSAFN	;Save in NSP. arg blk.
+	MOVEI	T1,BL$NSP
+	NSP.	T1,			;Do it
+	  JRST	.NSPER			;Look at error code
+	RETURN	ACOK..			;
+>; End of T10
+
+	PRGEND				;End of NFACC
+
+	TITLE	NFRCV Receive data over a logical link
+	ENTRY	NFRCV
+	SEARCH	TTTUNV
+	TTTINI
+	EXTERN	.UPEVT
+T10,<	EXTERN	.CNEVT,.NSPER>
+; NFRCV (4A)
+;
+; Receive data over a logical link.
+;
+; If message mode is specified, the routine will read exactly one DECNET
+; message (terminated by a DECNET segment with the EOM bit on).  If
+; non-message mode is specified, characters will be read from as many
+; messages as necessary to get the requested number of characters, and the
+; last (or only) message read from will not necessarily be exhausted.
+; If a read in non-message mode is followed by a read in message mode,
+; the second read may get a message fragment.
+;
+; If you use NFRCV with wait in non-message mode and an interrupt
+; message is received, you will not get return code RCINT. until the next
+; time you call NFRCV.  If the cooperating task does not send enough
+; data to satisfy the waiting NFRCV, your task will not see the
+; interrupt message.
+;
+; CALL NFRCV USING NETLN, USIZE, COUNT, DATA, MSG-FLG, WAIT.
+; RETCOD = NFRCV (NETLN, USIZE, COUNT, DATA, MSGFLG, WAIT)
+;
+; NETLN	network logical name, set by NFOPA, NFOPB, NFOP8, or NFOPP.
+; USIZE	Message unit size.  Ignored if the active side of the link was
+;	opened with NFOPA or NFOP8.  For links opened with NFOPB, this is
+;	the message length unit size.  Zero may be used to indicate
+;	words (or VAX longwords (32 bits)
+;	(for the local system).  This parameter is currently included
+;	only for user convenience and does not affect how the data is
+;	actually transmitted through the network.
+; COUNT	maximum characters read in message mode, or actual count.
+;	In stream mode on TOPS20, this number will never exceed 2048 for
+;	ASCII and 8-bit links.  For either mode, for both TOPS-10 and TOPS-20,
+;	this number will never exceed 456 words for binary links.
+;	Will contain actual number of characters read.
+;	For links opened with NFOPA, this is the number of ASCII
+;	characters in the message.  For links opened with NFOP8,
+;	this is the number of sequential 8-bit bytes in the message,
+;	stored as the local system normally stores 8-bit bytes.
+;	For links opened with NFOPB, this is the number of bytes
+;	(of the size specified in the message unit size) or words
+;	(or VAX longwords (32 bit))
+;	read.  Note that the last byte or word will be padded with
+;	zero bits if the message does not divide into bytes of the
+;	specified size, since the message is actually sent as
+;	8-bit bytes.
+; DATA	where message will go.
+; MSG-FLG	message mode flag:
+;	MSGMSG: read one message
+;	MSGSTM: read COUNT characters.
+;	For TOPS-10 only, if MSGSTM is specified, MSG-FLG will be set
+;	to MSGMSG if the End-of-message flag was on in the last
+;	message segment read
+; WAIT	wait flag:
+;	WAITLY: wait until characters received or read fails
+;	WAITLN and MSG-FLG MSGMSG: return characters or error
+;	WAITLN and MSG-FLG MSGSTM: return message or fragment, or error.
+; Return code and function value:
+;	RCWRNG: an argument is of the wrong type
+;	RCOK..: COUNT characters are in DATA
+;	RCABRJ: link disconnected or aborted,
+;		COUNT contains characters read to date
+;	RCINT.: interrupt received must be read first using NFRCI
+;	RCOVRN: overrun.  For TOPS-20, no data is lost.  Retry with
+;		larger buffer size.  For TOPS-10, data was lost (MSGMSG mode
+;		only, with buffer too small.  To avoid this, one could read
+;		message segments with MSGSTM until end-of-message (MSGMSG)
+;		is returned for last segment of the message).
+;	RCNENF: this much data not available (TOPS-20), or no data
+;		available (TOPS-10/20).
+;	HORROR: JSYS error.
+
+NFRCV:	SAVAC				;Save the ACs
+
+; Set up parameters
+
+; NETLN (0) setup:
+
+	IFN	TCK,<			;Type-checking code
+	HRLI	T1,.TYPE		;Get NETLN's type
+	HRRI	T1,0(ARG)		;...
+	LDB	T1,T1			;...
+	CAIN	T1,.OK			;Unspecified is always OK
+	 JRST	L.16			;...
+	CAIE	T1,.I1			;One-word integer is correct
+	 RETURN	RCWRNG			;Anything else is trouble
+>; End IFN TCK
+L.16:	XMOVEI	T1,@0(ARG)		;[51]Address of NETLN
+	MOVEM	T1,NETLN		;Save it
+	SKIPL	T1,@NETLN		;Get value given. Can not be negative
+	CAILE	T1,MAXLL		;Or greater than MAXLL
+	 RETURN	RCWRNG			;Return error
+
+; USIZE (1) setup:
+
+	IFN	TCK,<			;Type-checking code
+	HRLI	T1,.TYPE		;Get USIZE's type
+	HRRI	T1,1(ARG)		;...
+	LDB	T1,T1			;...
+	CAIN	T1,.OK			;Unspecified is always OK
+	 JRST	L.54			;...
+	CAIE	T1,.I1			;One-word integer is correct
+	 RETURN	RCWRNG			;Anything else is trouble
+>; End IFN TCK
+
+L.54:	XMOVEI	T1,@1(ARG)		;[51]Address of USIZE
+	MOVEM	T1,USIZE		;Save it
+
+; COUNT (2) setup:
+
+	IFN	TCK,<			;Type-checking code
+	HRLI	T1,.TYPE		;Get COUNT's type
+	HRRI	T1,2(ARG)		;...
+	LDB	T1,T1			;...
+	CAIN	T1,.OK			;Unspecified is always OK
+	 JRST	L.17			;...
+	CAIE	T1,.I1			;One-word integer is correct
+	 RETURN	RCWRNG			;Anything else is trouble
+>; End IFN TCK
+L.17:	XMOVEI	T1,@2(ARG)		;[51]Address of byte count
+	MOVEM	T1,COUNT		;Save it
+	MOVE	T1,@COUNT		;Get byte count
+	MOVE	T2,@NETLN		;Get our index
+	MOVE	T3,CODES(T2)		;Get link type code
+	CAIE	T3,^D36			;Binary?
+	 JRST	L.122			;No, skip this calculation
+	MOVE	T3,@USIZE		;Get byte size
+	SKIPN	T3			;Zero?
+	 MOVEI	T3,^D36			;Yes, use words
+	IMUL	T3,T1			;Count * bytesize = bits
+	IDIVI	T3,^D8			;Divided by 8 for 8-bit bytes
+	SKIPE	T4			;No remainder?
+	 AOS	T3			;Remainder, account for it
+	MOVEM	T4,SLOP			;Save left-over unused bytes
+	MOVEM	T3,@COUNT		;And use THIS value
+
+; DATA (3) setup:
+
+L.122:	HRLI	T1,.TYPE		;Get DATA's type
+	HRRI	T1,3(ARG)		;...
+	LDB	T1,T1			;...
+	CAIN	T1,.OK			;Unspecified, assume FORTRAN
+	 JRST	L.19			;...
+	CAIN	T1,.ST			;COBOL byte string
+	 JRST	L.18			;Do it
+	JRST	L.19			;Otherwise assume FORTRAN for now
+
+; COBOL code:
+
+L.18:	XMOVEI	T1,@3(ARG)		;[51]Address of two-word descriptor block
+	MOVE	T1,0(T1)		;Byte pointer
+	JRST	.E3			;...
+
+; End of COBOL code.
+
+; FORTRAN code:
+
+L.19:	XMOVEI	T1,@3(ARG)		;[51]String address
+	HLL	T1,[POINT 7,0]		;Make a byte pointer
+	MOVE	T2,@NETLN		;Get link index
+	MOVE	T2,CODES(T2)		;Get byte size
+	CAIE	T2,^D7			;Skip if 7-bit
+	 HLL	T1,[POINT 8,0]		;Otherwise, use 8-bit pointer
+
+; End of FORTRAN code.
+
+.E3:	MOVEM	T1,DATA			;Save it
+
+; MSG-FLG (4) setup:
+
+	IFN	TCK,<			;Type-checking code
+	HRLI	T1,.TYPE		;Get MSG-FLG's type
+	HRRI	T1,4(ARG)		;...
+	LDB	T1,T1			;...
+	CAIN	T1,.OK			;Unspecified is always OK
+	 JRST	L.20			;...
+	CAIE	T1,.I1			;One-word integer is correct
+	 RETURN	RCWRNG			;Anything else is trouble
+>; End IFN TCK
+L.20:	XMOVEI	T1,@4(ARG)		;[51]Message flag
+	MOVEM	T1,EOM			;Save it
+
+; WAIT (5) setup:
+
+	IFN	TCK,<			;Type-checking code
+	HRLI	T1,.TYPE		;Get WAIT's type
+	HRRI	T1,5(ARG)		;...
+	LDB	T1,T1			;...
+	CAIN	T1,.OK			;Unspecified is always OK
+	 JRST	L.21			;...
+	CAIE	T1,.I1			;One-word integer is correct
+	 RETURN	RCWRNG			;Anything else is trouble
+>; End IFN TCK
+L.21:	XMOVEI	T1,@5(ARG)		;[51]Wait flag
+	MOVEM	T1,WAIT			;Save it
+
+; End of setting up parameters.
+; CHKDAT (4)
+
+; Receive data over a link.
+
+; NETLN:	link number
+; COUNT:	count of data returned
+; EOM:		message-mode flag
+; DATA:		returned data
+
+CHKDAT:	MOVE	T1,@NETLN		;Slot number
+	HRRZ	T2,LLEVNT(T1)		;Get event flag
+	JUMPN	T2,CHKAVL		;If somthing there, proceed
+	CALL	.UPEVT			;Update event word in case lost INT
+	MOVE	T2,LLEVNT(T1)		;Get newest info
+; CHKAVL (4.1)
+
+; Check for available data.
+
+; NETLN:	link number
+; EOM:		message-mode flag
+
+CHKAVL:	TXNE	T2,EV.INT		;Interrupt message to read?
+	 JRST	[SETZM	@COUNT		;No data returned
+		 RETURN RCINT.]		;
+T20,<	MOVE	T1,@EOM			;Message mode flag
+	CAIN	T1,MSGMSG		;Message mode?
+	 JRST	MESS			;Yes, go do it
+	MOVE	T1,@NETLN		;Get slot number
+	MOVE	T1,LLJFN(T1)		;Get the JFN
+	SIBE%				;Any characters?
+	 SKIPA				;Have some bytes!
+	  JRST	CHKDS			;No data yet
+	MOVE	T1,@WAIT		;Get wait code
+	CAIE	T1,WAITLN		;Waiting?
+	 JRST	DORCV			;Yes, go wait
+	CAML	T2,@COUNT		;Have enough data?
+	 JRST	DORCV			;Yes, get it
+	MOVE	T3,@NETLN		;Get link number
+	MOVE	T3,CODES(T3)		;Get byte size
+	CAIE	T3,^D36			;Binary?
+	 JRST	CHKA.1			;No, all set
+	IMULI	T2,^D8			;Yes, compute bits
+	MOVE	T1,@USIZE		;Get user's desired byte size
+	SKIPN	T1			;Nonzero?
+	 MOVEI	T1,^D36			;No, use words
+	IDIV	T2,T1			;Get bytes
+	SKIPE	T3			;Any remainder?
+	 AOS	T2			;Yes, round up
+
+CHKA.1:	HRRZM	T2,@COUNT		;Return how much is there
+	RETURN	RCNENF			;Not enough for us
+>; End of T20
+
+T10,<	MOVE	T1,@NETLN		;Get channel number
+	MOVE	T2,LLSTAT(T1)		;Get last status
+	TXNN	T2,NS.NDA		;Data available?
+	  JRST	CHKDS			;No, go wait
+	JRST	DORCV			;Yes, go receive it
+>; End of T10
+; CHKDS (4.2.1.1)
+
+; Check for a disconnect.
+
+; NETLN:	link number
+; COUNT:	count of data returned, set to zero
+; WAIT:		wait flag
+; DATA:		returned data
+
+CHKDS:	MOVE	T1,@NETLN		;Get slot number
+	MOVE	T1,LLEVNT(T1)		;Get status
+	TXNE	T1,EV.ABT+EV.DIS	;Aborted or disconnected?
+	 JRST	[SETZM	@COUNT		;No data returned
+		 RETURN	RCABRJ]		;
+	MOVE	T1,@WAIT		;Get wait code
+	CAIE	T1,WAITLY		;Waiting?
+	 JRST	[SETZM	@COUNT		;No, no data available yet
+		 RETURN	RCNENF]		;
+	MOVEI	T1,DISTIM		;Yes, wait for data
+	DISMS%				;
+	JRST	CHKDAT			;Go check again
+; MESS (4.2)
+
+; Handle message-mode data.
+
+; NETLN:	link number
+; COUNT:	count of data
+; DATA:		returned data
+
+MESS:
+T20,<	MOVE	T1,@NETLN		;Slot number
+	MOVE	T1,LLSTAT(T1)		;Get status word
+	TXNN	T1,MO%EOM		;Full message?
+	 JRST	MESS.2			;No, check if disconnected or not done
+	MOVE	T1,@NETLN		;Get slot number
+	MOVE	T1,LLJFN(T1)		;Get JFN
+	SIBE%				;Get character count
+	 JFCL				;...
+	CAMG	T2,@COUNT		;Too many characters?
+	 JRST	DORCV			;No, do the read
+	MOVE	T3,@NETLN		;Get link number
+	MOVE	T3,CODES(T3)		;Get byte size
+	CAIE	T3,^D36			;Binary?
+	 JRST	MESS.1			;No, all set
+	IMULI	T2,^D8			;Yes, compute bits
+	MOVE	T1,@USIZE		;Get user's desired byte size
+	SKIPN	T1			;Nonzero?
+	 MOVEI	T1,^D36			;No, use words
+	IDIV	T2,T1			;Get bytes
+	SKIPE	T3			;Any remainder?
+	 AOS	T2			;Yes, round up
+
+MESS.1:	MOVEM	T2,@COUNT		;Return record size
+	RETURN	RCOVRN			;Too many characters
+
+; We may get here if the full message exceeds 512 words.  We can't do
+; anything else about this monitor "feature".
+
+MESS.2:	MOVE	T1,@NETLN		;Not a full message yet
+	MOVE	T1,LLJFN(T1)		;Get JFN
+	SIBE%				;Get count
+	 SKIPA				;Something there
+	  JRST	CHKDS			;No, check for a disconnect
+;	JRST	DORCV			;Read it anyways!
+>; End of T20
+; DORCV (4.2.1)
+
+; Read data.
+
+; NETLN:	link number
+; COUNT:	character count
+; EOM:		message-mode flag
+; DATA:		returned data
+
+DORCV:
+T20,<	MOVE	T1,@NETLN		;Get slot number
+	MOVE	T2,DATA			;Get the byte pointer
+	MOVE	T3,CODES(T1)		;Check for
+	CAIN	T3,^D36			;... 36 bit
+;**; [63] Change at DORCV + 4		CLR	11-Mar-83
+;[63]	 HRRI	T2,TEMPST		;... and use temporary area if so.
+;[63]	HLL	T2,LLEVNT(T1)		;Byte pointer
+	 MOVE	T2,[441000,,TEMPST]	;[63] ... and use temporary area if so
+	MOVE	T1,LLJFN(T1)		;Get the JFN
+	CAIN	T3,^D36			;36 bit?
+	 JRST	[MOVEI	T3,<4*TSIZE>	;Yes, set up count (4*8-bit bytes)
+		 MOVEM	T3,@COUNT	;Save count in user area
+		 JRST	.+1	]	;... and ignore user count
+	MOVN	T3,@COUNT		;Character count
+	SKIPE	@EOM			;Message mode?
+	 JRST	XMESS			;Yes
+	SIN%				;No
+	 ERJMP	EOF			;Error?
+	JRST	SINCON			;Go on
+
+XMESS:	SINR%				;Input
+	 ERJMP	EOF			;Error?
+
+SINCON:	ADD	T3,@COUNT		;Compute characters read
+	MOVEM	T3,@COUNT		;Return the count
+	MOVE	T1,@NETLN		;Offset
+	CALL	.UPEVT			;Update event word
+	MOVE	T1,@NETLN		;Get link number
+	MOVE	T1,CODES(T1)		;Get byte size
+	CAIN	T1,^D36			;36-bits?
+	 CALL	PACK			;Yes, pack bytes for the user
+	RETURN	RCOK..			;Yes
+
+EOF:	ADD	T3,@COUNT		;Compute characters read
+	MOVEM	T3,@COUNT		;Return it
+	MOVE	T1,@NETLN		;
+	CALL	.UPEVT			;Update status
+	MOVE	T1,@NETLN		;Get slot number
+	MOVE	T2,CODES(T1)		;Get byte size
+	CAIN	T2,^D36			;36-bits?
+	 CALL	PACK			;Yes, pack up data
+	MOVE	T1,@NETLN		;Get slot number back
+	MOVE	T1,LLEVNT(T1)		;Get event flags
+	TXNE	T1,EV.DIS+EV.ABT	;Disconnect or abort?
+	 RETURN	RCABRJ			;Yes
+	RETURN	HORROR			;SIN or SINR error
+>; End of T20
+
+T10,<	MOVE	T1,@NETLN		;Get slot number
+	HRRZM	T1,BL$NSP+.NSACH	;Save channel in arg block
+	MOVE	T2,DATA			;Get the byte pointer
+	MOVE	T3,CODES(T1)		;Check for
+	CAIN	T3,^D36			;... 36 bit
+;**; [63] Change at DORCV + 4		DPR	11-Mar-83
+;[63]	 HRRI	T2,TEMPST		;... and use temporary area if so.
+;[63]	HLL	T2,LLEVNT(T1)		;Byte pointer
+	 MOVE	T2,[441000,,TEMPST]	;[63] ... and use temporary area if so
+	MOVEM	T2,BL$NSP+.NSAA2	;Save in NSP. arg block
+	CAIN	T3,^D36			;36 bit?
+	 JRST	[MOVEI	T3,<4*TSIZE>	;Yes, set up count (4*8-bit bytes)
+		 MOVEM	T3,@COUNT	;Save count in user area
+		 JRST	.+1	]	;... and ignore user count
+	MOVE	T3,@COUNT		;Character count
+	MOVEM	T3,BL$NSP+.NSAA1	;Save in NSP. arg block
+	MOVE	T1,[XWD .NSFDR,.NSAA2+1] ;Function READ, block length
+	TXO	T1,NS.WAI		;To do this correctly, we need to WAIT
+	SKIPE	@EOM			;Was message mode requested?
+	TXO	T1,NS.EOM		;Say so to NSP.
+	MOVEM	T1,BL$NSP+.NSAFN	;Save in arg block
+	MOVEI	T1,BL$NSP
+	NSP.	T1,			;Read the data
+	  JRST	.NSPER			;Check error code
+	MOVE	T1,BL$NSP+.NSACH	;Get status
+	CALL	.CNEVT			;Update event word
+	MOVE	T1,@COUNT		;Get requested byte count
+	SKIPL	BL$NSP+.NSAA1		;If negative, we overran the buffer
+	SUB	T1,BL$NSP+.NSAA1	;Subtract bytes remaining
+	MOVEM	T1,@COUNT		;Return the count transferred to user
+	MOVE	T1,BL$NSP+.NSACH	;Get link status
+	SKIPE	@EOM			;Message mode?
+	  JRST	DORCV1			;Yes, skip this
+	MOVX	T2,MSGMSG		;Flag for MSG-MSG
+	TXNN	T1,NS.EOM		;Did we get last fragment of message?
+	MOVEM	T2,@EOM			;Yes, tell user
+DORCV1:	CALL	.CNEVT			;Update event word
+	MOVE	T1,@NETLN		;Get link number
+	MOVE	T1,CODES(T1)		;Get byte size
+	CAIN	T1,^D36			;36-bits?
+	 CALL	PACK			;Yes, pack bytes for the user
+	SKIPL	BL$NSP+.NSAA1		;If message mode, we may have lost data
+	RETURN	RCOK..			;No, return OK
+	RETURN	RCOVRN			;Yes, tell user we had Overrun
+>; End of T10
+
+; PACK (4.2.1.1) Ugly but necessary
+
+; Pack binary data received from the network in 8-bit bytes in VAX order
+; (backwards) into 36-bit words and compute how many bytes (of the size
+; specified by the user) were read.
+
+; Received from the network:
+
+; +-----+-----+-----+-----+---+ +-----+-----+-----+-----+---+ +-----+---
+; |  1  |  2  |  3  |  4  |   | | H5L |  6  |  7  |  8  |   | |  9  | ...
+; +-----+-----+-----+-----+---+ +-----+-----+-----+-----+---+ +-----+---
+
+; Desired results:
+
+; +---+-----+-----+-----+-----+ +-----+-----+-----+-----+---+
+; | 5L|  4  |  3  |  2  |  1  | |  9  |  8  |  7  |  6  |H5 | ...
+; +---+-----+-----+-----+-----+ +-----+-----+-----+-----+---+
+
+PACK:	PUSH	P,T4			;Save a register for byte loading
+	MOVE	T3,@COUNT		;Get byte count
+	MOVE	T1,[POINT 8,TEMPST]	;ILDB pointer to temporary area
+	JUMPE	T3,L.116		;If no bytes, skip moving them!
+	HRR	T2,DATA			;Address of user data area
+
+L.115:	HRLI	T2,001000		;Byte pointer to byte #1 destination
+	ILDB	T4,T1			;Get byte #1
+	DPB	T4,T2			;Store byte #1
+	SOJE	T3,L.116		;Stop if done
+	HRLI	T2,101000		;Byte pointer to byte #2 destination
+	ILDB	T4,T1			;Get byte #2
+	DPB	T4,T2			;Store byte #2
+	SOJE	T3,L.116		;Stop if done
+	HRLI	T2,201000		;Byte pointer to byte #3 destination
+	ILDB	T4,T1			;Get byte #3
+	DPB	T4,T2			;Store byte #3
+	SOJE	T3,L.116		;Stop if done
+	HRLI	T2,301000		;Byte pointer to byte #4 destination
+	ILDB	T4,T1			;Get byte #4
+	DPB	T4,T2			;Store byte #4
+	SOJE	T3,L.116		;Stop if done
+	HRLI	T2,400400		;Byte pointer to low-order nibble (#5)
+	ILDB	T4,T1			;Get whole byte #5
+	DPB	T4,T2			;Store low-order nibble (#5)
+	CAIE	T3,1			;Last byte?
+	 JRST	L.123			;No, skip this check
+	SKIPE	SLOP			;Unused bits present?
+	 JRST	L.116			;Yes, don't store them
+L.123:	LDB	T4,T1			;Get byte #5 again
+	LSH	T4,-4			;Remove low-order nibble
+	AOJ	T2,0			;Move to next destination word
+	HRLI	T2,000400		;Byte pointer to low-order nibble (#5)
+	DPB	T4,T2			;Store high-order nibble (#5)
+	SOJE	T3,L.116		;Stop if done
+	HRLI	T2,041000		;Byte pointer to byte #6
+	ILDB	T4,T1			;Get byte #6
+	DPB	T4,T2			;Store byte #6
+	SOJE	T3,L.116		;Stop if done
+	HRLI	T2,141000		;Byte pointer to byte #7
+	ILDB	T4,T1			;Get byte #7
+	DPB	T4,T2			;Store byte #7
+	SOJE	T3,L.116		;Stop if done
+	HRLI	T2,241000		;Byte pointer to byte #8
+	ILDB	T4,T1			;Get byte #8
+	DPB	T4,T2			;Store byte #8
+	SOJE	T3,L.116		;Stop if done
+	HRLI	T2,341000		;Byte pointer to byte #9
+	ILDB	T4,T1			;Get byte #9
+	DPB	T4,T2			;Store byte #9
+	AOJ	T2,0			;Increment destination word
+	SOJG	T3,L.115		;Continue if more bytes
+
+; Done shuffling bytes, so compute count.
+
+L.116:	MOVE	T1,@COUNT		;Retrieve count as 8-bit bytes
+	IMULI	T1,^D8			;... and convert to bits
+	MOVE	T3,@USIZE		;Get user's byte size
+	SKIPN	T3			;If zero,
+	 MOVEI	T3,^D36			;... use word size
+	IDIV	T1,T3			;Convert bits to user bytes
+	MOVEM	T1,@COUNT		;Store result
+
+L.117:	POP	P,T4			;Restore saved register
+	RET				;
+
+	PRGEND				;End of NFRCV
+
+	TITLE	NFSND Send data over a logical link
+	ENTRY	NFSND
+	SEARCH	TTTUNV
+	TTTINI
+T20,<	EXTERN	.JSER>
+T10,<	EXTERN	.CNEVT,.NSPER>
+; NFSND (5A)
+;
+; Send data over a logical link.
+;
+; Messages sent over a link opened with NFOPA are sent in ASCII, and may
+; be read directly as ASCII by the receiving task, even if the receiving
+; task is on a heterogeneous system.
+;
+; Messages sent over links opened with NFOP8 are sent as sequential
+; 8-bit bytes read as the local system normally stores such bytes and
+; received as the remote system normally stores such bytes.  This type of
+; message should be used for non-ASCII, non-numeric data such as
+; bit masks.
+;
+; Messages sent over links opened with NFOPB will look the same to the
+; receiving task as to the sender if the tasks are on homogeneous
+; systems; if the tasks are on heterogeneous systems, either the sending
+; task must convert the data before it is sent using the DCR, or the
+; receiving task must convert the data it receives (unconverted data
+; sent to a heterogeneous system will arrive in a format acceptable
+; as input to the DCR).  See Appendix H of the Functional Specification
+; for details of how the data is actually transported through the
+; network.
+;
+; CALL NFSND USING NETLN, USIZE, COUNT, DATA, MSG-FLG.
+; RETCOD = NFSND (NETLN, USIZE, COUNT, DATA, MSGFLG)
+;
+; NETLN	network logical name, set by NFOPA, NFOPB, NFOP8, or NFOPP.
+; USIZE	Message unit size.  Ignored if the active side of the link
+;	was opened with NFOPA, which will send ASCII data only, or with
+;	NFOP8, which will send 8-bit bytes only.  For links opened with
+;	NFOPB, this is the message length unit size.  Zero may be used to
+;	indicate words (or VAX longwords (32 bits))
+;	(on the local system).  This parameter is currently
+;	included only for user convenience and does not affect how data
+;	is actually transferred over the network.
+; COUNT	Message length (must be greater than zero).  The length is
+;	given in ASCII characters for links opened with NFOPA, in
+;	sequential 8-bit bytes for links opened with NFOP8, or in bytes
+;	of the size specified by the message unit size (or words
+;	or VAX longwords (32 bit)) for links opened with NFOPB.
+; DATA	message.
+; MSG-FLG message mode flag:
+;	MSGMSG: data in message mode
+;	MSGSTM: data in non-message (stream) mode.
+; Return code and function value:
+;	SNWRNG: an argument is of the wrong type
+;	SNOK..: data sent successfully
+;	HORROR: JSYS error.
+
+NFSND:	SAVAC				;Save the ACs
+
+; Set up parameters:
+
+; NETLN (0) setup:
+
+	IFN	TCK,<			;Type-checking code
+	HRLI	T1,.TYPE		;Get NETLN's type
+	HRRI	T1,0(ARG)		;...
+	LDB	T1,T1			;...
+	CAIN	T1,.OK			;Unspecified is always OK
+	 JRST	L.22			;...
+	CAIE	T1,.I1			;One-word integer is correct
+	 RETURN	SNWRNG			;Anything else is trouble
+>;	 End IFN TCK
+L.22:	XMOVEI	T1,@0(ARG)		;[51]NETLN
+	MOVEM	T1,NETLN		;Save it
+	SKIPL	T1,@NETLN		;Get value given. Can not be negative
+	CAILE	T1,MAXLL		;Or greater than MAXLL
+	 RETURN	SNWRNG			;Return error
+
+; USIZE (1) setup:
+
+	IFN	TCK,<			;Type-checking code
+	HRLI	T1,.TYPE		;Get USIZE's type
+	HRRI	T1,1(ARG)		;...
+	LDB	T1,T1			;...
+	CAIN	T1,.OK			;Unspecified is always OK
+	 JRST	L.55			;...
+	CAIE	T1,.I1			;One-word integer is correct
+	 RETURN	SNWRNG			;Anything else is trouble
+>; End IFN TCK
+L.55:	XMOVEI	T1,@1(ARG)		;[51]Address of USIZE
+	MOVEM	T1,USIZE		;Save it
+
+; COUNT (2) setup:
+
+	IFN	TCK,<			;Type-checking code
+	HRLI	T1,.TYPE		;Get COUNT's type
+	HRRI	T1,2(ARG)		;...
+	LDB	T1,T1			;...
+	CAIN	T1,.OK			;Unspecified is always OK
+	 JRST	L.23			;...
+	CAIE	T1,.I1			;One-word integer is correct
+	 RETURN	SNWRNG			;Anything else is trouble
+>; End IFN TCK
+L.23:	XMOVEI	T1,@2(ARG)		;[51]COUNT address
+	MOVEM	T1,COUNT		;Save it
+
+; DATA (3) setup:
+
+	HRLI	T1,.TYPE		;Get DATA's type
+	HRRI	T1,3(ARG)		;...
+	LDB	T1,T1			;...
+	CAIN	T1,.OK			;Unspecified, use FORTRAN
+	 JRST	L.25			;...
+	CAIN	T1,.ST			;COBOL byte string
+	 JRST	L.24			;Do it
+	JRST	L.25			;Otherwise assume FORTRAN for now
+
+; COBOL code:
+
+L.24:	XMOVEI	T1,@3(ARG)		;[51]Data pointer address
+	MOVE	T1,0(T1)		;Get byte pointer
+	JRST	.E4			;...
+
+; End of COBOL code.
+
+; FORTRAN code:
+
+L.25:	XMOVEI	T1,@3(ARG)		;[51]String address
+	HLL	T1,[POINT 7,0]		;Make a byte pointer
+	MOVE	T2,@NETLN		;Get link index
+	MOVE	T2,CODES(T2)		;Get byte size
+	CAIE	T2,^D7			;Skip if 7-bit
+	 HLL	T1,[POINT 8,0]		;Otherwise, use 8-bit pointer
+
+; End of FORTRAN code.
+
+.E4:	MOVEM	T1,DATA			;Save it
+
+; MSGFLG (4) setup:
+
+	IFN	TCK,<			;Type-checking code
+	HRLI	T1,.TYPE		;Get MSG-FLG's type
+	HRRI	T1,4(ARG)		;...
+	LDB	T1,T1			;...
+	CAIN	T1,.OK			;Unspecified is always OK
+	 JRST	L.26			;...
+	CAIE	T1,.I1			;One-word integer is correct
+	 RETURN	SNWRNG			;Anything else is trouble
+>; End IFN TCK
+L.26:	XMOVEI	T1,@4(ARG)		;[51]EOM flag address
+	MOVEM	T1,EOM			;Save it
+
+; End of setting up parameters.
+; SEND (5)
+
+; Send data over a logical link.
+
+; NETLN:	link number
+; DATA:		data to send
+; COUNT:	length of data
+; EOM:		message-mode flag
+
+SEND:	MOVE	T1,@NETLN		;Slot number
+	MOVE	T2,DATA			;Byte pointer
+	MOVE	T3,CODES(T1)		;Get byte size
+	CAIN	T3,^D36			;Binary mode?
+	 JRST	[CALL	UNPACK		;Yes, unpack data
+		 JRST	L.120	]	;Go do it
+;**; [63] Remove code at SEND + 5	CLR	11-Mar-83
+;[63]	HLL	T2,LLEVNT(T1)		;Byte pointer
+	MOVN	T3,@COUNT		;Character count
+L.120:
+T20,<	MOVE	T1,LLJFN(T1)		;Get the JFN
+	MOVE	T0,@EOM			;Get mode flag
+	CAIE	T0,MSGMSG		;Message mode?
+	 JRST	STREAM			;No
+>; End of T20
+;	JRST	MSG			;Yes, fall through to do message mode
+; MSG (5.2)
+
+; Do message mode.
+
+MSG:
+T20,<	SOUTR%				;Yes
+	 ERJMP	.JSER			;Error?
+	RETURN	SNOK..			;Return
+>; End of T20
+; STREAM (5.3)
+
+; Do stream mode.
+
+STREAM:
+T20,<	SOUT%				;Output it
+	 ERJMP	.JSER			;Error?
+	RETURN	SNOK..			;
+>; End of T20
+
+T10,<	MOVE	T1,@NETLN		;Get channel number
+	MOVEM	T1,BL$NSP+.NSACH	;Save channel number
+	SKIPE	@EOM			;If message mode
+	SKIPA	T1,[NS.WAI!NS.EOM!<XWD .NSFDS,.NSAA2+1>] ;Get function+flags
+	MOVE	T1,[NS.WAI!<XWD .NSFDS,.NSAA2+1>] ; Get function+flags+length
+	MOVEM	T1,BL$NSP+.NSAFN	;Save flags+functions+length
+	MOVNM	T3,BL$NSP+.NSAA1	;Save byte count
+	MOVEM	T2,BL$NSP+.NSAA2	;Save byte pointer
+	MOVEI	T1,BL$NSP
+	NSP.	T1,			;Do it
+	  JRST	.NSPER			;Check error code
+	MOVE	T1,BL$NSP+.NSACH	;Get Status
+	CALL	.CNEVT			;Update event word
+	RETURN	SNOK..			;Return
+>; End of T10
+
+; UNPACK (5.1) Ugly but necessary
+
+; Unpack 36-bit words into 8-bit bytes to be sent over the network in
+; VAX order (backwards).  The routine computes how many bytes to send
+; based on the user's byte size and count.
+
+; User data:
+
+; +---+-----+-----+-----+-----+ +-----+-----+-----+-----+---+
+; | 5L|  4  |  3  |  2  |  1  | |  9  |  8  |  7  |  6  |H5 | ...
+; +---+-----+-----+-----+-----+ +-----+-----+-----+-----+---+
+
+; Unpacked data for network transfer:
+
+; +-----+-----+-----+-----+---+ +-----+-----+-----+-----+---+ +-----+---
+; |  1  |  2  |  3  |  4  |   | | H5L |  6  |  7  |  8  |   | |  9  | ...
+; +-----+-----+-----+-----+---+ +-----+-----+-----+-----+---+ +-----+---
+
+UNPACK:	PUSH	P,T1			;Save temporary registers
+	PUSH	P,T5			;Save a register for the split byte
+	PUSH	P,T4			;Save a register for byte loading
+	SKIPN	T3,@USIZE		;Get message unit size in bits
+	 JRST	[MOVE T3,@COUNT		;If words, just pick up user count
+		JRST	L.121]		;And use as is
+	MOVEI	T1,^D36			;Compute bytes per word
+	IDIV	T1,T3			;... in T1
+	MOVE	T3,@COUNT		;Get count of bytes
+	IDIV	T3,T1			;... and change to words in T3
+	SKIPE	T4			;Any leftover bytes?
+	 AOJ	T3,			;Yes, one more word
+L.121:	MOVE	T4,T3			;One half (the number of words
+	AOJ	T4,0			;... plus one)
+	LSH	T4,-1			;... of split bytes
+	LSH	T3,2			;Change words to 8-bit bytes
+	ADD	T3,T4			;Add in byte fudge factor
+;**; [111] Change at L.121	DPR	04-June-84
+	CAILE	T3,TSIZE*4		;[111] If greater than out buffer
+	  MOVEI	T3,TSIZE*4		;[111] That is the max
+	PUSH	P,T3			;Save byte count for SOUT/SOUTR
+	HRR	T2,DATA			;Get user data address
+	MOVE	T1,[POINT 8,TEMPST]	;ILDB pointer to temporary area
+
+L.118:	HRLI	T2,001000		;Byte pointer to byte #1 source
+	LDB	T4,T2			;Get byte #1
+	IDPB	T4,T1			;Store byte #1
+	SOJE	T3,L.119		;Stop if done
+	HRLI	T2,101000		;Byte pointer to byte #2
+	LDB	T4,T2			;Get byte #2
+	IDPB	T4,T1			;Store byte #2
+	SOJE	T3,L.119		;Stop if done
+	HRLI	T2,201000		;Byte pointer to byte #3 source
+	LDB	T4,T2			;Get byte #3
+	IDPB	T4,T1			;Store byte #3
+	SOJE	T3,L.119		;Stop if done
+	HRLI	T2,301000		;Byte pointer to byte #4 source
+	LDB	T4,T2			;Get byte #4
+	IDPB	T4,T1			;Store byte #4
+	SOJE	T3,L.119		;Stop if done
+	HRLI	T2,400400		;Byte pointer to low-order nibble (#5)
+	LDB	T4,T2			;Get low-order nibble (#5)
+	AOJ	T2,0			;Move to next source word
+	HRLI	T2,000400		;Byte pointer to high-order nibble (#5)
+	LDB	T5,T2			;Get high-order nibble (#5) and
+	LSH	T5,4			;... shift it over and
+	ADD	T4,T5			;... add nibbles to get byte #5
+	IDPB	T4,T1			;Store byte #5
+	SOJE	T3,L.119		;Stop if done
+	HRLI	T2,041000		;Byte pointer to byte #6 source
+	LDB	T4,T2			;Get byte #6
+	IDPB	T4,T1			;Store byte #6
+	SOJE	T3,L.119		;Stop if done
+	HRLI	T2,141000		;Byte pointer to byte #7
+	LDB	T4,T2			;Get byte #7
+	IDPB	T4,T1			;Store byte #7
+	SOJE	T3,L.119		;Stop if done
+	HRLI	T2,241000		;Byte pointer to byte #8
+	LDB	T4,T2			;Get byte #8
+	IDPB	T4,T1			;Store byte #8
+	SOJE	T3,L.119		;Stop if done
+	HRLI	T2,341000		;Byte pointer to byte #9
+	LDB	T4,T2			;Get byte #9
+	IDPB	T4,T1			;Store byte #9
+	AOJ	T2,0			;Increment source words
+	SOJG	T3,L.118		;Continue if more bytes
+
+; Done shuffling bytes.
+
+L.119:	POP	P,T3			;Get byte count and
+	MOVN	T3,T3			;... negate it for SOUT/SOUTR
+	MOVE	T2,[POINT 8,TEMPST]	;Set up pointer for SOUT/SOUTR
+	POP	P,T4			;Restore registers
+	POP	P,T5			;...
+	POP	P,T1			;...
+	RET				;
+
+	PRGEND				;End of NFSND
+
+	TITLE	NFREJ Reject a link connection
+	ENTRY	NFREJ
+	SEARCH	TTTUNV
+	TTTINI
+T20,<	EXTERN	.JSER,.UPEVT>
+T10,<	EXTERN	.NSPER>
+; NFREJ (6A)
+;
+; Reject a connection on a passive link which got a connect event.
+; The link specified will not be availale for use after this routine
+; is called, whether or not the call succeeded.
+;
+; Note: A connection could be implicitly rejected by closing the JFN of
+; the logical link before accepting the connection, producing a connect
+; reject message with a reject code of 38 (user aborted).  In this case,
+; you must reopen the network JFN to receive subsequent connect
+; initiate messages.
+;
+; CALL NFREJ USING NETLN, CODE, COUNT, DATA.
+; RETCOD = NFREJ (NETLN, CODE, COUNT, DATA)
+;
+; NETLN	network logical name, set by the NFOPP routine.
+; CODE	abort or reject code.  See Appendix F of the
+;	Functional Specification for a description of abort and
+;	reject codes.
+; COUNT	count of optional data characters.
+; DATA	optional ASCII data.
+; Return code and function value:
+;	RJWRNG:	an argument is of the wrong type
+;	RJOK..: connection rejected successfully
+;	HORROR: JSYS error.
+
+NFREJ:	SAVAC				;Save ACs
+
+; Set up parameters:
+
+; NETLN (0) setup:
+
+	IFN	TCK,<			;Type-checking code
+	HRLI	T1,.TYPE		;Get NETLN's type
+	HRRI	T1,0(ARG)		;...
+	LDB	T1,T1			;...
+	CAIN	T1,.OK			;Unspecified is always OK
+	 JRST	L.27			;...
+	CAIE	T1,.I1			;One-word integer is correct
+	 RETURN	RJWRNG			;Anything else is trouble
+>; End IFN TCK
+L.27:	XMOVEI	T1,@0(ARG)		;[51]Address of NETLN
+	MOVEM	T1,NETLN		;Save it
+	SKIPL	T1,@NETLN		;Get value given. Can not be negative
+	CAILE	T1,MAXLL		;Or greater than MAXLL
+	 RETURN	RJWRNG			;Return error
+
+; CODE (1) setup:
+
+	IFN	TCK,<			;Type-checking code
+	HRLI	T1,.TYPE		;Get CODE's type
+	HRRI	T1,1(ARG)		;...
+	LDB	T1,T1			;...
+	CAIN	T1,.OK			;Unspecified is always OK
+	 JRST	L.28			;...
+	CAIE	T1,.I1			;One-word integer is correct
+	 RETURN	RJWRNG			;Anything else is trouble
+>; End IFN TCK
+L.28:	XMOVEI	T1,@1(ARG)		;[51]Address of CODE
+	MOVEM	T1,CODE			;Save it
+
+; COUNT (2) setup:
+
+	IFN	TCK,<			;Type-checking code
+	HRLI	T1,.TYPE		;Get COUNT's type
+	HRRI	T1,2(ARG)		;...
+	LDB	T1,T1			;...
+	CAIN	T1,.OK			;Unspecified is always OK
+	 JRST	L.29			;...
+	CAIE	T1,.I1			;One-word integer is correct
+	 RETURN	RJWRNG			;Anything else is trouble
+>; End IFN TCK
+L.29:	XMOVEI	T1,@2(ARG)		;[51]Address of COUNT
+	MOVEM	T1,COUNT		;Save it
+
+; DATA (3) setup:
+
+	HRLI	T1,.TYPE		;Get DATA's type
+	HRRI	T1,3(ARG)		;...
+	LDB	T1,T1			;...
+	CAIN	T1,.OK			;Unspecified, assume FORTRAN
+	 JRST	L.31			;...
+	CAIE	T1,.ST			;[7] COBOL byte string
+	 JRST	L.31			;[7] Otherwise, assume FORTRAN for now
+
+; COBOL code:
+
+	XMOVEI	T1,@3(ARG)		;[51][7] Address of data descriptor
+	MOVE	T1,0(T1)		;Get byte pointer
+	LDB	T3,[POINT 6,T1,11]	;[7] Get byte pointer
+	CAIE	T3,7			;[7] Must be ASCII
+	 RETURN	RJWRNG			;[7] Wrong type
+	JRST	.E5			;...
+
+; End of COBOL code.
+
+; FORTRAN code:
+
+L.31:	XMOVEI	T1,@3(ARG)		;[51]String address
+	HLL	T1,[POINT 7,0]		;Make a byte pointer
+
+; End of FORTRAN code.
+
+.E5:	MOVEM	T1,DATA			;Save it
+
+; End of setting up parameters.
+; REJ (6)
+
+; Reject a link.
+
+; NETLN:	link number
+; CODE:		reject code
+; DATA:		optional data
+; COUNT:	length of data
+
+REJ:
+T20,<	MOVE	T1,@NETLN		;Get slot number
+	MOVE	T1,LLJFN(T1)		;Get the JFN
+	MOVEI	T2,.MOCLZ		;Reject function
+	HRL	T2,@CODE		;Reject code
+	MOVE	T3,DATA			;Reject message
+	MOVE	T4,@COUNT		;Character count for message
+	CAILE	T4,SOPTDT		;Check size
+	 MOVEI	T4,SOPTDT		;Too big, so use maximum
+	MTOPR%				;
+	 ERJMP	.JSER			;Error?
+	MOVE	T1,@NETLN		;
+	CALL	.UPEVT			;Update status
+	RETURN	RJOK..			;
+>; End of T20
+
+T10,<	MOVE	T1,@NETLN		;Get channel number
+	HRRZM	T1,BL$NSP+.NSACH	;Save in NSP. arg block
+	MOVE	T1,@COUNT		;Get user byte count
+	MOVEI	T2,.NSACH+1		;Assume short arg type
+	SKIPN	T1			;Zero bytes?
+	  JRST	REJ2			;Don't send it then
+	CAILE	T1,SOPTDT		;More than the max??
+	  MOVEI	T1,SOPTDT		;Make it the max
+	HRLM	T1,BL$OPT+.NSASL	;Save in string desc.
+	MOVE	T2,DATA			;Pointer to user data
+	MOVE	T3,[POINT 8,BL$OPT+.NSAST] ;Pointer to string block
+REJ1:	ILDB	T4,T2			;Get a char
+	IDPB	T4,T3			;Store a char
+	SOJG	T1,REJ1			;Loop
+	MOVEI	T1,BL$OPT		;Update NSP. arg blk.
+	MOVEM	T1,BL$NSP+.NSAA1
+	MOVEI	T2,.NSAA1+1		;Long block length
+REJ2:	HRLI	T2,.NSFRJ		;Function code (REJECT)
+	MOVEM	T2,BL$NSP+.NSAFN	;Save in NSP. arg blk.
+	MOVEI	T1,BL$NSP
+	NSP.	T1,			;Do it
+	  JRST	.NSPER			;Look at error code
+	RETURN	RJOK..			;
+>; End of T10
+
+	PRGEND				;End of NFREJ
+
+	TITLE	NFINT Send an interrupt message
+	ENTRY	NFINT
+	SEARCH	TTTUNV
+	TTTINI
+T20,<	EXTERN	.JSER>
+T10,<	EXTERN	.NSPER,.CNEVT>
+; NFINT (7A)
+;
+; Send an interrupt message over a logical link.
+;
+; Unlike NFSND, data is always sent in message mode, so a prompt attempt
+; to send data is guaranteed.  Data sent in this mode is not sent in sync
+; with data sent by NFSND.  Only one interrupt can be sent over a logical
+; link at one time.
+;
+; CALL NFINT USING NETLN, COUNT, DATA.
+; RETCOD = NFINT (NETLN, COUNT, DATA)
+;
+; NETLN	network logical name, set by NFOPA, NFOPB, NFOP8, or NFOPP.
+; COUNT	characters of data to send (1 to SINTDT).
+; DATA	ASCII data.
+; Return code and function value:
+;	IDWRNG: an argument is of the wrong type
+;	IDOK..: data sent successfully
+;	HORROR: JSYS error.
+
+NFINT:	SAVAC				;Save the ACs
+
+; Set up parameters:
+
+; NETLN (0) setup:
+
+	IFN	TCK,<			;Type-checking code
+	HRLI	T1,.TYPE		;Get NETLN's type
+	HRRI	T1,0(ARG)		;...
+	LDB	T1,T1			;...
+	CAIN	T1,.OK			;Unspecified is always OK
+	 JRST	L.32			;...
+	CAIE	T1,.I1			;One-word integer is correct
+	 RETURN	IDWRNG			;Anything else is trouble
+>; End IFN TCK
+L.32:	XMOVEI	T1,@0(ARG)		;[51]Address of NETLN
+	MOVEM	T1,NETLN		;Save it
+	SKIPL	T1,@NETLN		;Get value given. Can not be negative
+	CAILE	T1,MAXLL		;Or greater than MAXLL
+	 RETURN	IDWRNG			;Return error
+
+; COUNT (1) setup:
+
+	IFN	TCK,<			;Type-checking code
+	HRLI	T1,.TYPE		;Get COUNT's type
+	HRRI	T1,1(ARG)		;...
+	LDB	T1,T1			;...
+	CAIN	T1,.OK			;Unspecified is always OK
+	 JRST	L.33			;...
+	CAIE	T1,.I1			;One-word integer is correct
+	 RETURN	IDWRNG			;Anything else is trouble
+>; End IFN TCK
+L.33:	XMOVEI	T1,@1(ARG)		;[51]Address of COUNT
+	MOVEM	T1,COUNT		;Save it
+
+; DATA (2) setup:
+
+	HRLI	T1,.TYPE		;Get DATA's type
+	HRRI	T1,2(ARG)		;...
+	LDB	T1,T1			;...
+	CAIN	T1,.OK			;Unspecified, assume FORTRAN
+	 JRST	L.35			;...
+	CAIE	T1,.ST			;[7] COBOL byte string
+	 JRST	L.35			;[7] Otherwise, assume FORTRAN for now
+
+; COBOL code:
+
+	XMOVEI	T1,@2(ARG)		;[51][7] Address of data descriptor
+	MOVE	T1,0(T1)		;Byte pointer
+	LDB	T3,[POINT 6,T1,11]	;[7] Get byte size
+	CAIE	T3,7			;[7] Must be ASCII
+	 RETURN	IDWRNG			;[7] Wrong type
+	JRST	.E6			;...
+
+; End of COBOL code.
+
+; FORTRAN code:
+
+L.35:	XMOVEI	T1,@2(ARG)		;[51]String address
+	HLL	T1,[POINT 7,0]		;Make it a byte pointer
+
+; End of FORTRAN code.
+
+.E6:	MOVEM	T1,DATA			;Save it
+
+; End of setting up parameters.
+; SINT (7)
+
+; Send an interrupt message.
+
+; NETLN:	link number
+; DATA:		interrupt data
+; COUNT:	length of data
+
+SINT:
+T20,<	MOVE	T1,@NETLN		;Get slot number
+	MOVE	T1,LLJFN(T1)		;Get the JFN
+	MOVEI	T2,.MOSIM		;Send interrupt message function
+	MOVE	T3,DATA			;Byte pointer
+	MOVE	T4,@COUNT		;Character count for message
+	CAILE	T4,SINTDT		;Check size
+	 MOVEI	T4,SINTDT		;Too big, use maximum
+	MTOPR%				;Send it
+	 ERJMP	.JSER			;Error?
+	RETURN	IDOK..			;
+>; End of T20
+
+T10,<	MOVE	T1,@NETLN		;Get channel number
+	HRRZM	T1,BL$NSP+.NSACH	;Save in NSP. arg block
+	MOVE	T1,@COUNT		;Get user byte count
+	CAILE	T1,SINTDT		;More than the max?
+	  MOVEI	T1,SINTDT		;Make it the max
+	HRLM	T1,BL$OPT+.NSASL	;Save in string desc.
+	JUMPE	T1,SINT2		;No data??
+	MOVE	T2,DATA			;Pointer to user data
+	MOVE	T3,[POINT 8,BL$OPT+.NSAST] ;Pointer to string block
+SINT1:	ILDB	T4,T2			;Get a char
+	IDPB	T4,T3			;Store a char
+	SOJG	T1,SINT1			;Loop
+	MOVEI	T1,BL$OPT		;Update NSP. arg blk.
+	MOVEM	T1,BL$NSP+.NSAA1
+SINT2:	MOVE	T2,[XWD .NSFIS,.NSAA1+1];Block length, function(snd int data)
+	MOVEM	T2,BL$NSP+.NSAFN	;Save in NSP. arg blk.
+	MOVEI	T1,BL$NSP
+	NSP.	T1,			;Do it
+	  JRST	.NSPER			;Look at error code
+	MOVE	T1,BL$NSP+.NSACH	;Get status
+	CALL	.CNEVT			;Update event word
+	RETURN	IDOK..			;
+>; End of T10
+
+	PRGEND				;End of NFINT
+
+	TITLE	NFRCI Receive an interrupt message
+	ENTRY	NFRCI
+	SEARCH	TTTUNV
+	TTTINI
+T10,<	EXTERN	.NSPER,.CNEVT>
+; NFRCI (8A)
+;
+; Receive a single interrupt message over a logical link.
+;
+; Receipt of an interrupt message is an asynchronous event.  The normal
+; way to access asynchronous events is through the NFGND interface
+; routine.  NFGND will announce interrupt messages before data messages;
+; such messages must be read before NFGND will announce any lower-level
+; events (data messages or disconnections).  Note that NFRCV will return
+; error code 2 and refuse to return data if an interrupt message is
+; available which has not been read by NFRCI.
+;
+; CALL NFRCI USING NETLN, COUNT, DATA.
+; RETCOD = NFRCI (NETLN, COUNT, DATA)
+;
+; NETLN	network logical name, set by NFOPA, NFOPB, NFOP8, or NFOPP.
+; COUNT	count of characters read.
+; DATA	ASCII data read (1 to SINTDT characters).  This area
+;	must be at least SINTDT characters long.
+; Return code and function value:
+;	RIWRNG: an argument is of the wrong type
+;	RIOK..: interrupt message read successfully.  COUNT has number
+;		of characters read
+;	RINONE: no message available now 
+;	HORROR: JSYS error.
+
+NFRCI:	SAVAC				;Save the ACs
+
+; Set up parameters:
+
+; NETLN (0) setup:
+
+	IFN	TCK,<			;Type-checking code
+	HRLI	T1,.TYPE		;Get NETLN's type
+	HRRI	T1,0(ARG)		;...
+	LDB	T1,T1			;...
+	CAIN	T1,.OK			;Unspecified is always OK
+	 JRST	L.36			;...
+	CAIE	T1,.I1			;One-word integer is correct
+	 RETURN	RIWRNG			;Anything else is trouble
+>; End IFN TCK
+L.36:	XMOVEI	T1,@0(ARG)		;[51]Address of NETLN
+	MOVEM	T1,NETLN		;Save it
+	SKIPL	T1,@NETLN		;Get value given. Can not be negative
+	CAILE	T1,MAXLL		;Or greater than MAXLL
+	 RETURN	RIWRNG			;Return error
+
+; COUNT (1) setup:
+
+	IFN	TCK,<			;Type-checking code
+	HRLI	T1,.TYPE		;Get COUNT's type
+	HRRI	T1,1(ARG)		;...
+	LDB	T1,T1			;...
+	CAIN	T1,.OK			;Unspecified is always OK
+	 JRST	L.37			;...
+	CAIE	T1,.I1			;One-word integer is correct
+	 RETURN	RIWRNG			;Anything else is trouble
+>; End IFN TCK
+L.37:	XMOVEI	T1,@1(ARG)		;[51]Address of ARG
+	MOVEM	T1,COUNT		;Save it
+
+; DATA (2) setup:
+
+	HRLI	T1,.TYPE		;Get DATA's type
+	HRRI	T1,2(ARG)		;...
+	LDB	T1,T1			;...
+	CAIN	T1,.OK			;Unspecified, assume FORTRAN
+	 JRST	L.39			;...
+	CAIE	T1,.ST			;[7] COBOL byte string
+	 JRST	L.39			;[7] Otherwise, assume FORTRAN for now
+
+; COBOL code:
+
+	XMOVEI	T1,@2(ARG)		;[51][7] Address of string descriptor
+	MOVE	T1,0(T1)		;Byte pointer
+	LDB	T3,[POINT 6,T1,11]	;[7] Get byte size
+	CAIE	T3,7			;[7] Must be ASCII
+	 RETURN	RIWRNG			;[7] Wrong type
+	JRST	.E7			;...
+
+; End of COBOL code.
+
+; FORTRAN code:
+
+L.39:	XMOVEI	T1,@2(ARG)		;[51]String address
+	HLL	T1,[POINT 7,0]		;Make it a byte pointer
+
+; End of FORTRAN code.
+
+.E7:	MOVEM	T1,DATA			;Save it
+
+; End of setting up parameters.
+; RCI (8)
+
+; Receive an interrupt.
+
+; NETLN:	link number
+; DATA:		interrupt data returned
+; COUNT:	length of data
+
+RCI:
+T20,<	MOVE	T1,@NETLN		;Get slot number
+	MOVX	T2,EV.INT		;
+	ANDCAM	T2,LLEVNT(T1)		;
+	MOVE	T1,LLJFN(T1)		;Get the JFN
+	MOVEI	T2,.MORIM		;MTOPR function
+	MOVE	T3,DATA			;Byte pointer
+	MTOPR%				;
+	 ERJMP	[RETURN RINONE]		;No interrupt message
+	MOVEM	T4,@COUNT		;Return count of bytes in message
+	MOVE	T1,@NETLN		;Get slot number
+	RETURN	RIOK..			;Return 0
+>; End of T20
+
+T10,<	MOVE	T1,@NETLN		;Get channel number
+	HRRZM	T1,BL$NSP+.NSACH	;Save in NSP. arg block
+	MOVEI	T1,<1+<<SOPTDT+3>/4>> ;Make string header
+	MOVEM	T1,BL$OPT		;Save in block
+	MOVEI	T1,BL$OPT		;Update NSP. arg blk.
+	MOVEM	T1,BL$NSP+.NSAA1
+	MOVE	T2,[XWD .NSFIR,.NSAA1+1] ;Function code (REC INT DATA), length
+	MOVEM	T2,BL$NSP+.NSAFN	;Save in NSP. arg blk.
+	MOVEI	T1,BL$NSP
+	NSP.	T1,			;Do it
+	  JRST	.NSPER			;Look at error code
+	MOVE	T1,BL$NSP+.NSACH	;Get status
+	CALL	.CNEVT			;Update event word
+	HLRZ	T1,BL$OPT+.NSASL	;Get string length
+	MOVEM	T1,@COUNT		;Tell user how many bytes
+	JUMPE	T1,[RETURN RINONE]	;No data??
+	MOVE	T2,DATA			;Pointer to user data
+	MOVE	T3,[POINT 8,BL$OPT+.NSAST] ;Pointer to string block
+RCI1:	ILDB	T4,T3			;Get a char
+	IDPB	T4,T2			;Store a char
+	SOJG	T1,RCI1			;Loop
+	RETURN	RIOK..			;Return okay
+>; End of T10
+
+	PRGEND				;End of NFRCI
+
+	TITLE	NFCLS Disconnect or abort a logical link
+	ENTRY	NFCLS
+	SEARCH	TTTUNV
+	TTTINI
+T20,<	EXTERN	.JSER>
+T10,<	EXTERN	.NSPER>
+; NFCLS (9A)
+;
+; Disconnect or abort the logical link (release its resources for reuse).
+;
+; A synchronous disconnect acts as a pipeline marker which will disconnect
+; the link after all transmissions outstanding have been completed.  An
+; abort instantaneously disconnects the link from the local end, as far as
+; the user is concerned.  DECNET specifies an abort code to be passed in
+; either case, but this feature is not universally implemented.  This routine
+; may be called either before or after receipt of a disconnect for the other
+; end.
+;
+; Network event indications are cleared at various times, depending on the
+; event.  Connect and disconnect (NOT abort) are cleared when reported.
+; Abort is never cleared; any further invocations of NFGND for an aborted
+; link will always get the "abort" code (until the link is disconnected
+; by the user, in which case the NETLN becomes an invalid parameter).
+; A data event is cleared only when there is no more data to be gotten at the
+; moment.  An interrupt event is cleared immediately for all implementations
+; that allow only one outstanding interrupt message (all, at present).
+; For other implementations, it is treated like a data event.
+;
+; CALL NFCLS USING NETLN, TYPE, COUNT, DATA.
+; RETCOD = NFCLS (NETLN, TYPE, COUNT, DATA)
+;
+; NETLN	network logical name, set by NFOPA, NFOPB, NFOP8, or NFOPP.
+; TYPE	type of link disconnect requested:
+;	0: synchronous disconnect (quiesce before disconnecting)
+;	nonzero: abort.
+;	See Appendix F of the Functional Specification for a description
+;	of abort codes.
+; COUNT	count of optional data.
+; DATA	ASCII optional data (1 to SOPTDT ASCII characters).
+; Return code and function value:
+;	CLWRNG: an argument is of the wrong type
+;	CLOK..: link disconnected
+;	HORROR: JSYS error.
+
+NFCLS:	SAVAC				;Save the ACs
+
+; Set up parameters:
+
+; NETLN (0) setup:
+
+	IFN	TCK,<			;Type-checking code
+	HRLI	T1,.TYPE		;Get NETLN's type
+	HRRI	T1,0(ARG)		;...
+	LDB	T1,T1			;...
+	CAIN	T1,.OK			;Unspecified is always OK
+	 JRST	L.40			;...
+	CAIE	T1,.I1			;One-word integer is correct
+	 RETURN	CLWRNG			;Anything else is trouble
+>; End IFN TCK
+L.40:	XMOVEI	T1,@0(ARG)		;[51]NETLN address
+	MOVEM	T1,NETLN		;Save it
+	SKIPL	T1,@NETLN		;Get value given. Can not be negative
+	CAILE	T1,MAXLL		;Or greater than MAXLL
+	 RETURN	CLWRNG			;Return error
+
+; TYPE (1) setup:
+
+	IFN	TCK,<			;Type-checking code
+	HRLI	T1,.TYPE		;Get TYPE's type
+	HRRI	T1,1(ARG)		;...
+	LDB	T1,T1			;...
+	CAIN	T1,.OK			;Unspecified is always OK
+	 JRST	L.41			;...
+	CAIE	T1,.I1			;One-word integer is correct
+	 RETURN	CLWRNG			;Anything else is trouble
+>; End IFN TCK
+L.41:	XMOVEI	T1,@1(ARG)		;[51]Abort or disconnect flag
+	MOVEM	T1,TYPE			;Save it
+
+; COUNT (2) setup:
+
+	IFN	TCK,<			;Type-checking code
+	HRLI	T1,.TYPE		;Get COUNT's type
+	HRRI	T1,2(ARG)		;...
+	LDB	T1,T1			;...
+	CAIN	T1,.OK			;Unspecified is always OK
+	 JRST	L.43			;...
+	CAIE	T1,.I1			;One-word integer is correct
+	 RETURN	CLWRNG			;Anything else is trouble
+>; End IFN TCK
+L.43:	XMOVEI	T1,@2(ARG)		;[51]Byte count address
+	MOVEM	T1,COUNT		;Save it
+
+; DATA (3) setup:
+
+	HRLI	T1,.TYPE		;Get DATA's type
+	HRRI	T1,3(ARG)		;...
+	LDB	T1,T1			;...
+	CAIN	T1,.OK			;Unspecified, assume FORTRAN
+	 JRST	L.45			;...
+	CAIE	T1,.ST			;[7] COBOL byte string
+	 JRST	L.45			;[7] Otherwise, assume FORTRAN for now
+
+; COBOL code:
+
+	XMOVEI	T1,@3(ARG)		;[51][7] DATA descriptor
+	MOVE	T1,0(T1)		;Byte pointer
+	LDB	T3,[POINT 6,T1,11]	;[7] Get byte size
+	CAIE	T3,7			;[7] Must be ASCII
+	 RETURN	CLWRNG			;[7] Wrong type
+	JRST	.E8			;...
+
+; End of COBOL code.
+
+; FORTRAN code:
+
+L.45:	XMOVEI	T1,@3(ARG)		;[51]String address
+	HLL	T1,[POINT 7,0]		;Make it a byte pointer
+
+; End of FORTRAN code.
+
+.E8:	MOVEM	T1,DATA			;Save it
+
+; End of setting up parameters.
+; CLS (9)
+
+; Close a logical link.
+
+; NETLN:	link number
+; TYPE:		type of close
+; COUNT:	count of optional data
+; DATA:		optional data
+
+CLS:
+T20,<	MOVE	T1,@NETLN		;Get slot number
+	MOVE	T2,LLSTAT(T1)		;[4] Get status
+	TXNN	T2,MO%CON		;[4] Still connected?
+	 JRST	CLOZ			;[4] Only close allowed here
+	SKIPE	@TYPE			;[4] Synchronous disconnect?
+	 JRST	DOMTR			;[4] No
+	SKIPN	@COUNT			;[4] Optional data?
+	 JRST	CLOZ			;[4] No
+>; End of T20
+
+;[4] Reinsert this code.  They say CLOSF% is fixed.
+;[4]
+;[4] This code can be re-inserted when CLOSF% is fixed to properly do a
+;[4] synchronous disconnect with no optional data.  It currently (5.1
+;[4] monitor) does not send a DI unless the MTOPR% is done, so we will
+;[4] always do the MTOPR% for now.
+; DOMTR
+
+; Do an abort or disconnect with optional data.
+
+; DATA:		optional data
+; COUNT:	length of data
+; TYPE:		type of disconnect
+; CODE:		abort code
+
+DOMTR:
+T20,<	MOVE	T1,LLJFN(T1)		;JFN of the link
+	MOVEI	T2,.MOCLZ		;Disconnect code
+	MOVE	T3,DATA			;Byte pointer
+	MOVE	T4,@COUNT		;Character count
+	CAILE	T4,SOPTDT		;Check for too long
+	 MOVEI	T4,SOPTDT		;Use maximum instead
+	HRL	T2,@TYPE		;Abort code
+	MTOPR%				;
+	 ERJMP	.JSER			;Error?
+>; End of T20
+; CLOZ
+
+; Do a synchronous disconnect or abort with no optional data.
+
+; TYPE:		type of close
+; NETLN:	link number
+
+CLOZ:
+T20,<	MOVE	T1,@NETLN		;Get slot number
+	MOVE	T1,LLJFN(T1)		;Get the JFN
+	SKIPE	@TYPE			;Abort or synchronous?
+	 TXO	T1,CZ%ABT		;Abort
+	CLOSF%				;Close the logical link
+	 ERJMP	.JSER			;Error?
+	MOVE	T2,@NETLN		;Slot number
+	SETZM	LLJFN(T2)		;Zero the JFN
+	SETZM	LLEVNT(T2)		;Zero the event word
+	SETZM	LLSTAT(T2)		;   and the status word
+	RETURN	CLOK..			;
+>; End of T20
+
+
+T10,<	MOVE	T1,@NETLN		;Get channel number
+	HRRZM	T1,BL$NSP+.NSACH	;Save in NSP. arg block
+	MOVE	T1,@COUNT		;Get user byte count
+	MOVEI	T2,.NSACH+1		;Assume short arg type
+	SKIPN	T1			;Zero bytes?
+	  JRST	CLS2			;Don't send it then
+	CAILE	T1,SOPTDT		;More than the max?
+	  MOVEI	T1,SOPTDT		;Make it the max
+	HRLM	T1,BL$OPT+.NSASL	;Save in string desc.
+	MOVE	T2,[POINT 7,@DATA]	;Pointer to user data
+	MOVE	T3,[POINT 8,BL$OPT+.NSAST] ;Pointer to string block
+CLS1:	ILDB	T4,T2			;Get a char
+	IDPB	T4,T3			;Store a char
+	SOJG	T1,CLS1			;Loop
+	MOVEI	T1,BL$OPT		;Update NSP. arg blk.
+	MOVEM	T1,BL$NSP+.NSAA1
+	MOVEI	T2,.NSAA1+1		;Long block length
+CLS2:	HRLI	T2,.NSFSD		;Function code (Synchronous disconnect)
+	MOVEM	T2,BL$NSP+.NSAFN	;Save in NSP. arg blk.
+	MOVEI	T1,BL$NSP
+	NSP.	T1,			;Do it
+	  JFCL				;Probably wrong state
+	MOVE	T1,[XWD .NSFRL,.NSACH+1];Now, release the channel
+	MOVEM	T1,BL$NSP+.NSAFN
+	MOVEI	T1,BL$NSP
+	NSP.	T1,			;Do it
+	  JFCL				;Could be wrong state again, but
+					; in any case the link is released
+CLS3:	MOVE	T1,@NETLN		;Get line number
+	SETZM	LLSTAT(T1)		;Clear status word
+	SETZM	LLEVNT(T1)		;Clear event word
+	SOSGE	NUMLL			;Decrement active LL count
+	  SETZM	NUMLL			;Don't let it go negative
+	RETURN	CLOK..			;
+>; End of T10
+
+	PRGEND				;End of NFCLS
+
+	TITLE	NFINF Get link information
+	ENTRY	NFINF
+	SEARCH	TTTUNV
+	TTTINI
+T20,<	EXTERN	.JSER>
+T10,<	EXTERN	.NSPER>
+; NFINF (10A)
+;
+; Get information about the other end of the logical link.
+;
+; CALL NFINF USING NETLN, TYPE, COUNT, AREA.
+; RETCOD = NFINF (NETLN, TYPE, COUNT, AREA)
+;
+; NETLN	network logical name, set by NFOPA, NFOPB, NFOP8, or NFOPP.
+; TYPE	type of information wanted:
+;	INODE: remote node name
+;	IOBJ: remote object type (passive only)
+;	IDESCF: remote object descriptor format (0, 1, 2) (passive only)
+;	IDESC: remote object descriptor (passive only)
+;	IUSER: remote process user id (passive only)
+;	IPASS: remote process password (passive only)
+;	IACCT: remote process account (passive only)
+;	IOPT: remote process optional data or disconnection
+;	or reject optional data
+;	ISEG: maximum segment size for the link
+;		Only available if connection has been accepted!
+;	IABTCD: abort code
+; COUNT	length of data returned.
+; AREA	where to put ASCII data.  Must be at least 16 characters long.
+; Return code and function value:
+;	INWRNG: an argument is of the wrong type
+;	INOK..: success
+;	INNOTA: information not available
+;	INOUTR: type is out of range
+;	HORROR: JSYS error.
+
+NFINF:	SAVAC				;Save the ACs
+
+; Set up parameters:
+
+; NETLN (0) setup:
+
+	IFN	TCK,<			;Type-checking code
+	HRLI	T1,.TYPE		;Get NETLN's type
+	HRRI	T1,0(ARG)		;...
+	LDB	T1,T1			;...
+	CAIN	T1,.OK			;Unspecified is always OK
+	 JRST	L.46			;...
+	CAIE	T1,.I1			;One-word integer is correct
+	 RETURN	INWRNG			;Anything else is trouble
+>; End IFN TCK
+L.46:	XMOVEI	T1,@0(ARG)		;[51]Address of NETLN
+	MOVEM	T1,NETLN		;Save it
+	SKIPL	T1,@NETLN		;Get value given. Can not be negative
+	CAILE	T1,MAXLL		;Or greater than MAXLL
+	 RETURN	INWRNG			;Return error
+
+; TYPE (1) setup:
+
+	IFN	TCK,<			;Type-checking code
+	HRLI	T1,.TYPE		;Get TYPE's type
+	HRRI	T1,1(ARG)		;...
+	LDB	T1,T1			;...
+	CAIN	T1,.OK			;Unspecified is always OK
+	 JRST	L.47			;...
+	CAIE	T1,.I1			;One-word integer is correct
+	 RETURN	INWRNG			;Anything else is trouble
+>; End IFN TCK
+L.47:	XMOVEI	T1,@1(ARG)		;[51]Address of TYPE
+	MOVEM	T1,TYPE			;Save TYPE
+
+; COUNT (2) setup:
+
+	IFN	TCK,<			;Type-checking code
+	HRLI	T1,.TYPE		;Get COUNT's type
+	HRRI	T1,2(ARG)		;...
+	LDB	T1,T1			;...
+	CAIN	T1,.OK			;Unspecified is always OK
+	 JRST	L.48			;...
+	CAIE	T1,.I1			;One-word integer is correct
+	 RETURN	INWRNG			;Anything else is touble
+>; End IFN TCK
+L.48:	XMOVEI	T1,@2(ARG)		;[51]Address of COUNT
+	MOVEM	T1,COUNT		;Save it
+
+; AREA (3) setup:
+
+	HRLI	T1,.TYPE		;Get AREA's type
+	HRRI	T1,3(ARG)		;...
+	LDB	T1,T1			;...
+	CAIN	T1,.OK			;Unspecified, assume FORTRAN
+	 JRST	L.50			;...
+	CAIE	T1,.ST			;[7] COBOL byte string
+	 JRST	L.50			;[7] Otherwise, assume FORTRAN for now
+
+; COBOL code:
+
+	XMOVEI	T1,@3(ARG)		;[51][7] Address of data descriptor
+	MOVE	T1,0(T1)		;Byte pointer
+	LDB	T3,[POINT 6,T1,11]	;[7] Get byte size
+	CAIE	T3,7			;[7] Must be ASCII
+	 RETURN	INWRNG			;[7] Wrong type
+	JRST	.E9			;...
+
+; End of COBOL code.
+
+; FORTRAN code:
+
+L.50:	XMOVEI	T1,@3(ARG)		;[51]String address
+	HLL	T1,[POINT 7,0]		;Make it a byte pointer
+
+; End of FORTRAN code.
+
+.E9:	MOVEM	T1,DATA			;Save it
+
+; End of setting up parameters.
+
+	MOVE	T1,@TYPE		;Get information type
+	CAIL	T1,IMIN			;Is requested type
+	 CAILE	T1,IMAX			;   within range?
+	  RETURN INOUTR			;No, error
+	JRST	INFDSP(T1)		;Go do it.
+; INFDSP (10)
+
+; Get link information.
+
+; TYPE:		type of information
+
+INFDSP:	JRST	BADTYP			;(0): No such function
+	JRST	NODNAM			;INODE (1): Return node name
+	JRST	OBJTYP			;IOBJ (2): Return object type
+	JRST	OBJDSF			;IDESCF (3): Object descriptor format
+	JRST	OBJDSC			;IDESC (4): Return object descriptor
+	JRST	USERID			;IUSER (5): Return userid
+	JRST	PASSWD			;IPASS (6): Return password
+	JRST	ACCNT			;IACCT (7): Return account
+	JRST	OPTDAT			;IOPT (8): Return optional data
+	JRST	SEGSIZ			;ISEG (9): Return maximum segment size
+	JRST	ABTCOD			;IABTCD (10): Get abort code
+
+
+BADTYP:	RETURN	INOUTR			;Unknown TYPE arg
+; ABTCOD (10.10)
+
+; Get the abort code.
+
+; NETLN:	link number
+; DATA:		returned data
+; COUNT:	length of returned data
+
+
+ABTCOD:
+T20,<	MOVE	T1,@NETLN		;Get slot number
+	HRRZ	T2,LLSTAT(T1)		;Abort or disconnect code
+	MOVE	T1,DATA			;Byte pointer
+	MOVEI	T3,^D10			;Radix
+	NOUT%				;
+	 ERJMP	.JSER			;Error?
+	CALL	NUMB			;Return string size
+	RETURN	INOK..			;
+>; End of T20
+
+T10,<	MOVE	T1,@NETLN		;Get channel number
+	HRRZM	T1,BL$NSP+.NSACH	;Save in NSP. arg block
+	SETZM	T1,BL$NSP+.NSAA1	;We don't want the user data
+	MOVE	T2,[XWD .NSFRD,.NSAA2+1] ;Function code (READ DISC DATA), length
+	MOVEM	T2,BL$NSP+.NSAFN	;Save in NSP. arg blk.
+	MOVEI	T1,BL$NSP
+	NSP.	T1,			;Do it
+	 RETURN	INNOTA			;Not available, I guess
+	MOVE	T1,DATA			;Get byte pointer to user area
+	MOVE	T2,BL$NSP+.NSAA2	;Get code
+	CALL	DECSTR			;Convert radix 10 to string
+	CALL	NUMB			;Tell user count of bytes
+	RETURN	INOK..			;Return 0
+>; End of T10
+; NODNAM (10.1)
+
+; Get the remote node name.
+
+; NETLN:	link number
+; DATA:		returned data
+; COUNT:	length of returned data
+
+NODNAM:
+T20,<	MOVE	T1,@NETLN		;Get slot number
+	MOVE	T1,LLJFN(T1)		;Get the JFN
+	MOVEI	T2,.MORHN		;
+	MOVE	T3,DATA			;
+	MTOPR%				;
+	 ERJMP	.JSER			;Error?
+	MOVE	T1,T3			;Updated byte pointer
+	CALL	NUMB			;Count bytes
+	RETURN	INOK..			;Return node name
+>; End of T20
+
+T10,<	MOVE	T4,@NETLN		;Get channel number
+	SKIPN	LLSTAT(T4)
+	 RETURN	INNOTA			;Not assigned
+	SUBI	T4,1			;Channel numbers start at 1
+	IMULI	T4,BL$ILN		;Multiply by INFO block size
+	SKIPN	BL$INF+BL$IND(T4)	;Do we have it?
+	 RETURN	INNOTA			;Nope
+	MOVE	T1,DATA			;Pointer to user data area
+	MOVE	T2,[POINT 7,BL$INF+BL$IND(T4)] ; Pointer to INFO area
+NODNM1:	ILDB	T3,T2			;Get a byte
+	JUMPE	T3,NODNM2		;End of string?
+	IDPB	T3,T1			;No, save it
+	JRST	NODNM1			;Loop
+NODNM2:	CALL	NUMB			;Count bytes for user
+	RETURN	INOK..			;All done
+>; End of T10
+; OBJTYP (10.2)
+
+; Get the remote object type.
+
+; NETLN:	link number
+; DATA:		returned data
+; COUNT:	length of returned data
+
+
+OBJTYP:
+T20,<	MOVE	T1,@NETLN		;Get slot number
+	MOVE	T2,LLSTAT(T1)		;Get logical link status
+	TXNN	T2,MO%SRV		;A server?
+	 RETURN	INNOTA			;No, no data to return
+	MOVE	T1,LLJFN(T1)		;Get the JFN
+	MOVEI	T2,.MORCN		;
+	MTOPR%				;
+	 ERJMP	.JSER			;Error?
+	MOVE	T1,DATA			;
+	MOVE	T2,T3			;Object type
+	MOVEI	T3,^D10			;Base 10
+	NOUT%				;Return it
+	 JRST	.JSER			;Error?
+	CALL	NUMB			;String size
+	RETURN	INOK..			;
+>; End of T20
+
+T10,<	MOVE	T4,@NETLN		;Get channel number
+	SKIPN	LLSTAT(T4)
+	 RETURN	INNOTA			;Not assigned
+	SUBI	T4,1			;Channel numbers start at 1
+	IMULI	T4,BL$ILN		;Multiply by INFO block size
+	HLRZ	T2,BL$INF+BL$IOB(T4)	;Get INFO
+	SKIPN	T2			;Do we have it?
+	 RETURN	INNOTA			;Nope
+	TRZ	T2,400000		;Clear "valid" flag
+	MOVE	T1,DATA			;Byte pointer to user area
+	CALL	DECSTR			;Convert radix 10 to string
+	CALL	NUMB			;Tell user count of bytes
+	RETURN	INOK..			;Return node name
+>; End of T10
+; USERID (10.5)
+
+; Get the remote process userid.
+
+; NETLN:	link number
+; DATA:		returned data
+; COUNT:	length of returned data
+
+USERID:
+T20,<	MOVE	T1,@NETLN		;Slot number
+	MOVE	T2,LLSTAT(T1)		;Logical link status
+	TXNN	T2,MO%SRV		;A server?
+	 RETURN	INNOTA			;No
+	MOVE	T1,LLJFN(T1)		;Get the JFN
+	MOVEI	T2,.MORUS		;
+	MOVE	T3,DATA			;
+	MTOPR%				;
+	 ERJMP	.JSER			;Error?
+	MOVE	T1,T3			;Updated byte pointer
+	CALL	NUMB			;String length
+	RETURN	INOK..			;
+>; End of T20
+
+T10,<	MOVE	T4,@NETLN		;Get channel number
+	SKIPN	LLSTAT(T4)
+	 RETURN	INNOTA			;Not assigned
+	SUBI	T4,1			;Channel numbers start at 1
+	IMULI	T4,BL$ILN		;Multiply by INFO block size
+	SKIPN	BL$INF+BL$IUS(T4)	;Do we have it?
+	 RETURN	INNOTA			;Nope
+	MOVE	T1,DATA			;Pointer to user data area
+	MOVE	T2,[POINT 7,BL$INF+BL$IUS(T4)] ; Pointer to INFO area
+USRID1:	ILDB	T3,T2			;Get a byte
+	JUMPE	T3,USRID2		;End of string?
+	IDPB	T3,T1			;No, save it
+	JRST	USRID1			;Loop
+USRID2:	CALL	NUMB			;Count bytes for user
+	RETURN	INOK..			;All done
+>; End of T10
+; OBJDSF (10.3)
+
+; Get the remote object descriptor format:
+
+; NETLN:	link number
+; DATA:		returned data
+; COUNT:	length of returned data
+
+OBJDSF:
+T20,<	MOVEI	T1,1			;String length
+	MOVEM	T1,@COUNT		;Return it
+	MOVE	T1,@NETLN		;Get slot number
+	MOVE	T2,LLSTAT(T1)		;Get logical link status
+	TXNN	T2,MO%SRV		;Server?
+	 RETURN	INNOTA			;
+	MOVE	T1,LLJFN(T1)		;Get the JFN
+	MOVEI	T2,.MOROD		;Function
+	MOVE	T3,[POINT 7,TEMPST]
+	MTOPR%				;
+	 ERJMP	.JSER			;Error?
+	MOVE	T1,DATA			;
+	MOVEI	T2,"0"			;
+	CAMN	T3,[POINT 7,TEMPST]	;
+	 JRST	[BOUT%			;
+		 RETURN	INOK..]		;
+	JUMPE	T4,[ADDI T2,1		;User and group numbers?  No
+		 BOUT%			;
+		 RETURN	INOK..]		;
+	ADDI	T2,2			;Yes
+	BOUT%				;
+	RETURN	INOK..			;
+>; End of T20
+
+T10,<	MOVE	T4,@NETLN		;Get channel number
+	SKIPN	LLSTAT(T4)
+	 RETURN	INNOTA			;Not assigned
+	SUBI	T4,1			;Channel numbers start at 1
+	IMULI	T4,BL$ILN		;Multiply by INFO block size
+	HRRZ	T2,BL$INF+BL$IFM(T4)	;Get INFO
+	SKIPN	T2			;Do we have it
+	 RETURN	INNOTA			;Nope
+	TRZ	T2,400000		;Clear "valid" flag
+	MOVE	T1,DATA			;Byte pointer to user area
+	CALL	DECSTR			;Convert radix 10 to string
+	CALL	NUMB			;Tell user count of bytes
+	RETURN	INOK..			;Return node name
+>; End of T10
+; OBJDSC (10.4)
+
+; Get the remote object description.
+
+; NETLN:	link number
+; DATA:		returned data
+; COUNT:	length of returned data
+
+OBJDSC:
+T20,<	MOVE	T1,@NETLN		;Get slot number
+	MOVE	T2,LLSTAT(T1)		;Get logical link status
+	TXNN	T2,MO%SRV		;Server?
+	 RETURN	INNOTA			;No
+	MOVE	T1,LLJFN(T1)		;Get JFN
+	MOVEI	T2,.MOROD		;Object descriptor function
+	MOVE	T3,[POINT 7,TEMPST]	;
+	MTOPR%				;
+	 ERJMP	.JSER			;Error?
+	JUMPE	T4,[HRROI T1,TEMPST	;Group and user codes?
+		 MOVE	T2,DATA		;From temp string to user's buffer
+		 SETZ	T3,		;ASCIZ string
+		 SIN%			;
+		 MOVE	T1,T2		;Updated pointer
+		 CALL	NUMB		;String length
+		 RETURN	INOK..]		;
+	MOVE	T1,DATA			;User's buffer
+	HLRZ	T2,T4			;Group
+	MOVEI	T3,^D8			;Octal
+	NOUT%				;
+	 ERJMP	.JSER			;Error?
+	MOVEI	T2,","			;Comma
+	BOUT%				;
+	HRRZ	T2,T4			;User
+	NOUT%				;
+	 ERJMP	.JSER			;Error?
+	MOVEI	T2,","			;
+	BOUT%				;
+	HRROI	T2,TEMPST		;
+	SETZ	T3,			;
+	SOUT%				;
+	CALL	NUMB			;String length
+	RETURN	INOK..			;
+>; End of T20
+
+T10,<	MOVE	T4,@NETLN		;Get channel number
+	SKIPN	LLSTAT(T4)
+	 RETURN	INNOTA			;Not assigned
+	SUBI	T4,1			;Channel numbers start at 1
+	IMULI	T4,BL$ILN		;Multiply by INFO block size
+	HRRZ	T2,BL$INF+BL$IFM(T4)	;Get Format type
+	SKIPN	T2			;Do we have it?
+	 RETURN	INNOTA			;Nope
+	MOVE	T1,DATA			;Byte pointer to user area
+	TRZ	T2,400000		;Clear "valid" flag
+	CAIGE	T2,2			;Format type 0 or 1?
+	  JRST	OBJD4			;Then only a string
+	HLRZ	T2,BL$INF+BL$IPP(T4)	;Get group (project) number
+	CALL	OCTSTR			;Turn it into a string
+	MOVEI	T2,","			;Separate with comma
+	IDPB	T2,T1
+	HRRZ	T2,BL$INF+BL$IPP(T4)	;Get user (programmer) number
+	CALL	OCTSTR			;Turn it into a string
+	MOVEI	T2,","			;Separate with comma
+	IDPB	T2,T1
+OBJD4:	MOVE	T2,[POINT 7,BL$INF+BL$ITK(T4)] ; Pointer to INFO area
+OBJD1:	ILDB	T3,T2			;Get a byte
+	JUMPE	T3,OBJD2		;End of string?
+	IDPB	T3,T1			;No, save it
+	JRST	OBJD1			;Loop
+OBJD2:	CALL	NUMB			;Count bytes for user
+	RETURN	INOK..			;All done
+>; End of T10
+; PASSWD (10.6)
+
+; Get the remote process password:
+
+; NETLN:	link number
+; DATA:		returned data
+; COUNT:	length of returned data
+
+PASSWD:
+T20,<
+	MOVE	T1,@NETLN		;Get slot number
+	MOVE	T2,LLSTAT(T1)		;Get link status
+	TXNN	T2,MO%SRV		;Server only
+	 RETURN	INNOTA			;
+	MOVE	T1,LLJFN(T1)		;Get the JFN
+	MOVEI	T2,.MORPW		;Password function
+	MOVE	T3,DATA			;
+	MTOPR%				;
+	 ERJMP	.JSER			;Error?
+	MOVE	T1,T3			;Updated pointer
+	CALL	NUMB			;
+	RETURN	INOK..			;
+>; End of T20
+
+T10,<	MOVE	T4,@NETLN		;Get channel number
+	SKIPN	LLSTAT(T4)
+	 RETURN	INNOTA			;Not assigned
+	SUBI	T4,1			;Channel numbers start at 1
+	IMULI	T4,BL$ILN		;Multiply by INFO block size
+	SKIPN	BL$INF+BL$IPS(T4)	;Do we have it?
+	 RETURN	INNOTA			;Nope
+	MOVE	T1,DATA			;Pointer to user data area
+	MOVE	T2,[POINT 7,BL$INF+BL$IPS(T4)] ; Pointer to INFO area
+PASSW1:	ILDB	T3,T2			;Get a byte
+	JUMPE	T3,PASSW2		;End of string?
+	IDPB	T3,T1			;No, save it
+	JRST	PASSW1			;Loop
+PASSW2:	CALL	NUMB			;Count bytes for user
+	RETURN	INOK..			;All done
+>; End of T10
+; ACCNT (10.7)
+
+; Get the remote process account.
+
+; NETLN:	link number
+; DATA:		returned data
+; COUNT:	length of returned data
+
+ACCNT:
+T20,<	MOVE	T1,@NETLN		;Get slot number
+	MOVE	T2,LLSTAT(T1)		;Get logical link status
+	TXNN	T2,MO%SRV		;Server?
+	 RETURN	INNOTA			;No
+	MOVE	T1,LLJFN(T1)		;Get the JFN
+	MOVEI	T2,.MORAC		;Account string function
+	MOVE	T3,DATA			;
+	MTOPR%				;
+	 ERJMP	.JSER			;Error?
+	MOVE	T1,T3			;Updated pointer
+	CALL	NUMB			;String length
+	RETURN	INOK..			;
+>; End of T20
+
+T10,<	MOVE	T4,@NETLN		;Get channel number
+	SKIPN	LLSTAT(T4)
+	 RETURN	INNOTA			;Not assigned
+	SUBI	T4,1			;Channel numbers start at 1
+	IMULI	T4,BL$ILN		;Multiply by INFO block size
+	SKIPN	BL$INF+BL$IAC(T4)	;Do we have it?
+	 RETURN	INNOTA			;Nope
+	MOVE	T1,DATA			;Pointer to user data area
+	MOVE	T2,[POINT 7,BL$INF+BL$IAC(T4)] ; Pointer to INFO area
+ACCT1:	ILDB	T3,T2			;Get a byte
+	JUMPE	T3,ACCT2		;End of string?
+	IDPB	T3,T1			;No, save it
+	JRST	ACCT1			;Loop
+ACCT2:	CALL	NUMB			;Count bytes for user
+	RETURN	INOK..			;All done
+>; End of T10
+; OPTDAT (10.8)
+
+; Get the remote process optional data.
+
+; NETLN:	link number
+; DATA:		returned data
+; COUNT:	length of returned data
+
+OPTDAT:
+T20,<	MOVE	T1,@NETLN		;Get slot number
+	MOVE	T1,LLJFN(T1)		;Get the JFN
+	MOVEI	T2,.MORDA		;Optional data function
+	MOVE	T3,DATA			;Byte pointer
+	MTOPR%				;
+	 ERJMP	.JSER			;Error?
+	MOVE	T1,T3			;Updated pointer
+	CALL	NUMB			;String length
+	RETURN	INOK..			;
+>; End of T20
+
+T10,<	MOVE	T4,@NETLN		;Get channel number
+	SKIPN	LLSTAT(T4)
+	 RETURN	INNOTA			;Not assigned
+	SUBI	T4,1			;Channel numbers start at 1
+	IMULI	T4,BL$ILN		;Multiply by INFO block size
+	SKIPN	BL$INF+BL$IOP(T4)	;Do we have it?
+	 RETURN	INNOTA			;Nope
+	MOVE	T1,DATA			;Pointer to user data area
+	MOVE	T2,[POINT 7,BL$INF+BL$IOP(T4)] ; Pointer to INFO area
+OPTD1:	ILDB	T3,T2			;Get a byte
+	JUMPE	T3,OPTD2		;End of string?
+	IDPB	T3,T1			;No, save it
+	JRST	OPTD1			;Loop
+OPTD2:	CALL	NUMB			;Count bytes for user
+	RETURN	INOK..			;All done
+>; End of T10
+; SEGSIZ (10.9)
+
+; Get the maximum segment size.
+
+; NETLN:	link number
+; DATA:		returned data
+; COUNT:	length of returned data
+
+SEGSIZ:
+T20,<	MOVE	T1,@NETLN		;Get slot number
+	MOVE	T1,LLJFN(T1)		;Get the JFN
+	MOVEI	T2,.MORSS		;Segment size function
+	MTOPR%				;Do the function
+	 ERJMP	.JSER			;Error?
+	MOVE	T2,T3			;Size
+	MOVEI	T3,^D10			;Radix ten
+	MOVE	T1,DATA			;Byte pointer
+	NOUT%				;...
+	 ERJMP	.JSER			;Error?
+	CALL	NUMB			;Return string size
+	RETURN	INOK..			;
+>; End of T20
+T10,<	MOVE	T1,[XWD .NSFRS,.NSAA1+1] ;Function (READ STS), length
+	MOVEM	T1,BL$NSP+.NSAFN
+	MOVE	T1,@NETLN		;Get channel number
+	MOVEM	T1,BL$NSP+.NSACH
+	MOVEI	T1,BL$NSP
+	NSP.	T1,			;Do it
+	 RETURN	INNOTA			;Not available
+	MOVE	T1,DATA			;Get pointer to user area
+	MOVE	T2,BL$NSP+.NSAA1	;Get segment size
+	CALL	DECSTR			;Give decimal string to user
+	CALL	NUMB			;Tell him/her how many bytes
+	RETURN	INOK..
+>; End of T10
+; NUMB
+
+; Count bytes in a string.
+
+; T1:		byte pointer to end of string
+; DATA:		start of string
+; COUNT:	length of string
+
+NUMB:	HRRZ	T2,T1			;Updated word
+	HRRZ	T3,DATA			;Original word
+	SUB	T2,T3			;Number of words
+	IMULI	T2,^D5			;Number of characters
+	LSH	T1,-^D30		;Get P
+	MOVEI	T3,^D36			;Bits in a word
+	SUB	T3,T1			;Bits
+	IDIVI	T3,^D7			;Bytes
+	ADD	T2,T3			;Total bytes
+	MOVEM	T2,@COUNT		;Return it
+	RET				;
+
+T10,<
+DECSTR:	SKIPA	T4,[EXP ^D10]
+OCTSTR:	MOVEI	T4,^D8
+NUMSTR:	JUMPGE	T2,NUMST1
+	MOVEI	T3,"-"
+	IDPB	T3,T1
+	MOVMS	T2
+NUMST1:	IDIVI	T2,(T4)
+	ADDI	T3,"0"
+	PUSH	P,T3
+	SKIPE	T2
+	PUSHJ	P,NUMST1
+	POP	P,T3
+	IDPB	T3,T1
+	POPJ	P,
+>; End of T10
+	PRGEND				;End of NFINF
+
+
+	TITLE	.UPEVT	Update the event flags
+	SEARCH	TTTUNV
+	TTTINI
+	ENTRY	.UPEVT
+T10,<	ENTRY	.CNEVT,.GTINF
+	EXTERN	.NSPER,.NSPIN>
+; .UPEVT (2.3)
+;
+; Update the event flags.
+;
+; Called explicitly and whenever an interrupt occurs.
+;
+; T1 must contain the slot number of the logical link
+; or -1 to indicate update of all links.
+
+.UPEVT:	JUMPGE	T1,[CALL ONELL		;If one link, update the single link
+		 RET	]		;... and return
+	MOVE	T4,[-MAXLL,,0]		;Make AOBJN pointer
+
+; Do all links:
+
+UPLP:	HRRZ	T1,T4			;Get logical link number
+T20,<	SKIPN	LLJFN(T1)>		;Link in use?
+T10,<	SKIPN	LLSTAT(T1)>		;Channel assigned?
+	 JRST	UPLPE			;No
+	PUSH	P,T4			;Save T4
+	CALL	ONELL			;Yes
+	POP	P,T4			;Restore T4
+
+UPLPE:	AOBJN	T4,UPLP			;Do all links
+	RET				;
+
+
+; Do one link:
+
+ONELL:
+T20,<	PUSH	P,T1			;Save the slot number
+	MOVE	T1,LLJFN(T1)		;Get the JFN
+	MOVEI	T2,.MORLS		;Get link status
+	MTOPR%				;Get it
+	 ERCAL	[SETZ	T3,		;Zero status on error
+		 RET	]		;Go on
+	POP	P,T1			;Get slot number
+	MOVE	T2,LLSTAT(T1)		;Get old status
+	MOVE	T4,LLEVNT(T1)		;Get event word
+	TXNE	T3,MO%SRV		;Passive task?
+	 JRST	PASS			;Yes, do it now
+	TXNE	T3,MO%CON		;Now connected?
+	 JRST	[TXNN	T2,MO%CON	;Not connected before?
+		  TXO	T4,EV.CON	;Connect event
+		 JRST	.+1	]	;
+	JRST	COMM			;Common checks
+
+PASS:	TXNE	T2,MO%WFC		;Were waiting for connect?
+	 JRST	[TXNN	T3,MO%WFC	;Yes, connect event
+		  TXO	T4,EV.CON	;Yes, connect event
+		 JRST	.+1	]	;
+
+COMM:	TXNE	T3,MO%ABT		;Abort?
+	 JRST	[TXNN	T2,MO%ABT	;Abort before?
+		  TXO	T4,EV.ABT	;Abort event
+		 JRST	.+1	]	;
+	TXNE	T3,MO%INT		;Interrupt message available?
+	 JRST	[TXNN	T2,MO%INT	;
+		  TXO	T4,EV.INT	;Interrupt message event
+		 JRST	.+1	]	;
+	TXNE	T3,MO%SYN		;Disconnect?
+	 JRST	[TXNN	T2,MO%SYN	;
+		  TXO	T4,EV.DIS	;Disconnect event
+		 JRST	.+1	]	;
+	MOVEM	T3,LLSTAT(T1)		;Save new link status
+	PUSH	P,T1			;Save slot number
+	MOVE	T1,LLJFN(T1)		;Get JFN
+	SIBE%				;Any data?
+	 JRST	[TXO	T4,EV.DAT	;Data event
+		 JRST	GOTDAT	]	;
+	TXZ	T4,EV.DAT		;No data
+
+GOTDAT:	POP	P,T1			;Restore T1
+	MOVEM	T4,LLEVNT(T1)		;Save event word
+	RET				;
+>; End of T20
+
+T10,<	MOVE	T2,[XWD .NSFRS,.NSACH+1] ;Function (READ STS), length
+	MOVEM	T2,BL$NSP+.NSAFN
+	MOVEM	T1,BL$NSP+.NSACH
+	MOVEI	T2,BL$NSP
+	NSP.	T2,			;Do it
+	  JRST	.NSPER			;Check error code
+	SKIPA	T2,BL$NSP+.NSACH	;Get channel status
+.CNEVT:	MOVE	T2,T1			;External entry with T1=STATUS
+					;Get status into T2 as well
+	MOVE	T3,LLSTAT(T1)		;Get old Status
+	MOVE	T4,LLEVNT(T1)		;Get current event word
+	TXZ	T4,EV.DAT		;Assume no data available
+	TXNE	T2,NS.NDA		;Data now available?
+	  TXO	T4,EV.DAT		;Mark it
+	TXZ	T4,EV.INT		;Assume no interrupt data
+	TXNE	T2,NS.IDA		;Int data now available?
+	  TXO	T4,EV.INT		;Mark it
+	MOVEM	T2,LLSTAT(T1)		;Save new Status
+	LDB	T2,[POINTR T2,NS.STA]	;Get new status code
+	LDB	T3,[POINTR T3,NS.STA]	;Get old status code
+	CAIN	T2,.NSSCM		;[110] if no communications
+	  JRST  [TXO T4, EV.ABT		;[110] tell user link is aborted
+		 JRST ONELL5]		;[110]
+	CAIE	T2,.NSSCR		;Now connect received?
+	 CAIN	T2,.NSSRN		;Or running?
+	  CAIA				;Then link is connected
+	JRST	ONELL1			;Not connected, on to next test
+	CAIE	T3,.NSSCW		;Old status connect wait?
+	 CAIN	T3,.NSSCS		;or connect sent?
+	  JRST	[TXO T4,EV.CON		;Then we have a connect event!!!
+		JRST ONELL5]		;That's all we need to know
+ONELL1:	CAIE	T2,.NSSDR		;New status disconnect received?
+	 CAIN	T2,.NSSDC		;Or disconnect confirmed?
+	  CAIA				;Then link is disconnected
+	JRST	ONELL2			;Not disconnected, on to next test
+	CAIE	T3,.NSSRN		;Old status running?
+	 CAIN	T3,.NSSDS		;Or disconnect sent?
+	  JRST	[TXO T4,EV.DIS		;Then we have a disconnect event!!!
+		JRST ONELL5]		;That's all we need to know
+ONELL2:	CAIE	T2,.NSSRJ		;Did we get a reject?
+	  JRST	ONELL3			;No, continue on
+	CAIE	T3,.NSSRN		;Was old state running?
+	 CAIN	T3,.NSSCS		;Or connect sent?
+	  JRST	[TXO T4,EV.DIS		;Let's call that a disconnect
+		JRST ONELL5]		;That's all we need to know
+ONELL3:	CAIE	T2,.NSSRN		;Now, if not running
+	 CAIE	T3,.NSSRN		;And old status was running
+	  CAIA				;Now running, all okay
+	   TXO	T4,EV.ABT		;The link must have been aborted
+ONELL5:	MOVEM	T4,LLEVNT(T1)		;Store new event word
+	RET
+
+
+; Routine .GTINF
+;
+; Called when a link goes into connect state.  This routine will read
+; the connect block for the link and save away the data that may be
+; needed by the NFINF sub-functions.  This is necessary since DECnet-10
+; will only save the info until the first read/write from/to the link
+; or the first call to NSP. to read connect data.
+;
+;	Arguments:  T1 contains the channel number
+;
+;	Preserves all AC's
+;
+.GTINF:	PUSH	P,T1			;Save some AC's
+	PUSH	P,T2
+	PUSH	P,T3
+	PUSH	P,T4
+	MOVEM	T1,BL$NSP+.NSACH	;Save the channel number in NSP. blk
+	MOVEI	T4,BL$ILN		;Length of an INFO block
+	IMULI	T4,-1(T1)		;Index for this channel
+	ADDI	T4,BL$INF		;Plus origin of the table
+	MOVE	T1,[XWD .NSFRI,.NSAA1+1] ;NSP. function,,length
+	MOVEM	T1,BL$NSP+.NSAFN
+	CALL	.NSPIN			;Initialize the connect block
+	MOVEI	T1,BL$CON		;Pointer to connect block
+	MOVEM	T1,BL$NSP+.NSAA1	;Save for NSP.
+	MOVEI	T1,BL$NSP
+	NSP.	T1,			;Get the info
+	  JRST	GTINF9			;This is not good!
+	HLRZ	T1,BL$NOD+.NSASL	;Get byte count
+	MOVE	T2,[POINT 8,BL$NOD+.NSAST] ;And pointer to node name
+	MOVE	T3,[POINT 7,BL$IND(T4)]	;Plus pointer for INFO block
+GTINF1:	ILDB	T0,T2			;Get a byte
+	IDPB	T0,T3			;Save it
+	SOJG	T1,GTINF1		;Loop
+	SETZ	T0,			;Get a zero byte
+	IDPB	T0,T3			;Make it ASCIZ
+	HLRZ	T1,BL$USR+.NSASL	;Get byte count
+	MOVE	T2,[POINT 8,BL$USR+.NSAST] ;And pointer to user ID
+	MOVE	T3,[POINT 7,BL$IUS(T4)]	;Plus pointer for INFO block
+GTINF2:	ILDB	T0,T2			;Get a byte
+	IDPB	T0,T3			;Save it
+	SOJG	T1,GTINF2		;Loop
+	SETZ	T0,			;Get a zero byte
+	IDPB	T0,T3			;Make it ASCIZ
+	HLRZ	T1,BL$PAS+.NSASL	;Get byte count
+	MOVE	T2,[POINT 8,BL$PAS+.NSAST] ;And pointer to password
+	MOVE	T3,[POINT 7,BL$IPS(T4)]	;Plus pointer for INFO block
+GTINF3:	ILDB	T0,T2			;Get a byte
+	IDPB	T0,T3			;Save it
+	SOJG	T1,GTINF3		;Loop
+	SETZ	T0,			;Get a zero byte
+	IDPB	T0,T3			;Make it ASCIZ
+	HLRZ	T1,BL$ACC+.NSASL	;Get byte count
+	MOVE	T2,[POINT 8,BL$ACC+.NSAST] ;And pointer to account
+	MOVE	T3,[POINT 7,BL$IAC(T4)]	;Plus pointer for INFO block
+GTINF4:	ILDB	T0,T2			;Get a byte
+	IDPB	T0,T3			;Save it
+	SOJG	T1,GTINF4		;Loop
+	SETZ	T0,			;Get a zero byte
+	IDPB	T0,T3			;Make it ASCIZ
+	HLRZ	T1,BL$OPT+.NSASL	;Get byte count
+	MOVE	T2,[POINT 8,BL$OPT+.NSAST] ;And pointer to optional user data
+	MOVE	T3,[POINT 7,BL$IOP(T4)]	;Plus pointer for INFO block
+GTINF5:	ILDB	T0,T2			;Get a byte
+	IDPB	T0,T3			;Save it
+	SOJG	T1,GTINF5		;Loop
+	SETZ	T0,			;Get a zero byte
+	IDPB	T0,T3			;Make it ASCIZ
+	HLRZ	T1,BL$SPT+.NSASL	;Get byte count
+	MOVE	T2,[POINT 8,BL$SPT+.NSAST] ;And pointer to task name
+	MOVE	T3,[POINT 7,BL$ITK(T4)]	;Plus pointer for INFO block
+GTINF6:	ILDB	T0,T2			;Get a byte
+	IDPB	T0,T3			;Save it
+	SOJG	T1,GTINF6		;Loop
+	SETZ	T0,			;Get a zero byte
+	IDPB	T0,T3			;Make it ASCIZ
+	MOVE	T1,BL$SPD+.NSDPP	;Get PPN
+	MOVEM	T1,BL$IPP(T4)		;Save in block
+	MOVE	T1,BL$SPD+.NSDFM	;Get format type
+	TRO	T1,400000		;Set "valid" flag
+	HRRM	T1,BL$IFM(T4)		;Save in block
+	MOVE	T1,BL$SPD+.NSDOB	;Get object type
+	TRO	T1,400000		;Set "valid" flag
+	HRLM	T1,BL$IOB(T4)		;Save in block
+GTINF9:	POP	P,T4			;Restore the AC's
+	POP	P,T3
+	POP	P,T2
+	POP	P,T1
+	RET				;Return
+>; End of T10
+	PRGEND				;End of .UPEVT
+
+	SEARCH	TTTUNV
+T20,<	TITLE	.JSER	Handle JSYS errors
+	ENTRY	.JSER>
+T10,<	TITLE	.NSPER	Handle NSP. UUO errors
+	ENTRY	.NSPER>
+	TTTINI
+; .JSER
+;
+; Code to execute when a JSYS fails.
+; T1 will contain the error code.
+
+.JSER:
+T20,<	CAIGE	T1,600000		;Real error code?
+	 JRST	[MOVEI	T1,.FHSLF	;For this process
+		 GETER%			;Get most recent error
+		 HRRZ	T1,T2		;
+		 CAIGE	T1,600000	;Real code?
+		  SETZ	T1,		;
+		 JRST	.+1	]	;
+	PUSH	P,T1			;Save real JSYS error code
+	MOVEI	T1,.PRIOU		;[46] To the user terminal
+	HRROI	T2,[ASCIZ /?JSYS error: /]	;[47][46] Give a nice prefix
+	SETZB	T3,T4			;[46] ...
+;**; [64] In .JSER, remove SOUT's	CLR	15-Mar-84
+;[64]	SOUT%				;[46] Show the user
+	MOVEI	T1,.PRIOU		;Primary output
+	HRLI	T2,.FHSLF		;Self
+	HLLO	T2,T2			;Most recent error
+	SETZ	T3,			;All bytes
+;**; [64] In .JSER, remove ERSTR	DPR	17-Apr-84
+;[64]	ERSTR				;Get error message
+	 JFCL
+	 JFCL
+	MOVEI	T1,.PRIOU		;Add
+	HRROI	T2,[ASCIZ /
+/]					;... a <CR><LF>
+	SETZB	T3,T4			;... to
+;**; [64] In .JSER, remove SOUT's	CLR	15-Mar-84
+;[64]	SOUT				;... the error message.
+	POP	P,T4			;Get JSYS error code
+	CAIN	T4,DCNX1		;Invalid network filename
+	 RETURN	INVARG			;...
+	CAIN	T4,DCNX5		;No more logical links available
+	 RETURN	TOOMNY			;...
+	CAIN	T4,DCNX3		;Invalid object
+	 RETURN	INVARG			;...
+	CAIN	T4,DCNX4		;Invalid task name
+	 RETURN	INVARG			;...
+	CAIN	T4,DCNX9		;Object is already defined
+	 RETURN	INVARG			;...
+	CAIN	T4,DCNX11		;Link aborted
+	 RETURN	ABRTRJ			;...
+	CAIN	T4,DCNX12		;String execeeds 16 bytes
+	 RETURN	INVARG			;...
+	CAIN	T4,DCNX2		;Interrupt message must be read first
+	 RETURN	INTRCV			;...
+	CAIN	T4,DCNX14		;Previous interrupt message outstanding
+	 RETURN	INTRCV			;...
+	CAIN	T4,DCNX15		;No interrupt message available
+	 RETURN	NODATA			;...
+	RETURN	HORROR			;Return horrible otherwise
+>; End of T20
+
+
+; .NSPER	Called on NSP. error return
+;
+;	T1 = error code returned by NSP.
+;
+
+T10,<
+.NSPER:	CAIN	T1,NSALF%		;Resource allocation failure
+	 RETURN	TOOMNY
+	CAIN	T1,NSNCD%		;No connect data to read
+	 RETURN	NODATA
+	CAIE	T1,NSWRS%		;Function called in wrong state
+	CAIN	T1,NSUKN%		;Unknown node name
+	 RETURN	INVARG
+	CAIN	T1,NSUXS%		;Unexpected state
+	 RETURN	INVARG
+	CAIGE	T1,NSUNR%		;One of the other "unexpected states"?
+	 CAIG	T1,NSUDS%
+	  CAIA				;No
+	 RETURN	INVARG
+	CAIGE	T1,NSREJ%		;One of the reject codes?
+	 CAIG	T1,NSRBO%
+	  CAIA				;No
+	 RETURN	ABRTRJ
+	SKIPG	T2,@NETLN		;Get channel number
+	 RETURN	HORROR			;Bad channel number
+	LDB	T2,[POINTR LLSTAT(T2),NS.STA] ;Get current state code
+	CAIE	T2,.NSSRJ		;Reject state?
+	CAIN	T2,.NSSDR		;Disconnect received state?
+	 RETURN	ABRTRJ
+	CAIE	T2,.NSSNR		;No resources state?
+	CAIN	T2,.NSSCF		;No confidence state?
+	 RETURN	ABRTRJ
+	CAIE	T2,.NSSLK		;No link state?
+	CAIN	T2,.NSSCM		;No communication state?
+	 RETURN	ABRTRJ
+	RETURN	HORROR			;Not much else to check
+>; End of T10
+
+	PRGEND				;End of .JSER
+	TITLE	TTTLOW Impure data for TTT
+	SEARCH	TTTUNV
+T10,<	SEARCH	UUOSYM>
+	ENTRY	TTTLOW
+DEFINE	X,(A,B),<
+A:	BLOCK	B
+>
+DEFINE	Y (SYM,SIZ),<		;;Macro to generate offsets in BL$INF
+	SYM==II
+	II==II+SIZ
+>				;;End of Y macro
+	II==0
+
+TTTLOW:	LOWSEG
+
+	END				;End of TTTLOW

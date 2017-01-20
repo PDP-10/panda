@@ -1,0 +1,1075 @@
+%TITLE 'U P D A T E  -- $UPDATE processor'
+!<BLF/REQUIRE 'RMSBLF.REQ'>
+MODULE update (IDENT = '2.0'
+		) =
+BEGIN
+
+GLOBAL BIND
+    updtv = 3^24 + 0^18 + 616;			! Edit date: 30-Apr-86
+
+!++
+!	FUNCTION:	THIS MODULE CONTAINS ROUTINES WHICH PROCESS
+!			THE $UPDATE MACRO IN RMS-20.
+!
+!
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1977, 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+!
+!
+!	AUTHOR:	S. BLOUNT/RL
+!
+!
+!	**********	TABLE OF CONTENTS	**************
+!
+!
+!
+!
+!		ROUTINE			FUNCTION
+!		=======			========
+!
+!		$UPDATE		PROCESSOR FOR $UPDATE MACRO
+!
+!		UPDSQR		$UPDATE FOR SEQUENTIAL/RELATIVE FILES
+!
+!		UPD		$UPDATE FOR INDEXED FILES
+!
+!		DOUPD		PERFORM THE ACTUAL UPDATE FOR INDEXED FIES
+!
+!		UPDUDR		RE-WRITE THE DATA IN THE CURRENT
+!				RECORD FOR INDEXED FILES
+!
+!-
+%SBTTL 'REVISION HISTORY'
+!+
+!	REVISION HISTORY:
+!
+!	EDIT	WHO	DATE		PURPOSE
+!	====	===	====		=======
+!
+!	1	JK	21-JUL-76	REQUIRE LIMITS.REQ
+!	2	SB	29-NOV-76	ADD UPDATE FOR INDEXED FILES
+!	3	SB	23-DEC-76	CHANGE ER$RSD TO ER$RSZ
+!	4	SB	8-MAR-77	MAKE FAILURE FOR DELSIDR BE OK
+!	5	SB	14-MAR-77	SET UP RRV FOR PUTSIDR FOR
+!					LENGTH CHANGES
+!
+!	*************************************************
+!	*						*
+!	*		NEW REVISION HISTORY		*
+!	*						*
+!	*************************************************
+!
+!	****** Release of RMS 1.0 *****
+!
+!	PRODUCT	MODULE	 SPR
+!	 EDIT	 EDIT	 QAR		DESCRIPTION
+!	======	======	=====		===========
+!	57	6	20-17231	Free bucket after FOLLOWPATH call
+!					in DOUPDIDX. (RLUSK, 26-Jan-82)
+!
+!	**  Begin RMS v2 Development **
+!
+!	400	400	xxxxx		Clean up BLISS code (RL, 22-Apr-83)
+!
+!	407	-	xxxxx		Pass CKEYUU a 30-bit address for the
+!					search key when in nonzero sections.
+!					(RL, 24-May-83)
+!
+!	416		xxxxx		Pass MOVEREC a 30-bit address from
+!					UPDSQR (RL, 7-Jul-83)
+!
+!	421		xxxxx		Allow changing record size when
+!					updating a variable-length record
+!					in a relative file, so long as the
+!					new length is not greater than the
+!					maximum record size. (RL, 20-Jul-83)
+!
+!	422		xxxxx		"Illegal read" occurs in a non-zero
+!					section when MOVEBKTDESC is called
+!					with a fetched value.  Do a BIND first
+!					to the fetched value and then call
+!					the macro. (RL, 25-Jul-83)
+!
+!       502                             Remote $Update
+!
+!       561                             Fix Random Remote $Update
+!
+!	616				Fix bad KSZ error on remote $UPDATE
+!
+!		***** END OF REVISION HISTORY *****
+!-
+
+REQUIRE 'rmsreq';
+
+EXTERNAL ROUTINE
+    Dap$Update;
+
+%SBTTL '$UPDATE -- processor for $UPDATE macro'
+
+GLOBAL ROUTINE $update (rabblock, errorreturn) : NOVALUE =
+! $UPDATE
+! =======
+!
+! PROCESSOR FOR $UPDATE MACRO
+! 	THE $UPDATE MACRO ALWAYS OPERATES ON THE CURRENT RECORD.
+!
+! FORMAT OF $UPDATE MACRO:
+!
+!		$UPDATE		<RAB-ADDRESS> [,<ERROR-ADDRESS>]
+!
+! RAB FIELDS USED AS INPUT TO $UPDATE:
+!
+!	ISI		INTERNAL STREAM IDENTIFIER
+!	RBF		ADDRESS OF USER RECORD BUFFER
+!	ROP		RECORD OPTIONS
+!		    <NO OPTIONS CURRENTLY USED>
+!	RSZ		SIZE OF UPDATED RECORD
+!
+! RAB FIELDS RETURNED TO USER BY $UPDATE:
+!
+!	STS		STATUS OF CURRENT OPERATION
+!	STV		ADDITIONAL STATUS INFORMATION
+!
+! INPUT:
+!	BLOCK		ADDRESS OF USER RECORD BLOCK
+!	ERRORRETURN	ADDRESS OF USER ERROR ROUTINE
+!
+! OUTPUT:
+!	<NO STATUS VALUE RETURNED>
+!
+! ROUTINES CALLED:
+!	RSETUP
+!	CHECKRP
+!	UPDSQR
+!	UPDIDX
+!
+    BEGIN
+
+    LOCAL 					!			!A421
+	record_length_has_changed;		! For relative files	!A421
+
+    rmsentry ($update);
+    !
+    !   FETCH THE USER'S RAB AND HIS ERROR ROUTINE ADDRESS
+    !
+    rab = .rabblock;				! FETCH RAB ADR
+    erradr = .errorreturn;			! AND USER ERROR ADDRESS
+    record_length_has_changed = 0;		! Assume same reclen	!A421
+    !
+    !   CHECK FOR STANDARD ERRORS AND $UPDATE ACCESS TO FILE
+    !
+    rsetup (axupd);				! SET UP THE WORLD
+    !
+    !   INSURE THAT FILE IS POSITIONED AND LOCKED
+    !
+    checkrp ();
+    !
+    !   CHECK THAT THE USER'S BUFFER IS VALID, AND THAT
+    !   HE IS NOT TRYING TO CHANGE THE SIZE OF THE RECORD,
+    !	UNLESS IT IS A VARIABLE-LENGTH RELATIVE RECORD.			!A421
+    !
+
+    IF .rab [rabrbf, 0] LEQ minuserbuff		! CHECK USER BUFFER
+    THEN
+	usererror (er$rbf);
+
+    IF .fst[fst$v_remote]			! 616
+    THEN
+        rst [rstrsz] = .rab[rabrsz, 0] ;
+
+    IF .rab [rabrsz, 0] NEQ .rst [rstrsz]	! CHECK RECORD SIZES
+    THEN
+
+	IF relfile AND 				! Relative files	!A421
+	    variablerlength AND 		! Variable format	!A421
+	    .rab [rabrsz, 0] LEQ .fst [fstmrs]	! Record less than max	!A421
+	THEN 					!			!A421
+	    record_length_has_changed = 1	! Set a flag		!A421
+	ELSE 					!			!A421
+	    usererror (er$rsz);			! Bad record size	!M421
+
+    IF .fst[fst$v_remote]						  !a501
+    THEN                                                                  !a501
+        Dap$Update (.rab, .erradr)					  !a501
+    ELSE                                                                  !a501
+    !+
+    !    FILE IS LOCAL.
+    !   DISPATCH TO THE CORRECT ROUTINE FOR THIS ORGANIZATION
+    !-
+
+    CASE fileorg FROM orgasc TO orgidx OF 	!			!M421
+	SET
+
+	[orgasc] : 				! ILLEGAL FOR ASCII FILES
+	    usererror (er$iop);
+
+	[orgseq] : 				! SEQUENTIAL		!M421
+	    updsqr (0);				! 0 = No reclen change	!M421
+
+	[orgrel] : 				! RELATIVE		!M421
+	    updsqr (.record_length_has_changed);	! Check reclen	!M421
+
+	[orgidx] : 				! INDEXED		!M421
+	    updidx ();
+	TES;					! END OF CASE FILEORG
+
+    !
+    !   RETURN HERE ONLY IF EVERYTHING WAS OK
+    !
+    setsuccess;
+    usrret ()
+    END;					! End $UPDATE
+
+%SBTTL 'UPDSQR -- sequential/relative $UPDATE'
+
+GLOBAL ROUTINE updsqr (record_length_has_changed) : NOVALUE =
+! UPDSQR
+! ======
+! ROUTINE TO PROCESS THE $UPDATE MACRO FOR SEQUENTIAL AND
+!	RELATIVE FILES. THIS ROUTINE MUST DO THE FOLLOWING:
+!
+!		1) DETERMINE THE BYTE ADDRESS OF THE CURRENT RECORD
+!		2) MAKE SURE THE CORRECT PAGE IS MAPPED IN THE BUFFER
+!		3) CHANGE THE DATA IN THE RECORD
+!
+! INPUT:
+!	RECORD_LENGTH_HAS_CHANGED : this is set to 1 if the length of
+!		a variable-length record in a relative file has been
+!		changed, 0 otherwise.
+!
+! OUTPUT:
+!	<NO STATUS RETURNED>
+!
+! RST FIELDS WHICH ARE USED:
+!
+!	CBKD		CURRENT BUCKET DESCRIPTOR
+!	PAGPTR		ABSOLUTE POINTER TO CURRENT RECORD
+!	RSZ		SIZE IN BYTES OF CURRENT RECORD
+!	RSZW		SIZE IN WORDS OF CURRENT RECORD
+!
+! NOTES:
+!
+!	1.	IF THERE IS ANY ERROR DURING THIS ROUTINE, IT
+!		WILL EXIT DIRECTLY TO THE USER; IT WILL NOT
+!		RETURN TO THE $UPDATE DISPATCHER.
+!
+!	2.	CURRENTLY, THIS ROUTINE ASSUMES THAT THE RECORD
+!		LENGTH CANNOT BE CHANGED ON EITHER FILE ORGANIZATION.
+!		IF THIS RESTRICTION IS LIFTED FOR RELATIVE FILES,
+!		THEN THE CHECK MUST BE MADE ONLY FOR SEQUENTIAL FILES.
+    BEGIN
+
+    LOCAL
+	temp,					! TEMPORARY LOCAL VARIABLE
+	crp,					! CURRENT RECORD POINTER VALUE
+	filepointer,				! POINTER TO CURRENT RECORD IN FILE BUFFER
+	userpointer,				! POINTER TO USER'S DATA
+	bytecount,				! SIZE OF THE RECORD IN BYTES
+	bytesize,				! BYTE SIZE OF THE FILE
+	bytenum;				! BYTE NUMBER OF THE START OF THE TARGET RECORD
+
+    TRACE ('UPDSQR');
+    !
+    !   DETERMINE BYTE-ADDRESS OF START OF RECORD
+    !
+    bytenum = (crp = .rst [rstdatarfa]);	! ASSUME SEQ FILE
+    !
+    !   FOR RELATIVE FILES, WE MUST CONVERT THE RFA (RECORD #)
+    !   INTO THE ACTUAL ADDRESS OF THE TARGET RECORD.
+    !
+
+    IF relfile
+    THEN
+	BEGIN					!  TO CONVERT CRP TO
+						!  A RECORD ADDRESS
+	bytenum = numbertorfa (.crp);
+
+	IF .bytenum EQL false THEN usererror (er$rfa)
+
+	END;					!  OF IF RELFILE
+
+    !
+    !   "BYTENUM" NOW CONTAINS THE ADDRESS
+    !   OF THE TARGET RECORD.  WE MUST MAP
+    !   THE RECORD AND RE-WRITE THE DATA PORTION OF IT
+    !
+    bytenum = .bytenum + headersize;		! IGNORE HEADER
+
+%IF dbug
+%THEN
+    lookat ('	BYTE # TO UPDATE: ', bytenum);	! **DEBUG**
+%FI
+
+    !
+    !   MAP THE RECORD (IT MAY HAVE SPANNED PAGES )
+    !
+    gtbyte (.bytenum, 				! BYTE NUMBER
+	false);					! DON'T CHECK
+
+    !+									!A421
+    !	Update sizes if the record length has changed.			!A421
+    !-									!A421
+
+    IF .record_length_has_changed		! New length?		!A421
+    THEN 					!			!A421
+	BEGIN					!			!A421
+	rst [rstrsz] = .rab [rabrsz, 0];	! Set up new sizes	!A421
+	rst [rstrszw] = sizeinwords (.rst [rstrsz], .fst [fstbsz]);	!A421
+	END;					!			!A421
+
+    !
+    !   REWRITE THE RECORD'S DATA
+    !
+    bytecount = .rst [rstrsz];			! FETCH THE SIZE IN BYTES
+    bytesize = .fst [fstbsz];			! AND THE BYTE SIZE
+    filepointer = .rst [rstpagptr];		! WHERE RECORD IS TO GO
+    userpointer = .rab [rabrbf, 0];		! WHERE RECORD IS TO COME FROM
+
+    IF .userpointer<lh> EQL 0			! Section number?	!A416
+    THEN 					!			!A416
+	userpointer = .userpointer OR .blksec;	! Default section	!A416
+
+    !
+    !   WE ARE NOW READY TO MOVE THE UPDATED RECORD INTO THE FILE.
+    !   IF THE RECORD DOESN'T SPAN A FILE PAGE, WE CAN BLT IT
+    !   DIRECTLY. IF NOT, WE MUST CALL MOVEREC TO DO ALL PAGE
+    !   TURNING AND ASSORTED MACHINATIONS.
+    !
+
+    IF (.filepointer AND ofsetmask) + .rst [rstrszw] LSS pagesize
+    THEN 					! WE CAN MOVE THE RECORD DIRECTLY
+	BEGIN
+	setbfdupd (cbd [bkdbfdadr]);		!INDIC FILE PAGE UPD
+
+	IF .rmssec NEQ 0			!			!A407
+	THEN 					!			!A407
+	    xcopy (.userpointer, 		! From			!A407
+		.filepointer, 			! To			!A407
+		.rst [rstrszw])			! Size			!A407
+	ELSE 					!			!A407
+	    movewords (.userpointer, 		! From			!M407
+		.filepointer, 			! To			!M407
+		.rst [rstrszw]);		! Size			!M407
+
+	END
+    ELSE
+	moverec (.filepointer, 			! TO
+	    .userpointer, 			! FROM
+	    true, 				! FLAG
+	    .bytecount, 			! COUNT
+	    .bytesize);				! SIZE
+
+    !+									!A421
+    !	Update the record length if necessary.				!A421
+    !-									!A421
+
+    IF .record_length_has_changed		! Is it needed?		!A421
+    THEN
+	BEGIN					!			!A421
+
+	LOCAL 					!			!A421
+	    record_header : REF BLOCK;		! Pointer to record	!A421
+
+	record_header = .rst [rstpagptr] - 1;	! Point at header	!A421
+	record_header [rhdrsize] = .rst [rstrsz];	! Update length	!A421
+	END;					!			!A421
+
+    !
+    !   UNLOCK THE RECORD IF IT WAS LOCKED
+    !
+
+    IF datalocked THEN unlock (crp);		! UNLOCK THE RECORD
+
+    RETURN
+    END;					! End UPDSQR
+
+%SBTTL 'UPDIDX -- $UPDATE for indexed files'
+
+GLOBAL ROUTINE updidx : NOVALUE =
+! UPDIDX
+! ======
+! ROUTINE TO PERFORM THE $UPDATE OPERATION FOR INDEXED FILES.
+!	IN ORDER TO PROCESS AN $UPDATE FOR INDEXED FILES, THE
+!	FOLLOWING LOGICAL OPERATIONS MUST BE DONE:
+!
+!		1 )	LOCK THE FILE (IF NECESSARY)
+!		2 )	DELETE THE RECORD POINTERS FOR ALL
+!			SECONDARY INDICES FOR WHICH THE KEY CHANGED
+!		3 )	UPDATE THE USER DATA RECORD
+!		4 )	INSERT NEW RECORD POINTERS IN THE INDEX
+!			FOR EACH NEW SECONDARY KEY VALUE.
+!
+! INPUT:
+!	<NONE>
+!
+! OUTPUT:
+!	<NO STATUS RETURNED>
+!
+! ROUTINES CALLED:
+!	DOUPDIDX
+!	PUTBKT
+!
+! NOTES:
+!
+!	1.	THIS ROUTINE WILL NOT RETURN TO THE CALLER (UPDIDX)
+!		IF AN ERROR WAS ENCOUNTERED; IT WILL EXIT DIRECTLY
+!		TO THE USER.
+!
+!	2.	THIS CODE CURRENTLY DOES NOT SUPPORT THE MODIFICATION
+!		OF THE RECORD LENGTH ON AN $UPDATE. FOR MORE INFO
+!		ON HOW THIS MIGHT BE DONE, SEE THE HEADING OF "UPDUDR".
+!
+!	3.	IF ANY ERROR OCCURS DURING THE PROCESSING OF AN $UPDATE,
+!		THE PROCESSING IS TERMINATED AND CONTROL IS RETURNED
+!		TO THE USER. IN SUCH A CASE, THE STATE OF THE USER'S
+!		DATA MAY BE UNDEFINED (PROPERLY STRUCTURED, BUT NOT
+!		LOGICALLY CONSISTENT). FOR EXAMPLE, ONE OF THE SIDR
+!		POINTERS MAY HAVE ALREADY BEEN DELETED; THUS, THE
+!		USER MAY HAVE LOST AN ACCESS PATH TO THE FILE.
+    BEGIN
+
+    LOCAL
+	recdesc : BLOCK [rdsize],		! USE LOCAL RECORD DESCRIPTOR
+	databd : BLOCK [bdsize],		! AND BUCKET DESCRIPTOR
+	savedstatus;				! STATUS RETURNED TO US
+
+!    EXTERNAL
+!	putbkt,					! RELEASE A BUCKET
+!	doupdidx;				! DO THE DIRTY WORK
+    TRACE ('UPDIDX');
+
+    !+
+    !   FIRST, WE WILL SET UP THE RECORD DESCRIPTOR PACKET.
+    !   THE FOLLOWING FIELDS MUST BE INITIALIZED:
+    !
+    !		FLAGS	= NULL
+    !		STATUS	= NULL
+    !		RECPTR	= ADDRESS OF CURRENT RECORD
+    !-
+
+    recdesc [rdflags] = 0;			! CLEAR FLAGS
+    recdesc [rdstatus] = 0;			! CLEAR STATUS
+    recdesc [rdrecptr] = .rst [rstpagptr];
+
+    !+
+    !   FETCH THE CURRENT BUCKET DESCRIPTOR FROM THE RST.
+    !   NOTE THAT THERE MUST BE A CURRENT BUCKET OR SOMETHING
+    !   HAS BEEN MESSED UP.
+    !-
+
+    fetchcurrentbkt (databd);
+
+    IF nullbd (databd) THEN rmsbug (msgbkt);
+
+    !
+    !   PERFORM THE ACTUAL WORK OF THE $UPDATE
+    !   AND  SAVE THE RESULTS THAT WE GOT
+    !
+    savedstatus = doupdidx (recdesc, 		! RD
+	databd);				! BKT
+    !
+    !   RELEASE THE CURRENT BUCKET (NOTE THAT WE ARE
+    !   RELEASING THE BUCKET AS IT IS STORED IN THE RST
+    !   BECAUSE THIS WILL ALSO SET THE RST CURRENT BUCKET
+    !   TO BE NULL)
+    !
+    releascurentbkt;
+    !
+    !   UNLOCK THE FILE IF ONE OF THE ROUTINES WE CALLED LOCKED IT
+    !
+
+    IF indexlocked THEN unlockindex;
+
+    IF .savedstatus EQL false THEN usrerr ();	! HAD AN ERROR
+
+    !
+    !   EVERYTHING WENT OK...CHECK FOR INDEX ERROR OR DUPLICATES
+    !
+
+    IF samekeyflag (recdesc) NEQ 0 THEN usrsts = su$dup;
+
+    IF idxerrorflag (recdesc) NEQ 0 THEN usrsts = su$idx;
+
+    RETURN
+    END;					! End UPDIDX
+
+%SBTTL 'DOUPDIDX -- perform actual indexed update'
+
+GLOBAL ROUTINE doupdidx (recdesc, databd) =
+! DOUPDIDX
+! ========
+! ROUTINE TO ACTUALLY PERFORM THE $UPDATE MACRO PROCESSING FOR
+!	AN INDEXED FILE. THIS ROUTINE MUST PERFORM THE FOLLOWING OPERATINS:
+!
+!		1 )	CHECK FOR CHANGES IN ALL KEYS
+!		2 )	DELETE OLD KEY VALUES FROM SECONDARY INDEX
+!		3 )	CAL UPDUDR TO UPDATE AND WRITE OUT THE
+!			PRIMARY DATA RECORD
+!		4 )	ADD NEW SIDR ENTRIES FOR THE NEW KEY VALUES
+!
+! INPUT:
+!	RECDESC		RECORD DESCRIPTOR PACKET
+!		RECPTR		ADDRESS OF CURRENT RECORD IN BUFFER
+!		FLAGS		PROCESSING FLAGS
+!			RDFLGHORIZOK
+!
+!	DATABD		BUCKET DESCRIPTOR OF CURRENT BUCKET
+!		<THIS BUCKET DESCRIPTOR MUST NOT BE EMPTY>
+!
+!
+! OUTPUT:
+!	TRUE:	OK...$UPDATE WAS PERFORMED
+!	FALSE:	ERROR
+!		FILE IS FULL (FOR RECORD LENGTH MODIFICATION)
+!
+! NOTES:
+!
+!	1.	ON ERROR, THE ERROR CODE WILL BE PUT INTO USRSTS.
+!
+!	2.	THIS ROUTINE NEVER RELEASES THE BUCKET WHICH IS
+!		PASSED TO IT. THIS MUST DO DONE BY "UPDIDX".
+!
+!	3.	ON ANY ERROR CONDITION, THE STATE OF THE USER'S FILE
+!		IS INDETERMINATE. THIS DOES NOT MEAN THAT IT IS
+!		"SCREWED UP" IN SOME PHYSICAL WAY, BUT SIMPLY THAT
+!		SOME ACCESS PATHS (SIDR RECORDS) MAY HAVE BEEN LOST,ETC.
+!
+!	4.	THIS ROUTINE WILL NOT ALLOW THE SIZE OF THE RECORD TO
+!		BE CHANGED ON AN $UPDATE. HOWEVER, COMMENTS ARE MADE
+!		THRUOUT THIS ROUTINE WHICH EXPLAINS WHAT HAS TO BE
+!		DONE IF THIS FACILITY IS EVER IMPLEMENTED. ALL
+!		COMMENTS ENCLOSED IN ANGLE BRACKETS ( "<,>") REFER
+!		TO THIS FACILITY.
+!
+!	5.	THIS ROUTINE USES THE "FLGDIDCHANGE" BIT IN THE
+!		KDB TO KEEP TRACK OF WHETHER THE CORRESPONDING
+!		SECONDARY KEY VALUE CHANGED. THIS IS NECESSARY
+!		BECAUSE ONCE THE DATA RECORD IS WRITTEN OUT,
+!		THE OLD VALUE OF THE KEY IS (OBVIOUSLY) NOT
+!		AVAILABLE.
+    BEGIN
+
+    MAP
+	recdesc : REF BLOCK,
+	databd : REF BLOCK;
+
+    LOCAL
+	tempbd : BLOCK [bdsize],
+	temprd : BLOCK [rdsize],
+	oldrecordptr : REF BLOCK,		! PTR TO CURRENT RECORD IN FILE
+	newrecordptr : REF BLOCK,		! PTR TO USER'S NEW UPDATED RECORD
+	keyofreference,				! CURRENT KEY NUMBER
+	newrecordsize,				! SIZE OF NEW RECORD
+	oldrecordsize,				! SIZE OF OLD RECORD
+	maxrecordsize,				! MAX SIZE OF A NEW RECORD
+	ptrtodata : REF BLOCK;			! PTR TO THE DATA PORTION OF CURRENT RECORD
+
+    EXTERNAL
+!	delsidr,				! DELETE A SECONDARY KEY
+!	ckeyuu,					! COMPARE USER KEY TO USER KEY
+	tbuffer;				! TEMP BUFFER FOR KEY STORAGE
+
+!	updudr,					! UPDATE PRIMARY DATA RECORD
+!	movekey,				! MOVE A KEY STRING
+!	putsidr,				! INSERT A NEW SECONDARY KEY
+!	lockit;					! LOCK THE FILE
+    TRACE ('DOUPDIDX');
+    !
+    !   FIRST, SET UP THE PRIMARY KDB ADDRESS
+    !
+    kdb = .fst [fstkdb];
+    !
+    !   SET UP POINTERS TO BOTH THE OLD AND THE NEW RECORDS,
+    !   AND <GET THE SIZE OF BOTH RECORDS>
+    !
+    oldrecordptr = .recdesc [rdrecptr];		! OLD RECORD IN FILE
+    ptrtodata = .oldrecordptr + .kdb [kdbhsz];
+    newrecordptr = .rab [rabrbf, 0];		! USER'S NEW RECORD
+
+    IF .rmssec NEQ 0 AND 			! Extended addressing?	!A407
+	.newrecordptr<lh> EQL 0			! User gave 18-bits?	!A407
+    THEN 					!			!A407
+	newrecordptr = .newrecordptr OR .blksec;	! Make global	!A407
+
+    oldrecordsize = .rst [rstrsz];		! Size of old record
+    newrecordsize = .rab [rabrsz, 0];		! Size of new record
+
+%IF 0
+%THEN
+
+    !+
+    !   <NOW, LET'S PERFORM SOME CHECKS ON THE SIZE OF THE
+    !   NEW RECORD>
+    !-
+
+    maxrecordsize = 				! Record not bigger than this
+    .kdb [kdbdbkz]^b2w;
+    maxrecordsize = .maxrecordsize - (bhhdrsize + .kdb [kdbhsz]);
+
+    IF (.newrecordsize LSS .kdb [kdbminrsz]) OR 	!
+	(sizeinwords (.newrecordsize, .fst [fstbsz]) GTR 	!
+	.maxrecordsize)
+    THEN 					! Record too short or too long
+	returnstatus (er$rsz);
+
+%FI
+
+    !+
+    !   GET THE RRV ADDRESS OF THE CURRENT RECORD
+    !-
+
+    recdesc [rdrrv] = .oldrecordptr [drrrvaddress];
+
+    !+
+    !   WE MUST NOW CYCLE THRU EACH KEY TO SEE IF IT CHANGED.
+    !   THE PRIMARY KEY CAN BE TREATED JUST LIKE A SECONDARY
+    !   KEY SINCE IT HAD TO BE DEFINED WITH THE "NO CHANGE"
+    !   ATTRIBUTE. IN ORDER TO SAVE TIME LATER (BECAUSE WE WON'T
+    !   HAVE TO COMPARE THE KEY STRINGS TWICE), WE WILL SET A
+    !   FLAG IN THE KDB WHICH WILL INDICATE WHETHER A PARTICULAR
+    !   KEY VALUE CHANGED OR NOT.  THEN LATER, WE ONLY HAVE TO
+    !   CHECK THE BIT INSTEAD OF COMPARING THE KEYS AGAIN.
+    !-
+
+    !
+
+    !   SET UP THE ADDRESS OF THE DATA PORTION OF THE RECORD
+    !
+    recdesc [rduserptr] = .ptrtodata;
+    !
+    !   PROCESS THIS LOOP ONCE FOR EACH KEY
+    !
+    keyofreference = 0;
+
+    UNTIL .kdb EQL 0 DO 			! THIS LOOP
+	BEGIN
+	!
+	!   ASSUME THE KEY DIDNT CHANGE
+	!
+	clrflag (kdb [kdbflags], flgdidchange);	! CLEAR THE FLAG
+
+	!+
+	!   CHECK IF THE KEY VALUE CHANGED. THIS CHECK IS
+	!   DONE ONLY IF THE OLD RECORD WAS BIG ENOUGH TO
+	!   HOLD THE ENTIRE KEY STRING, <AND THE NEW RECORD
+	!   IS ALSO BIG ENOUGH>
+	!-
+
+	IF .oldrecordsize GEQ .kdb [kdbminrsz]	!
+	    %(AND)%				!
+	    %(.NEWRECORDSIZE GEQ .KDB [ KDBMINRSZ ] )%	!
+	THEN 					! WE CAN COMPARE THE KEYS
+	    BEGIN
+	    lookat ('	CHECKING KEY #: ', keyofreference);
+
+	    IF ckeyuu (.recdesc, 		! OLD PTR
+		    .newrecordptr		! NEW PTR
+		) EQL false OR 			!
+		(lssflag (recdesc) NEQ 0)
+		!
+		!   IF THIS KEY CHANGED, WE MUST SET THE CORRESPONDING
+		!   FLAG BIT IN THE KDB. NOTE THAT THE KEY
+		!   DIDNT CHANGE IF CKEYUU RETURNED TRUE WITH THE
+		!   LSSFLAG NOT ON
+		!
+	    THEN 				! THE KEY CHANGED
+		BEGIN
+		rtrace ('	KEY HAS CHANGED...');
+		!
+		!   IS THIS KEY ALLOWED TO CHANGE?
+		!
+
+		IF chkflag (kdb [kdbflags], flgchange) EQL 0
+		THEN
+		    BEGIN
+		    usrstv = .keyofreference;	!INDIC WHICH KEY CHANGED
+		    returnstatus (er$chg);
+		    END;
+
+		setflag (kdb [kdbflags], flgdidchange);
+
+		!+
+		!   *****
+		!   IF DUPLICATES ARE NOT ALLOWED
+		!   THEN CHECK FOR DUPLICATES
+		!   ******
+		!-
+
+		IF chkflag (kdb [kdbflags], flgdup) EQL 0
+		THEN
+		    BEGIN
+
+		    BIND 			! 			!A422
+			frombd = .databd : BLOCK;	! Prevent bug	!A422
+
+		    !
+		    !   MAKE A COPY OF BD
+		    !
+		    movebktdesc (frombd, 	! FROM			!M422
+			tempbd);		! TO
+		    !
+		    !   MAKE A COPY OF RDP
+		    !
+		    movewords (.recdesc, 	! FROM
+			temprd);		! TO
+		    !
+		    !   MOVE KEY TO TEMP BUFFER
+		    !
+		    movekey (.newrecordptr, 	! FROM
+			tbuffer);		! TO
+		    temprd [wholeword] = 0;
+		    temprd [rduserptr] = tbuffer;
+		    temprd [rdusersize] = .kdb [kdbksz];
+
+		    IF followpath (temprd, tempbd) EQL false	!
+		    THEN
+			BEGIN
+			!					       !A57
+			!   Free the bucket without update	       !A57
+			!					       !A57
+			putbkt (false, tempbd);	!A57
+			RETURN false;
+			END;
+
+		    IF chkdup (			! DUPLICATE?
+			    temprd, 		! RECDES
+			    tempbd		! BKTD
+			) EQL false
+		    THEN
+			BEGIN
+			!					       !A57
+			!   Free the bucket without update	       !A57
+			!					       !A57
+			putbkt (false, tempbd);	!A57
+			returnstatus (er$dup);
+			END;
+
+		    !                                                  !A57
+		    !   Free the bucket without update                 !A57
+		    !						       !A57
+		    putbkt (false, tempbd);	!A57
+		    END;
+
+		!
+		!   *	END OF CHECK FOR DUPLICATES	**
+		!
+		END
+
+	    END;
+
+	!
+	!   WE HAVE FINISHED CHECKING THIS KEY..MOVE TO NEXT ONE
+	!
+	kdb = .kdb [kdbnxt];			! GET NEXT KDB
+	keyofreference = .keyofreference + 1;	! Bump key number
+	END;
+
+    !+
+    !   WE NOW KNOW THAT THE NEW RECORD IS OK. WE MUST
+    !   REMOVE THE OLD SIDR ENTRIES FOR EACH KEY VALUE WHICH
+    !   HAS CHANGED.
+    !-
+
+    kdb = .fst [fstkdb];			! RESET TO PRIMARY KEY
+    kdb = .kdb [kdbnxt];			! MOVE TO FIRST SECONDARY
+    !
+    !   DELETE SIDR POINTERS
+    !
+
+    UNTIL .kdb EQL 0 DO 			! THIS LOOP
+	BEGIN
+	keyofreference = .kdb [kdbref];
+
+	!+
+	!   NOW, IF THE KEY CHANGED, WE MUST DELETE THE OLD SIDR
+	!   ENTRY. FIRST, WE WILL MOVE THE KEY VALUE OF THIS
+	!   KEY INTO THE TEMPORARY KEY BUFFER (WE COULD USE THE
+	!   BOTTOM HALF OF THE RST KEY BUFFER)
+	!
+	!   NOTE THAT IF RECORD-LENGTH MODIFICATION IS
+	!   SUPPORTED, THERE MUST ALSO BE A CHECK HERE TO SEE
+	!   IF THE OLD RECORD CONTAINED THE KEY VALUE, BUT THE
+	!   NEW RECORD DIDNT (SINCE IN THIS CASE THE DIDCHANGE
+	!   BIT WOULD NOT BE ON)
+	!-
+
+	IF (chkflag (kdb [kdbflags], flgdidchange) NEQ 0)
+	THEN
+	    BEGIN
+	    lookat ('	DELETING KEY #', keyofreference);
+	    movekey (.ptrtodata, 		! FROM
+		tbuffer);			! TO
+	    !
+	    !   SET UP THE RECORD DESCRIPTOR PACKET
+	    !
+	    recdesc [rdusersize] = .kdb [kdbksz];	! USE FULL KEY SIZE
+	    recdesc [rduserptr] = tbuffer;	! USE GLOBAL TBUFFER
+	    !
+	    !   IF THE FILE HASN'T BEEN LOCKED, WE MUST LOCK IT
+	    !
+
+	    IF locking
+	    THEN
+
+		IF NOT indexlocked
+		THEN
+		    BEGIN
+
+		    IF lockindex (		!
+			    enqblk, 		! WAIT
+			    enqexc		! EXCLUSIVE
+			) EQL false
+		    THEN
+			returnstatus (er$edq)
+
+		    END;
+
+	    !
+	    !   AT THIS POINT, THE FILE IS LOCKED (IF NECESSARY)
+	    !   SO WE CAN DELETE THE OLD SIDR ENTRY
+	    !
+	    delsidr (.recdesc)
+	    !
+	    !   ***NOTE THAT IF DELSIDR FAILS, THERE IS NO
+	    !   CHECK HERE FOR THAT CONDITION. THIS IS BECAUSE
+	    !   AN EARLIER CRASH MAY HAVE CAUSED THE KEY TO
+	    !   NOT BE CORRECTLY INSERTED INTO ALL SECONDARY
+	    !   INDICES. ***
+	    !
+	    END;
+
+	kdb = .kdb [kdbnxt]			! GO TO NEXT KDB
+	END;
+
+    !+
+    !   AT THIS POINT, ALL OLD SIDR ENTRIES HAVE BEEN DELETED.
+    !   ALSO, THE FILE MAY STILL BE LOCKED. WE MUST NOW PERFORM
+    !   THE ACTUAL UPDATE OF THE USER DATA RECORD. WE WILL PASS
+    !   A FLAG TO "UPDUDR" INDICATING WHETHER THE FILE IS CURRENTLY
+    !   LOCKED OR NOT, AND THAT ROUTINE CAN THEN ALTER THE FLAG
+    !   IF IT HAS TO LOCK THE FILE.
+    !-
+
+    recdesc [rdrecptr] = .oldrecordptr;		! PTR TO FILE RECORD
+    kdb = .fst [fstkdb];			! START WITH PRIMARY
+
+    IF updudr (					!
+	    .recdesc, 				! RD
+	    .databd				! BKT
+	) EQL false
+	!
+	!   IT IS CURRENTLY IMPOSSIBLE FOR UPDUDR TO FAIL...HERE
+	!   IS THE CODE TO HANDLE AN ERROR WHEN RECORD-LENGTH
+	!   MODIFICATION IS SUPPORTED:
+	!
+    THEN
+	BEGIN
+	rmsbug (msgcantgethere);		! **** REMOVE WHEN IMPLEMENTED
+! 		USRSTV = ER$UDF;		! INDICATE UNDEFINED RECORD
+!  		BADRETURN
+	END;
+
+    !
+    !   NOW, PERFORM THIS LOOP ONCE FOR EACH SECONDARY KEY.
+    !   WE MUST NOW INSERT THE NEW VALUES OF THE SECONDARY
+    !   KEYS INTO THE CORRESPONDING INDEX.
+    !
+    kdb = .kdb [kdbnxt];			! MOVE TO FIRST SECONDARY
+
+    UNTIL .kdb EQL 0 DO 			! THIS LOOP
+	BEGIN
+	!
+	!   DID THIS KEY VALUE CHANGE?
+	!
+	!   THE SIZE OF THE NEW RECORD MUST INCLUDE THIS KEY STRING
+	!
+
+	IF (chkflag (kdb [kdbflags], flgdidchange) NEQ 0)	!
+	    %(AND)%				!
+	    %((.NEWRECORDSIZE GEQ .KDB[ KDBMINRSZ] ))%
+	THEN 					! WE MUST INSERT THIS NEW KEY VALUE
+	    BEGIN
+	    !
+	    !   <WE MAY NEED TO LOCK THE FILE AT THIS POINT.
+	    !   THIS WOULD BE NECESSARY ONLY IF RECORD LENGTH
+	    !   MODIFICATION IS SUPPORTED. THUS, IF THE OLD
+	    !   RECORD LENGTH WAS NOT BIG ENOUGH FOR ANY KEYS,
+	    !   AND THE PRIMARY DATA BUCKET DIDN'T SPLIT, AND
+	    !   THE NEW RECORD SIZE IS BIG ENOUGH FOR A SECONDARY
+	    !   KEY, THEN WE NEED TO LOCK THE FILE>
+	    !
+
+%IF dbug
+%THEN
+
+	    IF chkflag (kdb [kdbflags], flgchange) EQL 0	!
+	    THEN
+		rmsbug (msgflags);
+
+%FI
+
+	    IF locking
+	    THEN
+
+		IF NOT indexlocked
+		THEN
+		    BEGIN
+
+		    IF lockindex (		!
+			    enqblk, 		! WAIT
+			    enqexc		! EXCL
+			) EQL false
+		    THEN
+			returnstatus (er$edq)
+
+		    END;
+
+	    !
+	    !   INSERT THE NEW SECONDARY KEY VALUE
+	    !
+	    lookat ('	INSERTING SIDR FOR KEY: ', kdb [kdbref]);
+
+	    IF putsidr (.recdesc) EQL false
+	    THEN
+		BEGIN
+		usrstv = er$udf;		! INDICATE UNDEFINED RECORD
+		RETURN false
+		END;
+
+	    END;
+
+	!
+	!   GO TO NEXT SECONDARY KEY
+	!
+	kdb = .kdb [kdbnxt]
+	END;
+
+    !
+    !   AT THIS POINT, THE UPDATE WAS SUCCESSFUL.
+    !
+    RETURN true
+    END;					! End DOUPDIDX
+
+%SBTTL 'UPDUDR -- Update current record, indexed'
+
+GLOBAL ROUTINE updudr (recdesc, databd) =
+! UPDUDR
+! ======
+! ROUTINE TO UPDATE THE CONTENTS OF THE CURRENT RECORD FOR AN INDEXED FILE.
+!	THIS ROUTINE CURRENTLY IS TRIVIAL BECAUSE IT IS NOT POSSIBLE
+!	TO CHANGE THE LENGTH OF THE RECORD ON AN $UPDATE OPERATION.
+!	HOWEVER, IF THIS CODE IS CHANGED TO ALLOW RECORD LENGTH
+!	MODIFICATION, THEN THE FOLLOWING MUST BE DONE:
+!
+!		1 )	DETERMINE IF THE NEW RECORD WILL FIT IN THE
+!			CURRENT BUCKET.
+!
+!		2 )	IF SO, SQUEEZE THE OLD ONE OUT (WITH SOME
+!			OPTIMIZATION) AND INSERT THE NEW ONE WITHOUT
+!			ASSIGNING A NEW ID FOR IT.
+!
+!		3 )	IF NOT, SPLIT THE BUCKET AND CONTINUE AS IF
+!			THIS WERE A NORMAL $PUT OPERATION. HOWEVER,
+!			NOTE THAT SINCE WE MAY NOT HAVE TRAVERSED THE
+!			INDEX TO GET HERE, THE ENTIRE INDEX MAY HAVE TO
+!			BE SEARCHED AGAIN SIMPLY TO SET UP THE "PATH"
+!			ARRAY.  IF THE LAST OPERATION USED KEY ACCESS,
+!			THEN "PATH" IS ALREADY SET UP AND DOES NOT HAVE
+!			TO BE RE-INITIALIZED.
+!
+!
+! INPUT:
+!	RECDESC		RECORD DESCRIPTOR PACKET
+!		RECPTR		ADDRESS OF OLD RECORD (IN CURRENT BUFFER)
+!
+!	DATABD		CURRENT BUCKET DESCRIPTOR (MUST NOT BE NULL)
+!
+!
+! OUTPUT:
+!	TRUE:	OK, RECORD HAS BEEN UPDATED
+!	FALSE:	ERROR
+!		ENQ/DEQ ERROR
+!		COULD NOT INSERT NEW RECORD
+!
+! INPUT ARGUMENTS MODIFIED:
+!	RECORD DESCRIPTOR
+!		RECPTR		ADDRESS OF RECORD (MAY HAVE MOVED)
+!
+! ROUTINES CALLED:
+!	<NONE CURRENTLY>
+!
+! NOTES:
+!
+!	1.	FILEISLOCKED IS RETURNED TO THE CALLER BECAUSE THIS
+!		ROUTINE MAY HAVE TO LOCK THE FILE ON ITS OWN.
+    BEGIN
+
+    MAP
+	recdesc : REF BLOCK,
+	databd : REF BLOCK;
+
+    LOCAL
+	newrecordptr : REF BLOCK,		! PTR TO USER'S NEW UPDATED RECORD
+	oldrecordptr : REF BLOCK;		! PTR TO OLD RECORD IN BUFFER
+
+    TRACE ('UPDUDR');
+    !
+    !   FOR NOW, WE SIMPLY HAVE TO MOVE THE NEW RECORD (IN THE
+    !   USER'S RECORD BUFFER) INTO THE OLD EXISTING RECORD
+    !   (POINTED TO BY THE RECPTR FIELD). NOTE THAT THE SIZE OF
+    !   OLD RECORD IS KEPT IN THE RST SO WE DON'T HAVE TO RE-COMPUTE IT.
+    !
+    newrecordptr = .rab [rabrbf, 0];		! Get user's buffer	!M407
+
+    IF .rmssec NEQ 0 AND 			! Extended addressing?	!A407
+	.newrecordptr<lh> EQL 0			! User gave 18-bits?	!A407
+    THEN 					!			!A407
+	newrecordptr = .newrecordptr OR .blksec;	! Make global	!A407
+
+    oldrecordptr = .recdesc [rdrecptr] + .kdb [kdbhsz];
+    !
+    !   MOVE THE RECORD DATA
+    !
+
+    IF .rmssec NEQ 0				!			!A407
+    THEN 					!			!A407
+	xcopy (.newrecordptr, 			! From			!A407
+	    .oldrecordptr, 			! To			!A407
+	    .rst [rstrszw])			! Size			!A407
+    ELSE 					!			!A407
+	movewords (.newrecordptr, 		! From			!M407
+	    .oldrecordptr, 			! To			!M407
+	    .rst [rstrszw]);			! Size			!M407
+
+    						!
+    !   WRITE OUT THE CURRENT BUCKET TO THE FILE
+    !
+
+    IF NOT writebehind				!
+    THEN
+	updatebucket (databd)			!
+    ELSE
+	setbfdupd (databd [bkdbfdadr]);		!SET WRITE FLAG
+
+    RETURN true
+    END;					! End UPDUDR
+
+END
+
+ELUDOM
+ 

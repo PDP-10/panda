@@ -1,0 +1,1225 @@
+	Title WChunk - Routines to handle output to a virtual Vt100
+
+	SubTtl Table of Contents
+
+Comment \
+
+Written by ...	Tad Marshall, American Express Co., March - November 1981
+
+		Table of Contents	      Page(s)
+
+Entrys, Externs and some Definitions ........... 2
+Chunk (Handle 1 chunk of output) ............... 3-6
+NewLin (Handle a new line) ..................... 8-9
+VUp (Move cursor up) ........................... 10
+VDown (Move cursor down) ....................... 11
+VLeft (Move cursor left) ....................... 12
+VRight (Move cursor right) ..................... 13
+VMove (Absolute addressing) .................... 14
+VCeos (Clear to end of screen) ................. 15
+VCeol (Clear to end of line) ................... 16
+GetNms (Load number part of esc seq) ........... 17
+GetNum (Get a number from loaded list) ......... 18
+
+\
+
+	SubTtl Entrys and Externs
+
+; Entrys in WChunk.Mac ...
+
+	Entry Chunk,  PtyStr, SetPtr, NewLin, ClrLin
+
+; Externs required ...
+
+	Extern Blanks, GetSpc, GivSpc, PtyOut, SetMap, Beep
+	Extern WinHdr, PiOff,  PiOn,   EchByt
+
+	Search WSym, MonSym, MacSym ; The symbols we need
+	Sall
+
+	SubTtl PtOGet -- Routine to get a character from the pty buffer
+
+PtOGet:	SkipG PtOCnt(i)		; Any characters there?
+	 Jrst PtOGT1		;  No, check for lossage
+
+	Sos PtOCnt(i)		; Count down count of chars
+	Ildb t1, PtOGbp(i)	; Yes, get the charcter
+
+	Move t2, PtOGbp(i)	; See if pointer needs wrapping around
+	CamN t2, PtOEbp(i)
+	 Move t2, PtOIbp(i)	;  Yes, wrap it around to beginning
+	MoveM t2, PtOGbp(i)	; Store new pointer
+	RetSkp			;  and give successful return
+
+PtOGT1:	Move t2, PtOGbp(i)	; Out of sync?
+	CamN t2, PtOPbp(i)
+	 Ret			;  No
+
+	Push p, t1		; Possibly
+	Call PiOff		; Touchy code
+	Move t2, PtOPbp(i)	; Get output pointer
+	SkipG PtOCnt(i)		; Out of sync really?
+	 MoveM t2, PtOGbp(i)	;  Yes, fix this problem
+	Call PiOn		; All done
+	Pop p, t1
+	Ret
+
+	SubTtl Chunk -- Handle a chunk of buffered output from a pty
+
+Chunk:	Aos ChuCnt		; Update global statistic
+
+	Push p, t4		; Save regs ...
+	Push p, p1
+	Push p, p2
+
+	Call PiOff		; Ints off while in this routine
+
+	GTAD%			; Get the current time
+	MoveM t1, TimNow	; Store the "current" time
+
+	SetZ p1,		; Clear the count of characters in this chunk
+	Move p2, [Point 7, ChuBuf] ; Set up byte pointer to chunk buffer
+
+ChuLp1:	Call PtOGet		; Get a char
+	 Jrst ChuEn1		;  No more, that ends this chunk
+
+	Aoj p1,			; Bump the char count
+	Idpb t1, p2		; Store the char in our chunk buffer
+
+	CaiL p1, ChuChr		; Have we already handled enough chars?
+	 Jrst ChuEn1		;  Yes, stop adding chars
+
+	Move t2, PtySts(i)	; Get status
+	TxNN t2, PtLzyF		; Lazy update?
+	 CaiE t1, .ChCrt	;  No, was it a carriage return?
+	  Jrst ChuLp1		;   Either lazy update or not CR, loop ...
+
+; Got chunk buffer loaded, now see if we have to display it
+
+ChuEn1:	SetOM OnScrn		; Assume subjob is on-screen
+
+	SkpfOn PtOnsF		; Is it on-screen?
+	 SetZM OnScrn		;  It is not ...
+
+	TstWOn Gone		; Detached or pushed? (off-screen if yes)
+	 SetZM OnScrn		;  All subjobs are "off-screen"
+
+	HlrZ p3, PtyPos(i)	; Get row in p3
+	HrrZ p4, PtyPos(i)	;  ... column in p4
+
+	Move p2, [Point 7, ChuBuf] ; Set up byte pointer to chunk buffer
+
+	MoveI p6, Chnged	; Keep this bit real handy ...
+
+	Call SetPtr		; Set up ptr to the line
+
+	;continued on next page
+	;continued from previous page
+
+	Call WinHdr		; Get a new header if needed ...
+				;  (for log file if any, and for hardcopy,
+				;  again, if any)
+
+	Move t2, PtEIbp(i)	; This initial ptr to escape buffer
+	MoveM t2, PtEGbp(i)	; Start getting from beginning of buffer ...
+
+	SetZM LstChr		; No last char to be typed
+	SetZM UnpChr		; No unpulled character either ...
+
+ChuLp2:	Call PullCh		; Get a char from somewhere
+	 Jrst ChuDon		;  None to be had ...
+
+	SkipE SilncF		; Silenced?
+	 Jrst [	CamN i, ConSjb	;  Connected to it?
+		 Jrst .+1	;   Yes, handle the character anyway ...
+		Jrst ChuBot ]	; Ignore this char (already logged by PullCh)
+
+	CaiL t2, .ChDel		; A delete (or worse ...)?
+	 Jrst ChuBot		;  Yes, ignore it
+
+	CaiL t2, " "		; Compare with space ...
+	 Jrst ChuAdd		;  If space or greater, just add it
+
+	CaiN t2, .ChEsc		; Escape?
+	 Jrst ChuEsc		;  Yes, handle the escape sequence
+
+	CaiN t2, .ChCrt		; Return?
+	 Jrst [	Move p4, Margin	; Load up the current margin
+		Call SetPtr	; Make a new ptr
+		Jrst ChuBot ]	;  all done
+
+	CaiN t2, .ChFfd		; Formfeed?
+	 Jrst ChuLfd		;  Yes, treat as line feed (a Vt100 would)
+
+	CaiE t2, .ChVtb		; Control-K ? (vertical tab)
+	 CaiN t2, .ChLfd	;  Line feed?
+	  Jrst ChuLfd		;   Yes, deal with it
+
+	CaiN t2, .ChTab		; Tab?
+	 Jrst [	IOrI p4, 7	;  Yes, go to next tab stop
+		Aoj p4,		; Fancy trick ...
+		CaiLE p4, TrmWid-1 ; Greater than terminal width?
+		 MoveI p4, TrmWid-1 ; Truncate to width ...
+		Call SetPtr	; Get a new ptr
+		Jrst ChuBot ]
+
+	CaiN t2, .ChBel		; Bell?
+	 Jrst [	SkipE OnScrn	; Is the subjob onscreen?
+		 Call Beep	;  Yes, beep the bell ...
+		TstWOf ShoBel	; Do we want to show bells?
+		 Jrst ChuBot	;  No ...
+		MoveI t2, "^" ! Invert ; Inverted carat
+		Call AddChr	; Add this char
+		MoveI t2, "G" ! Invert ; Inverted capital G
+		Call AddChr	; Add this char
+		Jrst ChuBot ]	; That's it here ...
+
+	CaiN t2, .ChBsp		; Backspace?
+	 Jrst [	SosGE p4	; Decr the column, skip if legal
+		 SetZ p4,	;  Illegal, make it zero
+		Call SetPtr	; Get a new ptr
+		Jrst ChuBot ]	; Don't store directly
+
+	CaiN t2, .ChCnO		; Control-O?
+	 Jrst [	SetZM PtySet(i)	; Put us in the G0 charset
+		Call NewAtr	; Go set up a new attr based on this
+		Jrst ChuBot ]	; Done with this
+
+	CaiN t2, .ChCnN		; Control-N?
+	 Jrst [	MoveI t2, 1	; Get a one
+		MoveM t2, PtySet(i) ; Put us in the G1 charset
+		Call NewAtr	; Go set up a new attr based on this
+		Jrst ChuBot ]	; Done with this
+
+	Jrst ChuBot		; Some other control character, ignore it ...
+
+; Add this char to the stored line
+
+ChuAdd:	Ior t2, PtyAtr(i)	; Add in the current attribute
+	Call AddChr		; Add this char ...
+	Jrst ChuBot		; Done with this char
+
+; Here to add a char to the current line ...
+
+AddChr:	Idpb t2, p5		; Store the char
+	Aoj p4,			; Add in 1 space for this char
+
+	CaiL p4, TrmWid		; Did we go over the edge?
+	 Jrst [	SetO p4,	;  Yes, back up ...
+		AdjBp p4, p5	; Back up the byte pte
+		Move p5, p4	; Copy it over
+		MoveI p4, TrmWid-1 ; Set the column
+		Jrst .+1 ]	; Return to stream
+
+	Move t2, PtyRcl(i)	; Ptr to current line
+	IOrM p6, .Flags(t2)	; Say line has been changed
+
+	Move t1, TimNow		; Get "current" (more-or-less) time
+	MoveM t1, .Time(t2)	; Timestamp this write to the line ...
+	Ret			; Done here ...
+
+	;continued on next page
+	;continued from previous page
+
+; Handle escape sequence ...
+
+ChuEsc:	Call PullCh		; Try to get a char
+	 Jrst ChuDon		;  Can't ...
+
+	CaiN t2, "["		; Left square bracket?
+	 Jrst ChuSqr		;  Yes, go handle it
+
+	CaiN t2, "("		; Left paren?
+	 Jrst ChuLfP		;  Yes, go handle it
+
+	CaiN t2, ")"		; Right paren?
+	 Jrst ChuRtP		;  Yes, go handle it
+
+	CaiN t2, "#"		; Pound sign?
+	 Jrst ChuPou		;  Yes, go handle it
+
+	CaiN t2, "D"		; Capital D? (Index)
+	 Jrst [	Call NewLin	; Create a new line, the usual way ...
+		Jrst ChuBot ]	;  all done
+
+	CaiN t2, "M"		; Capital M? (Reverse index)
+	 Jrst [	Call RNwLin	; Create a new line, the other way ...
+		Jrst ChuBot ]	;  all done
+
+	CaiN t2, "Z"		; Identify terminal?
+	 Jrst [	Call VWhat	;  Yes, answer the question
+		Jrst ChuBot ]	; That's it
+
+	CaiN t2, "7"		; A seven? (means save cursor)
+	 Jrst [	HrlM p3, PtySPs(i) ; Set saved row
+		HrrM p4, PtySPs(i) ; Set saved column
+		Hrl t2, PtyG0S(i) ; Pick up G0 set
+		Hrr t2, PtyG1S(i) ; Pick up G1 set
+		MoveM t2, PtySGS(i) ; Save them
+		Hrl t2, PtySet(i) ; Pick up number of current set
+		Hrr t2, PtyAtr(i) ; Pick up current attributes
+		MoveM t2, PtySAt(i) ; Save them
+		Jrst ChuBot ]	; Done with this
+
+	CaiN t2, "8"		; An eight? (means restore cursor)
+	 Jrst [	Move t2, PtySGS(i) ; Pick up saved char sets
+		HlrZM t2, PtyG0S(i) ; Set the G0 set
+		HrrZM t2, PtyG1S(i) ; Set the G1 set
+		Move t2, PtySAt(i) ; Pick up which set, and old attr
+		HlrZM t2, PtySet(i) ; Set number of current set
+		HrrZM t2, PtyAtr(i) ; Set the old attributes
+		HlrZ p3, PtySPs(i) ; Get saved row 
+		HrrZ p4, PtySPs(i) ; Get saved column
+		Call FndRcl	; Go find the most recent line ...
+		Call SetPtr	; Get a new ptr to the line we are on
+		Jrst ChuBot ]	; Done with this
+
+	CaiN t2, "="		; An equal sign?
+	 Jrst [	MovX t2, PtPadF ; Keypad mode is now "application"
+		IOrM t2, PtySts(i) ; Set the bit
+		Jrst ChuBot ]	; Done with this
+
+	CaiN t2, ">"		; Greater-than sign?
+	 Jrst [	MovX t2, PtPadF ; Keypad mode is now "numeric"
+		AndCaM t2, PtySts(i) ; Clear the bit
+		Jrst ChuBot ]	; Done with this
+
+	CaiN t2, .ChEsc		; Another Esc?
+	 Jrst [	Call ResEsc	;  Yes, reset this guy ...
+		Jrst ChuEsc ]	; Done with this one, start a new esc seq
+
+	Jrst ChuBot		; Unknown, flush it
+
+ChuSqr:	Call PullCh		; Look at the next char
+	 Jrst ChuDon		;  Can't ...
+
+	CaiE t2, "?"		; Is the next char a question mark?
+	 Call UnPull		;  No, back up (if it is, we eat it)
+
+	Call GetNms		; Get numeric parameters, if any
+	 Jrst ChuDon		;  Can't ...
+
+	Call PullCh		; Get the closing char of the sequence
+	 Bug (HLT,<Can't get a char we should be able to get>)
+
+	CaiN t2, "A"		; A capital A?
+	 Jrst [	Call VUp	;  Yes, move up virtually
+		Jrst ChuBot ]	; Done with this
+
+	CaiN t2, "B"		; A capital B?
+	 Jrst [	Call VDown	;  Yes, move down virtually
+		Jrst ChuBot ]	; Done with this
+
+	CaiN t2, "C"		; A capital C?
+	 Jrst [	Call VRight	;  Yes, move right virtually
+		Jrst ChuBot ]	; Done with this
+
+	CaiN t2, "D"		; A capital D?
+	 Jrst [	Call VLeft	;  Yes, move left virtually
+		Jrst ChuBot ]	; Done with this
+
+	CaiN t2, "E"		; Capital E? (Next Line)
+	 Jrst [	SetZ p4,	; Clear the column offset
+		Call NewLin	; Create a new line
+		Jrst ChuBot ]	;  all done
+
+	CaiN t2, "H"		; A capital H?
+	 Jrst [	Call VMove	;  Yes, do a virtual move
+		Jrst ChuBot ]	; Done with this
+
+	CaiN t2, "J"		; A capital J?
+	 Jrst [	Call VCeos	;  Yes, do virtual clear-to-end-of-screen
+		Jrst ChuBot ]	; Done with this
+
+	CaiN t2, "K"		; A capital K?
+	 Jrst [	Call VCeol	;  Yes, do virtual clear-to-end-of-line
+		Jrst ChuBot ]	; Done with this
+
+	CaiN t2, "c"		; A lowercase c?
+	 Jrst [	Call VWhat	;  Yes, tell program its terminal type
+		Jrst ChuBot ]	; Done with this
+
+	CaiN t2, "f"		; A lowercase f? (Same as uppercase H)
+	 Jrst [	Call VMove	;  Yes, do a virtual move
+		Jrst ChuBot ]	; Done with this
+
+	CaiN t2, "h"		; A lowercase h?
+	 Jrst [	Call VHigh	;  Yes, set some flag high
+		Jrst ChuBot ]	; Done with this
+
+	CaiN t2, "l"		; A lowercase l?
+	 Jrst [	Call VLow	;  Yes, set some flag low
+		Jrst ChuBot ]	; Done with this
+
+	CaiN t2, "m"		; A lowercase m?
+	 Jrst [	Call VRend	;  Yes, set virtual rendition
+		Jrst ChuBot ]	; Done with this
+
+	CaiN t2, "n"		; A lowercase n?
+	 Jrst [	Call VDvSts	;  Yes, give device status or cursor position
+		Jrst ChuBot ]	; Done here
+
+	CaiN t2, "r"		; A lowercase r?
+	 Jrst [	Call VReg	;  Yes, set a new region
+		Jrst ChuBot ]	; Done here
+
+	CaiN t2, .ChEsc		; Another Esc?
+	 Jrst [	Call ResEsc	;  Yes, reset this guy ...
+		Jrst ChuEsc ]	; Done with this one, start a new esc seq
+
+	Jrst ChuBot		; Flush it ...
+
+	;continued on next page
+	;continued from previous page
+
+; Saw escape left paren ...
+
+ChuLfP:	Call PullCh		; Get next char
+	 Jrst ChuDon		;  Can't
+
+	CaiN t2, "B"		; Capital B?
+	 Jrst [	SetZM PtyG0S(i)	; Make this subjob's G0 charset be Ascii
+		Call NewAtr	; Set it up
+		Jrst ChuBot ]	; End of escape sequence
+
+	CaiN t2, "0"		; Zero?
+	 Jrst [	MoveI t2, Graphi ; Get graphic bit
+		MoveM t2, PtyG0S(i) ; Make this subjob's G0 charset be graphics
+		Call NewAtr	; Set it up
+		Jrst ChuBot ]	; End of escape sequence
+
+	CaiN t2, .ChEsc		; Another Esc?
+	 Jrst [	Call ResEsc	;  Yes, reset this guy ...
+		Jrst ChuEsc ]	; Done with this one, start a new esc seq
+
+	Jrst ChuBot		; Else, flush it ...
+
+; Saw Escape right paren ...
+
+ChuRtP:	Call PullCh		; Get next char
+	 Jrst ChuDon		;  Can't
+
+	CaiN t2, "B"		; Capital B?
+	 Jrst [	SetZM PtyG1S(i)	; Make this subjob's G1 charset be Ascii
+		Call NewAtr	; Set it up
+		Jrst ChuBot ]	; End of escape sequence
+
+	CaiN t2, "0"		; Zero?
+	 Jrst [	MoveI t2, Graphi ; Get graphic bit
+		MoveM t2, PtyG1S(i) ; Make this subjob's G1 charset be graphics
+		Call NewAtr	; Set it up
+		Jrst ChuBot ]	; End of escape sequence
+
+	CaiN t2, .ChEsc		; Another Esc?
+	 Jrst [	Call ResEsc	;  Yes, reset this guy ...
+		Jrst ChuEsc ]	; Done with this one, start a new esc seq
+
+	Jrst ChuBot		; Else, flush it ...
+
+; Saw Escape pound sign ...
+
+ChuPou:	Call PullCh		; Get next char
+	 Jrst ChuDon		;  Can't
+
+	Move t3, PtyRcl(i)	; Ptr to current line
+	Move t1, .Flags(t3)	; Get his flag word
+		
+	CaiN t2, "3"		; Three? (top half of double height line)
+	 Jrst [	TxZ t1, BotHlf ! WidLin	; Drop these attributes
+		TxO t1, TopHlf ! Chnged	; Set these
+		Jrst CpoTag ]	; Join common finish
+
+	CaiN t2, "4"		; Four? (bottom half of double height line)
+	 Jrst [	TxZ t1, TopHlf ! WidLin	; Drop these attributes
+		TxO t1, BotHlf ! Chnged	; Set these
+		Jrst CpoTag ]	; Join common finish
+
+	CaiN t2, "5"		; Five? (single height single width)
+	 Jrst [	TxZ t1, TopHlf ! BotHlf ! WidLin ; Drop these attributes
+		TxO t1, Chnged	; Set this one
+		Jrst CpoTag ]	; Join common finish
+
+	CaiN t2, "6"		; Six? (double width line, normal height)
+	 Jrst [	TxZ t1, TopHlf ! BotHlf	; Drop these attributes
+		TxO t1, WidLin ! Chnged	; Set these
+		Jrst CpoTag ]	; Join common finish
+
+	CaiN t2, .ChEsc		; Another Esc?
+	 Jrst [	Call ResEsc	;  Yes, reset this guy ...
+		Jrst ChuEsc ]	; Done with this one, start a new esc seq
+
+	Jrst ChuBot		; Else, flush it ...
+
+; Common finish for pound sign codes
+
+CpoTag:	MoveM t1, .Flags(t3)	; Put back the fixed-up flags
+	Jrst ChuBot		; Done with it
+
+; Set new pty graphic bit based on PtySet, PtyG0S and PtyG1S
+
+NewAtr:	MoveI t1, Graphi	; Get graphic bit
+	AndCam t1, PtyAtr(i)	; First clobber the old bit
+
+	Move t1, PtyG0S(i)	; Assume set zero
+	SkipE PtySet(i)		; Was it really?
+	 Move t1, PtyG1S(i)	;  No, use the other charset
+
+	IOrM t1, PtyAtr(i)	; Set the bit accordingly
+	Ret			;  and return
+
+	;continued on next page
+	;continued from previous page
+
+ChuLfd:	Call NewLin		; Create a new line
+
+ChuBot:	SetZM LstChr		; Forget the last char ...
+	SetZM UnpChr		; No unpulled character either ...
+
+	Call Flush		; Done with whatever, flush this buffer
+	Jrst ChuLp2		; Go try for more chars
+
+ChuDon:	HrlM p3, PtyPos(i)	; Store the updated row
+	HrrM p4, PtyPos(i)	; Store the column
+
+ChuEnd:	Call SetMap		; Go set up a good NewMap for the update rtns
+
+	Call PiOn		; Let ints back on now ...
+
+	Pop p, p2		; Restore regs ...
+	Pop p, p1
+	Pop p, t4
+
+	Ret			; and return
+
+	SubTtl NewLin --  Go to or create a new line, moving downwards
+
+NewLin:	Push p, t1		; Save some regs
+	Push p, t2
+	Push p, p1
+
+	Move p1, PtyRcl(i)	; Ptr to cur line (from which we are LF-ing)
+	Move t1, .FwdPt(p1)	; Get forward ptr from it
+
+	HrrZ t2, PtyReg(i)	; The bottom of the region
+	CaiE t2, 1(p3)		; Are we on the bottom? (Line number in p3 is
+				;  an offset, region line is real line number)
+	 Jrst [	SkipE t1	; Null forward ptr?
+		 MoveM t1, PtyRcl(i) ; No, store the new ptr
+		Aoj p3,		; Increment the line number
+		CaiLE p3, BotLin ; Did we just push it over the edge?
+		 MoveI p3, BotLin ; Yes, load up the limit
+		Jrst NwlEnd ]	; Done here
+
+	MoveI t2, LinSiz	; We need this many words
+	Call GetSpc		; Try to get some space
+	SkipN t2		; Did we get the space?
+	 Bug (HLT,<Failed to get space for new line>)
+
+	Call ClrLin		; Set this line to all blanks
+
+	Aos t2, LineID		; Get incremented line id
+	HrlZS t2		; Put ID in left half, zero right half
+	SkipN i			; WCL?
+	 TxO t2, WclLin		;  Yes, flag it
+	MoveM t2, .Flags(t1)	; Store the flag word
+
+	SkipE t2, .FwdPt(p1)	; Is this the bottom of the screen?
+	 Jrst [	MoveM t2, .FwdPt(t1) ; No, store forward ptr in new node
+		MoveM p1, .BkwPt(t1) ; Store backward ptr in new node
+		MoveM t1, .FwdPt(p1) ; Store forward ptr from node above
+		MoveM t1, .BkwPt(t2) ; Store backward ptr from node below
+		Jrst NwlMid ]	; Join more common code
+
+	MoveM t1, .FwdPt(p1)	; Store forward pointer in previous node
+	SetZM .FwdPt(t1)	; Clobber forward ptr in new node
+	MoveM p1, .BkwPt(t1)	; Store back pointer in new node
+
+	MoveM t1, PtyLol(i)	; Set this as the new low line
+
+; A decent mid point, done with "bottom splicing"
+
+NwlMid:	MoveM t1, PtyRcl(i)	; The new current line
+
+	HlrZ t2, PtyReg(i)	; Get line number of top of region
+	CaiN t2, 1		; Line 1 (ie. top of screen)?
+	 Jrst [	Move t2, PtyHil(i) ; Yes, ptr to the old high line in t2 ...
+		Move t2, .FwdPt(t2) ; Its following line ...
+		MoveM t2, PtyHil(i) ;  is the new high line ...
+		Jrst NwlEnd ]	; We are keeping the old line, just letting
+				;  it roll off the top of the virtual screen
+
+	Soj t2,			; Start with the count being 1 if line 2, etc.
+
+	Move t1, PtyHil(i)	; Get ptr to top line on screen
+NwlLop:	Move t1, .FwdPt(t1)	; Advance the ptr
+	SojG t2, NwlLop		; If on the right line, stop, else try again
+
+	Move p1, .BkwPt(t1)	; Pick up back ptr from this line
+	Move t2, .FwdPt(t1)	; Pick up fwd ptr from this line also ...
+
+	MoveM t2, .FwdPt(p1)	; Make fwd ptrs skip this line
+	MoveM p1, .BkwPt(t2)	; Make back ptrs skip the line also ...
+
+	Call GivSpc		; Give back the space the line used ...
+
+	;continued on next page
+	;continued from previous page
+
+NwlEnd:	Call SetPtr		; Get a new ptr to the line
+
+	Pop p, p1		; Restore regs
+	Pop p, t2
+	Pop p, t1
+
+	Ret			; and return
+
+	SubTtl RNwLin --  Go to or create a new line, moving upwards
+
+RNwLin:	Push p, t1		; Save some regs
+	Push p, t2
+	Push p, p1
+
+	Move p1, PtyRcl(i)	; Ptr to current line
+	Move t1, .BkwPt(p1)	; Get back ptr from it
+
+	HlrZ t2, PtyReg(i)	; The top of the region
+	CaiE t2, 1(p3)		; Are we at the top? (Line number in p3 is
+				;  an offset, region line is real line number)
+	 Jrst [ JumpE p3, RNlEnd ; If at top of screen, but not top of
+				; region, ignore this ...
+		MoveM t1, PtyRcl(i) ; Else, store the new ptr
+		SojA p3, RnlEnd ] ; Decrement the line number, then move on
+
+	MoveI t2, LinSiz	; We need this many words
+	Call GetSpc		; Try to get some space
+	SkipN t2		; Did we get the space?
+	 Bug (HLT,<Failed to get space for new line>)
+
+	Call ClrLin		; Set this line to all blanks
+
+	Aos t2, LineID		; Get incremented line id
+	HrlZS t2		; Put ID in left half, zero right half
+	SkipN i			; WCL?
+	 TxO t2, WclLin		;  Yes, flag it
+	MoveM t2, .Flags(t1)	; Store the flag word
+
+	Move t2, .BkwPt(p1)	; Get back ptr from the current line
+	MoveM t2, .BkwPt(t1)	; Store back ptr in new node
+	MoveM p1, .FwdPt(t1)	; Store forward ptr in new node
+	MoveM t1, .FwdPt(t2)	; Store forward ptr from node above
+	MoveM t1, .BkwPt(p1)	; Store backward ptr from node below
+
+; Done with "top splicing" ...
+
+	CamN p1, PtyHil(i)	; Was this the high line?
+	 MoveM t1, PtyHil(i)	;  Yes, so we have a new high line
+
+	MoveM t1, PtyRcl(i)	; The new current line
+
+	HrrZ t2, PtyReg(i)	; Get line number of bottom of region
+	CaiN t2, TrmLen		; Last line (ie. bottom of screen)?
+	 Jrst [	Move t1, PtyLol(i) ; Yes, ptr to the old low line in t2 ...
+		Move t2, .BkwPt(t1) ; Line preceding it ...
+		MoveM t2, PtyLol(i) ;  is the new low line ...
+		SetZM .FwdPt(t2) ; Make it have no forward ptr
+		Jrst RNlTag ]	; Go kill the old line ...
+
+	Move t1, PtyHil(i)	; Get ptr to top line on screen
+RNlLop:	Move t1, .FwdPt(t1)	; Advance the ptr
+	SojG t2, RNlLop		; If on the right line, stop, else try again
+
+	Move p1, .BkwPt(t1)	; Pick up back ptr from this line
+	Move t2, .FwdPt(t1)	; Pick up fwd ptr from this line also ...
+
+	MoveM t2, .FwdPt(p1)	; Make fwd ptrs skip this line
+	MoveM p1, .BkwPt(t2)	; Make back ptrs skip the line also ...
+
+RnlTag:	Call GivSpc		; Give back the space the line used ...
+
+	;continued on next page
+	;continued from previous page
+
+RNlEnd:	Call SetPtr		; Get a new ptr to the line
+
+	Pop p, p1		; Restore regs
+	Pop p, t2
+	Pop p, t1
+
+	Ret			; and return
+
+	SubTtl ClrLin -- Clear out the data part of a line node
+
+;
+; ClrLin -- Clear the line pointed to by t1
+;
+;   Call with ...
+;	t1/ address of line node whose data is to be overwritten with blanks
+;
+
+ClrLin:	Move t2, [Byte (12) " "," "," "] ; Load up a word of special blanks
+	MoveM t2, .Data(t1)	; Store it as the first word of data
+	HrlI t2, .Data(t1)	; The BLT control word ... (part 1)
+	HrrI t2, .Data+1(t1)	; ... (and part 2)
+	Blt t2, LinSiz-1(t1)	; Set all these words to special blanks
+
+	Move t2, BlnHsh		; The value a blank line hashs to ...
+	MoveM t2, .Hash(t1)	; Set it here for now
+
+	Move t2, TimNow		; Get "current" time
+	MoveM t2, .Time(t1)	; Give the line an initial timestamp ...
+
+	Ret			; Done here
+
+	SubTtl FndRcl -- Find the current line for a subjob
+
+;
+;   Call with ...
+;	p3/ offset of current row (0 is top of virtual screen)
+;
+
+FndRcl:	Move t2, p3		; Copy over the count
+	Move t1, PtyHil(i)	; Ptr to top line
+
+	TrNA			; Don't advance the first time thru ...
+
+FrcLop:	Move t1, .FwdPt(t1)	; Advance the line ptr
+	SojGE t2, FrcLop	;  ... and loop if more to do ...
+
+	MoveM t1, PtyRcl(i)	; Save this ptr as the most-recent line
+	Ret			;  all done
+
+	SubTtl SetPtr -- Set 12-bit byte ptr into line based on reg p4
+
+SetPtr:	Push p, t2		; Save this reg
+	Move t2, PtyRcl(i)	; Addr of current line
+	AddI t2, .Data		; Move to data part
+	HrlI t2, (Point 12,0)	; Make it a 12-bit byte ptr
+	MoveI p5, 0(p4)		; The number of bytes to skip
+	AdjBp p5, t2		; Skip them
+
+	Pop p, t2		; Restore reg ...
+	Ret			;  and return
+
+	SubTtl VUp -- Move up in virtual screen
+
+VUp:	Call GetNum		; Pick up the arg we want
+	 MoveI t2, 1		;  Default is 1 ...
+
+	SkipN t2		; Did we get a zero?
+	 MoveI t2, 1		;  Yes, use a one instead
+
+	Sub p3, t2		; Move up the requested number of rows
+
+	SkipGE p3		; Is row legal?
+	 SetZ p3,		;  Illegal, make it zero
+
+	Jrst UpDown		; Go join common code for up and down functions
+
+	SubTtl VDown -- Move down in virtual screen
+
+VDown:	Call GetNum		; Pick up the arg we want
+	 MoveI t2, 1		;  Default is 1 ...
+
+	SkipN t2		; Did we get a zero?
+	 MoveI t2, 1		;  Yes, use a one instead
+
+	Add p3, t2		; Move down the requested number of rows
+
+	CaiLE p3, BotLin	; Is row legal?
+	 MoveI p3, BotLin	;  Illegal, make it the maximum
+
+;  Common finish-up for Up and Down moves ...
+
+UpDown:	Call FndRcl		; Go find the most recent line ...
+	Jrst SetPtr		; Make a new ptr to this line, Ret from there
+
+	SubTtl VRight -- Move right in virtual screen
+
+VRight:	Call GetNum		; Pick up the arg we want
+	 MoveI t2, 1		;  Default is 1 ...
+
+	SkipN t2		; Did we get a zero?
+	 MoveI t2, 1		;  Yes, use a one instead
+
+	Add p4, t2		; Move right the requested number of cols
+
+	CaiLE p4, TrmWid-1	; Is column legal?
+	 MoveI p4, TrmWid-1	;  Illegal, make it the maximum
+
+	Jrst SetPtr		; Get a new ptr, return from there
+
+	SubTtl VLeft -- Move left in virtual screen
+
+VLeft:	Call GetNum		; Pick up the arg we want
+	 MoveI t2, 1		;  Default is 1 ...
+
+	SkipN t2		; Did we get a zero?
+	 MoveI t2, 1		;  Yes, use a one instead
+
+	Sub p4, t2		; Move left the requested number of cols
+
+	SkipGE p4		; Is column legal?
+	 SetZ p4,		; Illegal, make it zero
+
+	Jrst SetPtr		; Get a new ptr, return from there
+
+	SubTtl VMove -- Move to specified position in virtual screen
+
+VMove:	Call GetNum		; Pick up the first arg ...
+	 MoveI t2, 1		;  Default is 1 ...
+
+	SkipN t2		; Did we get a zero?
+	 MoveI t2, 1		;  Yes, use a one instead
+
+	Soj t2,			; Make it an offset
+
+	SkipGE t2		; Is row too low?
+	 SetZ t2,		;  Illegal, make it zero
+
+	CaiLE t2, BotLin	; Is row too high?
+	 MoveI t2, BotLin	;  Illegal, make it the maximum
+
+	MoveM t2, NewRow	; Save as new row number
+
+	Call GetNum		; Pick up the second arg ...
+	 MoveI t2, 1		;  Default is 1 ...
+
+	SkipN t2		; Did we get a zero?
+	 MoveI t2, 1		;  Yes, use a one instead
+
+	Soj t2,			; Make it an offset
+
+	SkipGE t2		; Is column too low?
+	 SetZ t2,		; Illegal, make it zero
+
+	CaiLE t2, TrmWid-1	; Is column too high?
+	 MoveI t2, TrmWid-1	;  Illegal, make it the maximum
+
+	MoveM t2, NewCol	; Save as new column number
+
+	Move p3, NewRow		; Load up the requested row number
+	Move p4, NewCol		;  and column number
+
+	Jrst UpDown		; Go finish up
+
+	SubTtl VCeol -- Virtual clear to end of line
+
+;
+; Called with ...
+;
+;	p4/ column number
+;	p5/ byte ptr to 12-bit byte we are at ...
+;	i/ subjob number
+;
+
+VCeol:	Push p, p4		; Save current column number
+	Push p, p5		;  and byte ptr
+	MoveI t2, " "		; Get a normal blank in t2
+
+VCLLop:	CaiL p4, TrmWid		; Go in a new column?
+	 Jrst [	Dpb t2, p5	; No, just overlay the old char
+		Jrst VCLEnd ]	; Done, go clean up
+
+	Idpb t2, p5		; Store the char
+	AojA p4, VCLLop		; Add in 1 space for this char, loop some more
+
+VCLEnd:	Pop p, p5		; Restore regs
+	Pop p, p4
+
+	Move t2, PtyRcl(i)	; Ptr to current line
+	IOrM p6, .Flags(t2)	; Say line has been changed
+
+	Move t1, TimNow		; Get "current" time
+	MoveM t1, .Time(t2)	; Timestamp this write to the line ...
+
+	Ret			; All done, return
+
+	SubTtl VCeos -- Virtual clear to end of screen
+
+;
+; Called with ...
+;
+;	p3/ row number
+;	p4/ column number
+;	p5/ byte ptr to 12-bit byte we are at ...
+;	i/ subjob number
+;
+
+VCeos:	JumpN p3, VcsMid	; If non-zero row, don't ...
+	 JumpN p4, VcsMid	;  If non-zero column, don't ...
+	  Jrst VCeos2		;   Full screen clear, use the other routine
+
+VcsMid:	Call VCeol		; First clear to the end of the line ...
+	Move t1, PtyRcl(i)	; Ptr to the current line
+
+VcsLop:	Move t1, .FwdPt(t1)	; Forward ptr from it
+	JumpE t1, R		; If no more lines, return
+
+	Call ClrLin		; Clear the data part
+	Jrst VcsLop		; Go try for another line
+
+	SubTtl VCeos2 -- Virtual clear to end of screen from home position
+
+;
+; Called with ...
+;	i/ subjob number
+;
+
+VCeos2:	Push p, p2		; Save some regs ...
+	Push p, p5
+	Push p, p6
+
+	Move t1, PtyHil(i)	; Ptr to the current (high) line
+	MoveI p2, TrmLen	; The number of lines to deal with
+	Move p5, PtyLol(i)	; The point where we are adding is at the
+				;  bottom of the screen (simulated for trace)
+	MoveI p6, 0(p5)		; A stable copy of the old "low" ptr (used
+				;  to get the new "high" ptr later)
+
+VC2Lp2:	Push p, t1		; Save addr of the line we are dealing with
+
+	MoveI t2, LinSiz	; We need this many words
+	Call GetSpc		; Try to get some space
+	SkipN t2		; Did we get the space?
+	 Bug (HLT,<Failed to get space for new line (screen clear)>)
+
+	SetZM .FwdPt(t1)	; Clobber any forward ptr
+	MoveM p5, .BkwPt(t1)	; Set the back pointer
+
+	Aos t2, LineID		; Get incremented line id
+	HrlZS t2		; Put ID in left half, zero right half
+	SkipN i			; WCL?
+	 TxO t2, WclLin		;  Yes, flag it
+	MoveM t2, .Flags(t1)	; Store the flag word
+
+	Call ClrLin		; Clear the line
+
+	MoveM t1, .FwdPt(p5)	; Store forward pointer in previous node
+	Move p5, t1		; Advance the trailing ptr
+
+	Pop p, t1		; Restore addr of the line we just cleared
+	Move t1, .FwdPt(t1)	; Forward ptr from it
+	SojG p2, VC2Lp2		; Go try for another line (if more to do)
+
+; Did them all ...
+
+	MoveM p5, PtyLoL(i)	; This last line is the bottom line
+
+	Move p6, 0(p6)		; New high line (one past the old low line) ...
+	MoveM p6, PtyHil(i)	; Store it here ...
+	MoveM p6, PtyRcl(i)	;  and here ...
+
+	Pop p, p6		; Restore regs
+	Pop p, p5
+	Pop p, p2
+
+	Jrst SetPtr		; Return setting the pointer for the new line
+
+	SubTtl VWhat -- Answer a request for device attributes
+
+VWhat:	MoveI t4, [AsciZ/[?1;2c/] ; The answerback saying we are a Vt100
+				; with the Advanced Video Option
+
+	Jrst PtyStr		; Send the string to the subjob
+
+	SubTtl VHigh -- Set some flag high (set mode)
+
+VHigh:	Call GetNum		; Get the first parameter
+	 SetZ t2,		;  None, assume zero
+
+VHiLop:	CaiN t2, 1		; One?
+	 Jrst [	MovX t2, PtCurF ; Arrow-key mode ("cursor key set mode")
+		IOrM t2, PtySts(i) ; Set the bit
+		Jrst VHiBot ]	; Done with this
+
+VHiBot:	Call GetNum		; Try to get another number
+	 Ret			;  No such luck ...
+
+	Jrst VHiLop		; Got one, go do something with it
+
+	SubTtl VLow -- Set some flag low (reset mode)
+
+VLow:	Call GetNum		; Get the first parameter
+	 SetZ t2,		;  None, assume zero
+
+VLoLop:	CaiN t2, 1		; One?
+	 Jrst [	MovX t2, PtCurF ; Arrow-key mode ("cursor key set mode")
+		AndCam t2, PtySts(i) ; Clear the bit
+		Jrst VLoBot ]	; Done with this
+
+VLoBot:	Call GetNum		; Try to get another number
+	 Ret			;  No such luck ...
+
+	Jrst VLoLop		; Got one, go do something with it
+
+	SubTtl VRend -- Set rendition for virtual terminal
+
+VRend:	Call GetNum		; Get the first parameter
+	 SetZ t2,		;  None, assume zero
+
+VReLop:	SkipN t2		; Zero?
+	 Jrst [	MoveI t2, Blink ! Bold ! Invert ! UScore ; These renditions ...
+		AndCam t2, PtyAtr(i) ; Turn off those bits ...
+		Jrst VReBot ]	; Done with this part
+
+	CaiN t2, 1		; One?
+	 Jrst [	MoveI t2, Bold	;  Flag for bold
+		Jrst VReSet ]	; Go set the bit
+
+	CaiN t2, 4		; Four?
+	 Jrst [	MoveI t2, UScore ;  Flag for underscored
+		Jrst VReSet ]	; Go set the bit
+
+	CaiN t2, 5		; Five?
+	 Jrst [	MoveI t2, Blink	;  Flag for blinking
+		Jrst VReSet ]	; Go set the bit
+
+	CaiN t2, 7		; Seven?
+	 Jrst [	MoveI t2, Invert ;  Flag for inverted
+		Jrst VReSet ]	; Go set the bit
+
+	Jrst VReBot		; When in doubt, throw it out
+
+VReSet:	IOrM t2, PtyAtr(i)	; Set the bit
+
+VReBot:	Call GetNum		; Try to get another number
+	 Ret			;  No such luck ...
+
+	Jrst VReLop		; Got one, go do something with it
+
+	SubTtl VDvSts -- Give virtual device status or cursor position
+
+VDvSts:	Call GetNum		; Get a number
+	 MoveI t2, 5		;  We will default to 5
+
+	CaiN t2, 5		; A five?
+	 Jrst [	MoveI t4, [AsciZ/[0n/]	; The No Malfunctions answer
+		Jrst PtyStr ]	; Send the string to him, return from there
+
+	CaiE t2, 6		; A six?
+	 Ret			;  No, don't know what to do
+
+	MoveI t4, [AsciZ/[/]	; Start of sequence
+	Call PtyStr		; Send it
+
+	SetZM LoWork		; Clear work area
+	HrrOI t1, LoWork	; Ptr to work area
+	MoveI t3, ^d10		; Decimal
+	MoveI t2, 1(p3)		; Copy over row number, convert from offset
+	NOUT%			; Type into core
+	 JEcBug (HLT,<Can't write row number in core>)
+
+	MoveI t4, LoWork	; Addr of work area
+	Call PtyStr		; Type the row number to the subjob
+
+	MoveI t2, ";"		; A semicolon
+	Call PtyOut		; Type it
+
+	SetZM LoWork		; Clear work area
+	HrrOI t1, LoWork	; Ptr to work area
+	MoveI t3, ^d10		; Decimal
+	MoveI t2, 1(p4)		; Copy over column number, convert from offset
+	NOUT%			; Type into core
+	 JEcBug (HLT,<Can't write column number in core>)
+
+	MoveI t4, LoWork	; Addr of work area
+	Call PtyStr		; Type the column number to the subjob
+
+	MoveI t2, "R"		; A capital R
+	Jrst PtyOut		; Send to subjob, return from there
+
+	SubTtl VReg -- Set region for virtual terminal
+
+VReg:	Call GetNum		; Try to get the top margin
+	 MoveI t2, 1		;  Default to 1
+	SkipG t2		; If we got a zero ...
+	 MoveI t2, 1		;  treat as a 1 ...
+	HrlM t2, PtyReg(i)	; Set top margin for the subjob
+
+	Call GetNum		; Try to get bottom margin
+	 MoveI t2, TrmLen	;  Default to bottom of screen
+	SkipG t2		; If we got a zero ...
+	 MoveI t2, TrmLen	;  treat as bottom of screen
+	HrrM t2, PtyReg(i)	; Set bottom margin for subjob
+
+; This ESC sequence puts us in the home position ...
+
+	SetZB p3, p4		; New row and column are zero ...
+	Jrst UpDown		; Go join common code ...
+
+	SubTtl GetNms -- Get Vt100 escape sequnce numbers ...
+
+;
+;   Call with ...
+;	p2/ byte ptr to text we are reading
+;
+;   Returns ...
+;	+1 if ran out of chars ...
+;	+2 if ended normally
+;
+;   With ...
+;	p2/ updated byte ptr
+;
+
+GetNms:	SetZM NumCnt		; No numbers stored yet
+	SetZM NumPtr		; We haven't started reading them yet either
+
+GnsLop:	Call PulNum		; Try to get a number
+	 Ret			;  Can't ...
+
+	Call PullCh		; Get the number's terminating char
+	 Ret			;  Can't ...
+
+	CaiN t2, ";"		; Was it a semi-colon?
+	 Jrst [	Aos t2, NumCnt	;  Yes, add one to our count of numbers
+		MoveM t4, Nums-1(t2) ; Store the number in the table
+		Jrst GnsLop ]	; and go try for another ...
+
+	Call UnPull		; Un-get char so the other routine can get it
+
+	Aos t2, NumCnt		; Add one to the count
+	MoveM t4, Nums-1(t2)	; Store away the last number we got
+
+	RetSkp			; And return good ...
+
+	SubTtl PulNum -- Use PullCh to read a number
+
+;
+;   Call PulNum
+;	Used to read in a number using PullCh
+;
+;   Returns ...
+;	+1 if hit eof on call to PullCh
+;	+2 if got a number, number in t4
+;
+
+PulNum:	SetZ t4,		; First clear t4
+
+PnmLop:	Call PullCh		; Get a char
+	 Ret			;  Can't
+
+	CaiL t2, "0"		; Less than char zero?
+	 CaiLE t2, "9"		; Greater than char nine?
+	  Jrst [ Call UnPull	;  One of these, bad char, un-get it
+		 RetSkp ]	;  and return happily ...
+
+	IMulI t4, ^d10		; Multiply the old number by ten
+	AddI t4, 0-"0"(t2)	; Add in this digit
+
+	Jrst PnmLop		; Go get another char
+
+	SubTtl GetNum -- Get a single number from previously stored numbers
+
+GetNum:	Aos t2, NumPtr		; Next number ...
+	CamLE t2, NumCnt	; Within range?
+	 Ret			;  No ... tell caller he is out of numbers
+
+	Move t2, Nums-1(t2)	; Get the number
+
+	JumpL t2, R		; If number is negative, take the default ...
+
+	RetSkp			; Tell caller he has his number
+
+	SubTtl Other escape sequence handler routines
+
+;
+;   Call PullCh
+;	Used to get a character from the pty escape buffer if possible,
+;	else from the chunk buffer ... returns skip or non-skip to say
+;	whether or not a char was found ...
+;
+;   Returns ...
+;	+1 if no char to be found
+;	+2 if found a char (from either buffer), char is in t2
+;
+
+PullCh:	CaiLE p1, ChuChr	; Count had better be less than maximum ...
+	 Bug (HLT,<Unreasonable buffer count in PullCh>)
+
+	SkipE t2, UnpChr	; Is there an unpulled char?
+	 Jrst [	SetZM UnpChr	;  Yes, clear it for next time
+		RetSkp ]	;  and return with the char
+
+	Move t2, PtEGbp(i)	; The escape getter ptr
+	CamE t2, PtEPbp(i)	; Same as the putter ptr?
+	 Jrst [	Ildb t2, PtEGbp(i) ;  No, get a byte from the escape buffer ...
+		MoveM t2, LstChr ; Save it in case we want to back up
+		RetSkp ]	;  and return with the char
+
+	SojL p1, R		; If no more bytes in the chunk, return bad ...
+	HrrZ t2, p2		; Pick up the addr portion ...
+	CaiG t2, p		; Are we pointing into the AC's?
+	 Bug (HLT,<Unreasonable byte pointer in PullCh>) ; Oh God ...
+
+	Ildb t2, p2		; Get the next byte from the chunk
+
+	MoveM t2, LstChr	; Save the char
+	Call StorCh		; Store the char in the escape buffer
+
+	MoveI t1, 0(t2)		; Copy over the char
+	Call EchByt		; Echo it (logging it and typing as required)
+
+	RetSkp			; Return with the char
+
+;
+;   Call UnPull
+;	Used to back up the pull sequence by one character
+;
+
+UnPull:	Move t1, LstChr		; Pick up the last char
+	MoveM t1, UnpChr	; Save it as the unpulled char
+	Ret			;  and return
+
+;
+;   Call StorCh ...
+;	Used to add a char to the pty escape buffer
+;
+;   Call with ...
+;	t2/ the char to be added
+;
+
+StorCh:	Move t1, PtECnt(i)	; The number of chars already stored there
+	CaiL t1, EBufMx		; Compare with maximum
+	 Ret			;  Buffer is filled ...
+
+	Idpb t2, PtEPbp(i)	; Store the char
+
+	Move t1, PtEPbp(i)	; Pick up the new putter ptr
+	MoveM t1, PtEGbp(i)	; Save it as getter ptr (prevents rereading)
+
+	Aos PtECnt(i)		; Bump the count
+	Ret			;  and return ...
+
+;
+;   Call Flush
+;	Used to flush the pty escape buffer
+;
+
+Flush:	SetZM PtECnt(i)		; Clear the count
+	Move t1, PtEIbp(i)	; The initial ptr
+	MoveM t1, PtEGbp(i)	; Lay it down as the getter ptr
+	MoveM t1, PtEPbp(i)	;  and the putter ptr ...
+	Ret			; All done
+
+;
+;   Call ResEsc
+;	Used to reset reading of escape sequence
+;
+
+ResEsc:	Call Flush		; First empty the buffer
+
+	Move t2, LstChr		; Get last char
+	Jrst StorCh		; Put it down as start of a new sequence, ret
+				;  from there
+
+	SubTtl PtyStr -- Send a string to a subjob
+
+PtyStr:	HrlI t4, (Point 7, 0)	; Make it a byte ptr
+
+PstLop:	Ildb t2, t4		; Get the next char
+	JumpE t2, R		; Quit on a null
+
+	Call PtyOut		; Send this char to the subjob
+	Jrst PstLop		;  and loop ...
+
+	End

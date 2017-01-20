@@ -1,0 +1,675 @@
+	TITLE	TRACE
+
+	SEARCH	MONSYM,MACSYM
+	TWOSEG
+	RELOC	0
+	SALL
+;******************************************************************************
+;*									      *
+;*  COPYRIGHT (c) DIGITAL EQUIPMENT CORPORATIO 1985, 1988 ALL RIGHTS RESERVED.*
+;* 									      *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND  COPIED    *
+;*  ONLY  IN  ACCORDANCE  WITH  THE  TERMS  OF  SUCH  LICENSE AND WITH THE    *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE.  THIS SOFTWARE OR  ANY  OTHER    *
+;*  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY    *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE  IS  HEREBY    *
+;*  TRANSFERRED.							      *
+;* 									      *
+;*  THE INFORMATION IN THIS SOFTWARE IS SUBJECT TO CHANGE  WITHOUT  NOTICE    *
+;*  AND  SHOULD  NOT  BE  CONSTRUED  AS  A COMMITMENT BY DIGITAL EQUIPMENT    *
+;*  CORPORATION.							      *
+;* 									      *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF  ITS    *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		      *
+;*									      *
+;******************************************************************************
+
+
+;
+; FUNCTIONAL SPEC:
+;
+;	This module is part of the EDT-36 system. Its function is to record
+;	the total length of CPU time spent in a given routine. It accepts
+;	the following arguments on the stack:
+;
+; ARGUMENTS:
+;
+;	.TFCN	the function code. This may be one of the following:
+;
+;		1 - Enable tracing on all or one routine
+;		2 - Disable tracing on all or one routine
+;		3 - Reset the trace database
+;		4 - List the current state of the database
+;		5 - Open the trace file, TRACE.DAT
+;		6 - Close the trace file
+;
+;	.TPTR	Byte pointer to the name of the routine to trace, or 0.
+;
+;	.TNUM	Number of stack items to record on entry to routine.
+;
+;	.TLOC	Name of a memory location to record on entry.
+;
+; RETURN VALUE:
+;
+;	None - the routine prints its own error messages
+;
+; NOTE:
+;
+;	This routine will correctly cope with subroutines which begin
+;	with any skip or non-skip instruction (including JSYS's), but
+;	it cannot cope with jump class instructions (JUMPx, JRST, JSR)
+;
+	PAGE
+	SUBTTL	DATABASE
+	
+	TRCLEN=10		;Number of slots in trace table
+	STKMAX=4		;Maximum number of stack items to hold
+
+	.TFCN=-4		;Offset to function code
+	.TPTR=-3		;Offset to byte pointer
+	.TNUM=-2		;Number of stack items to record
+	.TLOC=-1		;Name of location to record
+
+	A==1
+	B==2
+	C==3
+	D==4
+	E==5
+	F==6
+	G==7
+	P==17
+
+
+TRCMOD:	0			;Mode - 0 = off, 1 = on
+TRCCNT:	0			;Number of routines being traced
+TRCTIM:	0			;Time of TRACE ON
+TRCTOT:	0			;Total CPU time of tracing
+USRACS:	BLOCK	17		;Saved user AC's
+TRCINS:	0			;Instruction to XCT
+TRCADR:	0			;Address to return to
+TRCJFN:	0			;JFN of trace file
+
+;TRCTBL is the main data area for tracing routines. It has the following
+;structure. The record written to the file consists of all but the last
+;word of the data area.
+;
+;	+------------------+------------------+
+;	|       Routine name (sixbit)         |
+;	+------------------+------------------+
+;	|          Routine address            |
+;	+------------------+------------------+
+;	|           Entry counter             |
+;	+------------------+------------------+
+;	|    First instruction of routine     |
+;	+------------------+------------------+
+;	|         CPU time on entry           |
+;	+------------------+------------------+
+;	|    Total CPU time for routine       |
+;	+------------------+------------------+
+;	|       Address of caller + 1         |
+;	+------------------+------------------+
+;	|    Number of stack items recorded   |
+;	+------------------+------------------+
+;	|            Stack item 1             |
+;	+------------------+------------------+
+;	|            Stack item 2             |
+;	+------------------+------------------+
+;	|            Stack item 3             |
+;	+------------------+------------------+
+;	|            Stack item 4             |
+;	+------------------+------------------+
+;	|      Value of AC1 on return         |
+;	+------------------+------------------+
+;	|   Name of location being recorded   |
+;	+------------------+------------------+
+;	| Address of location being recorded  |
+;	+------------------+------------------+
+;	|  Value of location being recorded   |
+;	+------------------+------------------+
+;	|    TRCOF$ + 3 * n (for return)      |
+;	+------------------+------------------+
+
+	PHASE	0
+
+.TNAME:! BLOCK	1		;Routine name
+.TADRS:! BLOCK	1		;Address
+.TCNT:!  BLOCK	1		;Entry count
+.TINST:! BLOCK	1		;First instruction
+.TTIME:! BLOCK	1		;CPU time on entry
+.TTOTL:! BLOCK	1		;Total CPU time
+.TRETN:! BLOCK	1		;Return address
+.TSCNT:! BLOCK	1		;Number of stack items
+.TSTK:!  BLOCK	STKMAX		;First stack item
+.TAC1:!  BLOCK	1		;Value of AC1
+.TNAM1:! BLOCK	1		;Name of location to record
+.TADR1:! BLOCK	1		;Address of location
+.TVAL1:! BLOCK	1		;Value of location recorded
+.TRPTR:! BLOCK	1		;Return pointer
+.TLEN:!				;Length of block
+
+	DEPHASE
+
+DEFINE	X(A)<
+	XLIST
+	BLOCK	.TLEN-1
+	EXP	^D'A*3+TRCOF$
+	LIST
+>
+
+	%%N=0
+
+TRCTBL:	REPEAT	TRCLEN,<
+	X	\%%N
+	%%N=%%N+1
+>
+
+	PAGE
+	SUBTTL	MAIN ENTRY AND EXIT POINTS
+
+	ENTRY	$TRACE
+	RELOC	400000
+
+$TRACE:
+	MOVEM	16,USRACS+16		;Save the users AC's
+	MOVEI	16,USRACS
+	BLT	16,USRACS+15
+	MOVE	A,.TPTR(P)		;Get the byte pointer
+	SKIPG	B,.TFCN(P)		;Get the function code
+	 JRST	T.ERR1			;Bad
+	CAILE	B,6
+	 JRST	T.ERR1			;Too large
+	JRST	@[T.ON
+		  T.OFF
+		  T.RES
+		  T.LIS
+		  T.OPN
+		  T.CLS]-1(B)		;Dispatch
+
+
+T.RET:
+	HRLZI	16,USRACS		;Restore user AC's
+	BLT	16,15
+	MOVE	16,USRACS+16
+	RET
+
+	PAGE
+	SUBTTL	ERROR ROUTINES
+
+DEFINE	ERRMSG(STR)<
+	HRROI	A,[ASCIZ \STR\]
+	JRST	TERROR
+>
+
+T.ERR1:
+	ERRMSG	<Illegal function code>
+T.ERR2:
+	ERRMSG	<No symbol table found>
+T.ERR3:
+	ERRMSG	<Routine name not found in symbol table>
+T.ERR4:
+	ERRMSG	<Trace table full>
+T.ERR5:
+	ERRMSG	<Routine not being traced>
+T.ERR6:
+	ERRMSG	<Trace file already open>
+T.ERR7:
+	ERRMSG	<Cannot open trace file>
+T.ERR8:
+	ERRMSG	<Location name not found in symbol table>
+
+TERROR:
+	PUSH	P,A			;Save pointer for now
+	TMSG	<
+?TRACE - >
+	POP	P,A
+	PSOUT				;Do message
+	TMSG	<
+>
+	JRST	T.RET
+
+	PAGE
+	SUBTTL	TRACE ON ROUTINE
+
+T.ON:				;Switch on all or one routine
+	SKIPN	A			;All?
+	 JRST	T.ALL			;Yes
+	SKIPN	B,.JBSYM##		;Any symbol table?
+	 JRST	T.ERR2			;no
+	CALL	T.SIX			;Get routine to sixbit
+	CALL	T.R50			;Get routine to rad50
+TON.1:
+	CAMN	D,(B)			;Match?
+	 JRST	TON.2			;Yes
+	AOBJN	B,.+1			;Step past value
+	AOBJN	B,TON.1			;Look for another
+	JRST	T.ERR3			;Not found
+TON.2:
+	MOVE	B,1(B)			;Get routine address
+	MOVE	D,[-TRCLEN,,TRCTBL]	;Point to table
+TON.3:
+	SKIPN	.TNAME(D)		;Is it in use?
+	 JRST	TON.4			;No - found a free slot
+	ADDI	D,.TLEN-1
+	AOBJN	D,TON.3			;Look for another
+	JRST	T.ERR4			;No free slots
+TON.4:
+	AOS	TRCCNT			;Count the number of entries
+	MOVEM	C,.TNAME(D)		;Save the name for LIST
+	MOVEM	B,.TADRS(D)		;Save the address
+	MOVE	A,.TNUM(P)		;Number of stack items to record
+	MOVEM	A,.TSCNT(D)
+	SETZM	.TNAM1(D)		;Assume no location
+	SETZM	.TADR1(D)		;Make sure of it
+	SKIPN	A,.TLOC(P)		;Get pointer to name
+	 JRST	T.RET
+	PUSH	P,D			;Save pointer to entry
+	CALL	T.SIX			;Convert name to SIXBIT
+	CALL	T.R50			;Convert to RAD50
+	MOVE	B,.JBSYM##
+	POP	P,A			;Restore entry pointer
+TON.5:
+	CAMN	D,(B)			;Look for a symbol match
+	 JRST	TON.6			;OK
+	AOBJN	B,.+1
+	AOBJN	B,TON.5			;Loop for more
+	JRST	T.ERR8			;Not found
+TON.6:
+	MOVE	B,1(B)			;Get address of location
+	MOVEM	C,.TNAM1(A)		;Save the name
+	MOVEM	B,.TADR1(A)		;And the address
+	JRST	T.RET
+	PAGE
+T.ALL:				;Trace all
+	SKIPE	TRCMOD
+	 JRST	T.RET			;Avoid setting it twice
+	SETOM	TRCMOD			;Enable tracing
+	MOVE	D,[-TRCLEN,,TRCTBL]	;Clear out the entries for a new run
+TALL.1:
+	SETZM	.TTOTL(D)
+	SETZM	.TCNT(D)
+	SKIPN	.TNAME(D)		;Anyone there?
+	 JRST	TALL.2			;No
+	MOVE	C,.TADRS(D)		;Get the first instruction
+	MOVE	B,(C)
+	MOVEM	B,.TINST(D)		;And put it in the table
+	MOVEI	A,-TRCTBL(D)		;Get offset into table
+	IDIVI	A,.TLEN			;Get slot number
+	IMULI	A,3
+	ADD	A,[CALL TRCON$]		;Get pointer to ON routine
+	MOVEM	A,(C)			;Save the new instruction
+TALL.2:
+	ADDI	D,.TLEN-1
+	AOBJN	D,TALL.1		;Loop for next one
+	CALL	T.TIM			;Get current CPU time
+	MOVEM	B,TRCTIM		;Save it
+	SETZM	TRCTOT			;And clear the total
+	JRST	T.RET
+
+	PAGE
+	SUBTTL	TRACE OFF ROUTINE
+
+T.OFF:				;Stop tracing on one or all
+	SKIPN	A			;All?
+	 JRST	TOFF.3			;Yes
+	CALL	T.SIX			;Get name to sixbit
+	MOVE	4,[-TRCLEN,,TRCTBL]	;Point to table
+TOFF.1:
+	CAMN	C,.TNAME(D)		;Is this the one?
+	 JRST	TOFF.2			;Yes
+	ADDI	D,.TLEN-1
+	AOBJN	D,TOFF.1
+	JRST	T.ERR5			;Not found
+TOFF.2:
+	SOS	TRCCNT			;Decrement the counter
+	SETZM	.TNAME(D)		;Just mark the slot as free
+	SKIPE	B,.TINST(D)		;Get the instruction
+	 MOVEM	B,@.TADRS(D)		;And restore it if non zero
+	JRST	T.RET
+
+TOFF.3:				;Stop all tracing
+	SKIPN	TRCMOD			;Avoid second calculation
+	 JRST	T.RET
+	SETZM	TRCMOD			;Switch tracer off
+	CALL	T.TIM			;Get CPU time
+	SUB	B,TRCTIM		;Get total
+	MOVEM	B,TRCTOT		;Save for LIST
+	MOVE	D,[-TRCLEN,,TRCTBL]
+TOFF.4:
+	SKIPN	.TNAME(D)		;Is this one in use?
+	 JRST	TOFF.5			;No
+	MOVE	B,.TINST(D)		;Yes - restore its instruction
+	SETZM	.TINST(D)		;And flag it
+	MOVEM	B,@.TADRS(D)
+TOFF.5:
+	ADDI	D,.TLEN-1
+	AOBJN	D,TOFF.4		;Loop over all entries
+	JRST	T.RET
+
+	PAGE
+	SUBTTL	TRACE RESET ROUTINE
+
+T.RES:
+	SETZ	A,
+	SKIPE	TRCMOD			;If trace mode was on
+	 CALL	T.OFF			;Then turn it off
+	MOVE	D,[-TRCLEN,,TRCTBL]
+TRES.1:
+	SETZM	.TNAME(D)		;Mark the slot as free
+	ADDI	D,.TLEN-1
+	AOBJN	D,TRES.1		;Loop over all the table
+	JRST	T.RET
+
+	PAGE
+	SUBTTL	TRACE LIST ROUTINE
+
+T.LIS:
+	TMSG	<
+TRACE status: >
+	HRROI	A,[ASCIZ /ON
+/]
+	SKIPN	B,TRCMOD
+	 HRROI	A,[ASCIZ /OFF
+/]
+	PSOUT				;Display current status
+	SKIPN	TRCCNT			;Are any routines being traced?
+	 JRST	T.RET			;No - done now
+	JUMPN	B,TLIS.1		;Skip time if still running
+	TMSG	<TRACE time:   >
+	MOVEI	A,.PRIOU
+	MOVE	B,TRCTOT
+	MOVEI	C,^D10	
+	NOUT				;Display total trace time
+	 JFCL
+	TMSG	<  mS CPU time
+>
+
+TLIS.1:
+	MOVE	D,[-TRCLEN,,TRCTBL]
+	TMSG	<
+Routine   Entries   CPU time (mS)   Average   % Total
+-------   -------   -------------   -------   -------
+>
+
+TLIS.2:
+	SKIPN	.TNAME(D)		;Anything here?
+	 JRST	TLIS.5			;no
+	MOVE	B,[POINT 6,.TNAME(D)]	;Point to name
+	MOVEI	C,6
+TLIS.3:
+	ILDB	A,B
+	ADDI	A,40
+	PBOUT				;Output each character
+	SOJG	C,TLIS.3
+	TMSG	<    >
+
+	MOVEI	A,.PRIOU
+	MOVE	B,.TCNT(D)		;Get number of entries
+	MOVX	C,6B17+^D10
+	NOUT
+	 JFCL
+	TMSG	<       >
+
+	MOVEI	A,.PRIOU
+	MOVE	B,.TTOTL(D)		;Get total CPU time
+	MOVX	C,10B17+^D10
+	NOUT	 
+	 JFCL
+	TMSG	<     >
+
+	MOVEI	A,.PRIOU
+	MOVE	B,.TTOTL(D)		;Get average CPU time
+	MOVE	E,.TCNT(D)
+	JUMPE	E,TLIS.4		;Ignore it if never entered
+	IDIVI	B,(E)
+	PUSH	P,C			;Save remainder
+	MOVX	C,NO%LFL+5B17+^D10
+	NOUT
+	 JFCL
+	MOVEI	A,"."
+	PBOUT				;Insert a dot
+	POP	P,A
+	IMULI	A,^D10			;Make the first fraction digit
+	IDIVI	A,(E)
+	ADDI	A,"0"
+	PBOUT				;And output it
+	TMSG	<    >
+
+	SKIPN	TRCTOT
+	 JRST	TLIS.4			;Don't divide by zero
+	MOVEI	A,.PRIOU
+	MOVE	B,.TTOTL(D)		;Get %total
+	IMULI	B,^D100
+	IDIV	B,TRCTOT
+	PUSH	P,C			;Save the remainder
+	MOVX	C,NO%LFL+2B17+^D10
+	NOUT
+	 JFCL
+	MOVEI	A,"."
+	PBOUT				;Insert point
+	POP	P,A
+	IMULI	A,^D10			;Make first fraction digit
+	IDIV	A,TRCTOT
+	ADDI	A,"0"
+	PBOUT				;And output it
+TLIS.4:
+	TMSG	<
+>
+TLIS.5:
+	ADDI	D,.TLEN-1
+	AOBJN	D,TLIS.2		;Loop for the next
+	JRST	T.RET
+
+	PAGE
+	SUBTTL	OPEN AND CLOSE TRACE FILE
+
+T.OPN:
+	SKIPE	TRCJFN			;If already open
+	 JRST	T.ERR6			; Then error
+	MOVX	A,GJ%FOU+GJ%SHT
+	MOVE	B,[POINT 7,[ASCIZ /TRACE.DAT/]]
+	GTJFN
+	 ERJMP	T.ERR7
+	HRRZM	A,TRCJFN		;Save the JFN
+	MOVEI	B,OF%WR			;36-bit write
+	OPENF
+	 ERJMP	T.ERR7
+	GTAD				;Get the current date and time
+	MOVE	B,A
+	MOVE	A,TRCJFN
+	BOUT				;And put it in the file
+	GETNM				;Get the program name
+	MOVE	B,A
+	MOVE	A,TRCJFN
+	BOUT				;And put it in the file
+	MOVE	B,[STKMAX,,.TLEN-1]	;Get some flags
+	MOVE	A,TRCJFN
+	BOUT				;And put it in the file
+	MOVNI	A,5
+	RUNTM				;Get my runtime
+	MOVE	B,A
+	MOVE	A,TRCJFN
+	BOUT				;Base runtime
+	JRST	T.RET
+
+
+T.CLS:
+	SKIPE	A,TRCJFN
+	 CLOSF				;Close it if it was open
+	  JFCL
+	SETZM	TRCJFN			;Assume its closed now
+	JRST	T.RET
+
+	PAGE
+	SUBTTL	TRACE ENTRY AND EXIT ROUTINES
+
+DEFINE	X(N)<
+	XLIST
+	PUSH	P,A
+	MOVEI	A,^D'N*.TLEN+TRCTBL
+	JRST	T.TRC
+	LIST>
+
+	%%N=0
+
+TRCON$:
+	REPEAT	TRCLEN,<
+	X	\%%N
+	%%N=%%N+1>
+
+T.TRC:
+	SKIPN	TRCMOD			;Tracing?
+	 JRST	TTRC.1			;No
+	AOS	.TCNT(A)		;Count the number of entries
+	SKIPE	.TTIME(A)		;Recursive?
+	 JRST	TTRC.1			;Yes - ignore it - we're there already
+	PUSH	P,B
+	MOVE	B,.TRPTR(A)		;Point to dummy return routine
+	EXCH	B,-3(P)			;Get callers address
+	MOVEM	B,.TRETN(A)		;Save it
+	CALL	T.TIM			;Get current CPU time
+	MOVEM	B,.TTIME(A)		;And save it
+	POP	P,B
+TTRC.1:
+	SKIPN	TRCJFN			;Recording?
+	 JRST	TTRC.3			; No
+	PUSH	P,A
+	PUSH	P,B
+	MOVN	B,.TSCNT(A)		;Get number of stack items
+	JUMPE	B,TTRC.2
+	HRLS	B			;Make an AOBJN pointer
+	HRR	B,A
+	MOVEI	A,-5(P)
+	HRLI	A,-STKMAX		;Make a stack pointer
+	POP	A,.TSTK(B)		;Copy a stack item
+	AOBJN	B,.-1			;Loop for next
+TTRC.2:
+	MOVE	A,-1(P)			;Point to entry table
+	MOVE	B,@.TADR1(A)		;Get the value
+	SKIPE	.TNAM1(A)		;If there is a location name
+	 MOVEM	B,.TVAL1(A)		; Then save the value
+	POP	P,B
+	POP	P,A
+TTRC.3:
+	MOVE	A,.TINST(A)		;Get the first instruction
+	MOVEM	A,TRCINS
+	POP	P,A
+	EXCH	A,(P)			;Now move the return address off the stack
+	MOVEM	A,TRCADR
+	POP	P,A			;And get A back properly
+	XCT	TRCINS
+	JRST	@TRCADR			;Return without using the stack
+	CAIA				;Skip once
+	 AOS	TRCADR			;Skip twice
+	AOS	TRCADR
+	JRST	@TRCADR			;Return 
+	PAGE
+
+DEFINE	X(N)<
+	XLIST
+	PUSH	P,A
+	MOVEI	A,^D'N*.TLEN+TRCTBL
+	JRST	T.TRCF
+	LIST>
+
+	%%N=0
+
+TRCOF$:
+	REPEAT	TRCLEN,<
+	X	\%%N
+	%%N=%%N+1>
+
+T.TRCF:
+	PUSH	P,B
+	CALL	T.TIM			;Get current CPU time
+	SUB	B,.TTIME(A)		;Get difference
+	ADDM	B,.TTOTL(A)		;Save it
+	SKIPN	TRCJFN			;If not recording
+	 JRST	TRCF.1			; Then skip the write
+	PUSH	P,A
+	PUSH	P,B
+	MOVE	B,-3(P)			;Get value in AC1
+	MOVEM	B,.TAC1(A)
+	MOVEI	B,(A)			;Point to entry table
+	HRLI	B,(POINT 36,0)		;Make a byte pointer
+	MOVE	A,TRCJFN
+	MOVNI	C,.TLEN-1		;Length of record
+	SOUT				;Write the record
+	POP	P,C
+	POP	P,A
+TRCF.1:
+	SETZM	.TTIME(A)		;Flag that we have finished
+	POP	P,B
+	MOVE	A,.TRETN(A)		;Get old stack entry
+	EXCH	A,(P)
+	RET				;Return to callers caller
+
+	PAGE
+	SUBTTL	SUPPORT ROUTINES
+
+T.SIX:				;Get sixbit name in AC-C
+	MOVEI	E,6
+	MOVE	F,[POINT 6,C]
+	SETZ	C,
+	PUSH	P,A			;Save the pointer
+TSIX.1:
+	ILDB	G,A			;Get a byte
+	JUMPE	G,TSIX.2		;End on null
+	ANDI	G,177			;Make sure its 7-bit
+	CAIL	G,140			;Convert lowercase to uppercase
+	 SUBI	G,40
+	SUBI	G,40			;And make it 6-bit
+	IDPB	G,F
+	SOJG	E,TSIX.1
+TSIX.2:
+	POP	P,A
+	RET
+
+
+T.TIM:				;Get current CPU time to AC-B
+	PUSH	P,A
+	PUSH	P,C			;Save these AC's
+	MOVNI	A,5
+	RUNTM				;Get my runtime
+	MOVE	B,A
+	POP	P,C
+	POP	P,A
+	RET
+
+
+T.R50:				;Get name in RADIX50 to AC-D
+	MOVEI	E,6
+	SETZ	D,
+	PUSH	P,A
+TR50.1:
+	ILDB	G,A			;Get a character
+	JUMPE	G,TR50.2
+	ANDI	G,177			;Make if 7-bit
+	CAIL	G,140			;Convert lowercase to uppercase
+	 SUBI	G,40
+	SUBI	G,40			;And now 6-bit
+	ADJBP	G,[POINT 6,R50TBL]	;Point into the conversion table
+	ILDB	G,G
+	IMULI	D,50			;Multiply
+	ADD	D,G			;And add in next character
+	SOJG	E,TR50.1
+TR50.2:				;Here on trailing nulls
+	MOVEI	A,1
+	DPB	A,[POINT 4,D,3]		;Look for code 4 (global)
+	POP	P,A
+	RET
+
+R50TBL:
+	BYTE (6)00,00,00,00,46,47
+	BYTE (6)00,00,00,00,00,00
+	BYTE (6)00,00,45,00,01,02
+	BYTE (6)03,04,05,06,07,10
+	BYTE (6)11,12,00,00,00,00
+	BYTE (6)00,00,00,13,14,15
+	BYTE (6)16,17,20,21,22,23
+	BYTE (6)24,25,26,27,30,31
+	BYTE (6)32,33,34,35,36,37
+	BYTE (6)40,41,42,43,44,00
+	BYTE (6)00,00,00,00,00,00
+
+	END
+

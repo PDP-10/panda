@@ -1,0 +1,912 @@
+	TITLE	HELPER - OBTAIN HELP
+	SEARCH	MONSYM,MACSYM
+	SALL
+	TWOSEG
+
+;******************************************************************************
+;*									      *
+;*  COPYRIGHT (c) DIGITAL EQUIPMENT CORPORATIO 1975, 1988 ALL RIGHTS RESERVED.*
+;* 									      *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND  COPIED    *
+;*  ONLY  IN  ACCORDANCE  WITH  THE  TERMS  OF  SUCH  LICENSE AND WITH THE    *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE.  THIS SOFTWARE OR  ANY  OTHER    *
+;*  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY    *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE  IS  HEREBY    *
+;*  TRANSFERRED.							      *
+;* 									      *
+;*  THE INFORMATION IN THIS SOFTWARE IS SUBJECT TO CHANGE  WITHOUT  NOTICE    *
+;*  AND  SHOULD  NOT  BE  CONSTRUED  AS  A COMMITMENT BY DIGITAL EQUIPMENT    *
+;*  CORPORATION.							      *
+;* 									      *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF  ITS    *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		      *
+;*									      *
+;******************************************************************************
+
+;
+;This module searches a structured help library file for information on
+;a given topic and subtopic. The structure of the file is described in
+;the source file for the librarian.
+;
+;On entry the user must supply a FORTRAN or COBOL type argument block in
+;the following format:
+;
+;	-CNT,,0
+; AP->	[Pointer to command string]
+;	[Pointer to facility name]
+;	[Pointer to filespec to search or jfn of file]
+;	[Pointer to flags,,terminal width]
+;	[Address of error code]
+;
+;Defaults are as follows:
+;
+;Command string:	null - this supplies only level-0 text
+;Facility name:		program name
+;File specification:	first - HLP:SYSHLP.HLB
+;			then  - HLP:facility.HLB
+;			then  - DSK:facility.HLB
+;Flags and width:	0,,80.
+;Errors:		returned in AC0
+;
+
+;Edit history:
+;
+;1	Don't check for ambiguities on an exact match. CJG 6-Jul-1983
+;2	Fix a format problem in ALSO:. CJG 6-Jul-1983
+
+
+	SUBTTL	DEFINITIONS
+
+;User settable flags
+
+	HL.NFC==1B0		;Don't list facility name in title
+	HL.NLT==1B1		;Don't list title
+	HL.NLS==1B2		;Don't list sub-levels after main text
+	HL.NSD==1B3		;Don't search default files
+
+;Internal flags
+
+	HL.SHT==1B9		;Entered via .HELPR
+	HL.ERR==1B10		;Error code address was given
+	HL.FSP==1B11		;Filespec was given
+	HL.FAC==1B12		;Facility name was given
+	HL.STR==1B13		;Command string was given
+	HL.NRJ==1B14		;Don't release the jfn
+	HL.HLP==1B15		;User command was HELP
+
+;Error codes
+
+	E.OPNF=1		;Failed to open the help file
+	E.ALOC=2		;Failed to allocate memory
+	E.FCNF=3		;Facility not found
+	E.TPNF=4		;Topic not found and HL.NAS was set
+	E.TERM=5		;Terminal width less than 20
+
+;Internal parameters
+
+	FILPGS=^D8		;Number of pages to map if possible
+
+;
+;AC definitions
+;
+
+	Z=0
+	A=1
+	B=2
+	C=3
+	D=4
+	E=5
+	F=6			;Flags
+	AP=16			;Argument pointer
+	P=17			;Stack pointer
+
+;Useful characters
+
+	SPACE=40
+	TAB=11
+
+;
+;Offsets into HEADR0
+;
+
+	.LVERS=1		;Librarian version number
+	.LTXTP=2		;Pointer to text area
+	.LKEY0=3		;Pointer to level-0 key names
+	.LMAXK=4		;Length of longest key name
+
+	SUBTTL	LOCAL DATA AREA
+	RELOC	0
+
+HEADR0:	BLOCK	10			;Library header data
+USRACS:	BLOCK	17			;Copy of user AC's
+KEYSPC:	0				;[2] Spaces allowed per key
+FILPAG:	0				;Page number where file data is held
+FILADR:	0				;Address of file data
+FILJFN:	0				;JFN of help file
+LEVEL:	0				;Current level
+LVL0LN:	0				;Length of level-0 table
+LVL1P:	0				;Pointer to level-1 table
+PGMAP:	0				;Page number of first file page
+PGSMPD:	0				;Number of file pages mapped
+TBLPTR:	0				;Pointer to next table
+UFLAGS:	0				;Copy of user flags
+TXTADR:	0				;Base address of text
+TXTPTR:	0				;Offset to text
+NXTKEY:	0				;Pointer to next key in string
+TBLERR:	0				;Count of table errors detected
+FILOPN:	0				;-1 when file is open
+DEFSET:	0				;Status of defaulting
+FSPACE:	0				;Flag for space compression
+FILSPC:	0				;Address of current file spec
+USRFIL:	BLOCK	6			;User supplied filespec
+USRFSP:	BLOCK	20			;Users file spec
+SYSFIL:	ASCIZ /HLP:SYSHLP.HLB/		;Default system help file
+FACNAM:	BLOCK	4			;Facility name
+USRCMD:	BLOCK	20			;User supplied command
+HDRPTR:	0				;Pointer into header buffer
+LINBUF:	BLOCK	^D21			;Room for a full line of text
+GTJBLK:	GJ%OLD				;GTJFN block
+	.NULIO,,.NULIO
+	POINT	7,[ASCIZ /HLP/]
+	0
+	POINT	7,FACNAM
+	POINT	7,[ASCIZ /HLB/]
+	0
+	0
+	0
+
+
+	SUBTTL	ENTRY POINTS
+	RELOC	400000
+
+HELPER::
+	MOVEM	Z,USRACS		;Save users AC's
+	MOVE	Z,[1,,USRACS+1]
+	BLT	Z,USRACS+16
+	SETZM	USRCMD			;Set defaults - user command
+	GETNM				;Get program name
+	MOVE	B,[POINT 7,FACNAM]
+	CALL	SIX2A			;And convert to ASCII
+	MOVE	A,[POINT 7,SYSFIL]	;Default filespec
+	MOVEM	A,FILSPC
+	MOVEI	F,^D80			;Flags,,width
+	MOVEM	F,UFLAGS
+	HLRO	A,-1(AP)		;Get argument count
+	MOVNS	A
+	JRST	@[HLP.4B		;No arguments supplied
+		  HLP.4			;String only
+		  HLP.3			;+ facility
+		  HLP.2			;+ filespec
+		  HLP.1			;+ flags
+		  .+1](A)		;+ error
+
+	TXO	F,HL.ERR		;Error code found
+	SETZM	@4(AP)			;Clear it
+HLP.1:
+	MOVE	A,@3(AP)		;Get user flags
+	TLZ	A,777			;Clear any internal flags
+	HRRZ	B,A			;Copy terminal width
+	SKIPN	B			;If zero,
+	 MOVEI	B,^D80			; Then default to 80
+	CAIG	B,^D20			;See if its too small
+	 JRST	[MOVEI	Z,E.TERM	;Terminal too narrow
+		 JRST	ENDHLP]
+	HRR	F,B			;Copy the width
+	HLLZS	A
+	TDO	F,A			;Copy the flags
+	MOVEM	F,UFLAGS
+HLP.2:
+	MOVE	A,@2(AP)		;Get address of filespec
+	TDNN	A,[-100]		;See if it could be a jfn
+	 JRST	[TXO	F,HL.NRJ!HL.NSD	;Yes - don't search other files
+		 MOVEM	A,FILJFN	;Save the jfn
+		 JRST	HLP.3]
+	ADDI	AP,2			;Point to filespec descriptor
+	MOVE	B,[POINT 7,USRFSP]	;Point to storage area
+	MOVEI	D,^D80
+	SETOM	FSPACE			;No spaces allowed
+	CALL	MOVSTR
+	 CAIA				;Null string
+	TXO	F,HL.FSP
+HLP.3:
+	MOVE	AP,USRACS+AP		;Restore AP
+	ADDI	AP,1			;Point to facility descriptor
+	MOVE	B,[POINT 7,FACNAM]
+	MOVEI	D,^D20			;Up to 20 chars
+	SETOM	FSPACE			;No spaces allowed
+	CALL	MOVSTR
+	 CAIA				;Null string
+	TXO	F,HL.FAC
+HLP.4:
+	MOVE	AP,USRACS+AP		;Restore AP
+	MOVE	B,[POINT 7,USRCMD]	;Point to destination
+	MOVEI	D,^D80			;Up to 80 chars
+	SETZM	FSPACE			;Compress spaces
+	CALL	MOVSTR			;Copy the string
+	 JRST	HLP.4B			;Null string
+	TXO	F,HL.STR
+	MOVEI	A,5
+	MOVE	B,[POINT 7,USRCMD]	;See if the user said "HELP"
+	MOVEI	D,5
+	MOVE	E,[POINT 7,[ASCIZ /HELP/]]
+	EXTEND	A,[CMPSN]
+	 TXO	F,HL.HLP		;Yes - go to ALSO later on
+	JRST	HLP.5
+HLP.4B:
+	MOVE	A,[ASCIZ /HELP/]	;Default to "HELP"
+	MOVEM	A,USRCMD
+	TXO	A,HL.HLP		;Set the flag
+	JRST	HLP.5
+
+;
+;Alternate entry point - .HELPR
+;
+;When entering here, AC1 must contain the facility name in sixbit
+;and errors will be returned in AC0.
+;
+
+.HELPR::
+	MOVEM	Z,USRACS		;Save users AC's
+	MOVE	Z,[1,,USRACS+1]
+	BLT	Z,USRACS+16
+	SETZM	USRCMD			;Set some defaults
+	SKIPN	A
+	 GETNM				;Use program name by default
+	MOVE	B,[POINT 7,FACNAM]
+	CALL	SIX2A			;Convert to ASCII
+	MOVE	A,[POINT 7,SYSFIL]
+	MOVEM	A,FILSPC
+	MOVE	F,[HL.NLS!HL.SHT!HL.FAC+^D80]
+	MOVEM	F,UFLAGS
+
+;Now fall back into the main line
+
+	SUBTTL	OPEN THE FILE AND FIND ENTRY
+
+HLP.5:
+	SETZM	LEVEL			;Clear the level counter
+	SETZM	FILPAG			;Start at zero
+	SETZM	FILOPN			;File not open yet
+	SETOM	DEFSET			;Defaulting not started
+	MOVEI	D,FILPGS		;Number of pages to find
+	MOVEM	D,PGSMPD
+	CALL	FNDPAG			;Find some free pages
+
+FNDFIL:				;Try to find a file to use
+
+	MOVE	A,[POINT 7,LINBUF]
+	MOVEM	A,HDRPTR		;Preset pointer to header message
+	TXNE	F,HL.NRJ		;If NRJ is set, then JFN was supplied
+	 JRST	FNF.1
+	MOVEI	A,GTJBLK		;Point to the GTJFN block
+	MOVE	B,FILSPC
+	GTJFN				;Get a JFN
+	 JRST	NXTFLX			; Can't  - try another
+	HRRZM	A,FILJFN		;Save the JFN
+FNF.1:
+	MOVE	A,FILJFN		;Get the jfn
+	MOVEI	B,OF%RD!OF%DUD		;Open as 36-bit, read, no update
+	OPENF
+	 JRST	[MOVE	A,FILJFN	;Failed - release the JFN
+		 RLJFN
+		  JFCL
+		 JRST	NXTFLX]		;And try another one
+	HRLZ	A,FILJFN
+	MOVE	B,FILPAG
+	MOVE	C,[PM%CNT!PM%RD+2]
+	PMAP				;Map the first two pages of the file
+	 ERJMP	MAPERR
+	SETZM	PGMAP
+	MOVEI	A,2			;Save the counter
+	MOVEM	A,PGSMPD
+	MOVEI	A,HEADR0		;Set up a BLT pointer
+	HRL	A,FILADR
+	BLT	A,HEADR0+7		;Copy the header info
+	MOVE	A,HEADR0		;Get length of level-0 table in words
+	ANDI	A,777
+	SKIPN	A
+	 MOVEI	A,1			;Default to one page
+	LSH	A,^D9
+	MOVEM	A,LVL0LN		;Save for corrections
+	HRRZ	B,HEADR0+.LMAXK		;[2] Length of longest key
+	ADDI	B,2			;[2]
+	MOVEM	B,KEYSPC		;[2] And save it
+	MOVE	A,FILADR
+	ADDI	A,10			;Point to table
+	MOVE	B,[POINT 7,FACNAM]
+	PUSH	P,A
+	CALL	GETKEY			;Find length of key
+	POP	P,A
+	CALL	TBLUKP			;Try to find an entry
+	 JRST	[CALL	FCLOSE		;Can't find it - close the file
+		 JRST	NXTFIL]		;And try another one
+	HRRZM	B,TXTADR		;Save the text base address
+	MOVEM	A,TBLPTR		;Save as first pointer
+	MOVEM	A,LVL1P			;Save for later
+	SETOM	FILOPN			;File is now open OK
+	TXNN	F,HL.NFC		;If allowed - 
+	 CALL	MOVKY2			;Save the key for the title
+	SKIPN	USRCMD			;Is there any key there?
+	 JRST	DOTEXT			; No - just do text
+	CALL	LV1PAG			;Get the level-1 table
+	MOVE	B,[POINT 7,USRCMD]
+	MOVEM	B,NXTKEY		;Preset pointer to keys
+	SETZM	TXTPTR			;Clear the offset
+
+FNDNXT:
+
+	MOVE	B,NXTKEY		;Point to the string
+	CALL	GETKEY			;Find it
+	JUMPE	C,DOTEXT		;Done - do text
+	HRRZ	A,TBLPTR
+	JUMPE	A,AMBTOP		;Ambiguous or undefined topic
+	SKIPN	LEVEL
+	 SUB	A,LVL0LN		;Correct if last was level-0
+	ADD	A,FILADR		;Point to memory
+	CALL	TBLUKP			;Look for entry
+	 JRST	AMBTOP			;Not found
+	AOS	LEVEL			;Another one done
+	HRRZM	B,TXTPTR		;Save the pointers
+	MOVEM	A,TBLPTR
+	CALL	MOVKY2			;Copy for header or error
+	JRST	FNDNXT			;Loop for next one
+
+DOTEXT:
+	CALL	UNMAP			;Lose the current table
+	TMSG	<
+>
+	MOVE	A,TXTADR		;Get the file address of the text
+	ADD	A,TXTPTR
+	LSH	A,-^D9			;Make a page number
+	HRL	A,FILJFN
+	MOVE	B,FILPAG
+	MOVE	C,[PM%CNT!PM%RD+2]
+	HRRZM	C,PGSMPD
+	PMAP				;Get the text (which may spill over)
+	 ERJMP	MAPERR
+	TXNN	F,HL.NLT		;List title?
+	 CALL	DOLINE			;Type the header
+	MOVE	A,TXTPTR
+	ANDI	A,777			;Point to the real memory
+	ADD	A,FILADR
+	HRLI	A,(POINT 7,0)		;Make a byte pointer
+
+	PSOUT
+	TXNN	F,HL.HLP		;If the command was HELP
+	 JRST	ALSO
+	MOVE	A,LVL0LN		;Then force level-1 to be listed
+	MOVEM	A,TBLPTR		;By setting the pointer to level-1
+	SETZM	LEVEL			;And pretending we are at level-0
+	JRST	ALSO
+
+
+	SUBTTL	AMBIGUOUS AND ALSO ROUTINES
+
+AMBTOP:
+
+	TXNN	F,HL.NLS		;Can we list any more?
+	 JRST	AMB.1			;Yes
+	CALL	FCLOSE			;No - close the file
+	MOVEI	Z,E.TPNF		;Say topic not found
+	JRST	ENDHLP
+AMB.1:
+	PUSH	P,B
+	PUSH	P,C
+	MOVE	B,[POINT 7,[ASCIZ /Sorry, no help available on
+     /]]
+	SKIPE	A
+	 MOVE	B,[POINT 7,[ASCIZ /Ambiguous command
+     /]]
+	MOVEI	A,.PRIOU
+	SETZB	C,D
+	SOUT				;Send a message
+	POP	P,C
+	POP	P,B
+	CALL	COPKEY			;Copy the erroneous key
+	CALL	DOLINE			;Output the string
+	MOVE	B,[POINT 7,LINBUF]
+	MOVEM	B,HDRPTR		;Fall into ALSO
+	SKIPL	FILOPN			;If a file is not open
+	 JRST	DONE			;Then no more
+
+ALSO:
+
+	HRRZ	A,TBLPTR
+	SKIPE	A			;Anything to print?
+	 TXNE	F,HL.NLS		;Should we print extras?
+	  JRST	DONE			;No - just finish up
+	TMSG	<
+>
+	CALL	LV1PAG			;Get level-1 table again
+	HRRZ	A,UFLAGS		;See how many keys per line can
+	SUBI	A,5			;Be sent to the terminal
+	IDIV	A,KEYSPC		;[2]
+	PUSH	P,A
+	HRROI	A,[ASCIZ /Further information is available on the following:
+
+/]
+	PSOUT
+	HRRZ	A,TBLPTR
+	SKIPN	LEVEL			;If last was level-0
+	 SUB	A,LVL0LN		;Then correct the pointer
+	ADD	A,FILADR		;Point to the actual table
+	MOVN	B,(A)			;Make an AOBJN pointer
+	HRL	A,B
+	ADDI	A,1			;Point to first real entry
+	MOVE	B,[POINT 7,LINBUF]
+	MOVEM	B,HDRPTR		;Preset the pointer
+ALS.1:
+	MOVE	C,(P)			;Pick up the counter
+	CALL	MOVKEY			;Copy the entry
+	 JRST	ALS.2			;Done
+	SOJG	C,.-2
+	PUSH	P,A
+	CALL	DOLINE			;Output the line
+	POP	P,A
+	MOVE	B,[POINT 7,LINBUF]
+	MOVEM	B,HDRPTR		;Reset the pointer
+	JRST	ALS.1
+ALS.2:
+	ADJSP	P,-1
+	CALL	DOLINE			;Do the last line
+DONE:
+	CALL	FCLOSE
+	SETZ	Z,			;No error now
+
+ENDHLP:				;Restore AC's and return
+	PUSH	P,Z
+	MOVE	Z,[USRACS+1,,1]
+	BLT	Z,16			;Restore the AC's
+	POP	P,Z			;And the error code
+	RET
+
+	SUBTTL	NEXT FILE ROUTINE
+
+NXTFLX:				;See if we can do any more
+	TXNN	F,HL.NSD
+	 JRST	NXF.0
+	MOVEI	Z,E.OPNF		;Could not open the file
+	JRST	ENDHLP
+NXTFIL:
+	TXNN	F,HL.NSD		;Not found - try another?
+	 JRST	NXF.0
+	SETZ	A,
+	TXNN	F,HL.NLS
+	 JRST	AMBTOP
+	MOVEI	Z,E.TPNF
+	JRST	ENDHLP
+NXF.0:
+	HRRZ	A,FILSPC		;Have we tried system default?
+	CAIN	A,USRFIL
+	 JRST	[MOVE	A,[POINT 7,SYSFIL]
+		 MOVEM	A,FILSPC	;No - do it now
+		 JRST	FNDFIL]
+	SKIPL	DEFSET			;Has defaulting been started?
+	 JRST	NXF.1			;Yes
+	SETZM	FILSPC			;Default to HLP:facility.HLB
+	AOS	DEFSET			;Now at first level
+	JRST	FNDFIL
+NXF.1:
+	SKIPE	DEFSET			;What state are we in?
+	 JRST	[SETZ	A,		;Done them all - fail
+		 TXNN	F,HL.NLS
+		  JRST	AMBTOP
+		 MOVEI	Z,E.TPNF
+		 JRST	ENDHLP]
+	MOVE	A,[POINT 7,[ASCIZ /DSK:/]]
+	MOVEM	A,FILSPC		;Try the last option DSK:facility.HLB
+	AOS	DEFSET
+	JRST	FNDFIL
+
+MAPERR:
+	CALL	FCLOSE
+	MOVEI	Z,E.ALOC
+	JRST	ENDHLP
+
+	SUBTTL	SIXBIT-TO-ASCII, CLOSE AND UNMAP
+
+;
+;SIX2A - convert SIXBIT to ASCII.
+;On entry:	A Contains the SIXBIT word
+;		B Contains a pointer to the destination
+;
+
+SIX2A:
+	MOVE	C,[POINT 6,A]
+SIX.1:
+	TLNN	C,770000		;Any more left?
+	 JRST	SIX.2			; No
+	ILDB	D,C			;Get a byte
+	SKIPN	D			;If space
+	 JRST	SIX.2			; Then end on a null
+	ADDI	D,40			;Convert to ASCII
+	IDPB	D,B
+	JRST	SIX.1
+SIX.2:
+	SETZ	D,			;Make sure we end on a null
+	IDPB	D,B
+	RET
+
+;
+;FCLOSE - close a file and free any mapped pages.
+;
+
+FCLOSE:
+	CALL	UNMAP			;Unmap the pages
+	HRRZ	A,FILJFN
+	TXNE	F,HL.NRJ		;If we can't release the jfn
+	 TXO	A,CO%NRJ		;Then flag it
+	CLOSF				;Close the file
+	 JFCL
+	RET
+
+;
+;UNMAP - unmap the pages currently mapped from the file
+;
+
+UNMAP:
+	SKIPN	C,PGSMPD
+	 RET				;Nothing to do
+	SETO	A,
+	MOVE	B,FILPAG
+	HRLI	C,(PM%CNT+PM%ABT)
+	PMAP				;Unmap the pages
+	SETZM	PGSMPD			;None mapped now
+	RET
+
+	SUBTTL	TABLE LOOKUP ROUTINES
+
+;
+;TBLUKP - lookup an entry in a table and check for non-existant
+;entries or ambiguous values. A flag is also set when the table
+;has an inconsistancy - but we don't die here.
+;
+;On entry:	A = base address of table
+;		B = Byte pointer to the string
+;		C = length of string
+;
+;On exit:	A = Contents of second word of table
+;		B = Address of text (uncorrected)
+;
+;Non-skip:	A = -1 if ambiguous
+;		A =  0 if not found
+;
+
+TBLUKP:
+	MOVN	D,(A)			;-ve count
+	HRL	A,D			;Make an AOBJN pointer
+	AOS	A			;Point to first word pair
+TBK.0:
+	CALL	CHKENT			;See if the entry exists
+	 JRST	TBK.1			; Not far enough down yet
+	 JRST	[SETZ	A,		; Too far - not found
+		 RET]
+	PUSH	P,A			;Save the pointer
+	JUMPE	C,TBK.3			;[1] Exact match - don't do ambig.
+	AOS	A
+	AOBJN	A,.+2			;Point to next entry
+	 JRST	TBK.3			;End of table
+	CALL	CHKENT			;See if its ambiguous
+	 AOS	TBLERR			; Table error
+	 CAIA
+	  JRST	TBK.2
+TBK.3:
+	POP	P,A
+	MOVE	B,(A)			;Address of text
+	MOVE	A,1(A)			;Second word of table
+	AOS	(P)			;Good return
+	RET
+TBK.1:
+	AOS	A
+	AOBJN	A,TBK.0			;Go for next entry
+	SETZ	A,
+	RET				;Not found
+TBK.2:
+	POP	P,A
+	SETO	A,
+	RET				;Ambiguous
+
+;
+;CHKENT - See if the current entry matches the one given.
+;
+;On entry:	A = pointer to current entry
+;		B = pointer to string
+;		C = length of string
+;
+;On exit:	return +1 = Current entry too low
+;		return +2 = Current entry too high
+;		return +3 = Current entry matches (may be abbrev.)
+;			(C is zero on an exact match)
+;
+
+CHKENT:
+	PUSH	P,A
+	PUSH	P,B			;Save some things
+	MOVE	D,C
+	HLR	E,(A)			;Form pointer to key entry
+	ADD	E,FILADR
+	HRLI	E,(POINT 7,0)
+	PUSH	P,E			;Save this pointer
+	MOVE	A,C
+	EXTEND	A,[CMPSE]		;Compare - no need for filler
+	 JRST	CHK.1
+	ILDB	A,E			;[1] If the next byte is a null
+	SKIPN	A			;[1] Then it was an exact match
+	 SETZ	C,			;[1] So flag it as such
+	ADJSP	P,-1			;Tidy up and set for good return
+	AOS	-2(P)
+	AOS	-2(P)
+	JRST	CHK.2			;Strings are equal
+CHK.1:
+	POP	P,E
+	MOVE	A,C
+	MOVE	D,C			;Reset to find if too far
+	MOVE	B,(P)
+	EXTEND	A,[CMPSG]
+	 AOS	-2(P)
+CHK.2:
+	POP	P,B
+	POP	P,A
+	RET
+
+;
+;GETKEY - Scan down the string to find its start and end. Skip leading
+;spaces, tabs, and "/". End on the first space, tab, "/", or control
+;character.
+;
+;On entry:	B = pointer to string
+;
+;On exit:	B = pointer to real start of string
+;		C = length of useful string
+;		NXTKEY = pointer to character after end of string
+;
+
+GETKEY:
+	PUSH	P,B			;Store the 'real' start
+	SETZ	C,			;Clear the counter
+GTK.0:
+	ILDB	D,B			;Get a byte
+	CAIE	D,SPACE			;See if space
+	 CAIN	D,TAB			; or tab
+	  JRST	[SKIPE	C		;If leading - then ignore them
+		  JRST	GTK.3
+		 JRST	GTK.1]
+	CAIG	D,SPACE
+	 JRST	GTK.3			;End on control caracter
+GTK.2:
+	AOS	C			;Its a reasonable character
+	JRST	GTK.0
+GTK.1:
+	MOVEM	B,(P)			;Save this as the real pointer
+	JRST	GTK.0
+GTK.3:
+	MOVEM	B,NXTKEY		;Save a pointer to the next part
+	SETO	B,
+	ADJBP	B,NXTKEY
+	MOVEM	B,NXTKEY
+	POP	P,B			;Restore the real pointer
+	RET
+
+;
+;COPKEY - copy the key just found into HDRBUF and append a space. This
+;will be used either as the title for the help found or as part of the
+;error message.
+;
+;On entry:	B = pointer to key name
+;		C = length of key
+;		HDRPTR = pointer to end of buffer
+;
+
+COPKEY:
+	MOVE	A,C
+	MOVEI	D,1(C)			;Destination is padded
+	MOVE	E,HDRPTR
+	EXTEND	A,[MOVSLJ		;Move the name
+		   SPACE]		;And add a space
+	 JFCL
+	MOVEM	E,HDRPTR		;Save the new pointer
+	RET
+
+
+;
+;MOVKEY - Copy a key from a level-n table into the line buffer.
+;If required space out the text so that it all looks tidy.
+;
+
+MOVKY2:
+	HLRZ	A,B			;Make a pointer to the key
+	ADD	A,FILADR
+	HRLI	A,(POINT 7,0)
+	MOVE	B,HDRPTR		;Point to buffer
+	SETZ	C,			;And flag different mode
+	CALL	MVK.1
+	MOVEI	A,SPACE			;Put a space in the buffer
+	IDPB	A,B
+	MOVEM	B,HDRPTR
+	RET
+
+MOVKEY:
+	PUSH	P,A			;Save the table pointer
+	PUSH	P,C			;Save the item count
+	HLR	A,(A)			;Get a pointer to the key name
+	ADD	A,FILADR
+	HRLI	A,(POINT 7,0)
+	MOVE	B,HDRPTR		;Put the item here
+	MOVN	C,KEYSPC		;[2] Up to N characters
+	CALL	MVK.1			;Copy the string
+	SKIPG	C			;If the key was too long
+	 JRST	MVK.3
+	SUB	C,KEYSPC		;[2] Then fill to the next place
+	CALL	MVK.2
+MVK.3:
+	MOVEM	B,HDRPTR		;Save the pointer for later
+	POP	P,C
+	POP	P,A			;Restore the table pointer
+	AOS	A
+	AOBJN	A,[AOS	(P)		;Skip return if not last
+		   RET]
+	RET
+
+MVK.1:
+	ILDB	E,A			;Next byte of key name
+	JUMPE	E,MVK.2			;Done
+	IDPB	E,B			;Store it
+	AOS	C
+	JRST	MVK.1
+MVK.2:
+	MOVE	A,-1(P)			;See if we need to append spaces
+	SKIPGE	C			;Don't if this is the last item
+	 CAIN	A,1			;Or we are at the end of the buffer
+	  RET
+	MOVEI	E,SPACE			;Space up to 20 characters
+	IDPB	E,B
+	AOJN	C,.-1
+	RET
+
+;
+;MOVSTR - copy a string from the caller. On entry FSPACE is set as follows:
+;
+;	FSPACE = -1	terminate on the first space or tab
+;	FSPACE = 0	terminate on the first null, <CR>, or <LF>. Convert
+;			all spaces and tabs to a single space.
+;
+;Also on entry:
+;
+;	B = pointer to the destination
+;	D = maximum string length
+;	AP = pointer to the argument descriptor.
+;
+;On return:
+;
+;	.+1 - null string
+;	.+2 - OK
+;
+
+MOVSTR:
+	LDB	A,[POINT 4,(AP),12]	;Get the argument type
+	CAIN	A,15			;COBOL?
+	 JRST	MVS.1			; Yes - special
+	MOVEI	A,@0(AP)
+	SKIPN	A
+	 RET				;Return if null
+	HRLI	A,(POINT 7,0)		;And get a pointer to the string
+	PUSH	P,D			;Save for null test
+	JRST	MVS.2
+MVS.1:
+	MOVEI	A,@0(AP)
+	SKIPN	D,1(A)			;Length of string (incl trailing spaces)
+	 RET				;Null string
+	PUSH	P,D			;Save for null test
+	MOVE	A,0(A)			;Byte pointer
+MVS.2:
+	ILDB	C,A			;Get a byte
+	JUMPE	C,MVS.5			;End on <NULL>
+	CAIE	C,15			; Or <CR>
+	 CAIN	C,12			;  Or <LF>
+	  JRST	MVS.5
+	CAIE	C,40			;Is it a space
+	 CAIN	C,11			; Or TAB
+	  CAIA
+	   JRST	MVS.3			;No - see if stored space
+	SKIPGE	FSPACE			;Spaces allowed?
+	 JRST	MVS.5			;No - terminate
+	MOVEI	C,40
+	MOVEM	C,FSPACE		;Convert to space
+	SOJN	D,MVS.2			;Count down
+	JRST	MVS.5			;Done when zero (COBOL only)
+MVS.3:
+	SKIPG	FSPACE			;Was a space stored?
+	 JRST	MVS.4			;No
+	EXCH	C,FSPACE		;Yes - get it
+	IDPB	C,B			;Store it
+	MOVE	C,FSPACE		;And restore other character
+MVS.4:
+	CAIL	C,140			;If lowercase
+	 SUBI	C,40			; Then convert
+	IDPB	C,B			;Store the character
+	SETZM	FSPACE			;Nothing stored now
+	SOJN	D,MVS.2			;Round again
+MVS.5:
+	SETZ	C,
+	IDPB	C,B			;Terminate with <NULL>
+	CAME	D,(P)			;Was whole string null?
+	 AOS	-1(P)			; No
+	ADJSP	P,-1
+	RET
+
+;
+;DOLINE - Output the contents of the line buffer.
+;
+
+DOLINE:
+	MOVEI	B,15			;Skip two lines
+	IDPB	B,HDRPTR
+	MOVEI	B,12
+	IDPB	B,HDRPTR
+	SETZ	B,
+	IDPB	B,HDRPTR		;Put in a null byte
+	MOVE	A,[POINT 7,LINBUF]
+	PSOUT
+	RET
+
+	SUBTTL	MEMORY MANAGEMENT
+
+;
+;LV1PAG - Get level-1 table page(s) for search or listing of subordinate
+;level contents.
+;
+
+LV1PAG:
+	CALL	UNMAP			;Release any pages mapped
+	HLRZ	C,LVL1P			;Get the number of pages
+	ANDI	C,777			; in the next level-1 table
+	SKIPN	C
+	 MOVEI	C,1			;Default to 1
+	MOVEM	C,PGSMPD
+	CAILE	C,FILPGS		;Do we need more pages?
+	 CALL	FNDPAG			;Yes
+	HRRZ	A,LVL1P			;Get the address of the level-1 table
+	LSH	A,-^D9			;And make it a page number
+	HRL	A,FILJFN
+	MOVE	B,FILPAG		;Point to memory
+	HRLI	C,(PM%CNT!PM%RD)
+	PMAP
+	 ERJMP	[ADJSP	P,-1
+		 JRST	MAPERR]
+	RET
+
+;
+;FNDPAG - Find a number of pages to use and return the first page number
+;in FILPAG.
+;
+
+FNDPAG:
+	MOVE	C,FILPAG		;Start here
+	HRLI	C,.FHSLF		;Set the required flag
+FPG.1:
+	MOVE	A,C
+	RMAP				;Get the page status
+	 ERJMP	FPG.3
+	SKIPE	B
+	 AOJA	C,FPG.1			;Not available
+	MOVEM	C,FILPAG		;Save this one - it may be OK
+	MOVE	D,PGSMPD		;Get the count again (may have changed)
+	SOJ	D,
+	AOJ	C,
+FPG.2:
+	MOVE	A,C
+	RMAP				;Get status of next one
+	 ERJMP	FPG.3
+	SKIPE	B
+	 AOJA	C,FPG.1			;Not available - seach again
+	SOSLE	D			;See if all found
+	 AOJA	C,FPG.2			;Not yet - keep looking
+	HRRZ	C,FILPAG		;Got all of them - make an address
+	LSH	C,^D9
+	MOVEM	C,FILADR
+	RET
+FPG.3:
+	ADJSP	P,-1
+	JRST	MAPERR			;Cannot get memory
+
+	END

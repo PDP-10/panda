@@ -1,0 +1,590 @@
+%TITLE 'B U C K E T   -- bucket handling routines'
+!<BLF/REQUIRE 'RMSBLF.REQ'>
+MODULE bucket (IDENT = '2.0'
+		) =
+BEGIN
+!
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1984, 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+
+!++
+! FACILITY:	RMS
+!
+! ABSTRACT:
+!
+!	BUCKET contains all routines which process file
+!	buckets within RMS-20 files.
+!
+! ENVIRONMENT:	User mode, interrupts deferred until return
+!
+! AUTHOR: Ron Lusk , CREATION DATE: 11-Mar-83
+!
+! MODIFIED BY:
+!
+!	, : VERSION
+! 01	-
+!--
+
+!
+! TABLE OF CONTENTS
+!
+!	GETBKT,					! Retrieve a bucket
+!	PUTBKT : NOVALUE,			! Put it away
+!	ALCBKT;					! Create a new bucket
+!
+!
+! INCLUDE FILES:
+!
+
+REQUIRE 'rmsreq';
+
+!
+! MACROS:
+!
+!
+! EQUATED SYMBOLS:
+!
+!   None.
+!
+! OWN STORAGE:
+!
+!   None.
+!
+! EXTERNAL REFERENCES:
+!
+!   None.
+!
+
+%SBTTL 'GETBKT -- map and lock a bucket'
+
+GLOBAL ROUTINE getbkt (bktno, bktsiz, lockflag, bktdesc : REF BLOCK) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine performs the mapping and locking to
+!	assure that the specified bucket of an indexed file
+!	is in core and available for use by the caller.  No
+!	mapping is necessary if the bucket is still in core
+!	from a previous operation.  a non-successful return
+!	will be given if the bucket is busy.  See either
+!	RMSLIB.R36 or RMSSYS.R36 for the format of a bucket
+!	descriptor.
+!
+!	This routine determines whether "contiguous"
+!	allocation is required from the buffer manager.
+!	This concept is used only for sequential and
+!	relative files and means that if the target bucket
+!	is not in the buffer pool, then it is to be mapped
+!	into the first buffer, and the rest of the buffers
+!	are to receive the next pages in sequence.  It thus
+!	assumes that buffer allocation was contiguous when
+!	the record stream was initiated.
+!
+! FORMAL PARAMETERS
+!
+!	BKTNO - bucket number (actually an 18-bit page number).
+!	BKTSIZ - bucket size (in pages).
+!	LOCKFLAG - true if caller wants bucket locked.
+!	BKTDESC - bucket descriptor in which to return data.
+!
+! IMPLICIT INPUTS
+!
+!	?
+!
+! COMPLETION CODES:
+!
+!	TRUE -	Successful
+!	FALSE -	Unsuccessful
+!		    No room for bucket in core
+!		    Bucket is busy
+!		    Unexpected ENQUE/DEQUE errors
+!
+! SIDE EFFECTS:
+!
+!	?
+!
+! NOTES:
+!
+!	1.  On all errors in this routine, USRSTS will be set up.
+!
+!	2.  This routine makes the assumption (also made by
+!	    GETBUF) that for sequential and relative files,
+!	    only one buffer can be allocated at a time.
+!	    This is necessary for contiguous buffer
+!	    allocation to work.
+!
+!	3.  This routine maps the bucket into the buffer
+!	    pool before an attempt  is made to lock it.
+!	    This is to overlap the page I/O with the ENQ
+!	    request.  With luck, we may be able to
+!	    essentially get the ENQ for free.  If the lock
+!	    fails, then a page is already coming in that we
+!	    don't want, but it is likely that the user will
+!	    re-access it soon.
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	fpage,					! A file page number
+	contigflag,				! Allocate contiguous buffers
+	page_count,				! A count of pages
+	lockacc,				! Lock access (ENQSHR/ENQEXC)
+	bpage,					! A buffer page no.
+	bpagglobal,				! Global page number
+						!   (includes section)
+	incore,					! An incore flag
+	bfdadr,					! A buffer descriptor address
+	wanttolock,				! True if bucket should
+						!   be locked
+	temp;					! Temporary
+
+    TRACE ('GETBKT');
+    lookat ('	Getting bucket: ', bktno);
+    !
+    !   If caller wanted to lock bucket, and we are
+    !   locking, then remember it.
+    !
+    wanttolock = .lockflag AND locking;
+    !
+    !   Assume non-contiguous buffer allocation.
+    !
+    contigflag = false;
+    !
+    !   Perform locking, if necessary.
+    !
+    fpage = .bktno;				! Get bucket's file page number
+
+!+
+!   For seq/rel files, we must check if the
+!   user wanted read-ahead. if so, we will ask
+!   for contiguous buffer allocation.
+!-
+
+    IF NOT idxfile
+    THEN
+
+	IF readahead THEN contigflag = 1;
+
+!+
+!   Get a buffer for bucket.  If GETBUF returns false
+!   then return false as well to signal an error.
+!-
+
+    BEGIN
+
+    REGISTER
+	tempac;
+
+    page_count = (.bktsiz);			! Get # of pages
+
+    IF (tempac = getbuf (.fpage, 		! File page number
+	    .page_count, 			! No. pages
+	    .contigflag, 			! Contiguous
+	    bpage, 				! Buffer page returned
+	    incore, 				! Incore flag returned
+	    bfdadr)				! Buffer desc returned
+	) EQL false				!
+    THEN
+	RETURN .tempac;
+
+    END;
+
+!+
+!   For contiguous allocation, we must map all pages that will fit.
+!-
+
+    IF .contigflag NEQ false			! Contiguous allocation?
+    THEN
+	page_count = .bktsiz*.rst [rstbfdcount];	! Yes -- how many?
+
+!+
+!   If buffer is empty, map bucket into it.
+!-
+
+    IF .incore EQL false
+    THEN
+	BEGIN					! Map bucket into buffer
+	bpagglobal = .bpage OR (.rmssec^s2p);
+	lookat ('	Mapping bucket into page: ', bpagglobal);
+	lookat ('	Page count:            ', page_count);
+	pagin (.fst [fstjfn], 			! JFN
+	    .fpage, 				! File page number
+	    .bpagglobal, 			! Dest. page number
+	    .fst [fstfac], 			! Access bits
+	    .page_count);			! Page count
+	END;
+
+!+
+!   Lock the bucket if the caller wanted us to.
+!-
+
+    bktdesc [bkdflags] = 0;
+
+    IF .wanttolock				! Lock this page?
+    THEN
+	BEGIN					! Lock the bucket
+
+	IF inputmode
+	THEN
+	    lockacc = enqshr			! Sharable lock
+	ELSE
+	    lockacc = enqexc;			! Exclusive lock
+
+!+
+!   LOCKBUCKET is a macro which calls the
+!   ENQ routine with the proper arguments to
+!   lock a bucket.
+!-
+
+	IF lockbucket (.lockacc, .fpage) EQL false
+	THEN
+	    BEGIN
+	    putbuf (.page_count, 		! Bucket size
+		.bpage, 			! Buffer page
+		.incore, 			! Flag if incore
+		.bfdadr);			! Buffer descriptor
+	    returnstatus (er$rlk)		! Record is locked
+	    END
+	ELSE
+	    bktdesc [bkdflags] = bkdflglocked	! Mark as locked
+	END;					! Of if wanttolock
+
+!+
+!   Return fields in the bucket descriptor
+!-
+
+    bktdesc [bkdbfdadr] = .bfdadr;		! Adr of buffer descriptor
+    bktdesc [bkdbktsize] = .bktsiz;		! Bucket size in pages
+    bktdesc [bkdbktno] = .bktno;		! Bucket number
+    bktdesc [bkdbktadr] = .bpage^p2w;		! Address of bucket in core
+    !
+    !   Done!
+    !
+    RETURN true;
+    END;					! End of GETBKT
+
+%SBTTL 'PUTBKT -- Release a bucket'
+
+GLOBAL ROUTINE putbkt (updateflag, bktdesc : REF BLOCK) : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine performs all functions related to
+!	releasing a bucket (and its associated buffer) which
+!	was obtained via a call to GETBKT.
+!
+! FORMAL PARAMETERS
+!
+!	UPDATEFLAG  -	TRUE if file bucket should be
+!			updated immediately.
+!	BKTDESC	    -	Address of the bucket descriptor
+!			which contains the values generated
+!			by GETBKT.
+!
+! IMPLICIT INPUTS
+!
+!	?
+!
+! ROUTINE VALUE:
+!
+!	None.
+!
+! SIDE EFFECTS:
+!
+!	?
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	fpage,					! A file page number
+	page_count,				! A count of pages
+	bfdadr : REF BLOCK,			! Buffer descriptor
+	bpage,					! A buffer page number
+	bpagglobal;				! Same, with section number
+
+    TRACE ('PUTBKT');
+    checkinput (bktdesc [bkdbktsize], NEQ, 0);
+    checkinput (bktdesc [bkdbktadr], NEQ, 0);
+    bfdadr = .bktdesc [bkdbfdadr];		! Get buffer descriptor address
+    bpage = .bktdesc [bkdbktadr]^w2p;		! Compute buffer page number
+
+!+
+!   If we should update this bucket, then write it
+!   immediately unless deferred-write is set or
+!   "dyn-alc" (?) [From old sources]
+!-
+
+    IF (.updateflag NEQ false)			! If we update
+    THEN
+
+	IF ( NOT deferredwrite) OR (.bktdesc [bkdbfdadr] EQL 0)
+	THEN
+	    BEGIN				! Update the file pages
+	    lookat ('	Updating bucket: ', bktdesc [bkdbktno]);
+	    !
+	    !   Make global page number
+	    !
+	    bpagglobal = .bpage OR (.rmssec^s2p);
+	    !
+	    !   Write it out
+	    !
+	    pagout (.fst [fstjfn], 		! JFN
+		.bktdesc [bkdbktno], 		! File page
+		.bpagglobal, 			! Mem page
+		.bktdesc [bkdbktsize]);		! Page count
+	    					!
+	    !   Reset buffer descriptor
+	    !
+	    clearbfdupd (bfdadr)		! Reset flag
+	    END
+	ELSE
+	    setbfdupd (bfdadr);			! Preserve fact that
+
+    						! bucket needs writing
+
+!+
+!   Unlock bucket if GETBKT locked it.
+!-
+
+    fpage = .bktdesc [bkdbktno];		! Get file page no. of bucket
+
+    IF bktlocked (bktdesc)			! Is bucket locked?
+    THEN
+	BEGIN					! Unlock the bucket
+	lookat ('	Unlocking bucket: ', bktdesc [bkdbktno]);
+	!
+	!   UNLOCKBUCKET is a macro which calls the
+	!   DEQ routine with the proper arguments
+	!   to unlock a bucket.
+	!
+	unlockbucket (.fpage)			! Yes, unlock it
+	END;
+
+!+
+!   Give buffer back to buffer manager.
+!-
+
+    page_count = .bktdesc [bkdbktsize];
+    bpage = .bktdesc [bkdbktadr]^w2p;		! Compute buffer page number
+    putbuf (.page_count, 			! Number of pages
+	.bpage, 				! Buffer's page number
+	true, 					! Incore flag
+	.bfdadr);				! Buffer descriptor
+    lookat ('	Gave up buffer for bucket: ', bktdesc [bkdbktno]);
+    !
+    !   Indicate that this bucket descriptor is empty.
+    !
+    setnullbd (bktdesc);
+    !
+    !   Done
+    !
+    RETURN
+    END;					! End of PUTBKT
+
+%SBTTL 'ALCBKT -- Allocate a bucket for indexed file'
+
+GLOBAL ROUTINE alcbkt (bkttype, bktflags, levelno, bktdesc : REF BLOCK) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine allocates a bucket at the end of an
+!	indexed file.  The "end" of file is determined by
+!	the NXTBKT field in the File Prologue Table.  NXTBKT
+!	will bt incremented to point to the new "end" of
+!	file.
+!
+! FORMAL PARAMETERS
+!
+!	BKTTYPE	    -   Bucket type (index or data)
+!	BKTFLAGS    -	Flags to be stored in bucket header
+!	LEVELNO	    -	Level number of bucket
+!	BKTDESC	    -	Address of bucket descriptor
+!			into which data is returned.
+!
+! IMPLICIT INPUTS
+!
+!	NXTBKT	-   Next bucket to allocate (File Prologue Table)
+!
+!	One of the following, depending on bucket type:
+!	    IBKZ    -   Index bucket size (current KDB, in core)
+!	    DBKZ    -   Data bucket size (current KDB, in core)
+!
+!	One of the following, depending on bucket type:
+!	    IAN     -   Index area number (current KDB, in core)
+!	    DAN     -   Data area number (current KDB, in core)
+!
+! COMPLETION CODES:
+!
+!	TRUE	-   success
+!	FALSE	-   failure
+!			File is full (status ER$FUL)
+!			Dynamic memory exhausted (status ER$DME)
+!			Miscellaneous error returned by LOCKIT
+!
+! SIDE EFFECTS:
+!
+!	NXTBKT in the File Prologue Table will be incremented.
+!
+!	HYBYTE in the Record Status Table will be set to
+!	account for the new high byte in the file.
+!
+!	SOF (Size Of File) in the FST is updated by the
+!	macro SIZEOFFILE.
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	temp,					! Temporary
+	bktno,					! Bucket number
+	lockflag,				! Flag to lock prologue
+	bkt : REF BLOCK,			! Pointer to a bucket
+	bkd : BLOCK [bdsize];			! A bucket descriptor
+
+    REGISTER
+	bktsize,				! Bucket size
+	fpt : REF BLOCK;			! File Prologue Table
+
+    TRACE ('ALCBKT');
+
+!+
+!   Get bucket size depending on bucket type ( index/data ).
+!-
+
+    IF .bkttype EQL btypeindex			! Find bucket size:
+    THEN
+	bktsize = .kdb [kdbibkz]		! For index bucket
+    ELSE
+	bktsize = .kdb [kdbdbkz];		! For data bucket
+
+!+
+!   Get file prologue table so that we can increment NXTBKT.
+!-
+
+    rtrace (%STRING ('	GETTING FPT', %CHAR (13), %CHAR (10)));
+
+    IF getbkt (fptblockno, 			! Bucket number
+	    1, 					! Bucket size
+	    false, 				! Don't lock FPT
+	    bkd) EQL false			! Bucket descriptor
+    THEN
+	RETURN false;				! Return to caller on error
+
+    fpt = .bkd [bkdbktadr];			! Get address of FPT
+    lookat ('	Input bucket size: ', bktsize);
+    !
+    !   Get the number of the next bucket to allocate.
+    bktno = .fpt [fptnxtbkt];			! Fetch current NXTBKT
+    lookat ('	Current NXTBKT: ', bktno);
+
+!+
+!   Check to see if the file is completely full;
+!   note that the signal that the file is full
+!   is a "0" in NXTBKT.
+!-
+
+    IF ((.bktno + .bktsize) LEQ highestbucketno) AND 	! Check limit
+	.bktno NEQ 0				! Not already full, I hope?
+    THEN
+	fpt [fptnxtbkt] = .bktno + .bktsize	! Store new NXTBKT
+    ELSE
+	fpt [fptnxtbkt] = 0;			! Indicate "File Is Full"
+
+    						!   condition
+
+!+
+!   Remember the highest byte in this new bucket, so
+!   the file's EOF pointer can be set properly when
+!   the file is closed.
+!-
+
+    rst [rsthybyte] = .fpt [fptnxtbkt]^b2w;
+    fst [fstsof] = .rst [rsthybyte];		! Crock [Why? says
+    						! a later reader]
+    lookat ('	New NXTBKT: ', fpt [fptnxtbkt]);
+    rtrace (%STRING ('	RELEASING FPT', %CHAR (13), %CHAR (10)));
+    !
+    !   Release the File Prologue page.
+    !
+    putbkt (true, 				! Update flag
+	bkd);					! Bucket descriptor
+
+!+
+!   Make sure file hasn't run out of space.
+!-
+
+    IF (.bktno + .bktsize - 1) GTR highestbucketno	! Is file full?
+	OR .bktno EQL 0
+    THEN
+	BEGIN					! Handle full file
+	rtrace (%STRING ('	File is full', %CHAR (13), %CHAR (10)));
+	returnstatus (er$ful)			! Yes, return  "File Is Full"
+						!   condition to caller
+	END;
+
+!+
+!   Now get the new bucket into a buffer.
+!-
+
+    lookat ('	Getting bucket: ', bktno);
+    lookat ('	Size (in pages) is: ', bktsize);
+    temp = .bktsize;				! Store in local
+
+    IF getbkt (.bktno, 				! Bucket number
+	    .temp, 				! Bucket size
+	    false, 				! Lock flag
+	    .bktdesc) EQL false			! Bucket descriptor address
+    THEN
+	RETURN false;
+
+!+
+!   Now fill in the bucket header.
+!-
+
+    bkt = .bktdesc [bkdbktadr];			! Get address of bucket
+    bkt [bhbtype] = .bkttype;			! Set bucket type (index/data)
+    bkt [bhflags] = .bktflags;			! Set bucket header flags
+    bkt [bhnextbyte] = bhhdrsize;		! Setup first free byte number
+    bkt [bhthisarea] = 				! Set up area for bucket
+    (IF .bkttype EQL btypeindex			! What bucket type?
+    THEN 					!
+	.kdb [kdbian]				! Index area number
+    ELSE 					!
+	.kdb [kdbdan]);				! Data area number
+    bkt [bhlastid] = highestid;			! Initialize last record ID
+    bkt [bhnextid] = firstid;			! Initialize  next ID to use
+    bkt [bhlevel] = .levelno;			! Initialize level number
+    bkt [bhunused] = 0;				! Clear unused bits
+    !
+    !   Done
+    !
+    RETURN true;				! Successful return to caller
+    END;					! End of ALCBKT
+
+END						! End of Module BUCKET
+
+ELUDOM
+   

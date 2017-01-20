@@ -1,0 +1,1860 @@
+MODULE FALDAP(			!DAP message processing routines unique to FAL
+	IDENT='7.0(662) 1-Dec-86'
+        %BLISS36(,
+                 ENTRY(
+                       D$GACC, ! DAP$GET_ACCESS,         ! Get Access message
+                       D$GCTL, ! DAP$GET_CONTROL,        ! Get Control message
+                       D$GACM, ! DAP$GET_ACCESS_COMPLETE ! Get ACM message
+                       D$PACK, ! DAP$PUT_ACK,            ! Build ACK message
+                       D$ERRD, ! DAP$ERROR_RMS_DAP,      ! Conv RMS code to DAP
+                       D$PSTS, ! DAP$PUT_STATUS          ! Build STATUS message
+                       D$PSUC, ! DAP$PUT_SUCCESS         ! success status
+                       D$GCNT, ! DAP$GET_CONTINUE        ! Get CONTINUE message
+                       D$RETR  ! DAP$RETRY_LAST_OPERATION! Try again
+                       ))
+	)=
+BEGIN
+
+!
+!                   COPYRIGHT (c) 1984, 1986 by
+!	      DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASS.
+!
+! THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND  COPIED
+! ONLY  IN  ACCORDANCE  WITH  THE  TERMS  OF  SUCH  LICENSE AND WITH THE
+! INCLUSION OF THE ABOVE COPYRIGHT NOTICE.  THIS SOFTWARE OR  ANY  OTHER
+! COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY
+! OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE  IS  HEREBY
+! TRANSFERRED.
+!
+! THE INFORMATION IN THIS SOFTWARE IS SUBJECT TO CHANGE  WITHOUT  NOTICE
+! AND  SHOULD  NOT  BE  CONSTRUED  AS  A COMMITMENT BY DIGITAL EQUIPMENT
+! CORPORATION.
+!
+! DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF  ITS
+! SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.
+!
+
+!++
+! FACILITY:	FAL-20
+!
+! ABSTRACT:	This is the System-independent part of the DAP protocol.
+!
+!
+! ENVIRONMENT:	TOPS-20, Transportable BLISS DecNet Interface
+!
+! AUTHOR:	Andrew Nourse, CREATION DATE: 14-Feb-83
+
+! REVISION HISTORY:
+!
+!  533 - Crc Checking support
+!  555 - Fix key field for relative files
+!  556 - Add some new error codes
+!  557 - Fix multistream access
+!  561 - Eat ignorable KEY fields,
+!        default class to ASCII if RFM=UDF and MRS=0
+!  566 - fix protocol error
+!  600 - Send Key & Alloc attrs correctly
+!  601 - Add some error codes to translation table.
+!  603 - Fix Directory-List sending extra attributes msg.
+!  605 - Use new routines for handling RFA's
+!  610 - Fix extended KEY attributes, implement KNM sending/receiving,
+!	 don't compare checksums if requested to do so but we are
+!	 closing and deleting a file.
+!  611 - D$PSTS and D$GCTL weren't sending/receiving RFAs correctly.
+!  620 - Missing dot in D$GCTL trashed keyed KBF reception. Indexed
+!	 $GETs/$PUTs brain-damaged in various ways
+!  630 - Fix back-assward code mandated by DAP spec: Read key field
+!	 first, then figure out whether its dtp is numeric or string
+!	 for final Rab setup.
+!  632 - Add more errors to DAP$ERROR_RMS_DAP
+!  633 - Make wildcard delete work for PDP-11s.
+!  635 - Filenames of the form "FILE.TYPE;0" should work.  More work on
+!        renames to make them work from PDP-11 and VMS systems.
+!  643 - Always return main attributes even though access msg didnt say to
+!        if it is a OPEN, CREATE, or SUBMIT message (used by RT11), and
+!        don't put extra acks in directory list if talking pre v7 DAP
+!  647 - Remove some code that didn't do anything in DAP$GET_CONTROL
+!  662 - Add ER$DUP to D$ERRD.
+!--
+
+
+!
+! Conditionals
+!
+
+!
+! Libraries
+!
+
+LIBRARY 'BLISSNET';
+LIBRARY 'CONDIT';
+REQUIRE 'RMSREQ';
+
+!
+! Table of Contents
+!
+FORWARD ROUTINE
+    DAP$GET_ACCESS,                     ! Get Access message
+    ACCESS,                             ! Access remote user's file
+    FillBlocks,                         ! Fill in Fab & XABs
+    DAP$GET_CONTROL,                    ! Get Control message
+    dap$generation_check : NOVALUE,     ! Check for "name.type;gen"
+    CONTROL,                            ! Access remote user's record
+    DAP$GET_ACCESS_COMPLETE,            ! Get Access complete message
+    DAP$PUT_ACK: NOVALUE,               ! Build ACK message
+    DAP$ERROR_RMS_DAP,                  ! Convert RMS error code to DAP
+    DAP$PUT_STATUS: NOVALUE,            ! Build STATUS message
+    DAP$PUT_SUCCESS: NOVALUE,           ! Build STATUS message
+    DAP$GET_CONTINUE,                   ! Process CONTINUE message
+    DAP$RETRY_LAST_OPERATION,           ! Retry the last RMS verb we tried
+    DAP$3_PART_NAME: NOVALUE;           ! Send 3-part name if needed
+!
+! LITERALS
+!
+LITERAL FTPASSIVE = 1;                  ! This is always passive   !a577
+GLOBAL LITERAL RRE$$P = FTPASSIVE;                                 !a577
+! Interlock. Makes sure all modules compiled correct variant
+! Link error if wrong
+
+
+%IF %BLISS(BLISS36)
+    %THEN 
+    %IF %SWITCHES(TOPS20)
+        %THEN
+        LITERAL
+               OUR_OSTYPE=DAP$K_TOPS20,
+               OUR_BLOCK_SIZE=512,
+               DEVICE_NAME_LENGTH=40,   ! Including punctuation
+               DIRECTORY_NAME_LENGTH=41,!
+               FILE_NAME_LENGTH=40;     !
+        %ELSE
+        %ERROR('Not implemented on TOPS-10')
+        %FI
+
+    LITERAL
+           OUR_FILESYS=DAP$K_RMS20;
+    %ELSE %ERROR('Not implemented for 16/32 bit architectures')
+    %FI;
+
+
+!
+! External references
+!
+EXTERNAL ROUTINE Chazac,
+                 Chacaz,                                       !630
+                 S$Strdt,
+                 S$Mount: NOVALUE,
+                 Dap$Get_Header,
+                 Dap$Unget_Header,
+                 Dap$Get,
+                 Dap$$Get,
+                 Dap$$Get_Attributes,
+                 Dap$Get_Byte,
+                 Dap$Get_2byte,
+                 Dap$Get_Date,
+                 Dap$Get_Variable_String,
+                 Dap$Get_Longword,
+                 Dap$Size_Bitvector,
+                 Dap$Get_Bitvector,
+                 Dap$Get_Variable_Counted,
+                 Dap$Put,
+                 Dap$$Put,
+                 Dap$Put_Bitvector,
+                 Dap$Put_Header,
+                 Dap$Put_2byte,
+                 Dap$Put_Byte,
+                 Dap$Put_String,
+                 Dap$Put_Variable_Counted,
+                 Dap$Put_Longword,
+                 Dap$$Put_Attributes,
+                 Dap$Put_Name,
+                 Dap$Put_Message,
+                 Dap$Unget_Byte,
+                 Dap$Eat_Message,
+                 Dap$Rfa_Rms_Dap,
+                 Dap$Rfa_Dap_Rms,
+                 Num_Vb,						! 630
+                 Fal$Handle,
+                 R$Null,
+                 Rms$Signal,
+                 UAddr,
+                 UAPointer;
+
+
+EXTERNAL                                                                !a557vv
+    FalFab: $Fab_decl,
+    FalFst: $Rms_Fst,
+    RabVector: BLOCKVECTOR[256,Rab$k_Bln] FIELD( Rab$r_Fields ),
+    RstVector: BLOCKVECTOR[256,Rst$k_Bln] FIELD( Rst$r_Fields ),
+    Usrbuf: VECTOR[CH$ALLOCATION(dap$k_buffer_size,9)] VOLATILE,
+    KeyBuf: VECTOR[255] VOLATILE,                                       !a557^^
+    KnmBuf: VECTOR[256] VOLATILE;					!610
+
+!
+! MACROS
+!
+MACRO Dap_Error (Ddesc,Mac,Mic) =
+      ( BIND dapcod = Err_Ds (Mac, Mic);
+        SIGNAL ( dapcod, Ddesc );
+       dapcod )
+      %;
+
+!
+! Canned Messages   (Global PLITS)
+!
+GLOBAL BIND ACRMSG=PLIT(CHAR8(DAP$K_ACCESS_COMPLETE,0,
+                              DAP$K_ACCOMP_RESPONSE));
+GLOBAL D_ACR: $XPN_DESCRIPTOR(BINARY_DATA=(3,ACRMSG,BYTES));
+
+!
+! OWN Storage
+!
+
+OWN D_NULL: $STR_DESCRIPTOR(STRING=%CHAR(0));
+
+OWN 
+   FalXabKey: BLOCKVECTOR[256,Xab$k_Keylen]
+              FIELD(XabHdr$r_fields,XabKey$r_fields),
+              
+   FalXabAll: BLOCKVECTOR[32,Xab$k_Alllen]
+              FIELD(XabHdr$r_fields,XabAll$r_fields);
+
+
+GLOBAL ROUTINE Dap$Get_Access (P_Dd: REF $Dap_Descriptor,
+                                 P_Fab: REF $Fab_Decl,
+                                 P_Fst: REF $Rms_Fst)=
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Process ACCESS message
+!
+! FORMAL PARAMETERS:
+!
+!	P_DD: Addr of DAP message descriptor
+!       P_FAB: Addr of FAB -- FAB[FAB$A_FNA] must point to 200 character buffer
+!       P_Fst: Addr of FST
+!
+! ROUTINE VALUE:
+!
+!	DAP Operator code if successful, Signal error otherwise
+!
+! SIDE EFFECTS:
+!
+!       The ACCESS Message will have been read.
+!       A name message after the ACCESS message will have been read if RENAME
+!--
+BEGIN				!Digest ACCESS
+BIND Idd=.P_Dd: $Dap_Descriptor,
+     Odd=.Idd[Dap$A_Other_Dd]: $Dap_Descriptor,
+     Fab=.P_Fab: $Fab_Decl,
+     Nam=UAddr(.Fab[Fab$a_Nam]): $Nam_decl,
+     Fst=.p_Fst: $Rms_Fst;
+BIND Config=.Fst[Fst$a_Config]: $XabCfg_Decl;      ! Configuration Xab
+
+LOCAL
+    XabTail: REF $XabSum_decl,
+    Noa,                                ! Number of areas
+    Nok;
+
+OWN
+   NEsa: VECTOR[CH$ALLOCATION(255)],
+   NRsa: VECTOR[CH$ALLOCATION(255)],
+   NNam: $Nam( Esa=CH$PTR(Nesa), Ess=255, Rsa=CH$PTR(NRsa), Rss=255),
+   NFna: VECTOR[CH$ALLOCATION(255)],
+   NFab: $Fab(Nam=NNam, Fna=CH$PTR(NFna), FOP=<NAM,OFP>, FAC=PUT);       !m635
+
+LOCAL hp_Fab: VOLATILE;
+LOCAL hp_Fst: VOLATILE;
+
+ENABLE fal$handle( hp_Fab, hp_Fst );    ! Set up condition handler
+hp_Fab=Fab;
+hp_Fst=Fst;
+
+SELECTONE Dap$Get_Header(Idd) OF                  ! Munch the header
+    SET
+    [Dap$k_Access]:
+        BEGIN
+        LOCAL	Display: BITVECTOR[28],	!DISPLAY field for attributes to return
+                Password: VECTOR[CH$ALLOCATION(41)],
+                Accfunc,
+                Accopt: BITVECTOR[28],
+                Fac: BITVECTOR[28],
+                Shr: BITVECTOR[28];
+
+
+        Fst[Fst$b_Operation]=Dap$Get_Byte(Idd);	!OPEN/CREATE/ERASE/RENAME,etc
+
+        Dap$Get_Bitvector(Idd,Accopt,5);	!Access options
+
+        Fst[Fst$v_Accopt] = .Accopt;    ! Save access options !a533
+
+        Dap$Get_Variable_String(Idd,.Fab[Fab$a_Fna],255);
+                                !Store remote filespec where FNA points
+        dap$generation_check(.fab[fab$a_fna]);                            !a635
+
+        IF .Idd[Dap$h_Length] GTR 0
+        THEN
+            BEGIN
+            Dap$Get_Bitvector(Idd,Fac,3);	   ! FAC (File acce<ss options)
+            $Dap_Move_Bits(Fac,Dap$v_Fac_
+                           ,Fab,Fab$v_,
+                           Put,Get,Del,Upd,Trn,
+                           Bio,Bro,App);
+            END;
+
+        IF .Idd[Dap$h_Length] GTR 0                 ! SHR
+        THEN
+            BEGIN
+            Dap$Get_Bitvector(Idd,Shr,3);	!Shared operations
+            $Dap_Move_Bits(Shr,Dap$v_Fac_,Fab,Fab$v_Shr,  !542
+                           Put,Get,Del,Upd,Trn,
+                           Bio,Bro,App);
+            END;
+
+        ! Get display bits.  Historical DAP feature: if no display menu, and
+        ! its an open or create or submit then default to display the main
+        ! attributes.  This is still used by RT11.
+
+        IF .Idd[Dap$h_Length] GTR 0                 ! DISPLAY
+        THEN Dap$Get_Bitvector(Idd,Display,4)                        !a643v
+        ELSE IF .fst[FST$B_OPERATION] EQL DAP$K_OPEN
+                 OR .fst[FST$B_OPERATION] EQL DAP$K_CREATE
+                 OR .fst[FST$B_OPERATION] EQL DAP$K_SUBMIT             
+             THEN display=1;                    ! display the main attributes  
+                                                                     !a643^
+        !This tells what attributes we should return
+        Fst[Fst$v_Display] = .Display;
+
+
+        IF .Idd[Dap$h_Length] GTR 0                 ! PASSWORD
+        THEN Dap$Get_Variable_String(Idd,CH$PTR(Password),40);
+        !Password for file access
+        ! IGNORE FOR NOW
+
+        ! Get new name for $Rename
+        IF .Fst[Fst$b_Operation] EQL Dap$k_Rename
+        THEN
+            BEGIN
+            LOCAL nametype: BITVECTOR[21];
+            nnam[NAM$A_RLF] = nam;      ! Set rlf to "old" nam block      !a635
+
+            IF Dap$Get_Header( Idd ) NEQ Dap$k_Name  ! looking for a NAME msg
+            THEN Dap_Error(Idd, Dap$k_Mac_Sync, .Idd[Dap$b_Operator] );
+
+            Dap$Get_Bitvector( Idd, nametype, 3);
+
+            IF .nametype[Dap$k_Nametype_Fsp] EQL 0
+            THEN Dap_Error(Idd, Dap$k_Mac_Sync, .Idd[Dap$b_Operator] );
+
+            Dap$Get_Variable_String( Idd, CH$PTR(NFna), 255);
+            dap$generation_check(CH$PTR(nfna));        !a635
+            END;
+
+        ! Try to do the access
+        ! This will also fill in all XABs except KEY and ALLOCATION
+        ! which may occur in absurdly large numbers
+
+        Access(Fab, NFab, Fst);
+
+        IF .Nam[Nam$v_Wildcard]                     ! If Wildcarded
+        THEN Fst[Fst$v_Display_3_Part_Name] = 1;    ! we need 3-part name
+
+        IF .Fst[Fst$v_File_Open]               ! If we opened a file  !m561
+        THEN                                   ! Return its attributes
+            BEGIN                                  
+
+            !
+            ! Set up the appropriate Xabs by the display field
+            ! The Date/Time and Summary XABs are already attached
+            !
+
+            XabTail = .Fab[Fab$a_Xab];
+
+            WHILE 1 DO
+                BEGIN
+                IF .XabTail[Xab$v_Cod] EQL Xab$k_Sum
+                THEN
+                    BEGIN                   ! Find out how many areas & keys
+                    nok=.XabTail[Xab$b_Nok];
+                    noa=.XabTail[Xab$b_Noa];
+                    END;
+
+                IF .XabTail[Xab$a_Nxt] NEQ 0                           !m545
+                THEN XabTail=.XabTail[Xab$a_Nxt]
+                ELSE EXITLOOP;
+                END;
+
+            !
+            ! Set up as many Key XABs as needed
+            !
+                BEGIN
+                MAP xabtail: REF $Xabkey_decl;
+
+                INCR krf FROM 0 TO .nok-1      ! Set up enough Key Xabs
+                DO
+                    BEGIN
+                    xabtail[xab$a_nxt] = FalXabKey[.krf,0,0,0,0];
+                    xabtail = FalXabKey[.krf,0,0,0,0];
+
+!+ 610
+!	Since a $DISPLAY will not update the Knm field unless there is
+!	a Knm pointer present, initialize one for each key XAB if not
+!	already available.
+!-
+
+                    IF .Knmbuf[.krf] EQL 0				!610
+                    THEN
+                        BEGIN
+                        $XPO_GET_MEM( RESULT=KnmBuf[.krf],
+                                      UNITS=(40/(%BPVAL/8)),FILL=0);
+                        END;
+
+                    $XabKey_Init( Xab=.xabtail,
+                                  Knm=.KnmBuf[.krf],
+                                  KRef=.krf );
+                    END;
+                END;                        ! 
+
+
+            !
+            ! Set up as many Allocation XABs as needed
+            ! At least 1, the vax requires it!
+
+            noa = MAX( .noa, 1 );                                       !m545
+
+                BEGIN
+                MAP xabtail: REF $XabAll_decl;
+
+                INCR aid FROM 0 TO .noa-1      ! Set up enough Area Xabs
+                DO
+                    BEGIN
+                    xabtail[xab$a_nxt] = FalXabAll[.aid,0,0,0,0];
+                    xabtail = FalXabAll[.aid,0,0,0,0];
+                    $XabAll_Init( Xab=.xabtail,
+                                  Aid=.aid );
+                    END;
+                END;
+
+            xabtail[xab$a_nxt] = 0;     ! This is the end of the chain    !a545
+
+            $Rms_Display( Fab=Fab );   ! Fill in the XABs                 !a545
+                                                                          !d566
+
+            Dap$$Put_Attributes(Odd,Fab,Fst);    ! Build attributes & send
+            Dap$Put_Ack(Odd);                    ! with an ack
+            Dap$Put_Message(Odd);                ! Force it out 
+            END
+        ELSE                                     ! No file open
+            IF .Fst[Fst$v_Access_Active]         ! If access still active
+            THEN                                 !  
+                BEGIN                            ! 
+                Fst[Fst$v_Access_Active] = 0;    ! deactiviate it
+                Dap$$Put_Attributes( Odd, Fab, Fst ); ! Build attributes !a574
+
+                IF .Config[Xab$b_Version] GEQ 7  ! If DAP v7 or later
+                THEN Dap$Put_Ack(Odd);           ! Put out an ACK to separate
+
+!d635           IF (.Fst[Fst$b_Operation] EQL Dap$k_Rename)              !a577v
+!d635           THEN Dap$$Put_Attributes( Odd, NFab, Fst );              !m605
+
+                Dap$Put_String( Odd,D_Acr );     ! Send access complete
+                Dap$Put_Message( Odd );          !        response
+                END;
+
+!+ 610
+!	Now that the access has been successfully completed, release
+!	any dynamic blocks pointed to by KnmBuf.  Note that an access which
+!	fails will not release this memory here; a subsequent access will
+!	reuse it.  
+!
+!	Unfortunately we must cycle through the entire KNM vector looking
+!	for blocks to release, since there could be, e.g., 256 keys only
+!	the last of which had a Knm.
+!-
+
+        INCR I from 0 to 255
+        DO
+          BEGIN
+          IF .KnmBuf[.i] NEQ 0
+          THEN
+              BEGIN
+              $Xpo_Free_Mem (BINARY_DATA=(40/(%BPVAL/8),.KnmBuf[.i]));
+              KnmBuf[.i] = 0;
+              END;
+          END;
+
+        RETURN Dap$k_Access
+        END; ! Process ACCESS message
+
+    [Dap$k_Access_Complete]:
+        BEGIN
+        BIND URab=RabVector[ .idd[Dap$b_StreamID], 0,0,0,0 ]: $Rab_decl;
+        BIND URst=RstVector[ .idd[Dap$b_StreamID], 0,0,0,0 ]: $Rms_Rst; !a561
+
+        dap$get_access_complete ( idd, Fab, URab, URst )
+        END;
+
+    [OTHERWISE]:
+        BEGIN
+        Dap_Error(Odd,Dap$k_Mac_Sync,.Idd[Dap$b_Operator]);
+        RETURN .Idd[Dap$b_Operator]
+        END;
+    TES
+END;  !End of DAP$GET_ACCESS (D$GACC) (process ACCESS message)
+
+ROUTINE Access ( P_Fab: REF $Fab_decl,
+                 P_NFab: REF $Fab_decl,
+                 P_Fst: REF $Rms_Fst ) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Perform a file access as requested by remote user
+!
+! FORMAL PARAMETERS:
+!
+!       P_FAB:     Address of RMS FAB
+!       P_NFAB:    Address of RMS FAB for new name (rename only) or 0
+!       P_Fst:     Address of FST
+!--
+BEGIN
+BIND
+    Fab=.P_Fab: $Fab_Decl,
+    NFab=.P_NFab: $Fab_decl,
+    Fst=.P_Fst: $Rms_Fst,
+    Nam=UAddr(.Fab[Fab$a_Nam]): $Nam_decl,
+    Idd=.Fst[Fst$a_I_Dd]: $Dap_Descriptor,
+    Odd=.Fst[Fst$A_O_Dd]: $Dap_Descriptor,
+    Typ=.Fab[Fab$a_Typ]: $Typ_Decl,
+    Config=.Fst[Fst$a_Config]: $XabCfg_Decl;      ! Configuration Xab
+
+IF .Fst[Fst$h_File_Class] EQL 0           ! Default datatype to ASCII     !m545
+THEN Typ[Typ$h_Class] = Fst[Fst$h_File_Class]  ! In typ block
+     = Typ$k_Ascii;                       ! in FST                        !m545
+
+!+
+!  If the remote is trying for CRLF, or any other carriage control,
+!  This will hopefully keep old and stupid software out of trouble.
+!  If the file is an RMS file, it will get the reall attributes anyway.
+!-
+
+IF ((.Fst[Fst$h_Rat] AND Fab$m_Cr+Fab$m_Ftn+Fab$m_Emb) NEQ 0)           !a545vv
+THEN                                                                    !d606
+    BEGIN
+    Typ[Typ$h_Class] = Fst[Fst$h_File_Class] = Typ$k_Ascii;
+    Fst[Fst$h_Bsz] = Fab[Fab$v_Bsz] = 7;
+    Fab[Fab$v_Rfm] = Fab$k_Stm;
+    Fab[Fab$h_Rat] = 0;
+    END;                                                                !a545^^
+
+
+
+!+
+! Default the byte size if it is still not set
+!-
+    IF .Fst[Fst$h_Bsz] EQL 0
+    THEN Fst[Fst$h_Bsz] = Fab[Fab$v_Bsz] = 7;   ! Default to 7-bit ascii  !m570
+
+!+
+! Disbelieve the byte size if it is 8 and the file is ascii
+! Unless the system can be expected to know better
+!-
+    IF ( .Fst[Fst$h_Bsz] EQL 8 )
+    AND ( .Fst[Fst$h_File_Class] EQL Typ$k_Ascii )
+    AND ( .Config[Xab$b_OsType] NEQ Xab$k_Tops20 )
+    THEN Fst[Fst$h_Bsz] = Fab[Fab$v_Bsz] = 7;   ! Force to 7-bit ascii    !m570
+
+!+
+!  Do the things we need for wildcarding
+!-
+
+SELECT .Fst[Fst$b_Operation] OF
+    SET
+    [Dap$k_Create,                      ! Output file parse
+     Dap$k_Submit]: Fab[Fab$v_Ofp] = 1; !
+    [OTHERWISE]:			!610
+    Fab[Fab$v_Ofp] = 0;			!610
+    TES;
+
+!+
+! Mount the structure
+!-
+
+S$Mount( .Fab[Fab$a_Fna] );             ! mount structure             !a534
+
+$Rms_Parse( Fab=Fab, Err=Rms$Signal );  ! Parse to get expanded filespec
+$Rms_Search( Fab=Fab, Err=Rms$Signal ); ! Search to get first file
+Fab[Fab$v_Drj] = Fab[Fab$v_Nam] = 1;    ! Open by Nam Block
+                                        ! and do not release JFN
+
+Nam[Nam$v_Cha_Dev] =                                                     !a566v
+Nam[Nam$v_Cha_Dir] =
+Nam[Nam$v_Cha_Nam] =
+Nam[Nam$v_Cha_Ext] = 1;                 ! All new access                 !a566^
+
+IF .Fst[Fst$b_Operation] EQL Dap$k_Directory                             !a570
+THEN                                    ! Handle DIRECTORY specially
+    BEGIN
+    While .Fab[Fab$h_Sts] NEQ Rms$_Nmf DO
+        BEGIN
+        Fst[Fst$v_Display_3_Part_Name] = 1;     ! Return 3-part name always
+        Dap$3_Part_Name( Odd, Fab, Fst );
+
+        FillBlocks();
+
+        ! Build attributes & send
+
+        Dap$$Put_Attributes( Odd, Fab, Fst );  
+        IF .Config[Xab$b_Version] GEQ 7  ! If DAP v7 or later           !a643
+        THEN Dap$Put_Ack(Odd);           ! Put out an ACK               !m643
+        Dap$Put_Message( Odd );
+
+        ! Search for next file
+
+        $Rms_Search( Fab=Fab );
+        END;
+
+    Dap$Put_String( Odd,D_Acr );     ! Send access complete              !a603
+    Dap$Put_Message( Odd );          !        response                   !a603
+    END
+ELSE
+    Dap$3_Part_Name( Odd, Fab, Fst );  ! Return 3-part name if needed
+
+
+SELECTONE .fst[fst$b_operation] OF
+    SET
+    [Dap$k_Open]:      $Rms_Open(Fab=Fab, Err=Rms$Signal);
+    [Dap$k_Create]:    BEGIN                                              !m573
+                       LOCAL kd: REF $Rms_kdb INITIAL(.Fst[Fst$a_Kdb]);
+                       LOCAL ad: REF $Rms_adb[32] INITIAL(.Fst[Fst$a_Adb]);
+
+                       LOCAL XabTail: REF $XabSum_decl
+                             INITIAL(.FalFab[Fab$a_Xab]);
+
+                       ! Find end of XAB chain
+                       WHILE .XabTail[Xab$a_Nxt] NEQ 0
+                       DO XabTail=.XabTail[Xab$a_Nxt];
+
+                       ! Climb through the kdb chain, building key xabs
+                       WHILE .kd NEQ 0     ! We have keys defined, tell RMS
+                       DO  BEGIN
+                           BIND xk = FalXabKey [.kd[Kdb$h_Reference],0,0,0,0]:
+                                     $XabKey_decl,
+                           keyseg = xk[xab$h_siz0] : VECTOR,
+                           segvec = kd[kdb$z_segments] : VECTOR;
+
+                           $XabKey_Init( xab=xk, kref=.kd[Kdb$h_Reference] );
+
+			   xk[Xab$a_Knm]=.Knmbuf[.kd[Kdb$h_Reference]];
+
+                           xk[Xab$v_Dtp]=.kd[Kdb$v_Datatype];
+                           xk[Xab$h_Flg]=.kd[Kdb$h_Flags];
+                                         
+			   xk[Xab$h_dfl]=.kd[Kdb$h_dfl_offset];	!610
+			   xk[Xab$h_ifl]=.kd[Kdb$h_ifl_offset];	!610
+			   xk[Xab$b_Ian]=.kd[Kdb$b_Ian];	!610
+			   xk[Xab$b_Dan]=.kd[Kdb$b_Dan];	!610
+			   
+                           INCR i from 0 TO 7
+                           DO keyseg[.i]=.SegVec[.i];  ! Copy pos/siz pairs
+
+                           xabtail[Xab$a_Nxt]=xk;  ! Continue linked list !m600
+                           xabtail=xk;             !
+                           kd=.kd[Kdb$a_Nxt];
+                           END;
+
+                       IF .ad NEQ 0     ! We have areas defined, tell RMS
+                       THEN INCR i FROM 0 TO .ad[Adb$h_Bln]-1 DO
+                           BEGIN
+                           xabtail[xab$a_nxt] = FalXabAll[.i,0,0,0,0];
+                           xabtail = FalXabAll[.i,0,0,0,0];
+                           $XabAll_Init( Xab=.xabtail,
+                                         Aid=.i,
+                                         Bkz=.ad[adb$v_bkz,.i]);
+                           END;
+
+                       $Rms_Create(Fab=Fab, Err=Rms$Signal);
+                       END;
+
+    [Dap$k_Erase]:     BEGIN            ! Erase wildcarded files        !a633v
+                       WHILE 1          ! Note $RMS_Erase doesn'e expunge file
+                       DO BEGIN         ! (first 3-part name already output)
+                          Dap$$Put_Attributes( Odd, Fab, Fst ); ! Put attr out
+                          $RMS_Erase(FAB=fab, ERR=RMS$SIGNAL);  ! Erase file
+                          IF .Config[Xab$b_Version] GEQ 7  ! If DAP v7 or later
+                          THEN Dap$Put_Ack(Odd);           ! Put out an ACK
+                          $RMS_Search(FAB=fab);            ! Get next file
+                          IF .fab[FAB$H_STS] EQL RMS$_NMF  ! No more files?
+                          THEN EXITLOOP;                   ! yes, finish up
+                          Dap$3_Part_Name(Odd, Fab, Fst);  ! Send next name
+                          END;                             ! All files deleted
+                       DAP$Put_String( Odd,D_Acr );        ! Send access comp
+                       Dap$Put_Message( Odd );             !        response
+                       END;                                              !a633^
+
+    [Dap$k_Rename]:    BEGIN                                             !a635v
+                       BIND nnam = .nfab[FAB$A_NAM] : $NAM_DECL;
+                       fab[FAB$V_DRJ] = 0;      ! Release the jfns we get here
+                       WHILE 1
+                       DO BEGIN
+                          nnam[NAM$H_RSL] = 0;  ! Don't let RMS think
+                          nnam[NAM$H_ESL] = 0;  !  that there is a RSL or ESL
+                          $RMS_Parse(FAB=nfab); ! Let the rename catch errors
+
+                          $RMS_Rename(OLDFAB=fab, NEWFAB=nfab, ERR=RMS$SIGNAL);
+
+                          Dap$$Put_Attributes(Odd, Fab, Fst); ! Old attrib
+                          IF .Config[Xab$b_Version] GEQ 7  ! If DAP v7 or later
+                          THEN Dap$Put_Ack(Odd);           ! Put out an ACK 
+                          Dap$$Put_Attributes(Odd, NFab, Fst); ! New attrib
+
+                          IF .Config[Xab$b_Version] GEQ 7  ! If DAP v7 
+                          THEN Dap$Put_Ack(Odd);           ! Put out an ACK 
+                          Dap$Put_Message(Odd);
+                          $RMS_Parse(FAB=fab);             ! Any more files
+                          IF NOT $RMS_Status_ok(fab)       !  to rename?
+                          THEN EXITLOOP;                   ! If not, then exit
+                          $RMS_Search(FAB=fab);            ! yes, get it
+                          Dap$3_Part_Name(Odd, Fab, Fst);  ! Send old name
+                          END;
+                       DAP$Put_String(Odd, D_Acr);      ! Send access comp
+                       Dap$Put_Message(Odd);
+                       END;                                              !a635^
+
+    [Dap$k_Submit]:    BEGIN
+                       Fab[Fab$v_Scf]=1;        ! Set Submit-on-Close bit
+                       $Rms_Create(Fab=Fab, Err=Rms$Signal);
+                       END;
+    [Dap$k_Execute]:   BEGIN
+                       Fab[Fab$v_Scf]=1;        ! Set Submit-on-Close bit
+                       $Rms_Open(Fab=Fab, Err=Rms$Signal);
+                       $Rms_Close(Fab=Fab, Err=Rms$Signal);
+                       END;
+    [Dap$k_Directory]: ;                                                !d570
+    [OTHERWISE]:       Dap_Error(Odd,Dap$k_Mac_Unsupported,             !a635
+                          Dap$k_Mic_Access_Accfunc);                    !a635
+                                                                        !d635
+    TES;
+
+SELECTONE .fst[fst$b_operation] OF
+    SET
+    [Dap$k_Open,
+     Dap$k_Create,
+     Dap$k_Submit]:  Fst[Fst$v_Access_Active]= ! Access is active
+                      Fst[Fst$v_File_Open]=1;   ! Remember file is open
+    [Dap$k_Execute]:                                               !m635!m572
+        BEGIN                                                           !d603
+        Fst[Fst$v_Access_Active]=1;     ! Access is active
+        Fst[Fst$v_File_Open]=0;         ! No file is open
+        END;
+    [Dap$k_Rename,                                                       !a635
+     Dap$k_Erase,                                                        !a635
+     Dap$k_Directory]: BEGIN                                             !m635
+                       Fst[Fst$v_File_Open] = 0;      ! File not open    !m635
+                       Fst[Fst$v_Access_Active] = 0;  ! Access was ended !m635
+                       END;                                              !a635
+    TES;
+
+
+!+
+! Copy the file attributes into the FST that FAL uses
+!-
+Fst[Fst$h_Bsz] = .Fab[Fab$v_Bsz];       ! Use file byte size            !a557vv
+Fst[Fst$h_Rfm] = .Fab[Fab$v_Rfm];       ! and record format
+Fst[Fst$h_Rat] = .Fab[Fab$h_Rat];       ! and record attributes
+Fst[Fst$b_Fac] = .Fab[Fab$h_Fac];       ! and file access
+Fst[Fst$h_Fop] = .Fab[Fab$h_Fop];       ! and file access options
+Fst[Fst$h_Mrs] = .Fab[Fab$h_Mrs];       ! and maximum record size
+Fst[Fst$g_Mrn] = .Fab[Fab$g_Mrn];       ! and maximum record number     !a557^^
+
+
+.Fab[Fab$h_Sts]                         ! return status
+END;
+GLOBAL ROUTINE FillBlocks =
+!+
+! FUNCTIONAL DESCRIPTION
+!
+!       Fill in the Fabs & XABs for directory
+! 
+! IMPLICIT INPUTS
+!
+! FALFAB
+!-
+BEGIN
+BIND
+    Fab=FalFab: $Fab_Decl,
+    Fst=FalFst: $Rms_Fst,
+    Nam=.Fab[Fab$a_Nam]: $Nam_decl,
+    Idd=.Fst[Fst$a_I_Dd]: $Dap_Descriptor,
+    Odd=.Fst[Fst$A_O_Dd]: $Dap_Descriptor,
+    Typ=.Fab[Fab$a_Typ]: $Typ_Decl;
+
+!
+! Set up the appropriate Xabs by the display field
+! Date/Time and Summary XABs are already attached
+!
+LOCAL
+    xabtail: REF $XABSUM_DECL,
+    noa,                                ! Number Of Areas
+    nok,
+    hp_rab: VOLATILE,
+    hp_rst: VOLATILE,
+    hp_nlb: VOLATILE;
+
+
+
+ENABLE fal$handle (hp_rab, hp_rst, hp_nlb );    ! Enable handler
+hp_nlb=.fst[fst$a_nlb];                 ! Set up args for handler
+
+
+XabTail = .Fab[Fab$a_Xab];
+
+Fab[Fab$h_Fac] = Fab$m_Nil;             ! Nil access, no locking
+Fab[Fab$v_Drj] = Fab[Fab$v_Nam] = 1;    ! Keep the jfn, Open by NAM block
+
+$Rms_Open( Fab=Fab );                   ! Try to open file
+
+!
+! Loop through the XABs to find the end of the chain
+!
+
+WHILE 1 DO
+    BEGIN
+    IF .XabTail[Xab$v_Cod] EQL Xab$k_Sum
+    THEN
+        BEGIN       ! Find out how many areas & keys
+        nok=.XabTail[Xab$b_Nok];
+        noa=.XabTail[Xab$b_Noa];
+        END;
+
+    IF .XabTail[Xab$a_Nxt] NEQ 0
+    THEN XabTail=.XabTail[Xab$a_Nxt]
+    ELSE EXITLOOP;
+    END;
+
+!
+! Set up as many Key XABs as needed
+!
+    BEGIN
+    MAP xabtail: REF $Xabkey_decl;
+
+    INCR krf FROM 0 TO .nok-1
+    DO
+        BEGIN
+        xabtail[xab$a_nxt]=FalXabKey[.krf,0,0,0,0];
+        xabtail = FalXabKey[.krf,0,0,0,0];
+        $XabKey_Init( Xab=.xabtail,
+                      KRef=.krf );
+        END;
+    END;                        ! 
+
+
+!
+! Set up as many Allocation XABs as needed
+! At least 1, the vax requires it!
+
+noa = MAX( .noa, 1 );
+
+    BEGIN
+    MAP xabtail: REF $XabAll_decl;
+
+    INCR aid FROM 0 TO .noa-1
+    DO
+        BEGIN
+        xabtail[xab$a_nxt]=FalXabAll[.aid,0,0,0,0];
+        xabtail = FalXabAll[.aid,0,0,0,0];
+        $XabAll_Init( Xab=.xabtail,
+                      Aid=.aid );
+        END;
+    END;
+
+xabtail[xab$a_nxt] = 0;     !  End of the chain
+
+IF .Fab[Fab$a_Ifi] NEQ 0                ! If we got the file open
+THEN
+    BEGIN
+    $Rms_Display( Fab=Fab );            ! Fill in the XABs  
+    $Rms_Close( Fab=Fab );              ! Close the file again
+    END;
+
+Rms$_Suc
+END;
+
+GLOBAL ROUTINE Dap$Get_Control(  P_Dd: REF $Dap_Descriptor ) = 
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Routine to process a Control message
+!
+! FORMAL PARAMETERS:
+!
+!	P_DD:  Addr of DAP descriptor
+!  
+! IMPLICIT INPUTS:
+!
+!       RABVEC: This is the vector of RABs that FAL uses
+!       RSTVEC: This is the vector of RSTs that FAL uses
+!       For both of the above, the StreamId in the message header
+!       is used to select the RAB and the RST we want to use
+!
+! IMPLICIT OUTPUTS:
+!
+!       RAB and RST: point to the current RAB & RST
+!
+! ROUTINE VALUE:
+!
+!	CTLFUNC: the Control function code
+!
+! SIDE EFFECTS:
+!
+!	The requested Control function will have been initiated
+!
+!--
+BEGIN
+BIND idd=.p_dd: $dap_descriptor;
+BIND odd=.p_dd[dap$a_other_dd]: $dap_descriptor;
+
+BIND fab=FalFab: $Fab_decl,                                               !m557
+     fst=FalFst: $Rms_Fst;                                                !m557
+
+LOCAL hp_rab: VOLATILE REF $rab_decl,   ! Hold addresses of args for handler
+      hp_rst: VOLATILE REF $rms_rst,    !
+      hp_nlb: VOLATILE REF $xpn_nlb();  ! 
+
+ENABLE fal$handle (hp_rab, hp_rst, hp_nlb );    ! Enable handler
+hp_nlb=.fst[fst$a_nlb];                 ! Set up args for handler         !d557
+
+DO
+    BEGIN
+    SELECT dap$get_header(idd) OF
+    SET
+    [dap$k_control]:
+        BEGIN
+        BIND URab=RabVector[ .idd[Dap$b_StreamID], 0,0,0,0 ]: $Rab_decl,  !a557
+             URst=RstVector[ .idd[Dap$b_StreamID], 0,0,0,0 ]: $Rms_Rst;   !a557
+
+        LOCAL ctlfunc;
+        LOCAL ctlmenu: BITVECTOR[28] INITIAL(0);
+        LOCAL display: BITVECTOR[28] INITIAL(0);
+	LOCAL Key:     BYTE8VECTOR[256] INITIAL(0);			 !630
+        LOCAL dkrf;
+
+        Rab = Hp_Rab = URab;                                             !m560
+        Rst = Hp_Rst = URst;                                             !m560
+
+        ctlfunc=dap$get_byte(idd);
+
+        URst[rst$v_no_send_control]=1; ! Do not send control msg back
+                
+        dap$get_bitvector(idd,ctlmenu,1);       ! Get the message menu
+
+	IF .ctlmenu[dap$v_ctl_rac]		! RAC field present
+        THEN URab[rab$b_rac]=$dap_translate_value(dap$get_byte(idd),
+                                                  dap$k_rac_, rab$k_,
+                                                  seq,key,rfa,blk,tra,bft);
+
+	IF .ctlmenu[dap$v_ctl_key]              ! KEY field present     !m555vv
+        THEN
+            BEGIN
+            LOCAL recnum;
+
+            CASE .URab[Rab$b_Rac] FROM Rab$k_Seq TO Rab$k_Bft OF
+            SET
+            [Rab$k_Key]:
+
+!+ 630
+!  Read the key field into an intermediate buffer.  Then match up the
+!  Krf with the FST's Fdb to figure out how to decode the field.
+!-
+
+                CASE .Fab[Fab$v_Org] FROM Fab$k_Seq TO Fab$k_Idx OF
+                SET
+                [Fab$k_Idx]:
+                    BEGIN
+                    LOCAL ksz;
+                    ksz = Dap$Get_Variable_Counted (idd,
+                                 CH$PTR(key,0,8),
+                                 255);
+                    IF .ksz EQL Dap$_Ftl
+                    THEN SIGNAL(Rms$_Ksz)
+                    ELSE URab[Rab$b_Ksz] = .ksz;
+
+                    END; ! of Indexed file access by key
+                [Fab$k_Rel]:  ! Record number for relative files
+                    (.URab[Rab$a_Kbf]) = dap$get_longword(idd);
+                [INRANGE, OUTRANGE]: 
+                    Dap$Get_Variable_String(idd,0,255);  ! Ignore field   !a561
+                TES;
+            [Rab$k_Blk,
+             Rab$k_Bft]:
+                URab[rab$g_bkt] = Get_Vbn(idd);                           !m577
+
+            [Rab$k_Rfa]:
+                BEGIN                                                    !a605v
+                LOCAL rfa: BYTE8VECTOR[8];
+                Dap$Get_Variable_Counted( idd, CH$PTR(rfa,0,8), 8 );	 !m611
+                URab[Rab$g_Rfa] = Dap$Rfa_Dap_Rms(rfa);
+                END;                                                     !a605^
+
+            [INRANGE, OUTRANGE]:
+                Dap$Get_Variable_String( idd, 0, 255 );  ! Ignore field   !m561
+            TES;
+            END;  ! of code to handle KEY field                         !m555^^
+
+        dkrf = .URab[rab$b_krf];			! get last-used KRF!630
+  
+	IF .ctlmenu[dap$v_ctl_krf] 			! KRF field present
+        THEN
+            BEGIN
+            Urab[rab$b_krf] = dap$get_byte(idd);        ! get new KRF	!630
+            dkrf = .URab[rab$b_Krf];
+            END;
+
+        IF .ctlmenu[dap$v_ctl_key]			! If there was
+        AND (.Fab[Fab$v_Org] EQL Fab$k_Idx)		! an indexed KEY
+        THEN
+          BEGIN						! 630
+            LOCAL dtp;
+            LOCAL Xabptr: REF $XabKey_decl;
+
+            Xabptr = FalXabKey[.dkrf,0,0,0,0];
+            dtp = .Xabptr[Xab$v_Dtp];
+
+            SELECT .dtp OF
+              SET
+                 [Xab$k_In4, Xab$k_Bn4]:
+                    BEGIN
+                    .URab[Rab$a_kbf] = Num_Vb (key);
+                    URab[Rab$b_Ksz] = 4;			! 620
+                    END;
+                 [Xab$k_Stg, Xab$k_Ebc, Xab$k_Pac]:       ! ascii
+                    BEGIN
+                    LOCAL ksz,
+                          Keyptr;
+                    Keyptr=.URab[Rab$a_Kbf];
+                    TGUPointer (Keyptr, .Fst[Fst$h_Bsz] );
+                    ksz = chacaz (CH$PTR(key,0,8),.Keyptr);
+                    URab[Rab$b_Ksz] = .ksz;
+                    END;
+
+                 [OTHERWISE]: SIGNAL(Rms$_dtp);
+              TES;
+          END;
+
+	IF .ctlmenu[dap$v_ctl_rop] ! ROP field present
+        THEN
+            BEGIN
+            LOCAL rop: BITVECTOR[42] INITIAL(0,0);
+            dap$get_bitvector(idd,rop,6);
+
+            $dap_move_bits(rop, dap$v_rop_, ! Translate DAP bits
+                           URab, rab$v_, ! to RMS ones
+                           eof,fdl,loc,rah,loa,wbh,kgt,kge,pad,
+                           nrp,uif,ulk,tpt,nlk,bio,lim,nxr);
+            END;
+
+	IF .ctlmenu[dap$v_ctl_hsh] ! HSH field present
+        THEN
+            BEGIN
+            dap_error(odd,dap$k_mac_unsupported,dap$k_mic_control_hsh);
+            ! Not Supported -- Reserved as of DAP 7.0
+            END;
+
+	IF .ctlmenu[dap$v_ctl_display] ! DISPLAY field present
+        THEN
+            BEGIN
+            dap$get_bitvector(idd,display,4);
+            Fst[Fst$v_Display] = .display;
+            END;
+
+
+        ! Save the function code away
+        fst [ fst$b_operation ] = .ctlfunc ;
+
+        ! Now do the requested function
+        control ( URab, URst )
+        END;
+
+    [DAP$K_ACCESS_COMPLETE]:
+        BEGIN
+        BIND URab=RabVector[ .idd[Dap$b_StreamID], 0,0,0,0 ]: $Rab_decl;
+        BIND URst=RstVector[ .idd[Dap$b_StreamID], 0,0,0,0 ]: $Rms_Rst; !a561
+
+        Hp_Rab = URab;                                                !a557
+        Hp_Rst = URst;                                                !a561
+
+        dap$get_access_complete ( idd, Fab, URab, URst ) ;
+        END;
+
+    [OTHERWISE]:
+        dap_error (odd, dap$k_mac_sync, .idd[dap$b_operator] )
+    TES;
+    END WHILE .fst[fst$v_file_open]
+END;
+
+ROUTINE dap$generation_check(p_pointer) : NOVALUE =                  !a635vv
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Check for a  filename of the  form "file.type;gen" and  change it  into
+!       "file.type.gen".   Also  check  for  "<>file.type"  and  change  it  to
+!       "file.type".  Yuk.
+!
+! FORMAL PARAMETERS:
+!
+!       Byte pointer to ASCIZ filename to check.
+!--
+BEGIN
+
+LOCAL char,
+      bpointer,
+      pointer;
+
+! Braindamaged VMS gives us a directory string of "<>", so look for that
+
+pointer = .p_pointer;                   ! Copy byte pointer to string
+INCR i FROM 1 TO 255                    ! Look through for the length of string
+DO BEGIN
+   IF (char = CH$RCHAR_A(pointer)) EQL 0        ! If we hit a null we are done
+   THEN EXITLOOP;
+   IF .char EQL %C'<' OR .char EQL %C'['        ! Is it the beginning of a dir?
+   THEN BEGIN                                   ! yes
+        char = CH$RCHAR_A(pointer);             ! Get the next character
+        IF .char NEQ %C'>' AND .char NEQ %C']'  ! Is it the end of dir spec?
+        THEN EXITLOOP;                          ! Nope, there is nothing wrong
+        bpointer = CH$PLUS(.pointer,-2);        ! Back up by two please
+        INCR j FROM 1 TO 255-.i                 ! Look through the rest of str
+        DO BEGIN                                ! Move string back 2 characters
+           char = CH$RCHAR_A(pointer);          ! Get a character
+           CH$WCHAR_A(.char,bpointer);          ! Move it back by two
+           IF .char EQL 0 THEN EXITLOOP;        ! If null exit INCR j loop
+           END;                                 ! End of INCR j loop
+        EXITLOOP;                               ! And exit INCR i loop
+        END;                                    ! End of INCR i loop
+   END;
+
+! Look for the end of the string
+
+pointer = .p_pointer;                   ! Copy byte pointer to string
+INCR i FROM 1 TO 255                    ! For the length of the string
+DO IF CH$RCHAR_A(pointer) EQL 0 THEN EXITLOOP;  ! Find the null there
+pointer = CH$PLUS(.pointer,-1);         ! Back up over the null
+
+! Look backwards until a ";" found, quitting if anything besides a digit is
+! found.
+
+UNTIL .pointer EQL .p_pointer           ! Until we are back at the start
+DO BEGIN                                ! Loop through here
+
+   pointer = CH$PLUS(.pointer,-1);      ! Back up by one
+   char = CH$RCHAR(.pointer);           ! Get that character
+
+   IF .char EQL %C';'                   ! is the character a semicolon? 
+   THEN BEGIN                           ! Yes
+        CH$WCHAR(%C'.',.pointer);       ! Change it back to a period
+        EXITLOOP;                       ! And return
+        END;
+
+   IF .char NEQ %C'-' AND (.char LSS %C'0' OR .char GTR %C'9')
+   THEN RETURN;                         ! Return now if character not numeric
+
+   END;
+
+END;                                                                    !a635^^
+
+ROUTINE control ( p_rab: REF $rab_decl, p_rst: REF $rms_rst ) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Perform a record access as requested by remote user
+!
+! FORMAL PARAMETERS:
+!
+!       P_RAB:     Address of RMS RAB
+!       P_RST:     Address of RST
+!
+! IMPLICIT INPUTS:
+!
+!       FAB: Address of FAB
+!       FST: Address of FST
+!--
+BEGIN
+BIND Urst=.p_rst: $rms_rst,   ! URst is an argument, Rst is the global !M557ff
+     Urab=.p_rab: $rab_decl,  ! URab is an argument, Rab is the global !M557ff
+     UFab=.Fab: $Fab_decl,
+     UFst=.Fst: $Rms_Fst,
+     idd=.Fst[Fst$a_I_Dd]: $dap_descriptor,
+     odd=.Fst[Fst$a_O_Dd]: $dap_descriptor;
+LOCAL
+     rabsav: REF $Rab_decl VOLATILE,
+     rstsav: REF $Rms_Rst VOLATILE;
+
+ENABLE Fal$Handle ( rabsav, rstsav );
+
+rabsav=URab;
+rstsav=URst;
+
+CASE .fst[fst$b_operation] FROM 1 TO dap$k_ctlfunc_max OF
+    SET
+    [Dap$k_Get]:                    ! GET RECORD(S)
+        BEGIN
+        
+        SELECT .URab[Rab$b_Rac] OF
+            SET
+            [Rab$k_Bft]:    ! Block mode file transfer
+                BEGIN
+                Fst[Fst$h_File_Class] = Typ$k_Image;    ! Block image !a541
+
+                DO  BEGIN
+                    $Rms_Read (Rab=URab, Err=Rms$Signal);    ! Get a record
+                    Dap$$Put(URab, URst, Rms$Signal);
+                    URab[Rab$g_Bkt] = .URab[RAb$g_Rfa]+1; ! Next bucket
+                    END WHILE 1;
+                END;
+
+            [Rab$k_Tra]:                ! Sequential File Transfer
+                BEGIN                   ! in Record Mode
+                DO  BEGIN
+                    $Rms_Get(Rab=URab, Err=Rms$Signal);    ! Get a record
+                    Dap$$Put(URab, URst, Rms$Signal)
+                    END WHILE 1;
+                END;
+
+            [Rab$k_Blk]:    ! random $READ
+                BEGIN
+                Fst[Fst$h_File_Class] = Typ$k_Image;    ! Block image !a541
+                $Rms_Read (Rab=URab, Err=Rms$Signal);
+                Dap$$Put (URab, URst, Rms$Signal);
+                Dap$Put_Success( Odd);                  ! Win status  !a555
+                END;
+
+            [OTHERWISE]:        ! Record mode $GET
+                BEGIN
+                $Rms_Get (Rab=URab, Err=Rms$Signal);
+                Dap$$Put (URab, URst, Rms$Signal);
+                Dap$Put_Success( Odd);                  ! Win status  !a555
+                END;
+            TES;
+        END;
+    [Dap$k_Connect]:                ! INITIATE A DATA STREAM
+        BEGIN
+        LOCAL Rac;
+
+        !+
+        ! Set up the RAB we are going to use
+        !-                                                              !a557vv
+        URab[Rab$h_Bid] = Rab$k_Bid;
+        URab[Rab$h_Bln] = Rab$k_Bln;
+        $Rab_Store(Rab=URab, Fab=UFab,
+                   ubf=UsrBuf, usz=dap$k_buffer_size/(%BPUNIT/8),
+                   Kbf=KeyBuf, Ksz=255 );
+
+        URst[Rst$h_Bln] = Rst$k_Bln;                 ! Set up the RST
+        URst[Rst$h_Bid] = Rst$k_Bid;                 ! 
+        URst[Rst$a_Fst] = .Fst;                      !          
+        URst[Rst$v_StreamId] = .Idd[Dap$b_StreamId]; !                  !a557^^
+
+        ! Now save the RAC & make TRA, BLK, or BFT into SEQ
+        Rac=.URab[Rab$b_Rac];
+        SELECT .Rac OF
+            SET
+            [Rab$k_Tra,
+             Rab$k_Blk,
+             Rab$k_Bft]: URab[Rab$b_Rac]=Rab$k_Seq;
+            [ALWAYS]:
+                BEGIN
+                $Rms_Connect(Rab=URab, Err=Rms$Signal); ! Connect RAB to FAB
+                Dap$Put_Ack(Odd);           ! Acknowledge the connect
+                Dap$Put_Message(Odd);
+                END;
+            [Rab$k_Tra,
+             Rab$k_Blk,
+             Rab$k_Bft]: URab[Rab$b_Rac]=.Rac; ! Restore RAC
+            TES;
+
+        IF .Fst[Fst$v_Accopt_Crc]       ! If checking CRC !a533
+        THEN URst[Rst$h_Checksum] = %O'177777'; ! CRC-16  !a533
+
+        END;
+
+    [Dap$k_Update]:                 ! UPDATE CURRENT RECORD
+        BEGIN
+        Dap$$Get( URab, URst, Rms$Signal);        ! Read record
+        $Rms_Update (Rab=URab, Err=Rms$Signal);      ! Update record
+        Dap$Put_Success( Odd);                  ! Win status  !a555
+        END;
+
+    [Dap$k_Put]:                    ! PUT FOLLOWING RECORD(S)
+        BEGIN
+        LOCAL Rac;
+        ! Now save the RAC & make TRA, BLK, or BFT into SEQ
+        Rac=.URab[Rab$b_Rac];
+        SELECT .Rac OF
+            SET
+            [Rab$k_Tra]:
+                BEGIN
+                URab[Rab$b_Rac]=Rab$k_Seq;
+                                                                         !M542 
+                WHILE Dap$$Get(URab, URst, Rms$Signal) NEQ 0     ! Read record
+                DO $Rms_Put(Rab=URab, Err=Rms$Signal);          ! Write record
+
+                URab[Rab$b_Rac]=.Rac; ! Restore RAC
+                END;
+
+            [Rab$k_Bft]:    ! Block mode file transfer
+                BEGIN                                                     !M542
+                Fst[Fst$h_File_Class] = Typ$k_Image; !a542
+
+                WHILE Dap$$Get(URab, URst, Rms$Signal) NEQ 0  ! Read block
+                DO
+                    BEGIN
+                    URab[Rab$g_Bkt] = .URab[Rab$g_Rfa];                   !a542
+                    $Rms_Write(Rab=URab, Err=Rms$Signal);   ! Write block !m542
+                    END
+                END;
+
+            [Rab$k_Blk]:    ! Block mode $WRITE
+                BEGIN
+                Dap$$Get( URab, URst, Rms$Signal);        ! Read block
+                $Rms_Write (Rab=URab, Err=Rms$Signal);       ! Write block
+                Dap$Put_Success( Odd);                  ! Win status  !a555
+                END;
+            [OTHERWISE]:        ! Record mode $PUT
+                BEGIN
+                Dap$$Get( URab, URst, Rms$Signal);        ! Read record
+                $Rms_Put (Rab=URab, Err=Rms$Signal);         ! Write record
+                Dap$Put_Success( Odd);                  ! Win status  !a555
+                END;
+            TES;
+        END;                    ! End of $PUT/$WRITE
+
+    [Dap$k_Delete]:                 ! DELETE CURRENT RECORD
+        BEGIN
+        $Rms_Delete (Rab=URab, Err=Rms$Signal);
+        Dap$Put_Success( Odd);                  ! Win status  !a555
+        END;
+
+    [Dap$k_Rewind]:                 ! REWIND FILE
+        BEGIN
+        $Rms_Disconnect (Rab=URab, Err=Rms$Signal);
+        $Rms_Connect (Rab=URab, Err=Rms$Signal);
+        Dap$Put_Success( Odd);                  ! Win status  !a555
+        END;
+
+    [Dap$k_Truncate]:               ! TRUNCATE FILE
+        BEGIN
+        $Rms_Truncate (Rab=URab, Err=Rms$Signal);
+        Dap$Put_Success( Odd);                  ! Win status  !a555
+        END;
+
+    [Dap$k_Release]:                ! UNLOCK RECORD
+        BEGIN
+        $Rms_Release (Rab=URab, Err=Rms$Signal);
+        Dap$Put_Success( Odd);                  ! Win status  !a555
+        END;
+
+    [Dap$k_Free]:                   ! UNLOCK ALL RECORDS
+        BEGIN
+        $Rms_Free (Rab=URab, Err=Rms$Signal);
+        Dap$Put_Success( Odd);                  ! Win status  !a555
+        END;
+
+    [Dap$k_Flush]:                  ! WRITE OUT ALL MODIFIED I/O BUFS
+        BEGIN
+        $Rms_Flush (Rab=URab, Err=Rms$Signal);
+        Dap$Put_Success( Odd);                  ! Win status  !a555
+        END;
+
+    [Dap$k_Find]:                   ! FIND RECORD
+        BEGIN
+        $Rms_Find (Rab=URab, Err=Rms$Signal);
+        Dap$Put_Success( Odd);                  ! Win status  !a555
+        END;
+
+!            [DAP$K_MODIFY]:                 ! MODIFY FILE ATTRIBUTES
+!            [DAP$K_EXTEND_BEGIN]:           ! FORWARD/BACKWARD SPACE
+!            [DAP$K_NXTVOL]:                 ! START NEXT VOLUME
+!            [DAP$K_EXTEND_END]:             ! EXTEND FILE BY ALC MSG
+    [Dap$k_Display]:                ! RETRIEVE ATTRIBUTES MESSAGE !a545vv
+        BEGIN
+        $Rms_Display( Fab=UFab, Err=Rms$Signal);
+        Dap$$Put_Attributes( Odd, UFab, UFst );  
+        Dap$Put_Ack( Odd );
+        Dap$Put_Message( Odd );
+        END;                                                      !a545^^
+!            [DAP$K_SPACE_FORWARD]:          ! FORWARD SPACE
+!            [DAP$K_SPACE_BACKWARD]:         ! BACKWARD SPACE
+!            [DAP$K_CHECKPOINT]:             ! CHECKPOINT
+!            [DAP$K_RECOVERY_GET]:           ! GET, recovering after checkpoint
+!            [DAP$K_RECOVERY_PUT]:           ! PUT, recovering after checkpoint
+    [INRANGE]: Dap_Error(Odd,Dap$k_Mac_Unsupported,
+                             Dap$k_Mic_Control_Ctlfunc);
+    [OUTRANGE]: Dap_Error(Odd,Dap$k_Mac_Invalid,
+                              Dap$k_Mic_Control_Ctlfunc);
+    TES;
+.URab[rab$h_sts]                         ! Return status
+END;                                    ! CONTROL
+
+GLOBAL ROUTINE dap$get_access_complete (p_dd: REF $dap_descriptor,
+                                          p_fab: REF $fab_decl,
+                                          p_rab: REF $rab_decl,
+                                          p_rst: REF $rms_rst )=
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Routine to process an ACCESS COMPLETE message
+!	The message header may have already been eaten
+!
+! FORMAL PARAMETERS:
+!
+!	P_DD:  Addr of DAP descriptor
+!       P_FAB: Addr of FAB
+!       P_RAB: Addr of RAB
+!       P_RST: Addr of rst
+!
+! IMPLICIT INPUTS:
+!
+!       FALFST: Fst
+!
+! ROUTINE VALUE:
+!
+!	CMPFUNC: the ACCESS COMPLETE function code
+!
+! SIDE EFFECTS:
+!
+!	The accessed file, if any, will be closed or flushed
+!
+!--
+BIND Idd=.p_Dd: $Dap_Descriptor;
+Bind Odd=.idd[Dap$a_Other_Dd]: $Dap_Descriptor;
+BIND Fab=.p_Fab: $Fab_decl;
+BIND Nam=.Fab[Fab$a_Nam]: $Nam_decl;    ! In Same section as we are in
+BIND Rab=.p_Rab: $Rab_decl;
+BIND Rst=.p_Rst: $Rms_Rst;
+BIND Fst=FalFst: $Rms_fst;
+
+LOCAL fop: BITVECTOR[42];
+LOCAL original_fop: BITVECTOR[18];
+LOCAL checksum;
+LOCAL cmpfunc;
+LOCAL v;
+
+original_fop=.fab[fab$h_fop];                      ! Save original fop bits
+
+If .idd[dap$h_length] LEQ 0                        ! If we have not read header
+THEN IF dap$get_header(idd) NEQ dap$k_access_complete ! do so, and if it isnt
+     THEN                                          ! Access Complete
+         BEGIN                                     ! 
+         dap$unget_header(idd);                    !  then regurgitate  
+         RETURN 0                                  !  and return
+         END;
+
+cmpfunc=dap$get_byte(idd);                         ! Save ACCOMP function
+
+IF .idd[dap$h_length] GTR 0                        ! If message continues
+THEN                                               ! next field is a FOP
+    BEGIN
+    dap$get_bitvector(idd,fop,6);                  ! Get FOP field
+    $dap_move_bits(fop,dap$v_fop_,fab,fab$v_,                          !m573
+                   rwo,rwc,pos,dlk,lck,
+                   ctg,sup,nef,tmp,mkd,dmo,
+                   wck,rck,cif,lko,sqo,mxv,spl,
+                   scf,dlt,cbt,wat,dfw,tef,
+                   drj);
+    END;
+
+    IF .idd[dap$h_length] GTR 0         ! If anything left in message
+    THEN                                ! It must be the checksum      !a533vv
+        BEGIN
+        LOCAL checksum;
+
+        IF .Fop[Dap$v_Fop_Dlt]		! 610 If we're deleting the file
+        AND .cmpfunc EQL Dap$k_Accomp_Command  ! 610 on a close
+        THEN Dap$Eat_message (idd)	! 610 don't bother with checksum
+        ELSE
+            BEGIN
+            checksum=dap$get_2byte(idd);  ! Get checksum field if any
+
+            IF (.checksum NEQ .Rst[Rst$h_Checksum])   !If it was wrong
+            AND .Fst[Fst$v_Accopt_Crc]            ! and the caller cares !a561
+            THEN SIGNAL( Dap$_Crc );
+            END;
+        END;                                                            !a533^^
+
+v=(CASE .cmpfunc FROM 1 TO Dap$k_Accomp_Max OF
+   SET
+    [Dap$k_Accomp_Command]:
+                    BEGIN
+                    ! Allow search afterwards if wildcarded
+                    Fab[Fab$v_Drj] = ( Nam NEQ 0 AND .Nam[Nam$v_Wildcard]);
+                                                                        !m577
+                    $Rms_Close (Fab=Fab, Err=Rms$Signal);     ! close the file
+
+                    IF .Fab[Fab$v_Drj]                                  !m577
+                    THEN
+                        BEGIN
+                        $Rms_Search (Fab=Fab);      ! Look for more files
+
+                        IF .Fab[Fab$h_Sts] NEQ Rms$_Nmf
+                        THEN Dap$3_Part_Name( Odd, Fab, Fst );  !a566
+
+                        IF .Fab[Fab$h_Sts] EQL Rms$_Suc
+                        THEN            ! Found one
+                            BEGIN       ! Send new attributes & RETURN
+                            $Rms_Open (Fab=Fab, Err=Rms$Signal );
+                            Dap$$Put_Attributes( Odd, Fab, Fst );
+                            Dap$Put_Ack( Odd );
+                            Dap$Put_Message( Odd );
+                            Fst[Fst$v_File_Open]=1;     ! file open now !a566
+                            RETURN Dap$k_Accomp_Command;
+                            END
+                        END;
+
+                    Fst[Fst$v_File_Open]=0;     ! no file open now
+
+                    Dap$Put_String(Odd,D_Acr);
+                    Dap$Put_Message(Odd);
+
+                    Dap$k_Accomp_Command        ! we won & we're done
+                    END;
+    [Dap$k_Accomp_Response]:
+                    Dap_Error(Idd, Dap$k_Mac_Invalid,Dap$k_Mic_Accomp_Cmpfunc);
+                    ! An Active task is not supposed to send this
+    [Dap$k_Accomp_Purge]:
+                    BEGIN
+                    EXTERNAL ROUTINE r$reset;          !?
+                    EXTERNAL ROUTINE r$null;           !?
+                    r$reset(fab,r$null);               !?
+                    fst[fst$v_file_open]=0;            ! No file open now
+
+                    dap$put_string(odd,d_acr);
+                    dap$put_message(odd);
+
+                    dap$k_accomp_purge                 ! They gave up on us
+                    END;
+    [DAP$K_ACCOMP_EOS]:                            ! $DISCONNECT rab
+                    BEGIN
+                    $Rms_disconnect ( rab=rab, err=rms$signal );
+
+                    dap$put_string(odd,d_acr);
+                    dap$put_message(odd);
+                    Dap$k_Accomp_Eos
+                    END;
+
+    [Dap$k_Accomp_Skip]:
+                    BEGIN
+                    !+
+                    ! This is like Accomp_Command except
+                    ! that the FOP close options are NOT honored.
+                    ! Unlike Accomp_Purge, wildcard access may continue.
+                    !-
+
+                    Fst[Fst$h_Fop] = .Fab[Fab$h_Fop];   ! Save the real FOP
+                    Fab[Fab$h_Fop] = Fab$m_Drj+Fab$m_Nam ; ! Allow search
+
+                    IF (.Fab[Fab$a_Ifi] NEQ 0)    ! If the file is open   !a566
+                    THEN $Rms_Close (Fab=Fab, Err=Rms$Signal); ! close the file
+
+                    Fab[Fab$h_Fop] = .Fst[Fst$h_Fop];   ! Get back the real FOP
+
+                    IF Nam NEQ 0 AND .Nam[Nam$v_Wildcard]    
+                    THEN
+                        BEGIN
+                        $Rms_Search (Fab=Fab);      ! Look for more files
+
+                        IF .Fab[Fab$h_Sts] NEQ Rms$_Nmf
+                        THEN Dap$3_Part_Name( Odd, Fab, Fst );  !a566
+
+                        IF .Fab[Fab$h_Sts] EQL Rms$_Suc
+                        THEN            ! Found one
+                            BEGIN       ! Send new attributes & RETURN
+                            $Rms_Open( Fab=Fab, Err=Rms$Signal );
+                            Dap$$Put_Attributes( Odd, Fab, Fst );
+                            Dap$Put_Ack( Odd );
+                            Dap$Put_Message( Odd );
+                            Fst[Fst$v_File_Open]=1;     ! file open now !a566
+                            RETURN Dap$k_Accomp_Skip;
+                            END
+                        END;
+
+                    Fst[Fst$v_File_Open]=0;     ! no file open now
+
+                    Dap$Put_String(Odd,D_Acr);
+                    Dap$Put_Message(Odd);
+
+                    Dap$k_Accomp_Skip        ! we won & we're done
+                    END;
+
+    [Dap$k_Accomp_Change_Begin]:
+                    BEGIN
+                    Dap_Error(Idd, Dap$k_Mac_Unsupported,
+                                   Dap$k_Mic_Accomp_Cmpfunc);
+                    Dap$k_Accomp_Change_Begin
+                    END;
+
+    [Dap$k_Accomp_Change_End]:
+                    BEGIN
+                    Dap_Error(Idd, Dap$k_Mac_Unsupported,
+                                   Dap$k_Mic_Accomp_Cmpfunc);
+                    Dap$k_Accomp_Change_End
+                    END;
+
+    [Dap$k_Accomp_Terminate]:
+                    BEGIN
+                    Fab[Fab$v_Drj]=0;           ! No more files! Period!
+                    $Rms_Close (Fab=Fab, Err=Rms$Signal);     ! close the file
+                    Fst[Fst$v_File_Open]=0;     ! no file open now
+
+                    Dap$Put_String(Odd,D_Acr);
+                    Dap$Put_Message(Odd);
+
+                    Dap$k_Accomp_Terminate       ! we won & we're done
+                    END;
+
+    [OUTRANGE]:     BEGIN                          ! Not a valid function code
+                    dap_error(odd,
+                              dap$k_mac_invalid,
+                              dap$k_mic_accomp_cmpfunc)
+                    END;
+TES);
+
+fab[fab$h_fop]=.original_fop;                      ! Restore the FOP
+
+.v                 ! Returned value is Access Complete function code
+END;	!DAP$GET_ACCESS_COMPLETE
+
+GLOBAL ROUTINE dap$put_ack ( dd: REF $dap_descriptor ): NOVALUE=
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Build an ACK message
+!
+! FORMAL PARAMETERS:
+!
+!       DD:     Addr of output DAP message descriptor
+!
+!--
+    BEGIN				
+    Init_Message(dd[$]);                ! Set up dap descriptor
+    Dd[Dap$b_Operator]=dap$k_ack;       ! Build header
+    Dd[Dap$v_Mflags_Length] = 1;        ! Send length field
+    Dd[Dap$h_Length] = 0;               ! No data
+    dap$put_header(dd[$]);              !
+    END;                                ! DAP$PUT_ACK
+GLOBAL ROUTINE dap$error_rms_dap (stscode) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Return appropriate DAP Miccode for RMS error code
+!
+! FORMAL PARAMETERS:
+!
+!       STSCODE: RMS error code
+!
+!--
+    BEGIN				
+    SELECT .STSCODE OF
+        SET
+        $dap$$translate_value(rms$_,dap$_,
+                              bug,bsz,ccf,ccr,cef,cgj,chg,cod,cof,cur,
+                              dan,del,dev,dup,dtp,dme,dnf,eof,ext,
+                              fex,flg,flk,fnf,fnm,fop,ful,ian,iop,key,ksz,
+                              mrn,mrs,nef,nmf,npk,org,pos,prv,
+                              rac,rat,rbf,rer,rex,rfa,rfm,rlk,rnf,rnl,rop,rsz,
+                              rtb,shr,siz,
+                              typ,ubf,usz,wer,wlk,
+                              xab,xcl
+                              );
+                                                                          !m662
+
+        [rms$_fsi]: dap$_syn;
+        [Dap$k_Facility_Code TO Dap$k_Facility_Code+%O'7777777']: !a545
+               .StsCode;                ! Already what we want    !a545
+        [OTHERWISE]:  0;
+        TES
+    END;                                ! DAP$ERROR_RMS_DAP
+GLOBAL ROUTINE dap$put_status(p_dd: REF $dap_descriptor,
+                              maccode,
+                              miccode,
+                              rfa,
+                              recnum,
+                              stv,
+                              p_txt): NOVALUE=
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Build a STATUS message, using specified status codes
+!
+! FORMAL PARAMETERS:
+!
+!       P_DD:      Address of DAP message descriptor
+!       MACCODE: As defined in DAP spec
+!       MICCODE: As defined in DAP spec
+!                 or put the whole code in MICCODE and leave MACCODE 0
+!       RFA:     RFA number in error
+!       RECNUM:  Record number in error
+!       STV:     Secondary status code
+!       TXT:     String descriptor to text if nonzero
+!--
+    BEGIN				! Fix handling of RFAs & recnums  !m605
+    BIND dd=.p_dd: $Dap_Descriptor;
+    BIND txt=.p_txt: $str_descriptor();
+    LOCAL macmic;                       ! Combined code goes here
+                                        ! !----!------------!
+    macmic=.miccode+.maccode;           ! !MAC !    MIC     !
+                                        ! !----!------------!
+                                        ! 4 bits  12 bits
+
+    IF .macmic GTR Dap$k_Facility_Code  ! If we got a 32-bit condition code
+    THEN macmic=.macmic<DapCode>;       ! Convert to 16-bit Dap status code
+
+    init_message(dd);                ! 
+    dd[dap$b_operator]=dap$k_status; ! Build header
+    dd[dap$h_length]=2;              ! Length of MACCODE+MICCODE
+    dap$put_header(dd);              !
+    dap$put_2byte(dd,.macmic);       ! Put maccode & miccode as 2 byte field
+
+    IF .rfa NEQ 0
+    THEN
+        BEGIN
+        LOCAL vrfa: BYTE8VECTOR[8];
+        Dap$Rfa_Rms_Dap( .rfa, vrfa );
+        Dap$Put_Variable_Counted(dd,CH$PTR(vrfa,0,8));  ! And the RFA !m611
+        END;
+
+    IF .recnum NEQ 0 THEN dap$put_longword(dd,.recnum); ! And the record number
+    IF .stv NEQ 0 THEN dap$put_longword(dd,.stv);       ! And the STV
+    IF txt NEQ 0                                        ! Send text if any
+    THEN
+        BEGIN
+        dap$put_byte(dd,.txt[str$h_length]);
+        dap$put_string(dd,txt);
+        END;
+    END;                                ! DAP$PUT_STATUS
+GLOBAL ROUTINE dap$put_Success( dd: REF $dap_descriptor ): NOVALUE=
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Build and send a STATUS message, using SUCCESS status codes
+!
+! FORMAL PARAMETERS:
+!
+!       DD:      Address of DAP message descriptor
+!
+! IMPLICIT INPUTS:
+!
+!       MACCODE: Dap$k_Mac_Success (as defined in DAP spec)
+!       MICCODE: Dap$k_Err_Normal  (As defined in DAP spec)
+!       RFA:     from Rab[Rab$g_Rfa] 
+!       RECNUM:  0
+!       STV:     0
+!       TXT:     0
+!--
+BEGIN
+Dap$Put_Status( .dd,                    ! Use output descriptor we were passed
+                Dap$k_Mac_Success,      ! Normal success return
+                Dap$k_Err_Normal,       ! Normal success return
+                .Rab[Rab$g_Rfa],        ! Return the RFA to the user
+                0,                      ! No RECNUM
+                0,                      ! No STV
+                0                       ! No text of error message
+              );
+
+Dap$Put_Message( .dd );                 ! Force it out
+END;   ! Dap$Put_Success
+
+
+GLOBAL ROUTINE dap$get_continue ( p_dd: REF $dap_descriptor )=
+!++
+! FUNCTIONAL DESCRIPTION
+!
+!      Flush all messages in the pipe until a CONTINUE is seen.
+!      Then parse the CONTINUE message and return its function code
+!
+! FORMAL PARAMETERS
+!
+!      P_DD: address of input dap descriptor
+!
+! RETURNED VALUE
+!
+!      dap function code for CONTINUE message
+!--
+BEGIN
+BIND dd=.p_dd: $dap_descriptor;
+
+! Ignore all messages until a CONTINUE message
+WHILE dap$get_header (dd) NEQ dap$k_continue
+DO dap$eat_message (dd);                ! Throw away this message
+
+dap$get_byte (dd)                       ! Return CONTINUE function code
+END;
+
+GLOBAL ROUTINE dap$retry_last_operation ( p_blk: REF $rab_decl,
+                                          P_st: REF $rms_rst )=
+!++
+! FUNCTIONAL DESCRIPTION
+!
+!      Retry the last operation we attempted
+!
+! FORMAL PARAMETERS
+!
+!      P_BLK: address of RAB or FAB (as appropriate)
+!      P_ST:  address of FST or RST ( "  " )
+!
+! RETURNED VALUE
+!
+!      whatever the last operation returns when we retry it
+!
+!--
+BEGIN
+IF .P_Blk[rab$h_bid] EQL fab$k_bid
+THEN access ( .P_Blk, .P_st )
+ELSE control ( .P_blk, .P_st )
+END;
+
+
+ROUTINE Dap$3_Part_Name( P_Odd, P_Fab, P_Fst ): NOVALUE =
+!+
+! Send 3-part Name Message(s) if needed
+!-
+BEGIN                                                                !a566v
+BIND Odd=.P_Odd: $Dap_Descriptor,
+     Fab=.P_Fab: $Fab_decl,
+     Nam=.Fab[Fab$a_Nam]: $Nam_decl,
+     Fst=.P_Fst: $Rms_Fst;
+
+IF .Nam[Nam$v_Wildcard]
+THEN Fst[Fst$v_Display_3_Part_Name] = 1;
+
+IF .Fst[Fst$v_Display_3_Part_Name]                               
+THEN
+    BEGIN
+    Local Nametype: BITVECTOR[28];
+
+    IF .Nam[Nam$v_Cha_Str]
+    THEN
+        BEGIN
+        Nametype=0;
+        Nametype[Dap$k_Nametype_Str]=1;
+        Dap$Put_Name( Odd, Fab, Nametype );
+        END;
+
+    IF .Nam[Nam$v_Cha_Dir]
+    THEN
+        BEGIN
+        Nametype=0;
+        Nametype[Dap$k_Nametype_Dir]=1;
+        Dap$Put_Name( Odd, Fab, Nametype );
+        END;
+
+    !+
+    ! Send the filename and extension in any case
+    !-
+    Nametype=0;                                                 
+    Nametype[Dap$k_Nametype_Nam]=1;
+    Dap$Put_Name( Odd, Fab, Nametype );
+    END;             
+END; !Dap$3_Part_Name                                                 !A566^
+
+END ELUDOM
+   

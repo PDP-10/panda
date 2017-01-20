@@ -1,0 +1,1098 @@
+
+%TITLE 'P U T   -- $PUT service'
+!<BLF/REQUIRE 'RMSBLF.REQ'>
+MODULE put (IDENT = '3(577)'
+		) =
+BEGIN
+
+GLOBAL BIND
+    putv = 3^24 + 0^18 + 577;			! Edit date: 19-Sep-85
+
+!+
+!
+!
+!    FUNCTION:	THIS MODULE CONTAINS ALL ROUTINES WHICH PROCESS
+!    THE $PUT MACRO FOR RMS-20.
+!    AUTHOR:	S. BLOUNT
+!
+!
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1977, 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+!
+!
+!
+!    **********	TABLE OF CONTENTS	**************
+!
+!
+!
+!
+!    ROUTINE			FUNCTION
+!    =======			========
+!
+!    $PUT			PROCESSOR FOR $PUT MACRO
+!
+!    PUTSQR			"PUT"'S RECORD TO A SEQUENTIAL OR RELATIVE FILE
+!
+!    PUTREC			PERFORMS PHYSICAL TRANSFER OF RECORD
+!
+!    PUT			"PUT"'S RECORD TO INDEXED FILE
+!
+!    SETPUT			SET-UP FOR $PUT TO INDEXED FILE
+!
+!
+!
+!
+!
+!    REVISION HISTORY:
+!
+!    EDIT	DATE		WHO		PURPOSE
+!    ====	====		===		=======
+!
+!    1	7-OCT-76	SEB		MISC OPTIMIZATIONS
+!    2	28-OCT-76	SEB		ADD RELEASECURRENTBUCKET MACRO
+!    3	8-NOV-76	SEB		FIX BUG IN PUT TO REL FILE
+!    4	23-NOV-76	SEB		FIX CHECK OF VALID BIT
+!    5	7-FEB-77	SEB		FIX MAXRECORDSIZE COMP. IN SETPUT
+!    SO TOO BIG RECORDS ARE DETECTED
+!    6	11-MAR-77	SEB		PUT CODE IN FOR CHECK BYTE
+!    7	23-MAR-77	SEB		UNDO EDIT 6
+!    8	5-APR-77	SEB		DON'T BLT FULL SIZE OF RELATIVE RECORD
+!    9	6-APR-77	SEB		CHANGE HYBYTE TO RST FIELD
+!
+!    *************************************************
+!    *						*
+!    *		NEW REVISION HISTORY		*
+!    *						*
+!    *************************************************
+!
+!    PRODUCT	MODULE	 SPR
+!    EDIT	 EDIT	 QAR		DESCRIPTION
+!    ======	======	=====		===========
+!
+!
+!    ***** END OF REVISION HISTORY *****
+!
+!    ***** BEGIN VERSION 2 DEVELOPMENT *****
+!
+!
+!    PRODUCT	MODULE	 SPR
+!    EDIT	 EDIT	 QAR		DESCRIPTION
+!    ======	======	=====		===========
+!
+!    301	300	XXXXX		SUPPORT EXTENDED ADDRESSING.
+!
+!	400	400	xxxxx	    Clean up BLISS code (RL,22-Apr-83)
+!
+!	416		xxxxx	    Clarify logic in PUTREC (RL,7-Jul-83)
+!
+!    501			    Remote file access (AN, Jun-84)
+!    504                            Image Mode (AN, Jul-84)
+!    572                            Set update flag (DR, Sep-85)
+!    575			    Allow image put by RFA (AN, 24-Oct-85)
+!-
+
+REQUIRE 'RMSREQ';
+
+EXTERNAL ROUTINE
+! EXTERNAL ROUTINES USED
+!
+!    PUTASC			"PUT"'S RECORD TO ASCII FILE
+     PUTM11: NOVALUE;         ! "PUT"'S RECORD TO MACY11 FILE
+!    PUTIMA			"PUT"'S RECORD TO IMAGE FILE
+!
+
+
+%SBTTL 'PUT - $PUT processor'
+
+
+GLOBAL ROUTINE $put (rab_block, errorreturn) =
+! $PUT
+! ====
+! PROCESSOR FOR $PUT MACRO
+! INPUT:
+!	ADDRESS OF USER RECORD BLOCK (RAB)
+!	ADDRESS OF USER ERROR ROUTINE
+! OUTPUT:
+!	<STATUS FIELD OF USER RAB>
+! ROUTINES CALLED:
+!	PUTASCII
+!       PUTIMAGE
+!	PUTSQR
+!	PUTIDX
+!	RSETUP
+! FORMAT OF THE $PUT MACRO:
+!
+!		$PUT	<RAB-ADDRESS> [,<ERROR-ADDRESS>]
+!
+! RAB FIELDS USED AS INPUT BY $PUT:
+!
+!	ISI		INTERNAL STREAM IDENTIFIER
+!	KBF		KEY BUFFER ADDRESS (RELATIVE/INDEXED)
+!	KSZ		SIZE OF KEY IN KEY BUFFER (INDEXED)
+!	LSN		LINE-SEQUENCE NUMBER (LSA)
+!	RAC		RECORD ACCESS
+!	RBF		ADDRESS OF USER RECORD BUFFER
+!	ROP		RECORD ACCESS OPTIONS
+!	RSZ		SIZE OF RECORD
+!
+! RAB FIELDS WHICH ARE SET BY $PUT:
+!
+!	BKT		RECORD NUMBER OF CURRENT RECORD (RELATIVE)
+!	RBF		ADDRESS OF BUFFER FOR NEXT RECORD (-11 COMPATIBILITY)
+!	RFA		RECORD'S FILE ADDRESS
+!	STS		COMPLETION STATUS CODE
+!	STV		ADDITIONAL STATUS INFORMATION
+    BEGIN
+
+    REGISTER
+	errorcode;				! USED TO SAVE AN ERROR CODE
+
+    rmsentry ($put);
+
+    !+
+    !    FETCH INPUT ARGS
+    !-
+
+    rab = .rab_block;				! GET ADDRESS OF RAB
+    erradr = .errorreturn;			! AND USER ERROR ADDRESS
+    rsetup (axput);				! DO OTHER STUFF
+!+
+!
+!    ***	 ERROR PROCESSING FOR $PUT MACRO   ***
+!    *						*
+!    * THE FOLLOWING ERRORS ARE CHECKED:		*
+!    *	1. RFA ADDRESSING IS ILLEGAL		*
+!    *	2. RECORD-SIZE < = MAX-REC-SIZE		*
+!    *	3. RECORD BUFFER MUST BE PROPER		*
+!    *	4. RECORD-SIZE FOR FIXED-LENGTH RECORDS	*
+!    *						*
+!    *						*
+!    *************************************************
+!
+!-
+    errorcode = 0;				! ASSUME NO ERROR
+
+    !
+    ! RFA addressing on output is dangerous, but Fortran needs it....
+    !
+    IF (rfaadr AND rmsfile
+        AND (NOT .Fst[Fst$v_Remote]))           ! DO ALLOW RFA ADDRESSING !m577
+    THEN errorcode = er$rac; 			! IF file is NON-RMS OR REMOTE
+
+    IF (.fst [fstmrs] NEQ 0)			! IF THERE IS A MAX RECORD SIZE
+    THEN
+
+	IF (.rab [rabrsz, 0] GTR .fst [fstmrs]) THEN errorcode = er$rsz;
+
+						! RECORD IF BIGGER THAN MAXIMUM
+
+    IF .rab [rabrbf, 0] LEQ minuserbuff THEN errorcode = er$rbf; ! CHECK BUFFER
+
+    IF fixedlength
+    THEN
+	BEGIN
+
+	IF .rab [rabrsz, 0] NEQ .fst [fstmrs] THEN errorcode = er$rsz
+
+	END;
+
+    !+
+    !    WAS THERE AN ERROR?
+    !-
+
+    IF .errorcode NEQ 0
+    THEN
+	BEGIN
+	usrsts = .errorcode;
+	usrerr ()				! EXIT FROM RMS
+	END;
+
+    !+
+    !    *****  END OF ERROR PROCESSING FOR $PUT ******
+    !-
+
+    IF .fst[fst$v_remote]						  !a501
+    THEN                                                                  !a501
+        Dap$Put (.rab, .erradr)						  !a501
+    ELSE                                                                  !a501
+    !+
+    !    FILE IS LOCAL.
+    !    DISPATCH TO A ROUTINE TO WRITE A RECORD FOR EACH FILE ORGANIZATION
+    !-
+
+    CASE fileorg FROM 0 TO 3 OF
+	SET
+
+	[0] :
+            SELECT .Fst[Fst$h_File_Class] OF
+                SET
+                [0, Typ$k_Ascii]:
+                    putascii (); 		! ASCII file
+                [Typ$k_Image, Typ$k_Byte]:
+                    putimage ();                ! IMAGE file
+                [Typ$k_Macy11]:
+                    PutM11 ();                  ! Macy11 file             !a567
+                [OTHERWISE]:
+                    usererror( rms$_cla );      ! unknown
+                TES;
+	[1] :
+	    putsqr ();				! Sequential file
+
+	[2] :
+	    putsqr ();				! Relative file
+
+	[3] :
+	    putidx ();				! Indexed file
+	TES;
+
+    !+
+    !    SET THE "SUCCESS" BIT AND REMEMBER THAT THIS WAS A $PUT
+    !-
+
+    setsuccess;					! SET SUCCESS BIT AND LAST-OPER
+
+    ! Set the sequential flag if operation is sequential
+
+    Rst[Rst$v_Last_Sequential] = SeqAdr;                                 !a577
+
+    !+
+    !    RETURN THE RFA OF THIS RECORD TO THE USER
+    !-
+
+    rab [rabrfa, 0] = .rst [rstdatarfa];
+
+    !+
+    !    EXIT TO THE USER
+    !-
+
+    usrret ();					! Exit
+    1
+    END;					! End $PUT
+
+%SBTTL 'PUTSQR - Seq/Rel PUT'
+
+GLOBAL ROUTINE putsqr =
+! PUTSQR
+! ======
+!
+! THIS ROUTINE PROCESSES THE $PUT VERB TO A SEQUENTIAL OR RELATIVE
+! FILE
+!
+! INPUT:
+!	<NONE>
+!
+! OUTPUT:
+!	<NONE>
+!
+    BEGIN
+
+    LOCAL
+	temp1,
+	bytenum,				! BYTE NUMBER OF TARGET RECORD
+	header,
+	crp;					! SAVE FOR ARA
+
+    REGISTER
+	fullrecordsize;
+
+    TRACE ('PUTSQR');
+
+    !+
+    !    FIND THE CRP AND BYTE-ADDRESS OF THE CURRENT RECORD FOR EACH FILE TYPE
+    !-
+
+!+
+!    WE MUST PERFORM DIFFERENT OPERATIONS HERE DEPENDING
+!    UPON THE FILE ORGANIZATION. HERE IS A SUMMARY OF
+!    THE ACTIONS WHICH ARE DONE BELOW:
+!
+!
+!    ASCII FILES:
+!    IF THIS IS AN ASCII FILE, THEN WE SHOULD NOT BE HERE, MUST BE A BUG.
+!
+!    SEQUENTIAL FILES:
+!    FOR SEQUENTIAL FILES, WE FIRST MUST COMPUTE THE SIZE
+!    OF THIS RECORD IN WORDS. THIS QUANTITY IS COMPUTED HERE
+!    BECAUSE IT IS USED HEAVILY LATER AND WE WOULD LIKE NOT
+!    TO HAVE TO RE-COMPUTE IT SEVERAL TIMES.  THEN, WE MUST
+!    DETERMINE IF THIS RECORD CAN FIT ON THE PAGE IF THE
+!    FB$BLK ATTRIBUTE IS DEFINED FOR THE FILE.
+!
+!    RELATIVE FILES:
+!    WE MUST FETCH EITHER THE NRP OR THE USER'S RECORD
+!    KEY, DEPENDING UPON HIS RECORD-ACCESS FIELD. THIS
+!    VALUE WILL THEN BE MAPPED INTO AN RFA WHICH GIVES
+!    THE STARTING ADDRESS OF THE TARGET RECORD.
+!-
+
+    !+
+    !    COMPUTE THE SIZE IN WORDS OF THIS RECORD
+    !-
+
+    rst [rstrszw] = sizeinwords (.rab [rabrsz, 0], .fst [fstbsz]);
+
+    CASE fileorg FROM 0 TO 3 OF
+	SET
+
+	[0] :
+	    0;					! SHOULD NOT GET HERE
+
+	[1] :
+	    BEGIN
+	    crp = .rst [rstnrp];		! GET NRP
+!+
+!    IF FILE IS BLOCKED, SEE IF RECORD
+!    CAN FIT ON THIS PAGE
+!-
+
+	    IF blocked
+	    THEN 				! CHECK TO SEE IF RECORD CAN FIT ON PAGE
+		crp = nospan (.crp);
+
+	    bytenum = .crp			! GET FILE ADDRESS
+	    END;
+
+	[2] :
+	    BEGIN				! Relative
+	    crp = (CASE recordaccess FROM 0 TO 1 OF
+		SET
+		[0] : .rst [rstnrp];		! Sequential access: fetch NRP
+		[1] :
+		    BEGIN			! Key access
+
+		    LOCAL
+			tempkbfpt;
+
+		    tempkbfpt = .rab [rabkbf, 0];
+
+		    IF .tempkbfpt LSS minuserbuff THEN usererror (er$kbf);
+
+		    IF .tempkbfpt<lh> EQL 0 THEN tempkbfpt = .tempkbfpt OR .blksec;
+
+		    ..tempkbfpt
+		    END
+		TES);
+
+	    IF (bytenum = numbertorfa (.crp))	! COMPUTE BYTE-# OF RECORD
+		EQL false
+	    THEN
+		usererror (er$key)		! RECORD WAS .GTR. MRN
+	    END;
+
+	[3] :
+	TES;
+
+!+
+!    AT THIS POINT, WE HAVE THE FOLLOWING VALUES:
+!    CRP	=	RFA OF THE RECORD TO BE WRITTEN
+!    BYTENUM	=	BYTE ADDRESS OF RECORD
+!-
+!+
+!    SET UP SOME VALUES WHICH WE WILL USE LATER SO THEY
+!    CAN BE IN REGISTERS TO SAVE TIME
+!-
+    fullrecordsize = .rst [rstrszw];		! SIZE OF ENTIRE RECORD
+
+    !+
+    !    MAKE SURE THE RECORD CAN FIT ON ONE PAGE IF BLOCKED
+    !-
+
+    IF blocked
+    THEN
+
+	IF ((.fullrecordsize + headersize) GTR pagesize) THEN usererror (er$rsz);
+
+    !+
+    !    PRINT OUT THE RESULTS FOR DEBUGGING
+    !-
+
+    lookat ('	BYTE NUMBER OF REC: ', bytenum);
+    lookat ('	CURRENT REC PTR:: ', crp);
+
+    !+
+    !    UNLOCK CURRENT RECORD
+    !-
+
+    IF datalocked THEN unlock (rst [rstdatarfa]);	! UNLOCK THE CURRENT RECORD
+
+    !+
+    !    MAKE CRP EQUAL TO NRP
+    !-
+
+    rst [rstdatarfa] = .crp;			! CRP = NRP
+
+    !+
+    !    LOCK THE RECORD TO BE WRITTEN
+    !-
+
+    IF locking THEN lockrec (crp);		! LOCK THE RECORD
+
+!+
+!    THE RECORD IS NOW LOCKED ( IF FILE-SHARING )
+!    HOWEVER, IT MAY NOT BE IN OUR BUFFER SO
+!    WE MUST GET IT THERE AND SET UP THE
+!    POINTER TO IT ( PAGPTR ) WITHIN THE WINDOW PAGE
+!-
+
+    !+
+    !    POSITION THE FILE TO THE CORRECT RECORD
+    !-
+
+    gtbyte (.bytenum, false);			! FETCH FILE PAGE INTO USER WINDOW
+
+    !+
+    !    THE PAGE IS NOW IN THE BUFFER AND PAGPTR POINTS TO IT
+    !-
+
+    header = .(.rst [rstpagptr]);		! GET RECORD HEADER
+
+    IF seqfile AND seqadr               ! Sequential access to seq file   !m567
+    AND (.header NEQ 0)  
+    THEN usererror (er$nef);	! ATTEMPT TO INSERT RECORD
+
+!+
+!    FOR RELATIVE FILES, THE RECORD CAN BE WRITTEN EXCEPT
+!    IN THE CASE WHERE THE RECORD IS VALID, BUT NOT DELETED.
+!    THEREFORE, WE MUST CHECK BOTH THE VALID AND THE DELETED
+!    BITS IN THE RECORD HEADER.
+!-
+
+    IF relfile
+    THEN
+	BEGIN					! Check for non-deleted record
+
+	IF (chkflag (header, rhdrvalid + rhdrdelete)) EQL (rhdrvalid) THEN usererror (er$rex);
+
+	rab [rabbkt, 0] = .crp			! Return record number
+	END;
+
+    !+
+    !    NOW, MOVE THE RECORD ONTO THE FILE PAGE
+    !-
+
+    putrec ();					! MOVE RECORD
+
+    !+
+    !    UPDATE THE HIGHEST BYTE IN THE FILE
+    !-
+
+    temp1 = .bytenum + .fullrecordsize + headersize;	! COMPUTE WHERE NEXT RECORD IS
+
+    IF .temp1 GTR .rst [rsthybyte]		! IF THIS RECORD IS HIGHER THAN ANY PREVIOUS ONE...
+    THEN
+	BEGIN
+	rst [rsthybyte] = .temp1;		! RESET EOF BYTE
+	fst [fstsof] = .temp1;			! CROCK
+	END;
+
+    !+
+    !    UPDATE THE NEXT RECORD POINTER
+    !-
+
+    IF seqadr
+    THEN
+	rst [rstnrp] = (IF seqfile THEN .crp + headersize + .fullrecordsize
+						! NRP = OLD NRP + SIZE OF HEADER + SIZE OF RECORD
+	ELSE .crp + 1);				! BUMP RECORD NUMBER FOR RELATIVE FILES
+
+    !
+    ! Now release any locked record
+    !
+
+    IF datalocked THEN unlock (rst [rstdatarfa]);	! UNLOCK THE RECORD
+
+    RETURN true
+    END;					! End PUTSQR
+
+%SBTTL 'PUTREC - create record in file'
+
+GLOBAL ROUTINE putrec : NOVALUE =
+! PUTREC
+! ======
+! THIS ROUTINE CREATES A RECORD IN A RMS-20 FILE. IT IS
+!	ASSUMED ON INPUT THAT PAGPTR POINTS TO THE
+!	CORRECT PLACE ON THE CURRENT WINDOW PAGE AT WHICH TO
+!	WRITE THE RECORD. THERE MUST BE NO OVERLAP PAST
+!	THE END OF THE WINDOW PAGE ON INPUT.
+!	ON OUTPUT, PAGPTR WILL BE CLOBBERED.
+! INPUT:
+!	<NONE>
+! OUTPUT:
+!	<NO STATUS RETURNED>
+! GLOBALS USED:
+!	GTBYTE
+!	MOVEREC
+    BEGIN
+
+    LOCAL
+	count,
+	bytesize,
+	dummylocal,				! USED TO PASS SUBROUTINE ARGS
+	newpage,
+	userbuff;
+
+    REGISTER
+	recordptr,
+	temp,
+	bltac;
+
+    MAP
+	recordptr : REF BLOCK;
+
+    TRACE ('PUTREC');
+
+    !+
+    !    CHECK VALIDITY OF A FEW THINGS
+    !-
+
+    recordptr = .rst [rstpagptr];		! FETCH POINTER
+
+    !+
+    !    WRITE HEADER
+    !-
+
+    recordptr [wholeword] = .rab [rabrsz, 0] + rhdrvalid;	! RECORD-SIZE + VALID
+!+
+!    WE HAVE NOW WRITTEN THE HEADER FOR THIS RECORD.
+!    WE MUST BUMP THE FILE POINTER AND CHECK TO SEE
+!    IF WE ARE PAST THE END OF THE FILE BUFFER. IF SO,
+!    WE WILL MAP IN THE NEXT PAGE OF THE FILE AND WRITE
+!    THE REST OF THE RECORD
+!-
+    recordptr = .recordptr + 1;			! BUMP FILE POINTER
+
+    IF (.recordptr AND ofsetmask) EQL 0
+    THEN 					! We overlapped
+	BEGIN					! Map next page
+        !
+        ! Flag this bucket for update!
+        ! Updating pages to disk happens automagically on TOPS20
+        ! but not on TOPS10, so this tells the low-level code to do it.
+        ! 
+
+	setbfdupd (cbd [bkdbfdadr]);		! Indic file page upd   !m572
+
+	newpage = ((.currentfilepage + 1)^p2w);	! GET START OF NEXT FILE PAGE
+
+	!+
+	!    Position the file
+	!-
+
+	gtbyte (.newpage, 			! RFA of next page
+	    false);				! No abort
+	recordptr = .rst [rstpagptr]		! Reset pointer
+	END;
+
+!+
+!    WE ARE NOW READY TO MOVE THE RECORD TO THE FILE.
+!    HOWEVER, IN MOST CASES THE RECORD WILL FIT ENTIRELY
+!    ON THE CURRENT FILE PAGE. IF THIS IS THE CASE, WE
+!    DON'T NEED TO PERFORM ALL THE PAGE TURNING THAT
+!    "MOVEREC" CAN DO; SO, A QUICK BLT IS ALL WE NEED.
+!    THEREFORE, IF THIS RECORD DOES NOT SPAN FILE PAGES,
+!    WE WILL DO THE MOVE HERE; OTHERWISE, WE WILL CALL
+!    "MOVEREC" TO DO IT FOR US.
+!-
+    bytesize = .fst [fstbsz];			! BYTE SIZE OF RECORD TO MOVE
+    count = .rab [rabrsz, 0];			! SIZE OF RECORD
+    userbuff = .rab [rabrbf, 0];		! GET USER ADDRESS
+
+    IF .userbuff<lh> EQL 0			!			!M416
+    THEN 					!			!M416
+	userbuff = .userbuff OR .blksec;	! DEFAULT SECTION #	!M416
+
+    temp = .rst [rstrszw];			! GET RSZW INTO AC
+
+    IF ((.recordptr AND ofsetmask) + .temp) LSS pagesize
+    THEN
+	BEGIN					! Record does not span
+						!   page boundaries
+	setbfdupd (cbd [bkdbfdadr]);		! Indic file page upd
+
+	IF .rmssec NEQ 0
+	THEN
+	    xcopy (.userbuff, 			! From
+		.recordptr, 			! To
+		.temp)				! Size
+	ELSE
+	    movewords (.userbuff, 		! From
+		.recordptr, 			! To
+		.temp);				! Size
+
+	END
+    ELSE
+	BEGIN
+
+	!+
+	!    Set up to move the record, if it spans pages
+	!-
+
+	dummylocal = .recordptr;		! Store in local variable
+	moverec (.dummylocal, 			! Window ptr
+	    .userbuff, 				! User buffer
+	    true, 				! Put-flag
+	    .count, 				! Size
+	    .bytesize);				! Bytesize
+	END;
+
+    RETURN
+    END;					! End PUTREC
+
+%SBTTL 'PUTIDX - Insert UDR into indexed file'
+
+GLOBAL ROUTINE putidx : NOVALUE =
+! PUTIDX
+! ======
+! ROUTINE TO INSERT A USER DATA RECORD INTO AN INDEXED FILE. ON
+!	ENTRY TO THIS ROUTINE, NO PREPARATION OR RECORD UNLOCKING
+!	HAS BEEN DONE.
+! INPUT:
+!	<NONE>
+! OUTPUT:
+!	<NONE>
+! ROUTINES CALLED:
+!	FOLLOWPATH
+!	INSRTUDR
+!	IDXUPDATE
+!	INSRTSIDR
+!	REMOVRECORD
+    BEGIN
+
+    LOCAL
+	result,
+	recdesc : BLOCK [rdsize],		! Record descriptor packet
+	secrecdesc : BLOCK [rdsize],		! 2nd Index Record Descriptor
+	bktdesc : BLOCK [bdsize],		! Bucket descriptor of data
+	splitbd1 : BLOCK [bdsize],		! 1st extra bucket descriptor
+	splitbd2 : BLOCK [bdsize],		! 2nd extra bucket descriptor
+	rootbd : BLOCK [bdsize],		! Bucket desc for index root
+	tempptr : REF BLOCK,			! Proper bucket pointer
+	userrecordptr : REF BLOCK,		! Ptr to the user's record
+	addressofrecord,			! Location of new record
+	keyofreference,				! Current key value
+	datapage;				! Data page number
+
+    TRACE ('PUTIDX');
+
+    !+
+    !    SET UP THE ADDRESS OF THE USER'S DATA RECORD
+    !-
+
+    userrecordptr = .rab [rabrbf, 0];
+    ! Default section is the section of the RAB
+
+    IF .userrecordptr<lh> EQL 0 THEN userrecordptr = .userrecordptr OR .blksec;
+
+    !+
+    !    SET UP THE ARGUMENTS FOR THE PUT INDEXED OPERATION
+    !-
+
+    setput (recdesc);
+
+    !+
+    !    SET OUR BUCKET DESCRIPTOR TO BE NULL
+    !-
+
+    setnullbd (bktdesc);
+
+    !+
+    !    ***** LOCK THE ENTIRE INDEX DURING OUR OPERATION *****
+    !-
+
+    IF locking
+    THEN
+	BEGIN
+
+	IF lockindex (enqblk, enqexc) EQL false THEN usererror (er$edq)
+
+	END;
+
+!+
+!    BEFORE WE INSERT THE RECORD, WE MUST CHECK TO MAKE
+!    SURE THAT THIS KEY HAS AN INDEX STRUCTURE
+!-
+
+    IF noindexflag NEQ 0
+    THEN
+	BEGIN
+	!
+	!   We must create an index root and a first data bucket.
+	!
+	makidx ();				! Make the index
+!+
+!    WE MUST NOW CHECK TO SEE IF THERE STILL ISN'T
+!    AN INDEX FOR THIS KEY. THIS COULD BE TRUE IF
+!    A FILE WITHOUT AN INDEX WAS OPENED, BUT SOMEONE
+!    ELSE CREATED AN INDEX BEFORE WE DID.
+!-
+
+	IF noindexflag NEQ 0
+	THEN 					! There was an error
+	    cleanup (bktdesc)
+
+	END;
+
+    !+
+    !    INSERT THE DATA RECORD INTO THE PRIMARY INDEX
+    !-
+
+    IF followpath (recdesc, bktdesc) EQL false	! Bucket
+!+
+!    IF WE COULDN'T LOCATE THE DATA BUCKET, THEN WE MUST
+!    EXIT WITH FAILURE. HOWEVER, IF THE SEARCH KEY IS .GTR.
+!    THAN ALL KEYS IN THE BUCKET, THEN THAT IS A REASONABLE
+!    SITUATION.
+!-
+    THEN
+	cleanup (bktdesc);
+
+    !+
+    !    CHECK FOR DUPLICATE RECORD
+    !-
+
+    result = chkdup (recdesc, bktdesc);
+!+
+!    WE NOW HAVE LOCATED THE POSITION WHERE THE NEW RECORD
+!    IS TO BE INSERTED. HOWEVER, WE MUST DETERMINE IF
+!    SOME OTHER PROCESS ALREADY HAS THE BUCKET LOCKED.
+!-
+
+    IF .result NEQ false			! Did CHKDUP succeed?
+    THEN
+
+	IF locking
+	THEN
+	    BEGIN
+	    result = lockbd (bktdesc, enqaa, enqexc)	! DON'T WAIT FOR BUCKET
+	    END;
+
+!+
+!    THE RECPTR FIELD IN THE RECORD-DESCRIPTOR NOW CONTAINS
+!    THE ADDRESS WHERE WE WANT TO WRITE OUR NEW RECORD.
+!-
+
+    IF .result NEQ false			! IF CHKDUP SAID WE CAN GO ON
+    THEN
+	result = insrtudr (recdesc, 		! Rec-desc
+	    .userrecordptr, 			! Record
+	    bktdesc, 				! Bucket
+	    splitbd1, 				! Extra-1
+	    splitbd2);				! Extra-2
+
+!+
+!    IF EITHER CHKDUP, LOCKIT, OR INSRTUDR RETURNED AN ERROR, WE
+!    MUST CLEAN UP OUR OPERATIONS.
+!-
+
+    IF .result EQL false THEN cleanup (bktdesc);
+
+!+
+!    WE MUST NOW SAVE THE ADDRESS WITHIN THE DATA BUCKET OF THE
+!    THE RECORD WE JUST INSERTED
+!-
+    addressofrecord = .recdesc [rdrecptr];
+
+    !+
+    !    ** IF IT IS SEQ $PUT AND A BUCKET SPLIT(ONE WAY) OCCURRED **
+    !    ** WITH R-NEW GOING TO A NEW BUCKET, THEN THE ORIG BKT WAS **
+    !    ** FLUSHED IN INSRTUDR SO WE MUST MAKE THE SPLIT BUCKET   **
+    !    ** THE CURRENT BKT...				     **
+    !-
+
+    IF seqadr					! SEQ ACCESS
+    THEN
+
+	IF flushorigbd (recdesc) NEQ 0
+	THEN
+	    BEGIN
+	    movebktdesc (splitbd1, 		! From
+		bktdesc);			! To
+	    clrflag (recdesc [rdstatus], rdflgnewinnew);
+	    END;
+
+!+
+!    AT THIS POINT, BOTH THE DATA BUCKET AND THE INDEX
+!    ARE STILL LOCKED. WE MUST UPDATE THE INDEX STRUCTURE
+!    (IF NECESSARY) AND THEN UNLOCK ALL THESE BUCKETS
+!-
+
+    IF idxupdateflag (recdesc) NEQ 0
+    THEN 					! We must update the index
+	BEGIN
+
+	IF idxupdate (recdesc, 			! Record desc
+		bktdesc, 			! Bucket
+		splitbd1, 			! Extra-1
+		splitbd2) EQL false		! Extra-2
+	THEN
+	    setidxerrorflag (recdesc)		! Remember the error
+	END;
+
+!+
+!    MOVE THE RFA OF THIS RECORD INTO THE RRV ADDRESS
+!    IN THE RECORD DESCRIPTOR PACKET, AND INTO THE CURRENT
+!    RP ADDRESS IN THE RST (SO IT CAN BE RETURNED TO THE
+!    USER ON RETURN FROM PUTIDX)
+!-
+    rst [rstdatarfa] = (secrecdesc [rdrrv] = .recdesc [rdrfa]);	! MOVE RFA TO RRV
+    secrecdesc [rdstatus] = .recdesc [rdstatus];	! SAVE STATUS BITS
+
+    !+
+    !    LOOP OVER ALL KEY DESCRIPTORS
+    !-
+
+    keyofreference = refprimary;		! INITIALIZE TO 0
+
+    WHILE (kdb = .kdb [kdbnxt]) NEQ 0 DO
+	BEGIN
+
+	!+
+	!    BUMP THE CURRENT KEY OF REFERENCE
+	!-
+
+	keyofreference = .keyofreference + 1;
+!+
+!    MAKE SURE RECORD IS LONG ENOUGH TO CONTAIN
+!    THIS SECONDARY KEY VALUE
+!-
+
+	IF .rab [rabrsz, 0] GEQ .kdb [kdbminrsz]%(AND)%%(THIS KEY IS NOT THE NULL KEY VALUE)%
+	THEN
+	    BEGIN				! Put record into sec index
+	    rtrace (%STRING ('	Inserting record into sec idx', 	!
+		    %CHAR (13), %CHAR (10)));
+
+	    !+
+	    !    INSERT THIS RECORD IN THE SECONDARY INDEX
+	    !-
+
+	    IF putsidr (secrecdesc) EQL false THEN removrecord (recdesc, bktdesc);
+
+!+
+!    WE MUST NOW MOVE THE FLAGS FROM THIS RECORD
+!    DESCRIPTOR INTO THE PRIMARY RECORD DESCRIPTOR.
+!    THUS, IF WE SAW EITHER AN INDEX ERROR OR A
+!    DUPLICATE SECONDARY, WE MUST REMEMBER IT.
+!-
+	    setflag (recdesc [rdstatus], .secrecdesc [rdstatus])
+	    END
+
+	END;
+
+    !+
+    !    RECORD HAS BEEN INSERTED INTO ALL INDEXES
+    !-
+
+    rtrace (%STRING ('	Record has been inserted', 	!
+	    %CHAR (13), %CHAR (10)));
+
+    !+
+    !    UPDATE NRP IF THIS WAS A $PUT SEQUENTIAL
+    !-
+
+    kdb = .fst [fstkdb];			! SET UP FOR PRIM KEY
+    recdesc [rdrecptr] = .addressofrecord;	! RESTORE LOC OF RECORD
+!+
+!    **	UPDATE NRP IF THIS WAS A $PUT SEQ		**
+!-
+
+    IF seqadr					! SEQUENTIAL ACCESS
+    THEN
+	setnrp (recdesc, bktdesc);
+
+    !+
+    !    CHECK FOR DUPLICATE RECORDS
+    !-
+
+    IF samekeyflag (recdesc) NEQ 0 THEN usrsts = su$dup;
+
+    !+
+    !    CHECK FOR INDEX UPDATE ERRORS
+    !-
+
+    IF idxerrorflag (recdesc) NEQ 0 THEN usrsts = su$idx;
+
+    !+
+    !    GIVE THE DATA BUCKET BACK (IT HAS ALREADY BEEN WRITTEN TO THE FILE
+    !-
+
+    putbkt (false, 				! No update
+	bktdesc);
+!+
+!    UNLOCK THE INDEX STRUCTURE OF THE FILE SO OTHER PROCESSES
+!    CAN TRAVERSE THE INDEX.
+!-
+
+    IF locking THEN unlockindex;
+
+    !+
+    !    RETURN TO THE $PUT DISPATCHER
+    !-
+
+    RETURN
+    END;					! End PUTIDX
+
+%SBTTL 'SETPUT - Set up for indexed $PUT'
+
+GLOBAL ROUTINE setput (recdesc) =
+! SETPUT
+! ======
+! ROUTINE TO SET UP THE RECORD DESCRIPTOR PACKET FOR A
+!	$PUT TO AN INDEXED FILE. THIS ROUTINE PERFORMS
+!	THE FOLLOWING OPERATIONS:
+!
+!	1.	SET UP THE KEY DESCRIPTOR BLOCK POINTER
+!	2.	CHECK THE LAST USER KEY IF THIS IS A $PUT SEQ
+!	3.	CHECK THE USER RECORD SIZE
+!	4.	COMPUTE THE WORD SIZE (RSZW) OF THE RECORD AND STORE IT
+!	5.	MOVE THE KEY INTO A TEMPORARY BUFFER
+!	6.	CHECK FOR OUT-OF-SEQUENCE KEY STRING
+! INPUT:
+!	RECDESC		=	RECORD DESCRIPTOR PACKET
+! OUTPUT:
+!	<NO STATUS RETURNED>
+! FIELDS IN THE RECORD DESC. WHICH ARE MODIFIED:
+!	USRSIZE		=	SIZE OF USER KEY STRING
+!	USERPTR		=	ADDRESS OF PRIMARY KEY STRING
+! ROUTINES CALLED:
+!	CKEYUI
+    BEGIN
+
+    MAP
+	recdesc : REF BLOCK;
+
+    LOCAL
+	datarecordptr : BLOCK [1],		! ADDR OF USER DATA RECORD
+	cbkdptr : REF BLOCK,			! PTR TO CURRENT BUCKET DESC
+	lastkeybuff;
+
+    REGISTER
+	maxrecordsize,				! MAX SIZE OF USER DATA RECORD
+	tempac,
+	recordsize;				! CURRENT SIZE OF USER DATA RECORD
+
+    TRACE ('SETPUT');
+
+    !+
+    !    SET UP THE KDB POINTER FOR PRIMARY KEY
+    !-
+
+    kdb = .fst [fstkdb];
+
+    !+
+    !    RELEASE THE CURRENT BUCKET, IF ANY
+    !-
+
+    releascurentbkt;
+
+    !+
+    !    CHECK IF USER'S RECORD IS TOO BIG FOR A BUCKET
+    !-
+
+    maxrecordsize = (.kdb [kdbdbkz]^b2w);	! SIZE OF BUCKET
+    maxrecordsize = .maxrecordsize - bhhdrsize - .kdb [kdbhsz];
+    recordsize = (rst [rstrsz] = .rab [rabrsz, 0]);	! GET RECORD SIZE
+
+    IF (rst [rstrszw] = (recdesc [rdlength] = sizeinwords (.recordsize, .fst [fstbsz]))) GTR .maxrecordsize
+    THEN
+	usererror (er$rsz);
+
+    !+
+    !    CHECK THAT THE RECORD CONTAINS THE PRIMARY KEY
+    !-
+
+    IF .recordsize LSS .kdb [kdbminrsz]
+    THEN 					! Primary key not in record
+	usererror (er$rsz);
+
+!+
+!    WE WILL NOW MOVE THE PRIMARY KEY TO A TEMPORARY
+!    BUFFER TO SAVE TIME
+!-
+    datarecordptr = .rab [rabrbf, 0];
+!	If section number is 0, default to same section as the RAB
+
+    IF .datarecordptr<lh> EQL 0 THEN datarecordptr = .datarecordptr OR .blksec;
+
+    movekey (.datarecordptr, tbuffer);
+!+
+!    SET UP THE RECORD DESCRIPTOR TO INDICATE THAT THE
+!    KEY STRING RESIDES IN OUR TEMPORARY BUFFER
+!-
+!+
+!    ***NEXT INSTR. ASSUMES THAT RDFLAGS AND RDSTATUS ARE
+!    IN WORD 0 *********
+!-
+    recdesc [wholeword] = 0;
+    recdesc [rduserptr] = tbuffer;
+    recdesc [rdusersize] = .kdb [kdbksz];	! USE FULL KEY SIZE
+!+
+!    IF THIS IS A SEQUENTIAL $PUT OPERATION, WE MUST CHECK
+!    THAT THE CURRENT KEY IS HIGHER THAN THE LAST KEY USED
+!-
+
+    IF seqadr
+    THEN
+	BEGIN
+!+
+!    IF THE LAST OPERATION WAS ALSO A $PUT SEQUENTIAL,
+!    THEN WE MUST COMPARE THE KEYS
+!-
+
+	IF .rst [rstlastoper] EQL c$put
+	THEN
+
+	    IF (chkflag (rst [rstflags], flglastseq) NEQ 0)
+	    THEN
+		BEGIN
+		lastkeybuff = .rst [rstkeybuff];	! GET ADDR OF LAST KEY
+
+		IF ckeykk (.recdesc, 		! Rec desc
+			.lastkeybuff) EQL true	! Last key
+
+		    !+
+		    !    IS THIS KEY GTR THAN THE LAST ONE?
+		    !-
+
+!+
+!    NOTE THAT CKEYKK RETURNS TRUE ONLY IF THE
+!    SEARCH KEY IS LEQ THE TARGET KEY, THUS WE
+!    ACTUALLY WANT THIS ROUTINE TO FAIL FOR OUR
+!    KEY COMPARISON
+!-
+		THEN
+		    usererror (er$seq)
+
+		END;
+
+	!+
+	!    INDICATE THAT THIS OPERATION IS SEQUENTIAL
+	!-
+
+	setflag (rst [rstflags], flglastseq)
+	END
+    ELSE 					! Random put...clear seq bit
+	clrflag (rst [rstflags], flglastseq);
+
+    RETURN true
+    END;					! End SETPUT
+
+END
+
+ELUDOM
+ 

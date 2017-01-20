@@ -1,0 +1,410 @@
+ %TITLE 'LQUERY - do /QUERY processing'
+MODULE LQUERY (				! Do /QUERY processing
+		IDENT = '3-002'			! File: LQUERY.BLI Edit: CJG3002
+		) =
+BEGIN
+!COPYRIGHT (c) DIGITAL EQUIPMENT CORPORATION 1981, 1988.  ALL RIGHTS RESERVED.
+!
+!THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED ONLY
+!IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH THE INCLUSION OF 
+!THE ABOVE COPYRIGHT NOTICE.  THIS SOFTWARE OR ANY OTHER COPIES THEREOF MAY 
+!NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY OTHER PERSON.  NO TITLE
+!TO AND OWNERSHIP OF THE SOFTWARE IS HEREBY TRANSFERRED.
+!
+!THE INFORMATION IN THIS SOFTWARE IS SUBJECT TO CHANGE WITHOUT NOTICE AND 
+!SHOULD NOT BE CONSTRUED AS A COMMITMENT BY DIGITAL EQUIPMENT CORPORATION.
+!
+!DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR RELIABILITY OF ITS 
+!SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+!
+!++
+! FACILITY:	EDT -- The DEC Standard Editor
+!
+! ABSTRACT:
+!
+!	This module handles the user interface of the /QUERY
+!	option on various line mode commands, such as SUBSTITUTE.
+!
+! ENVIRONMENT:	Runs at any access mode - AST reentrant
+!
+! AUTHOR: Bob Kushlis, CREATION DATE: February 3, 1978
+!
+! MODIFIED BY:
+!
+! 1-001	- Original.  DJS 02-FEB-1981.  This module was created by
+!	extracting the routine EDT$$PROC_QRYQAL  from the module EXEC.BLI.
+! 1-002	- Regularize headers.  JBS 20-Mar-1981
+! 1-003	- Use the ASSERT macro and fix up some comments mangled by converting QUERY
+!	   to EDT$$PROC_QRYQAL .  JBS 01-Jun-1981
+! 1-004	- Revise journaling.  JBS 22-Jun-1981
+! 1-005	- Use new message codes.  JBS 04-Aug-1981
+! 1-006	- Make empty responses illegal.  JBS 16-Aug-1981
+! 1-007	- Prompt from a global.  JBS 23-Oct-1981
+! 1-008	- Use heap storage instead of the stack to hold the constructed
+!	   line.  JBS 27-Jan-1982
+! 1-009	- Add a missing dot.  JBS 28-Jan-1982
+! 1-010	- Add JOU_VALID.  JBS 09-Apr-1982
+! 1-011	- Refresh the screen after a query.  JBS 05-Jul-1982
+! 1-012	- If the journal file ends at a query response, treat the response
+!	   as "Q", to return to command level.  Note that the "Q" must
+!	   be journaled.  JBS 10-Jul-1982
+! 3-001 - Fix various string pointers and add BYTE_SIZE for larger than
+!	  7 bit bytes.  GB 1-Mar-1983
+! 3-002 - Clear CC in case the user tried to ^C out. CJG 5-Jan-1984
+!--
+
+%SBTTL 'Declarations'
+!
+! TABLE OF CONTENTS:
+!
+
+REQUIRE 'EDTSRC:TRAROUNAM';
+
+FORWARD ROUTINE
+    EDT$$PROC_QRYQAL;				! Process the EDT$$PROC_QRYQAL  qualifier
+
+!
+! INCLUDE FILES:
+!
+
+REQUIRE 'EDTSRC:EDTREQ';
+
+!
+! MACROS:
+!
+!	NONE
+!
+! EQUATED SYMBOLS:
+!
+
+LITERAL
+    QUERY_LEN = 80,
+    LINE_LEN = LIN_FIXED_SIZE*BYTES_PER_WORD + 255;
+
+!
+! OWN STORAGE:
+!
+!	NONE
+!
+! EXTERNAL REFERENCES:
+!
+!	In the routine
+%SBTTL 'EDT$$PROC_QRYQAL  - do /QUERY processing'
+
+GLOBAL ROUTINE EDT$$PROC_QRYQAL (		! Do /QUERY processing
+    WPTR, 					! Used to reconstruct line for SUBSTITUTE
+    WEND					! Used to reconstruct line for SUBSTITUTE
+    ) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	EDT$$PROC_QRYQAL  processing routine.  This routine is called before operating on
+!	each line by those commands which can take a /QUERY qualifier.
+!
+!	The options bits are checked to see if the /QUERY qualifier was used.
+!	If not the routine returns success immediately.  If it was specified,
+!	then the user is prompted for verification.  The actions for each
+!	possible answer are:
+!
+!		Y - Return a 1 to indcate operation should be performed.
+!		N - Return a 0 to indicate operation should not be performed.
+!		Q - The global flag EXE_QRYQUIT  is set to stop further processing.
+!		A - The /QUERY option bit is cleared so no more queries are done.
+!
+!	If the answer is not one of the above, then a message is displayed and the
+!	user is prompted again.
+!
+! FORMAL PARAMETERS:
+!
+!  WPTR			Used to reconstruct line for SUBSTITUTE, 0 otherwise
+!
+!  WEND			Used to reconstruct line for SUBSTITUTE, 0 otherwise
+!
+! IMPLICIT INPUTS:
+!
+!	RCOV_MOD
+!	LN_BUF
+!	LN_LEN
+!	WK_LN
+!	EXE_QRYQUIT
+!	EXE_SBITS
+!	PMT_QUERY
+!
+! IMPLICIT OUTPUTS:
+!
+!	JOU_VALID
+!
+! ROUTINE VALUE:
+!
+!	1 = do the operation
+!	0 = don't do the operation
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+    EXTERNAL ROUTINE
+	EDT$$FMT_MSG,			! Place the text of a message in the format buffer
+	EDT$$RD_CMDLN,			! Read a command line
+	EDT$$RD_JOUTXT,			! Read a text record from the journal file
+	EDT$$TI_FLUSHJOUFI : NOVALUE,	! Write current journal buffer on journal file
+	EDT$$TI_BUFCH : NOVALUE,	! Store a character in the journal buffer
+	EDT$$CNV_UPC,			! Convert to upper case
+	EDT$$TY_CURLN,			! Display the current line
+	EDT$$ALO_HEAP,			! Allocate heap storage
+	EDT$$DEA_HEAP : NOVALUE,	! Deallocate heap storage
+	EDT$$FMT_CRLF;			! Terminate a formatted line
+
+    EXTERNAL
+	RCOV_MOD,
+	LN_BUF : VECTOR [CH$ALLOCATION (255, BYTE_SIZE)],
+	LN_LEN,
+	WK_LN : REF LIN_BLOCK,
+	CC,				! Control-C flag
+	EXE_QRYQUIT,			! Quit flag  for /QUERY operations.
+	EXE_SBITS,			! The options switches.
+	PMT_QUERY : VECTOR,		! Counted ASCII string for /QUERY prompt
+	JOU_VALID,			! 1 = journal record is valid
+	FMT_BOT;			! We are printing at the bottom of the screen
+
+    MESSAGES ((PLSANSYNQ, INSMEM));
+
+    LOCAL
+	QUERY_RESP : REF BLOCK [CH$ALLOCATION (QUERY_LEN)],
+	QUERY_RESP_PTR,			! String ptr to response
+	QUERY_RESP_COMPLETE,		! 1 = response is complete
+	RET_VAL,			! Return value
+	LEN,
+	SW_LINE,			! Save WK_LN
+	IN,				! Input char ptr
+	OUT,				! Output char ptr
+	WLEN,				! Length of rest of line
+	L_WPTR,				! Local copy of WPTR
+	T_LINE : REF LIN_BLOCK;		! Current line with substitutions
+
+!+
+! Check for the /QUERY bit.  If it is clear then return 1.
+!-
+
+    IF .EXE_SBITS<OPB_QUERY>
+    THEN
+	BEGIN
+!+
+! Display the line so the user can see what he is verifying.
+!-
+
+	IF (.WPTR EQL 0)
+	THEN
+	    EDT$$TY_CURLN ()
+	ELSE
+!+
+! During a SUBSTITUTE command, the current line is in various
+! pieces which are here reconstructed so that any substitution
+! already made on the line are shown.
+!-
+	    BEGIN
+!+
+! Allocate enough space for a maximum-length line.
+!-
+
+	    IF EDT$$ALO_HEAP (%REF (LINE_LEN), T_LINE)
+	    THEN
+		BEGIN
+!+
+! Initialize the description for the line to be constructed.
+!-
+		EDT$$CPY_MEM (LIN_FIXED_SIZE, .WK_LN, .T_LINE);
+!+
+! Copy the line up to the last substitution.
+!-
+		IN = CH$PTR (LN_BUF, 0, BYTE_SIZE);
+		OUT = CH$PTR (T_LINE [LIN_TEXT], 0, BYTE_SIZE);
+
+		DECR I FROM .LN_LEN - 1 TO 0 DO
+		    CH$WCHAR_A (CH$RCHAR_A (IN), OUT);
+
+!+
+! Copy the current line from the last match to the end.
+!-
+		WLEN = CH$DIFF (.WEND, .WPTR);
+
+		IF ((.LN_LEN + .WLEN) GTR 255) THEN WLEN = MAX (0, 255 - .LN_LEN);
+
+		L_WPTR = .WPTR;
+
+		DECR I FROM .WLEN - 1 TO 0 DO
+		    CH$WCHAR_A (CH$RCHAR_A (L_WPTR), OUT);
+
+!+
+! Fixup the description of the fake current line.
+!-
+		T_LINE [LIN_LENGTH] = .LN_LEN + .WLEN;
+!+
+! Type the line.
+!-
+		SW_LINE = .WK_LN;	! Save the current line description
+		WK_LN = .T_LINE;		! Make the constructed line the current one
+		EDT$$TY_CURLN ();		! Format and output this line
+		WK_LN = .SW_LINE;	! Restore the current line description
+!+
+! Deallocate the heap storage used to hold the line.
+!-
+		EDT$$DEA_HEAP (%REF (LINE_LEN), T_LINE);
+		END
+	    ELSE
+		BEGIN
+!+
+! There is not enough heap storage to print the line.  Don't do this operation
+! and stop the whole command.  Also, give an appropriate error message.
+!-
+		EDT$$FMT_MSG (EDT$_INSMEM);	! Give an appropriate error message
+		EXE_QRYQUIT = 1;		! Stop the command
+		RETURN (0);			! Don't do this substitution
+		END;
+
+	    END;
+
+!+
+! Allocate space to hold the response to the query.
+!-
+
+	IF ( NOT EDT$$ALO_HEAP (%REF (QUERY_LEN), QUERY_RESP))
+	THEN
+	    BEGIN
+!+
+! There is not enough storage to accept the response.  Don't do this
+! operation and stop the whole command.  Also, give an appropriate error message.
+!-
+	    EDT$$FMT_MSG (EDT$_INSMEM);		! Give an appropriate message
+	    EXE_QRYQUIT = 1;			! Stop the command
+	    RETURN (0);				! Don't do this substitution
+	    END;
+
+	QUERY_RESP_COMPLETE = 0;
+	QUERY_RESP_PTR = CH$PTR (.QUERY_RESP,, BYTE_SIZE);
+
+	WHILE ( NOT .QUERY_RESP_COMPLETE) DO
+	    BEGIN
+!+
+! Get the line from either the terminal or the journal file.
+!-
+
+	    IF .RCOV_MOD
+	    THEN
+		BEGIN
+
+		IF ( NOT EDT$$RD_JOUTXT (.QUERY_RESP, LEN))
+		THEN
+		    BEGIN
+!+
+! We have reached the end of the journal file.  Fake a "Q" response so that
+! we will terminate this command without making any more changes to the buffer.
+!-
+		    LEN = 1;
+		    CH$WCHAR (%C'Q', .QUERY_RESP_PTR);
+!+
+! We must journal the fake response, in case we do another /RECOVER during this session.
+!-
+		    EDT$$TI_BUFCH (CH$RCHAR (.QUERY_RESP_PTR));
+		    JOU_VALID = 1;
+		    END;
+
+		END
+	    ELSE
+		BEGIN
+!+
+! Make sure the journal buffer has been written to the journal file,
+! since we are about to wait for terminal input.
+!-
+		EDT$$TI_FLUSHJOUFI (%C'T');
+!+
+! If all the text is being concentrated at the bottom of the screen, then be sure we are prompting
+! on a blank line.
+!-
+
+		IF .FMT_BOT THEN EDT$$FMT_CRLF ();
+
+		EDT$$RD_CMDLN (PMT_QUERY [1], .PMT_QUERY [0], .QUERY_RESP, LEN, QUERY_LEN);
+!+
+! Make sure the response is journaled.  Only the first character of the response is journaled
+! because only the first character is important.
+!-
+
+		IF (.LEN GEQ 1) THEN EDT$$TI_BUFCH (CH$RCHAR (.QUERY_RESP_PTR));
+
+		JOU_VALID = 1;
+		END;
+
+!+
+! Check out the answer.
+!-
+
+	    IF (.LEN LSS 1)
+	    THEN
+		BEGIN
+		CC = 0;
+		EDT$$FMT_MSG (EDT$_PLSANSYNQ);
+		END
+	    ELSE
+		BEGIN
+		EDT$$CNV_UPC (.QUERY_RESP_PTR, 1);
+
+		SELECTONE CH$RCHAR (.QUERY_RESP_PTR) OF
+		    SET
+
+		    [%C'Y'] :
+			BEGIN
+			RET_VAL = 1;
+			QUERY_RESP_COMPLETE = 1;
+			END;
+
+		    [%C'N'] :
+			BEGIN
+			RET_VAL = 0;
+			QUERY_RESP_COMPLETE = 1;
+			END;
+
+		    [%C'A'] :
+			BEGIN
+			EXE_SBITS<OPB_QUERY> = 0;
+			RET_VAL = 1;
+			QUERY_RESP_COMPLETE = 1;
+			END;
+
+		    [%C'Q'] :
+			BEGIN
+			EXE_QRYQUIT = 1;
+			RET_VAL = 0;
+			QUERY_RESP_COMPLETE = 1;
+			END;
+
+		    [OTHERWISE] :
+			EDT$$FMT_MSG (EDT$_PLSANSYNQ);
+		    TES;
+
+		END;
+
+	    END;
+
+!+
+! Come here when the query response is complete.  RET_VAL contains the
+! value to return.  Deallocate the heap storage used to hold the responses
+! to the query.
+!-
+	EDT$$DEA_HEAP (%REF (QUERY_LEN), QUERY_RESP);
+	END
+    ELSE
+	RET_VAL = 1;
+
+    RETURN (.RET_VAL);
+    END;					! of routine EDT$$PROC_QRYQAL
+
+
+END
+ELUDOM

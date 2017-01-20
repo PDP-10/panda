@@ -1,0 +1,545 @@
+/*
+**	SCANF - parses formatted input text
+**
+**	(c) Copyright Ken Harrenstien 1989
+**		for all changes after v.188, 13-Jun-1988
+**	(c) Copyright Ian Macky, SRI International 1986
+*/
+/*
+ *	this scanf code conforms with the description of [f,s]scanf
+ *	as described in Harbison & Steele's "C: A Reference Manual",
+ *	sections 11.5.28 (scanf), 11.5.16 (fscanf) and 11.5.30 (sscanf)
+ */
+
+#include <stdio.h>
+#include <ctype.h>
+#include <stdarg.h>
+#include <string.h>
+
+#if __STDC__
+#define CONST const
+#else
+#define CONST
+#endif
+
+struct scanf_work {
+    FILE *stream;		/* input stream (source) */
+    int asscnt;			/* number of successful assignments */
+    int ccnt;			/* # of chars read from stream so far */
+    va_list args;		/* pointer to arg list */
+    CONST char *format;		/* pointer to format string */
+    int assign;			/* TRUE if assigning results from this parse */
+    int width;			/* maximum field width */
+    int size;			/* SHORT, LONG or NORMAL */
+    int error;			/* flag set by parse routines if bad input */
+};
+
+#define CHAR_SET_SIZE	128	/* size of character set */
+
+static int valid_char[CHAR_SET_SIZE];
+
+/* sf.size says what size object you want the return value to be stored
+   as.  internally the largest size is used, which is then cast into
+   the requested size for storing */
+
+#define SHORT		-1
+#define NORMAL		0
+#define LONG		1
+#define LNGDBL		2
+
+#ifndef TRUE
+#define TRUE	1
+#define FALSE	0
+#endif
+
+/* Internal routines */
+static int _vfscanf();
+static void duox_scanf(), f_scanf(),
+	c_scanf(), s_scanf(), n_scanf();
+static void bracket_scanf();
+
+#if __STDC__
+int sscanf(const char *s, const char *format, ...)
+#else
+int
+sscanf(s, format /*, ...*/)
+char *s;
+char *format;
+#endif
+{
+    FILE *f;
+    va_list ap;
+    int result;
+
+    va_start(ap, format);		/* set up pointer to args */
+    f = sopen(s, "r", strlen(s));	/* set up to read from string */
+    result = _vfscanf(f, format, ap);
+    va_end(ap);
+    fclose(f);				/* nuke the string FILE */
+    return result;
+}
+
+#if __STDC__
+int scanf(const char *format, ...)
+#else
+int
+scanf(format /*, ...*/)
+char *format;
+#endif
+{
+    va_list ap;
+    int ret;
+
+    va_start(ap, format);
+    ret = _vfscanf(stdin, format, ap);
+    va_end(ap);
+    return ret;
+}
+
+#if __STDC__
+int fscanf(FILE *stream, const char *format, ...)
+#else
+int
+fscanf(stream, format /*, ...*/)
+FILE *stream;
+char *format;
+#endif
+{
+    va_list ap;
+    int ret;
+
+    va_start(ap, format);
+    ret = _vfscanf(stream, format, ap);
+    va_end(ap);
+    return ret;
+}
+
+static int
+_vfscanf(stream, format, args)
+FILE *stream;
+CONST char *format;
+va_list args;
+{
+    struct scanf_work sf;
+    int c, ch;
+
+    if (!_readable(stream)) return 0;
+    sf.stream = stream;		/* put args 'n' stuff into global storage */
+    sf.args = args;		/* so subroutines can get at them */
+    sf.format = format;
+    sf.asscnt = 0;		/* number of successful parse&assigns */
+
+    /*	it's more efficient for a PDP-10 CPU to do pre-increment
+     *	char fetch operations, so we're going to make less elegant C
+     *	code which will produce more efficient machine code.  so sue me.
+     */
+    for (c = *sf.format; c; c = *++sf.format) {
+
+	/*	whitespace in the format string means to skip over whitespace
+	 *	in the input stream, if any exists.  any amount of format
+	 *	whitespace is semantically equivalent, so skip it all.
+	 */
+	if (isspace(c)) {
+	    while (isspace(c = getc(sf.stream))) sf.ccnt++;
+	    if (c == EOF) break;
+	    ungetc(c, sf.stream);
+	    while (isspace(c = *++sf.format)) ;
+	    /* Drop thru to handle non-whitespace char in format string */
+	}
+	if (c != '%') {
+	    /*	if it's not whitespace or a conversion op, then it's just joe
+	     *	random character, which must match what comes next in the input
+	     *	stream
+	     */
+	    if (c == (ch = getc(sf.stream))) {
+		sf.ccnt++;
+		continue;		/* OK, continue main loop! */
+	    }
+	    ungetc(ch, sf.stream);	/* Ugh, didn't match, restore char */
+	    break;			/* and break out of main loop */
+	}
+
+	/* a percent starts a conversion specification.  if the next char is
+	 * '*', then no assignment is done, the object is just parsed and
+	 * skipped over.  there may be a maximum field width, expressed as an
+	 * unsigned decimal number, which must be positive.  there may be a
+	 * size specification, one of 'h' for short or 'l' (lowercase 'L') for
+	 * long.  all of those are optional, but if any appear, they must be
+	 * in the order above.  the required part is the conversion op, a
+	 * single character, one of:
+	 *
+	 *		d	signed decimal		== strtol(,,10)
+	**		i	integer			== strtol(,,0)
+	 *		o	unsigned octal		== strtoul(,,8)
+	 *		u	unsigned decimal	== strtoul(,,10)
+	 *	     x, X	unsigned hexidecimal	== strtoul(,,16)
+	 *  e, E, f, g, G	floating-point		== strtod(,)
+	 *		s	whitespace-delimited string
+	 *		[	complicated string-scanner frob	]
+	 *		c	one or more characters
+	**		p	pointer representation
+	**		n	return chars read thus far
+	 *		%	single percent-sign
+	 */
+	/*
+	 *	check for assignment flag.
+	 */
+	if ((c = *++sf.format) != '*')
+	    sf.assign = TRUE;
+	else {
+	    sf.assign = FALSE;
+	    c = *++sf.format;
+	}
+
+	/*
+	 *	check for maximum field width specification.  must be positive,
+	 *	if given (can't be negative, since the syntax doesn't allow a
+	 *	way to denote it)
+	 */
+	if (isdigit(c)) {
+	    sf.width = c - '0';
+	    while (isdigit(c = *++sf.format))
+		sf.width = sf.width * 10 + c - '0';
+	    if (!sf.width) break;		/* has to be positive */
+	} else sf.width = -1;		/* -1 means unspecified */
+
+	/*
+	 * now check for a size specification, 'h' for short, 'l' for long,
+	 * 'L' for long double, nothing for normal.
+	 */
+	switch (c) {
+	    case 'h':	sf.size = SHORT; c = *++sf.format; break;
+	    case 'l':	sf.size = LONG; c = *++sf.format; break;
+	    case 'L':	sf.size = LNGDBL; c = *++sf.format; break;
+	    default:	sf.size = NORMAL;
+	}
+
+	/*
+	 *	now find out what it is they really want to do.  each routine
+	 *	clears sf.error if its parse succeeds.  for an unknown op,
+	 *	the error flag remains set, so the code falls out the bottom
+	 *	of the switch.
+	 */
+	sf.error = TRUE;		/* initialize error-on-parse flag */
+
+	switch (c) {
+	case 'd': duox_scanf(&sf, 1, 10);	break;	/* Decimal */
+	case 'i': duox_scanf(&sf, 0, 0);	break;	/* Integer */
+	case 'o': duox_scanf(&sf, 0, 8);	break;	/* Octal */
+	case 'u': duox_scanf(&sf, 0, 10);	break;	/* Unsigned decimal */
+	case 'x':
+	case 'X': duox_scanf(&sf, 0, 16);	break;	/* Hexadecimal */
+	case 'e':
+	case 'E':
+	case 'g':
+	case 'G':
+	case 'f': f_scanf(&sf);		break;	/* Floating-point */
+	case 's': s_scanf(&sf);		break;	/* String */
+	case '[': bracket_scanf(&sf);	break;	/* Scanset frob ] */
+	case 'c': c_scanf(&sf);		break;	/* Char(s) */
+	case 'p': duox_scanf(&sf,0,8);	break;	/* Pointer rep */
+	case 'n': n_scanf(&sf);		break;	/* Ret # chars read */
+	case '%':
+	    sf.error = (getc(sf.stream) != '%');
+	    sf.ccnt++;
+	    break;
+	}
+
+	/* If any error in the parsed conversion, punt now. */
+	if (sf.error) break;
+    }
+
+    if (!sf.asscnt && feof(sf.stream))	/* if got EOF before making any */
+	return EOF;			/* assignments, return EOF, else */
+    else return sf.asscnt;		/* return # of successful assigns */
+}
+
+/* N_SCANF - 'n' Return # of characters read thus far
+*/
+static void
+n_scanf(sf)
+register struct scanf_work *sf;
+{
+    switch (sf->size) {
+    case SHORT:	 *(va_arg(sf->args, short *)) = sf->ccnt;	break;
+    case NORMAL: *(va_arg(sf->args, int   *)) = sf->ccnt;	break;
+    case LONG:	 *(va_arg(sf->args, long  *)) = sf->ccnt;	break;
+    }
+}
+
+/* DUOX_SCANF - 'd', 'u', 'o', 'x' Scanner for various integers.
+**	Similar functionality to strtol().
+*/
+
+static void duox_scanf(sf, signflag, base)
+int signflag, base;
+struct scanf_work *sf;
+{
+    long v = 0;				/* where the value will accumulate */
+    unsigned long uv = 0;
+    int negate = FALSE;			/* TRUE if should negate value */
+    int owidth = sf->width;		/* remember field width at start */
+    int c;
+
+    while (isspace(c = getc(sf->stream)))	/* Skip whitespace */
+	sf->ccnt++;			/* Char gobbled, account for it */
+
+
+    switch (c) {
+	case '-': negate = TRUE;	/* fall into '+' code */
+	case '+': if (--sf->width == 0)	/* OK to gobble it, so bump cnt */
+			return;		/* Match failure, no number */
+		  c = getc(sf->stream);
+     }
+
+    /* Check for initial char '0' in case hex or not sure of base yet.
+    ** If only "0x" is found without a valid hex digit following it, we
+    ** must return a matching error since we can't back up more than 1
+    ** character.  This is a strict interpretation of the dpANS.
+    ** the behavior is different from what strtol() does since strtol
+    ** operates on a string and can thus do infinite backup.
+    */
+    if (c == '0' && (!base || base == 16)) {
+	if (--sf->width			/* Mark '0' gobbled */
+	  && ((c = getc(sf->stream)) == 'x' || c == 'X')) {
+	    if (!base) base = 16;
+	    sf->width--;		/* Gobble the following 'X' */
+	    c = getc(sf->stream);
+ 	} else {
+	    sf->error = FALSE;		/* Got something (0 digit) */
+	    if (!base) base = 8;
+	}
+    } else if (!base) base = 10, signflag++;
+
+    for (; c != EOF && sf->width;
+		((--sf->width) ? (c = getc(sf->stream)) : 0),
+		sf->error = FALSE) {
+	switch (base) {
+	case 8:	if (!isodigit(c)) break;
+		uv = (uv << 3) + (c - '0');
+		continue;
+	case 16: if (!isxdigit(c)) break;
+		uv = (uv << 4) + toint(c);
+		continue;
+	case 10: if (!isdigit(c)) break;
+		if (signflag) v = (v*10) + (c - '0');
+		else uv = (uv*10) + (c - '0');
+		continue;
+	}
+	ungetc(c, sf->stream);		/* Not a valid digit, stop loop */
+	break;				/* and don't mark that char gobbled */
+    }
+
+    if (sf->error) return;
+
+    sf->ccnt += (sf->width - owidth);	/* Account for # chars gobbled */
+    if (sf->assign) {
+	sf->asscnt++;			/* bump successful assignment count */
+	if (!signflag) v = uv;
+	if (negate) v = -v;		/* take care of that unary minus */
+	switch (sf->size) {		/* assign to the right type now... */
+	    case SHORT:  *va_arg(sf->args, short *) = v; break;
+	    case NORMAL: *va_arg(sf->args, int   *) = v; break;
+	    case LONG:   *va_arg(sf->args, long  *) = v; break;
+	}
+    }
+}
+
+/*
+ *	floating-point scanner;  this would be nicer as separate
+ *	steps; get a sign, get some digits, maybe a dot, maybe more
+ *	digits, then maybe an e, maybe a sign, etc etc etc, but having
+ *	to track the field width makes it a bitch, so for now i'm
+ *	resorting to a single get-char loop with flags saying what
+ *	field we're in, so there's a single place to watch the total
+ *	# characters read so far...   (but there must be a better way)
+ */
+
+static void f_scanf(sf)
+struct scanf_work *sf;
+{
+    int owidth = sf->width;		/* remember field width at start */
+    double value, multiplier;
+    int exponent, negate, exp_neg, post_dot, in_exponent, c;
+
+    negate = exp_neg = post_dot = in_exponent = FALSE;
+    exponent = value = 0;
+
+    while (isspace(c = getc(sf->stream)))	/* Skip whitespace */
+	sf->ccnt++;			/* Char gobbled, account for it */
+
+    switch (c) {
+	case '-': negate = TRUE;	/* fall into '+' code */
+	case '+': if (--sf->width == 0)	/* OK to gobble it, so bump cnt */
+			return;		/* Match failure, no number */
+		  c = getc(sf->stream);
+     }
+
+    /* Get integer part if any */
+    while (isdigit(c) && sf->width) {
+	sf->error = FALSE;
+	value = value * 10.0 + (c - '0');
+	if (--sf->width) c = getc(sf->stream);
+    }
+    /* Get fractional part if any */
+    if (c == '.' && sf->width) {
+	if (--sf->width) c = getc(sf->stream);
+	multiplier = 1.0;
+	while (isdigit(c) && sf->width) {
+	    sf->error = FALSE;
+	    value += (c - '0') / (multiplier *= 10.0);
+	    if (--sf->width) c = getc(sf->stream);
+	}
+    }
+    /* Get exponent if any */
+    if (sf->error) {		/* If no number yet, just return. */
+	if (sf->width) ungetc(c, sf->stream);
+	return;
+    }
+    if (sf->width && (c == 'e' || c == 'E')) {
+	sf->error = TRUE;		/* Default to error again */
+	if (--sf->width) switch (c = getc(sf->stream)) {
+	    case '-':	exp_neg = TRUE;	/* fall into '+' code */
+	    case '+':	if (--sf->width) c = getc(sf->stream);
+			break;
+	} else return;			/* Field truncated too soon, fail */
+	while (isdigit(c) && sf->width) {
+	    sf->error = FALSE;
+	    exponent = exponent * 10 + c - '0';
+	    if (--sf->width) c = getc(sf->stream);
+	}
+    }
+    if (sf->width)			/* Push char back if stopped due to */
+	ungetc(c, sf->stream);		/* mismatch rather than field */
+    if (sf->error) return;
+
+    sf->ccnt += (sf->width - owidth);	/* Account for # chars gobbled */
+
+    for (; exponent > 0; exponent--) {
+	if (exp_neg)	value /= 10.0;
+	else		value *= 10.0;
+    }
+    if (sf->assign) {
+	sf->asscnt++;			/* bump successful assignment count */
+	if (negate) value = -value;
+	switch (sf->size) {
+	    case LONG:
+		*((double *) va_arg(sf->args, double *)) = (double) value;
+		break;
+	    default:
+		*((float *) va_arg(sf->args, float *)) = (float) value;
+		break;
+	}
+    }    
+}
+
+/*
+ *	character scanner
+ */
+
+static void c_scanf(sf)
+struct scanf_work *sf;
+{
+    int c;
+    char *s;
+
+    if (sf->width < 0) {
+	if ((c = getc(sf->stream)) != EOF) {
+	    sf->error = FALSE;
+	    sf->ccnt++;
+	    if (sf->assign) {
+		*((int *) va_arg(sf->args, int)) = c;
+	    	sf->asscnt++;
+	    }
+	}
+    } else {
+	if (sf->assign)			/* make a pointer to their array */
+	    s = va_arg(sf->args, char *);
+	while (sf->width-- && (c = getc(sf->stream)) != EOF) {
+	    sf->ccnt++;
+	    if (sf->assign) *s++ = c;	/* suck the chars */
+	}
+	if (sf->width < 0) {		/* if scanned everything, then */
+	    sf->error = FALSE;		/* flag that parse was OK */
+	    if (sf->assign) sf->asscnt++;
+	}
+    }
+}
+
+/*
+ *	string scanner
+ */
+
+static void s_scanf(sf)
+struct scanf_work *sf;
+{
+    int owidth = sf->width;
+    int c;
+    char *s;
+
+    while (isspace(c = getc(sf->stream)))	/* Skip whitespace */
+	sf->ccnt++;			/* Char gobbled, account for it */
+
+    if (sf->assign)
+	s = va_arg(sf->args, char *);
+
+    while (c != EOF && sf->width) {
+	if (!isspace(c)) {
+	    if (sf->assign) *s++ = c;
+	    sf->error = FALSE;
+	    if (--sf->width) c = getc(sf->stream);
+	} else {
+	    ungetc(c, sf->stream);
+	    break;
+	}
+    }
+
+    if (sf->error) return;
+
+    sf->ccnt += (sf->width - owidth);	/* Account for # chars gobbled */
+    if (sf->assign) {
+	*s = '\0';
+	sf->asscnt++;
+    }
+}
+
+static void bracket_scanf(sf)
+struct scanf_work *sf;
+{
+    int c, i, logic;
+    char *s;
+
+    if ((c = *++sf->format) == '^') {
+	logic = FALSE;
+	c = *++sf->format;
+    } else if (c)				/* must be SOMETHING */
+	logic = TRUE;
+    else return;
+
+    for (i = 0; i < CHAR_SET_SIZE; i++)		/* initialize the screen */
+	valid_char[i] = !logic;
+
+    while (c != ']') {
+	valid_char[c%CHAR_SET_SIZE] = logic;
+	if (!(c = *++sf->format)) return;
+    }
+
+    s = va_arg(sf->args, char *);		/* point to destination buf */
+
+    while (sf->width-- && (c = getc(sf->stream)) != EOF) {
+	if (c < CHAR_SET_SIZE && valid_char[c]) {
+	    if (sf->assign) *s++ = c;
+	    sf->ccnt++;
+	} else {
+	    ungetc(c, sf->stream);
+	    break;
+	}
+    }
+
+    sf->error = FALSE;		/* null strings and everything A-OK */
+
+    if (sf->assign) {
+	*s = '\0';
+	sf->asscnt++;
+    }
+}

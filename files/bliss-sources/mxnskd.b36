@@ -1,0 +1,1290 @@
+module NMUSKD (					! Scheduler
+		ident = 'X00.22',
+		main = TOPMOST,
+		version = '4(117)',
+		environment (stack = TSTACK)
+		) =
+begin
+!	COPYRIGHT (c) DIGITAL EQUIPMENT CORPORATION 1985, 1989.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A  LICENSE AND MAY BE USED AND  COPIED
+!	ONLY IN  ACCORDANCE  WITH  THE  TERMS OF  SUCH  LICENSE  AND  WITH  THE
+!	INCLUSION OF THE ABOVE  COPYRIGHT NOTICE.  THIS  SOFTWARE OR ANY  OTHER
+!	COPIES THEREOF MAY NOT BE PROVIDED  OR OTHERWISE MADE AVAILABLE TO  ANY
+!	OTHER PERSON.  NO  TITLE TO  AND OWNERSHIP  OF THE  SOFTWARE IS  HEREBY
+!	TRANSFERRED.
+!
+!	THE INFORMATION IN THIS  SOFTWARE IS SUBJECT  TO CHANGE WITHOUT  NOTICE
+!	AND SHOULD  NOT  BE CONSTRUED  AS  A COMMITMENT  BY  DIGITAL  EQUIPMENT
+!	CORPORATION.
+!
+!	DIGITAL ASSUMES NO  RESPONSIBILITY FOR  THE USE OR  RELIABILITY OF  ITS
+!	SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+
+!++
+! Facility: LSG DECnet Network Management
+!
+! Abstract:
+!
+!       This module provides the scheduling code for multi-tasking.
+!	The main routine (start) for any program using this scheduler
+!	is contained here also.
+!
+!       Scheduling is done on two entities:
+!
+!       (1)  Queues   when a queue becomes non-empty all
+!                     tasks waiting are scheduled.
+!
+!       (2)  Events   when an event occurs the first task waiting for
+!                     the event is scheduled.
+!
+!
+! Environment: TOPS10 and TOPS20 user mode, MCB RSX task mode
+!
+! Author: Steven M. Jenness, Creation date: 20 August 1980
+!
+!--
+
+!
+! Include files
+!
+
+library 'MXNLIB';                       ! All needed definitions
+
+%if $TOPS20
+    %then
+	library 'MONSYM';		! Monitor symbols
+	library 'MXJLNK';		! JSYS linkage definitions
+    %fi
+
+!
+! Global routines
+!
+
+forward routine
+    NMU$SCHED_MANAGER;				! Global entry definitions
+
+!
+! Local routines
+!
+
+forward routine
+    TOPMOST : novalue,				! Starting routine
+    GET_NEXT_TASK,				! Empty RUN_QUEUE
+    MAKE_TASK_RUNNABLE : novalue,		! Fill up RUN_QUEUE
+    SCHEDULER_TASK : novalue,			! Scheduler task co-routine
+    TIMEOUT_SIGNAL : TIMER_INTERRUPT_LINKAGE novalue,	! Signal SKD_EVENT
+    TT_SCAN;					! Scan TIME_QUEUE
+
+!
+! Global literals
+!
+
+global literal
+    %name ('TB.SKD') = %fieldexpand (TB_SCHED_QUEUE, 0) * %UPVAL,
+    %name ('TB.QUE') = %fieldexpand (TB_TASK_QUEUE, 0) * %UPVAL,
+    %name ('TB.STR') = %fieldexpand (TB_START, 0) * %UPVAL,
+    %name ('TB.ABT') = %fieldexpand (TB_ABORT, 0) * %UPVAL,
+    %name ('TB.RSC') = %fieldexpand (TB_RESOURCE, 0) * %UPVAL,
+    %name ('TB.ERR') = %fieldexpand (TB_ERROR_PC, 0) * %UPVAL,
+    %name ('TB.NAM') = %fieldexpand (TB_NAME, 0) * %UPVAL,
+%if $TOPS10 or $TOPS20
+%then
+    %name ('TB.BUF') = %fieldexpand (TB_ERROR_BUFFER, 0) * %UPVAL,
+%fi
+    %name ('TB.EVW') = %fieldexpand (TB_EVENT_WAIT, 0) * %UPVAL,
+    %name ('TB.SEM') = %fieldexpand (TB_SEMAPHORE, 0) * %UPVAL,
+    %name ('TB.TIM') = %fieldexpand (TB_TIME, 0) * %UPVAL,
+    %name ('TB.CTX') = %fieldexpand (TB_CONTEXT, 0) * %UPVAL,
+    %name ('TB.STK') = %fieldexpand (TB_STACK, 0) * %UPVAL;
+
+!
+! Own storage
+!
+
+!
+! Make something have an initial value so $OWN$ PSECT for NMUSKD
+! shows up in TKB36 map.
+!
+
+literal
+    STACK_LENGTH = 600,
+    RUN_QUEUE_SIZE = 50;		! Max number of concurrently running
+					! tasks
+own
+    COPYRIGHT : vector [11] initial (%asciz 'COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION, 1984.'),
+    RUN_QUEUE : vector [RUN_QUEUE_SIZE],! Queue of runnable tasks
+    NEXT_RUNNABLE_TASK : initial (-1),	! Points into RUN_QUEUE
+    LAST_RUNNABLE_TASK : initial (-1),	! Last runnable task pointer
+    TASK_QUEUE : Q_HEADER,              ! Queue of all tasks
+    SKD_EVENT : EVENT_BLOCK,            ! Event for scheduler wakeup
+    SKD_TASK : ref TASK_BLOCK,          ! Task block for scheduler
+    TIME_OUT : TIME_BLOCK;
+
+global
+    TSTACK : vector [STACK_LENGTH],     ! Use this stack
+    TIME_QUEUE : Q_HEADER,              ! Queue of tasks waiting for timeouts
+    NMLVER : initial (4),
+    DECECO : initial (0),
+    USRECO : initial (0);
+
+%master_debug_data_base;                ! Debugging data base
+
+!
+! Structures
+!
+! Timer queue scanning data block
+!
+
+    $field
+    TQUEUE_SCAN_FIELDS =
+	set
+	TT_NOW = [$sub_block (TIME_BLOCK_SIZE)], ! Current time
+	TT_TIME = [$sub_block (TIME_BLOCK_SIZE)] ! Least of wakeup times found
+	tes;
+
+literal
+    TQUEUE_SCAN_SIZE = $field_set_size;
+
+macro
+    TIMER_SCAN_BLOCK = block [TQUEUE_SCAN_SIZE] field (TQUEUE_SCAN_FIELDS) %;
+
+!
+! External references
+!
+
+external
+    CURTSK;					! Current task pointer
+
+external routine
+    NMU$TABLE_ROUTINES,				! Table manipulation routines
+    NMU$QUEUE_MANAGER,				! Queue manager routines
+    NMU$MEMORY_MANAGER,				! Memory management routines
+    INIT_GLOBALS;				! Other global routines for
+                                                !  initialization
+
+%routine ('TOPMOST') : novalue =
+
+!++
+! Functional description:
+!
+!       This is the "main" routine for the program using this
+!	scheduler.
+!
+!	It initializes the memory management system, scheduler and
+!	any other system that requires initialization (defined in
+!	NMINI.REQ).
+!
+!
+! Note that interlocks need to be developed to allow multi-streaming
+! of initialization code.
+!
+!--
+
+    begin
+
+!
+! Detach the job from the Force Line if necessary. (Tops-10 only)
+!
+    %if $TOPS10 %then DETACH (); %fi
+
+!
+! Setup the debugging data base (if needed)
+!
+    %debug_setup;
+
+!
+! Reset memory manager
+!
+    NMU$MEMORY_RESET ();
+    NMU$MEMORY_INITIALIZE (BASIC_MEMORY);
+!
+! Reset the scheduler.
+!
+! Reset master task queue and queue of runnable tasks.
+!
+    NMU$QUEUE_RESET (TASK_QUEUE);
+!
+! Create null task using the current stack.
+!
+    NMU$QUEUE_RESET (TIME_QUEUE);
+    NMU$SCHED_EVENT (SKD_EVENT, $true);
+
+    SKD_TASK = NMU$MEMORY_GET (TASK_BLOCK_ALLOCATION);
+    CURTSK = .SKD_TASK;
+
+    begin
+
+    local
+	TASK_NAME_POINTER, NAME_LITERAL;
+
+    TASK_NAME_POINTER = ch$ptr (SKD_TASK [TB_NAME]);
+    NAME_LITERAL = ch$asciz ('SCHEDULER');
+    ch$movasciz (TASK_NAME_POINTER, .NAME_LITERAL);
+    end;
+
+!
+! Initialize all other systems.
+!
+    MASTER_INITIALIZATION;
+!
+! Start scheduling by calling scheduler co-routine
+!
+    SCHEDULER_TASK ();
+!
+! If return here ... NML has crashed.
+!
+    end;					! End of TOPMOST
+%global_routine ('NMU$SCHED_CREATE', CODE, STACK_SIZE, ABORT_RTN, NAME_PTR) =
+
+!++
+! Functional description:
+!
+!       This routine allocates a task state block and sets the task
+!       up for execution.  The code specified is started when the
+!       task comes up in the runnable task queue.
+!
+! Formal parameters:
+!
+!       .CODE         Address of routine to execute as the task
+!       .STACK_SIZE   Number of fullwords to allocate for stack
+!	.ABORT_RTN    Address of a routine to call when the task
+!		       is aborted
+!	.NAME_PTR     Byte pointer to a ASCIZ task name string
+!
+! Routine value:
+!
+!       The returned value is the address of the task's state
+!       block.  This value is used whenever the task is to
+!       be affected by such routines as NMU$SCHED_ABORT.
+!
+! Side effects:
+!
+!       The runnable task queue gets another task.
+!
+!--
+
+    begin
+
+    local
+	TASK : ref TASK_BLOCK,
+	TASK_NAME;
+
+    %debug (SCHEDULER_TRACE, (TRACE_INFO ('Creating %A (%O)', .NAME_PTR, .CODE)));
+
+%if $TOPS10 or $TOPS20
+%then
+    STACK_SIZE = .STACK_SIZE*2;
+%fi
+!
+! Get memory for a task block
+!
+    TASK = NMU$MEMORY_GET (TASK_BLOCK_ALLOCATION + (.STACK_SIZE*%upval));
+!
+! Initialize start address, error routine, task name and
+! stack.
+!
+    TASK [TB_START] = .CODE;
+    TASK_INITIALIZE (.TASK, .STACK_SIZE);
+    TASK [TB_ABORT] = .ABORT_RTN;
+    TASK_NAME = ch$ptr (TASK [TB_NAME]);
+    ch$movasciz (TASK_NAME, .NAME_PTR);
+!
+! Insert entry into master task queue and
+! runnable task queue.
+!
+    NMU$QUEUE_INSERT (TASK_QUEUE, TASK [TB_TASK_QUEUE]);
+    MAKE_TASK_RUNNABLE (TASK [TB_SCHED_QUEUE]);
+!
+! Return address of the task block.
+!
+    .TASK
+    end;					! End of NMU$SCHED_CREATE
+%global_routine ('NMU$SCHED_ABORT', TASK : ref TASK_BLOCK) : novalue =
+
+!++
+! Functional description:
+!
+!       This routine aborts a task and calls it's clean up routine.
+!
+! Formal parameters:
+!
+!       .TASK   Address of task block for task to abort.
+!
+! Routine value: none
+! Side effects:
+!
+!       The specified task will be aborted, it's cleanup routine
+!       will be called (if it exists) and all traces of the task
+!       will disappear.
+!
+!--
+
+    begin
+
+    bind routine
+	A_ROUTINE = .TASK [TB_ABORT];		! Abort routine address
+
+    %debug (SCHEDULER_TRACE, (TRACE_INFO ('Aborting task %A (%O)',
+					   ch$ptr (TASK [TB_NAME]), .TASK)));
+
+    if A_ROUTINE neq 0 then A_ROUTINE (.TASK);
+
+!*****
+! If task is completely aborted ... delete the task and resources
+!*****
+
+    end;					! End of NMU$SCHED_ABORT
+%global_routine ('NMU$SCHED_FINI') : novalue =
+
+!++
+! Functional description:
+!
+!	This routine is called whenever a task "exits".  This means
+!	that the routine comprising the main routine of the task
+!	attempts to return.
+!
+! Formal parameters: none
+!
+! Routine value: none
+! Side effects:
+!
+!--
+
+    begin
+
+    TASK_INFO ('Task has exited');
+
+    NMU$SCHED_DESCHEDULE ();
+    end;					! End of NMU$SCHED_FINI
+%global_routine ('NMU$SCHED_ERROR', ERROR_PTR) : novalue =
+
+!++
+! Functional description:
+!
+!        This routine is called in a task's context to abnormally
+!        complete it's execution.  It puts the supplied error message
+!        into the task's task block error buffer and then calls
+!        NMU$SCHED_COMPLETE to abort the task.
+!
+! Formal parameters:
+!
+!    .ERROR_PTR    Pointer to ASCIZ string to be put into the
+!                   task block error buffer.
+!
+! Routine value: none
+! Side effects: none
+!
+!--
+
+    begin
+
+%if not $MCB
+%then
+    local
+         TASK : ref TASK_BLOCK,
+         TB_POINTER;
+
+    TASK = CURRENT_TASK;
+
+    TB_POINTER = ch$ptr (TASK [TB_ERROR_BUFFER]);
+
+    if .ERROR_PTR neq 0
+    then ch$movasciz (TB_POINTER, .ERROR_PTR);
+%fi
+
+    NMU$SCHED_COMPLETE ();
+    end;                                ! End of NMU$SCHED_ERROR
+%global_routine ('NMU$SCHED_COMPLETE') : novalue =
+
+!++
+! Functional description:
+!
+!        This routine is called in a task's context to abnormally
+!        complete it's execution.  It outputs the message that is
+!        stored in the task block's error buffer, aborts the task
+!        and deschedules it forever.
+!
+! Formal parameters: none
+!
+! Routine value: none
+! Side effects: none
+!
+!--
+
+    begin
+    local
+         TASK : ref TASK_BLOCK;
+
+    TASK = CURRENT_TASK;
+
+%if not $MCB
+%then
+    TASK_INFO (ch$ptr (TASK [TB_ERROR_BUFFER]));
+%fi
+
+    %if $TOPS10 %then STOP_PROGRAM; %fi  ! Stop NML right now
+    %if $TOPS20 %then STOP_PROGRAM; %fi  ! Stop NML right now
+
+    NMU$SCHED_ABORT (.TASK);
+    NMU$SCHED_DESCHEDULE ();
+    end;                                ! End of NMU$SCHED_COMPLETE
+%global_routine ('NMU$SQUEUE_RESET', QUEUE : ref SQ_HEADER) : novalue =
+
+!++
+! Functional description:
+!
+!       This routine resets a "scheduling" type queue.  Any queue
+!       that can have scheduling done on it contains extra information
+!       in the queue header that should be reset any time the queue
+!       is reset.
+!
+! Formal parameters:
+!
+!       .QUEUE   Address of queue header
+!
+! Routine value: none
+! Side effects:
+!
+!      Any entries on the queue are lost
+!      Any tasks that are waiting on this queue have
+!       their entries on the task wait list deleted.
+!
+!--
+
+    begin
+
+!
+! Reset data queue.
+!
+    NMU$QUEUE_RESET (QUEUE [Q_QUEUE]);
+!
+! Reset queue non-empty event.
+! Don't allow SQUEUE operations at interrupt level.
+!
+    NMU$SCHED_EVENT (QUEUE [Q_EVENT], $false);
+    end;					! End of NMU$SQUEUE_RESET
+%global_routine ('NMU$SQUEUE_INSERT', QUEUE : ref SQ_HEADER, ENTRY) : novalue =
+
+!++
+! Functional description:
+!
+!       This routine inserts an entry into a queue.  If a task is
+!       waiting for this queue to become non-empty, it is scheduled
+!       for execution.
+!
+! Formal parameters:
+!
+!       .QUEUE   Address of a queue header block
+!       .ENTRY   Address of a entry to be inserted to queue
+!
+! Routine value: none
+! Side effects:
+!
+!       If the queue becomes non-empty the queue of tasks waiting
+!       for this to happen is checked.  If a task is waiting, it
+!       is put onto the queue of runnable tasks.
+!
+!--
+
+    begin
+
+    NMU$QUEUE_INSERT (QUEUE [Q_QUEUE], .ENTRY);
+    NMU$SCHED_FLAG (QUEUE [Q_EVENT]);
+    end;					! End of NMU$SQUEUE_INSERT
+%global_routine ('NMU$SQUEUE_REMOVE', QUEUE : ref SQ_HEADER) =
+
+!++
+! Functional description:
+!
+!       This routine removes an entry from a queue.  If the queue
+!       is empty, the calling task is descheduled and a new task
+!       is selected for running.  If no task is runnable, the null
+!       task is executed.
+!
+! Formal parameters:
+!
+!       .QUEUE   Address of a queue header block
+!
+! Routine value:
+!
+!       Address of entry from queue
+!
+! Side effects: none
+!
+!--
+
+    begin
+
+    local
+	ENTRY;
+
+    while (ENTRY = NMU$QUEUE_REMOVE (QUEUE [Q_QUEUE])) eql 0 do
+	NMU$SCHED_WAIT (QUEUE [Q_EVENT],0);
+
+    .ENTRY
+    end;					! End of NMU$SQUEUE_REMOVE
+%global_routine ('NMU$QQUEUE_RESET', QUEUE : ref QQ_HEADER, QUOTA) : novalue =
+
+!++
+! Functional description:
+!
+!       This routine resets a "quota scheduling" type queue.  Any queue
+!       that can have scheduling done on it contains extra information
+!       in the queue header that should be reset any time the queue
+!       is reset.
+!
+! Formal parameters:
+!
+!       .QUEUE   Address of queue header
+!       .QUOTA   Number of Entries in queue before insert waits
+!
+! Routine value: none
+! Side effects:
+!
+!      Any entries on the queue are lost
+!      Any tasks that are waiting on this queue have
+!       their entries on the task wait list deleted.
+!
+!--
+
+    begin
+
+!
+! Reset the scheduler queue portion of this entry.
+!
+    NMU$SQUEUE_RESET (QUEUE [QQ_SQUEUE]);
+!
+! Reset insert queue resume event.
+! Don't allow SQUEUE operations at interrupt level.
+!
+    NMU$SCHED_EVENT (QUEUE [QQ_IEVENT], $false);
+    QUEUE [QQ_QUOTA] = .QUOTA;
+    QUEUE [QQ_CURRENT] = 0;
+    end;					! End of NMU$QQUEUE_RESET
+%global_routine ('NMU$QQUEUE_INSERT', QUEUE : ref QQ_HEADER, ENTRY) : novalue =
+
+!++
+! Functional description:
+!
+!       This routine inserts an entry into a queue.  If a task is
+!       waiting for this queue to become non-empty, it is scheduled
+!       for execution. If this insert would exceed the insert quota
+!       the current task is suspended.
+!
+! Formal parameters:
+!
+!       .QUEUE   Address of a queue header block
+!       .ENTRY   Address of a entry to be inserted to queue
+!
+! Routine value: none
+! Side effects:
+!
+!       If the queue becomes non-empty the queue of tasks waiting
+!       for this to happen is checked.  If a task is waiting, it
+!       is put onto the queue of runnable tasks.
+!
+!--
+
+    begin
+
+    while .QUEUE [QQ_CURRENT] geq .QUEUE [QQ_QUOTA]
+    do NMU$SCHED_WAIT (QUEUE [QQ_IEVENT],0);
+
+    QUEUE [QQ_CURRENT] = .QUEUE [QQ_CURRENT] + 1;
+    NMU$SQUEUE_INSERT (QUEUE [QQ_SQUEUE], .ENTRY);
+    end;					! End of NMU$QQUEUE_INSERT
+%global_routine ('NMU$QQUEUE_REMOVE', QUEUE : ref QQ_HEADER) =
+
+!++
+! Functional description:
+!
+!       This routine removes an entry from a queue.  If the queue
+!       is empty, the calling task is descheduled and a new task
+!       is selected for running.  If no task is runnable, the null
+!       task is executed. When a remove has dropped the number of
+!       queue entries to less than the quota the queue inserter is
+!       resumed.
+!
+! Formal parameters:
+!
+!       .QUEUE   Address of a queue header block
+!
+! Routine value:
+!
+!       Address of entry from queue
+!
+! Side effects: none
+!
+!--
+
+    begin
+
+    local
+        ENTRY;
+
+    ENTRY = NMU$SQUEUE_REMOVE (QUEUE [QQ_SQUEUE]);
+    QUEUE [QQ_CURRENT] = .QUEUE [QQ_CURRENT] - 1;
+
+    if .QUEUE [QQ_CURRENT] lss .QUEUE [QQ_QUOTA]
+    then NMU$SCHED_FLAG ( QUEUE [QQ_IEVENT]);
+
+    .ENTRY
+    end;					! End of NMU$QQUEUE_REMOVE
+%global_routine ('NMU$QQUEUE_EXTRACT', QUEUE : ref QQ_HEADER, ENTRY) =
+
+!++
+! Functional description:
+!
+!       This routine removes an explicit entry from a queue.  The
+!       quota for the queue is adjusted to reflect the entry's
+!       extraction.
+!
+! Formal parameters:
+!
+!       .QUEUE   Address of a queue header block
+!       .ENTRY   Address of entry on queue
+!
+! Routine value:
+!
+!	$true	Entry was found on the queue and extracted
+!	$false	Entry was not found on the queue
+!
+! Side effects: none
+!
+!--
+
+    begin
+
+    if NMU$QUEUE_EXTRACT (QUEUE [QQ_SQUEUE], .ENTRY)
+    then
+        begin
+        QUEUE [QQ_CURRENT] = .QUEUE [QQ_CURRENT] - 1;
+        $true
+        end
+    else
+        $false
+
+    end;					! End of NMU$QQUEUE_EXTRACT
+%global_routine ('NMU$SCHED_EVENT', EVENT : ref EVENT_BLOCK, INT_OFF) : novalue =
+
+!++
+! Functional description:
+!
+!       This routine resets the data base associated with a
+!       particular event.
+!
+! Formal parameters:
+!
+!       .EVENT		Address of event block (EVENT_BLOCK)
+!	.INT_OFF	Boolean flag indicating if interrupts
+!			are to be turned off when this event
+!			is being signalled. (i.e. this flag is
+!			$true if the event can be signalled from
+!			interrupt level.)
+!
+! Routine value: none
+! Side effects:
+!
+!       The queue of tasks waiting for the event is cleared.
+!       The count of event occurances is cleared.
+!
+!--
+
+    begin
+
+    %debug (EVENT_TRACE, (TRACE_INFO ('Event reset (%O)', .EVENT)));
+
+!
+! Reset queue of tasks waiting for this event.
+!
+    NMU$TABLE_CLEAR (EVENT [EB_TASKS]);
+!    EVENT [EB_TASKS] = 0;
+!
+! Lock the event semaphore, indicating is hasn't
+! happened yet.
+!
+!
+!    LOCK (EVENT [EB_SEMAPHORE]);
+	EVENT [EB_SEMAPHORE] = $false;
+!
+! Set the interrupt suppression flag (if event
+! can be signalled from interrupt level.
+!
+    EVENT [EB_NOINT] = .INT_OFF;
+    end;					! End of NMU$SCHED_EVENT
+%global_routine ('NMU$SCHED_FLAG', EVENT : ref EVENT_BLOCK) : novalue =
+
+!++
+! Functional description:
+!
+!       This routine flags an "event" occurance.  Any task that
+!       is waiting for the event will be put onto the RUNNABLE
+!       task queue.
+!
+! Formal parameters:
+!
+!       .EVENT    Address of selected event queue header
+!
+! Routine value: none
+! Side effects:
+!
+!       Tasks may be put onto the runnable queue.
+!       The queue associated with the EVENT will be emptied.
+!
+!--
+
+    begin
+
+    local
+	TASK : ref TASK_BLOCK;
+
+    %debug (EVENT_TRACE, (TRACE_INFO ('Event flagged (%O)', .EVENT)));
+
+!
+! If can be flagged from interrupt level .. turn
+! interrupts off for a moment.
+!
+
+    if .EVENT [EB_NOINT] then INTERRUPT_OFF;
+
+!
+! Signal that the event has happened by either
+! scheduling the next task queued to the event
+! or unlocking the semaphore if no task is ready
+! for the event.
+!
+
+    TASK = 0;
+    incr INDEX from 1 to NMU$TABLE_MAX (EVENT [EB_TASKS]) do
+	if NMU$TABLE_FETCH (EVENT [EB_TASKS], .INDEX, TASK) then
+	begin
+	MAKE_TASK_RUNNABLE (TASK [TB_SCHED_QUEUE]);
+	NMU$TABLE_DELETE (EVENT [EB_TASKS], .INDEX);
+	end;
+
+!
+! Now we clear the table pointed to by the event block, so that people who
+! just deallocate the block without calling NMU$SCHED_EVENT, won't make us lose
+! the memory taken up by the table. (At this point all of the useful info in
+! the table has been extracted.)
+!
+    NMU$TABLE_CLEAR (EVENT [EB_TASKS]);
+
+    EVENT [EB_SEMAPHORE] = $true;
+
+!
+! Turn interrupts back on if they were
+! turned off.
+!
+
+    if .EVENT [EB_NOINT] then INTERRUPT_ON;
+
+!
+! If we can be called at interrupt level, issue a PROCESS_WAKE in case this
+! interrupt occurred between the time _DESCHEDULE checked the RUN_QUEUE, and
+! the time it does a PROCESS_SLEEP.  This will nullify the PROCESS_SLEEP.
+!
+
+!    if .EVENT [EB_NOINT] then PROCESS_WAKE;
+
+    end;					! End of NMU$SCHED_FLAG
+%global_routine ('NMU$SCHED_WAIT', EVENT: ref EVENT_BLOCK, SECONDS) :  =
+
+!++
+! Functional description:
+!
+!       This routine blocks a process until it is woken up on
+!       any event (or queue non-empty) that it is waiting for,
+!       or until the timeout interval (if specified) passes.
+!
+! Formal parameters:
+!
+!	.EVENT	 Address of event block on which to wait
+!	SECONDS Number of seconds to wait before timing out
+!
+! Routine value: $true if the awaited event happened or if no timeout requested
+!                $false if it timed out
+! Side effects: none
+!
+!--
+
+    begin
+
+    local
+	TASK : ref TASK_BLOCK,
+	TABLE_INDEX,
+	EVENT_OCCURRED;
+
+    %debug (EVENT_TRACE, (TRACE_INFO ('Event wait (%O)', .EVENT)));
+
+!
+! Turn the interrupts off if this event
+! can be signalled from interrupt level.
+!
+
+    if .EVENT [EB_NOINT] then INTERRUPT_OFF;
+
+!
+! Test for the event having occured already.
+! Deschedule the task if not.  Turn the
+! interrupts on in any case.
+!
+
+!    EVENT_OCCURRED = LOCK (EVENT [EB_SEMAPHORE]);
+    EVENT_OCCURRED = .EVENT [EB_SEMAPHORE];
+    EVENT [EB_SEMAPHORE] = $false;  ! Reset the flag after reading it
+
+    if not .EVENT_OCCURRED	        ! If event has not yet occurred,
+    then			        ! add current task to task list
+	begin			        ! for this event.
+	TABLE_INDEX = NMU$TABLE_INSERT (EVENT [EB_TASKS], CURRENT_TASK);
+
+	if .EVENT [EB_NOINT] then INTERRUPT_ON;	! Enable interrupts
+	if .SECONDS eql 0	        ! If no time specified,
+	then			        !  just suspend task.
+	    begin
+	    NMU$SCHED_DESCHEDULE ();    ! When task resumes...
+            EVENT [EB_SEMAPHORE] = $false; ! Reset the flag.  Event occurred
+	    return $true		!  Return
+	    end
+        else				! If a wait time was specified,
+            NMU$SCHED_SLEEP (.SECONDS);	!  suspend task by sleeping.
+
+	!
+	! Task will resume here if sleep time expires or event occurs.
+	! If it timed out, task needs to be removed from event task
+	! list; if event occurred, task needs to be removed from
+	! TIME_QUEUE.  We try to do both -- no ill side effects.
+	!
+
+	if .EVENT [EB_NOINT] then INTERRUPT_OFF; ! Interrupts off again
+
+!	EVENT_OCCURRED = LOCK (EVENT [EB_SEMAPHORE]);
+	EVENT_OCCURRED = .EVENT [EB_SEMAPHORE];
+	EVENT [EB_SEMAPHORE] = $false;  ! Reset the event flag after reading
+
+	NMU$TABLE_DELETE (EVENT [EB_TASKS], .TABLE_INDEX);
+
+	TASK = CURRENT_TASK;
+
+	NMU$QUEUE_EXTRACT(TIME_QUEUE, TASK [TB_SCHED_QUEUE]);
+
+	if .EVENT [EB_NOINT] then INTERRUPT_ON;
+
+	return .EVENT_OCCURRED
+
+	end;
+
+    if .EVENT [EB_NOINT] then INTERRUPT_ON;
+    $true
+
+end;						! End of NMU$SCHED_WAIT
+%global_routine ('NMU$SCHED_DESCHEDULE') : novalue =
+
+!++
+! Functional description:
+!
+!	This routine deschedules the currently running task. It checks
+!       to see if any tasks waiting for events have timed out, and causes
+!       their events to be flagged if so (see NMU$TIMEOUT_CHECK).
+!	If no other task wants to run, the null task is run.
+!
+! Formal parameters: none
+!
+! Routine value: none
+! Side effects: none
+!
+!--
+
+    begin
+
+    local
+	TASK : ref TASK_BLOCK;
+
+    TASK = 0;
+
+!
+! Wait until a task is found and scheduled
+!
+    while .TASK eql 0
+    do
+	begin
+
+!
+! Turn interrupts off so that the scheduler is not
+! interrupted while working on the run queue.
+!
+	INTERRUPT_OFF;
+!
+! Get the next entry from the run queue.
+!
+	TASK = GET_NEXT_TASK ();
+!
+! Turn the interrupts back on now.
+!
+	INTERRUPT_ON;
+!
+! Switch context to either the new task (if
+! one was removed from the queue or the the
+! null task.
+!
+
+	if .TASK neq 0
+	then
+	    if .TASK neq CURRENT_TASK
+	    then
+		begin
+		%debug (SCHEDULER_TRACE,
+			(TRACE_INFO ('Switch to (%O) %A',
+				 .TASK, ch$ptr (TASK [TB_NAME]))));
+
+		CONTEXT_SWITCH (.TASK);
+	        end
+	    else
+		begin
+		%debug (SCHEDULER_TRACE,
+			(TRACE_INFO ('Continuing current task')));
+		1;
+		end
+	else
+	    begin
+	    %debug (SCHEDULER_TRACE,
+		    (TRACE_INFO ('No runnable task .. sleeping')));
+
+	    %if not $TOPS10 %then PROCESS_SLEEP (60);
+                            %else PROCESS_SLEEP (0); %fi
+
+	    %debug (SCHEDULER_TRACE,
+		    (TRACE_INFO ('Program woken up')));
+	    end;
+	end;
+!
+! When context switched back to this task...
+! this routine will return.
+!
+    end;					! End of NMU$SCHED_DESCHEDULE
+%global_routine ('NMU$SCHED_PAUSE') : novalue =
+
+!++
+!
+! Functional description:
+!
+!	This routine will put the currently running task at the end of the
+!	RUN_QUEUE, and then deschedule.  It's purpose is to allow tasks that
+!	take a long time to be interrupted.  This call should be placed at
+!	strategic, frequently executed points in the task, such as after
+!	executing a monitor call that blocks for a while.
+!
+!	In essence, this routine will make the current task be the last task
+!	to be executed in the RUN_QUEUE.  Other tasks are installed by
+!	interrupt level, or by other tasks, and they will all take precedence
+!	over the current task, if they were on the RUN_QUEUE already.
+!
+!--
+
+begin
+    if .NEXT_RUNNABLE_TASK eql .LAST_RUNNABLE_TASK then return;
+
+    MAKE_TASK_RUNNABLE (CURRENT_TASK);
+    NMU$SCHED_DESCHEDULE ();
+end;						! End of NMU$SCHED_PAUSE
+%global_routine ('NMU$SCHED_SLEEP', TIME) : novalue =
+
+!++
+! Functional description:
+!
+!	This routine is called by any task that wishes to go
+!	to sleep for a short while.  The task will block until
+!	the specified number of seconds elapses.
+!
+! Formal parameters:
+!
+!	.TIME	Number of seconds to wait.
+!
+! Routine value: none
+! Side effects: none
+!
+!--
+
+    begin
+
+    local
+	TASK : ref TASK_BLOCK;
+
+    %debug (SCHEDULER_TRACE, (TRACE_INFO ('Task sleeping for %D seconds', .TIME)));
+
+!
+! Get address of currently running task's task block.
+!
+    TASK = CURRENT_TASK;
+!
+! Set the time to wake this task up, clear the wakeup
+! event and queue it to the time wakeup queue.
+!
+    TIME_CURRENT (.TIME, TASK [TB_TIME]);
+!First extract the item from the queu if it was in there already. This will
+!insure that an item never get in there twice.
+    NMU$QUEUE_EXTRACT(TIME_QUEUE, TASK [TB_SCHED_QUEUE]);
+    NMU$QUEUE_INSERT (TIME_QUEUE, TASK [TB_SCHED_QUEUE]);
+!
+! Signal to the TIMER TASK that someone has modified it's
+! data base.  Then wait for the TIMER TASK to put this task
+! back onto the run queue.
+!
+    NMU$SCHED_FLAG (SKD_EVENT);
+    NMU$SCHED_DESCHEDULE ();
+
+    %debug (SCHEDULER_TRACE,
+	    (TRACE_INFO ('Task woken up')));
+    end;					! End of NMU$SCHED_SLEEP
+%routine ('GET_NEXT_TASK') =
+
+!++
+!
+! Functional description:
+!
+!	This routine will remove the first runnable task from the runnable
+!	task queue.  First, it will check to see if NEXT_RUNNABLE_TASK and
+!	LAST_RUNNABLE_TASK point to the same vector entry.  If so, then the
+!	queue is empty.  Otherwise, we increment NEXT_RUNNABLE_TASK, and
+!	get that item out of the runnable task vector.
+!
+! Routine value:
+!
+!	Zero if there are no runnable tasks.
+!	Otherwise, the address of the task block.
+!
+!--
+
+begin
+    local
+	VALUE;
+
+    if .NEXT_RUNNABLE_TASK eql .LAST_RUNNABLE_TASK then return 0;
+
+    INTERRUPT_OFF;
+
+    NEXT_RUNNABLE_TASK = (.NEXT_RUNNABLE_TASK + 1) mod RUN_QUEUE_SIZE;
+
+    VALUE = .RUN_QUEUE [.NEXT_RUNNABLE_TASK];
+
+    INTERRUPT_ON;
+
+    .VALUE
+end;						! End of GET_NEXT_TASK
+%routine ('MAKE_TASK_RUNNABLE', TASK) : novalue =
+
+!++
+!
+! Functional description:
+!
+!	This routine will install the specified task on the RUN_QUEUE.
+!	The task will be put at the end of the RUN_QUEUE, so that it will
+!	be run after all currently waiting tasks.  This causes round robin
+!	type scheduling to occur.
+!
+!	It works by incrementing LAST_RUNNABLE_TASK so that it points at
+!	a new entry in RUN_QUEUE.  If (after incrementing) the LAST_RUNNABLE_
+!	TASK pointer is equal to the NEXT_RUNNABLE_TASK pointer, we stopcode.
+!
+! Formal parameters:
+!
+!	TASK		Address of task to be installed on RUN_QUEUE.
+!
+!--
+
+begin
+    INTERRUPT_OFF;
+
+    LAST_RUNNABLE_TASK = (.LAST_RUNNABLE_TASK + 1) mod RUN_QUEUE_SIZE;
+
+    if .LAST_RUNNABLE_TASK eql .NEXT_RUNNABLE_TASK then
+	TASK_ERROR ('Run queue overflowed in MAKE_TASK_RUNNABLE');
+
+    RUN_QUEUE [.LAST_RUNNABLE_TASK] = .TASK;
+
+    INTERRUPT_ON;
+end;					! End of MAKE_TASK_RUNNABLE
+%routine ('SCHEDULER_TASK') : novalue =
+
+!++
+! Functional description:
+!
+!	This task handles timeouts for other tasks.  Other
+!	tasks queue themselves to this task to be woken up
+!	after the time specified in the TIME_OUT block in
+!	their respective task blocks.
+!
+! Formal parameters: none
+!
+! Routine value: none
+! Side effects: none
+!
+!--
+
+    begin
+
+    local
+	TT_SBLK : TIMER_SCAN_BLOCK;
+
+!
+! Flag that no time out interrupt is currently defined.
+!
+    TIME_SET_NULL (TIME_OUT);
+!
+! Loop doing this task's work forever.
+!
+
+    while $true do
+	begin
+!
+! Get current time.
+!
+	TIME_CURRENT (0, TT_SBLK [TT_NOW]);
+	TIME_SET_NULL (TT_SBLK [TT_TIME]);
+!
+! Scan timer queue, scheduling any task that needs
+! to be scheduled.  Also find the next time to have
+! a time out interrupt generated.
+!
+	NMU$QUEUE_SCAN (TIME_QUEUE, TT_SBLK, TT_SCAN);
+!
+! The time returned in TT_TIME is the time of the closest
+! task wakeup.  If it is greater than zero, a task is
+! waiting for wakeup.  If no task is waiting, then clear
+! any pending interrupts.
+!
+! Set a new time out interrupt if needed.
+!
+
+	if TIME_NULL (TT_SBLK [TT_TIME])
+	then
+	    begin
+	    TIME_INTERRUPT_CLEAR;
+	    TIME_SET_NULL (TIME_OUT);
+	    end
+	else
+
+	    if TIME_TEST (TT_SBLK [TT_TIME], lss, TIME_OUT)
+	       or TIME_NULL (TIME_OUT)
+	    then
+		begin
+		TIME_COPY (TIME_OUT, TT_SBLK [TT_TIME]);
+		TIME_INTERRUPT_CLEAR;
+		TIME_INTERRUPT_SET (TIME_OUT, TIMEOUT_SIGNAL);
+		end;
+
+!
+! Wait until the next scheduler event occurs.  The scheduler
+! event includes both time interrupts and another task
+! queueing itself to be woken up in the future.
+!
+	NMU$SCHED_WAIT (SKD_EVENT,0);
+	end;
+
+    end;					! End of SCHEDULER_TASK
+%routine ('TIMEOUT_SIGNAL') TIMER_INTERRUPT_ROUTINE novalue =
+
+!++
+! Functional description:
+!
+!	This routine is called at interrupt level when
+!	a timer interrupt occurs.  It signals the SKD_EVENT
+!	so that the scheduler task will start again.
+!
+! Formal parameters: none
+!
+! Routine value: none
+! Side effects: none
+!
+!--
+
+    begin
+        TIME_SET_NULL (TIME_OUT);
+	NMU$SCHED_FLAG (SKD_EVENT);
+	PROCESS_WAKE;
+    end;					! End of TIMEOUT_SIGNAL
+%routine ('TT_SCAN', TASK : ref TASK_BLOCK, DATA : ref TIMER_SCAN_BLOCK) =
+
+!++
+! Functional description:
+!
+!	This routine performs the timer queue scaning for the
+!	scheduler task.
+!
+!	When a task is found that has a wakeup time less than
+!	the current time, a wakeup event is generated for it.
+!
+!	The closest wakeup time to the current time is kept
+!	so that a wake up interrupt can be set.
+!
+! Formal parameters:
+!
+!	.TASK	Address of task from time queue
+!	.DATA	Address of timer queue scanning data block
+!
+! Routine value: none
+! Side effects: none
+!
+!--
+
+    begin
+!
+! Check to see if the task needs to be woken up.
+!
+
+    if TIME_TEST (TASK [TB_TIME], leq, DATA [TT_NOW])
+    then
+	begin
+	NMU$QUEUE_SCAN_EXTRACT (TASK [TB_SCHED_QUEUE]);
+	MAKE_TASK_RUNNABLE (TASK [TB_SCHED_QUEUE]);
+	end
+    else
+!
+! Check if wakeup time of task is the closest future
+! time.
+!
+
+	if TIME_TEST (DATA [TT_TIME], gtr, TASK [TB_TIME])
+	   or TIME_NULL (DATA [TT_TIME])
+	then TIME_COPY (DATA [TT_TIME], TASK [TB_TIME]);
+
+!
+! Return value indicating that queue scan should continue to
+! the end of the queue.
+!
+    0
+    end;					! End of TT_SCAN
+%global_routine ('NMU$SCHED_CURRENT') =
+
+!++
+! Functional description:
+!
+!	This routine returns the current task block address.
+!
+! Formal parameters: none
+!
+! Routine value:
+!
+!	A task block address
+!
+! Side effects: none
+!
+!--
+
+    begin
+    CURRENT_TASK
+    end;					! End of NMU$SCHED_CURRENT
+
+end						! End of module SCHED
+
+eludom
+
+! Local Modes:
+! Mode:BLISS
+! Auto Save Mode:0
+! Comment Column:40
+! Comment Rounding:+1
+! End:

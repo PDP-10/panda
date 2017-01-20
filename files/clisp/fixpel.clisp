@@ -1,0 +1,714 @@
+;;; -*- Mode:CLISP; Package:LISP -*-
+;Aida::Ss:<Clisp.Upsala>Fixpel.Clisp.11, 20-Mar-86 03:05:40, Ed: Victor
+; It isn't a feature, it's a module.  Provide it.
+;Aida::Ss:<Clisp.Upsala>Fixpel.Clisp.11, 17-Jan-86 12:48:41, Ed: Victor
+; Export Fixpel-Error-Init, but don't call it, let the user choose.
+;Aida::Ss:<Clisp.Upsala>Fixpel.Clisp.2, 15-Jan-86 19:07:14, Ed: Victor
+; Gaah.  Started looking at the code, sorry.
+; Define FIXPEL-foobar-handler, and define fixpel-error-init, so people who
+;don't like it can revert by saying (lisp::error-init).
+; Rehacked some strings too.  This code needs cleaning up, believe me...
+;;; Aida::Ss:<Clisp.Upsala>Fixpel.Clisp.1, 23-Dec-85 23:37:08, Ed: Victor
+;;; Merged Per's Handlers and DWIM into FIXPEL.CLISP,
+;;; set *dwim-searched-packages* to something reasonable, 
+;;; made it a feature to have Fixpel.
+
+;<D85.PER-MILDNER.CLISP>HANDLERS.CLISP.7,  9-Dec-85 23:58:42, Edit by D85.PER-MILDNER
+; Now it's possible to get a description of a symbol at query.
+;<D85.PER-MILDNER.CLISP>HANDLERS.CLISP.123,  6-Dec-85 05:13:42, Edit by D85.PER-MILDNER
+; Added friendlier query-fun to everything (Argh again).
+;<D85.PER-MILDNER.CLISP>HANDLERS.CLISP.91,  5-Dec-85 02:42:22, Edit by D85.PER-MILDNER
+; Added handler for unbound function (Argh..)
+;<D85.PER-MILDNER.CLISP>HANDLERS.CLISP.83,  3-Dec-85 17:42:56, Edit by D85.PER-MILDNER
+; Yet another complete rehack now also handles local variables.
+;<D85.PER-MILDNER.CLISP>HANDLERS.CLISP.18,  2-Dec-85 17:25:49, Edit by D85.PER-MILDNER
+; Complete rehack now also handles step and stuff at top-level.
+;<D85.PER-MILDNER.CLISP>ERRH.CLISP.29, 27-Nov-85 03:40:37, Edit by D85.PER-MILDNER
+; Created.
+
+;;; By Per Mildner
+
+(provide "FIXPEL")
+(in-package 'lisp)
+
+(export '(*dwim-searched-packages* similar-pname-p fixpel-error-init))
+
+(defvar *%handler-debug* nil
+  "Controls some printout from the handler.")
+
+(defvar *dwim-searched-packages*
+  (remove (find-package 'keyword)
+     (remove (find-package 'compiler)
+	(list-all-packages)))
+  "A package,symbol or a list of such denoting the packages to search in
+   after misspelled symbols. If T search all packages including internals.")
+
+;;; Fixpel-unbound-variable handler is a handler for the :unbound-variable
+;;;  condition.  If the error is signaled correctably, then the correction
+;;;  value is obtained either by getting a new symbol from user or
+;;;  by forcing the user to setq the symbol in the break loop.
+;;; Note for hackers: It would be desirable to correctly patch even in
+;;;  sub-evaluations e.g. (defun foo ()
+;;;                         (eval '(let ((flip flop) (blip blip))
+;;;                                   (cons flip blip)))).
+;;;  It doesn't work just to use nsubst on (spdlrt nexteval..) because
+;;;   of the possibility that a symbol appears at more than one place,
+;;;   compare with (blip blip) above.
+;;; I have not figured out how to get a handle to the cons inside a let as
+;;;  above and it doesn't seem to be possible.
+
+;;; Fixpel-Undefined-Function-Handler
+
+(defun Fixpel-unbound-variable-handler
+  (ignore continue-string function error-string &rest args)
+  (declare (ignore ignore))
+  (error-print error-string args function continue-string)
+  (if continue-string
+      (let ((error-level (get-error))
+	    (var (car args)))
+	(if error-level
+	    (let*
+	     ((sp-err (car error-level))
+	      (p-err (cdr error-level))
+	      (sp-p-var (multiple-value-list (nextbl sp-err p-err)))
+	      (sp (car sp-p-var))
+	      (varentry (caddr sp-p-var)) ;  Var should be cdr of varentry.
+	      (nextevalblip (or (and (numberp sp) (nextev (1- sp))) sp))
+	      (formentry (memq var (spdlrt nextevalblip)))
+	      (ans
+	       (%dwimdosyms
+		var sp-err
+		"Use the local variable ~A instead?"
+		"Use the global ~[variable~;constant~] ~A instead?"))
+	      (returnkey (car ans))
+	      (newvar (cdr ans)))
+	     (if ans
+		 (progn
+		  (if varentry (setf (cdr varentry) newvar))
+		  (if formentry (setf (car formentry) newvar))
+		  (return-from Fixpel-unbound-variable-handler
+			       (values returnkey
+				       (speval sp-err newvar)))))
+
+	      ;;; Comes here if no symbols matched or suited the user.
+	     (prog ()
+	      loop
+	       (internal-break-loop)
+	       (if (speval sp-err `(boundp ',var))
+		   (return (values ':return (speval sp var))))
+	       (format *error-output*
+		       "~%;Warning, Can not proceed until ~S has been Setq'd."
+		       var)
+	       (go loop)))
+
+	    ;;; Goes here if error-level could not be determined
+	    ;;; This should never happen but in that case use (boundp ..)
+	    ;;;  instead of (speval...) since there's no context for speval.
+	    (prog ()
+	     loop
+	      (internal-break-loop)
+	      (if (boundp var)
+		  (return-from Fixpel-unbound-variable-handler
+			       (values ':return (symbol-value var))))
+	      (format *error-output*
+		      "~%;Warning, Can not proceed until ~S has been Setq'd."
+		      var)
+	      (go loop))))
+
+      ;;; Goes here if continue-string was nil i.e. if the error was
+      ;;;  uncorrectable.
+      (dont-proceed)))
+
+
+;;; Fixpel-Undefined-Function-Handler
+
+;;; Fixpel-undefined-function-handler is a handler for the :undefined-function
+;;;  condition.  If the error is signaled correctably, then the correction
+;;;  value is obtained either by getting a new symbol from user or
+;;;  by forcing the user to define it in the break loop.
+
+
+(defun Fixpel-undefined-function-handler
+  (ignore continue-string function error-string &rest args)
+  (declare (ignore ignore))
+  (error-print error-string args function continue-string)
+  (if continue-string
+      (let ((error-level (get-error))
+	    (var (car args)))
+	(if error-level
+	    (let*
+	     ((sp-err (car error-level))
+	      (p-err (cdr error-level))
+	      (sp-p-var (multiple-value-list (nextbl sp-err p-err)))
+	      (sp (car sp-p-var))
+	      (varentry (caddr sp-p-var)) ;  Var should be cdr of varentry.
+	      (formentry (memq var varentry)))
+	     (when formentry
+	       (let*
+		((ans (%dwimdofuns
+		       var sp-err
+		       "Use the local ~[function~;macro~] ~A instead?"
+		       "Use the ~[function~;macro~;special form~] ~A ~
+		       instead?"))
+		 (newvar (cdr ans)))
+		(when ans ; I.e. match and user liked it.
+		  (setf (car formentry) newvar)
+		  ;;; return (values :return (symbol-function..))
+		  ;;; doesn't work so we'll have to do this instead:
+		  (spredo sp) ; And Pray...
+	          ;;; Spredo never returns, but if, then I want to know.
+		  (format *error-output*
+			  "~%Internal error in FIXPEL, please report it!!!"))))
+	     ;;; Comes here if no symbols were good or if something went wrong.
+	     (prog ()
+	      loop
+	       (internal-break-loop)
+	       (if (fboundp var)
+		   (return (values ':return (symbol-function var))))
+	       (format *error-output*
+		       "~%;Warning, Can not proceed until ~S has been defun'd."
+		       var)
+	       (go loop)))
+	    ;;; Goes here if error-level could not be determined
+	    ;;; This should never happen but in that case use (boundp ..)
+	    ;;;  instead of (speval...) since there's no context for speval.
+	    (prog ()
+	     loop
+	      (internal-break-loop)
+	      (if (fboundp (car args))
+		  (return (values ':return (symbol-function (car args)))))
+	      (format *error-output*
+		      "~%;Warning, Can not proceed until ~S has been defun'd."
+		      (car args))
+	      (go loop))))
+      ;;; Goes here if continue-string was nil i.e. if the error was
+      ;;;  uncorrectable.
+      (dont-proceed)))
+
+(defun %dwimdosyms (var sp-err local-query global-query)
+  "A very local elephantiasis function."
+  (let ((asked ()))
+    
+    ;;; Check if any local symbols match.
+    (and (speval sp-err `(boundp '%venv%))
+	 (do*
+	  ((matches? (member var 
+			     (mapcan #'(lambda (x) ; Filter out non conses.
+					 (if (consp x)
+					     `(,(car x))))
+				     (speval sp-err '%venv%))
+			     :test #'similar-pname-p)
+		     (member var (cdr matches?) :test #'similar-pname-p))
+	   (newvar (car matches?) (car matches?)))
+	  ((atom matches?))
+	  (and
+	   (not (memq newvar asked)) ; Only ask once.
+	   (push newvar asked) ; Remember the already asked.
+	   (let ((ans
+		  (%dwimquery
+		   sp-err nil nil local-query
+		   "Answer~%~
+		   ~7TYes to use this local variable instead of ~
+		      the undefined one,~%~
+		   ~7TNo to search for another matching symbol,~%~
+		   ~7TQuit to get to the break-loop immediately or~%~
+		   ~7T'symb to use this symb instead." newvar)))
+	     (ecase (car ans)
+		    (:no nil)
+		    (:yes
+		     (return-from %dwimdosyms (cons :return newvar)))
+		    (:quit
+		     (return-from %dwimdosyms nil))
+		    (:return
+		     (return-from %dwimdosyms ans)))))))
+
+    ;;; Check if any global symbols of the current package match.
+    (do-symbols
+     (newvar *package*)
+     (and
+      (speval sp-err `(boundp ',newvar))
+      (similar-pname-p var newvar)
+      (not (memq newvar asked)) ; Don't ask more than once.
+      (push newvar asked) ; Remember which have been asked.
+      (loop
+       (let* ((what (or (and (assoc `lisp::%constant newvar) 1) 0))
+	      ;; What is 0 for constants 1 for variables.
+	      (ans
+	       (%dwimquery
+		sp-err nil t global-query
+		"Answer~%~
+		~7TYes to use this ~[constant~;variable~] ~
+		   instead of the undefined one,~%~
+		~7TNo to search for another matching symbol,~%~
+		~7TQuit to get to the break-loop immediately,~%~
+		~7TDescribe to describe it or~%~
+		~7T'symb to use this symb instead." what newvar)))
+	 (ecase (car ans)
+		(:no (return nil))
+		(:yes 
+		 (return-from %dwimdosyms (cons :return newvar)))
+		(:quit
+		 (return-from %dwimdosyms nil))
+		(:describe (describe newvar))
+		(:return
+		 (return-from %dwimdosyms ans)))))))
+    
+    ;;; Check if any global symbols from the other packages match.
+    (or
+     (and (eq *dwim-searched-packages* t) ; If package-list is T
+	  (let ((ans
+		 (%dwimquery
+		  sp-err nil nil
+		  "Look at the internal symbols of all packages ~
+		   for a match?"
+		  "Answer~%~
+		  ~7TYes to try to find a matching internal symbol ~
+		     (may take some time),~%~
+		  ~7TNo to only look at exported symbols,~%~
+		  ~7TQuit to get to the break-loop immediately or~%~
+		  ~7T'symb to use this symb instead.")))
+	    (ecase (car ans)
+		   (:no nil)
+		   (:yes T)
+		   (:quit
+		    (return-from %dwimdosyms nil))
+		   (:return
+		    (return-from %dwimdosyms ans))))
+	;;; Check all symbols in all packages.
+	  (do-all-symbols
+	   (newvar)
+	   (and
+	    (speval sp-err `(boundp ',newvar))
+	    (similar-pname-p var newvar)
+	    (not (memq newvar asked)) ; Don't ask more than once.
+	    (push newvar asked) ; Remember which have been asked.
+	    (loop
+	     (let* ((what (or (and (assoc `lisp::%constant newvar) 1) 0))
+		    ;; What is 0 for constants 1 for variables.
+		    (ans
+		     (%dwimquery
+		      sp-err nil t global-query
+		      "Answer~%~
+		      ~7TYes to use this ~[constant~;variable~] instead ~
+		         of the undefined one,~%~
+		      ~7TNo to search for another matching symbol,~%~
+		      ~7TQuit to get to the break-loop immediately,~%~
+		      ~7TDescribe to describe it or~%~
+		      ~7T'symb to use this symb instead." what newvar)))
+	       (ecase (car ans)
+		      (:no (return nil))
+		      (:yes
+		       (return-from %dwimdosyms (cons :return newvar)))
+		      (:quit
+		       (return-from %dwimdosyms nil))
+		      (:describe (describe newvar))
+		      (:return
+		       (return-from %dwimdosyms ans))))))))
+	
+	;;; Else Only check external-symbols of selected packages.
+     (let
+      ((packages (remove *package* (%mdwimpln))))
+      (and packages
+	   (let ((ans
+		  (%dwimquery
+		   sp-err nil nil
+		   "Look at the symbols exported from~%~
+		   the package~??"
+		   "Answer~%~
+		   ~7TYes to try to find a matching external symbol,~%~
+		   ~7TNo or Quit to get to the break-loop immediately or~%~
+		   ~7T'symb to use this symbol instead."
+		   "~p~#[ none~; ~a~; ~a and ~a~:;~
+			   ~@{~#[~; and~] ~a~^,~}~]"
+		   (cons (length packages) (mapcar #'package-name packages)))))
+	     (ecase (car ans)
+		    (:yes T)
+		    (:no
+		     (return-from %dwimdosyms nil))
+		    (:quit
+		     (return-from %dwimdosyms nil))
+		    (:return
+		     (return-from %dwimdosyms ans))))
+	   (dolist
+	    (package (remove *package* (%mdwimpln)))
+	    (do-external-symbols
+	     (newvar package)
+	     (and
+	      (speval sp-err `(boundp ',newvar))
+	      (not (memq newvar asked)) ; Only ask once.
+	      (push newvar asked) ; Remember the already asked.
+	      (similar-pname-p var newvar)
+	      (loop
+	       (let* ((what (or (and (assoc `lisp::%constant newvar) 1) 0))
+		      ;; What is 0 for constants 1 for variables.
+		      (ans
+		       (%dwimquery
+			sp-err nil t global-query
+			"Answer~%~
+			~7TYes to use this ~[constant~;variable~] instead ~
+			   of the undefined one,~%~
+			~7TNo to search for another matching symbol,~%~
+			~7TQuit to get to the break-loop immediately,~%~
+			~7TDescribe to describe it or~%~
+			~7T'symb to use this symbol instead." what newvar)))
+		 (ecase (car ans)
+			(:no
+			 (return nil))
+			(:yes 
+			 (return-from %dwimdosyms (cons :return newvar)))
+			(:quit
+			 (return-from %dwimdosyms nil))
+			(:describe (describe newvar))
+			(:return
+			 (return-from %dwimdosyms ans)))))))))))))
+
+(defun %dwimdofuns (fun sp-err local-query global-query)
+  "Just another very local elephantiasis function."
+  (let ((asked ()))
+    ;;; Check if any local symbols match.
+    (when (speval sp-err `(boundp '%fenv%))
+      (let ((env (speval sp-err `%fenv%)))
+	(do*
+	 ((matches?
+	   (member
+	    fun 
+	    (mapcan #'(lambda (y) ; Filter out non conses from noisy a-list.
+			(if (consp y)
+			    `(,(car y))))
+		    env) :test #'similar-pname-p)
+	   (member fun (cdr matches?) :test #'similar-pname-p))
+	  (newfun (car matches?) (car matches?)))
+	 ((atom matches?))
+	 (and
+	  (not (memq newfun asked)) ; Only ask once.
+	  (push newfun asked) ; Remember the already asked.
+	  (let* ((what (or (and (eq 'macro (cadr (assoc newfun env))) 1)
+			   0))
+		 (ans
+		  (%dwimquery
+		   sp-err t nil local-query
+		   "Answer~%~
+		   ~7TYes to use this local ~[function~;macro~] instead ~
+		      of the undefined one,~%~
+		   ~7TNo to search for another matching symbol,~%~
+		   ~7TQuit to get to the break-loop immediately or~%~
+		   ~7T'FUN to use the form (normally a function-name) ~
+		      ANY instead."
+		   what newfun)))
+	    (ecase (car ans)
+		   (:no nil)
+		   (:yes
+		    (return-from %dwimdofuns (cons :return newfun)))
+		   (:quit
+		    (return-from %dwimdofuns nil))
+		   (:return
+		    (return-from %dwimdofuns ans))))))))
+
+    ;;; Check if any global symbols of the current package match.
+    (do-symbols
+     (newfun *package*)
+     (and
+      (speval sp-err `(fboundp ',newfun))
+      (similar-pname-p fun newfun)
+      (not (memq newfun asked)) ; Only ask once.
+      (push newfun asked) ; Remember the already asked.
+      (loop
+       (let* ((what (or
+		     (and (special-form-p newfun) 2)
+		     (and
+		      (speval sp-err `(macro-function ',newfun)) 1)
+		     0))
+	;;; What is 0 if function, 1 if macro or 2 if a special-form.
+	      (ans
+	       (%dwimquery
+		sp-err t t global-query
+		"Answer~%~
+		~7TYes to use this global ~[function~;macro~;special form~] ~
+		   instead of the undefined one,~%~
+		~7TNo to search for another matching symbol,~%~
+		~7TQuit to get to the break-loop immediately,~%~
+		~7TDescribe to describe it or~%~
+		~7T'FUN to use the form (normally a function-name) ~
+		    FUN instead."
+		what newfun)))
+	 (ecase (car ans)
+		(:no (return nil))
+		(:yes
+		 (return-from %dwimdofuns (cons :return newfun)))
+		(:quit
+		 (return-from %dwimdofuns nil))
+		(:describe (describe newfun))
+		(:return
+		 (return-from %dwimdofuns ans)))))))
+    (or
+     (and (eq *dwim-searched-packages* t) ; If package-list is T
+	  (let ((ans
+		 (%dwimquery
+		  sp-err t nil
+		  "Look at the internal symbols of all packages ~
+		  for a match?"
+		  "Answer~%~
+		  ~7TYes to try to find a matching internal symbol ~
+		    (may take some time),~%~
+		  ~7TNo to only look at exported symbols,~%~
+		  ~7TQuit to get to the break-loop immediately or~%~
+		  ~7T'FUN to use the form (normally a function-name) ~
+		      FUN instead of the undefined symbol.")))
+	    (ecase (car ans)
+		   (:no
+		    NIL)
+		   (:yes T)
+		   (:quit
+		    (return-from %dwimdofuns nil))
+		   (:return
+		    (return-from %dwimdofuns ans))))
+	  ;;; Check all symbols in all packages..
+	  (do-all-symbols
+	   (newfun)
+	     (and
+	      (speval sp-err `(fboundp ',newfun))
+	      (similar-pname-p fun newfun)
+	      (not (memq newfun asked)) ; Only ask once.
+	      (push newfun asked) ; Remember the already asked.
+	      (loop
+	       (let* ((what (or
+			     (and (special-form-p newfun) 2)
+			     (and
+			      (speval sp-err `(macro-function ',newfun)) 1)
+			     0))
+	      ;;; What is 0 if function, 1 if macro or 2 if a special-form.
+		      (ans
+		       (%dwimquery
+			sp-err t t global-query
+			"Answer~%~
+			~7TYes to use this global ~
+			   ~[function~;macro~;special form~] ~
+			   instead of the undefined one,~%~
+			~7TNo to search for another matching symbol,~%~
+			~7TQuit to get to the break-loop immediately,~%~
+			~7TDescribe to describe it or~%~
+			~7T'FUN to use the form (normally a function-name)~%~~
+			    FUN instead."
+			what newfun)))
+		 (ecase (car ans)
+			(:no (return nil))
+			(:yes
+			 (return-from %dwimdofuns (cons :return newfun)))
+			(:quit
+			 (return-from %dwimdofuns nil))
+			(:describe (describe newfun))
+			(:return
+			 (return-from %dwimdofuns ans))))))))
+	
+     ;;; Only check external-symbols of selected packages.
+     (let
+      ((packages (remove *package* (%mdwimpln))))
+      (and packages
+	   (let ((ans
+		  (%dwimquery
+		   sp-err nil nil
+		   "Look at the symbols exported from~%~
+		   the package~??"
+		   "Answer~%~
+		   ~7TYes to try to find a matching external symbol,~%~
+		   ~7TNo or Quit to get to the break-loop immediately or~%~
+		   ~7T'FUN to use the form (normally a function-name) ~
+		       FUN instead of the undefined symbol."
+		   "~p~#[ none~; ~a~; ~a and ~a~:;~
+			   ~@{~#[~; and~] ~a~^,~}~]"
+		   (cons (length packages) (mapcar #'package-name packages)))))
+	     (ecase (car ans)
+		    (:no
+		     (return-from %dwimdofuns nil))
+		    (:yes T)
+		    (:quit
+		     (return-from %dwimdofuns nil))
+		    (:return
+		     (return-from %dwimdofuns ans))))
+	   (dolist
+	    (package packages)
+	    (do-external-symbols
+	     (newfun package)
+	     (and
+	      (speval sp-err `(fboundp ',newfun))
+	      (similar-pname-p fun newfun)
+	      (not (memq newfun asked)) ; Only ask once.
+	      (push newfun asked) ; Remember the already asked.
+	      (loop
+	       (let* ((what (or
+			     (and (special-form-p newfun) 2)
+			     (and
+			      (speval sp-err `(macro-function ',newfun)) 1)
+			     0))
+		;;; What is 0 if function, 1 if macro or 2 if a special-form.
+		      (ans
+		       (%dwimquery
+			sp-err t t global-query
+			"Answer~%~
+			~7TYes to use this ~[function~;macro~;special form~] ~
+			   instead of the undefined one,~%~
+			~7TNo to search for another matching symbol,~%~
+			~7TQuit to get to the break-loop immediately,~%~
+			~7TDescribe to describe it or~%~
+			~7T'FUN to use the form (normally a function-name) ~
+			    FUN instead."
+			what newfun)))
+		 (ecase (car ans)
+			(:no (return nil))
+			(:yes 
+			 (return-from %dwimdofuns (cons :return newfun)))
+			(:quit
+			 (return-from %dwimdofuns nil))
+			(:describe (describe newfun))
+			(:return
+			 (return-from %dwimdofuns ans))))))))
+	   ))
+     )))
+
+(defun %mdwimpln ()
+  ; Make Dwim Package-List Normal.
+  "Implements the meaning of *dwim-searched-packages*"
+  (cond ((eq *dwim-searched-packages* t) ; T means check all packages.
+	 (list-all-packages))
+	((packagep *dwim-searched-packages*) ; Could be a single package to.
+	 (list *dwim-searched-packages*))
+	((symbolp *dwim-searched-packages*)  ; or a symbol.
+	 (let
+	  ((xx (find-package *dwim-searched-packages*)))
+	  (if xx                ; If a package of that name exists
+	      (list xx))))      ; return a list of it.
+	((listp *dwim-searched-packages*)
+	 ; Is normally a list of packages or symbols denoting packages.
+	 ; If It's not this will convert it to that format making
+	 ; a symbol or a package into a list of a package or else
+	 ; turning all symbols into packages and removing all nonmatching
+	 ; symbols and other stuff.
+	 (mapcan
+	  #'(lambda (x)
+	      (cond
+	       ((packagep x) (list x))
+	       ((symbolp x) (let ((xx (find-package x)))
+			      (if xx (list xx))))))
+	  *dwim-searched-packages*))))
+
+
+(defun %dwimquery (sp any desc? query help &rest formatargs)
+  (let ((query (concatenate 'string query " (Y N D Q) ")))
+    (loop
+     (fresh-line)
+     (apply #'format *debug-io* query formatargs)
+     (let* ((ans (read *debug-io*))
+	    (symans (and (consp ans) (null (caddr ans))
+			 (eq (car ans) 'QUOTE)
+			 (or any (symbolp (cadr ans)))))
+	    (ans-string (and (symbolp ans) (subseq (symbol-name ans) 0 1))))
+       (cond (symans
+	      (return-from %dwimquery (cons :return (cadr ans))))
+	     ((string-equal ans-string "Y")
+	      (return-from %dwimquery '(:yes)))
+	     ((string-equal ans-string "N")
+	      (return-from %dwimquery '(:no)))
+	     ((string-equal ans-string "Q")
+	      (return-from %dwimquery '(:quit)))
+	     ((and desc? (string-equal ans-string "D"))
+	      (return-from %dwimquery '(:describe)))
+	     (t (apply #'format *debug-io* help formatargs)))))))
+
+
+
+;<HACKS.CLISP.CARMEN>DWIM.CLISP.3,  9-Dec-85 17:28:19, Edit by D85.PER-MILDNER
+; Redone for speed.
+;<D85.PER-MILDNER.CLISP>DWIM.CLISP.24,  3-Dec-85 11:06:08, Edit by D85.PER-MILDNER
+; Is Finixed jes? 
+
+;;; By Per Mildner.
+;;; A spelling-corrector similar in purpose to Maclisp's Dwim.
+;;;
+;;; Algorithm:
+;;;   x matches y iff:	1. x has the same printname as y, or
+;;;			2. x has two adjacent chars switched
+;;;			   compared to y, or
+;;;			3. x has one extra char compared to y, or
+;;;			4. x has one char missing compared to y, or
+;;;			5. x has one different char compared to y.
+;;;   exception: 2 and 5 does not apply if pname of x is one char long.
+;;;
+;;; Examples:
+;;;   ALAN matches ALAN, AALN, ALLAN, ALN, ALAM.
+
+#| This version works too but is sometimes much slower.
+(defun similar-pname-p (x y)
+  "T if the print-name of the symbol x is similar to that of the symbol y.
+  primarily useful as in:
+  (member 'xsym list-of-ysyms :test #'similar-pname-p)"
+  (let* ((xn (symbol-name x))
+	 (xl (length xn))
+	 (yn (symbol-name y))
+	 (yl (length yn))
+	 (x-y (- xl yl)))
+    (and
+     (<= -1 x-y 1) ; If length differ more than 1 char then skip immediately
+     ;  this is somewhat redundant but may speed things up.
+     (let ((indx1 (mismatch xn yn :test #'char-equal)))
+       (cond
+	((not indx1) t)                 ; No difference. (1. above)
+	((and (zerop x-y) ; Same length and
+	      (> xl 1))   ;  pname of x longer than one char.
+	 (let ((indx2
+		(1- (mismatch xn yn :test #'char-equal :from-end t))))
+	   (or (= indx1 indx2)          ; One char is different. (5. above)
+	       (string-equal            ; Two chars is switched. (2. above)
+		(concatenate 'string
+			     (subseq xn 0 indx1)
+			     (string (elt xn (1+ indx1)))
+			     (string (elt xn indx1))
+			     (subseq xn (+ 2 indx1)))
+		yn))))
+	((plusp x-y)                    ; X has one extra char. (3. above)
+	 (string-equal (concatenate 'string
+				    (subseq xn 0 indx1)
+				    (subseq xn (1+ indx1)))
+		       yn))
+	((minusp x-y)                   ; X has one missing char. (4. above)
+	 (string-equal (concatenate 'string
+				    (subseq yn 0 indx1)
+				    (subseq yn (1+ indx1)))
+		       xn)))))))
+|#
+
+(defun similar-pname-p (x y)
+  "T if the print-name of the symbol x is similar to that of the symbol y.
+  primarily useful as in:
+  (member 'xsym list-of-ysyms :test #'similar-pname-p)."
+  (let* ((xn (symbol-name x))
+	 (xl (length xn))
+	 (yn (symbol-name y))
+	 (yl (length yn))
+	 (x-y (- xl yl)))
+    (and
+     (<= -1 x-y 1) ; If length differ more than 1 char then skip immediately
+     ;  this is somewhat redundant but may speed things up.
+     (let* ((indx1 (%sp-string-compare-ignore xn 0 xl yn 0 yl))
+	    (indx1+1 (and indx1 (1+ indx1))))
+       (cond
+	((not indx1) t)                 ; No difference. (1. above)
+	((and (zerop x-y) ; Same length and
+	      (> xl 1))   ;  pname of x longer than one char.
+	 (let ((indx2
+		(%sp-string-compare-ignore
+		 xn indx1+1 xl yn indx1+1 yl)))
+	   (or (not indx2)          ; One char is different. (5. above)
+	       (and
+		(char-equal (aref xn indx1) (aref yn indx1+1))
+		(char-equal (aref xn indx1+1) (aref yn indx1))))))
+	((plusp x-y)                    ; X has one extra char. (3. above)
+	 (not (%sp-string-compare-ignore xn indx1+1 xl yn indx1 yl)))
+	((minusp x-y)                   ; X has one missing char. (4. abovze)
+	 (not (%sp-string-compare-ignore xn indx1 xl yn indx1+1 yl))))))))
+
+(defun fixpel-error-init ()
+
+  (condition-psetq
+   :unbound-variable #'fixpel-unbound-variable-handler
+   :undefined-function #'fixpel-undefined-function-handler
+   ))

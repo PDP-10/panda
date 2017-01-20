@@ -1,0 +1,783 @@
+;;; -*- Lisp -*-
+;;;
+;;; **********************************************************************
+;;; This code was written as part of the Spice Lisp project at
+;;; Carnegie-Mellon University, and has been placed in the public domain.
+;;; If you want to use this code or any part of Spice Lisp, please contact
+;;; Scott Fahlman (FAHLMAN@CMUC). 
+;;; **********************************************************************
+;;;
+;;; Spice Lisp pretty printer.
+;;; Written by Skef Wholey.
+;;; *Print-Circle* printing added by Todd Kaufmann.
+;;;
+
+(in-package 'lisp)
+
+(export '(pprin1 pprint pprinc grindef defprint))
+
+;;; This package provides the following functions:
+;;;
+;;; (PPRIN1 Object &Optional Output-Stream)			[EXPR]
+;;; Analog of PRIN1.  Prettily prints the object to the given stream
+;;; with special characters slashified.
+;;;
+;;; (PPRINC Object &Optional Output-Stream)			[EXPR]
+;;; Analog of PRINC.  Special characters are not slashified.
+;;;
+;;; (PPRINT Object &Optional Output-Stream)			[EXPR]
+;;; Analog of PRINT.  TERPRI + PPRIN1 + SPACE.
+;;;
+;;; (GRINDEF Function-Name)					[MACRO]
+;;; Prettily prints the definition of the function named by Function-Name.
+;;;
+;;; (DEFPRINT Function-Name Definiton)				[MACRO]
+;;; Defines how lists whose CAR is Function-Name will be printed.
+
+;;; Pretty printing is done in two steps:
+;;;	1] Converting the lisp object to a PP-Obj structure, and
+;;;	2] Printing that structure in some pretty fashion.
+;;;
+;;; There are 3 levels of "prettiness" that are used in printing an object:
+;;;	1] Basic grinding: formatting according to a handful of simple
+;;;	   parameters.  This is done by the function Basically-Grind.
+;;;	2] Simple, common ways of formating Defuns, Dos, etc.  The
+;;;	   specifications for how an object is printed this way are either
+;;;	   positive integers specifying the number of "special arguments" or
+;;;	   negative integers specifying the number of "first line arguments".
+;;;	   This is done by Specially-Grind.
+;;;	3] Arbitraily hairy formatting conventions can be specified and are
+;;;	   ground by Hairily-Grind.  Prog, for example, is specified this way.
+
+;;; The PP-Obj structure holds stringified objects and their lengths. The Type
+;;; slot holds SIMPLE, COMPLEX, STRING, or SPACE.  If it is SIMPLE, then Object
+;;; contains an index into the PPrint-Buffer.  If it is COMPLEX, Object holds
+;;; a list of PP-Objs; if it is STRING, then Object has a string representation
+;;; of the object, and if it is SPACE, the PP-Obj is a marker for a possible
+;;; line break.  The Callish slot holds what might be a function name from the
+;;; original form.
+
+;20; some things that aren't defined in Common Lisp
+(defun line-length () 80)
+
+;;; The code here assumes some extra facilities as part of string
+;;; output streams.  We can't implement these facilities because
+;;; of our implementation of string output streams.  Thus we have
+;;; to use a "buffer stream".  The following implement the extra
+;;; Spice Lisp output string functions in terms of a buffer stream.
+;;; In addition, we had to replace make-string-output-stream
+;;; with make-buffer-stream.  Note that get-output-stream-string
+;;; cannot be used with a buffer stream, but that is no problem
+;;; in this code.
+
+;;; In order to make this code reentrant, we need to use a different
+;;; buffer stream at each level.  To avoid using lots of free space,
+;;; we keep a stack of buffer streams, in pprint-buffer-stream-list.
+
+(defun string-output-stream-index (s) (file-position s))
+(defsetf string-output-stream-index file-position)
+(defun string-output-stream-string (s) (get-buffer-stream-string s))
+
+;;; end of Tops-20 code
+
+(defstruct (pp-obj (:type vector) (:constructor slow-crufty-make-pp-obj))
+  (type 'simple :read-only t)
+  (length () :read-only t :type fixnum)
+  (object () :read-only t)
+  (callish () :read-only t)
+  (label-ref () :read-only t)
+  ;; a reference to number objects if they've been seen before
+  ;; used with *print-circle* is true.
+  )
+
+;;; This here macro is preferable to calling the keyword-parsing function.
+
+(defmacro make-pp-obj (&key (type ''simple) length object callish label-ref)
+  `(vector ,type ,length ,object ,callish ,label-ref))
+
+;;; Pre-computed pp-objs for quicker printing:
+
+(defparameter pp-space-obj ())
+(defparameter pp-open-paren-obj ())
+(defparameter pp-close-paren-obj ())
+(defparameter pp-sharp-open-paren-obj ())
+(defparameter pp-sharp-open-angle-obj ())
+(defparameter pp-close-angle-obj ())
+(defparameter pp-dot-obj ())
+(defparameter pp-dotdotdot-obj ())
+(defparameter pp-starstar-obj ())
+(defparameter pp-nil-obj ())
+(defparameter pp-sharp-angle-array-rank-obj ())
+(defparameter pp-sharp-obj ())
+(defparameter pp-a-obj ())
+(defparameter pp-dotdotdot-close-paren-obj ())
+
+(defvar pprint-buffer-stream nil)
+(defvar pprint-buffer-stream-list nil)
+
+(defun pprint-init ()
+  "Initializes the pretty printer."
+  (setq pp-space-obj (make-pp-obj :type 'space :length 1)
+	pp-open-paren-obj (make-pp-obj :type 'string :length 1 :object "(")
+	pp-close-paren-obj (make-pp-obj :type 'string :length 1 :object ")")
+	pp-sharp-open-paren-obj
+	 (make-pp-obj :type 'string :length 2 :object "#(")
+	pp-sharp-open-angle-obj
+	 (make-pp-obj :type 'string :length 2 :object "#<")
+	pp-close-angle-obj (make-pp-obj :type 'string :length 1 :object ">")
+	pp-dot-obj (make-pp-obj :type 'string :length 1 :object ".")
+	pp-dotdotdot-obj (make-pp-obj :type 'string :length 4 :object " ...")
+	pp-starstar-obj (make-pp-obj :type 'string :length 2 :object "**")
+	pp-nil-obj (make-pp-obj :type 'string :length 3 :object "NIL")
+	pp-sharp-angle-array-rank-obj
+	 (make-pp-obj :type 'string :length 14 :object "#<Array, rank ")
+	pp-sharp-obj (make-pp-obj :type 'string :length 1 :object "#")
+	pp-a-obj (make-pp-obj :type 'string :length 1 :object "A")
+	pp-dotdotdot-close-paren-obj
+	 (make-pp-obj :type 'string :length 5 :object " ...)")
+;20;	pprint-buffer-stream (make-string-output-stream)))
+	pprint-buffer-stream-list (list nil)))
+
+;;; PP-Line-Length is bound by the top level pprinting functions to an
+;;; appropriate thing.
+
+(defvar pp-line-length ()
+  "What PPRINT thinks is the number of characters that will fit on a line.")
+
+;;; A macro that helps putting stuff on the end of lists.
+
+(defmacro end-cons (splice value)
+  `(setq ,splice (cdr (rplacd ,splice (list ,value)))))
+
+
+;;; Indentation returns the number of spaces to output after a newline as
+;;; defined by the description of Indent-Style in Basically-Grind.
+
+(defun indentation (components indent-style charpos)
+  (declare (fixnum charpos))
+  (cond ((numberp indent-style)
+	 (+ charpos (the fixnum indent-style)))
+	((eq indent-style 'normal)
+	 (+ charpos (pp-obj-length (car components))))
+	((eq indent-style 'past-name)
+	 (+ charpos (pp-obj-length (car components))
+	            (pp-obj-length (cadr components)) 1))
+	(t (error "Flaming PPrint death!"))))
+
+;;; Tab-Over prints the specified number of spaces on *Standard-Output*.
+
+(defconstant maximum-pp-indentation 70)
+(defconstant pp-indentation-string (make-string 70 :initial-element #\space))
+
+(defun tab-over (indent-pos)
+  (write-string pp-indentation-string *standard-output* :start 0
+		:end (min indent-pos maximum-pp-indentation)))
+
+;;;Marking the objects in a table (when *print-circle* is on):
+				    
+(defparameter pp-hash-table (make-hash-table :test #'eq)
+  "Objects are marked here so we can detect cycles & structures.")
+
+(defvar pp-label-object-counter 0
+  "A counter for handing out labels to objects printed with sharp-equals.")
+
+(eval-when (compile load eval)
+  (defmacro circular-table-entry (x)
+    "Return the value hashed in the pp-hash-table under x."
+    `(gethash ,x pp-hash-table))
+)
+
+(defmacro marked-p (obj)
+  "Returns true (non-nil) if object has been marked in table."
+  `(circular-table-entry ,obj))
+
+(defmacro duplicate-p (obj)
+  "True if object seen more than once."
+  `(integerp (circular-table-entry ,obj)))
+
+(defmacro set-duplicate (obj)
+  "Mark as being duplicated.  A fresh label is generated & assigned to it."
+  `(setf (circular-table-entry ,obj)
+	 (incf pp-label-object-counter)))
+
+(defmacro mark-first-time (obj)
+  "Mark an object as seen for the first time."
+  `(setf (circular-table-entry ,obj) t))
+
+(defmacro duplicate-already-printed-p (obj)
+  "Is true if the obj's referent has been pp-objified."
+  `(and (integerp (circular-table-entry ,obj))
+	(minusp (circular-table-entry ,obj))))
+
+(proclaim '(special *print-gensym*))
+
+(defun mark-obj-in-table (object &optional (currlevel 0))
+  "Marks an object and all of its sub-objects in the pp-hash-table.
+  Used for printing out circular structures & non-interned symbols."
+  ;; Check if object is already in table.  If so, set entry to seen-before
+  ;;  if not, put object in as first-time, and then put its sub-objects in.
+  ;; we're looking for duplicates
+  (if (marked-p object)
+      ;;if marked seen at least once.  If only once, give it a label.
+      (unless (duplicate-p object)
+	(set-duplicate object))
+      ;;else put it in for first time, & mark it's components
+      (progn (if (or (consp object)
+		     (and *print-array*
+			  (arrayp object)
+			  (not (bit-vector-p object)))
+		     (and *print-gensym*
+			  (symbolp object)
+			  (null (symbol-package object)))
+		     (structurep object))
+		 (mark-first-time object))
+	     (typecase object
+	       (cons
+		(mark-obj-in-table (car object)(1+ currlevel))
+		(mark-obj-in-table (cdr object) currlevel))
+	       (structure
+		(do ((index (if (simple-vector-p object) 1 0) (1+ index))
+		     (str-length (length object)))
+		    ((or (= index str-length)
+			 (if *print-length*
+			     (= index *print-length*)
+			     nil)))
+		  (mark-obj-in-table (aref object index) (1+ currlevel))))
+	       (vector (dotimes (i (if *print-length*
+				       (min *print-length* (length object))
+				       (length object)))
+			 (mark-obj-in-table (aref object i) (1+ currlevel))))
+	       (array (mark-array object (1+ currlevel)))))))
+
+;;; Marking the elements of an array
+
+(defun mark-array (object currlevel)
+  "Marks the elements of an array in the circularities table."
+  (if *print-array*
+      (progn
+       (mark-array-guts (header-ref object %array-data-slot)
+			(array-dimensions object)
+			currlevel 0))))
+
+(defun mark-array-guts (array dimensions currlevel index)
+  (cond ((null dimensions)
+	 (mark-obj-in-table (aref array index))
+	 (1+ index))
+	((and (not (null *print-level*))
+	      (>= currlevel *print-level*))
+	 index)
+	(t
+	 (do ((index index)
+	      (times 0 (1+ times))
+	      (limit (pop dimensions)))
+	     ((or (= times limit)
+		  (and (not (null *print-length*))
+		       (= times *print-length*)))
+	      index)
+	   (setq index
+		 (mark-array-guts array dimensions (1+ currlevel) index))))))
+
+
+(defmacro mark-if-referent-and-return-label (obj)
+  "Marks a labeled object as having already been printed."
+  `(if (and *print-circle* (duplicate-p ,obj))
+       (- (setf (circular-table-entry ,obj)
+	     (- (circular-table-entry ,obj))))))
+
+
+;;; Converting the lisp object to a PP-Obj structure:
+
+(defun pp-objify (object &optional (currlevel 0))
+  (declare (fixnum currlevel))
+  "Returns a PP-Obj structure which is used to prettily print the Object."
+  (if (and *print-level* (> currlevel (the fixnum *print-level*)))
+      pp-sharp-obj
+      ;; if *print-circle*
+      ;;    then if obj in table
+      ;;         then *return labeled pp-obj
+      ;;    else normal pp-objification
+      (if (and *print-circle* (duplicate-already-printed-p object))
+	  ;; if obj is in table(already) then obj is #i#
+	  (let* ((*print-pretty* nil)
+		 (p-o
+		  (the string
+		       (format nil "#~d#" (- (circular-table-entry object))))))
+	    (make-pp-obj :type 'string
+			 :object p-o
+			 :length (length p-o)))	; it needs no label-ref slot
+	  (typecase object
+	    (string (pp-objify-atom object))
+	    (structure (pp-objify-structure object currlevel))
+	    (vector (pp-objify-vector object currlevel))
+	    (array (pp-objify-array object currlevel))
+	    (list (pp-objify-list object currlevel))
+	    (t (pp-objify-atom object))))))
+
+;;; that takes care of the #n# objects.  Now, what about the #n= objects?
+;;; When we make a pp-object, we set its label-ref slot to the 
+;;; circular-table-entry.  When grinding the object, if the label-ref slot
+;;; is a positive number then write #n=, increase the indent position and
+;;; print the object.
+
+(defun pp-objify-atom (object)
+  "Makes a PP-Obj for an atom."
+  (let ((start (string-output-stream-index pprint-buffer-stream))
+	(*print-pretty* nil))
+    (output-object object)
+    (make-pp-obj :length (- (string-output-stream-index pprint-buffer-stream)
+			    start)
+		 :object start
+		 :label-ref (mark-if-referent-and-return-label object))))
+
+(defun pp-objify-structure (structure currlevel)
+  "Makes a PP-Obj for a structure.  Calls the structure's print-function
+  which will throw something into a stream; we then seal it up into a pp-obj."
+  (let ((start (string-output-stream-index pprint-buffer-stream))
+	(info (get (svref structure 0) 'defstruct-description))
+	(label (mark-if-referent-and-return-label structure)))
+    (if info
+	;;20; call OUTPUT-STRUCTURE (defined in PRINT.CLISP)
+	(output-structure structure currlevel)
+	(write-string "#<Bizzare illegal thing that looks like a structure>"))
+    (make-pp-obj :length (- (string-output-stream-index pprint-buffer-stream)
+			    start)
+		 :object start
+		 :label-ref label)))
+
+(defun pp-objify-vector (object currlevel)
+  (declare (fixnum currlevel))
+  "Makes a PP-Obj for a vector."
+  (if (or (structurep object) (bit-vector-p object))
+      (pp-objify-atom object)
+      (do* ((label (mark-if-referent-and-return-label object))
+	    (index 0 (1+ index))
+	    (terminus (length (the vector object)))
+	    (total-length 2)
+	    (result (list pp-sharp-open-paren-obj))
+	    (splice result))
+	   ((or (and *print-length* (>= index *print-length*))
+		(= index terminus))
+	    (cond ((/= index terminus)
+		   (end-cons splice pp-dotdotdot-obj)
+		   (setq total-length (+ 3 total-length))))
+	    (end-cons splice pp-close-paren-obj)
+	    (make-pp-obj :type 'complex
+			 :length (1+ total-length)
+			 :object result
+			 :label-ref label))
+	(declare (fixnum index total-length terminus))
+	(cond ((> index 0)
+	       (end-cons splice pp-space-obj)
+	       (setq total-length (1+ total-length))))
+	(end-cons splice (pp-objify (aref object index) (1+ currlevel))))))
+
+(defun pp-objify-array (object currlevel)
+  "Makes a PP-Obj for an array."
+  (let ((label (mark-if-referent-and-return-label object))
+	(rank-obj (pp-objify (array-rank object) currlevel)))
+    (if (not *print-array*)
+	(make-pp-obj :type 'complex
+		     :length (+ 14 (pp-obj-length rank-obj) 1)
+		     :object (list pp-sharp-angle-array-rank-obj
+				   rank-obj pp-close-angle-obj)
+		     :label-ref label)
+	(let ((result (list nil)))
+	  (pretty-array-guts (header-ref object %array-data-slot)
+			     (array-dimensions object)
+			     currlevel 0 result)
+	  (make-pp-obj :type 'complex
+		       :length (+ 1 (pp-obj-length rank-obj) 1
+				  (do ((total 0)
+				       (stuff (cdr result) (cdr stuff)))
+				      ((null stuff) total)
+				    (setq
+				     total (+ total
+					      (pp-obj-length (car stuff))))))
+		       :object (list* pp-sharp-obj rank-obj pp-a-obj
+				      (cdr result))
+		       :label-ref label)))))
+
+(defun pretty-array-guts (array dimensions currlevel index splice)
+  (cond ((null dimensions)
+	 (end-cons splice (pp-objify (%sp-svref array index)))
+	 (values splice (1+ index)))
+	((and (not (null *print-level*))
+	      (>= currlevel *print-level*))
+	 (end-cons splice pp-sharp-obj)
+	 (values splice index))
+	(t
+	 (end-cons splice pp-open-paren-obj)
+	 (do ((index index)
+	      (times 0 (1+ times))
+	      (limit (pop dimensions)))
+	     ((or (= times limit)
+		  (and (not (null *print-length*))
+		       (= times *print-length*)))
+	      (if (not (= times limit))
+		  (end-cons splice pp-dotdotdot-close-paren-obj)
+		  (end-cons splice pp-close-paren-obj))
+	      (values splice index))
+	   (if (not (zerop times))
+	       (end-cons splice pp-space-obj))
+	   (multiple-value-setq (splice index)
+	     (pretty-array-guts array dimensions (1+ currlevel)
+				index splice))))))
+
+(defun pp-objify-list (object currlevel)
+  (declare (fixnum currlevel))
+  "Makes a PP-Obj for a list."
+  (if (eq (car object) '*macroexpansion*)
+      (setq object (caddr object)))
+  (cond
+   ((null object)
+    pp-nil-obj)
+   ((and (symbolp (car object)) (get (car object) 'simple-read-macro)
+	 (listp (cdr object)) (cadr object) (null (cddr object)))
+    (let ((label (mark-if-referent-and-return-label object))
+	  (argument (pp-objify (cadr object) currlevel))
+	  (macro (get (car object) 'simple-read-macro)))
+      (make-pp-obj :type 'complex
+		   :length (+ (pp-obj-length argument) (pp-obj-length macro))
+		   :object (cons macro (if (eq (pp-obj-type argument) 'complex)
+					   (pp-obj-object argument)
+					   (list argument)))
+		   :callish (pp-obj-callish argument)
+		   :label-ref label)))
+   (t
+    (do* ((objekt object (cdr objekt))
+	  (callish (if (and (symbolp (car object))
+			    (or (fboundp (car object))
+				(eq (car object) 'lambda)))
+		       (car object)))
+	  (currlength 0 (1+ currlength))
+	  (total-length 1)
+	  (result (list pp-open-paren-obj))
+	  (splice result)
+	  ;; we better mark this object now in case any subobjects are in it
+	  (label (mark-if-referent-and-return-label object)))
+	 ((or (and *print-length* (>= currlength (the fixnum *print-length*)))
+	      (null objekt))
+	  (cond (objekt
+		 (end-cons splice pp-dotdotdot-obj)
+		 (setq total-length (+ total-length 3))))
+	  (end-cons splice pp-close-paren-obj)
+	  (make-pp-obj :type 'complex
+		       :length (1+ total-length)
+		       :object result
+		       :callish callish
+		       :label-ref label))
+      (declare (fixnum currlength total-length))
+      (cond ((> currlength 0)
+	     (end-cons splice pp-space-obj)
+	     (setq total-length (1+ total-length))))
+      (end-cons splice (pp-objify (car objekt) (1+ currlevel)))
+      (setq total-length (+ (pp-obj-length (car splice)) total-length))
+      (cond ((or (not (listp (cdr objekt)))
+		 (duplicate-p (cdr objekt)))
+	     (end-cons splice pp-space-obj)
+	     (end-cons splice pp-dot-obj)
+	     (end-cons splice pp-space-obj)
+	     (end-cons splice (pp-objify (cdr objekt) (1+ currlevel)))
+	     (setq total-length (+ total-length 3
+				   (pp-obj-length (car splice))))
+	     (setq objekt ())))))))
+
+;;; Printing the PP-Obj:
+
+;;; Break-Always = T causes newlines at every SPACE.  Many-On-a-Line = T
+;;; causes as many objects as possible to be put on a line if the whole object
+;;; won't fit on a line.  If Many-On-a-Line is (), then each component will
+;;; be put on a separate line if the whole object won't fit on a line.
+;;; An Indent-Style = NORMAL causes components on successive lines to line
+;;; up with the column following the end of the first component (e.g. a left
+;;; paren).  An Indent-Style = PAST-NAME causes components on successive
+;;; lines to line up with the first column of the third component (e.g. the
+;;; first argument to a function.)  A fixnum Indent-Style causes components
+;;; to be indented that many spaces past the first column of the first
+;;; component.  Charpos is the column we believe we're starting to print
+;;; in.
+
+(defun basically-grind (object break-always many-on-a-line indent-style
+			       charpos)
+  (declare (fixnum charpos))
+  "Prints out an object constructed by PP-Objify."
+  (if (or break-always
+	  (and (null many-on-a-line)
+	       (> (+ (pp-obj-length object) charpos) pp-line-length)))
+      (break-always-grind (pp-obj-object object)
+			  indent-style charpos)
+      (break-sometimes-grind (pp-obj-object object)
+			     indent-style charpos)))
+
+(defun break-always-grind (object indent-style charpos)
+  (declare (fixnum charpos))
+  "Prints each component of the Object on its own line."
+  (do ((components object (cdr components))
+       (indent-pos (indentation object indent-style charpos)))
+      ((null components))
+    (cond ((eq (pp-obj-type (car components)) 'space)
+	   (write-char #\newline)
+	   (tab-over indent-pos)
+	   (setq charpos indent-pos))
+	  (t
+	   (master-grind (car components) charpos)
+	   (setq charpos (+ charpos (pp-obj-length (car components))))))))
+
+(defun break-sometimes-grind (object indent-style charpos)
+  (declare (fixnum charpos))
+  "Prints as many components as possible on each line."
+  (do* ((components object (cdr components))
+	(early-indent-pos (indentation object 1 charpos))
+	(late-indent-pos (indentation object indent-style charpos))
+	(indent-pos early-indent-pos))
+      ((null components))
+    (declare (fixnum indent-pos))
+    (cond ((eq (pp-obj-type (car components)) 'space)
+	   (cond ((> (+ charpos (pp-obj-length (cadr components)))
+		     pp-line-length)
+		  (write-char #\newline)
+		  (tab-over indent-pos)
+		  (setq charpos indent-pos))
+		 (t
+		  (setq indent-pos late-indent-pos)
+		  (write-char #\space)
+		  (setq charpos (1+ charpos)))))
+	  (t
+	   (master-grind (car components) charpos)
+	   (setq charpos (+ charpos (pp-obj-length (car components))))))))
+
+;;; Specially grind acts on the Specially-Grind property of the Callish slot
+;;; of the given object, which must be an integer.  If this number is
+;;; positive, that many SPACE PP-Objs following the function name indent
+;;; ala PAST-NAME.  The following forms are indented 2 in and given
+;;; separate lines.  If the number is negative, minus that many SPACE PP-Objs
+;;; simply space over, and the rest are again indented 2 on separate lines.
+
+(defun specially-grind (object charpos)
+  (let ((spec (get (pp-obj-callish object) 'specially-grind)))
+    (if (plusp spec)
+	(special-arg-grind (pp-obj-object object) spec charpos)
+	(top-line-grind (pp-obj-object object) (- spec) charpos))))
+
+(defun special-arg-grind (object spec charpos)
+  (do ((components object (cdr components))
+       (body-indent)
+       (indent-pos charpos))
+      ((or (null components)
+	   (eq (pp-obj-type (car components)) 'space))
+       (when components
+	 (write-char #\space)
+	 (setq components (cdr components))
+	 (setq indent-pos (+ indent-pos 1))
+	 (do ((i 0))
+	     ((or (= i spec) (null components)))
+	   (cond ((eq (pp-obj-type (car components)) 'complex)
+		  (incf i)
+		  (break-always-grind (pp-obj-object (car components))
+				      1 indent-pos))
+		 ((eq (car components) pp-nil-obj)
+		  (incf i)
+		  (write-string "()"))
+		 ((eq (car components) pp-space-obj)
+		  (write-char #\newline)
+		  (tab-over indent-pos))
+		 (t
+		  (incf i)
+		  (master-grind (car components) indent-pos)))
+	   (setq components (cdr components)))
+	 (if components (break-always-grind components 1 body-indent))))
+    (master-grind (car components) charpos)
+    (setq indent-pos (+ indent-pos (pp-obj-length (car components))))
+    (if (eq (car components) pp-open-paren-obj)
+	(setq body-indent indent-pos))))
+
+(defun top-line-grind (object spec charpos)
+  (do ((components object (cdr components))
+       (spaces-seen 0)
+       (body-indent)
+       (indent-pos charpos))
+      ((or (null components)
+	   (= spaces-seen spec))
+       (when components
+	 (break-always-grind components 1 (or body-indent (+ charpos 1)))))
+    (cond ((eq (pp-obj-type (car components)) 'space)
+	   (setq spaces-seen (1+ spaces-seen))
+	   (write-char #\space)
+	   (setq indent-pos (1+ indent-pos)))
+	  (t
+	   (master-grind (car components) charpos)
+	   (setq indent-pos (+ indent-pos (pp-obj-length (car components))))
+	   (if (and (null body-indent) (eq (car components) pp-open-paren-obj))
+	       (setq body-indent indent-pos))))))
+
+;;; Hairily-Grind isn't implemented:
+
+(defun hairily-grind (&rest ignore)
+  (declare (ignore ignore))
+  (error "I'm not yet implemented."))
+
+;;; Master-Grind dispatches to grinders various levels of intelligence
+;;; by looking at the PP-Obj handed to it.
+
+(defun master-grind (object charpos)
+  (when (pp-obj-label-ref object)	; if this object needs a label
+    (let ((*print-pretty* nil)
+	  (p-o (format nil "#~d=" (pp-obj-label-ref object))))
+      (write-string p-o *standard-output*)
+      (incf charpos (length p-o))))
+  (cond ((eq (pp-obj-type object) 'simple)
+	 (let ((start (pp-obj-object object)))
+	   (write-string (string-output-stream-string pprint-buffer-stream)
+			 *standard-output* :start start
+			 :end (+ start (pp-obj-length object)))))
+	((eq (pp-obj-type object) 'string)
+	 (write-string (pp-obj-object object)))
+	((pp-obj-callish object)
+	 (cond ((get (pp-obj-callish object) 'specially-grind)
+		(specially-grind object charpos))
+	       ((get (pp-obj-callish object) 'hairily-grind)
+		(hairily-grind object charpos))
+	       (t
+		(basically-grind object () t 'past-name charpos))))
+	(t
+	 (basically-grind object () t 'normal charpos))))
+
+;;; The exported functions:
+
+
+;;; This is what does it.  The main function
+;;;  after adding all the stuff for *print-circle*, some things are a little
+;;;  hazy, like  pp-label-stream?  extra?
+;;;           why if i don't set *print-pretty* to nil, it calls itself
+;;;               recursively even tho i thot everywhere it was being set to
+;;;               nil before making any output?
+;;;  so it would seem the turning off of itself is a hack, to be taken care of
+;;;  when print & pprint make the big merger!  For they must, it is written, or
+;;;  else much *print-circle* code should have to be replicated...
+;;; I need to think the if in there more... right?
+;;; But if *pretty is turned off, there can be no more recursive calls!
+;;;  is that what I want to do?  in case of structures???
+;;; And while i'm on the topic of bugs, does marking stop at appropriate depths
+;;;  & levels?  Should it stop? sure.  Does it?
+;;; The crash I was getting from trying to printed strange functions:  still
+;;;  exist?
+
+
+(defvar *pprint-recursive-call* ()
+  "Is true when pprint is called from pprint.")
+
+(defun output-pretty-object (object &optional (currlevel 0))
+  "Prettily outputs the Object to *Standard-Output*, like Output-Object."
+  (if (null (cdr pprint-buffer-stream-list))
+      (rplacd pprint-buffer-stream-list 
+	      (list (make-buffer-stream))))
+  (let* ((pp-line-length (or (line-length) 80))
+	 (pprint-buffer-stream-list (cdr pprint-buffer-stream-list))
+	 (pprint-buffer-stream (car pprint-buffer-stream-list)))
+    (setf (string-output-stream-index pprint-buffer-stream) 0)
+    (if *print-circle*
+	(progn
+	 (unless *pprint-recursive-call*
+	   (clrhash pp-hash-table)
+	   (setq pp-label-object-counter 0))
+	 (mark-obj-in-table object)))
+    (let ((*pprint-recursive-call* t))
+      (unwind-protect
+       (master-grind
+	(let ((*standard-output* pprint-buffer-stream))
+	  (pp-objify object currlevel))
+	(or (charpos) 0))
+       (setq *pprint-recursive-call* nil)))))
+
+(defun pprin1 (object &optional (*standard-output* *standard-output*))
+  "Prettily outputs the Object to the Stream slashifying special characters."
+  (let* ((*print-escape* t))
+    (output-pretty-object object)))
+
+(defun pprinc (object &optional (*standard-output* *standard-output*))
+  "Prettily outputs the Object to the Stream without slashifying."
+  (let* ((*print-escape* ()))
+    (output-pretty-object object)))
+
+(defun pprint (object &optional (*standard-output* *standard-output*))
+  "Prettily outputs the Object preceded by a newline and followed by a space."
+  (write-char #\newline)
+  (pprin1 object)
+  (write-char #\space)
+  (values))
+
+(defun pretty-lambda-to-defun (name lambda &optional arglist)
+  `(defun ,name ,(or arglist (cadr lambda))
+     ,@(if (and (null (cdddr lambda)) (listp (caddr lambda))
+		(eq (caaddr lambda) 'block))
+	   (cddr (caddr lambda))
+	   (cddr lambda))))
+
+(defmacro grindef (function-name)
+ "Prettily prints the definition of the function whose name is Function-Name."
+ (if (and (symbolp function-name) (fboundp function-name))
+     (let ((stuff (symbol-function function-name)))
+       (if (and (listp stuff) (listp (cdr stuff)))
+	   (case (car stuff)
+	     (lambda `(pprint ',(pretty-lambda-to-defun function-name stuff)))
+	     (macro
+	      (if (compiledp function-name)
+		  `(pprint '(setf (symbol-function ,function-name) ',stuff))
+		  `(pprint '(defmacro ,@(cdr (pretty-lambda-to-defun
+					      function-name (cdr stuff)))))))
+	     (t `(pprint '(setf (symbol-function ,function-name) ',stuff))))
+	   `(pprint '(setf (symbol-function ,function-name) ',stuff))))
+     nil))
+
+(defmacro defprint (function-name way)
+  "Defines a Way for PPrint to print a call to the function named by
+   Function-Name.  See ??? for details."
+  (if (listp way)
+      `(%put ',function-name ',(car way) ,(cadr way))
+      `(%put ',function-name 'specially-grind ,way)))
+
+;;; DefPrints for some common things:
+
+(defprint block 1)
+(defprint case -1)
+(defprint catch 1)
+(defprint catch-all 2)
+(defprint cond most-positive-fixnum)
+(defprint defconstant -2)
+(defprint defvar -2)
+(defprint defmacro -2)
+(defprint defun -2)
+(defprint do 2)
+(defprint do* 2)
+(defprint do-all-symbols -1)
+(defprint do-external-symbols -1)
+(defprint do-internal-symbols -1)
+(defprint do-symbols -1)
+(defprint dolist -1)
+(defprint dotimes -1)
+(defprint flet 1)
+(defprint function (simple-read-macro (make-pp-obj :type 'string :length 2
+						   :object "#'")))
+(defprint labels 1)
+(defprint lambda 1)
+(defprint let 1)
+(defprint let* 1)
+(defprint macro -2)
+(defprint macrolet 1)
+(defprint multiple-value-setq -1)
+(defprint multiple-value-bind -2)
+(defprint mvcall -1)
+(defprint prog 1)					; eventually hairier
+(defprint prog* 1)
+(defprint prog1 0)
+(defprint prog2 0)
+(defprint progn 0)
+(defprint progv 2)
+(defprint quote (simple-read-macro (make-pp-obj :type 'string :length 1
+						:object "'")))
+(defprint throw 2)
+(defprint typecase -1)
+(defprint unless -1)
+(defprint unwind-all 2)
+(defprint unwind-protect 2)
+(defprint when -1)

@@ -1,0 +1,1309 @@
+%TITLE 'A S C I I   -- ASCII record routines'
+!<BLF/REQUIRE 'RMSBLF.REQ'>
+MODULE ascii (IDENT = '2.0'
+		) =
+BEGIN
+!
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1984, 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+!++
+! FACILITY:	RMS
+!
+! ABSTRACT:
+!
+!	ASCII contains all routines dealing with I/O to ASCII or LSA
+!	files; this includes Line Sequence Number handling routines.
+!
+! ENVIRONMENT:	User Mode, Interrupts deferred until return
+!
+! AUTHOR: Ron Lusk , CREATION DATE:  8-Mar-83
+!
+! MODIFIED BY:
+!
+!	Ron Lusk, 23-Feb-84 : VERSION 2.0
+! 01	-   Rewrite PUTLSN and GETLSN for extended addressing.
+! 02	-   Return RFA to user
+! 03    -   Implement RB$WAA and RB$WBA
+! 441	-   Remove MOVST instruction and replace with ILDB/IDPB loop.
+!	    The MOVST has an alarming tendency to insert <NUL>s in the
+!	    middle of records when records with leading <NUL>s cross
+!	    page boundaries.  Also, CTRL-Z detection is needed for TTY:
+! 445	-   In edit 441, check MOVEFLAG before checking if enough
+!	    buffer space is left; otherwise, after an RTB error,
+!	    we neatly past the end of file to "complete" a partial $GET.
+! 457	-   In edit 441, we are checking to see if the remaining space
+!	    in the user buffer - 1 is LEQ 0.  It should be LSS 0.
+!--
+
+!
+! TABLE OF CONTENTS
+!
+!
+!	PUTASCII -- Process $PUT macro for ASCII/LSA file
+!       PUTELS -- Write End-of-Line sequence to file
+!	PUTLSN -- Write LSN to LSA file
+!	GETASCII -- Process $PUT macro for ASCII/LSA file
+!	GETLSN -- Read LSN from LSA file
+!
+!
+! INCLUDE FILES:
+!
+
+REQUIRE 'rmsreq';
+
+!
+! MACROS:
+!
+!   None.
+!
+! EQUATED SYMBOLS:
+!
+
+GLOBAL BIND
+    asciv = 2^24 + 0^18 + 441;			! Edit number
+
+!
+!   Symbols used for Line-sequenced files
+!
+
+LITERAL
+    pagemarkcode = -1,				! Line-number for page mark
+    pagemarksize = 2*5,				! # of chars in page-mark
+    pmrecsize = 2,				! Size of data in page mark
+    linenumflag = 1^0,				! Flag to denote line-number
+    lsnbufsize = %O'200',			! Size of a TOPS-10 buffer!A56
+    pagemark1 = 				! 5 spaces, LSB set
+	%EXACTSTRING (5, %O'40') + linenumflag,
+    pagemark2 = %CHAR ($chcrt, $chffd);		! <CR><FF><NUL><NUL><NUL>
+
+!
+! OWN STORAGE:
+!
+!   NONE
+!
+! EXTERNAL REFERENCES:
+!
+!   None
+!
+%SBTTL 'PUTASCII -- $PUT for STM and LSA'
+
+GLOBAL ROUTINE putascii : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!	This routine processes the $PUT macro for ASCII and Line-Sequenced
+!	ASCII files.  It is placed in this module in order to
+!	localize all access to non-RMS file organizations.
+!
+! FORMAL PARAMETERS
+!
+!	NONE.
+!
+! IMPLICIT INPUTS
+!
+!	?
+!
+! ROUTINE VALUE:
+!
+!	NONE.
+!
+! SIDE EFFECTS:
+!
+!	?
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	filepointer,				! Byte pointer to file buffer
+	userpointer : VECTOR [2],		! Byte pointer to user buffer
+						!   (2 words to support
+						!   non-zero sections)
+	destsize,				! Size of destination buffer
+        bytesize,                               ! Bytesize of file        !a577
+        bytesperpage,                           ! # of bytes fit on page  !a577
+	recordsize,				! Size of current record
+	bytestomove,				! Count of bytes to be
+						!   moved to user buffer
+	asciibytesleft;				! Free bytes in file buffer
+
+    TRACE ('PUTASCII');
+    !
+    !	If this is a TTY or LPT device, then we must reset all buffer
+    !	counters and pointers, etc. If not, we
+    !	must make sure that we are at the EOF.
+    !
+
+    IF tty OR llpt				![3] Make LPT work
+    THEN
+	BEGIN					! To reset buffer
+	rst [rstbytecount] = 0;			! Clear buffer
+	rst [rstpagptr] = CH$PTR (.curentbufferadr);	! Clear buffer
+	END
+    ELSE
+	BEGIN					! To check for EOF
+        IF rfaadr                       ! If RFA access                  !a573v
+        THEN                            ! Fetch File Page Into User Window
+            BEGIN
+            rst [Rst$g_Data_Rfa] = .rab [Rab$g_Rfa] ;
+            FindAsc( false );
+            rst[rst$v_eof]=0;           ! Clear end of file
+            END
+	ELSE                                                             !a575^
+            IF endoffile
+	THEN
+    !+
+    !   Update the RFA put it in the RAB
+    !   Since we must be at EOF, the EOF byte # becomes our RFA
+    !-
+            rab [rabrfa, 0] = rst [rstdatarfa] = .rst [rsthybyte] ! update RFA
+        ELSE
+	    usererror (er$nef)			! Must be at EOF
+	END;
+
+    !+
+    !   Update the RFA put it in the RAB
+    !   Since we must be at EOF, the EOF byte # becomes our RFA
+    !-
+
+    rab [rabrfa, 0] = rst [rstdatarfa] = .rst [rsthybyte];	![2] update RFA
+    !
+    !   If RB$WAA, advance (or whatever ELS contains) first
+    !
+
+    IF (.rab [rabrop, 0] AND rb$waa) NEQ 0	![3]
+    THEN
+	putels ();
+
+    !
+    !	For sequenced files, we must first create a line number.
+    !
+
+    IF sequenced
+    THEN
+	BEGIN
+	putlsn ();				! Write LSN into file
+
+	IF .rab [rablsn, 1] EQL pagemarkcode	! NOTE: Extend the sign
+	THEN
+	    RETURN 				! Ignore record if pagemark
+	    					! is output
+	END;
+
+    !+
+    !	Set up file and user buffer pointers
+    !-
+
+
+    userpointer = .Rab[Rab$a_Rbf];      ! User's Ptr to buffer            !a575
+    bytesize = .Fst[Fst$h_Bsz];                                           !a575
+    bytesperpage = ( %BPVAL / .bytesize ) * pagesize;			  !a575
+    TGUPointer( userpointer, .bytesize ); ! Make 2-word global if needed  !m575
+
+    recordsize = .rab [Rab$h_Rsz];		! Get # bytes to write
+
+
+    recordsize = .rab [rabrsz, 0];		! Get # bytes to write
+
+    !+
+    !	This is the main loop. It continues until the
+    !	entire user record has been written to the file.
+    !-
+
+    WHILE .recordsize GTR 0 DO
+	BEGIN
+
+	!+
+	!   Is our buffer full?
+	!-
+
+	IF .rst [rstbytecount] EQL pagesize*asciibytperword	!
+	THEN
+	    writebuffer ();			! Output full buffer
+
+	filepointer = .rst [rstpagptr];		! Fetch file pointer
+	bytestomove = .recordsize;		! Assume that record
+						! can fit in file
+	asciibytesleft = 			! Assume ASCII file
+	pagesize*asciibytperword - .rst [rstbytecount];
+
+	!+
+	!   Use the record size or the buffer space left, whichever
+	!   is smaller.
+	!-
+
+	IF .recordsize GTR .asciibytesleft	!
+	THEN
+	    bytestomove = .asciibytesleft;	!
+
+	destsize = .bytestomove;		! Assume same size
+
+	!+
+	!   Debugging
+	!-
+
+	lookat ('	FILEPTR: ', filepointer);
+	lookat ('	# BYTES: ', bytestomove);
+	lookat ('	ASCII BYTES: ', asciibytesleft);
+
+	!+
+	!   Do a Move-String With Left Justification to file
+	!-
+
+	BEGIN
+
+	LOCAL
+	    usrbp : VECTOR [2],			! Temporary 2-word user ptr
+	    filbp : VECTOR [2],			! Temporary 2-word file ptr
+	    src_len,				! Temporary source length
+	    dst_len;				! Temporary dest. length
+
+	!
+	!   Set up for MOVSLJ instruction
+	!
+	usrbp [0] = .userpointer [0];		! Possible 2-word byte pointer
+	usrbp [1] = .userpointer [1];
+	filbp [0] = .filepointer;		! Local BP
+	src_len = .bytestomove;
+	dst_len = .destsize;
+
+	IF moveleft_ea (			! Move the record
+		usrbp, 				! Source
+		filbp, 				! Destination
+		src_len, 			! Size of source
+		dst_len) EQL false		! Size of destination
+	THEN
+	    rmsbug (msgmovestring);		! Move-String failed
+
+	!
+	!   Update our file and buffer pointers
+	!
+	filepointer = .filbp;			! Update pointers
+	userpointer [0] = .usrbp [0];
+	userpointer [1] = .usrbp [1];
+	recordsize = .recordsize - .bytestomove;
+	rst [rstpagptr] = .filepointer;		! Update pointer
+	END;					! End MOVSLJ block
+	!
+	!   Update # of bytes left in buffer
+	!
+	rst [rstbytecount] = .rst [rstbytecount] + .bytestomove;
+	END;					! Of WHILE loop
+
+    !
+    !   If RB$WBA, advance (or whatever ELS contains) now
+    !
+
+    IF (.rab [rabrop, 0] AND rb$wba) NEQ 0	![3]
+    THEN
+	putels ();
+
+    !+
+    !   We have now moved the entire record from the user's buffer
+    !   into the internal RMS-20 file buffer.  We must also reset
+    !   RSTHYBYTE to reflect the highest byte in the file.
+    !-
+
+    IF seqadr                                                        !m575
+    THEN
+        rst [rst$g_highest_byte] = .rst [rst$g_highest_byte] + .rab [Rab$h_Rsz]
+    ELSE
+        rst [rst$g_highest_byte] = MAX( .rst [rst$g_highest_byte],
+                                        .rab[rab$g_rfa] + .rab [Rab$h_Rsz] ) ;
+
+    !+
+    !	If we are writing this record to a terminal, then we
+    !	should output it immediately.
+    !-
+
+    IF tty OR llpt
+    THEN
+        BEGIN
+        writebuffer ();		                        ! Make LPT work
+        Rst[Rst$h_Byte_Count] = 0;                      ! Clear byte count
+	rst [rstpagptr] = CH$PTR (.curentbufferadr);	! Reset pointer
+        END;                                                           !a577
+
+    RETURN
+    END;					! End of PUTASCII
+
+%SBTTL 'PUTELS -- write end-of-line sequence'
+GLOBAL ROUTINE putels : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Output the End-of-line sequence as requested
+!
+! FORMAL PARAMETERS
+!
+!	NONE.
+!
+! IMPLICIT INPUTS
+!
+!	RAB [ELS]
+!       RST
+!
+! ROUTINE VALUE:
+!
+!	NONE.
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	filepointer,				! Byte pointer to file buffer
+	userpointer : VECTOR [2],		! Byte pointer to user buffer
+						!   (2 words to support
+						!   non-zero sections)
+	c;					! Current character
+
+    TRACE ('PUTELS');
+
+    !+
+    !	Set up file and user buffer pointers
+    !-
+
+    IF .rab [rabels, 0] NEQ 0			! Did user specify end-of-line sequence?
+    THEN 					! Yes. use it
+	BEGIN
+
+	IF .rmssec EQL 0
+	THEN
+	    userpointer [0] = CH$PTR (.rab [rabels, 0])	! Get user address
+	ELSE
+	    BEGIN				! Extended addressing
+
+	    LOCAL
+		temp;				! Build pointer here
+
+	    temp<lh> = %O'440700' + %O'40';	! 2-word ASCII byte pointer
+	    temp<rh> = 0;
+	    userpointer [0] = .temp;
+	    temp = .rab [rabels, 0];
+
+	    IF .temp<lh> EQL 0 THEN userpointer [1] = .temp OR .blksec ELSE userpointer [1] = .temp;
+
+	    END
+
+	END
+    ELSE
+	userpointer = CH$PTR (UPLIT (%CHAR (13, 10, 0)));	! Use CRLF default
+
+    !+
+    !	This is the main loop. It continues until the
+    !	ELS has been written to the file.
+    !-
+
+    WHILE (c = CH$RCHAR_A (userpointer)) NEQ 0 DO 	! Copy until we get a NULL
+	BEGIN
+	! Is our buffer full?
+
+	IF .rst [rstbytecount] EQL pagesize*asciibytperword THEN writebuffer ();	! Output full buffer
+
+	CH$WCHAR_A (.c, rst [rstpagptr]);	! Write the byte out
+	rst [rstbytecount] = .rst [rstbytecount] + 1;	! # of bytes in buffer
+	rst [rsthybyte] = .rst [rsthybyte] + 1;	! # of bytes in file
+	END;					! Of WHILE loop
+
+    RETURN
+    END;					! End of PUTELS
+%SBTTL 'PUTLSN -- write LSN to file'
+GLOBAL ROUTINE putlsn : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!	This routine takes the sequence number from the user's RAB
+!	and inserts it into the file as 5 ASCII digits (with bit 0
+!	turned on) followed by a horizontal TAB character.  Note
+!	That the first digit is forced to be on a word boundary.
+!	Any bytes between the VFE of the last record and the LSN
+!	will be nulls.
+!
+! FORMAL PARAMETERS
+!
+!	NONE.
+!
+! IMPLICIT INPUTS
+!
+!	NONE.
+!
+! ROUTINE VALUE:
+!
+!	NONE.
+!
+! SIDE EFFECTS:
+!
+!	?
+!
+!		Format of a LSA record
+!		====== == = === ======
+!
+!	<Five-digit-ASCII-number><Bit-0><TAB><The-data-record><VFE>
+!
+!
+!		Format of a Pagemark
+!		====== == = ========
+!
+!	<Five-ASCII-blanks><Bit-0><CR><FF><Three-nulls>
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	users_lsn,				! User's Line-Sequence-Number
+	buffer_lsn : REF VECTOR [2];		! Address on page for LSN
+
+    TRACE ('PUTLSN');
+    !
+    !	Fetch the line number, extending the sign.
+    !
+    users_lsn = .rab [rablsn, 1];		! Note sign extension
+
+    !+
+    !	Check the range of the LSN
+    !-
+
+    IF .users_lsn LSS pagemarkcode OR 		! Less than -1?
+	.users_lsn GTR maxlsn			! Greater than 99999?
+    THEN
+	usererror (er$lsn);			! Don't allow such things
+
+    !+
+    !	Check now to see if we have enough room
+    !	left on this page to put a whole LSN and
+    !	its <TAB>, or a whole pagemark.
+    !
+    !	This means that there will, on occasion,
+    !	be a null word near the end of the page.
+    !	This is just fine for SOS and EDIT,
+    !	and RMS will accept it as well.
+    !-
+
+    BEGIN					! Checking end of page
+
+    LOCAL
+	bytes_remaining;			! Free bytes in page
+
+    IF (bytes_remaining = 			!
+	(pagesize*asciibytperword) - .rst [rstbytecount]) LSS 10
+    THEN
+	BEGIN
+	!
+	!   Increment the number of bytes written to file.
+	!
+	rst [rstbytecount] = .rst [rstbytecount] + .bytes_remaining;
+	rst [rsthybyte] = .rst [rsthybyte] + .bytes_remaining;
+	!
+	!   Write this buffer to file, getting a new one.
+	!
+	writebuffer ();				! Output page
+	END;
+
+    END;
+
+    !+
+    !	Calculate the number of bytes we have to
+    !	advance the pointer in order to put it on
+    !	a word boundary; then, increment all the counters
+    !	and the pointer to allow for that.
+    !-
+
+    BEGIN
+
+    LOCAL
+	bump_count;				! Bytes to bump the
+
+    						!   counters and pointers by.
+
+    !+
+    !	The following expression is complex, but neatly yields
+    !	the distance from here to the next word boundary.
+    !-
+
+    bump_count = 				!
+    (asciibytperword - 				! Difference to next word
+    (.rst [rstbytecount] MOD asciibytperword))	! boundary, but turn
+    MOD asciibytperword;			! 5 chars into 0.
+    !
+    !	Adjust the pointer and counters
+    !
+    rst [rstbytecount] = 			! Bytes on page
+    .rst [rstbytecount] + .bump_count;
+    rst [rsthybyte] = 				! Bytes written to file
+    .rst [rsthybyte] + .bump_count;
+    rst [rstpagptr] = 				! Byte pointer
+    CH$PLUS (.rst [rstpagptr], .bump_count);
+    END;
+
+    !+
+    !	Convert the byte pointer into an address on the page.
+    !-
+
+    BEGIN
+    !
+    !	To determine the address of the string referenced by
+    !	a word-aligned pointer, increment it by 1.  This
+    !	will eliminate any possibility of ambiguity in the
+    !	address field.
+    !
+    buffer_lsn = CH$PLUS (.rst [rstpagptr], 1);	! Get whole pointer
+    buffer_lsn = .buffer_lsn<0, %BPADDR, 0>;	! Isolate address field
+    END;
+
+    !+
+    !	Handle pagemarks and real LSNs appropriately.
+    !-
+
+    IF .users_lsn EQL pagemarkcode		! LSN = -1?
+    THEN
+
+    !+
+    !	Put out a pagemark
+    !-
+
+	BEGIN
+	buffer_lsn [0] = pagemark1;		! First half
+	buffer_lsn [1] = pagemark2;		! Second half
+	rst [rstbytecount] = 			! Update bytes on page
+	.rst [rstbytecount] + pagemarksize;
+	rst [rsthybyte] = 			! Update bytes to file
+	.rst [rsthybyte] + pagemarksize;
+	rst [rstpagptr] = 			! Update byte pointer
+	CH$PLUS (.rst [rstpagptr], pagemarksize);
+	END
+    ELSE
+
+    !+
+    !	Write out the Line Sequence Number
+    !-
+
+	BEGIN
+
+	LOCAL
+	    number_length,
+	    double_ptr : VECTOR [2] INITIAL (0, 0),
+	    double_lsn : VECTOR [2] INITIAL (0, 0),
+	    ascii_lsn;				! "Buffer" for text LSN
+
+	!+
+	!   Convert the user's LSN to ASCII.  If the
+	!   conversion fails (and it shouldn't by
+	!   now), let the user know.
+	!-
+
+	double_lsn [1] = .users_lsn;
+	double_ptr [0] = CH$PTR (ascii_lsn);
+	number_length = asciibytperword OR 1^35;	! For filling
+
+	IF NOT cvtbdo (				! Convert binary to decimal
+		number = double_lsn, 		! LSN to convert to text
+		string = double_ptr, 		! Destination pointer
+		length = number_length, fill = %C'0')	! Fill with zeroes
+	THEN
+	    usererror (er$lsn);			! Something went wrong
+
+	buffer_lsn [0] = .ascii_lsn OR linenumflag;	! LSN to output buffer
+	!
+	!   Set byte pointer and write the <TAB>
+	!
+	rst [rstpagptr] = 			! Postion byte pointer
+	CH$PLUS (.rst [rstpagptr], 5);
+	CH$WCHAR_A (%O'11', rst [rstpagptr]);	! Write the <TAB>
+	!
+	!   Update the remaining counters
+	!
+	rst [rstbytecount] = 			! Update bytes on page
+	.rst [rstbytecount] + 6;
+	rst [rsthybyte] = 			! Update bytes to file
+	.rst [rsthybyte] + 6;
+	END;
+
+    END;					! End of PUTLSN
+
+%SBTTL 'GETASCII -- $GET for STM, LSA files'
+GLOBAL ROUTINE getascii (moveflag) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!	This routine processes the $GET macro for files with STM
+!	and LSA record format.  For ASCII files, it transfers one
+!	record into the user's buffer, where a record is defined as
+!	being a stream of ASCII bytes terminated by a Vertical
+!	Format Effector.
+!
+!	For sequenced files, full words will be transferred until
+!	the next line-number is found.
+!
+! FORMAL PARAMETERS
+!
+!	MOVEFLAG --	Flag for record transfer:
+!			    True: move the record ($GET)
+!			    False: skip the record (last $GET was partial)
+!
+! IMPLICIT INPUTS
+!
+!	?
+!
+! ROUTINE VALUE:
+!
+!	Number of bytes in record, or number moved if PARTIALFLAG has been set.
+!
+! SIDE EFFECTS:
+!
+!	This routine sets RSTRHSIZE, which is the record header size.
+!	For ASCII stream files the size is zero (no record header).
+!	For LSA stream files the size is 6 if record begins with an LSN,
+!	or 10 if the record is a pagemark.  This field is used by the
+!	$TRUNCATE processor to know how much to subtract from
+!	RSTDATARFA to find the beginning of the current physical record.
+!
+!	Note: A logical record is defined as the data the user sees;
+!	    a physical record is defined as the record header plus the
+!	    user's data.
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	significant_char_seen,			! Saw a non-<NUL> char	!A441
+	tty_eof,				! EOF on TTY: (^Z seen)	!A441
+	userpointer : VECTOR [2],		! Pointer to user's buffer
+	exitflag,				! Flag for leaving the loop
+	recordsize,				! Current length of record
+	nextword,				! Next file word for LSA files
+	movestatus,				! Temporary variable
+	buffersize,				! Size of user's buffer
+        bytesize;                               ! Byte size to use	!a574 
+
+    TRACE ('GETASCII');
+
+    bytesize = .Fab[Fab$v_Bsz];                                         !a574 
+
+    !+
+    !	If unit record device, reset buffer
+    !   Otherwise, check for end of file
+    !-
+
+    IF tty OR llpt				![3] Make LPT work
+    THEN
+	BEGIN					! To reset buffer
+	rst [rstbytecount] = 0;			! Clear buffer
+	rst [rstpagptr] = CH$PTR (.curentbufferadr,	! Clear buffer
+                                  ,
+                                  .bytesize );    ! File byte size        !m574
+	END
+    ELSE
+	BEGIN
+
+	IF endoffile THEN usererror (er$eof);
+
+	END;
+
+    !+
+    !	Set up user buffer pointer, etc.
+    !-
+
+    userpointer = .Rab[Rab$a_Rbf];      				!a574 
+    TGUPointer( userpointer, .bytesize );        			!a574 
+
+    buffersize = 				! Remember size of his buffer
+     .rab [Rab$h_Usz] * ( %BPVAL / .Fab[Fab$v_Bsz] ); ! in bytes
+    recordsize = 0;				! Clear total size
+    rab [Rab$h_Rsz] = 0;			! Clear his record size
+    tty_eof = 0;				! Clear TTY: EOF flag	!A441
+    exitflag = false;				! Loop forever
+                                                                        !d574
+    significant_char_seen = 0;			! Skip leading <NUL>s	!A441
+    tty_eof = 0;				! Clear TTY: EOF flag	!A441
+    exitflag = false;				! Loop forever
+
+    !+
+    !	If we are skipping a record, then don't use a user pointer
+    !-
+
+    IF .moveflag EQL false THEN userpointer = 0;	! No data will be moved
+
+    !+
+    !	Process LSN if reading an LSA stream file.
+    !   LSA stream files have 7 bit bytes,
+    !   no matter what the FDB says.
+    !-
+
+    IF sequenced AND (partialflag EQL 0)
+    THEN
+	BEGIN					! Get an LSN
+	getlsn ();				! Fetch the line-number
+
+	IF .rab [rablsn, 1] EQL pagemarkcode
+	THEN
+	    BEGIN				! Handle pagemark
+	    rst [rstrhsize] = stmrhpm;		! Set record header size
+	    setflag (rst [rstflags], flgupdptr);	! Must update pointer
+	    rst [rstrsz] = asciibytperword;	! Record size=5
+
+	    IF .buffersize NEQ 0
+	    THEN
+		BEGIN				! Move the pagemark record
+		CH$WCHAR_A (charcr, userpointer);
+		CH$WCHAR_A (charff, userpointer);
+		END;
+
+	    RETURN pmrecsize			! So, recordsize is zero
+	    END
+	ELSE
+	    rst [rstrhsize] = stmrhlsn		! Set record header size
+	END;
+
+    IF NOT (sequenced)				!
+    THEN
+	rst [rstrhsize] = stmrhasc;		! Set record header size
+
+    						! for ascii stream file
+
+    !+
+    !	This is the main loop. it continues until a VFE is
+    !	Seen or the user's buffer is filled.
+    !-
+
+    UNTIL .exitflag DO
+	BEGIN
+
+	!+
+	!   If buffer is empty, then re-fill it.
+	!-
+
+	IF .rst [rstbytecount] EQL 0 THEN readbuffer ();
+
+	IF endoffile THEN usererror (er$eof);	! Check for EOF
+
+	!+
+	!   We will now move the entire record
+	!   until we come to either the end
+	!   of the file, or the end of the
+	!   user's buffer, or a VFE. We will save
+	!   the status of this move because we
+	!   have to do some common clean-up before
+	!   we need to check it.
+	!-
+
+	BEGIN
+
+	!++
+	!   Beginning of edit 441 rewrite
+	!--
+
+
+	REGISTER 				!			!A441
+	    user_ptr_index;			! Index to byte pointer	!A441
+
+	user_ptr_index = userpointer;		! Set index register	!A441
+
+	!+								!A441
+	!   This loop copies as much of the record as
+	!   is in this file buffer.  If we encounter a
+	!   VFE, set MOVESTATUS to FALSE and exit the
+	!   loop.  Otherwise, exit when we have
+	!   emptied the file buffer or filled 
+	!   the user buffer.
+	!
+	!   If we are reading from the TTY:, regard ^Z
+	!   as a terminator like a VFE.
+	!
+	!-
+
+	movestatus = true;			! Set no-VFE status	!A441
+
+	WHILE .rst [rstbytecount] GTR 0 DO	! While bytes in buffer	!A441
+	    BEGIN
+
+	    REGISTER
+		char;
+
+	    char = CH$RCHAR_A (rst [rstpagptr]);
+	    rst [rstbytecount] = .rst [rstbytecount] - 1;
+
+	    SELECTONE .char OF
+		SET
+
+		[$chnul] :
+		    BEGIN
+
+		    IF .significant_char_seen	! Seen non-<NUL> already?
+		    THEN
+			BEGIN
+
+			IF .moveflag AND 	! Quit if moving data	!M445
+			(buffersize = .buffersize - 1) LSS 0	! Space	!M457
+			THEN
+			    EXITLOOP;		! No - leave
+
+			idpb (char, 0, user_ptr_index);	! Yes - put byte
+			recordsize = .recordsize + 1;	! Bump size
+			END;
+
+		    END;
+
+		[$chlfd, $chvtb, $chffd] :
+		    BEGIN
+
+		    IF .moveflag AND 		! Quit if moving data	!M445
+		    (buffersize = .buffersize - 1) LSS 0	! Space	!M457
+		    THEN 			!
+			EXITLOOP;		! No - leave
+
+		    idpb (char, 0, user_ptr_index);	! Yes - put byte
+		    recordsize = .recordsize + 1;	! Bump rec size
+		    movestatus = false;		! Terminate
+		    EXITLOOP;			! Quit looping
+		    END;
+
+		[$chcnz] :
+		    BEGIN
+
+		    significant_char_seen = 1;
+
+		    IF .moveflag AND 		! Quit if moving data	!M445
+		    (buffersize = .buffersize - 1) LSS 0	! Space	!M457
+		    THEN 			!
+			EXITLOOP;		! No - leave
+
+		    idpb (char, 0, user_ptr_index);	! Yes - put byte
+		    recordsize = .recordsize + 1;	! Bump rec size
+
+		    IF tty			! EOF for TTY:?
+		    THEN
+			BEGIN
+			tty_eof = true;		! Yes -
+			movestatus = false;	! Terminate
+			EXITLOOP;		! Quit looping
+			END;
+
+		    END;
+
+		[OTHERWISE] :
+		    BEGIN
+
+		    significant_char_seen = 1;
+
+		    IF .moveflag AND 		! Quit if moving data	!M445
+		    (buffersize = .buffersize - 1) LSS 0	! Space	!M457
+		    THEN 			!
+			EXITLOOP;		! No - leave
+
+		    idpb (char, 0, user_ptr_index);	! Yes - put byte
+		    recordsize = .recordsize + 1;	! Bump rec size
+		    END;
+		TES;
+
+	    END;
+
+	!++
+	!   End of edit 441 rewrite
+	!--
+
+	END;					! End record reading loop
+
+	IF .movestatus EQL false THEN exitflag = true;	! Exit from loop
+
+!++
+!
+!   At this point, we have done the following:
+!
+!	1) moved a full record, or
+!	2) filled the user's buffer, or
+!	3) exhausted the current file buffer.
+!
+!--
+
+	!+
+	!	Set up the record size field and check for
+	!	a record which is too big for the user's buffer.
+	!-
+
+	IF .moveflag
+	THEN
+	    BEGIN
+	    rab [rabrsz, 0] = .recordsize;	! Update user's record size
+
+	    !+
+	    !	If we are still trying to process the
+	    !	record,  but the buffer is full then
+	    !	we have filled the user's buffer.
+	    !-
+
+	    IF (.exitflag EQL false) AND (.buffersize LEQ 0)
+	    THEN
+		BEGIN
+		usrsts = er$rtb;		! Set partial record
+		usrstv = .recordsize;		! Return partial record size
+		setflag (rst [rstflags], flgpartial);	! Remember this
+		exitflag = true			! Leave
+		END
+
+	    END;
+
+	END;
+
+    !+
+    !   Store the size of this record in the user's RAB
+    !-
+
+    rst [rstrsz] = .recordsize;			! Pass the record size back
+    !
+    !	Set the RST flag bit which tells FINDASC that
+    !	the file pointer (PAGPTR) must be updated before
+    !	the next operation can be done.
+    !
+    setflag (rst [rstflags], flgupdptr);
+    !									!A441
+    !   Check that we didn't receive EOF from TTY:			!A441
+    !									!A441
+
+    IF .tty_eof THEN usererror (er$eof);				!A441
+
+    !
+    !	We have now done everything and we can exit.
+    !
+    RETURN .recordsize
+    END;					! End of GETASCII
+
+%SBTTL 'GETLSN -- read an LSN'
+
+GLOBAL ROUTINE getlsn : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!	This routine parses a Line Sequence Number.  The file is
+!	assumed to have been positioned to a word boundary by
+!	the FINDASC routine.  The TAB following the line number
+!	will be stripped off by this routine (see note).  See the PUTLSN
+!	routine for the format of an LSA record.  Also note that
+!	this routine handles pagemarks (see the PUTLSN routine
+!	for the format of a pagemark).
+!
+!	Note:	If the character following the line number is not a
+!		<TAB>, it is part of the record and is not stripped.
+!
+! FORMAL PARAMETERS
+!
+!	NONE.
+!
+! IMPLICIT INPUTS
+!
+!	?
+!
+! ROUTINE VALUE:
+!
+!	NONE.
+!
+! SIDE EFFECTS:
+!
+!	?
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	buffer_lsn : REF VECTOR [2];		! LSN in input buffer
+
+    TRACE ('GETLSN');
+
+    !+
+    !	If there are fewer than five bytes remaining in
+    !	the buffer, then the buffer is empty as far
+    !	as we are concerned.
+    !-
+
+    IF .rst [rstbytecount] LSS asciibytperword
+    THEN
+	BEGIN
+	!
+	!   Get a new buffer and check for EOF.
+	!
+	readbuffer ();				! Get a buffer
+
+	IF endoffile THEN usererror (er$eof);	! EOF wins an error
+
+	END;
+
+    !+
+    !	Calculate the number of bytes to the next
+    !	word boundary, and adjust the pointer
+    !	and counters appropriately.
+    !-
+
+    BEGIN
+
+    LOCAL
+	aligned_pointer,			! Build pointer here
+	bytes_to_bump;				! Bytes to next word
+
+    aligned_pointer = .rst [rstpagptr];		! Copy the buffer pointer
+    buffer_lsn = .aligned_pointer<0, %BPADDR>;	! Fetch the address field
+
+    !+
+    !	Certain word-aligned pointers (for instance, the
+    !	default pointer to an address generated by the POINT
+    !	pseudo-op in MACRO) have an address field which
+    !	references the beginning of a string, and byte
+    !	address fields describing a field to the left of
+    !	that string (so an ILDB will get the first byte of
+    !	the string, for instance).  If this is the case,
+    !	then the address field points to the correct
+    !	address.  Other word-aligned pointers contain the
+    !	address of the word preceding the word really
+    !	pointed to.  This ambiguity has to be checked here.
+    !-
+
+    IF .aligned_pointer<30, 6> EQL %O'44' OR 	! Local pointer
+	.aligned_pointer<30, 6> EQL %O'61'	! One-word global
+    THEN
+	buffer_lsn = .aligned_pointer<0, %BPADDR>
+    ELSE
+	buffer_lsn = .aligned_pointer<0, %BPADDR> + 1;
+
+    aligned_pointer = CH$PTR (.buffer_lsn);	! Set up word-aligned pointer
+    !
+    !	Fix the counters
+    !
+    bytes_to_bump = CH$DIFF (.rst [rstpagptr], .aligned_pointer);
+    rst [rstpagptr] = .aligned_pointer;
+    rst [rstbytecount] = .rst [rstbytecount] - .bytes_to_bump;
+    END;
+
+    !+
+    !	EDIT and SOS both write a word of nulls at the end
+    !	of a block of 200 (octal) words rather than split
+    !	the Line Sequence Number and its <TAB> between
+    !	blocks.  RMS does the same on page boundaries.  If
+    !	we find a word of nulls, it better be on a block
+    !	boundary; we'll bump things normally if so, give an
+    !	error if not.
+    !-
+
+    IF .buffer_lsn [0] EQL 0			! Word of nulls?
+    THEN
+	BEGIN
+
+	!+
+	!   We have three courses of action conditioned
+	!   on the position of the null word.
+	!-
+
+	SELECTONE 1 OF
+	    SET
+
+	    [(.buffer_lsn MOD %O'1000') EQL %O'777'] :
+		!
+		!   The null is on a page boundary,
+		!   so read in another buffer.
+		!
+		BEGIN
+		!
+		!   Set up the RFA
+		!
+		rst [rstdatarfa] = .rst [rstdatarfa] + asciibytperword;
+		readbuffer ();			! Get a buffer
+
+		IF endoffile THEN usererror (er$eof);
+
+		!
+		!   The buffer address is in the current
+		!   bucket descriptor in the RST.  Fetch it
+		!   to point at the LSN, rather than finding
+		!   what the page pointer is really pointing
+		!   to.
+		!
+		buffer_lsn = .cbd [bkdbktadr];	! Address of new buffer
+		END;
+
+	    [(.buffer_lsn MOD %O'200') EQL %O'177'] :
+		!
+		!   We are on a block boundary that is not a
+		!   page boundary (or we would have gotten
+		!   caught in the previous select-action.
+		!   Bump the pointers to the next block.
+		!
+		BEGIN
+		!
+		!   Set up the RFA
+		!
+		rst [rstdatarfa] = .rst [rstdatarfa] + asciibytperword;
+		!
+		!   Decrement the number of
+		!   bytes left in this buffer.
+		!
+		rst [rstbytecount] = .rst [rstbytecount] - asciibytperword;
+		!
+		!   Bump byte pointer.
+		!
+		rst [rstpagptr] = CH$PLUS (.rst [rstpagptr], asciibytperword);
+		!
+		!   Adjust pointer to the LSN
+		!
+		buffer_lsn = .buffer_lsn + 1;
+		END;
+
+	    [OTHERWISE] :
+		BEGIN
+		fileproblem (er$lsn);		! File consistency bug
+		usrerr ();			! Take error return
+		END;
+	    TES;
+
+	END;					! End handling null words
+
+    !+
+    !	Handle pagemarks and real LSNs differently.
+    !-
+
+    IF .buffer_lsn [0] EQL pagemark1		! Pagemark in file?
+    THEN
+	BEGIN					! Pagemark handling
+
+	!+
+	!   Check to see if we span pages.
+	!-
+
+	IF .rst [rstbytecount] EQL asciibytperword	! End of buffer?
+	THEN
+	    BEGIN				! Pagemark across pages
+	    readbuffer ();			! Get a new buffer
+
+	    IF endoffile THEN usererror (er$eof);
+
+	    !
+	    !	Adjust pointers to skip
+	    !	second word of pagemark.
+	    !
+	    rst [rstbytecount] = .rst [rstbytecount] - asciibytperword;
+	    rst [rstpagptr] = CH$PLUS (.rst [rstpagptr], asciibytperword);
+	    END
+	ELSE
+	    BEGIN				! Normal pagemark
+	    !
+	    !	Adjust pointers to skip
+	    !	over pagemark.
+	    !
+	    rst [rstbytecount] = .rst [rstbytecount] - pagemarksize;
+	    rst [rstpagptr] = CH$PLUS (.rst [rstpagptr], pagemarksize);
+	    END;
+
+	!
+	!   Update byte position in file
+	!
+	rst [rstdatarfa] = .rst [rstdatarfa] + pagemarksize;
+	!
+	!   Return -1 for a pagemark
+	!
+	rab [rablsn, 1] = pagemarkcode;		! Return -1 as LSN
+	END					! Pagemark handling
+    ELSE
+	BEGIN					! LSN handling
+
+	!+
+	!   Convert the linenumber to binary.
+	!-
+
+	BEGIN					! LSN conversion
+
+	LOCAL
+	    number_length,
+	    double_number : VECTOR [2] INITIAL (0, 0),
+	    double_pointer : VECTOR [2] INITIAL (0, 0);
+
+	number_length = asciibytperword;
+	double_pointer [0] = .rst [rstpagptr];
+
+	IF NOT cvtdbo (				! Convert the number
+		number = double_number, 	!
+		length = number_length, 	!
+		string = double_pointer)	!
+	THEN
+	    BEGIN
+	    fileproblem (er$lsn);		! Something wrong with file
+	    usrerr ();				! Tell user
+	    END
+	ELSE
+	    rab [rablsn, 1] = .double_number [1];	! LSW of result
+
+	END;					! LSN conversion
+	!
+	!   Presumably, all has gone OK so far, so
+	!   bump the bytepointer and decrement the
+	!   number of bytes remaining on the page.
+	!
+	rst [rstpagptr] = CH$PLUS (.rst [rstpagptr], asciibytperword);
+	rst [rstbytecount] = .rst [rstbytecount] - asciibytperword;
+	rst [rstdatarfa] = .rst [rstdatarfa] + asciibytperword;
+
+	!+
+	!   If the LSN was (by chance) on the end of a page,
+	!   we have to read a new buffer.
+	!-
+
+	IF .rst [rstbytecount] EQL 0		! End of page?
+	THEN
+	    BEGIN
+	    readbuffer ();			! Get a new buffer
+
+	    IF endoffile THEN usererror (er$eof);
+
+	    END;
+
+	!+
+	!   Look for a <TAB>.  If there is no <TAB>,
+	!   then the first character is really part
+	!   of a record.  If there is a <TAB>, strip
+	!   it off the record.
+	!-
+
+	IF CH$RCHAR (.rst [rstpagptr]) EQL $chtab	! Is it a <TAB>?
+	THEN
+	    BEGIN
+	    !
+	    !	Skip over <TAB>
+	    !
+	    rst [rstpagptr] = CH$PLUS (.rst [rstpagptr], 1);
+	    !
+	    !	Account for the <TAB>
+	    !
+	    rst [rstbytecount] = .rst [rstbytecount] - 1;
+	    rst [rstdatarfa] = .rst [rstdatarfa] + 1;
+	    END;
+
+	END;					! LSN handling
+
+    ! [2] RFA will be returned to user before this has fiddled with it
+    ! because FINDASC will have set it.
+    END;					! End of GETLSN
+
+END						! End of Module ASCII
+
+ELUDOM
+   

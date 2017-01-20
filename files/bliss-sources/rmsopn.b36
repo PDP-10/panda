@@ -1,0 +1,1758 @@
+!<BLF/REQUIRE 'RMSBLF.REQ'>
+%TITLE 'RMSOPN - RMS-20 $OPEN/$CREATE Verbs'
+MODULE RMSOPN (IDENT = '3.0(656)'
+		) =
+BEGIN
+!
+!			  COPYRIGHT (c) 1984, 1986 BY
+!	      DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASS.
+!
+! THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND  COPIED
+! ONLY  IN  ACCORDANCE  WITH  THE  TERMS  OF  SUCH  LICENSE AND WITH THE
+! INCLUSION OF THE ABOVE COPYRIGHT NOTICE.  THIS SOFTWARE OR  ANY  OTHER
+! COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY
+! OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE  IS  HEREBY
+! TRANSFERRED.
+!
+! THE INFORMATION IN THIS SOFTWARE IS SUBJECT TO CHANGE  WITHOUT  NOTICE
+! AND  SHOULD  NOT  BE  CONSTRUED  AS  A COMMITMENT BY DIGITAL EQUIPMENT
+! CORPORATION.
+!
+! DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF  ITS
+! SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.
+!
+
+!++
+! FACILITY:	RMS
+!
+! ABSTRACT:
+!
+!	OPENER contains all routines which process the
+!	$OPEN and $CREATE macros in RMS-20.
+!
+! ENVIRONMENT:	User mode
+!
+! AUTHOR: Ron Lusk , CREATION DATE: 25-Mar-83
+!
+! MODIFIED BY:
+!
+!	Ron Lusk, 20-Dec-83 : VERSION 2.0
+!  01	- Clean up BLISS code
+!  02	- (AWN) Make OFILE able to open LPT:
+!  03	- Do no locking when FB$SMU is set.
+! 414	- Fix missing parentheses in DOOPEN
+! 444	- When only reading, open file Read-Unrestricted.
+!
+!       Andrew Nourse, 5-Apr-85 : Version 3.0
+! 501   - Put in code for remote file access
+! 502   - Change over to new standard names
+! 504   - Implement Image (RFM=UDF) Mode
+! 507   - Implement $Parse and $Search
+! 545   - Return resultant on local $Create or $Open
+! 550	- Put FST address in FAB before calling F$OPEN for FFF; process
+!	  errors appropriately. (RL)
+! 556   - Don't put the jfn in the Fab in GETJFN, that may break other things
+! 557   - Use new place in FST for Fop
+! 565	- (RL) Return STV from FFF call
+! 566   - Handle parse-only remote jfn correctly
+! 577   - Handle 8-bit ASCII correctly
+! 600   - Set up byte size for LSA files
+! 602   - Check byte size on $Create
+! 607	- Check file existence before $OPEN/$CREATE;
+!	  earlier call for CHECKXAB to prevent dummy
+!	  file creation for bad XAB chain.
+! 613	- Add DIL8 type class to support DIL formatted 8-bit
+!	  records generated (only) by DIU
+! 621	- Make FOP=SUP kill an existing file on $CREATE if
+!	  CIF not set.
+! 654   - Set the creation and read dates on $CREATE if there is a date XAB.
+! 656   - (GAS, 15-Oct-86) Write the protection into the XABPRO on $OPEN, and
+!          use protection in XABPRO to set the file's protection on $CREATE.
+
+!--
+
+!
+! TABLE OF CONTENTS
+!
+!
+!	$OPEN	    -	$OPEN processor
+!	$CREATE	    -	$CREATE processor
+!	OFILE	    -	get a JFN and open the file
+!	DOOPEN	    -	perform rest of file opening
+!
+!
+! INCLUDE FILES:
+!
+
+REQUIRE 'rmsreq';				! Standard definitions
+
+REQUIRE 'rmsosd';				! OS-dependent definitions
+
+!
+! MACROS:
+!
+!<BLF/MACRO>
+
+MACRO
+    !
+    !	Macro to exit an open routine successfully
+    !
+    openexit =
+	BEGIN
+	oaflags = 0;				! No unwind needed
+	usrret ()				! Jump to user
+	END
+    %;
+
+!
+! EQUATED SYMBOLS:
+!
+BUILTIN SCANN;
+
+%IF NOT %DECLARED ($DvRmt)              ! Temp definition
+%THEN LITERAL $DvRmt=$DvAts;            ! until Monsym has it right 	  !a501
+%FI
+
+MAP
+    !
+    !	RMSLIB cannot define these externals as MONWORD (because
+    !	a library file cannot reference a structure from a library
+    !	file) so MAP them instead.
+    !
+    dvflgs : monword,				! Device flags (from DVCHAR)
+    fdbword1 : monword;				! First word of FDB
+
+GLOBAL BIND
+    !
+    !	Error-mapping tables defined for the $CREATE/$OPEN calls
+    !
+    opnerrtab = $oserrmap (			! Error code map
+	    <er$fsi, gjfx4, gjfx5, gjfx6, 	! Invalid file specification
+		gjfx7, gjfx8, gjfx9, gjfx10, 	!
+		gjfx11, gjfx12, gjfx13, gjfx14, 	!
+		gjfx31, gjfx33, gjfx34, gjfx43>, 	!
+	    <er$fnf, gjfx16, gjfx17, gjfx18, 	! File not found
+		gjfx19, gjfx20, gjfx24, 	!
+		gjfx28, gjfx32, opnx2>, 	!
+	    <er$fex, gjfx27>, 			! File already exists
+	    <er$prv, gjfx35, gjfx44, opnx3, 	! Access privileges needed
+		opnx4, opnx6, opnx15>, 		!
+	    <er$dev, gjfx38>, 			! Bad device
+	    <er$flk, opnx9>);			! File locked
+
+!
+! OWN STORAGE:
+!
+!   None.
+!
+! EXTERNAL REFERENCES:
+!
+!   DAP$OPENFILE, DAP$MERGE, F$Open
+
+EXTERNAL ROUTINE
+         F$Open,
+         R$Null,
+         RL$Merge,
+         Psizefile,			! 621
+         Truncfile : NOVALUE;		! 621
+
+FORWARD ROUTINE getjfn,
+                dapprotra;
+!
+%SBTTL '$OPEN - open existing file'
+
+GLOBAL ROUTINE $open (fabblock, errorreturn) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine processes the $OPEN service.  It is
+!	called directly from the RMS-20 verb dispatcher.
+!	This routine upon completion will exit directly back
+!	to the RMS-20 exit processing routine.
+!
+! FORMAL PARAMETERS
+!
+!	FABBLOCK    -	user's File Access Block
+!
+!	    **	Inputs **
+!
+!	    FABBLS  -	Block size for file
+!	    FABFAC  -	File access value
+!	    FABFOP  -	File options
+!	    FABFNA  -	File specification address (or pointer)
+!	    FABJFN  -	JFN of file
+!	    FABSHR  -	File sharing value
+!
+!	    ** Outputs **
+!
+!	    FABDEV  -	Device characteristics
+!	    FABIFI  -	Internal file identifier
+!	    FABJFN  -	JFN of file
+!	    FABORG  -	File organization
+!	    FABRAT  -	Record attributes
+!	    FABRFM  -	Record format
+!	    FABSTS  -	Completion status code
+!	    FABSTV  -	Additional status information
+!
+!
+!	ERRORRETURN -	user's error handling routine
+!
+! IMPLICIT INPUTS
+!
+!	?
+!
+! ROUTINE VALUE:
+!
+!	None.
+!
+! SIDE EFFECTS:
+!
+!	?
+!
+!--
+
+    BEGIN
+
+!++
+!   ******** Flow of $OPEN routine ********
+!
+!	1)  Open the file
+!	2)  Lock the file
+!	3)  Process file prologue
+!	4)  Update fields in user FAB
+!	5)  Create the File Status Block
+!	6)  Check for all errors in $OPEN request
+!--
+
+    rmsentry ('$OPEN');
+!+
+!   Fetch the user's FAB and error address.
+!-
+    fab = .fabblock;				! Get address of FAB
+    erradr = .errorreturn;			!   and user error address
+    errorblock (fab);				! All errors go to the FAB
+    !
+    !   Make sure this is a FAB.
+    !
+
+    IF .fab [blocktype] NEQ fabcode THEN usererror (er$fab);
+
+    IF .fab [blocklength] LSS v1fabsize THEN usererror (er$bln);
+
+    oaflags = 0;				! Clear the open-abort flags
+!+
+!   Open the file.
+!-
+
+    IF ofile (gj_old) NEQ true			! Try to open the file
+    THEN
+        rmsbug (msgfailure);
+
+    setflag (oaflags, abrclose);		! File is open
+
+
+!+
+!   Now do the rest of the processing for local files
+!-
+
+    IF .fst [fst$v_remote] EQL 0
+    THEN
+        BEGIN
+!+
+!   We must make sure the file exists.  This check must be
+!   made because if the user gave us a JFN, we have no way
+!   of checking if it is associated with an existing file
+!   without reading the FDB (which we did in OFILE).
+!-
+
+        IF .fdbword1 [fb_nxf]			! File does not exist
+        THEN
+            oabort (er$fnf);
+
+!+
+!   Perform the rest of the $OPEN service processing.
+!-
+        doopen ();
+        END;                            ! End of local file processing
+
+    openexit					! Return to user
+    END;					! End of $OPEN
+
+%SBTTL '$CREATE - create a file'
+
+GLOBAL ROUTINE $create (fabblock, errorreturn) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Create a new file for use by RMS-20.  An option
+!	(CIF) is supported which will $OPEN the file if it
+!	already exists.
+!
+! FORMAL PARAMETERS
+!
+!	FABBLOCK    -	user's File Access Block
+!
+!	    **	Inputs **
+!
+!	    FABBLS  -	Block size for file
+!	    FABBKS  -	Bucket size for file
+!	    FABFAC  -	File access value
+!	    FABFOP  -	File options
+!	    FABFNA  -	File specification address (or pointer)
+!	    FABJFN  -	JFN of file
+!	    FABMRN  -	Maximum record number
+!	    FABMRS  -	Maximum record size
+!	    FABORG  -	File organization
+!	    FABRAT  -	Record attributes
+!	    FABRFM  -	Record format
+!	    FABSHR  -	File sharing value
+!	    FABXAB  -	Address of XAB chain
+!
+!	    ** Outputs **
+!
+!	    FABBLS  -	Block size of file [?]
+!	    FABDEV  -	Device characteristics
+!	    FABIFI  -	Internal file identifier
+!	    FABJFN  -	JFN of file
+!	    FABSTS  -	Completion status code
+!	    FABSTV  -	Additional status information
+!
+!
+!	ERRORRETURN -	user's error handling routine
+!
+! IMPLICIT INPUTS
+!
+!	?
+!
+! ROUTINE VALUE:
+!
+!	None.
+!
+! SIDE EFFECTS:
+!
+!	?
+!
+!--
+
+    BEGIN
+    regs;
+
+    LOCAL
+	temp : BLOCK [1],
+	diskflag,				! Flag if device is a disk
+	plgsec,					! Plog page with section number
+	gtjfnbits;				! Bits for GTJFN JSYS
+
+    rmsentry ('$CREATE');
+    fab = .fabblock;				! Get address of FAB
+    erradr = .errorreturn;			!   and user error address
+    errorblock (fab);				! Send all errors to FAB
+    !
+    !   Check block-type code of FAB.
+    !
+
+    IF .fab [blocktype] NEQ fabcode THEN usererror (er$fab);
+
+    IF .fab [blocklength] LSS v1fabsize THEN usererror (er$bln);
+
+    !
+    !   Must do output on $CREATE.
+    !
+
+    IF chkflag (fab [fabfac, 0], axwrt) EQL 0 THEN usererror (er$fac);
+
+    !   Check byte size
+    IF ( .fab[Fab$v_Bsz] EQL 0 )
+    OR ( .fab[Fab$v_Bsz] GTR %BPUNIT )
+    THEN usererror ( Rms$_Bsz );                                          !a602
+
+    oaflags = 0;				! Clear the abort flags
+    !
+    !   Determine the bits for the GTJFN JSYS.
+    !
+    gtjfnbits = gj_new;				! Default is error if old file
+
+    IF chkflag (fab [fabfop, 0], fopcif) NEQ 0
+    THEN
+	gtjfnbits = 0				! Just open if exists
+    ELSE
+
+	IF chkflag (fab [fabfop, 0], fopsup) NEQ 0	! Supersede file
+	THEN
+	    gtjfnbits = gj_fou;
+
+!+
+!   Open the file.
+!-
+    IF ofile (.gtjfnbits) NEQ true		! Shouldn't fail
+    THEN
+        rmsbug (msgfailure);
+
+!+
+!   Set the flag which indicates the file is open and must
+!   be closed.
+!-
+    setflag (oaflags, abrclose);
+
+!+
+!   Local File Create
+!-
+    IF .fst [fst$v_remote] EQL 0
+    THEN
+        BEGIN
+
+!+
+!   For convenience, determine if device is a disk.
+!-
+        IF .dvflgs[DV_TYP] EQL $DVDSK   ! Is it a disk device?
+        THEN diskflag = TRUE            ! Yes, it is
+        ELSE diskflag = FALSE;          ! No, it is not a disk device
+
+!+
+!   At this point, we must check to see if the file exists
+!   and if the user specified the "CREATE IF" file option.
+!   If so, we must continue as if this were a regular $OPEN
+!   macro.  However, for non-disk devices, the $CREATE will
+!   always form a new file.
+!-
+
+
+        IF NOT .fdbword1 [fb_nxf]       ! Non-existent file?
+        THEN
+
+            IF .diskflag                ! Does the file exist?
+            THEN BEGIN                  ! Yes, the file exists
+
+                 ! Does user want to open the file if it exists?
+
+                IF (chkflag (fab [fabfop, 0], fopcif) NEQ 0)
+                THEN 				! Do the $OPEN
+                    BEGIN
+                    doopen ();			! Proceed as if $OPEN
+                    openexit			! Return if successful
+                    END;
+
+!+  621
+!   File exists and CIF was not set.  If SUP is set, proceed with $CREATE
+!   after blowing the file away, else ER$FEX.
+!-
+                IF (chkflag (fab[fabfop, 0], fopsup) EQL 0) ! SUP on?
+                THEN oabort (er$fex)                        ! No
+                ELSE                                        ! Yes
+                   BEGIN
+                   LOCAL p_in_file;
+                   p_in_file = psizefile (.userjfn);        ! Get filesize
+                   Truncfile (.userjfn, 0, .p_in_file);     ! Blow file away
+                   IF NOT chfdb (                           ! File is null
+                                 $xwd ($fbsiz,.userjfn),
+                                 -1,
+                                 0)
+                   THEN monerr ();
+                   END;
+            END;
+
+        ! File is local and may exist.  Set the creation and read date times.
+
+        IF .diskflag                    ! Is it a disk file?
+        THEN BEGIN                      ! The file needs its date set
+            
+             LOCAL xab_pointer : REF $XABDAT_DECL;        ! Current XAB
+
+             ! Find any interesting XABs and set the file as specified
+
+             xab_pointer = .fab[FAB$A_XAB];     ! Point to the user's xab
+             WHILE .xab_pointer NEQ 0 DO        ! Search through XAB chain
+                   BEGIN 
+                   BIND uxab = UADDR(.xab_pointer): $XABDAT_DECL;
+
+                   ! We only care about protection and date XABs.
+
+                   SELECTONE .uxab[XAB$V_COD] OF 
+                   SET
+                   [XAB$K_DAT]: BEGIN ! Yes, check it out
+
+                                IF .uxab[XAB$G_CDT] NEQ 0       ! creation date
+                                THEN IF NOT CHFDB ($XWD ($FBWRT, .userjfn),
+                                                   -1,
+                                                   .uxab[XAB$G_CDT])
+                                     THEN MONERR ();    ! Punt off if it fails
+
+                                IF .uxab[XAB$G_RDT] NEQ 0        ! A read date?
+                                THEN IF NOT CHFDB ($XWD ($FBREF, .userjfn),
+                                                   -1,
+                                                   .uxab[XAB$G_RDT])
+                                     THEN MONERR ();    ! Punt off if it fails
+                                END;
+
+                  ! Set the file's protection as specified by the user
+                  ! Note: we don't check the protection code at all
+                  ! and the "system" priv is ignored since this doesn't
+                  ! exist under TOPS-20 (WHEEL or OPERATOR can always do
+                  ! anything to any file).
+
+                  [XAB$K_PRO]: BEGIN
+                               LOCAL protcode;
+                               BIND pxab = uxab : $XABPRO_DECL;
+                               protcode = dapprotra(.pxab[XAB$V_PROTOWN])^12 +
+                                          dapprotra(.pxab[XAB$V_PROTGRP])^6 +
+                                          dapprotra(.pxab[XAB$V_PROTWLD]);
+                               IF .protcode NEQ 0
+                               THEN IF NOT CHFDB ($XWD ($FBPRT, .userjfn),
+                                                  %O'777777',
+                                                  .protcode)
+                               THEN MONERR ();
+                               END;
+
+                  TES;                  ! End of SELECTONE
+
+                  ! Point to next xab and loop if not at the end yet
+
+                  xab_pointer = .uxab[XAB$A_NXT];       ! Point to next XAB
+
+                  END;                  ! End of UNTIL .xab_pointer NEQ 0
+
+        END;                            ! End of file_is_not_remote code
+
+        ! Set up the file class
+
+        IF (fst[FST$H_FILE_CLASS] = UCLASS(.fab)) EQL 0
+        THEN BEGIN
+             IF .fab[FAB$V_RFM] EQL FAB$K_UDF
+             THEN fst[FST$H_FILE_CLASS] = TYP$K_IMAGE;
+             IF .fab[FAB$V_MACY11]
+             THEN fst[FST$H_FILE_CLASS] = TYP$K_MACY11;
+             END;
+
+!+
+!   Reset system-level file class field in the FDB.
+!-
+
+        IF (.fab [Fab$v_rfm] NEQ Fab$k_Stm) AND ! Not ASCII Stream file and
+           (.fab [Fab$v_rfm] NEQ Fab$k_Lsa) AND   !   not LSA file    !m504
+           (.fab [fab$v_rfm] NEQ Fab$k_Udf)    !   not image file     !a504
+        THEN
+            BEGIN
+            !
+            !   Make sure that this is a disk.  Otherwise,
+            !   it's an error.
+            !
+
+            IF .diskflag EQL false THEN usererror (er$dev);  !  must be on disk
+
+            IF NOT chfdb (                      ! Change file class field
+                    $xwd ($fbctl, .userjfn), 	! Word to change,,JFN
+                    fb_fcf, 			! Bits to change
+                    fld ($fbrms, fb_fcf))	! Value to assign bits
+            THEN
+                monerr ();
+
+            !+
+            !   Now, set the byte size in the FDB to be 36.
+            !   This is not required for the monitor but is
+            !   a good thing to do at this point.
+            !-
+
+            IF NOT chfdb (                      ! Set byte size
+                    $xwd ($fbbyv, .userjfn), 	! Word to change,,JFN
+                    fb_bsz, 			! Bits to change
+                    fld (rmsbytesize, fb_bsz))	! New value for bytesize
+            THEN
+                monerr ();
+
+            !+
+            !   Get a free page for the File Prologue.
+            !-
+
+            IF (plogpage = gpage (1)) EQL false	! No more memory?
+            THEN
+                oabort (er$dme);
+
+            !
+            !   Set up a temporary pointer to this page, and
+            !   map in page 0 from the file to create the prologue.
+
+            fpt = .plogpage^p2w;                ! Set pointer
+
+            !
+            ! Get page including section number for PAGIN
+            !
+            plgsec = .plogpage OR (.rmssec^s2p);
+            pagin (.userjfn, 			! JFN
+                0,                              ! Page
+                .plgsec,                        ! Into
+                axupd, 				! Access
+                1);                             ! Count
+
+            !+
+            !   Set up the file prologue.
+            !-
+
+            setplog ();                         ! Set up the file prologue
+            setflag (oaflags, abrplogpage);     ! Remember this was done
+            END
+        ELSE
+            BEGIN                               ! Set byte size for LSA
+                                                !   and stream files
+
+            IF .fab [faborg, 0] NEQ orgseq      ! ORG must be sequential
+            THEN
+                oabort (er$rfm);
+
+            IF .Fab [Fab$v_Rfm] EQL Fab$k_Udf   ! 'Image' file     !a504
+            THEN                        
+                BEGIN              
+                !+
+                ! An Image File (RFM=UDF) contains (presumably) binary data
+                ! has no prologue,  and we set the file byte size
+                ! to the real one in BSZ
+                !-
+
+                Fst[Fst$h_File_Class] = Typ$k_Image; ! UDF implies image !a575
+
+                IF .diskflag NEQ false
+                THEN
+                    BEGIN
+                    IF NOT sfbsz (.userjfn, .Fab [Fab$v_Bsz] )	! Set byte size
+                    THEN monerr ();		                ! for the open
+
+                    IF NOT chfdb (			 ! Set byte size
+                            $xwd ($fbbyv, .userjfn), 	 ! Word to change,,JFN
+                            fb_bsz,                      ! Bits to change
+                            fld ( .Fab [Fab$v_Bsz] , fb_bsz)) ! New bytesize
+                    THEN monerr ();
+                    END
+                END
+
+            ELSE IF .fab [Fab$v_Rfm] EQL Fab$k_Lsa      ! Line-sequenced?
+            THEN
+                BEGIN
+                IF NOT sfbsz (.userjfn, rmsbytesize)	! Set byte size
+                THEN monerr ();
+                END
+            ELSE
+                IF .diskflag NEQ false
+                THEN
+                    BEGIN                                                !m577
+                    IF NOT sfbsz (.userjfn, .Fab [Fab$v_Bsz] ) ! Set byte size
+                    THEN monerr ();                            ! for the open
+
+                    IF NOT chfdb (			 ! Set byte size
+                            $xwd ($fbbyv, .userjfn), 	 ! Word to change,,JFN
+                            fb_bsz,                      ! Bits to change
+                            fld ( .Fab [Fab$v_Bsz] , fb_bsz)) ! bytesize !m577
+                    THEN monerr ();
+                    END
+
+            END;
+
+!+
+!   Set up the File Status Table.
+!-
+
+        IF setfst () EQL false          ! Quit if we can't do it
+        THEN
+            oabort (.usrsts);
+
+        setflag (oaflags, abrfst);      ! Remember this
+        fst [fstsof] = .fst [fstlobyte];        ! Initialize file size to
+    						!   size of prologue.
+!+
+!   Indicate that this is a new file and we are not locking.
+!-
+        fst [fstflags] = (.fst [fstflags] OR flgnewfile) AND 	!
+        ( NOT flglocking);
+        !
+        !   Check for errors.
+        !
+
+        IF ferror () EQL false			! Quit if errors
+        THEN
+            oabort (.usrsts);
+
+!+
+!   For indexed files, we must now create the rest of the
+!   file prologue.
+!-
+
+        IF idxfile
+        THEN
+            BEGIN
+							!607
+
+!+
+!   XAB chain has already been checked in OFILE before we get here.
+!   If the XABs were OK, we can set up the rest of the File
+!   Prologue.  If we can't do that, quit with an error.
+!-
+
+	    IF idxfilprolog () EQL false THEN oabort (er$dme);
+
+!+
+!   We have now created the Prologue.  However, we must read
+!   the prologue back in and set up the special internal
+!   data structures (Key Blocks).
+!-
+
+            IF readadb (.fpt) EQL false		! Get the ADB
+            THEN
+                oabort (.usrsts);
+
+            fst [fstadb] = .adb;			! Save address in FST
+            setflag (oaflags, abradb);		! Remember we read the ADB
+
+            IF setkdb (.fpt) EQL false		! Set up KDBs
+            THEN
+                oabort (.usrsts)
+
+            END;
+
+!+
+!   We can now flush the free page that we used to create
+!   the File Prologue (if this is an RMS file).
+!-
+
+        IF rmsfile
+        THEN
+            BEGIN
+            rtrace (%STRING ('	Flushing prologue page...', 	!
+                    %CHAR (13), %CHAR (10)));
+            pagout (.userjfn, 0, .plogpage, 1);	! Write it out
+            ppage (.plogpage, 			! Page number
+                1, 					! Count
+                true)				! Destroy the page
+            END;
+
+        !
+        !   Return file-ID.
+        fab [fabifi, 0] = .fst;			! Return FST address as IFI
+        fab [fabjfn, 0] = .userjfn;			! Set it in FAB
+        END;                                    ! End of Local $Create code
+
+    openexit					! Return to user
+    END;					! End of $CREATE
+
+
+%SBTTL 'OFILE - do file opening'
+
+GLOBAL ROUTINE ofile (gtjfnbits) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine does the actual file open operation for the
+!	$OPEN macro.  It is called only from $OPEN and $CREATE.
+!       It does a GTJFN if the user did not give us a JFN.
+!
+!       If the file is local it will OPENF it.
+!       If the file is remote it will call DAP$OPEN.
+!       If the user supplied a filespec of the form
+!       Node"user pass acct"::file, the GTJFN will fail,
+!       but the filespec is actually valid for RMS.
+!       In this case a GTJFN will be performed after reformatting
+!       the filespec into node::filespec;userid:user;password:pass
+!
+!       It also performs some minimal checking to
+!	make sure that the device is a proper one for the
+!	file.  These checks are performed here only because
+!	there are certain errors which will prevent the file
+!	from being opened successfully, so it is better if
+!	we can give the user an intelligent error message,
+!	instead of one from the monitor.
+!
+! FORMAL PARAMETERS
+!
+!	GTJFNBITS   -	bits for GTJFN JSYS
+!
+! IMPLICIT INPUTS
+!
+!	?
+!
+! COMPLETION CODES:
+!
+!	TRUE	-   always
+!
+! SIDE EFFECTS:
+!
+!	?
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	temp,
+	mask,					! Mask bits for device field
+	openbsz,				! Byte size for the OPENF
+	filedesc,
+	existflag;				! 607
+
+    TRACE ('OFILE');
+!+
+!   Release 1 supports a new mode:  "Transparent" read.
+!   This is designated by FABFAC = 0 and FABSHR ignored, and
+!   means allow read no matter what.
+!-
+
+    IF .fab [fabfac, 0] EQL axnil		! Transparent read?
+    THEN
+	fab [fabshr, 0] = axnil;		! Yes - sharing irrelevant.
+
+!+
+!   Allocate some core for File Status Table to set up three fields.
+!   If the fst is not already there
+!-
+
+    IF .Fab[Fab$a_Ifi] NEQ 0                            ! If FST exists !m566
+    THEN fst=.Fab[Fab$a_Ifi]                            ! then use it    !a507 
+    ELSE                                                                 !a507
+        BEGIN
+        IF (fst = gmem (fst$k_bln)) EQL false   ! Room for FST?           !m502
+        THEN
+            returnstatus (er$dme);      ! No - error
+
+        fst [fst$h_bln] = fst$k_bln;		! Set up blocklength      !m502
+        fst [fst$h_bid] = fst$k_bid;		! Set up block id         !a504
+        setflag (oaflags, abrfst);			! Flush FST on aborting
+        END;                                                              !a507
+
+!+
+!   Get a JFN if we haven't been given one.
+!-
+
+    GetJfn( .GtJfnBits );
+
+    setflag (oaflags, abrclose);		! Close file on errors
+
+    existflag = true;				!607 assume all files exist
+    fdbword1 = 0;				!607 Set only for disk files
+
+!+
+!   We must now determine the device characteristics of this file.
+!-
+    IF (.userjfn LSS $ErBas)            ! If we have a JFN, not an error code
+    AND (.userjfn GTR 0)                ! or nothing
+    THEN
+        BEGIN
+        dvflgs = devchar (.userjfn);    ! Get device flags (20 format)
+        IF .dvflgs[dv_typ] EQL $DvRmt   ! Is it a remote filespec?	  !a501
+        THEN
+            BEGIN
+            fst[fst$v_remote] = fab[fab$v_remote] = 1;
+            RLJFN( .UserJfn );          ! Release the JFN                !a566
+            UserJfn = 0;                ! and clear it                   !a566
+            END;
+
+!+ 607
+!   If the file is local, determine whether it exists or not.  If we're
+!   trying to $OPEN a non-existent file, complain now before any OPENF
+!   so we don't possibly create a trash file--e.g. if our JFN is the result
+!   of an OFP $PARSE so it never had GJ%OLD set.  If the GTFDB fails, we
+!   must have been handed a bad user JFN.
+!-
+
+    IF NOT .fst[fst$v_remote]		!607 If file is local disk
+    AND .dvflgs[dv_typ] EQL $dvdsk	!607
+    THEN				!607 see if it exists or not
+	BEGIN
+        IF NOT gtfdb (			!607 Get some of the FDB
+               .userjfn, 		!607 JFN
+               $xwd (1, $fbctl), 	!607 One word, starting at .FBCTL
+               fdbword1)		!607 Put it here
+        THEN
+	    BEGIN
+	       GetEr( $FhSlf ; UsrStv );!607 Return an STV
+               oabort (er$jfn);		!607 JFN not good enough for OPEN
+	    END;
+
+	IF .fdbword1[fb_nxf]		!607 flag existence/non-existence
+	THEN existflag=false		!607
+	ELSE existflag=true;		!607
+
+	IF .existflag EQL false		!607 If files does not exist
+	AND (.GtJfnBits AND gj_old) NEQ 0 !607 and we're trying to open it
+	THEN oabort (er$fnf);		!607 complain
+
+ 	END;
+    END;				!607 end real JFN
+
+!+  607
+!   If the file is indexed, and we're going to create it, check the user's
+!   XAB chain for errors.  If the XABs are bad for any reason, abort right
+!   now so a trash file is not created.  Note that for local files for
+!   which CIF was set the file's existence has been determined by existflag.
+!   Remote files will always have .existflag=true: we can't determine here
+!   whether a remote $CREATE with a bad XAB chain may create a trash file
+!   on failure.
+!-
+
+    IF .Fab[Fab$v_org] EQL Fab$k_Idx	!607 if file is indexed
+    AND .existflag EQL false		!607 and does not exist
+    THEN
+	BEGIN
+	IF .GtJfnBits NEQ 0		!607 If no CIF was set
+	THEN
+	    BEGIN
+	    IF checkxab () EQL false THEN oabort (.usrsts); !607
+	    END;
+	END;
+
+
+    IF .fst [fst$v_remote]              !M501 If file is remote,
+    THEN                                !     use DAP to open it
+        BEGIN
+        LOCAL function_code;
+
+        fst[fst$h_bid]=fst$k_bid;       ! Set up FST, SETFST is not used here
+        fst[fst$a_flink]=.fst;          ! No streams active yet
+                                                                      !d574
+        IF (.gtjfnbits AND gj_old) NEQ 0
+        THEN function_code = Dap$k_Open
+        ELSE function_code = Dap$k_Create;
+
+        dap$openfile ( .fab, .function_code, 0, 0 );
+        
+        IF .fab [fab$h_sts] NEQ Rms$_Suc        ! If we didn't win
+        THEN usererror ( .fab [fab$h_sts] );    ! Check for success or error
+
+        fab[fab$a_ifi] = .fst;          ! Return file-ID                !a574
+        fst[fst$h_rfm] = .fab[fab$v_rfm];
+        fst[fst$b_fac] = .fab[fab$h_fac];
+        fst[fst$h_mrs] = .fab[fab$h_mrs];
+        fst[fst$g_mrn] = .fab[fab$g_mrn];
+        fst[fst$h_fop] = .fab[fab$h_fop];       ! Copy fop to new place !m557
+        fst[fst$h_rat] = .fab[fab$h_rat];
+        fst[fst$h_bsz] = .fab[fab$v_bsz];
+        fst[fst$h_org] = .fab[fab$v_org];
+        fst[fst$a_blink]=fst[fst$a_flink]=.fst; ! Link to self          !a501
+        fst[fst$h_device_type]=dvdsk;    !? Assume disk for now         !a501
+        END
+    ELSE
+        BEGIN                           ! Local File setup
+        BIND Nam=UAddr( .Fab[Fab$a_Nam] ): $Nam_decl;         !a545vv
+        IF Nam NEQ 0
+        THEN
+            BEGIN
+!+
+!  Return resultant name to user if he gave us a NAM block
+!-
+            IF .Nam[Nam$h_Bid] NEQ Nam$k_Bid ! It really is a name block
+            THEN UserError( Rms$_Nam );      ! isn't it?               !a575
+
+            IF .Nam[Nam$h_Bln] EQL Nam$k_Bln ! Check the length        !a575
+            THEN                             ! If wrong ignore block
+                BEGIN                        ! (error would break FTS)
+                IF NOT .Fab[Fab$v_Nam]       ! Unless Open by NAM block
+                THEN Nam[Nam$g_Wcc] = 0;     ! Clear wildcard context  !a572
+
+                RL$Merge( .Fab, Merge$M_Point, R$Null )
+                END;
+            END;                                                       !a545^^
+
+
+
+!+  607
+!   At this point we have read the .FBCTL word of the FDB
+!   into FDBWORD1, which for non-disk files will be zero.
+!   We must determine what "class" the file belong to
+!   (i.e., it is either an RMS-file or an ASCII-file).
+!   However, for non-disk files, this will obviously not
+!   work, so we have cleared the variable FDBWORD1 first, to
+!   make sure that the check below results in this file
+!   being classified as an ASCII file.
+!-
+								!d607
+!+
+!   We must determine if this is an RMS-20 file.  If so, we
+!   can open it in 36-bit mode.  If not (i.e., it's a stream
+!   or LSA file), then we must open it in 7-bit mode so the
+!   monitor EOF pointer doesn't get rounded up to the
+!   nearest full word.
+!-
+        openbsz = rmsbytesize;			! Assume RMS file
+
+        IF .fdbword1 [fb_fcf] NEQ $fbrms		! Is it really RMS?
+        THEN
+            openbsz = asciibytesize;		! No - use 7-bit mode
+
+!++
+!   Set up for the OPENF JSYS.  Start by setting the access
+!   bits necessary.
+!--
+
+            BEGIN
+
+            LOCAL
+                open_error,				! Error code from OPENF
+                openbits : monword;			! Bits for OPENF
+
+            mask = 0;					! Clear device flag
+
+            IF ((.fab [fabfac, 0] AND axget) NEQ 0)	! Doing input?
+            THEN
+                mask = dv_in;				! Device can do input
+
+!+
+!   Set up the file byte size, and set the read and "Don't
+!   update to disk" bits.
+!
+!
+!   *** Note that sequential/relative files will not be
+!   updated to disk automatically by RMS. ***
+!-
+
+            openbits = (.openbsz^opfbszlsh) + of_dud;	![2]		!M444
+
+            IF .dvflgs [dv_in]				![2] If readable
+            THEN
+                openbits = .openbits OR of_rd;		![2] open for read
+
+            IF ((.fab [fabfac, 0] AND axwrt) NEQ 0)	! If an output mode
+            THEN
+                BEGIN
+                mask = .mask OR dv_out;		      ! Must be output device
+                openbits [of_wr] = 1;		      ! Set write bit
+                openbits [of_thw] = 1;		      ! Open thawed	  !A444
+                END				      !		          !M444
+            ELSE				      !		          !A444
+                openbits [of_rdu] = 1;		      !Read unrestricted  !A444
+
+    !+
+    !   Quickly check for some device errors.
+    !-
+
+            IF (.dvflgs AND .mask) NEQ .mask OR 	! Can't do operation
+                (.dvflgs [dv_typ] EQL $dvmta)		! MTA
+            THEN
+                usererror (er$dev);
+
+            IF NOT openf (.userjfn, .openbits; open_error)	! Open the file
+            THEN
+                mapcodes (.open_error, er$cof, opnerrtab);
+
+            END;
+!+
+!   Set the device characteristic flags in the user's FAB.
+!-
+        mask = 0;					! Collect bits here
+
+        IF ((.dvflgs AND dv_dir) NEQ 0)		! Directory device
+        THEN
+            mask = devmdi;
+
+        temp = .dvflgs [dv_typ];			! Get device class
+
+        IF .temp EQL $dvmta				! Magtape?
+        THEN
+            setflag (mask, devsqd);			! Yes - Sequential device
+
+        IF .temp EQL $dvtty				! TTY:?
+        THEN
+            setflag (mask, devtrm);			! Terminal
+
+        IF (.temp GEQ $dvlpt) AND 			! LPT:, CDR:, or TTY:
+            (.temp LEQ $dvtty)
+        THEN
+            BEGIN
+            setflag (mask, devrec);			! Record device
+
+            IF .temp NEQ $dvcdr			! TTY, LPT are CCL
+            THEN
+                setflag (mask, devccl)
+
+            END;
+
+        fab [fabdev, 0] = .mask;			! Return flags to user
+        END;                            ! Local File processing
+
+    RETURN true					! Return OK
+    END;					! End of OFILE
+%SBTTL 'GetJfn -- Get a JFN for the file described by the FAB'
+
+GLOBAL ROUTINE GetJfn ( GtJfnBits: BITVECTOR[%BPVAL] ) =
+!+
+! FUNCTIONAL DESCRIPTION:
+!
+!   Get a JFN for the file described by the FAB.
+!
+! FORMAL PARAMETER:
+!
+!   GtJfnBits: Bits to pass to GTJFN JSYS.
+!
+! RETURN VALUE:
+!
+!   Flags,,JFN from GTJFN JSYS
+!
+! IMPLICIT OUTPUTS:
+!
+!   UserJfn: set to new JFN
+!
+!-
+
+    BEGIN
+    MAP UserJfn: MonWord;
+    LOCAL
+         bits_and_jfn,
+         fs_ptr,
+         delim_ptr;
+
+
+    IF (UserJfn = .Fab[Fab$h_Jfn]) NEQ 0        ! We already have a JFN
+    THEN
+        BEGIN
+        LOCAL
+            file_status : monword;
+
+        IF NOT gtsts (.userjfn; file_status) THEN monerr ();
+
+        IF .file_status [gs_opn]        ! File already open
+        OR (.file_status EQL 0)         ! or invalid JFN
+        THEN
+            usererror (er$jfn)
+        ELSE
+            RETURN .UserJfn;            ! JFN is OK. return.
+        END;
+
+
+    fs_ptr = UAPointer ( .fab [fab$a_fna] );
+    ! Globalize Bytepointer
+
+!+
+! Try to do a GTJFN on the file
+!-
+
+    IF NOT gtjfn (.gtjfnbits OR gj_sht, 	! Flags
+		  .fs_ptr; 			! Pointer to file specification
+		   userjfn,			! Return the JFN
+                   delim_ptr)                   ! and updated pointer     !a501
+    THEN 					! JSYS failed
+        BEGIN                               ! GTJFN Failed...
+
+        SELECT .userjfn OF                  !M501 VV
+           SET
+
+           [gjfx38]: ! Output-Only Device
+
+                IF .fab [fabfac, 0] EQL axput
+                THEN                            ! Only ask for output
+                    BEGIN
+                    IF gtjfn (gj_sht, .fs_ptr; userjfn)
+                    THEN mapcodes (.userjfn, er$cgj, opnerrtab)
+                    END
+                ELSE mapcodes (.userjfn, er$dev, opnerrtab);              !m531
+
+           [gjfx55]: ! Illegal to use Node Name
+
+                IF gtjfn (gj_sht+gj_ofg, .fs_ptr; userjfn)
+                THEN
+                    fab [ fab$v_remote ] = fst [ fst$v_remote] = 1
+                ELSE
+                    mapcodes (.userjfn, er$cgj, opnerrtab);
+
+	   [OTHERWISE]:
+           !+
+           !   Make sure we did not get fooled by node"user pass"::filespec
+           !   If we get that, GTJFN will terminate on the quote
+           !-
+                IF SCANN (delim_ptr) EQL %C'"'      		       !A501 vv
+                THEN
+                    fab [fab$v_remote] = fst [fst$v_remote] = 1
+                ELSE
+                    mapcodes (.userjfn, er$cgj, opnerrtab);
+            TES;
+
+        Bits_and_Jfn = .UserJfn;    ! Save the flags to return         !a566
+        UserJfn = .UserJfn<rh>;       ! Flush the flags                !a566
+        END
+    ELSE
+        BEGIN        ! The GTJFN succeeded
+        LOCAL
+            file_status : monword;
+
+        IF .UserJfn[GJ_NOD]             ! If a node name is given      !a575
+        THEN fab [fab$v_remote] = fst [fst$v_remote] = 1;
+
+        !+
+        !   Make sure we did not get fooled by node"user pass"::filespec
+        !   If we get that, GTJFN will terminate on the quote
+        !-
+
+        IF SCANN (delim_ptr) EQL %C'"'      		       !A501 vv
+        THEN                                                   !D575
+            BEGIN
+            rljfn (.userjfn);       ! Get rid of JFN, file is remote
+                                    ! we only had JFN on part of the spec
+            fab [fab$v_remote] = fst [fst$v_remote] = 1;
+            userjfn = 0;
+            END
+
+        ELSE
+        !+
+        !   File is local.
+        !   JFN must be ok but must not be associated
+        !   with an open file.
+        !-
+            BEGIN
+            Bits_and_Jfn = .UserJfn;    ! Save Flags,,Jfn                 !a566
+            UserJfn<lh>=0;              ! Clear flags                     !a566
+
+            IF NOT gtsts (.userjfn; file_status) THEN monerr ();
+
+            ! Removed check for parse-only JFN. It is legal now. !d507
+
+            IF .file_status [gs_opn]		! File already open
+            THEN
+                usererror (er$jfn);
+
+            END; ! Local file
+        END;
+
+    .Bits_And_Jfn                       ! Return value                    !a566
+    END; ! GetJfn
+
+%SBTTL 'DOOPEN - finish opening file'
+
+GLOBAL ROUTINE doopen : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	DOOPEN completes the opneing of a file for RMS-20.
+!	This routine does not acquire a JFN or open the
+!	file.  Hoever, it performs all other functions
+!	necessary to set up a file for later processing.
+!
+!	This routine is called only on $OPEN or $CREATE when
+!	the CIF bit is set and the file already exists.
+!
+!	The following operations are performed by this
+!	routine:
+!
+!	    1)	Lock the file.
+!	    2)	Map in page zero of the file (disk only).
+!	    3)	For RMS files, read the prologue;
+!		Non-RMS files, determine if ASCII or LSA.
+!	    4)	Update the user's FAB.
+!	    5)	Set up the FST.
+!	    6)	Check for errors in user call.
+!	    7)	For indexed files, process rest of prologue.
+!
+! FORMAL PARAMETERS
+!
+!	None.
+!
+! IMPLICIT INPUTS
+!
+!	?
+!
+! ROUTINE VALUE:
+!
+!	None.
+!
+! SIDE EFFECTS:
+!
+!	?
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	dstatus,				! To hold DISPFILE status
+	temp : REF BLOCK,
+	plgsec,					! PLOGPAGE + section offset
+	firstword : BLOCK [1],
+	fileheader;
+
+    TRACE ('DOOPEN');
+!+
+!   We must now keep track of what operations have been
+!   performed during the open processing, so that if a
+!   problem occurs later, we can unwind easily.  This is
+!   done by setting a bit in OAFLAGS for each operation
+!   which we might need to undo later.  For starters, note
+!   that the file is open and must be closed on an error.
+!-
+    setflag (oaflags, abrclose);
+    !
+    !   Locking possibly applies is this is a disk file,
+    !   unless this is a transparent read or LIBOL SMU is
+    !	underway.
+    !
+
+    IF (.dvflgs [dv_typ] EQL $dvdsk) AND 	! Must be disk...
+	(.fab [fabfac, 0] NEQ axnil) AND 	! ...not transparent	!M404
+	((.fab [fabfac, 0] AND fb$smu) EQL 0)	! ...not doing SMU !A404!M414
+    THEN
+	BEGIN
+	temp = enqblk;				! Assume we will block
+
+	IF (.fab [fabfop, 0] AND fopwat) EQL 0	! Do we wait?
+	THEN
+	    temp = enqaa;			! No, file must be available
+
+	$callos (er$flk, (fileq (enqcall, .temp)));
+	setflag (oaflags, abrunlock)		! Flag that we've locked file
+	END;
+
+!+
+!   Process the prologue.
+!-
+!+
+!   We must now read the first word of the file in order to
+!   make sure that it is a proper RMS-20 file, or to
+!   dtermine whether this is an ASCII or LSA file.  However,
+!   for carriage-control devices, we don't want to do this.
+!   Therefore we must first clear the local variable to make
+!   sure that this file is treated as an ASCII file (i.e.,
+!   the LSB will be off in each word).
+!-
+    firstword = 0;				! For carriage-control devices
+    !
+    !   Is this a disk?
+    !
+
+    IF .dvflgs [dv_typ] EQL $dvdsk		! Disk
+    THEN                                        ! Get info from FDB for FAB, &
+	BEGIN					! Determine type from 1st word
+
+        GTFDB( .UserJfn, (1^18)+$Fbbyv, fdbbyv ); ! Get number of pages in file
+        Fab[Fab$g_Alq] = .fdbbyv<rh>;   
+
+	IF (plogpage = gpage (1)) EQL false	! Get memory
+	THEN
+	    oabort (er$dme);
+
+	setflag (oaflags, abrplogpage);		! Flag that page is in
+
+	!+
+	!   If the file is null (i.e., page 0
+	!   doesn't exist, then the next instruction
+	!   will generate an illegal read error.
+	!   Thus, we must make sure the page exists
+	!   before we try to read it.
+	!-
+
+	IF pagexist (.userjfn, 0)
+	THEN
+	    BEGIN				!PAGE 0 EXISTS
+	    !
+	    ! Get page number including our section number
+	    !
+	    plgsec = .plogpage OR (.rmssec^s2p);
+	    pagin (.userjfn, 			! JFN
+		0, 				! Page
+		.plgsec, 			! Into
+		axget, 				! Access
+		1);				! Count
+	    fpt = .plogpage^p2w;		! Set up prologue pointer
+	    firstword = .fpt [wholeword];	! Get 1st word of file
+	    END;
+
+	END;
+
+!+
+!   We must determine if this file is one which was created
+!   by RMS-20. This is indicated by the "file class" field
+!   in the FDB.  If this is an RMS-20 file, then we must
+!   read in the file descriptive information contained in
+!   the file prologue and use it to determine if the user
+!   has made any errors, and move some of its contents into
+!   the user's FAB.
+!-
+
+    IF .firstword [blocktype] EQL fpblock	! Is it a prologue?
+    THEN 					! Copy prologue data to FAB
+	BEGIN
+
+	!+
+	!   Make sure this is a disk file.
+	!-
+
+	IF .dvflgs [dv_typ] NEQ $dvdsk		! RMS file must be on disk
+	THEN
+	    oabort (er$dev);
+
+	!+
+	!   Update user parameter section of FAB.
+	!-
+
+	fab [faborg, 0] = .fpt [fptorg];	! File organization
+	fab [fabrat, 0] = .fpt [fptrat];	! File attributes
+	fab [fabmrs, 0] = .fpt [fptmrs];	! Maximum record number
+	fab [fabmrn, 0] = .fpt [fptmrn];	! Maximum file size
+	fab [fabbsz, 0] = .fpt [fptbsz];	! Byte size
+	fab [fabbks, 0] = .fpt [fptbks];	! Bucket size
+	fab [fabrfm, 0] = .fpt [fptrfm];	! Record format
+	END
+    ELSE
+	BEGIN					! Clear FAB for ASCII files
+	rtrace (%STRING ('	Clearing FAB for Non-RMS file...', 	!m504
+		%CHAR (13), %CHAR (10)));
+
+        CASE ( fst[fst$h_File_Class] = UClass( .fab ) )			!a504
+            FROM 0 TO Typ$k_Class_Max OF        		        !a504
+            SET                                                         !a504 
+            [0,
+             Typ$k_Ascii]:                                              !a524 
+                BEGIN                          
+                IF .firstword [blocktype] EQL fpblock	! RMS file
+                THEN                                    ! , but bad FDB?
+                    BEGIN
+                    fileproblem (fe$bfc);		! Bad file class
+                    usrret ()
+                    END;
+
+                IF (.firstword AND bitn (35)) NEQ 0	! LSA file?
+                THEN
+                    temp = Fab$k_Lsa			! Sequenced if bit 35
+                ELSE
+                    temp = Fab$k_Stm			! Ascii stream file
+                END;
+
+            [Typ$k_Image,                                              !m561
+             Typ$k_Byte,                                               !m561
+             Typ$k_DIL8]:
+                IF .Fab[Fab$h_Mrs] EQL 0        ! 0 record size        !a561
+                THEN                                                   !a561
+                    BEGIN  ! 0 record size cannot be image, make       !a561vv
+                    Fst[Fst$h_File_Class] = Typ$k_Ascii; ! Ascii      
+
+                    IF (.firstword AND bitn (35)) NEQ 0	! LSA file?
+                    THEN
+                        temp = Fab$k_Lsa        ! Sequenced if bit 35
+                    ELSE
+                        temp = Fab$k_Stm        ! Ascii stream file
+                    END                                                !a561^^
+                ELSE temp = Fab$k_Udf;
+
+            [Typ$k_Macy11]:
+		BEGIN
+		temp = Fab$k_Udf;
+		Fab[Fab$v_Macy11] = 1;
+		END;
+
+            [OUTRANGE]:
+                BEGIN
+                temp = .Fab[Fab$v_Rfm];    ! Use user-specified RFM     !a524
+
+		!
+		!   Provide access to the FST for the
+		!   FFF routines, and put the JFN in the
+		!   FST (so we won't have to erase it later
+		!   from the FAB in case of an error).
+		!
+		fst [fst$h_jfn] = .userjfn;	! Set up JFN		!A550
+		fab [fab$a_ifi] = .fst;		! FFF will globalize	!A550
+		!
+		!   Call the FFF routines
+		!
+		f$open (.fab);			!m524
+		usrstv = .rab [rab$h_stv];	! Return STV value	!A565
+
+		!+
+		!   If we did not succeed, we want to
+		!   zero the IFI field, since RMS proper
+		!   doesn't know we set it.  Then, we
+		!   will return the usual error.
+		!-
+
+		IF NOT $rms_status_ok (.fab)	!a524
+		THEN
+		    BEGIN
+		    fab [fab$h_jfn] = 0;	! Zero JFN		!A550
+		    fab [fab$a_ifi] = 0;	! Zero FST		!A550
+		    usererror (.fab [fab$h_sts]);	! Return error	!a524
+		    END;
+                END;
+            TES;						        !a504^^
+
+        Fab[Fab$v_Rfm] = Fst[Fst$h_Rfm] = .temp;                        !a524 
+
+	SELECT .temp OF
+        SET
+        [Fab$k_Lsa]:                    ! LSA file?		       !m524
+
+        !+
+        !   For LSA files, we must change the file byte size back to 36,
+        !   since we need to read it in binary mode.
+        !   But we should tell user & RMS that it has the usual Ascii size
+        !-
+            BEGIN
+            Fab [Fab$v_Bsz] = Fst [Fst$h_Bsz] = asciibytesize;        !a600
+	    IF NOT sfbsz (.userjfn, rmsbytesize)	! Set bytesize
+	    THEN
+		monerr ();
+            END;
+
+        [Fab$k_Udf,
+         Fab$k_Stm]:                                                  !m577
+        !+
+        ! If it is Image or Ascii, set the Jfn byte size to the file byte size
+        !-
+            BEGIN
+            LOCAL filebytesize;
+
+            IF .dvflgs [dv_typ] EQL $dvdsk		! Disk        !m577
+            THEN
+                BEGIN
+                IF NOT gtfdb (              ! Get some of the FDB
+                        .userjfn,           ! JFN
+                        $xwd (1, $fbbyv),   ! One word, starting at .FBBYV
+                        filebytesize)       ! Put it here
+                THEN monerr ();
+
+                filebytesize = .Pointr(filebytesize,fb_bsz);    ! Get from FDB
+                END
+            ELSE filebytesize = 0;
+
+            IF .filebytesize EQL 0      ! 0 is illegal                   !a566
+            THEN filebytesize =         ! So use
+                (IF .temp EQL Fab$k_Stm THEN asciibytesize   ! normal char size
+                                        ELSE %BPVAL);        ! word size !m577
+
+            IF (.filebytesize EQL %BPVAL) ! 36 bit bytes?
+            AND (.temp EQL Fab$k_Stm)     ! in a stream file.
+            THEN filebytesize = asciibytesize; ! No way. It was written by
+                                               ! retarded software        !a600
+
+            Fab [Fab$v_Bsz] = Fst [Fst$h_Bsz] = .filebytesize;
+
+            IF .dvflgs [dv_typ] EQL $dvdsk		! Disk            !m577
+            THEN
+                IF NOT sfbsz( .userjfn, .filebytesize )	! Set bytesize
+ 	        THEN monerr ();
+            END;
+        [Fab$k_Stm,
+         Fab$k_Lsa]:
+            fab [fab$h_mrs] = 0;                ! No maximum record size
+        TES;
+
+	fab [fab$v_org] = orgseq;		! Sequential file organization
+!d504	fab [fab$h_mrs] = 0;			! No maximum record size
+	fab [fab$g_mrn] = 0;			! No maximum record count
+	fab [fab$h_rat] = 0;			! No record attributes apply
+!d504	fab [fab$v_bsz] = asciibytesize		! Reset if ASCII
+	END;
+
+
+
+
+!+
+!   Set up the File Status Table.
+!-
+
+    IF setfst () EQL false			! Initialize FST
+    THEN
+	oabort (.usrsts);
+
+    setflag (oaflags, abrfst);			! We got core for FST
+
+    !+
+    !   If we are locking, set flag in FST.
+    !-
+
+    IF chkflag (oaflags, abrunlock) NEQ 0	! Locking? (from OAFLAGS)
+    THEN
+	setflag (fst [fstflags], flgflocked);
+
+    !+
+    !   Check for all errors in $OPEN/$CREATE request.
+    !-
+
+    IF ferror () EQL false			! False if errors
+    THEN
+	oabort (.usrsts);
+
+!+
+!   If this is an indexed file, we must process the rest of
+!   the file prologue.  We did not perform the function
+!   earlier in the open processing because there was no
+!   information that we needed, and flushing the internal
+!   blocks, etc., is a painful operation.  Thus, we only
+!   process the rest of the prologue after we have performed
+!   all normal checking operations on the file.
+!-
+
+    IF idxfile
+    THEN
+	BEGIN
+
+	!+
+	!   First, read in the Area Descriptor Block.
+	!-
+
+	IF readadb (.fpt) EQL false		! Get ADB
+	THEN
+	    oabort (.usrsts);
+
+	fst [fstadb] = .adb;			! Save address in FST
+	setflag (oaflags, abradb);		! Flag that we have ADB
+
+	!+
+	!   Next, set up all key descriptors and
+	!   link them to the FST.
+	!-
+
+	IF setkdb (.fpt) EQL false		! Set up KDBs
+	THEN
+	    oabort (.usrsts);
+
+	END;
+
+    !+
+    !   If the user has given us an XAB chain, we fill
+    !   it in for him.
+    !-
+
+    IF .fab [fabxab, 0] NEQ 0
+    THEN
+
+	IF (dstatus = dispfile ()) NEQ true	! Display file
+	THEN
+	    BEGIN
+	    usrsts = .dstatus;			! Save result
+	    oabort (.usrsts);
+	    END;
+
+!+
+!   If this is a disk file, we must give back the free page
+!   which we got earlier to read in the File Prologue.
+!-
+
+    IF dasd
+    THEN
+	ppage (.plogpage, 			! Page number
+	    1, 					! Count of pages
+	    true);				! Unmap this page
+
+    !+
+    !   Finally, return the file-ID of this file to the
+    !   user's FAB.
+    !-
+
+    fab [fab$a_ifi] = .fst;			! Return file-ID
+    fab [fabjfn, 0] = .userjfn;			! Set it in FAB
+    
+    RETURN
+    END;					! End of DOOPEN
+
+GLOBAL ROUTINE chkremote  =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Determine if the file specified in the FAB is remote
+!
+! FORMAL PARAMETERS
+!
+!	None.
+!
+! IMPLICIT INPUTS
+!
+!	The JFN provided in the FAB, if any
+!       otherwise, the filespec pointed to by the FAB
+!
+! ROUTINE VALUE:
+!
+!	TRUE if the file is remote
+!       FALSE if it is local
+!
+! SIDE EFFECTS:
+!
+!	None
+!
+!--
+BEGIN
+    IF .fab[fab$h_jfn] NEQ 0
+    THEN
+        BEGIN
+        LOCAL nodename: VECTOR[CH$ALLOCATION(9)],
+              nodeptr:  INITIAL(CH$PTR(nodename));
+        
+        jfns ( nodeptr, .fab[fab$h_jfn], js_nod ; nodeptr );
+
+        (.nodeptr NEQ CH$PTR(nodename)) ! If it moved, there's a nodename.
+        END                             ! so return the truth of the relational
+    ELSE (find_substring(.fab[fab$a_fna] ,pp('::')) NEQ 0)
+                                        ! return the truth of this relational
+END;
+
+ROUTINE dapprotra (p_dap_bits)  =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Translate dap protection bits to TOPS20 protection bits.  DAP
+!       protection bits are mapped roughly to the TOPS20 protection bits based
+!       on the following:
+!                                
+!       DAP protection bit                        TOPS-20 protection code
+!       bit 0   (deny read access)                code 40 (read access)
+!       bit 1/3 (deny write/delete access)        code 20 (write/delete access)
+!       bit 2   (deny execute access)             code 10 (execute access)
+!       bit 4/8 (deny append/extend access)       code 04 (append access)
+!       bit 5   (deny directory list access)      code 02 (directory list)
+!
+! FORMAL PARAMETERS
+!
+!	p_dap_bits: dap protection to translate
+!
+! IMPLICIT INPUTS
+!
+!       None.
+!
+! ROUTINE VALUE:
+!
+!	TOPS20 protection code.
+!       
+!--
+
+LOCAL retcode;
+
+BIND dap_bits = p_dap_bits : BITVECTOR[36];
+
+retcode = %O'76';                       ! Assume full access
+%(
+IF .dap_bits[XAB$M_NOREAD]              ! Deny read access?
+THEN retcode = .retcode AND NOT %O'40'; ! Yes, turn off read access bit
+
+IF .dap_bits[XAB$M_NOWRITE]             ! Deny write?
+THEN retcode = .retcode AND NOT %O'20'; ! Yes, turn off delete access bit
+
+IF .dap_bits[XAB$M_NOEXECUTE]           ! Deny execute access?
+THEN retcode = .retcode AND NOT %O'10'; ! Yes, turn off execute access bit
+
+IF .dap_bits[XAB$M_NOAPPEND]            ! Deny append?
+THEN retcode = .retcode AND NOT %O'04'; ! Yes, turn off append access bit
+
+IF .dap_bits[XAB$M_NOLIST]              ! Deny directory list access?
+THEN retcode = .retcode AND NOT %O'02'; ! Yes, turn off directory access bit
+)%
+
+IF .dap_bits[0]                         ! Deny read access?
+THEN retcode = .retcode AND NOT %O'40'; ! Yes, turn off read access bit
+
+IF .dap_bits[1]                         ! Deny write access?
+THEN retcode = .retcode AND NOT %O'20'; ! Yes, turn off delete access bit
+
+IF .dap_bits[2]                         ! Deny execute access?
+THEN retcode = .retcode AND NOT %O'10'; ! Yes, turn off execute access bit
+
+IF .dap_bits[4]                         ! Deny append access?
+THEN retcode = .retcode AND NOT %O'04'; ! Yes, turn off append access bit
+
+IF .dap_bits[5]                         ! Deny directory list access?
+THEN retcode = .retcode AND NOT %O'02'; ! Yes, turn off directory access bit
+
+IF .retcode EQL %O'76'                  ! Make me happy by using 77 for 
+THEN retcode = %O'77';                  !  the full access protection
+
+RETURN .retcode;                        ! Return the code we created
+
+END;                                    ! end of dapprotra
+
+END						! End of Module OPENER
+
+ELUDOM

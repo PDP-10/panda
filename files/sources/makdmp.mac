@@ -1,0 +1,1017 @@
+;Edit 4 to MAKDMP.MAC by CJOHNSON on Wed 28-Dec-83, for SPR #19824
+;		Allow dumper backups, rewrite command parser
+;[4] This edit is not really an edit, its a rewrite.  Since MAKDMP was 95%
+;     command parser, rewriting it is a rewrite.  For that reason, you will
+;     not find [4] marks everywhere.
+
+;THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY ONLY BE USED
+;  OR COPIED IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE.
+
+;COPYRIGHT (C) 1976,1977,1978,1979,1980,1981 BY DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASS.
+
+	TITLE MAKDMP
+	SUBTTL	Christopher Johnson (Rewritten as edit [4] 22-Dec-83)
+	SUBTTL	Documentation
+
+COMMENT\
+
+Purpose:
+
+	This is a program to create a TOPS-20 Dump file.
+
+Source:
+
+	Christopher Johnson on the DECSYSTEM-20 (2866) for DEC.
+
+Functions:
+
+	Standardized mechanism for creating DUMP.EXE, which must exist
+for OS crash dumps to be saved by the bootstrap.
+
+\
+	SUBTTL	Symbol Definitions
+
+	SEARCH	MONSYM, MACSYM
+	.REQUIRE SYS:MACREL
+	SALL
+	.DIRECTIVE FLBLST		;Show first binary lines only
+
+Comment\
+
+AC Definitions
+
+	NOTE that the program uses three separate stacks: P (AC17), the
+standard program and data stack, TAKEP, the TAKE command stack of command
+and log file JFNs, and ERRP, a stack of cleanup routines to be called
+upon an error in a command parsing subroutine.
+
+	.FP is the frame pointer, used in TRVAR and other MACSYM macros.
+It contains the contents of P at subroutine entry, and after the previous
+contents of .FP have been pushed onto P.  RS contains the status returned
+from a subroutine that wants to return some status.  Zero means success.
+\
+
+RS==0					;Return status
+T1==1					;Temp and JSYS args
+T2==2
+T3==3
+T4==4
+DEST==5
+TAKEP==13				;TAKE command JFN Stack pointer
+ERRP=14					;Error cleanup stack pointer
+.FP==15					;Frame pointer
+P==17					;Stack pointer
+
+PLEN==100				;Main stack length
+ERRLEN==20				;Length of cleanup stack
+TAKLEN==20				;Max number of nested TAKE commands
+
+DEFDEV:	ASCIZ/MAKDMP/			;Default device
+DEFDIR:	ASCIZ/SYSTEM/			;Default directory
+DEFNAM:	ASCIZ/DUMP/			;Default name
+DEFEXT:	ASCIZ/EXE/			;Default extension
+EXEDIR:	1776,,1
+	1777,,1
+SRCPAG==100				;Page to map from
+
+;;;Flag to JFNPOP:
+ENDMSG==-1
+NOMSG==0
+
+;;;Define place-holders for use with FLDDB., so I don't use the wrong
+;;;  number of commas!!!
+FLGS==0
+DATA==0
+LST==0
+
+;;;Macro to define an entry in a TBLUK%-style keyword table:
+DEFINE KW(KEY,FLAGS<0>,DATA)<
+	[
+	IFE <FLAGS>,<ASCIZ/KEY/>
+	IFN <FLAGS>,<FLAGS+CM%FW
+		     ASCIZ/KEY/>
+	IFB <DATA>,<..D..==.'KEY>
+	IFNB <DATA>,<..D..==DATA>
+	],,..D..
+	PURGE ..D..
+>;;;End of macro KW
+
+
+;;;Error in COMND% JSYS
+DEFINE CMDERR<ERJMP CMDER0>
+
+;;;CM%NOP (no parse) error after COMND% JSYS:
+DEFINE NOPERR<JRST CMDER0>
+
+;;;Error in JSYS called in a command subroutine:
+DEFINE CHKERR(STG,RTN,ARG)<
+	ERJMP	[PUSH P,[EXP [ASCIZ/STG/]]
+		 IFB <RTN>,<PUSH P,[0]>
+		 IFNB <RTN>,<PUSH P,[RTN]>
+		 IFB <ARG>,<ADJSP P,1>
+		 IFNB <ARG>,<PUSH P,ARG>
+		 CALL CHKER0
+		 JRST NEWCMD]>
+
+;;;Warning in JSYS called in a command subroutine:
+DEFINE CHKWRN(STG,RTN,ARG)<
+	ERJMP	[PUSH P,[EXP [ASCIZ/STG/]]
+		 IFB <RTN>,<PUSH P,[0]>
+		 IFNB <RTN>,<PUSH P,[RTN]>
+		 IFB <ARG>,<ADJSP P,1>
+		 IFNB <ARG>,<PUSH P,ARG>
+		 CALL CKWRN0
+		 JRST NEWCMD]>
+
+;;;Trappable error in instruction used in a command subroutine.  Can handle
+;;;  PDL overflow, ill mem read, write, or execute, or anything else that
+;;;  ERJMP can trap.  It is the same as CHKERR, but calls CHKTR0, which
+;;;  doesn't call ERROUT.  I.E., no ERSTR% message is output.
+DEFINE CHKTRP(STG,RTN,ARG)<
+	ERJMP	[PUSH P,[EXP [ASCIZ/STG/]]
+		 IFB <RTN>,<PUSH P,[0]>
+		 IFNB <RTN>,<PUSH P,[RTN]>
+		 IFB <ARG>,<ADJSP P,1>
+		 IFNB <ARG>,<PUSH P,ARG>
+		 CALL CHKTR0
+		 JRST NEWCMD]>
+
+;;;Warning in a JSYS called where the error should be ignored:
+DEFINE WARN(STG,RTN,ARG)<
+	ERCAL	[PUSH P,[EXP [ASCIZ/STG/]]
+		 IFB <RTN>,<PUSH P,[0]>
+		 IFNB <RTN>,<PUSH P,[RTN]>
+		 IFB <ARG>,<ADJSP P,1>
+		 IFNB <ARG>,<PUSH P,ARG>
+		 CALL CKWRN0
+		 RET]>
+
+
+;;;Version Number
+VMAJOR==5
+VMINOR==1
+VWHO==0
+VEDIT==4
+
+VMAKDMP==BYTE(3)VWHO(9)VMAJOR(6)VMINOR(18)VEDIT
+
+	SUBTTL	Writeable data areas
+
+
+;;;The command state block.  This controls the parse of each field.
+CSB:	BLOCK	.CMGJB+1
+
+;;;The text buffer.  The text to be parsed is placed here by COMND%
+TXTLEN==^D300				;Length in bytes
+TXTBUF:	BLOCK	<TXTLEN/5>+1		;Space for text input
+
+;;;The atom buffer.  The last field COMND% tried to parse is here.
+ATOMLN==^D50				;Length in bytes
+ATOMBF:	BLOCK	<ATOMLN/5>+1		;Space for atoms
+
+;;;GTJFN% arg block used by COMND% calls on files
+GJBLK:	BLOCK	.GJATR+1
+
+;;;The stack of command file JFNs: input,,output
+TAKSTK:	BLOCK	TAKLEN
+
+;;;The stack of routines to call on an error to clean up:
+;;;  each entry is two words long: saved .FP in the first, routine address
+;;;  in the second.
+ERRSTK:	BLOCK	ERRLEN*2
+
+;;;The normal pushdown stack
+PDL:	BLOCK	PLEN
+
+MSGFLG:	BLOCK	1			;Internal flag for JFNPOP
+FILJFN:	BLOCK	1
+FILSIZ:	BLOCK	1
+
+	SUBTTL	Main program
+
+;
+; Entry vector:
+;
+
+EVEC:	JRST	START			;Start address
+	JRST	START			;Reenter address is the same
+	EXP	VMAKDMP			;Declare version number
+
+START:	RESET%				;Reset process state
+	MOVE	P,[IOWD PLEN,PDL]	;Set up initial program stack
+	MOVE	TAKEP,[IOWD TAKLEN,TAKSTK] ;Initial TAKE file stack state
+
+;
+; Now that the basic initialisation is done, init the command state block:
+;
+
+	MOVEI	T1,REPARS		;Reparse address
+	MOVEM	T1,CSB+.CMFLG		;In flag word
+	MOVE	T1,[.PRIIN,,.PRIOU]	;Primary JFNs
+	MOVEM	T1,CSB+.CMIOJ		;  are the first JFNs
+	HRROI	T1,[			;<Match brackets
+		    ASCIZ/MAKDMP>/]	;Prompt string
+	MOVEM	T1,CSB+.CMRTY		;In prompt string buffer
+	HRROI	T1,TXTBUF		;Text buffer pointer
+	MOVEM	T1,CSB+.CMBFP
+	MOVEM	T1,CSB+.CMPTR
+	MOVEI	T1,TXTLEN		;Length of text buffer
+	MOVEM	T1,CSB+.CMCNT
+	MOVEM	T1,CSB+.CMINC
+	HRROI	T1,ATOMBF		;Pointer to atom buffer
+	MOVEM	T1,CSB+.CMABP
+	MOVEI	T1,ATOMLN		;Length thereof
+	MOVEM	T1,CSB+.CMABC
+	MOVEI	T1,GJBLK		;GTJFN% Jsys arg block for COMND%
+	MOVEM	T1,CSB+.CMGJB
+
+;
+; Here at start of each new command line.  The error stack is reset, and the
+;  .CMINI function is executed.  This is NOT the place to go on a reparse,
+;  since the .CMINI resets the pointers in the CSB, making ^H useless.
+;
+
+NEWCMD:	MOVE	ERRP,[IOWD ERRLEN*2,ERRSTK] ;Get initial cleanup stack pointer
+	MOVE	P,[IOWD PLEN,PDL]	;Reset normal stack
+
+	MOVEI	T1,CSB			;Point to Command State Block
+	MOVEI	T2,[FLDDB. .CMINI]	;Initialisation function
+	COMND%				;Init pointers, type prompt, etc.
+	  ERJMP	INIERR			;Error in initialisation
+	JRST	NEWPAR			;Now continue as if a new parse
+
+;
+; This code is called directly by the comnd on a reparse.  We must
+;  cleanup and unwind.
+;
+
+REPARS:	CALL	CLEANUP
+
+;
+; Here to parse the first field of the command.  In addition, the
+;  COMND% JSYS causes a jump here when the user edits into a field we have
+;  already parsed.
+;
+
+NEWPAR:	MOVEI	T1,CSB			;Address of CSB
+	MOVEI	T2,[FLDDB. .CMKEY,CM%HPP,CMDTBL,<Command, >]
+					;Parse keywords from CMDTBL,
+					;  preceding the standard help with
+					;  "Command, "
+	COMND%				;Try for a keyword
+	  ERJMP	FSTERR			;Error on first field - check eof
+	TXNE	T1,CM%NOP		;Did it parse?
+	  NOPERR			;No.  "?Invalid command"
+
+;
+; Here it has parsed, so T2 points to the entry that matched from the
+;  keyword table.  In the left half is the address of the keyword text,
+;  in the right, the address of the corresponding routine.  Get the
+;  address, call the routine, then loop for another command.
+;
+
+	HRRZ	T2,(T2)			;Get the routine address
+	CALL	(T2)			;Call it
+	JRST	NEWCMD			;Then loop for another command
+
+;
+; This is the TBLUK% table for the first field.  To update this
+;  table, add KW entries in alphabetic order, and increment each half of the
+;  XWD for each keyword added.
+;
+
+CMDTBL:	XWD	4,4
+	KW	Create
+	KW	Exit
+	KW	Help
+	KW	Take
+
+	SUBTTL	Create Command
+
+;
+; Creates the dump file after parsing the user command
+;
+
+.CREATE:
+	TRVAR ALLOWF
+	CLEARM ALLOWF			;Setup /ALLOW
+	MOVEI T1,CSB
+	MOVEI T2,[FLDDB. .CMNOI,0,<POINT 7,[ASCIZ\Dump File\]>]
+	COMND%
+	 CMDERR
+	TXNE T1,CM%NOP
+	 NOPERR
+	PUSH ERRP,.FP			;Save frame indicator
+	XMOVEI T1,CREERR		;Save address of unwind routine
+	PUSH ERRP,T1
+	CALL CLRGJB			;Clear the gtjfn arg block
+	MOVE T1,[POINT 7,DEFDEV]
+	MOVEM T1,GJBLK+.GJDEV
+	MOVE T1,[POINT 7,DEFDIR]	;Put in the defaults
+	MOVEM T1,GJBLK+.GJDIR
+	MOVE T1,[POINT 7,DEFNAM]
+	MOVEM T1,GJBLK+.GJNAM
+	MOVE T1,[POINT 7,DEFEXT]
+	MOVEM T1,GJBLK+.GJEXT
+
+	MOVEI T1,CSB
+	MOVEI T2,[FLDDB. .CMFIL,CM%SDH,,<filespec>,,<[
+			FLDDB. .CMSWI,,SWITAB]>] ;Parse a filespec or switch
+	COMND%
+	 CMDERR
+	TXNE T1,CM%NOP
+	 NOPERR
+	HRRZS T3			;Keep the fdb used address
+	LDB T1,[POINTR <(T3)>,CM%FNC]	;Get the function code
+	CAIN T1,.CMFIL			;Was it file or switch?
+	IFSKP.				;Switch
+	   HRRZ T2,(T2)			;Get address of switch processor
+	   CALL (T2)			;Call it
+	   MOVEI T1,CSB
+	   MOVEI T2,[FLDDB. .CMFIL,CM%SDH,,<filespec>]
+	   COMND%			;Now get the filespec
+	    CMDERR
+	   TXNE T1,CM%NOP
+	    NOPERR
+	ENDIF.
+	MOVEM T2,FILJFN			;Save the JFN
+	MOVS DEST,T2			;Get ready for PMAP
+	MOVEI T1,CSB
+	MOVEI T2,[FLDDB. .CMNOI,0,<POINT 7,[ASCIZ\for Memory Size\]>]
+	COMND%
+	 CMDERR
+	TXNE T1,CM%NOP
+	 NOPERR
+
+	MOVEI T1,CSB
+	MOVEI T2,[FLDDB. .CMNUM,CM%SDH,12,<number - K words>] ;Parse a number
+	COMND%
+	 CMDERR
+	TXNE T1,CM%NOP
+	 NOPERR
+	MOVEM T2,FILSIZ			;Save the file size
+
+	MOVEI T1,CSB
+	MOVEI T2,[FLDDB. .CMNOI,0,<POINT 7,[ASCIZ\K words\]>]
+	COMND%
+	 CMDERR
+	TXNE T1,CM%NOP
+	 NOPERR
+
+	MOVEI T1,CSB
+	MOVEI T2,[FLDDB. .CMCFM]
+	COMND%
+	 CMDERR
+	TXNE T1,CM%NOP
+	 NOPERR
+
+	MOVE T1,FILJFN			;Retrieve the jfn
+	MOVE T2,[<FLD(44,OF%BSZ)>+OF%WR] ;36-bit bytes, write
+	OPENF%				;Open the file
+	 CHKERR				;Handle any problems
+	DMOVE T1,EXEDIR			;Get default exe dir
+	DMOVEM T1,SRCPAG*1000		;Into the page
+	MOVE T2,FILSIZ			;Retrieve file size
+
+MAPIT0:	ASH T2,1			;Make it a page count
+	ADDI T2,1			;Allow one page for directory
+	MOVEM T2,FILSIZ			;Save number
+
+MAPIT:	MOVE T1,[.FHSLF,,SRCPAG]	;Map from us
+	MOVE T2,DEST			; to file
+	MOVX T3,PM%RWX			;Read, Write
+	MOVES SRCPAG*1000+777		;Create the page
+	PMAP%				;Map it
+	 CHKERR				;Handle any strangeness
+	ADDI DEST,1			;Incr page number
+	HRRZ T1,DEST			;Keep page number
+	CAMGE T1,FILSIZ			;Got it all yet?
+	JRST MAPIT			;No. go on
+	MOVE T1,FILJFN			;Get back the jfn
+	TXO T1,CO%NRJ			;Don't release JFN
+	CLOSF%				;Close the file
+	 CHKERR
+	HRLI T1,.FBSIZ			;The file's size
+	SETO T2,
+	MOVE T3,FILSIZ			;Get page count
+	IMULI T3,^D512			;Compute words in the file
+	CHFDB%
+	HRLI T1,.FBBYV
+	MOVX T2,FB%BSZ
+	MOVX T3,<FLD(44,FB%BSZ)>
+	CHFDB%
+	HRLI T1,.FBCTL			;Change flag word
+	MOVX T2,FB%NOD
+	MOVX T3,FB%NOD			;Default to disallow dumper backups
+	SKIPE ALLOWF			;/ALLOW?
+	 CLEAR T3,			;Then allow dumper backups
+	CHFDB%
+
+DONE:	TMSG <[Dump file: >
+	MOVEI T1,.PRIOU			;Output to terminal
+	HRRZ T2,FILJFN			;Get jfn
+	CLEARB T3,T4
+	JFNS%				;Output filespec to the user
+	TMSG < created]
+>
+	MOVE T1,FILJFN			;Get back the jfn
+	RLJFN				;Release it
+	 JSERR
+	RET
+
+;
+; Here is the error 'unwind' routine called via the ERRP stack
+;
+
+CREERR:	SAVEAC T1
+	SKIPN T1,FILJFN			;Is there a jfn to worry about?
+	IFSKP.				;Yes
+	   TXO T1,CO%NRJ		;Keep the jfn
+	   CLOSF%			;Close the file
+	    NOP
+	   HRRZ T1,FILJFN		;Get a jfn
+	   RLJFN%			;Release it
+	    NOP
+	ENDIF.
+	CLEARM FILSIZ			;Reset the other variables we've setup
+	CLEARM FILJFN
+	CLEARM ALLOWF			;Clear switch value
+	RET
+
+;
+; Here when the /ALLOW dumper backup switch is used
+;
+
+.Allow:	SETOM ALLOWF			;Set switch value
+	RET
+
+;
+; This is the switch table for Create (currently just /ALLOW)
+;
+
+SWITAB:	SWTSIZ,,SWTSIZ
+	KW <Allow-Dumper-Backup>,,.Allow
+SWTSIZ==.-SWITAB-1
+
+	SUBTTL	Exit Command
+
+
+Comment\
+
+	EXIT (to superior) cfm
+
+This command just executes a HALTF% JSYS.  If the program is CONTINUEd, it
+will continue at the next command.  An EXIT command does not terminate
+command file processing.
+\
+
+.EXIT:	MOVEI T1,CSB			;CSB address
+	MOVEI T2,[FLDDB. .CMNOI,0,<POINT 7,[ASCIZ/to TOPS-20 Command Level/]>]
+	COMND%				;Type out the noise word
+	  CMDERR			;Error
+	TXNE T1,CM%NOP			;Did it parse?
+	  NOPERR			;Nope
+
+	MOVEI T1,CSB
+	MOVEI T2,[FLDDB. .CMCFM]	;Confirm function
+	COMND%				;Wait for the <CR>
+	  CMDERR			;Error
+	TXNE T1,CM%NOP			;Did it parse?
+	  NOPERR			;Nope
+
+;
+; Everything parsed, so let's exit:
+;
+
+	HALTF%				;Exit to superior
+	RET				;Return to command loop
+	SUBTTL	Help Command
+
+.Help:	STKVAR	HJFN			;Storage for help file jfn
+	MOVEI	T1,CSB			;CSB address
+	MOVEI	T2,[FLDDB. .CMNOI,0,<POINT 7,[ASCIZ/with MAKDMP/]>]
+	COMND%				;Type out the noise word
+	  CMDERR			;Error
+	TXNE	T1,CM%NOP		;Did it parse?
+	  NOPERR			;Nope
+	MOVEI	T1,CSB
+	MOVEI	T2,[FLDDB. .CMCFM]	;Confirm function
+	COMND%				;Wait for the <CR>
+	  CMDERR			;Error
+	TXNE	T1,CM%NOP		;Did it parse?
+	  NOPERR			;Nope
+
+	MOVX	T1,GJ%SHT+GJ%OLD	;Look for existing help file
+	HRROI	T2,[ASCIZ/HLP:MAKDMP.HLP/] ;On hlp:
+	GTJFN%				;Try getting jfn on file
+	 ERJMP	.Helpf			;Failed!
+	MOVEM	T1,Hjfn			;Store jfn for later
+	MOVX	T2,OF%RD+7B5		;Read seven bit bytes
+	OPENF%				;Open the file for read
+	 ERJMP	.Helpf
+
+.Helpl:	MOVE T1,Hjfn			;Get help file jfn
+	BIN%				;Get next char in file
+	SKIPN T1,T2			;Get char
+	IFSKP.				;Any there?
+	   PBOUT%			;Print on tty
+	   JRST	.Helpl			;Continue till eof
+	ELSE.
+	   GTSTS%			;What's happening?
+	   TXNN T2,GS%EOF		;End of input?
+	    JRST .Helpl			;No, ignore the null
+	   MOVE T1,Hjfn			;Get help file jfn
+	   TXO T1,CO%NRJ		;Don't release the jfn yet
+	   CLOSF%			;All done now
+	    HRRZ T1,Hjfn		;Get jfn back (error code munged it)
+	   RLJFN%			;Release it
+	    JFCL			;Don't worry!?
+	ENDIF.
+	RET
+
+.Helpf:
+;	Tmsg <% Help file unavailable because: > ;Start nice message
+;	CALL ERROUT			;Display jsys error
+	MOVE T1,[POINT 7,HLPTXT]
+	PSOUT
+	RET
+
+HLPTXT:	ASCIZ/
+MAKDMP creates a dump file for TOPS-20 monitor crashes.
+
+In the filespec you must supply the structure name.  The remainder
+of the fields will be defaulted if you do not choose to enter anything.
+
+To indicate the amount of memory you have, use the following information:
+
+Physical Memory		K Words
+
+.5 megaword		512
+1 megaword		1024
+1.5 megaword		1536
+2 megaword		2048
+
+etc.
+
+/
+	SUBTTL	TAKE Command
+
+Comment\
+
+	There are three forms of this command:
+
+	1. TAKE (commands from file) infile (logging output to) outfile
+	or
+	2. TAKE (commands from file) infile
+	or
+	3. TAKE
+
+	This command sets up to read the commands from a specified
+file, and to write any parsing output to a separate file.  It opens
+the specified files, pushes the current input and output jfns (from
+word .CMIOJ of the CSB) on the JFN stack, and moves the specified JFNs
+into .CMIOJ.  Subsequent COMND% calls using the same CSB will read
+from and write to the specified files.  Subcommands should not use the
+same CSB, but should always copy word .CMIOJ from CSB.  When end of
+file is detected while parsing a command, the current command and log
+files are closed, and the previous ones are popped from the JFN stack
+into .CMIOJ.
+
+	In form 1, the input file must be specified, and the output
+file defaults to TTY:.  In form 2, the current output file is
+retained; if it had been .PRIOU (as it is initially), it stays that
+way; otherwise, it is set to whatever the previous output file was.
+Form 3 is simply a way of terminating a command file without getting
+the message "[End of infile.CMD]".  It has the same effect as the end
+of the file in all other respects.
+
+\
+
+.TAKE:	SAVEAC <T1,T2,T3,T4>		;Save some acs
+	TRVAR <NEWIJF,NEWOJF,<CMDNAM,8>>
+					;Define new input and output JFNs
+					;  also command file name string
+	SETZM NEWIJF			;Clear input
+	SETZM NEWOJF			;  and output JFNs
+
+	PUSH ERRP,.FP			;Save .FP and addr of cleanup routine:
+	PUSH ERRP,[TAKERR]		;  Setup in case of NOPERR.
+
+	MOVEI T1,CSB			;Addr of CSB
+	MOVEI T2,[FLDDB. .CMNOI,0,<POINT 7,[ASCIZ/commands from file/]>]
+					;Noise word parse
+	COMND%				;Parse it
+	  CMDERR			;NOPERR
+	TXNE T1,CM%NOP			;Did it parse?
+	  NOPERR			;Nope
+
+;
+; Here, we parse for either an input file (the command file), or a return.
+;  First, the GTJFN% arg block has to be set up to default the filespec.
+;
+
+	CALL CLRGJB			;Zero gtjfn block
+	MOVX T1,GJ%OLD			;File must exist
+	MOVEM T1,GJBLK+.GJGEN		;In flags word
+	HRROI T1,[ASCIZ/COMMAND/]	;Default filename
+	MOVEM T1,GJBLK+.GJNAM
+	HRROI T1,[ASCIZ/CMD/]		;Default file type
+	MOVEM T1,GJBLK+.GJEXT
+
+	MOVEI T1,CSB
+	MOVEI T2,[FLDDB. (.CMCFM,FLGS,DATA,,,[
+		    FLDDB. (.CMFIL,FLGS,DATA,<Command file,>)])]
+					;Parse an input file spec or confirm
+	COMND%
+	  CMDERR			;Error
+	TXNE T1,CM%NOP			;Did it parse?
+	  NOPERR			;Nope
+
+	HRRZS T3			;Get address of last func blk used
+	LOAD T3,CM%FNC,(T3)		;Get function code
+	CAIN T3,.CMCFM			;Was it a confirm
+	  JRST [PUSH P,[NOMSG]		;Yes. End current command file
+		CALL JFNPOP		;  typing the "[End of ]" message
+		ADJSP P,-1		;Remove JFNPOP arg from stack
+		RET]			;Then return to command loop
+	MOVEM T2,NEWIJF			;Save the JFN
+
+	MOVEI T1,CSB			;Point to CSB
+	MOVEI T2,[FLDDB. .CMNOI,FLGS,<POINT 7,[ASCIZ/logging output to/]>]
+					;Noise word
+	COMND%
+	  CMDERR			;Error
+	TXNE T1,CM%NOP			;Did it parse?
+	  NOPERR			;Nope
+
+;
+; Here we are ready to parse the log file name or a return to retain the
+;  current log file.  First, we have to set up the GTJFN% block for the
+;  defaults.  The default device and directory are the connected ones,
+;  the file name is that of the command file, and the default file
+;  type is .LOG.
+;
+
+	CALL CLRGJB			;Clear gtjfn block
+	MOVX T1,GJ%FOU			;Use next higher generation
+	MOVEM T1,GJBLK+.GJGEN		;Store in GTJFN% arg block
+	HRROI T1,CMDNAM			;Point to name string
+	MOVEM T1,GJBLK+.GJNAM		;Store
+	MOVE T2,NEWIJF			;JFN is that of command file
+	MOVX T3,FLD(.JSAOF,JS%NAM)	;Output file name always
+	JFNS%
+
+	HRROI T1,[ASCIZ/LOG/]		;Point to file type string
+	MOVEM T1,GJBLK+.GJEXT		;Store it in the arg block
+
+	MOVEI T1,CSB			;Point to CSB
+	MOVEI T2,[FLDDB. (.CMCFM,FLGS,DATA,,,[
+		    FLDDB. (.CMFIL,FLGS,DATA,<Log file,>)])]
+					;File spec or confirm
+	COMND%				;Parse the log file spec
+ 	  CMDERR			;Error
+	TXNE T1,CM%NOP			;Did it parse?
+	  NOPERR			;Nope
+
+	HRRZS T3			;Get address of last func blk used
+	LOAD T3,CM%FNC,(T3)		;Get function code
+	CAIN T3,.CMCFM			;Was it a confirm
+	  SETO T2,			;Yes. Default to current log JFN
+	MOVEM T2,NEWOJF			;Save log JFN
+
+	JUMPL T2,.TAKE2			;Skip the confirm if defaulted
+	MOVEI T1,CSB			;Point to CSB
+	MOVEI T2,[FLDDB. .CMCFM]	;Confirm function
+	COMND%				;Parse the confirmation
+	  CMDERR			;Error
+	TXNE T1,CM%NOP			;Did it parse?
+	  NOPERR			;Nope
+
+;
+; Now that the command has been parsed, the files can be opened and pushed.
+;
+
+.TAKE2:	MOVE T1,NEWIJF			;Get the input JFN
+	MOVX T2,OF%RD+FLD(7,OF%BSZ)	;7-bit bytes, read
+	OPENF%				;Try to open the file
+	  CHKERR <Can't open command file >,JFNTYP,NEWIJF
+
+	SKIPG T1,NEWOJF			;Skip if changed output JFN
+	  JRST .TAKE1			;Didn't change, so don't open
+	MOVX T2,OF%WR+FLD(7,OF%BSZ)	;7-bit bytes, write
+	OPENF%				;Try to open the file
+	  CHKERR <Can't open log file >,JFNTYP,NEWOJF
+
+.TAKE1:	PUSH TAKEP,CSB+.CMIOJ		;Push current I/O files
+	  CHKTRP <Too many TAKE command levels>
+	HRLZ T4,NEWIJF			;Input file in T4(lh)
+	HRR T4,NEWOJF			;Output file in T4(rh)
+	SKIPG NEWOJF			;Skip if changed output JFN
+	  HRR T4,CSB+.CMIOJ		;Didn't change, use old JFN
+	MOVEM T4,CSB+.CMIOJ		;Set up as current files
+
+	RET				;Return to command loop
+
+;
+; This is the cleanup routine for the take command.  Its purpose is to
+;  release the jfns for the comand and log files, if they they exist.
+;  Called from CLEANUP upon an error within a take command.  No input
+;  arguments are required, no output status is supplied.
+;
+
+TAKERR:	PUSH	P,T1			;Save T1
+	SKIPN	T1,NEWIJF		;If input JFN set,
+	IFSKP.
+	    TXO T1,CO%NRJ		;Keep jfn
+	    CLOSF%			;Try to close it
+	      NOP			;Don't care if it can't
+	    MOVE T1,NEWIJF		;Get JFN again if error on CLOSF%
+	    RLJFN%			;  release it
+	      NOP			;Ignore error
+	ENDIF.				;End if JFN set
+	SKIPG	T1,NEWOJF		;If output JFN set and other
+					;  than previous JFN
+	IFSKP.
+	    TXO T1,CO%NRJ		;Keep jfn
+	    CLOSF%			;Try to close output file
+	      NOP			;Ignore error
+	    MOVE T1,NEWOJF		;Get JFN again if error
+	    RLJFN%			;Release it
+	      NOP			;Ignore error
+	ENDIF.				;End if output JFN
+	POP	P,T1			;Restore T1
+	RET				;Then return
+	SUBTTL	Error Routines
+
+Comment\
+	Routine CMDER0 is jumped to when an error occurs in a COMND% JSYS
+parse.  It is called either by CMDERR (error in the call itself) or by
+NOPERR (CM%NOP bit set after the call).
+\
+
+
+CMDER0:	HRROI	T1,[ASCIZ/?Invalid command - /]
+	PSOUT%				;Output an error message
+	CALL	ERROUT			;Output last error, then crlf
+	CALL	CLEANUP			;Clean any JFNs, etc.
+	CALL	JFNUNW			;Unwind the TAKE file stack
+	JRST	NEWCMD			;Then try a command from the
+					;terminal
+
+
+Comment\
+	The CHKER0 subroutine is called when an error occurs in a JSYS
+which is called from a command parsing subroutine.  The call is generated
+by the CHKERR macro, which takes three arguments:  the string to type out
+on the first line (preceded by a "?"), a subroutine to call to output any
+special data, or zero if no such routine, and data to pass to the
+subroutine.  These three arguments are pushed onto the stack in order, then
+CHKER0 is called.  When the special subroutine is called, its single
+argument is on the stack.
+\
+
+CHKER0:	HRRO	T1,-3(P)		;Pointer to string to type
+	ESOUT%				;Output it as an error message
+	SKIPN	-2(P)			;Any routine specified?
+	  JRST	NORTNE			;No. Skip it.
+	PUSH	P,-1(P)			;Push the argument
+	CALL	@-3(P)			;Call the routine.
+	ADJSP	P,-1			;Fix the stack
+NORTNE:	HRROI	T1,[BYTE(7)15,12,0]	;CRLF
+	PSOUT%
+	CALL	ERROUT			;Type last error, then crlf
+	CALL	CLEANUP			;Clean up any unclosed jfns, etc.
+	CALL	JFNUNW			;Unwind the JFN stack to the top
+	RET				;Then return
+
+
+Comment\
+	The CKWRN0 subroutine is called to give a warning from a JSYS
+which is called from a command parsing subroutine.  The call is generated
+by the CHKWRN macro, which takes three arguments:  the string to type out
+on the first line (preceded by a "%"), a subroutine to call to output any
+special data, or zero if no such routine, and data to pass to the
+subroutine.  These three arguments are pushed onto the stack in order, then
+CKWRN0 is called.  When the special subroutine is called, its single
+argument is on the stack.
+\
+
+CKWRN0:	HRRO	T1,[ASCIZ/
+%/]					;Precede message with "%"
+	PSOUT%
+	HRROI	T1,-3(P)		;Pointer to string to type
+	PSOUT%				;Output it
+	SKIPN	-2(P)			;Any routine specified?
+	  JRST	NORTNW			;No
+	PUSH	P,-1(P)			;Push the argument
+	CALL	@-3(P)			;Call the routine.
+	ADJSP	P,-1			;Fix the stack
+NORTNW:	HRROI	T1,[BYTE(7)15,12,0]	;CRLF
+	PSOUT%
+	CALL	ERROUT			;Output last error, then crlf
+	RET				;Then return
+
+
+Comment\
+	The CHKTR0 subroutine is called when an error occurs in an
+instruction used in a command parsing subroutine.  The call is
+generated by the CHKTRP macro, which takes three arguments: the string
+to type out on the first line (preceded by a "?"), a subroutine to
+call to output any special data, or zero if no such routine, and data
+to pass to the subroutine.  These three arguments are pushed onto the
+stack in order, then CHKTR0 is called.  When the special subroutine is
+called, its single argument is on the stack.
+\
+
+CHKTR0:	HRRO	T1,-3(P)		;Pointer to string to type
+	ESOUT%				;Output it as an error message
+	SKIPN	-2(P)			;Any routine specified?
+	  JRST	NORTNT			;No. Skip it.
+	PUSH	P,-1(P)			;Push the argument
+	CALL	@-3(P)			;Call the routine.
+	ADJSP	P,-1			;Fix the stack
+NORTNT:	HRROI	T1,[BYTE(7)15,12,0]	;CRLF
+	PSOUT%
+	CALL	CLEANUP			;Clean up any unclosed jfns, etc.
+	CALL	JFNUNW			;Unwind the JFN stack to the top
+	RET				;Then return
+
+
+Comment\
+	This routine simply types out the last error message, followed
+by a CRLF.  It takes no arguments and returns no status.
+\
+
+ERROUT:	MOVX	T1,.PRIOU		;Output to primary
+	HRLOI	T2,.FHSLF		;Get .FHSLF,,-1
+	SETZ	T3,			;Entire string
+	ERSTR%				;Output the error message
+	  NOP				;Don't care about impossible errors
+	  NOP				;...
+	HRROI	T1,[BYTE(7) 15,12,0]	;CRLF
+	PSOUT%
+	RET
+
+;
+; This is a utility routine to type out (with JFNS%) the jfn on the stack
+;  before this routine's return address, found at -1(P).  The routine saves
+;  ACs 1-4 on the stack, so the jfn argument is actually referred to as
+;  -5(P).  It outputs in standard format (zero argument to JFNS%).
+;
+
+JFNTYP:	ADJSP	P,4			;Save Ac 1-4
+	DMOVEM	T1,-3(P)
+	DMOVEM	T3,-1(P)
+	MOVX	T1,.PRIOU		;Output to primary
+	MOVE	T2,-5(P)		;This JFN
+	SETZ	T3,			;Default format
+	JFNS%				;Output the filespec
+	DMOVE	T1,-3(P)		;Restore the ACs
+	DMOVE	T3,-1(P)
+	ADJSP	P,-4			;Recover the stack space
+	RET				;Then return
+	SUBTTL	CLEANUP Subroutine
+
+Comment\
+
+	Many command parsing routines may allocate resources in the
+parsing of the command.  An example of this is the parsing routine .TAKE,
+in this program, which gets two JFNs which are used after the command is
+confirmed.
+
+	The CLEANUP routine is called when an error happens in the
+middle of a parsing routine.  Its purpose is to deallocate any such
+resources.  Since this is a general subroutine, called from many
+different parsing subroutines, it can't know on it's own what
+resources need to be deallocated.  Instead, any routine that allocates
+such resources pushes two words onto the ERRSTK: the frame pointer at
+the time of that routine's entry (.FP), and the address of the routine
+to call to deallocate the resources.  This routine can reference the
+same TRVAR local variables as the parent routine, since when it is
+called, .FP points to the same place on the stack as in the parent
+routine.
+
+	The routine should release any resources allocated during the
+parsing routine, then return.  CLEANUP will then call the next
+routine, and continue until all routines on the stack have been
+called.  Of course, if there are no routines on the stack, CLEANUP
+returns immediately.  \
+
+CLEANUP:
+	PUSH	P,T1			;Save T1
+	PUSH	P,.FP			;  and .FP
+CLNLUP:	CAMN	ERRP,[IOWD ERRLEN*2,ERRSTK]
+					;Are we at the end of the stack?
+	  JRST	CLNEND			;Yes.  Return
+	MOVE	.FP,-1(ERRP)		;Get the saved frame pointer
+	CALL	@0(ERRP)		;Call the cleanup routine
+	ADJSP	ERRP,-2			;Pop off the last two words
+	JRST	CLNLUP			;And loop for the rest
+
+;
+; Note that here, P contains IOWD ERRLEN*2,ERRSTK:
+;
+
+CLNEND:	POP	P,.FP			;Get frame pointer back
+	POP	P,T1			;  and T1
+	RET				;Then return
+
+
+Comment\
+	The JFNUNW subroutine closes all open command and log files, and
+sets the primary jfns as the current ones in the .CMIOJ word of the CSB.
+It does this by calling JFNPOP repeatedly, until JFNPOP returns +1, meaning
+that the current I/O files are the primary ones.
+\
+
+JFNUNW:	PUSH	P,[ENDMSG]		;Arg for JFNPOP: type message
+	CAIN	TAKEP,TAKSTK+TAKLEN-1	;Did the take stack overflow?
+	  SUB	TAKEP,[1,,1]		;Yes. Adjust it by hand.
+					;  It should point to last JFN
+JFNLUP:	CALL	JFNPOP			;Pop one command file level
+	JUMPE	RS,JFNLUP		;Continue until none left
+	ADJSP	P,-1			;Remove stack space
+	RET				;Then return
+
+
+Comment\
+	The JFNPOP subroutine pops one level of command and log files,
+closing them and typing "[End of command-file.type]" for each level closed.
+It returns +1 if the current level is the top level (.PRIIN,,.PRIOU in
+CSB+.CMIOJ) or +2 otherwise.
+\
+
+JFNPOP:	EXCH	T1,-1(P)		;Get the arg, save T1
+	MOVEM	T1,MSGFLG		;Put in "own" storage (sorry)
+	EXCH	T1,-1(P)		;Get old T1 back
+	SAVEAC	<T1,T4>			;Save two ACs
+	SETO	RS,			;Assume stack empty
+	CAMN	TAKEP,[IOWD TAKLEN,TAKSTK]
+					;Is it?
+	  RET				;Yes. Return the -1.
+	SETZ	RS,			;No.  We will return a zero.
+	HLRZ	T1,CSB+.CMIOJ		;Get input JFN
+	PUSH	P,T1			;Save for JFNTYP, etc.
+	SKIPN	MSGFLG			;Should we type out?
+	  JRST	JFNPP1			;No. Skip the type-out.
+	HRROI	T1,[ASCIZ/[End of /	;]Match brackets
+		   ]			;Begin message
+	PSOUT%
+	CALL	JFNTYP			;Type out the filespec
+	HRROI	T1,[			;[Match brackets
+		    ASCIZ/]
+/]					;End of message
+	PSOUT%
+JFNPP1:	POP	P,T1			;Get input JFN back
+	MOVE	T4,T1			;Save it over CLOSF% errors
+	CLOSF%				;Try to close it
+	  WARN	<Can't close command file >,JFNTYP,T4
+					;Error - not fatal
+	HRRZ	T1,CSB+.CMIOJ		;Get output JFN
+	HRRZ	T4,0(TAKEP)		;Get previous output JFN
+	CAMN	T1,T4			;Are they the same?
+	  JRST	JFNPP2			;Yes. Don't close
+	MOVE	T4,T1			;Save output JFN over CLOSF%
+	CLOSF%				;Try to close the output file
+	  WARN	<Can't close log file >,JFNTYP,T4
+					;Error: not fatal, though
+JFNPP2:	POP	TAKEP,CSB+.CMIOJ	;Pop a JFN level
+	  CHKTRP <Too many EOFs????
+?I somehow popped too many files from TAKEP.  Please report this!!
+(This, by the way, is impossible.)>
+	RET				;Then return
+
+INIERR:	HRROI	T1,[ASCIZ/COMND% JSYS init error: /]
+	ESOUT%
+	HRROI	T1,[BYTE(7)0]
+	ESOUT%
+	MOVX	T1,.PRIOU
+	HRLOI	T2,.FHSLF
+	SETZ	T3,
+	ERSTR%
+	  NOP
+	  NOP
+	HALTF%
+	JRST	START
+
+
+FSTERR:	MOVX	T1,.FHSLF		;Current fork
+	GETER%				;Get the last error number
+	HRRZS	T2			;Get just the error number
+	CAIE	T2,IOX4			;Was it end of input file reached?
+	  JRST	CMDER0			;No.  Some other error, then
+	CALL	JFNPOP			;Eof. Pop one TAKE file level
+	JRST	NEWCMD			;Then take next command from
+					; next higher level
+
+;
+; Routine to clear long form GTJFN argument block
+;
+
+CLRGJB:	SAVEAC T1
+	CLEARM GJBLK			;Zero first word first
+	MOVE T1,[GJBLK,,GJBLK+1]
+	BLT T1,GJBLK+.GJATR
+	RET
+
+	END	<3,,EVEC>

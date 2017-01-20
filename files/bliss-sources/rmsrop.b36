@@ -1,0 +1,1072 @@
+%TITLE 'RMSROP - RMS-20 DAP File Open Routines'
+MODULE RMSROP (                         ! Open a file using DAP
+		IDENT = '3(663)'
+                %BLISS36(,ENTRY(
+                                dap$openfile, !open a remote file (using dap)
+                                dap$close,    !close a remote file (using dap)
+                                dap$EndAccess,!deaccess remote file (using dap)
+                                d$SDisplay    !set display bits by xab chain
+                                ))
+		) =
+BEGIN
+!
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1981, 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+
+!++
+! FACILITY: DAP/RMS
+!
+! ABSTRACT:
+!     Open a file using DAP if the file is on another system,
+!     or using RMS if it is on the same system.
+!
+! ENVIRONMENT: BLISSNET, RMS, XPORT, Transportable Code.
+!
+! AUTHOR:	Andrew Nourse, CREATION DATE: 2-Jan-82
+!
+! RMS Edit:
+!
+! 663 - Check if DAP tracing is wanted and setup the logfile if so.
+! 662 - On sending a CONTINUE(abort) interrupt, completely forget
+!	about any previous DAP messages.
+! 656 - (GAS, 13-Oct-86) Implement protection XABs.
+! 645 - Allow image mode to TOPS-10 systems.
+! 644 - Don't forget third argument to dap$get_config.
+! 640 - Clear Fst[Fst$a_Nlb] after deallocating the Nlb
+! 627 - Set extended Key attribute display bit for remote indexed
+!	$Open if partner supports it, even if no user key XAB
+!	was supplied.  
+! 607 - No longer reset DAP function code to OPEN on CIF $CREATE
+! 604 - Fix cleanup on close with more files left.
+! 601 - Fill in both nam blocks on $Rename
+! 600 - Fix $Change_End, & changing attrs on close
+! 571 - Request 3-part name if possible, even if not wildcarded.
+! 566 - Handle remote wildcard errors correctly
+! 560 - Default to ASCII if RFM = STM or LSA
+! 555 - Default to Image for TOPS-20
+! Module Edit:
+! 24    - Set up CRC stuff
+! 23    - Send access complete if access active, not just file open
+! 22    - Remove jacket routines and RMS-ify module
+! 21    - Put patchable stuff in the plit psect
+! 20    - Poor-man's routing now invoked by setting PMRFLG to -1
+! 17    - Undefined ASCII to non-stream sets CR only if no other RAT bits set
+! 16    - R$OPEN should merge related filespec
+!       - R$ERASE should call DAP$NEXTFILESPEC for additional filespecs
+! 15    - R$OPEN & R$CREATE continue after signalling RMS$_SUP for remote-only
+! 14    - Make R$RESET get rid of link.
+! 13    - Have R$RESET check the NEW FILE bit in the FST
+! 12    - Send ACCESS COMPLETE(PURGE) as interrupt message
+! 11    - Work around IAS wierdnesses
+! 10    - Tell RMS that file is stream if using block mode
+! 07    - Don't set implied CRLF unless user does not know format
+! 06    - Give DD's pointers to each other
+! 05    - Make DAP$CLOSE eat entire DATA message also
+! 04    - Make DAP$CLOSE eat entire ACCESS COMPLETE message
+! 03    - Put in ENTRY points
+! 02    - Eat messages in pipe on close
+! 01	- The beginning
+!--
+
+!
+! INCLUDE FILES:
+!
+
+!LIBRARY 'RMS';
+!LIBRARY 'RMSBLK';
+!LIBRARY 'DAP';
+REQUIRE 'RMSREQ';
+LIBRARY 'BLISSNET';
+LIBRARY 'CONDIT';
+
+!
+! TABLE OF CONTENTS:
+!
+
+FORWARD ROUTINE
+        Dap$Openfile,     !Open a remote file (using DAP)
+        Dap$Close,        !Close a remote file (using DAP)
+        Dap$EndAccess,    !Deaccess (close/disconnect) remote file (using DAP)
+        D$SDisplay;       !Set display bits
+!
+! MACROS:
+!
+UNDECLARE %QUOTE type;  ! This causes trouble with BLISSNET keywordmacros !a501
+
+!
+! EQUATED SYMBOLS:
+!
+
+COMPILETIME Multiple_Filespecs=1;       ![16] On for mult-filespec support
+
+%IF %BLISS(BLISS36)
+    %THEN
+    %IF %SWITCHES(TOPS20)
+        %THEN
+            LITERAL Our_Ostype=Dap$k_Tops20;
+	    LITERAL Our_Filesys=Dap$k_Filesys_Rms20;                    !m572
+	%ELSE                                                           !m572v
+            LITERAL Our_Ostype=Dap$k_Tops10;
+	    LITERAL Our_Filesys=Dap$k_Filesys_Tops10;                   !m572^
+        %FI
+        LITERAL Ma_Return = 1;
+    %FI
+
+LITERAL FopCloseBits = (Fab$m_Spl OR Fab$m_Scf OR Fab$m_Dlt);           !m600
+
+!
+! RUN-TIME FEATURE TESTS:
+!
+
+PSECT GLOBAL=$HIGH$;
+PSECT OWN=$HIGH$;
+
+GLOBAL
+    Pmrflg: INITIAL(0);                 ! Set nonzero for poor-man's routing
+
+GLOBAL
+    DAccOpt: INITIAL(0);                ! Set to 8 for CRC checking
+
+OWN VmsSlp: INITIAL(256);               ! Number of bytes VMS is likely to
+                                        ! be off in its own BYTLM/buffersize
+                                        ! calculation.  We restrict it to
+                                        ! less than its own stated max by
+                                        ! this amount to keep it from hanging
+                                        ! itself.
+
+OWN AcmDrl_Mask: BITVECTOR [ Dap$k_Accomp_Max ]
+                 PRESET( [Dap$k_Accomp_Response]=1,     ! RESPONSE
+                         [Dap$k_Accomp_Eos]=1,          ! DISCONNECT
+                         [Dap$k_Accomp_Change_Begin]=1  ! attr change on close
+                       );                                                !d600
+
+!
+! EXTERNAL REFERENCES:
+!
+
+EXTERNAL ROUTINE
+		D$CTrace: NOVALUE,				!663
+		D$ZTrace: NOVALUE,				!663
+                D$SetAi,
+		D$Strace,					!663
+                D$NamAi,
+                Dap$Handle,
+                Dap$Put_Message,
+                Dap$Get_Message,
+                Dap$Get_Config,
+                Dap$Put_Name,
+                Dap$Put_Config,
+                Dap$Put_Attributes,
+                Dap$Put_Bitvector,
+                Dap$Put_Access,
+                Dap$Put_Byte,
+                Dap$Put_2Byte,
+                Dap$Put_Header,
+                Dap$Get_Header,
+                Dap$Get_Status,
+                Dap$Get_2Byte,
+                Dap$Get_Attributes,
+                Dap$Error_Dap_Rms,
+                Dap$Merge,
+                Dap$Unget_Header,
+                Dap$Size_Bitvector,
+                Dap$Get_Byte,
+                Dap$Get_Bitvector,
+                R$Null,
+                UAddr,
+                UAPointer,
+                Xpn$Signal;
+%IF Multiple_Filespecs
+%THEN
+EXTERNAL ROUTINE Dap$Nextfilespec;
+%FI
+EXTERNAL FalObj;
+
+EXTERNAL T20bug: BITVECTOR,
+         Vmsbug: BITVECTOR,
+         Rsxbug: BITVECTOR,
+         Rstbug: BITVECTOR,
+         Iasbug: BITVECTOR,
+         T10bug: BITVECTOR,
+         Rtbug:  BITVECTOR,
+	 D$GTrace;				! 663
+
+GLOBAL ROUTINE Dap$Openfile (P_Fab: REF $Fab_Decl,
+                               Function,
+                               P_Nfab: REF $Fab_Decl,
+                               Err): =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!   OPEN/CREATE/... A REMOTE FILE
+!
+! FORMAL PARAMETERS:
+!
+!   P_FAB: An RMS FAB with a NODEID embedded in the filespec.
+!   FUNCTION: ACCESS message function code (DAP) or 0 to exchange configs only
+!             Function OR'ed with Fab$m_Nam for $Parse
+!   P_NFAB: New FAB for Rename
+!   ERR: Address of error routine or 0
+!
+! IMPLICIT PARAMETERS:
+!
+!   FST: addr of FST
+!
+! COMPLETION CODES:
+!
+!   RMS codes
+!
+! SIDE EFFECTS:
+!
+!  If the link is not already open
+!   An NLB is allocated.  Fst[Fst$a_Nlb] will point to it
+!   2 $Dap_Descriptor's are allocated, Fst[Fst$a_(I,O)_Dd] point to them
+!   A Configuration Xab is allocated. Fst[Fst$a_Config] will point to it
+!
+!   For ERASE and EXECUTE, the requested operation will have been completed
+!   and the above data strucures de-allocated.
+!--
+    BEGIN
+    BIND UFab=.P_Fab: $Fab_Decl,
+         Nfab=.P_NFab: $Fab_Decl,          ! New name for rename
+         Nam=Uaddr(.UFab[Fab$a_Nam]): $Nam_decl,
+         Typ=Uaddr(.UFab[Fab$a_Typ]): $Typ_decl;
+
+    LOCAL Fabsav: VOLATILE REF $Fab_Decl;
+
+    LOCAL P_nlb : REF $xpn_nlb();
+    LOCAL accopt: BITVECTOR[35] INITIAL(0),
+          display: BITVECTOR[28] INITIAL(0);
+    LOCAL P_Cfgblk: REF $XabCfg_Decl;
+    LOCAL P_Obuf,
+          P_Idd: REF $dap_descriptor,
+          P_Odd: REF $dap_descriptor;
+    LOCAL class;
+    LOCAL errsav: VOLATILE;
+
+    ENABLE dap$handle ( fabsav, errsav ) ;
+
+    IF .err EQL 0 THEN err = r$null ;
+
+    errsav = .err ;
+    fabsav = UFab ;                      ! Handler will need this
+
+    IF .Fst[Fst$a_Nlb] EQL 0
+    THEN
+        BEGIN
+
+        $Xpo_Get_Mem (Units=Dap$k_Buffer_Size %BLISS36(/4), Result=P_Obuf);
+                                            ! Allocate Output Buffer
+
+        $Xpo_Get_Mem (Units=Dap$k_Descriptor_Len, Result=P_Odd, Fill=0);
+        $Xpn_Desc_Init(Descriptor=.P_Odd, Class=Dynamic_Bounded,
+                       Binary_Data=(Dap$k_Buffer_Size,.P_Obuf,Bytes));
+
+        $Xpo_Get_Mem (Units=Dap$k_Descriptor_Len, Result=P_Idd, Fill=0);
+        $Xpn_Desc_Init(Descriptor=.P_Idd, Class=Bounded);
+
+        $Xpo_Get_Mem (Units=Nlb$k_Length, Result=P_Nlb, Fill=0); ! Allocate NLB
+        $Xpn_Nlb_Init (Nlb=.P_Nlb);
+
+        !Now set up the pointers:
+        !
+        !   +---------+   +---------+   +---------+
+        !   |   FAB   |-->|   FST   |-->| CONFIG  |
+        !   +---------+   +----+----+   +---------+
+        !            ,----'    V    `-.
+        !   +---------+   +---------+ :  
+        !   |   IDD   |   |   ODD   | :  
+        !   +---------+   +--+------+ :
+        !            `--.    V        ;
+        !            +-----------+<--'
+        !            |    NLB    |
+        !            +-----------+
+        ! 
+
+        Fst[Fst$a_Nlb]=.P_Nlb;          ! Point the DIB at the NLB
+        Fst[Fst$a_I_Dd]=.P_Idd;         !  ... and the input descriptor
+        Fst[Fst$a_O_Dd]=.P_Odd;         !  ... and the output descriptor
+        Fst[Fst$h_Fop]=.UFab[Fab$h_Fop]; ! Copy the FOP into the FST
+
+        Fst[Fst$v_Accopt]=.DAccopt;     ! Use default accopt   ![24]
+
+        P_Odd[Dap$a_Nlb]=.P_Nlb;        ! Output descriptor points to NLB
+        P_Idd[Dap$a_Nlb]=.P_Nlb;        ! Input descriptor ...
+
+        P_Idd[Dap$a_Other_Dd]=.P_Odd;   ![6] DD's should point
+        P_Odd[Dap$a_Other_Dd]=.P_Idd;   ![6] to each other
+
+        $Xpo_Get_Mem (Units=Xab$k_CfgLen, Result=P_Cfgblk, Fill=0);
+        ! Allocate  config XAB
+
+        $XabCfg_Init( Xab=.P_CfgBlk );  ! Initialize internal Cfg XAB   !a554
+
+        Fst[Fst$a_Config]=.P_Cfgblk;    ! Point the Dib at it
+
+        D$SetAi( .P_Nlb, UFab );         ! Get access info from filespec !m571
+
+        D$NamAi( Nam,
+                 .P_Nlb[Nlb$a_Node_Name],
+                 .P_Nlb[Nlb$a_User_id],
+                 .P_Nlb[Nlb$a_Password],
+                 .P_Nlb[Nlb$a_Account]
+               );         ! Put it in NAM block if any    !m571
+
+        IF .Function EQL Dap$k_Rename
+        THEN
+            BEGIN
+            BIND NewNam = UAddr(.NFab[Fab$a_Nam]): $Nam_decl;
+            IF NewNam NEQ 0
+            THEN
+                D$NamAi( NewNam,
+                         .P_Nlb[Nlb$a_Node_Name],
+                         .P_Nlb[Nlb$a_User_id],
+                         .P_Nlb[Nlb$a_Password],
+                         .P_Nlb[Nlb$a_Account]
+                       );         ! Put it in NAM block if any    !a601
+            END;
+        !++
+        ! Open the link
+        !--
+
+        IF .P_Nlb[Nlb$v_Open]         ! If link was open, close it       !a566
+        THEN $Xpn_Close( Nlb=.P_Nlb, Failure = 0 );
+
+        IF .Pmrflg NEQ 0  ![10] PMRFLG is patched to enable poor-man's routing
+        THEN
+        $Xpn_Open (Nlb=.P_Nlb, Object=.FalObj, Type=Active,
+                   Options=(Wait,Pmr),                  ! ask for PMR
+                   Buffer_Size=Dap$k_Buffer_Size,       ! Tell PMR buffer size
+                   Timeout = 180, Failure=Xpn$Signal)
+        ELSE
+        $Xpn_Open (Nlb=.P_Nlb, Object=.FalObj, Type=Active,
+                   Option=Wait,
+                   Timeout = 180, Failure=Xpn$Signal);
+
+
+	D$Strace(.P_Nlb[Nlb$a_Node_Name],.P_Nlb[Nlb$h_Jfn]);		!663
+
+        Dap$Put_Config(.P_Odd, Dap$k_Buffer_Size);
+        Dap$Put_Message(.P_Odd);          ! Send configuration
+
+        Dap$Get_Config (.P_Idd, .P_Cfgblk, ufab);       ! Get one back    !m644
+
+        ! Workaround VMS BYTLM bug.
+        ! If user BYTLM is less than our buffersize, VMS FAL hangs
+        ! trying to send a message that is too large.
+        ! Currently we set a limit of what the VAX sends us - 256
+        IF .Vmsbug[Vms_Bug_Bytlm_Hang]  ! VMS does not check its own limit
+        AND (.P_Cfgblk[Xab$b_Ostype] EQL Dap$k_Vms)
+        THEN
+            BEGIN                   ! Exchange new configurations
+            LOCAL Bufsiz;           ! Gets lower of our max or vms's
+            Bufsiz=MIN(.P_Cfgblk[Xab$h_Bufsiz]-.Vmsslp, Dap$k_Buffer_Size);
+
+            Dap$Put_Config (.P_Odd,.Bufsiz);
+            Dap$Put_Message(.P_Odd);
+            Dap$Get_Config(.P_Idd,.P_Cfgblk,ufab);                        !m644
+            P_Cfgblk[Xab$h_Bufsiz]=.Bufsiz;        ! Don't forget the slop
+            END;
+        END
+    ELSE
+        BEGIN                           ! Set up local pointers
+        P_Idd=.Fst[Fst$a_I_Dd];
+        P_Odd=.Fst[Fst$a_O_Dd];
+        P_Nlb=.Fst[Fst$a_Nlb];
+        P_Cfgblk=.Fst[Fst$a_Config];
+        END;
+
+    ! The link is now open, and CONFIG messages have been exchanged.
+    ! All pointers have been set up
+
+        BEGIN
+        BIND Idd=.P_Idd: $Dap_Descriptor,
+             Odd=.P_Odd: $Dap_Descriptor,
+             Nlb=.P_Nlb: $Xpn_Nlb(),
+             Nam=.UFab[Fab$a_Nam]: $Nam_decl,
+             Cfgblk=.P_Cfgblk: $XabCfg_Decl;
+        LOCAL Fop: BITVECTOR[18];                                        !a573
+
+        ! Remember the function we were trying to do
+        Fst[Fst$b_Operation]=.Function<0,8>;                             !m566
+
+        ! Use smaller of local & remote buffer sizes ( but 0 = infinity )
+        IF (.Cfgblk[Xab$h_Bufsiz] GTR 0)
+        THEN Odd[Dap$h_Message_Length]=
+               MIN(.Odd[Dap$h_Message_Length],.Cfgblk[Xab$h_Bufsiz]); ![14]
+
+        !+
+        ! Update state bits
+        !-
+        Fst[Fst$v_Close_Done] = 0;                                !a566
+
+        !+
+        ! If the file is already open (because of $PARSE)
+        ! then fill in config block if any and return
+        !-
+                                                                !a571ff
+        IF (.Fst[Fst$v_File_Open] AND .Fst[Fst$v_Drj]) ! Already opened
+        OR (.Function EQL 0)                           ! or didn't want to
+        THEN
+            BEGIN
+            LOCAL xabcfg: REF $XabCfg_decl;
+            xabcfg = UAddr(.UFab[Fab$a_Xab]);
+            WHILE .xabcfg NEQ 0
+            DO  BEGIN
+                IF .xabcfg[Xab$v_Cod] EQL Xab$k_Cfg   ! Return config
+                THEN
+                    BEGIN               ! Copy non-header portion of config 
+                    IF .rmssec EQL 0  
+                    THEN $move_words ( Cfgblk+Xab$k_HdrLen,    ! Section 0
+                                       .XabCfg+Xab$k_HdrLen,
+                                       Xab$k_CfgLen-Xab$k_HdrLen )  
+                    ELSE $Rms$Xcopy  ( Cfgblk+Xab$k_HdrLen, ! Section nonzero
+                                       .XabCfg+Xab$k_HdrLen,
+                                       Xab$k_CfgLen-Xab$k_HdrLen );    
+                    EXITLOOP;
+                    END
+                ELSE xabcfg=UAddr(.xabcfg[Xab$a_Nxt]);
+                END;
+
+            Fst[Fst$v_Open_Done] = 1;
+
+            CASE .Function FROM 0 TO Dap$k_Execute OF                   !a577
+            SET        ! By NAM block
+            [0,
+             Dap$k_Open]:  RETURN (UFab[Fab$h_Sts]=Rms$_Suc);
+            [Dap$k_Create]: Dap$Close( UFab, Err ); ! Close up before creating
+            [Dap$k_Erase]:
+                 BEGIN
+                 Fst[Fst$v_Dlt] = 1;    ! Set delete-on-close
+                 RETURN Dap$Close( UFab, Err ); ! And close it
+                 END;
+            [Dap$k_Submit]:
+                 BEGIN
+                 Fst[Fst$v_Scf] = 1;    ! Set delete-on-close
+                 RETURN Dap$Close( UFab, Err ); ! And close it
+                 END;
+            [Dap$k_Rename]:
+                 BEGIN
+                 Dap$EndAccess( UFab, Dap$k_Accomp_Change_Begin, r$null );
+                 RETURN Dap$EndAccess( Nfab, Dap$k_Accomp_Change_End, r$null );
+                 END;
+            [INRANGE]: ;                 ! nothing special
+            [OUTRANGE]: UserError(Rms$_Bug);
+            TES;
+            END;
+
+        !+
+        ! Check for unsupported features
+        !-
+
+        ! Block mode is only permissible between homogenous systems
+        ! (in our case 36-bit systems)
+                                                                         !m645v
+        IF .UFab[Fab$v_Bio]                                    ! Block mode and
+           AND NOT (.cfgblk[XAB$B_OSTYPE] EQL XAB$K_TOPS20     ! not TOPS-20 or
+                    OR .cfgblk[XAB$B_OSTYPE] EQL XAB$K_TOPS10) !     TOPS-10?
+        THEN SIGNAL(UFab[Fab$h_Sts]=Rms$_Ons,                            !m645^
+                    UFab[Fab$h_Stv]=Dap$k_Mac_Unsupported+Dap$k_Mic_Access_Fac,
+                    UFab);
+
+        !+
+        ! Get File datatype from TYP block if specified
+        ! Default datatype if no TYP block given
+        !-
+
+        IF .UFab[Fab$a_Typ] NEQ 0
+        THEN Class
+               = Fst[Fst$h_File_Class]
+               = .BLOCK[UAddr(.UFab[Fab$a_Typ]),Typ$h_Class]             !m566
+        ELSE Class=0;
+
+        !+
+        !  Default the file class if it was not specified
+        !  Default is ASCII unless talking to another 20,
+        !  running the RMS FAL, in which case it is IMAGE
+        !-
+
+        IF .Class EQL 0 
+        THEN
+            BEGIN                                                       !a555vv
+            IF  (.UFab[Fab$v_Rfm] NEQ Fab$k_Stm) ! not stream            !a560
+            AND (.UFab[Fab$v_Rfm] NEQ Fab$k_Lsa) ! not sequenced         !a560
+            AND ( (.CfgBlk[Xab$b_FileSys] EQL Our_Filesys)              !m577
+                 OR (.CfgBlk[Xab$b_FileSys] EQL Xab$k_Filesys_Tops10) ) !m577
+            THEN Class = Typ$k_Image
+            ELSE Class = Typ$k_Ascii;         
+
+            Fst[Fst$h_File_Class] = .Class;
+            END;                                                        !a555^^
+
+        ! Default the RFM to something reasonable if this is an ASCII file
+
+        IF (.Class EQL Typ$k_Ascii) AND (.UFab[Fab$v_Rfm] EQL Fab$k_Udf)
+        THEN
+            BEGIN
+            CASE .Cfgblk[Xab$b_Ostype]
+            FROM 1 TO Dap$k_Ostype_Max OF
+            SET
+            [Dap$k_Rsts,
+             Dap$k_Tops10,
+             Dap$k_Tops20,
+             Dap$k_Rt11,
+             Dap$k_Os8,
+             Dap$k_Rts8]:  UFab[Fab$v_Rfm]=Fab$k_Stm;
+
+            [INRANGE]:
+                 BEGIN
+                 UFab[Fab$v_Rfm]=Fab$k_Var;       ![7] Variable
+                 IF .UFab[Fab$h_Rat] EQL 0        ![17] If no record attributes
+                 THEN UFab[Fab$v_Cr]=1;            ![7] Set Implied CRLF
+                 END;
+
+            [OUTRANGE]: SIGNAL(Rms$_Dpe,
+                               Dap$k_Mac_Invalid+Dap$k_Mic_Config_Ostype,
+                               UFab);
+            TES;
+            END;     
+
+
+        IF .Fst[Fst$v_Access_Active] EQL 0      ! If we are not in the middle
+        THEN                                    ! of a wildcard access
+            BEGIN
+            Fst[Fst$v_Error] = 0;       ! We did not get an error yet     !a566
+                                                                          !d573
+            !
+            ! Send the Attributes message
+            !
+
+            Fop = .UFab[Fab$h_Fop];
+
+            ! Clear the close-type FOP bits so IAS doesn't complain
+            Fst[Fst$h_Fop] = UFab[Fab$h_Fop]
+                           = .UFab[Fab$h_Fop] AND NOT FopCloseBits;       !m600
+
+            Display = Fst[Fst$v_Display]
+              = (IF (.Function EQL Dap$k_Open) AND (NOT .UFab[Fab$v_Cif]) !m573
+                 THEN 1^Dap$v_Display_Attributes
+                 ELSE D$SDisplay( UFab ) ) ;
+
+
+            Dap$Put_Attributes (Odd, UFab);            ! Send Attributes
+
+            IF .UFab[Fab$v_Cif] THEN UFab[Fab$v_Sup]=0; ![11] CIF overrides SUP
+
+            !
+            ! If FOP bit CIF (Create-if) is set, make CREATE into OPEN
+            !
+
+!607            IF .UFab[Fab$v_Cif] AND (.Function EQL Dap$k_Create)
+!607            THEN Function=Dap$k_Open;
+
+            !
+            ! Send the Access message
+            !
+
+            Accopt=.Fst[Fst$v_Accopt];
+
+            ! Now see what attributes we want on the access.
+            ! We will ask for whatever we have XAB's, etc for.
+            Display = D$SDisplay( UFab );                                 !m577
+
+            ! If $Rename, check both FABS and or the bits
+            IF .Function EQL Dap$k_Rename                                 !a577
+            THEN Display = .Display OR D$Sdisplay( NFab );
+
+            ! If indexed $Open, always request key attributes             !627
+            IF (.Function EQL Dap$k_Open)
+            AND (.UFab[Fab$v_Org] EQL Fab$k_Idx)
+            THEN 
+               BEGIN
+                    IF .CfgBlk[Xab$v_Key_Definition]
+                    THEN Display[Dap$v_Display_Key]=1;
+               END;
+
+            Fst[Fst$v_Display] = .Display;                                !a577
+
+            Dap$Put_Access( Odd,
+                            UFab,
+                            .Function<0,8>,   ! low byte is function code !m566
+                            Accopt,
+                            Display,
+                            Nfab);
+            Dap$Put_Message(Odd);
+            END;
+
+        SELECT Dap$Get_Header( idd ) OF      ! Peek at next message      !m566v
+        SET
+        [ALWAYS]:
+            Dap$Unget_Header( idd );         ! Put message back
+
+        [Dap$k_Attributes,
+         Dap$k_Name]:                        ! We got a file 
+            SELECT .Function OF
+            SET
+            [ALWAYS]:
+                Fst[Fst$v_Access_Active] = 1; ! Access in progress
+
+            [Dap$k_Open + Fab$m_Nam,    ! This was really $Parse
+             Dap$k_Directory]:                                              !
+                BEGIN
+                UFab[Fab$h_Fop] = Fst[Fst$h_Fop] = .Fop;                  !a573
+                RETURN UFab[Fab$h_Sts]= Rms$_Suc;
+                ! Get directory info on SEARCH
+                END;
+            TES;
+        TES;                                                             !m566^
+
+        Dap$Get_Attributes(Idd, UFab);       ! Get returned Attributes
+
+        !+
+        ! If remote system changed the file datatype
+        ! and it knows about such things
+        ! and we did not insist on a particular one, use theirs
+        !-
+        IF (UClass( UFab ) EQL 0)
+        AND (.CfgBlk[Xab$b_Filesys] EQL Xab$k_Filesys_Rms20)
+        THEN
+            BEGIN
+            IF Typ NEQ 0
+            THEN Typ[Typ$h_Class] = .Fst[Fst$h_File_Class];
+            END;
+
+        !+
+        !  $Rename returns an Ack after the first set of attributes
+        !  if it was supposed to return attributes for both filespecs
+        !  This sets the File_Open bit.  The access complete after
+        !  the second set of attributes should clear it, but we will
+        !  anyway, just to be sure.
+        !-
+        IF (.Function EQL Dap$k_Rename) ! If Rename,                     !a577v
+        AND .Fst[Fst$v_File_Open]       ! Must be intermediate state
+        THEN
+            BEGIN
+            Dap$Get_Attributes( Idd, NFab ); ! Get attrs for new fab
+            Fst[Fst$v_File_Open] = 0;   ! Defensive
+            END;                                                         !a577^
+
+        UFab[Fab$h_Fop] = Fst[Fst$h_Fop] = .Fop;                           !a573
+
+        IF (.Fst[Fst$v_Drj] EQL 0)
+        AND (.Fst[Fst$v_File_Open] EQL 0)
+        THEN
+            BEGIN                           ! Close the link & free data strs
+            Fst[Fst$v_Access_Active]=0;                                   !m547
+            Fst[Fst$v_Open_Done]=0;                                       !a566
+            Dap$Close( UFab, .Err );
+            END;
+
+        Fst[Fst$v_Open_Done] = .Fst[Fst$v_File_Open];  ! We did an open 
+
+        UFab[Fab$h_Sts]=Rms$_Suc
+        END                             ! End of common open code
+    END;			!End of DAP$OPENFILE
+
+GLOBAL ROUTINE Dap$Close (P_Fab, Err): =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!   Close a remote file
+!
+! FORMAL PARAMETERS:
+!
+!   P_FAB: Addr of  FAB with a NODEID embedded in the filespec.
+!   ERR: Address of error routine
+!
+! SIDE EFFECTS:
+!
+!   If there are no more files coming:
+!    The link is closed
+!    The subsidiary data structures are freed
+!   If there is another file (wildcarding), the attributes are read into FAB
+!--
+    BEGIN
+    BIND cmpfunc=( IF .Fst[Fst$v_Error] AND (NOT .Fst[Fst$v_File_Open])
+                   THEN Dap$k_Accomp_Skip
+                   ELSE Dap$k_Accomp_Command );
+
+    Dap$EndAccess (.P_Fab, cmpfunc, .Err);
+
+    END;
+GLOBAL ROUTINE Dap$EndAccess (P_Fab, Function, Err): =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!   Complete a remote access with an Access Complete message
+!
+! FORMAL PARAMETERS:
+!
+!   P_FAB: Addr of  FAB with a NODEID embedded in the filespec.
+!   FUNCTION: ACCESS message function code (DAP) or 0 for normal close
+!   ERR: Address of error routine
+!
+! IMPLICIT PARAMETERS:
+!
+!   FST: Addr of FST
+!
+! SIDE EFFECTS:
+!
+!   If there are no more files coming:
+!    The link is closed
+!    The subsidiary data structures are freed
+!   If there is another file (wildcarding), the attributes are read into FAB
+!--
+    BEGIN
+    BIND UFab=.P_Fab: $FAB_DECL;
+    BIND UFst=.Fst: $Rms_Fst;                                             !m572
+    BIND URst=.UFst[Fst$a_Flink]: $Rms_Rst;! CRC only works with 1 stream !m566
+    BIND Odd=.Fst[Fst$a_O_Dd]: $Dap_Descriptor;
+    BIND Idd=.Fst[Fst$a_I_Dd]: $Dap_Descriptor;
+    BIND Nlb=.Fst[Fst$a_Nlb]: $Xpn_Nlb();
+    BIND Cfg=.Fst[Fst$a_Config]: $Xabcfg_Decl;
+
+    LOCAL v;                            ! Temp for returned value
+    LOCAL Fabsav: VOLATILE;
+    LOCAL Errsav: VOLATILE;
+
+    ENABLE Dap$Handle(Fabsav,Errsav);   ! Setup Condition handler
+    Errsav=.Err;
+    Fabsav=UFab;                        ! Handler will need this
+
+    IF .err EQL 0 THEN err = r$null ;   ![22] Default to do-nothing routine
+
+    IF UFst EQL 0 THEN RETURN RMS$_IFI; ! If no FST, nothing open         !m572
+    IF Nlb EQL 0 THEN RETURN RMS$_IFI;  ! If no NLB, nothing either       !a577
+
+    IF .Function GTR Dap$k_Accomp_Max   ![22] range check
+    THEN SIGNAL(Rms$_Bug,
+                Dap$k_Mac_Invalid+Dap$k_Mic_AcComp_CmpFunc,
+                UFab);
+
+    !+
+    ! If last operation failed
+    ! Send Continue(Abort) as interupt message,
+    ! Then send Accomp
+    !-
+    IF .UFst[Fst$v_File_Open]                                          !m574
+    AND .UFst[Fst$v_Error]
+    THEN
+        BEGIN
+        Odd[Dap$v_Interrupt]=1;
+
+        ! Forget what we were going to send
+        Odd[Dap$h_Bytes_Remaining]=16;   ! Max length for interrupt message
+        Odd[Dap$a_Data]=CH$PLUS(.Odd[Dap$a_Data],-.Odd[Dap$h_Bytes_Used]);
+        Odd[Dap$h_Length] = 0;                            !662
+        Odd[Dap$h_Bytes_Used]=0;                          !to data in message
+
+        Init_Message( Odd );
+        Odd[Dap$b_Operator]=Dap$k_Continue;
+        Dap$Put_Header( Odd );
+        Dap$Put_Byte( Odd, Dap$k_Con_Abort );
+        Dap$Put_Message( Odd );
+        
+        END;
+
+    IF (.UFab[Fab$v_Put] EQL 0) AND (.Function EQL Dap$k_Accomp_Purge)
+    THEN Function=Dap$k_Accomp_Command; ! Some FAL's interpret purge as
+                                        ! erase, even for input files!!
+
+    If .UFst[Fst$v_Access_Active]       ! Send Access complete if active,![23]
+    THEN                                ! otherwise don't bother
+        BEGIN
+        LOCAL Fop: BITVECTOR[42] INITIAL(REP ((%BPUNIT+41)/%BPUNIT) OF (0));
+        LOCAL Foplength;
+
+        ! If last try failed, do a skip
+        IF .UFst[Fst$v_Error] AND (NOT .UFst[Fst$v_File_Open])
+        THEN Function = Dap$k_Accomp_Skip; !m566
+
+        IF .function EQL Dap$k_Accomp_Change_End  ! change attrs on close !a577
+        THEN
+            BEGIN
+            Dap$Put_Attributes( Odd, UFab );
+            Dap$Put_Name( Odd, UFab, %REF(1^Dap$k_Nametype_Fsp) );
+            END;
+
+        $Dap_Move_Bits ( UFst, Fst$v_, Fop, Dap$v_Fop_,
+                         Rwo,Rwc,Pos,Dlk,Lck,
+                         Ctg,Sup,Nef,Tmp,Mkd,Dmo,
+                         Wck,Rck,Cif,Lko,Sqo,Mxv,Spl,
+                         Scf,Dlt,Cbt,Wat,Dfw,Tef,Opf,
+                         Drj,Dfw);                                      !m547 
+
+        IF .Iasbug[Ias_Bug_Acm_Fop]     ![11] IAS does not like most fop bits
+        AND (.Cfg[Xab$b_Ostype] EQL Dap$k_Ias)
+        THEN Fop=(.Fop AND Dap$v_Fop_Spl);
+
+	Foplength=Dap$size_Bitvector(Fop,6,0);
+
+        Init_Message(Odd);
+        Odd[Dap$b_Operator]=Dap$k_Access_Complete;
+
+        IF .Function EQL Dap$k_Accomp_Eos       ! $Disconnect             !a557
+        THEN Odd[Dap$b_StreamId] = .Rst[Rst$v_StreamId]; ! say which rab
+
+        Odd[Dap$v_Mflags_Length]=1;
+        Odd[Dap$h_Length]=.Foplength+1; ! Count length of FOP
+
+        Dap$Put_Header(Odd);
+        Dap$Put_Byte(Odd,.Function);    ! COMMAND (normal) or PURGE (punt)
+
+        IF .Foplength NEQ 0             ! Send FOP if needed
+        THEN Dap$Put_Bitvector(Odd,Fop,6);
+
+        IF .UFst[Fst$v_Accopt_Crc]      ! Send CRC if needed    !a533
+        AND (URst NEQ UFst)             ! And we have an RST    !a533
+        THEN Dap$Put_2Byte( Odd, .URst[Rst$h_Checksum] );       !a533
+
+        Dap$Put_Message (Odd);          ! Shove it out
+
+        IF .function EQL Dap$k_Accomp_Change_Begin
+        THEN RETURN 0;                  ! No response to change_begin
+                                        ! we send attrs & name & change_end
+
+        DO                      ![2] Clean out pipeline
+            BEGIN
+            v=Dap$Get_Header(Idd);      ! Get response
+
+            SELECT .v OF SET
+            [Dap$k_Access_Complete]:
+                BEGIN                               ! Yes,
+                LOCAL Cmpfunc;
+                LOCAL Fop: BITVECTOR[42];
+
+                Cmpfunc=Dap$Get_Byte(Idd);            ![4] Eat rest of message
+                IF .Cmpfunc NEQ Dap$k_Accomp_Response ![4] Is it a response
+                THEN SIGNAL(Rms$_Dpe,0,UFab);         ![4] Error if not
+
+                IF .Function NEQ Dap$k_Accomp_Eos   ! If not $Disconnect !m511
+                THEN
+                    BEGIN
+                    UFst[Fst$v_File_Open]     =     ! File is not open any more
+                    UFst[Fst$v_Error]         =     ! File is not in error
+                    UFst[Fst$v_Open_Done]     =     ! File is not open any more
+                    UFst[Fst$v_Access_Active] = 0;  ! No access any more
+                    UFst[Fst$v_Close_Done]    = 1;  ! File is closed
+
+                    UFst[Fst$v_Drj] = .UFab[Fab$v_Drj]; ! Close link if no drj
+                    END;
+
+                IF .Idd[Dap$h_Bytes_Remaining] GTR 0
+                THEN
+                    BEGIN
+                    Dap$Get_Bitvector(Idd,Fop,6);  ![4] Eat FOP field if any
+
+                    %( Ignore FOP we get back                       !d545
+                    $Dap_Move_Bits (Fop, Dap$k_Fop_, Fab, Fab$v_,
+                                    Rwo,Rwc,Pos,Dlk,Lck,
+                                    Ctg,Sup,Nef,Tmp,Mkd,Dmo,
+                                    Wck,Rck,Cif,Lko,Sqo,Mxv,Spl,
+                                    Scf,Dlt,Cbt,Wat,Dfw,Tef,Opf,
+                                    Drj,Dfw);
+                    )%
+
+                    END;
+
+                IF .idd[dap$h_length] GTR 0     ! If anything left in message
+                THEN                    ! It must be the checksum      !a547 vv
+                    BEGIN
+                    LOCAL checksum;
+
+                    checksum=dap$get_2byte(idd);   ! Then get checksum field
+                    IF (.checksum NEQ .URst[Rst$h_Checksum])
+                    AND .UFst[Fst$v_Accopt_Crc] ! If we care
+                    THEN SIGNAL( Dap$_Crc );
+                    END;                                               !a547 ^^
+
+                EXITLOOP UFab[Fab$h_Sts]=Rms$_Suc;
+                END;
+            [Dap$k_Name]:
+                BEGIN
+                !+
+                ! We closed the file and got a NAME message for another file.
+                ! We flag the access still active
+                !-
+
+                UFst[Fst$v_Access_Active]=1;     ! Accessing another file
+                UFst[Fst$v_File_Open]=1;         ! which is open
+                UFst[Fst$v_Open_Done]=0;         ! but it is not $open'ed yet
+                Fst[Fst$v_Close_Done]=1;         ! last file was closed   !a566
+                UFst[Fst$v_Error]=0;             ! no error yet
+                EXITLOOP Dap$Unget_Header(Idd);  ! Back up for SEARCH
+                END;                             
+            [Dap$k_Status]:
+                BEGIN
+                UsrStv = Dap$Get_Status(Idd);  ! End of file or error     !m566
+                UsrSts = Dap$Error_Dap_Rms(.UsrStv);                      !m566
+                END;                            ! error code
+
+            [Dap$k_Data]: WHILE .Idd[Dap$h_Length] GTR 0 ![2] Eat data
+                          DO Dap$Get_Byte(Idd);          ![2] Chomp! Chomp!
+
+            [OTHERWISE]: SIGNAL( Rms$_Dpe,
+                                 Dap$k_Mac_Sync+.idd[dap$b_operator],
+                                 UFab );
+            TES;
+            END WHILE .Fst[Fst$v_Access_Active];                 !m577
+        END;
+
+    IF ( .UFst[Fst$v_Drj] EQL 0 )      ! Should we keep things open?
+    AND ( .AcmDrl_Mask [ .Function ] EQL 0 )
+    THEN
+        BEGIN
+	LOCAL Nlb_Jfn;
+
+	Nlb_Jfn = .Nlb[Nlb$h_Jfn];
+
+        ! Even if there are more files, we don't want to see them.
+
+        Fst[Fst$v_Access_Active] = 0; ! This must be clear for cleanup    !a604
+
+        $Xpn_Close(Nlb=Nlb, Failure=0);  ! Close the link
+
+        $Xpo_Free_Mem(Binary_Data=(Dap$k_Descriptor_Len,Idd));
+        $Xpo_Free_Mem(Binary_Data=(Nlb$k_Length,Nlb));    
+	Fst[Fst$a_Nlb] = 0;                                               !640
+        $Xpo_Free_Mem(Binary_Data=(Dap$k_Buffer_Size %BLISS36(/4),
+                           %BLISS36( .(Odd[Dap$a_Data])<0,18>)+1 ),
+                           Failure=R$Null
+                           );       ! Deallocate output buffer
+        $Xpo_Free_Mem(Binary_Data=(Dap$k_Descriptor_Len,Odd));
+
+        IF .D$Gtrace LSS 0 THEN			!663
+	   BEGIN
+	     D$ZTrace(.Nlb_Jfn);
+	     D$CTrace ();			! Close any trace log
+	   END;    
+
+        END;
+
+    .v
+    END;                ! Dap$EndAccess
+
+GLOBAL ROUTINE D$SDisplay ( P_Fab ) = 
+BEGIN
+!+
+! FUNCTIONAL DESCRIPTION
+!
+!     See what attributes we want on the access.
+!     We will ask for whatever we have XAB's, etc for.
+!     Set display bits in FST for access or control msg
+!
+! FORMAL PARAMETERS:
+!
+!     P_FAB: Addr of FAB
+!
+! IMPLICIT PARAMETERS:
+!
+!     FST: Addr of FST
+!
+! RETURNED VALUE
+!
+!     BITVECTOR of DAP display bits
+!
+!-
+BIND UFab=.P_Fab: $Fab_decl;                                            !m577
+BIND UFst=.Fst: $Rms_Fst;                                               !m572
+BIND CfgBlk=.UFst[Fst$a_Config]: $XabCfg_decl;
+LOCAL Xab: REF $XabKey_Decl;
+LOCAL Display: BITVECTOR[28] INITIAL(0);
+LOCAL nok: INITIAL(0),          ! # of keys                             !a601
+      noa: INITIAL(0);          ! # of areas                            !a601
+
+If .UFab[Fab$a_Nam] NEQ 0                                               !m577
+THEN
+    BEGIN
+    Display[Dap$v_Display_Nam]=1; ! File name
+    IF .CfgBlk[Xab$v_Display_3_Part_Name]                               !a571
+    THEN Display[Dap$v_Display_3_Part_Name]=1; ! Decomposed File name
+    END;
+
+Xab=.UFab[Fab$a_Xab];                    ! Search the XAB chain         !m601
+
+IF (  .Xab NEQ 0 )                       ! Minimum buffer address       !a601
+AND ( .Xab LSS rms$k_minimum_user_buffer_addr )
+THEN UserError( RMS$_XAB );
+
+WHILE .Xab NEQ 0
+DO  BEGIN
+    Xab=UAddr(.Xab);                    ! Extendify                       !a601
+
+    IF .Xab[Xab$h_Bid] NEQ Xab$k_Bid  ! Is it really an XAB at all?       !a601
+    THEN UserError( Rms$_Xab );
+
+    CASE .Xab[Xab$v_Cod] FROM Xab$K_Key TO xab$k_Cod_Max OF               !m601
+        SET
+
+        [Xab$k_Key]: BEGIN
+                     IF .Xab[Xab$h_Bln] NEQ Xab$k_KeyLen
+                     THEN UserError( Rms$_Bln );
+                     IF .Xab[Xab$b_Ref] LSS .Nok
+                     THEN UserError( Rms$_Ref );
+                     Nok = .Xab[Xab$b_Ref] + 1;
+                     IF .CfgBlk[Xab$v_Key_Definition]                !m571ff
+                     THEN Display[Dap$v_Display_Key]=1;
+                     END;
+
+        [Xab$k_All]: BEGIN
+                     MAP Xab: REF $XabAll_decl;
+                     IF .Xab[Xab$h_Bln] NEQ Xab$k_AllLen
+                     THEN UserError( Rms$_Bln );
+                     IF .Xab[Xab$b_Aid] LSS .Noa
+                     THEN UserError( Rms$_Ref );
+                     Noa = .Xab[Xab$b_Aid] + 1;
+                     IF .CfgBlk[Xab$v_Allocation]
+                     THEN Display[Dap$v_Display_All]=1;
+                     END;
+
+        [Xab$k_Dat]: BEGIN
+                     IF .Xab[Xab$h_Bln] NEQ Xab$k_DatLen
+                     THEN UserError( Rms$_Bln );
+                     IF .CfgBlk[Xab$v_Date_Time]
+                     THEN Display[Dap$v_Display_Dat]=1;
+                     END;
+
+        [Xab$k_Sum]: BEGIN
+                     IF .Xab[Xab$h_Bln] NEQ Xab$k_SumLen
+                     THEN UserError( Rms$_Bln );
+                     IF .CfgBlk[Xab$v_Summary]
+                     THEN Display[Dap$v_Display_Sum]=1;
+                     END;
+
+        [XAB$K_PRO]: BEGIN
+                     IF .xab[XAB$H_BLN] NEQ XAB$K_PROLEN
+                     THEN usererror (RMS$_BLN);
+                     IF .cfgblk[XAB$V_PROTECTION]
+                     THEN display[DAP$V_DISPLAY_PRO]=1;
+                     END;
+        [INRANGE]:;
+        [OUTRANGE]: usererror (RMS$_COD);
+        TES;
+
+    Xab=.Xab[Xab$a_Nxt];     ! On to the next one                         !m601
+
+    ! If chain continues, check Minimum buffer address
+    IF  ( .Xab NEQ 0 )                                                    !a601
+    AND  ( .Xab LSS rms$k_minimum_user_buffer_addr )
+    THEN UserError( RMS$_NXT );
+    END;
+
+Display[Dap$v_Display_Att]=1;   ! Always get main attributes
+.Display                                ! Return the entire bitvector
+END;
+END            !End of module
+ELUDOM
+   

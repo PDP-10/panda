@@ -1,0 +1,679 @@
+%TITLE 'XPNEVE - Return event information for logical links'
+MODULE XPNEVE (
+               ENTRY ( XPN$EVENT_INFO )
+              ) =
+BEGIN
+!  COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1981, 1986.
+!  ALL RIGHTS RESERVED.
+!  
+!  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!  COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!  THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!  ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!  AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!  SOFTWARE IS HEREBY TRANSFERRED.
+!  
+!  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!  NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!  EQUIPMENT CORPORATION.
+!  
+!  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!  ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+
+!++
+! FACILITY:
+!   BLISSnet-20, the TOPS-20 implementation of the Transportable BLISS
+!   interface to DECNET.
+!
+! ABSTRACT:
+!   This module supports the BLISSnet macro $XPN_EVENT_INFO.
+!
+! ENVIRONMENT:
+!   TOPS-20 user mode with XPORT.
+!
+! AUTHOR: Larry Campbell, CREATION DATE: November 20, 1981
+!
+! MODIFIED BY:
+!
+!--
+
+!
+! TABLE OF CONTENTS:
+!
+FORWARD ROUTINE
+    xpn$event_info,                     ! Outer routine, called by user
+    xpn$$event_info,                    ! Does the actual work
+    xpn$$connect,                       ! Check for connect event
+    xpn$$aborted,                       ! Check for abort
+    xpn$$interrupt,                     ! Check for interrupt message
+    xpn$$link_service,                  ! Check for link service message
+    xpn$$data_available,                ! Check for data available
+    xpn$$disconnected,                  ! Check for disconnect event
+    xpn$$get_connect_info : NOVALUE;    ! Reads remote object information
+!
+! INCLUDE FILES:
+!
+LIBRARY 'BLI:XPORT';
+LIBRARY 'BLISSNET';
+LIBRARY 'BLI:MONSYM';
+LIBRARY 'BLISSNET20';
+REQUIRE 'JSYSDEF';
+!
+! MACROS:
+!
+
+!
+! EQUATED SYMBOLS:
+!
+
+!
+! OWN STORAGE:
+!
+
+!
+! EXTERNAL REFERENCES:
+!
+EXTERNAL ROUTINE
+    xpn$$new_buffer : NOVALUE,          ! Sets new buffer in NLB
+    xpn$$link_status,                   ! Returns status of a link
+    xpn$$valid_nlb,                     ! Validates an NLB
+    xpn$$int_set : NOVALUE,             ! Set interrupts for list of NLBs
+    xpn$$sleep : NOVALUE;               ! Sleep for n milliseconds
+
+GLOBAL ROUTINE xpn$event_info (nlb_vector, success, failure, output, wait) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Outer routine called by $XPN_EVENT_INFO macro.  This routine
+!   validates the NLBs, calls xpn$$event_info to do the work, and handles
+!   user-supplied success/failure routines.
+!
+! FORMAL PARAMETERS:
+!   nlb_vector          - counted vector (0th element is count) of addresses
+!                         of Network Link Blocks to check
+!   success             - optional address of routine to call on success
+!   failure             - optional address of routine to call on failure
+!   output              - this gets address of NLB for which an event occurred
+!   wait                - 0 to return immediately, 1 to wait for an event
+!                         to occur before returning
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!    Success codes:
+!       Any code returned by xpn$$event_info
+!
+!    Error codes:
+!       XPN$_BADVECTOR  - an invalid NLB vector was passed
+!       XPN$_NOT_OPEN   - one of the NLBs was not open
+!       In addition, any error code from xpn$$event_info may be returned
+!
+! SIDE EFFECTS:
+!   If an event occurred, output gets the address of the pertinent NLB.
+!   Otherwise a zero is stored in output.
+!
+!--
+    BEGIN
+
+    MAP
+        nlb_vector : REF VECTOR[1];
+
+    LOCAL
+        out_nlb : REF $XPN_NLB(),       ! address of NLB for which event occurred
+        this_nlb : REF $XPN_NLB(),      ! Current NLB
+        retcode,                        ! Return code from xpn$$event_info
+        retcode_2ndary;                 ! Secondary returned code
+    !
+    ! Validate the NLBs first
+    !
+    INCR index FROM 1 TO .nlb_vector[0] DO
+        BEGIN
+        IF NOT (retcode = xpn$$valid_nlb (.nlb_vector[.index])) THEN
+            BEGIN
+            IF .output NEQ 0 THEN (.output) = .nlb_vector[.index];
+            EXITLOOP
+            END;
+        this_nlb = .nlb_vector[.index];
+        IF NOT .this_nlb[NLB$V_OPEN] THEN
+            BEGIN
+            retcode = XPN$_NOT_OPEN;
+            IF .output NEQ 0 THEN (.output) = .this_nlb;
+            EXITLOOP
+            END
+        END;
+    !
+    ! Call xpn$$event_info to do the work, if the NLBs were valid
+    !
+    out_nlb = 0;
+    WHILE 1 DO
+        BEGIN
+        !
+        ! Insure interrupts are enabled for all NLBs
+        !
+        xpn$$int_set (.nlb_vector);
+        !
+        ! Check for events
+        !
+        IF .retcode THEN retcode = xpn$$event_info (.nlb_vector, out_nlb);
+        !
+        ! If user specified WAIT and no event, sleep and try again.  If
+        ! all links are passive and waiting for connect, we can do an infinite
+        ! sleep.  However, if links are active we must do short sleeps because
+        ! not all abort/disconnect events cause interrupts (sigh).
+        !
+        IF NOT (.wait AND (.retcode EQL XPN$_NO_EVENT))
+        THEN
+            EXITLOOP
+        ELSE
+            BEGIN
+            LOCAL
+                infinite_sleep_allowed;
+            infinite_sleep_allowed = 1;
+            INCR i FROM 1 TO .nlb_vector[0]
+            DO
+                BEGIN
+                BIND
+                    this_nlb = .nlb_vector[.i] : $XPN_NLB ();
+                infinite_sleep_allowed = .this_nlb[NLB$V_PASSIVE]
+                                         AND (NOT .this_nlb[NLB$V_CONNECTED])
+                                         AND (NOT .this_nlb[NLB$V_CONN_REQ])
+                                         AND .infinite_sleep_allowed;
+                !
+                ! Count down the timer if one exists
+                !
+                IF .this_nlb[NLB$B_TIMEOUT] GTR 0
+                THEN
+                    IF (this_nlb[NLB$B_TIMEOUT] =
+                        .this_nlb[NLB$B_TIMEOUT] - 1) LEQ 0
+                    THEN
+                        EXITLOOP (out_nlb = this_nlb; retcode = XPN$_TIMEOUT);
+                END;
+            IF .infinite_sleep_allowed
+            THEN
+                xpn$$sleep (0)          ! forever
+            ELSE
+                xpn$$sleep (1000)       ! Sleep for one second
+            END
+        END;
+    !
+    ! Store the output NLB address if user requested it
+    !
+    IF (.output NEQ 0) AND (.out_nlb NEQ 0) THEN (.output) = .out_nlb;
+    !
+    ! Check completion code and call action routines if appropriate
+    !
+    IF .retcode EQL XPN$_NO_EVENT
+        THEN out_nlb = .nlb_vector[1];
+    IF .out_nlb NEQ 0
+        THEN retcode_2ndary = .out_nlb[NLB$G_2ND_CODE]
+        ELSE retcode_2ndary = 0;
+    IF .retcode THEN
+        BEGIN
+        !
+        ! Call success routine if one specified
+        !
+        IF .success NEQ 0 THEN
+            retcode =
+                (.success) (XPN$K_EVENT, .retcode,
+                                    .retcode_2ndary, .out_nlb)
+        END
+    ELSE
+        IF .failure NEQ 0 THEN
+            retcode =
+                (.failure) (XPN$K_EVENT, .retcode,
+                                    .retcode_2ndary, .out_nlb);
+    RETURN (.retcode)
+    END;
+
+ROUTINE xpn$$event_info (nlb_vec, out_nlb) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   This routine does the work for xpn$event_info.  When it is called,
+!   the vector and each NLB in it have been validated.  The vector is
+!   scanned in priority order for events and, when one is found, out_nlb
+!   gets the address of the culpable NLB and the appropriate completion
+!   code is returned.
+!
+! FORMAL PARAMETERS:
+!   nlb_vec             - counted vector of NLB addresses
+!   out_nlb             - where to store address of interesting NLB
+!
+! IMPLICIT INPUTS:
+!   The state of each net link is examined with MTOPR JSYSes.
+!
+! IMPLICIT OUTPUTS:
+!   For the "interesting" NLB, the following fields may be updated:
+!       NLB$V_STATUS    - any bit here might be set or cleared
+!
+!   If a connect initiate event occurs for a passive link, the following
+!   fields (or the descriptors pointed to by the fields) may be updated:
+!       NLB$B_REM_FORMAT        - Object descriptor format for remote object
+!       NLB$B_REM_OBJTYP        - Remote object type
+!       NLB$A_NODE_NAME         - Remote node name
+!       NLB$A_REM_DESCR         - Remote object descriptor
+!       NLB$A_USER_ID           - User-ID supplied by remote task
+!       NLB$A_PASSWORD          - Password supplied by remote task
+!       NLB$A_ACCOUNT           - Account string supplied by remote task
+!       NLB$A_OPTIONAL          - Optional data supplied by remote task
+!       NLB$H_REM_USER          - Remote object's user code
+!       NLB$H_REM_GROUP         - Remote object's group code
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   Success codes:
+!	XPN$_NO_EVENT   - no event has occurred
+!       XPN$_CONNECT    - a connect event occurred
+!       XPN$_INTERRUPT  - an interrupt message arrived
+!       XPN$_LINK_SERV  - a link service message arrived
+!       XPN$_DATA       - a data message arrived
+!       XPN$_COMPLETED  - a previous I/O operation has finished
+!
+!   Warning codes:
+!       XPN$_ABORTED    - an abort or connect reject event occurred
+!       XPN$_DISCONN    - a disconnect event occurred
+!
+!   Error codes:
+!       XPN$_NOT_OPEN   - NLB was not opened
+!       XPN$_BAD_NLB    - an invalid NLB was detected
+!
+! SIDE EFFECTS:
+!   out_nlb             - gets the address of the NLB for which an event
+!                         occurred
+!
+!--
+    BEGIN
+
+    MAP
+        nlb_vec : REF VECTOR[0];
+    !
+    ! Loop through the NLB vector and check each one for events.
+    !
+    INCR nlb_index FROM 1 TO .nlb_vec[0] DO
+        BEGIN
+        (.out_nlb) = .nlb_vec[.nlb_index];
+        IF xpn$$connect (..out_nlb) THEN RETURN (XPN$_CONNECT);
+        IF xpn$$aborted (..out_nlb) THEN RETURN (XPN$_ABORTED);
+        IF xpn$$interrupt (..out_nlb) THEN RETURN (XPN$_INTERRUPT);
+        IF xpn$$link_service (..out_nlb) THEN RETURN (XPN$_LINK_SERV);
+        IF xpn$$data_available (..out_nlb) THEN RETURN (XPN$_DATA);
+        IF xpn$$disconnected (..out_nlb) THEN RETURN (XPN$_DISCONN);
+        END;
+    (.out_nlb) = 0;
+    RETURN (XPN$_NO_EVENT)
+    END;
+
+ROUTINE xpn$$connect (nlb) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Check to see if a connect completion (connect accept, for active links,
+!   or connect initiate, for passive links) has occurred.
+!
+! FORMAL PARAMETERS:
+!   nlb         - address of the NLB to check
+!
+! IMPLICIT INPUTS:
+!   The monitor's database is queried via JSYSes.
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!    1  - a connect event has occurred
+!    0  - no connect event occurred
+!
+! SIDE EFFECTS:
+!   NLB$V_STATUS is updated to reflect the new status of the link.
+!
+!--
+    BEGIN
+
+    MAP
+        nlb : REF $XPN_NLB();
+
+    nlb_binds;                          ! Get short names for popular fields
+    !
+    ! If already connected, return false, as we can't have a connect event
+    ! for an already-connected link.
+    !
+    IF .nlb[NLB$V_CONNECTED] THEN RETURN (0);
+    IF active THEN
+        BEGIN
+        !
+        ! If no connect request pending, return false
+        !
+        IF NOT .nlb[NLB$V_CONN_REQ] THEN RETURN (0);
+        !
+        ! OK, link is active and connect request pending. See if satisfied yet.
+        !
+        IF ((xpn$$link_status (.nlb) AND MO_CON) NEQ 0) THEN
+            BEGIN
+            !
+            ! Connect was accepted.  Update NLB$V_STATUS bits and return true.
+            !
+            nlb[NLB$V_CONN_REQ] = 0;
+            nlb[NLB$V_CONNECTED] = 1;
+            RETURN (1)
+            END
+        ELSE
+            RETURN (0)
+        END
+    ELSE
+        !
+        ! Passive, see if waiting for connect confirm (indicates connect
+        ! request has been received)
+        !
+        IF ((xpn$$link_status (.nlb) AND MO_WCC) NEQ 0)
+        THEN
+            BEGIN
+            !
+            ! Connect request arrived.  Update NLB$V_STATUS bits, update
+            ! connect information for the remote task, and return true.
+            !
+            nlb[NLB$V_CONN_REQ] = 1;
+            xpn$$get_connect_info (.nlb);
+            RETURN (1)
+            END
+        ELSE
+            RETURN (0);
+    END;
+
+ROUTINE xpn$$get_connect_info (nlb) : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Gets the connect information for the remote task and stores it in
+!   the appropriate NLB fields.
+!
+! FORMAL PARAMETERS:
+!   nlb         - address of a Network Link Block
+!
+! IMPLICIT INPUTS:
+!   Information returned by various MTOPR% JSYSes.
+!
+! IMPLICIT OUTPUTS:
+!   Information is copied to the appropriate NLB fields.
+!
+! ROUTINE VALUE and 
+! COMPLETION CODES:
+!   NONE
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+    BEGIN
+
+    MAP
+        nlb : REF $XPN_NLB();
+
+    LOCAL
+        count,
+        descr,
+        groups,
+	string_buffer : VECTOR [CH$ALLOCATION (132)];
+    !
+    ! If the user has allocated a descriptor for remote node name, fill it.
+    !
+    IF (descr = .nlb[NLB$A_NODE_NAME]) NEQ 0 THEN
+        BEGIN
+        IF NOT JSYS_MTOPR (.nlb[NLB$H_JFN],
+                           $MORHN,
+                           CH$PTR (string_buffer),
+                           0; ,,count)
+        THEN
+            RETURN;
+        count = ABS (CH$DIFF (.count, CH$PTR (string_buffer)));
+        $STR_COPY (STRING = (.count, CH$PTR (string_buffer)),
+                   TARGET = .descr);
+        END;
+    !
+    ! Get remote object-descriptor, and user and group codes
+    !
+    IF NOT JSYS_MTOPR (.nlb[NLB$H_JFN],
+                       $MOROD,
+                       CH$PTR (string_buffer),
+                       0; , , count, groups)
+    THEN
+        RETURN;
+    !
+    ! If user provided a descriptor for a remote object descriptor,
+    ! fill it up.
+    !
+    IF (descr = .nlb[NLB$A_REM_DESCR]) NEQ 0 THEN
+        BEGIN
+        count = ABS (CH$DIFF (.count, CH$PTR (string_buffer)));
+        $STR_COPY (STRING = (.count, CH$PTR (string_buffer)),
+                   TARGET = .descr)
+        END;
+    nlb[NLB$H_REM_GROUP] = .groups<lh>;
+    nlb[NLB$H_REM_USER] = .groups<rh>;
+    nlb[NLB$V_REM_GROUP] = .groups<lh> NEQ 0;
+    nlb[NLB$V_REM_USER] = .groups<rh> NEQ 0
+    END;
+
+ROUTINE xpn$$aborted (nlb) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Tests to see if a logical link has been aborted.
+!
+! FORMAL PARAMETERS:
+!   nlb         - address of a Network Link Block
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   1   - an abort event occurred
+!   0   - no abort event detected
+!
+! SIDE EFFECTS:
+!   NLB$V_STATUS updated if an abort occurred.
+!
+!--
+    BEGIN
+
+    MAP
+       nlb : REF $XPN_NLB();
+
+    LOCAL
+        link_status;
+
+    IF ((link_status = xpn$$link_status (.nlb)) AND MO_ABT) NEQ 0 THEN
+        BEGIN
+        nlb[NLB$V_ABORTED] = 1;
+        nlb[NLB$V_CONNECTED] = 0;
+        nlb[NLB$G_2ND_CODE] = .link_status<rh>;
+        RETURN (1)
+        END
+    ELSE
+        RETURN (0);
+    END;
+
+ROUTINE xpn$$interrupt (nlb) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Check for arrival of interrupt messages.
+!
+! FORMAL PARAMETERS:
+!   nlb         - address of the Network Link Block
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   NLB$V_STATUS
+!       NLB$V_IRPT_MSG  - set if an interrupt message has arrived
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   0   - no new interrupt messages have arrived
+!   1   - new interrupt messages have arrived
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+    BEGIN
+
+    MAP
+        nlb : REF $XPN_NLB();
+
+    nlb[NLB$V_IRPT_MSG] = ((xpn$$link_status (.nlb) AND MO_INT) NEQ 0)
+
+    END;
+
+ROUTINE xpn$$link_service (nlb) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Test to see if a link service message has been received for a logical link.
+!   Since TOPS-20 does not support user control of link service messages, this
+!   routine merely returns 0 (false).
+!
+! FORMAL PARAMETERS:
+!    nlb        - address of Network Link Block
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   Always returns false (0).
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+    0;
+
+ROUTINE xpn$$data_available (nlb) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   This routine tests for the existence of data available to be read on
+!   a logical link for which a read was previously posted.  If this routine
+!   returns success, then the NLB buffer descriptor points to the data.
+!   Since TOPS-20 does not support user asynchronous I/O, this routine must
+!   actually do the read as well (after having determined that the monitor
+!   is holding a message so we won't block).
+!
+! FORMAL PARAMETERS:
+!   nlb         - address of the Network Link Block.
+!
+! IMPLICIT INPUTS:
+!   nlb[NLB$V_DATA_REQ] - if this bit is off, this routine returns false.
+!   The monitor's database is queried with SIBE and MTOPR JSYSes.
+!
+! IMPLICIT OUTPUTS:
+!   nlb[NLB$V_DATA_REQ] - cleared if input is done (to force caller to post
+!                         another read)
+!   nlb[NLB$T_DATA]     - descriptor pointing to buffer of data read.
+!                         Dynamic memory associated with this descriptor
+!                         may be released and assigned.
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!
+!   0   - no data returned
+!   1   - data was available and has been read
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+    BEGIN
+
+    MAP
+        nlb : REF $XPN_NLB();
+
+    LOCAL
+	link_status;
+    !
+    ! Make sure a read was posted.
+    !
+    IF NOT (.nlb[NLB$V_DATA_REQ]) THEN RETURN (0);
+    !
+    ! Get link status, insure link still viable, see if a message is waiting.
+    !
+    link_status = xpn$$link_status (.nlb);
+    IF (.link_status AND MO_CON) EQL 0 THEN RETURN (0);
+    IF (.link_status AND MO_EOM) EQL 0
+    THEN
+        RETURN (0)                      ! No message, return false
+    ELSE                                ! Else do hair to read message
+        BEGIN
+        LOCAL
+            byte_count;
+        IF JSYS_SIBE (.nlb[NLB$H_JFN]; byte_count)
+        THEN
+            xpn$$bug ('MO%EOM on but SIBE skipped');
+        xpn$$new_buffer (nlb[NLB$T_DATA], .byte_count);
+        IF NOT JSYS_SINR (.nlb[NLB$H_JFN],
+                          .nlb[NLB$A_STRING],
+                          -.byte_count,
+                          0)
+        THEN
+            RETURN (0);
+        nlb[NLB$V_DATA_REQ] = 0;
+        RETURN (1)
+        END;
+    END;			!End of xpn$$data_available
+
+ROUTINE xpn$$disconnected (nlb) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   This routine tests to see if a logical link has been disconnected.
+!
+! FORMAL PARAMETERS:
+!   nlb         - address of the Network Link Block
+!
+! IMPLICIT INPUTS:
+!   The monitor is queried with an MTOPR JSYS (in xpn$$link_status).
+!
+! IMPLICIT OUTPUTS:
+!   NLB$V_CONNECTED     - cleared if link is disconnected
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   0   - link is not disconnected
+!   1   - link is disconnected
+!
+! SIDE EFFECTS
+!	NONE
+!
+!--
+    BEGIN
+
+    MAP
+        nlb : REF $XPN_NLB();
+
+    LOCAL
+        link_status;
+
+    !
+    ! If link isn't connected, we can't have a disconnect event
+    !
+    IF NOT .nlb[NLB$V_CONNECTED] THEN RETURN (0);
+    IF ((link_status = xpn$$link_status (.nlb)) AND MO_CON) EQL 0
+    THEN
+        BEGIN
+        nlb[NLB$V_CONNECTED] = 0;
+        nlb[NLB$G_2ND_CODE] = .link_status<rh>;
+        RETURN (1)
+        END
+    ELSE
+        RETURN (0)
+    END;			!End of xpn$$disconnected
+
+END				!End of module
+ELUDOM

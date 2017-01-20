@@ -1,0 +1,1195 @@
+	TITLE QDMAIL List queued mail files
+	SUBTTL Written by Tom Rindfleisch
+
+	SEARCH MACSYM,MONSYM	;System definitions
+	SALL			;Suppress macro expansions
+	.DIRECTIVE FLBLST	;Sane listings for ASCIZ, etc.
+	.REQUIRE HSTNAM		;Host name routines
+	.REQUIRE SYS:MACREL	;MACSYM support routines
+	.TEXT "/NOINITIAL"	;Suppress loading of JOBDAT
+	.TEXT "QDMAIL/SAVE"	;Save as QDMAIL.EXE
+	.TEXT "/SYMSEG:PSECT:CODE" ;Put symbol table and patch area in CODE
+
+VWHO==0				;Who last edited (0=developers)
+VMAJOR==5			;Same as release of TOPS-20
+VMINOR==3
+VQDML==^D14			;QDMAIL's version number
+
+; *******************************************************************
+; *								    *
+; * QDMAIL is a program to scan the connected directory for various *
+; * queued mail files and to print out the file type and            *
+; * destination host.  It is adapted from MMAILR.              	    *
+; *								    *
+; *******************************************************************
+
+; Routines invoked externally
+
+	EXTERN $GTLCL
+	SUBTTL Conditional Assembly
+
+IFNDEF FTOMLR,<FTOMLR==1>	; Non-zero to process old queue files
+IFNDEF DATORG,<DATORG==1000>	;Data on page 1
+IFNDEF CODORG,<CODORG==10000>	;Code on page 10
+IFNDEF PAGORG,<PAGORG==30000>	;Paged data on page 30
+IFNDEF FREORG,<FREORG==40000>	;Free storage starts at page 40
+
+	SUBTTL Definitions
+
+F==0
+A=1
+B=2
+C=3
+D=4
+E=5
+T=6
+TT=7
+M=10
+N=11
+O=12
+X=14
+Y=15
+Z=16
+P=17
+
+; Character definitions
+
+.CHDEL==177			;Delete
+EOL=.CHCUN			;End of line for PRINT UUO
+
+; Local UUO's
+OPDEF PRINT [1B8]
+OPDEF UTYPE [2B8]
+OPDEF UETYPE [3B8]
+OPDEF UERR [4B8]
+
+; The following print macros do output only if PRINTP is set
+DEFINE TYPE (X)
+   <	UTYPE [ASCIZ /X/]	; Just type string
+   >
+DEFINE CTYPE (X)
+   <	UTYPE 10,[ASCIZ /X/]	; Do crlf and type string
+   >
+DEFINE CITYPE (X)
+   <	UTYPE 1,[ASCIZ /X/]	; Conditional crlf and type string
+   >
+
+DEFINE ETYPE (X)
+   <	UETYPE [ASCIZ /X/]	; Type string (fmt codes)
+   >
+DEFINE CETYPE (X)
+   <	UETYPE 10,[ASCIZ /X/]	; Do crlf and type string (fmt codes)
+   >
+DEFINE CIETYP (X)
+   <	UETYPE 1,[ASCIZ /X/]	; Conditional crlf and type str (fmt codes)
+   >
+
+DEFINE DEFERR (X,Y)
+   <	DEFINE X (Z)
+	   <	IFIDN <Z>,<>,<UERR Y,0>
+		IFDIF <Z>,<>,<UERR Y,[ASCIZ /Z/]>
+	   >
+   >
+
+DEFERR WARN,3
+DEFERR JWARN,7
+DEFERR FATAL,12
+DEFERR JFATAL,16
+
+	SUBTTL Impure storage
+
+	LOC 41
+	JSR UUOH
+
+	.PSECT PAGDAT,PAGORG	;Declare PAGDAT PSECT
+	.ENDPS
+
+	.PSECT FRESTG,FREORG	;Declare FRESTG PSECT
+FSPAG==FREORG/1000
+	.ENDPS
+
+	.PSECT DATA,DATORG	;Enter data area
+
+CORBEG==.			;Start of core initialized at startup
+PRINTP:	BLOCK 1			;If messages should print out
+NPDL==177			;Size of stack
+PDL:	BLOCK NPDL		;Pushdown list
+MPP:	BLOCK 1			;Saved stack ptr for SAVACS/RSTACS
+SAVEP:	BLOCK 1			;Place to save stack ptr in local rtns
+PGTBLL==<1000-FSPAG+^D35>/^D36
+PAGTBL:	BLOCK PGTBLL		;Bit table
+FREPTR:	BLOCK 1			;Tail,,head for free block list
+
+PLINBP:	BLOCK 2			;Start of line in parser
+PWSPBP:	BLOCK 2			;Byte pointer of start of line after whitespace
+PCLNBP:	BLOCK 2			;Where there was a colon
+PDELBP:	BLOCK 2			;Where there was a rubout
+PDELB2:	BLOCK 2			;Where it ends
+
+;;; Structure of a mail file set up block
+DEFINE DFMBLK(SYM)<
+	SYM==MSGLEN
+	MSGLEN==MSGLEN+1
+>;End DEFINE
+
+MSGLEN==0	;Initialize length of block
+DFMBLK(MSGPAG)			;Starting -# pgs,,starting core page
+DFMBLK(MSGJFN)			;File JFN
+DFMBLK(MSGWRT)			;Time msg was queued
+DFMBLK(MSGRXM)			;Time to attempt network retransmissions
+DFMBLK(MSGNTF)			;Time to tell sender of delivery status
+DFMBLK(MSGDEQ)			;Time to dequeue the msg -- dead letter
+MSGBLK:	BLOCK MSGLEN
+
+DIRNUM:	BLOCK 1			;Directory being hacked
+FILIDX:	BLOCK 1			;File tbl index for queued file type
+IFN FTOMLR,<
+   OMLRBF: BLOCK 20		;Buffer for address strings (old MAILER)
+>;IFN FTOMLR
+INUUO:	BLOCK 1			;Safety check to prevent recursive UUO's
+TEMPAC:	BLOCK 1			;Temp ac storage
+ NUPDL==20			;Size of UUO PDL
+UUOPDL:	BLOCK NUPDL		;Pushdown list for processing UUO's
+UUOACS: BLOCK 20		;ACs saved over UUO
+INTPC:	BLOCK 1			;Interrupt PC
+INTACS:	BLOCK 4			;ACs saved over interrupt
+LHOST:	BLOCK 1			;Address of site entry for local host
+NCKNMF:	BLOCK 1			;Non-zero if host name was a nickname
+ HSTBFL==30
+HSTBUF:	BLOCK HSTBFL		;Put string of a host here
+STRBUF:	BLOCK 1000		;String buffer, used globally
+STRBF1:	BLOCK 1000		;Alternative string buffer, used locally
+COREND==.-1			;End of core initialized at startup
+
+DEBUG:	0			;If debugging
+
+;; Routine to save AC's
+SAVACS:	0			;JSR here to save all ACs on stack
+	JRST [	PUSH P,MPP
+		ADJSP P,17
+		MOVEM P,MPP
+		MOVEM 16,(P)
+		MOVEI 16,-16(P)
+		BLT 16,-1(P)
+		JRST @SAVACS]
+
+;; Routine to restore AC's
+RSTACS:	0			;JSR here to restore ACs
+	JRST [	MOVSI 16,-16(P)
+		BLT 16,16
+		ADJSP P,-17
+		POP P,MPP
+		JRST @RSTACS]
+
+	.ENDPS
+
+	SUBTTL Pure storage
+
+	.PSECT CODE,CODORG
+
+BITS:
+...BIT==0
+REPEAT <^D36>,<
+	1B<...BIT>
+	...BIT==...BIT+1
+>;REPEAT <^D36>
+
+; Following are definitions and a table of file names/processing
+; functions to handle delivery of various queued mail formats:
+
+DEFINE FILXX(GSTR,PSTR,PRCHDR,PRCTXT,FLGS)<
+   FL%STR==0
+	[ASCIZ `GSTR`],,[ASCIZ `PSTR`] 	; File group name string and
+					; printing descriptor
+   FL%PRC==1
+	PRCHDR,,PRCTXT			; Setup routines for processing
+					; header/text
+   FL%FLG==2
+	FLGS
+   FL%LEN==3
+>;DEFINE FILXX
+
+; Control flags for processing names
+FF%OML==1B0		;Old style queue file (adr in extension)
+
+FILTBL:
+	FILXX(<[--QUEUED-MAIL--].NEW*>,<Queued Mail [New]:>,GQUEKY,GQUEH1,0)
+	FILXX(<[--QUEUED-MAIL--].NETWORK>,<Queued Mail [Network]:>,GQUEKY,GQUEH1,0)
+	FILXX(<[--QUEUED-MAIL--].RETRANSMIT>,<Queued Mail [Retransmit]:>,GQUEKY,GQUEH1,0)
+	FILXX(<[--RETURNED-MAIL--].>,<Nondelivery Reply:>,GQUEKY,GQUEH1,0)
+	FILXX(<[--RETURNED-MAIL--].NETWORK>,<Nondelivery Reply [Network]:>,GQUEKY,GQUEH1,0)
+	FILXX(<[--RETURNED-MAIL--].RETRANSMIT>,<Nondelivery Reply [Retransmit]:>,GQUEKY,GQUEH1,0)
+	FILXX(<[--BAD-QUEUED-MAIL--].>,<Bad Mail:>,GQUEKY,GQUEH1,0)
+	FILXX(<[--BAD-QUEUED-MAIL--].RETRANSMIT>,<Bad Mail [Retransmit]:>,GQUEKY,GQUEH1,0)
+	FILXX(<[--BAD-RETURNED-MAIL--].>,<Bad Nondelivery Reply:>,GQUEKY,GQUEH1,0)
+	FILXX(<[--BAD-RETURNED-MAIL--].RETRANSMIT>,<Bad Nondelivery Reply [Retransmit]:>,GQUEKY,GQUEH1,0)
+IFN FTOMLR,<
+	FILXX(<[--UNSENT-MAIL--].*>,<Queued Mail [Old Style]:>,GQUEUN,GQUEH0,FF%OML)
+	FILXX(<]--UNSENT-NEGATIVE-ACKNOWLEDGEMENT--[.*>,<Nondelivery Reply [Old Style]:>,GQUEUN,GQUEH0,FF%OML)
+	FILXX(</UNDELIVERABLE-MAIL/.>,<Dead Mail [Old Style]:>,GQUEUN,GQUEH0,FF%OML)
+>;IFN FTOMLR
+NFTBL==<.-FILTBL>/FL%LEN
+
+LCLNAM:	ASCIZ/TOPS-20/		;Gets clobbered at initialization time
+	BLOCK LCLNAM+20-.
+LCLNME==.			;End of local name (for padding purposes)
+
+SUBTTL Main program
+
+; Definition of program entry vector
+ENTVEC:	JRST GO			; Normal entry
+	JRST GO			; REENTER
+	BYTE(3)VWHO(9)VMAJOR(6)VMINOR(18)VQDML ;QDMAIL version
+ENTVCL==.-ENTVEC
+
+GO:	RESET
+	MOVE F,[A,,B]		;Clear out ACs (paranoia)
+	SETZ A,
+	BLT A,P
+	MOVE P,[IOWD NPDL,PDL]	;Set up stack
+	SETZB F,CORBEG		;Clear out impure storage
+	MOVE A,[CORBEG,,CORBEG+1]
+	BLT A,COREND
+	SETOM INUUO		;Init recursive UUO flag
+	MOVEI A,.FHSLF
+	RPCAP			;Get our capabilities
+	IOR C,B			;Enable everything we've got
+	EPCAP
+	HRROI A,LCLNAM		;Try to get local host name
+	CALL $GTLCL
+	 WARN <No local hostname information>
+	GJINF
+	PUSH P,B		;Save connected directory
+	MOVE B,A		;Login user number
+	SETZ A,			;No flags
+	RCDIR			;Convert user number to directory number in C
+	SETOM PRINTP		;Print all messages
+	POP P,B			;Get back connected directory
+	CAMN B,C		;Login same as connected?
+	 JRST DOLOGN		;Yes, just do it and stop
+	PUSH P,C
+	CALL DODIR		;Do connected first
+	TYPE <
+>
+	POP P,B
+DOLOGN:	CALL DODIR		;Do login
+	CALL CLRPTB		;Unmap all remaining pages
+	MOVEI A,.FHSLF		;Clear all files
+	CLZFF
+	HALTF
+	JRST GO			;Restart totally if continue
+
+
+; Here to scan files in a directory
+DODIR:	CIETYP <Trying %2U...>
+	MOVEM B,DIRNUM		;Save directory number
+	MOVE A,[-NFTBL,,FILTBL]	;Init file type index
+TFLUP:	MOVEM A,FILIDX
+	HRROI A,STRBUF		;Set up name string for file sought
+	MOVE B,DIRNUM
+	DIRST
+	 JRST FILUPX		;No go, try next file type
+	MOVE B,FILIDX		;b =: ptr to current file type string
+	HLRZ B,FL%STR(B)
+	CALL MOVST0
+	MOVE A,[GJ%IFG!GJ%OLD!GJ%SHT+<0,,-3>]
+	HRROI B,STRBUF
+	GTJFN
+	 JRST FILUPX		;No go, try next file type
+	MOVE X,A		;Save JFN
+	CALL CRIF
+	MOVE A,FILIDX		;a =: ptr to descriptor string
+	HRRZ A,FL%STR(A)
+	CETYPE <%1W>
+FILUP:	MOVEI A,(X)		;Print the file name
+	CALL DQFIL		;Print the file information
+	 CIETYP <  %1J ...can't map file> ;+1, can't map file
+	 NOP				  ;+2, error processing file
+	MOVE A,X		;Step to next file in this group
+	GNJFN
+	 JRST FILUPX		;No more, try next type
+	JRST FILUP
+
+;; Here to step to the next file type
+FILUPX:	MOVE A,FILIDX		;No, a =: current file type index
+	ADDI A,FL%LEN-1		;Step to next one
+	AOBJN A,TFLUP
+	TYPE <
+>				;Don't do doubled CRLF
+	RET
+
+SUBTTL Queued Mail File Handling
+
+;;; Scan a queued mail file and print out relevant information
+;;; about its queue status and destination.
+; Entry:   a = wild card jfn for file
+; Call:    CALL DQFIL
+; Return:  +1, error mapping file
+;	   +2, error processing file
+;	   +3, success
+DQFIL:	JSR SAVACS		;Save all ACs
+	MOVEI B,(A)		;Make copy of the name
+	HRROI A,STRBUF
+	SETZ C,
+	JFNS
+	HRROI B,STRBUF		;Must get another JFN
+	CALL MAPQFL
+	 JRST RSTRET		;Failed, return
+	MOVEI M,MSGBLK		;m := pointer to msg block
+	MOVEM A,MSGJFN(M)	;Save JFN
+	MOVEM D,MSGPAG(M)	;Save starting copy
+	HLRZS D			;d := # pgs in file
+	CIETYP <  %1J   %4D pg%4P>
+	CALL PARINI		;Initialize parser (ptr to msg text)
+	SETZM MSGRXM(M)		;Clear default retransmission time
+	SETZM MSGNTF(M)		;Clear delivery status notification time
+	SETZM MSGDEQ(M)		;Clear default dequeue time for msg
+	HRRZ A,MSGJFN(M)	;Get file write date
+	CALL .GFWDT
+	MOVEM B,MSGWRT(M)
+	MOVE A,MPP		;Return at least +2 from here
+	AOS -20(A)
+	MOVE A,FILIDX		;a := current file type index
+	HLRZ A,FL%PRC(A)	;a := processing dispatch for header
+	JRST 0(A)		;Do it
+
+IFN FTOMLR,<
+;; Here to fake a header for xxx.<addressee> files
+GQUEUN: PUSH P,X		;Save the current msg string info
+	PUSH P,Y
+	HRROI A,STRBUF		;a := buffer for the extension info
+	HRRZ B,MSGJFN(M)	;b := msg file JFN
+	MOVSI C,000100		;Print extension only
+	JFNS
+	MOVE A,[POINT 7,STRBUF]	;Now scan the string for the host name
+	MOVE B,A
+	SETZB X,Y		;Init host ptr and string length
+GQUEN0:	ILDB C,B		;c := next char
+	JUMPE C,GQUEN1		;Quit on null
+	CAIN C,.CHCNV		;^V?
+	 JRST GQUEN0		;Yes, ignore it
+	CAIN C,"@"		;Start of host?
+	 JRST [ SETZ C,		;Yes, clobber the "@" with a null
+		IDPB C,A
+		MOVE X,A	;Save start of host string
+		JRST GQUEN0 ]
+	IDPB C,A		;Store the char
+	AOJA Y,GQUEN0		;Count the char and do the next
+
+; Here we have the end of the addressee string
+GQUEN1:	SKIPE X			;"@" seen?
+	 CAMN A,X		;Yes, host null?
+	  JRST [MOVE B,[POINT 7,LCLNAM]	;No, use local name
+		MOVE X,A	;Update host ptr (in case no "@")
+		JRST GQUEN0 ]
+	MOVE B,A		;OK, terminate edited string
+	IDPB C,B
+
+; Now we create a fake header (as if [--QUEUED-MAIL--])
+	MOVE A,[POINT 7,OMLRBF]	;a := place to build it
+	MOVEI B,.CHFFD		;Start with ^L<host><crlf>
+	IDPB B,A
+	MOVE B,X		;b := ptr to host string
+	SETZ C,
+	SOUT			;(Have to SOUT - not word boundary)
+	MOVEI B,CRLF0
+	CALL MOVSTR
+	MOVEI B,STRBUF		;Add <addressee><crlf>
+	CALL MOVSTR
+	MOVEI B,CRLF0
+	CALL MOVSTR
+	MOVEI B,.CHFFD		;And finish with ^L<CRLF>
+	IDPB B,A
+	MOVEI B,CRLF0
+	CALL MOVST0
+	MOVE X,[POINT 7,OMLRBF]	;Now set to scan the string
+	ADDI Y,^D8+1		;Account ^L's and <crlf>'s in length
+				;(and 1 so PARLIN thinks a msg follows)
+	JRST GQUEKY		;Make like it's [--QUEUED-MAIL--]
+>;IFN FTOMLR
+
+;; Parse the head of the file
+GQUEKY:	CALL PARLIN		;Get a line from the file
+	 JRST QUEEOF		;Premature eof
+	TRNN F,FP%FF		;Was a formfeed seen?
+	 JRST [	CETYPE <   ?Invalid queued mail file format in line ">
+		JRST QUEBK0]	;Toss the losing file out
+
+;; Now parse the message recipients
+GQUERC:	TRNE F,FP%EOL		;Empty line?
+	 JRST [	TRNE F,FP%EQU	;Control parameter specification?
+		 JRST QUEBPM	;Yes, must be error
+		TRNN F,FP%BKA	;Sender specification?
+		 JRST GQUEHD	;No, must be start of actual message
+		MOVE A,[POINT 7,HSTBUF] ;Yes, substitute local name
+		MOVEI B,LCLNAM
+		CALL MOVST0
+		JRST GQURC0]	;Process it
+	TRNE F,FP%EQU		;Control parameter specification?
+	 JRST [	MOVEI A,QUEPTB	;Yes, lookup in parameter keyword table
+		CALL PARKEY
+		 JRST QUEBPM	;Bad luck...
+		JRST GQURC1]	;Got it, continue processing
+	CALL PARSTR		;Get pointers for this line
+	MOVE B,[POINT 7,HSTBUF]
+	DO.
+	  ILDB A,C		;Make uppercase
+	  IDPB A,B
+	  CAIE A,.CHNUL		;Quit on null
+	   SOJG D,TOP.		;Or count
+	ENDDO.
+	SETZ A,			;Fill out with nulls
+	DO.
+	  IDPB A,B
+	  TLNE B,760000
+	   LOOP.
+	ENDDO.
+GQURC0:	MOVEI A,HSTBUF		;Now print it appropriately
+	TRNE F,FP%BKA		;Sender spec?
+	 JRST [	CETYPE <     From: %1W>
+		JRST GQURC1]
+	CETYPE <     To:   %1W>
+
+;; Here to process the next input line...
+GQURC1:	CALL PARLIN		;Get a line
+	 JRST QUEEOF		;Premature eof
+	TRNE F,FP%FF		;Started with form?
+	 JRST GQUERC		;Yes, next host then
+	JRST GQURC1		;Ignore it and try another line
+
+
+;; Now finish up, remembering where the headers start
+GQUEHD:	MOVE A,FILIDX		;a := index to current file type
+	HRRZ A,FL%PRC(A)	;a := processing dispatch for msg
+	JRST 0(A)		;Do it
+	
+IFN FTOMLR,<
+GQUEH0:	POP P,Y			;Recover ptr info for msg text itself
+	POP P,X
+>;IFN FTOMLR
+GQUEH1:	MOVE A,MSGWRT(M)	;Print date/time msg queued
+	CETYPE <     Queued: %1T>
+	CALL RELQUE		;Release the file
+	JRST RSTSKP		;Skip return from it all
+
+;;; Table of parameter keywords and processing routines
+QUEPTB:	-NQPRMS,,.+1
+	[ASCIZ/AFTER/],,QUEAFT	;Formerly RETRANSMIT
+;	[ASCIZ/DATA/],,QUEDAT
+	[ASCIZ/DELIVERY-OPTIONS/],,QUEDEL
+	[ASCIZ/DEQUEUE/],,QUEDEQ
+	[ASCIZ/DISCARD-ON-ERROR/],,QUEDER
+	[ASCIZ/ERROR/],,QUEERR
+	[ASCIZ/NET-MAIL-FROM-HOST/],,QUEHST
+	[ASCIZ/NOTIFY/],,QUENTF
+	[ASCIZ/RETURN-PATH/],,QUERPT
+NQPRMS=.-QUEPTB-1
+
+;;; Here to process (no-op) "NET-MAIL-FROM-HOST" line
+QUEHST:	RETSKP
+
+;;; Here to fetch time to attempt network retransmissions
+QUEAFT:	CALL GQUTIM		;Decode the time value
+	 RET			;No go
+	MOVEM B,MSGRXM(M)	;Save it
+	RETSKP			;And success return
+
+;;; Here to fetch time to notify sender of transmission status
+QUENTF:	CALL GQUTIM		;Decode the time value
+	 RET			;No go
+	MOVEM B,MSGNTF(M)	;Save it
+	RETSKP			;And success return
+
+;;; Here to fetch time to notify sender of transmission status
+QUEDEQ:	CALL GQUTIM		;Decode the time value
+	 RET			;No go
+	MOVEM B,MSGDEQ(M)	;Save it
+	RETSKP			;And success return
+
+;;; Here to fetch return path
+QUERPT:	RETSKP
+
+;;; Here to fetch return delivery options
+QUEDEL:	RETSKP
+
+;;; Here to set flag for discarding msg without notifying sender if
+;;; failed or dequeued (no-op)
+QUEDER:	RETSKP			;Success return
+
+;;; Here to fetch error log file name
+QUEERR:	RETSKP
+
+;;; Routine to decode a time value for a control parameter
+;;; Return:  +1, error
+;;;	     +2, success - value in b
+GQUTIM:	DMOVE C,PCLNBP		;Rest of line after colon
+	CALL PARST1
+	MOVE A,[POINT 7,STRBF1]	;Temp buffer for time string
+GQUTI0:	ILDB B,C
+	CAIE B," "		;Skip starting spaces and tabs
+	 CAIN B,.CHTAB
+	  JRST [SOJG D,GQUTI0	;Look some more
+		RET]		;Unless string exhausted
+	SKIPA
+GQUTI1:	 ILDB B,C		;Next char
+	IDPB B,A		;Copy it
+	CAIN B,.CHNUL		;Quit on null
+	 JRST GQUTI2
+	SOJG D,GQUTI1		;If not end of string, continue
+	MOVEI B,0		;Else end with null
+	IDPB B,A
+GQUTI2:	HRROI A,STRBF1		;Now convert the time string
+	IDTIM
+	 RET
+	RETSKP
+	
+
+;; Premature EOF
+QUEEOF:	CETYPE <   ?Premature end of file>
+QUEBRT:	CALL RELQUE		;Free entry
+	JRST RSTRET		;Single return
+
+;; Bad keyword
+QUEBKY:	CETYPE <   ?Unrecognized keyword in line ">
+QUEBK0:	MOVEI A,101		;Primary output
+	CALL PARSTR		;Set up line ptr/length
+	MOVE B,C
+	MOVN C,D
+	SOUT
+	SETZ C,
+QUEBK1:	HRROI B,[ASCIZ /"
+/]
+	SOUT
+	JRST QUEBRT
+
+;; Bad control parameter specification
+QUEBPM:	CETYPE <   ?Bad control parameter in line ">
+	JRST QUEBK0
+
+;;; Release storage from queue entry in M
+RELQUE:	HLRZ A,MSGPAG(M)	;a := # pages mapped
+	JUMPE A,RELQUR		;Quit if none touched
+	HRRZ B,MSGPAG(M)	;b := starting page
+	CALL PAGDAL		;Unmap the msg file pages
+RELQUR:	HRRZ A,MSGJFN(M)	;Close the file
+	CLOSF
+	 JFATAL <RELQUE: >
+	RET
+
+
+;;; Map in a file
+; Entry:   b = ptr to name
+; Call:    CALL MAPQFL
+; Return:  +1, error
+;	   +2, success
+;   a = fresh file jfn
+;   b = starting core address
+;   c = # of bytes
+;   d = # pages,,starting core page
+MAPQFL:	PUSH P,[OF%RD!OF%PDT]	;Open read and leave access dates
+	MOVSI A,(GJ%OLD!GJ%SHT)
+	GTJFN
+	IFJER.
+	  POP P,B
+	  RET
+	ENDIF.
+	PUSH P,A		;Save the jfn
+	MOVE B,-1(P)		;Get OPENF flags and open the file
+	OPENF
+	 JRST MPFLOE		;No go	
+	SIZEF			;Fetch its size information
+	 JRST MPFLSE		;No go
+	PUSH P,B		;Save number of bytes
+	MOVEI A,(C)		;Number of pages needed for whole file
+	CALL PAGALC		;Allocate them
+	 JRST MPFLPE		;No go???
+	HRLZ A,-1(P)		;Start with page 0 of file
+	HRLI B,.FHSLF
+	HRLI C,(PM%CNT!PM%RD!PM%CPY)
+	PMAP
+	 ERJMP MPFLPE		;???
+MAPFI1:	HRLI C,(B)
+	MOVS D,C		;d := # pgs,,starting pg
+	LSH B,9			;b := core address of first page
+	POP P,C			;c := # of bytes
+	POP P,-1(P)		;Move the jfn down on the stack
+POPA1J:	POP P,A
+	RETSKP
+
+;; Here on error preparing file map
+MPFLPF:	ADJSP P,-1		;Clear page count from stack
+MPFLPE:	ADJSP P,-1		;Clear byte count from stack
+MPFLSE:	POP P,A			;Close the file
+	CLOSF
+	 NOP
+MPFLSR:	ADJSP P,-1		;Clear OPENF bits
+	RET
+
+;; Here if OPENF fails for file
+MPFLOE:	POP P,A			;Release the jfn
+	RLJFN
+	 NOP
+	JRST MPFLSR		;Fail return
+
+	SUBTTL Parser
+
+;;; Parser flags
+FP%FF==1			;Formfeed seen at start of line
+FP%CLN==2			;Colon seen
+FP%EOL==4			;Blank line (after any formfeed, that is)
+FP%DEL==10			;Rubout on line
+FP%EQU==20			;Equal sign seen (control parameter)
+FP%BKA==40			;Backarrow seen (sender spec)
+FP%WSP==100			;Whitespace at start
+
+;;; Initialize parser, called with starting address in B, byte count in C
+PARINI:	HRLI B,(<POINT 7,0>)
+	DMOVE X,B
+	RET
+
+;;; Parse a single line
+PARLIN:	TRZ F,FP%FF!FP%CLN!FP%EOL!FP%DEL!FP%WSP
+	SETZM PDELB2		;Filter for malformed <del> pairs
+PARLN0:	DMOVEM X,PLINBP		;Save start of line
+PARLN1:	DMOVEM X,PWSPBP
+	SOJL Y,CPOPJ
+	ILDB D,X		;Get first character
+	CAIN D,.CHFFD		;Formfeed?
+	 JRST [	TRO F,FP%FF
+		TRZ F,FP%BKA!FP%EQU  ;Clear special flags
+		JRST PARLN0]
+	CAIN D,"="		;Equal sign?
+	 JRST [ TRO F,FP%EQU	;Yes
+		JRST PARLN0 ]
+	CAIN D,"_"		;Backarrow?
+	 JRST [ TRO F,FP%BKA	;Yes
+		JRST PARLN0 ]
+	CAIE D,.CHTAB
+	 CAIN D,.CHSPC
+	  JRST [TRO F,FP%WSP
+		JRST PARLN1]
+	CAIE D,.CHCRT		;End of line?
+	 JRST PARLN3		;No, normal character
+	TRO F,FP%EOL
+	JRST PARLN4
+
+PARLN2:	SOJL Y,CPOPJ
+	ILDB D,X
+	CAIN D,.CHCRT
+	 JRST PARLN4
+PARLN3:	CAIN D,.CHDEL
+	 JRST PARLN5
+	CAIN D,":"
+	 TROE F,FP%CLN
+	  JRST PARLN2
+	DMOVEM X,PCLNBP		;Save pointers when got to colon
+	JRST PARLN2
+
+PARLN4:	SOJL Y,CPOPJ
+	ILDB D,X		;Skip lf too
+	SKIPG PDELB2		;Matching <del> set?
+	 TRZ F,FP%DEL		;No, ignore any seen
+	RETSKP
+
+PARLN5:	TROE F,FP%DEL		;Rubout within line is start of host
+	 JRST [	SKIPE PDELB2	;Matching pair?
+		 JRST [	SETOM PDELB2  ;No, flag error
+			JRST PARLN2]
+		DMOVEM X,PDELB2
+		JRST PARLN2]
+	DMOVEM X,PDELBP
+	JRST PARLN2
+PARLNE=.			;Bound for interrupt handling
+
+;;; Parse a keyword from table in A
+;;; Returns +1 failure, else calls routine pointed to by table
+PARKEY:	TRNE F,FP%CLN		;Line had a colon in it?
+	 JRST [	MOVE D,PCLNBP	;Yes, use byte pointer of colon then
+		JRST PARKY1]
+	SETO D,
+	ADJBP D,X
+PARKY1:	LDB TT,D		;Get character that terminates atom
+	SETZ T,
+	DPB T,D			;Replace it with null
+	MOVE T,0(A)		;t := aobjn ptr to lookup table
+PARKY2:	HLRZ A,0(T)		;a := ptr to next table entry
+	HRLI A,(<POINT 7,0>)
+	MOVE B,PLINBP		;Start of line
+	CALL STRCMP		;Match?
+	 AOBJN T,PARKY2		;No, try the next
+	DPB TT,D		;Replace character
+	JUMPGE T,CPOPJ		;If no match, return
+	HRRZ A,(T)		;Get entry
+	JRST (A)		;Go call that routine
+
+;;; get pointers for this line
+PARSTR:	DMOVE C,PLINBP
+PARST1:	SUB D,Y
+	SUBI D,2		;Number of chars less CRLF
+	RET
+
+RSTSKP:	MOVE P,MPP		;Be sure stack is reset
+	AOSA -20(P)		;Skip return
+RSTRET:	 MOVE P,MPP		;Be sure stack is reset
+	JSR RSTACS
+	RET
+
+CPOP2J:	AOS (P)
+CPOP1J:	AOS (P)
+CPOPJ:	RET
+
+SUBTTL Core Allocation
+
+;;; Bit table hacking, page number in A for all
+PAGSBT:	PUSH P,[IORM B,(A)]	;Set bit
+	JRST PAGHBT
+
+PAGCBT:	PUSH P,[ANDCAM B,(A)]	;Clear bit
+	JRST PAGHBT
+
+PAGTBT:	PUSH P,[TDNE B,(A)]	;Skip if bit clear
+PAGHBT:	PUSH P,A
+	PUSH P,B
+	SUBI A,FSPAG		;Make relative to start of bit table
+	IDIVI A,^D36
+	MOVEI A,PAGTBL(A)	;Point to right word
+	MOVE B,BITS(B)		;Get right bit
+	XCT -2(P)
+	 SKIPA
+	  AOS -3(P)
+	POP P,B
+	POP P,A
+	ADJSP P,-1
+	RET
+
+;;; Allocate number of pages in A, returns +1 failure, +2 page number in B
+PAGAL1:	MOVEI A,1		;Allocate one page
+PAGALC:	PUSH P,C
+	PUSH P,A		;Save number of pages we need
+	MOVEI B,FSPAG		;Starting free page
+PAGALB:	CALL PAGFFP		;Fast search for first free page
+	 JRST POPACJ		;Failure, just return
+	MOVEI A,1(B)
+	MOVE C,(P)		;Get number of pages to hack again
+PAGALL:	SOJLE C,PAGALW		;Got enough, return address from b
+	CAIL A,1000		;Page number too big?
+	 JRST POPACJ		;Yes, fail
+	CALL PAGTBT		;Is this bit set?
+	 JRST [	MOVEI B,1(A)	;Try for next free page
+		JRST PAGALB]
+	AOJA A,PAGALL		;Try for next match
+PAGALW:	MOVE C,(P)
+	MOVEI A,(B)
+PAGAW1:	CALL PAGSBT		;Allocate one page
+	SOJLE C,POPAC1
+	AOJA A,PAGAW1
+POPAC1:	AOS -2(P)		;Winning return
+POPACJ:	POP P,A
+	POP P,C
+	RET
+
+;;; Deallocate pages, number in A, starting page in B
+PAGDA1:	MOVEI A,1		;Deallocate one page
+PAGDAL:	PUSH P,A
+	PUSH P,B
+	PUSH P,C
+	EXCH A,B		;Setup for page number in A
+PAGDA2:	SOJL B,PAGDA3
+	CALL PAGCBT		;Clear one bit
+	AOJA A,PAGDA2
+PAGDA3:	SETO A,
+	MOVE B,-1(P)		;Starting page
+	HRLI B,.FHSLF
+	MOVE C,-2(P)		;Count
+	HRLI C,(PM%CNT)
+	PMAP			;Flush those pages
+POPCBA:	POP P,C
+POPBAJ:	POP P,B
+CPOPAJ:	POP P,A
+	RET
+
+;;; Fast search for the first free bit, starting page in B
+;;; Returns +1 failure, +2 with page number in B
+PAGFFP:	SUBI B,FSPAG		;Make relative to start of bit table
+	IDIVI B,^D36
+	SETCM A,PAGTBL(B)	;Get first word to check
+	LSH A,(C)
+	MOVNI C,(C)
+	LSH A,(C)		;Clear out random bits to left
+	SKIPA C,B		;Starting word index
+PAGFF1:	 SETCM A,PAGTBL(C)	;Get word to check
+	JFFO A,PAGFF2		;Got any ones?
+	CAIL C,PGTBLL		;No - beyond last word?
+	 RET			;Failed
+	AOJA C,PAGFF1		;No, search for next word
+PAGFF2:	IMULI C,^D36		;Number of bits passed
+	ADDI B,FSPAG(C)		;Final winning page number
+	CAIL B,1000		;Was page valid?
+	 RET			;No
+	RETSKP
+
+; Routine to unmap core buffer pages currently in use
+; Entry:   pagtbl = bitmap for pages in use
+; Call:    CALL CLRPTB
+; Return:  +1
+CLRPTB:	SETO A,			;Unmap special prebuffer pages
+	MOVSI B,.FHSLF
+	SETZ C,
+	MOVSI T,-PGTBLL		;t =: aobjn ptr to PAGTBL
+CLRPT0:	SKIPE A,PAGTBL(T)	;Any bits in this entry?
+	 JFFO A,CLRPT1		;Yes, scan for 1st one
+	AOBJN T,CLRPT0		;No more, try next word
+	RET			;Done
+
+; Here to unmap a page flagged in PAGTBL
+; Entry:   t = ptr to PAGTBL word for page
+;	   b = count of flag bit position for page
+CLRPT1:	MOVEI C,0(T)		;c =: PAGTBL word index
+	IMULI C,^D36		;c =: page count for prior wds in table
+	ADDI B,FSPAG(C)		;b =: core page number
+	CAIL B,1000		;Legal page?
+	 FATAL <CLRPTB: Invalid page table bit set>
+	CALL PAGDA1		;Deallocate this page
+	JRST CLRPT0		;Look for more to do
+
+SUBTTL UUO Handler
+
+; UUO enters here via JSR UUOH
+UUOH:	0			;Ret adr for JSR entry
+	AOSE INUUO		;Recursive call?
+	 JRST [	MOVEM A,TEMPAC	;Yes???
+		HRROI A,[ASCIZ/Recursive UUO call illegal!/]
+		PSOUT
+		MOVE A,TEMPAC
+		JRST %FATAL]
+	MOVEM A,UUOACS+A	;Save an ac
+	MOVEM P,UUOACS+P	;And the stack
+	MOVE P,[IOWD NUPDL,UUOPDL]  ;Set up local stack
+	PUSH P,UUOH		;Save the calling pc
+	PUSH P,[UUORTP]		;Put stack restore entry on
+	LDB A,[POINT 9,40,8]	;a := opcode field
+	JRST @UUOS(A)		;Dispatch to handler routine
+	
+; Here to save whole ac block and set up for RET to restore acs and
+; return.  Entered by JSR UUOSV
+UUOSV:	0
+	MOVE A,UUOACS+A		;Restore entry a
+	MOVEM 16,UUOACS+16	;Save all ACs (P done on entry)
+	MOVEI 16,UUOACS
+	BLT 16,UUOACS+15
+	PUSH P,[UUORT]		;Put ac restore entry on stack
+	JRST @UUOSV
+
+; Here to restore ac block and return +1 to user.
+UUORT:	MOVSI 16,UUOACS		;Restore ACs
+	BLT 16,16
+	RET
+
+; Here to restore single ac and return +1 to user.
+UUOFRT:	MOVE A,UUOACS+A		;Recover ac
+	RET
+
+; Here to restore return adr and caller's stack ptr
+UUORTP:	POP P,UUOH		;UUOH := return adr
+	MOVE P,UUOACS+P		;p := caller's stack
+	SOS INUUO		;Reset the entry flag
+	JRST @UUOH
+
+; UUO handler dispatch table
+UUOS:	0
+	%PRINT
+	%TYPE
+	%ETYPE
+	%ERROR
+
+;; Print a character
+%PRINT:	HRRZ A,40		;Get byte
+	CAIN A,EOL		;PRINT EOL means do CRLF
+	 JRST [	CALL CRLF	;Do it
+		JRST UUOFRT ]
+	PBOUT
+	JRST UUOFRT		;Take fast return
+
+;; Type a string after crlf if needed
+%TYPE:	SKIPN PRINTP
+	 JRST UUOFRT
+	CALL TYCRIF		;Check if we should do a CRLF
+%TYPE0:	HRRO A,40		;Get string
+	PSOUT
+	JRST UUOFRT
+
+;; Do a conditional crlf
+TYCRIF:	MOVE A,40		;Get instruction
+	TLNE A,(<10,0>)		;Wants CRLF all the time?
+	 JRST CRLF		;Yes
+	TLNE A,(<1,0>)		;Wants fresh line?
+	 JRST CRIF		;Yes
+	RET
+
+;; Do crlf if not at start of line currently
+CRIF:	PUSH P,A
+	PUSH P,B
+	CALL CRIF1		;Do it
+	JRST POPBAJ
+
+CRIF1:	MOVEI A,.PRIOU
+	RFPOS
+	TRNE B,-1		;If not at start of line,
+	 CALL CRLF1		;Type CRLF
+	RET
+
+;; Do crlf unconditionally
+CRLF:	PUSH P,A
+	CALL CRLF1
+	JRST CPOPAJ
+
+CRLF1:	HRROI A,CRLF0
+	PSOUT
+	RET
+
+CRLF0:	ASCIZ/
+/
+
+;; Print error messages
+%ERROR:	JSR UUOSV		;Save the ac context
+	CALL CRIF		;Get a fresh line
+	MOVE B,40		;Get instruction
+	TLNE B,(<10,0>)		;Wants %?
+	 SKIPA A,["?"]		;No
+	  MOVEI A,"%"
+	PBOUT
+%ERR1:	TRNN B,-1		;Any message to print?
+	 JRST %ERR2		;No
+	CALL %ETYE0		;Yes, print it out
+	MOVE B,40		;And recover instruction
+%ERR2:	TLNN B,(<4, 0>)		;Wants JSYS error message?
+	 JRST %ERR3
+	HRROI A,[ASCIZ / - /]
+	TRNE B,-1		;If a previous message, type delimiter
+	 PSOUT
+	MOVEI A,.PRIOU
+	HRLOI B,.FHSLF		;This fork
+	SETZ C,
+	ERSTR
+	 NOP
+	 NOP
+%ERR3:	CALL CRLF
+	LDB A,[POINT 2,40,12]	;Get low order bits of ac field
+	JRST %ERRS(A)
+
+%ERRS:	JRST %FATAL		;0 - not used
+%ERRET:	JRST %FATAL		;1 - not used
+	JRST %FATAL		;2 - return to EXEC
+	RET			;3 - return to user
+
+;; Here on fatal error
+%FATAL:	HALTF
+	HRROI A,[ASCIZ /?Can't continue
+/]
+	PSOUT
+	JRST %FATAL
+
+;; Here to print a string, filling in escape sequences
+%ETYPE:	JSR UUOSV		;Save the ac context
+	SKIPN PRINTP
+	 RET
+	CALL TYCRIF		;Type a CRLF maybe
+%ETYE0:	HRRZ N,40
+%ETYS0:	HRLI N,(<POINT 7,0>)	;Get byte pointer to string
+%ETYP1:	ILDB A,N		;Get char
+	JUMPE A,CPOPJ		;Done
+	CAIE A,"%"		;Escape code?
+	 JRST %ETYP0		;No, just print it out
+	SETZ O,			;Reset AC
+%ETYP2:	ILDB A,N
+	CAIL A,"0"		;Is it part of addr spec?
+	 CAILE A,"7"
+	  JRST %ETYP3		;No
+	IMULI O,^D8		;Yes, increment address
+	ADDI O,-"0"(A)
+	JRST %ETYP2
+%ETYP3:	CAIG A,"Z"
+	 CAIGE A,"A"
+	  JRST %ETYP0
+	CALL @%ETYTB-"A"(A)	;Do dep't thing
+	JRST %ETYP1
+
+%ETYP0:	PBOUT
+	JRST %ETYP1
+
+%ETYTB:	%ETYPA			;A - print time
+	%ETYPB			;B - print date
+	%ETYP0			;C
+	%ETYPD			;D - print decimal
+	%ETYER			;E - error code
+	%ETYPF			;F - floating
+	%ETYP0			;G
+	%ETYPH			;H - RH as octal
+	%ETYP0			;I
+	%ETYPJ			;J - filename
+	REPEAT 4,<%ETYP0>	;K, L, M, N
+	%ETYPO			;O - octal
+	%ETYPP			;P - pluralizer
+	REPEAT 2,<%ETYP0>	;Q, R
+	%ETYPS			;S - string with escape sequences
+	%ETYPT			;T - date and time
+	%ETYPU			;U - user name
+	%ETYP0			;V
+	%ETYPW			;W - string with no escapes
+	REPEAT 3,<%ETYP0>	;X, Y, Z
+
+;; Print time only
+%ETYPA:	MOVSI C,(OT%NDA)	;No day, just time
+	JRST %ETYB0
+
+;; Options for printing just day or date/time
+%ETYPT:	TDZA C,C		;Both date and time
+%ETYPB:	 MOVSI C,(OT%NTM)	;No time, just day
+%ETYB0:	JUMPE O,.+2		;If AC field spec'd
+	 SKIPA B,UUOACS(O)	;Use it
+	  SETO B,		;Else use now
+	MOVEI A,.PRIOU
+	ODTIM
+	RET
+
+;; Print decimal and octal numbers
+%ETYPD:	SKIPA C,[^D10]		;Decimal
+%ETYPO:	 MOVEI C,^D8		;Octal
+	MOVE B,UUOACS(O)	;Get data
+%ETYO0:	MOVEI A,.PRIOU
+	NOUT
+	 NOP
+	RET
+
+;; Print string for specified error code
+%ETYER:	MOVEI A,.PRIOU
+	MOVSI B,.FHSLF		;This fork
+	HRR B,UUOACS(O)		;Get error code
+	SETZ C,
+	ERSTR
+	 NOP
+	 NOP
+	RET
+
+;; Print floating point number
+%ETYPF:	MOVEI A,.PRIOU
+	MOVE B,UUOACS(O)
+	SETZ C,
+	FLOUT
+	 NOP
+	RET
+
+;; Print RH of number in octal
+%ETYPH:	MOVEI C,^D8
+	HRRZ B,UUOACS(O)
+	JRST %ETYO0
+
+;; Print file name from jfn
+%ETYPJ:	MOVEI A,.PRIOU
+	HRRZ B,UUOACS(O)
+	MOVE C,[001110,,1]
+	JFNS
+	RET
+
+;; Add "S" depending on the value of a number
+%ETYPP:	MOVEI A,"s"
+	MOVE B,UUOACS(O)
+	CAIE B,1
+	 PBOUT			;Make plural unless just one
+	RET
+
+;; Recursive string output with escape sequence handling
+%ETYPS:	PUSH P,N
+	SKIPE N,UUOACS(O)
+	 CALL %ETYS0		;Recursive call
+CPOPNJ:	POP P,N
+	RET
+
+;; Print directory or user name
+%ETYPU:	MOVEI A,.PRIOU
+	MOVE B,UUOACS(O)
+	DIRST
+	 NOP
+	RET
+
+;; String output without further escape sequence handling
+%ETYPW:	MOVE A,UUOACS(O)
+	TLNN A,-1
+	 HRLI A,(<POINT 7,0>)
+	PSOUT
+	RET
+
+SUBTTL Utility Routines
+
+; Here to step to the next available directory number
+; Entry:   a = flags
+;	   b = wild card string (always PS:<*>)
+;	   c = current directory number
+; Call:    CALL STPDIR
+; Return:  +1, a = flags, c = new directory number
+STPDIR:	RCDIR
+	RET
+
+; Routine to fetch the write date/time of a file
+; Entry:   a = file JFN
+; Call:    CALL .GFWDT
+; Return:  +1, b = file write date/time
+.GFWDT:	PUSH P,C		;Save an ac
+	MOVEI B,B		;Answer into b
+	MOVEI C,1		;Only the write date/time
+	RFTAD
+	POP P,C			;Recover ac
+	RET
+
+;;;Move a string from B to A
+MOVSTR:	HRLI B,(<POINT 7,0>)
+MOVST1:	ILDB D,B
+	JUMPE D,MOVST3
+	IDPB D,A
+	JRST MOVST1
+
+;;;Move string and terminating null
+MOVST0:	HRLI B,(<POINT 7,0>)
+MOVST2:	ILDB D,B
+	IDPB D,A
+	JUMPN D,MOVST2
+MOVST3:	RET
+
+
+; Routine to compare two strings ignoring case differences
+; Entry:   a,b = ptrs to strings
+; Call:    CALL STRCMP
+; Return:  +1, match failed
+;	   +2, strings match
+STRCMP:	PUSH P,C		; Save some ac's
+	PUSH P,D
+STRCM0:	ILDB C,A		; c := next char from a
+	CAIL C,"a"		; Raise it if necessary
+	 CAILE C,"z"
+	  CAIA
+	   SUBI C,"a"-"A"
+	ILDB D,B		; d := next char from b
+	CAIL D,"a"		; Raise it if necessary
+	 CAILE D,"z"
+	  CAIA
+	   SUBI D,"a"-"A"
+	CAME C,D		; Same?
+	 JRST STRCM1		; No
+	JUMPN C,STRCM0		; If not end of strings, continue
+	AOS -2(P)		; Match, return +2
+STRCM1:	POP P,D			; Recover ac's
+	POP P,C
+	RET
+
+
+...LIT:	XLIST
+	LIT
+	LIST
+
+	END <ENTVCL,,ENTVEC>	; Set up entry vector
+
+; Local Modes:
+; Mode: MACRO
+; Comment Start:;
+; Comment Begin:;
+; End:

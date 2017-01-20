@@ -1,0 +1,2325 @@
+;	Start of WCC edit history
+;
+;[W1]	Correct outgoing BSMTP format mail [JGD 14-7-86]
+;
+;[W2]	Add cmdbuf and descriptor [JGD 7-25-86]
+;
+;[W3]	Copy domains.txt to domains.tmp and map the tmp file [JGD 9-3-86]
+;
+;[W4]	Fix patch W1 [JGD 8-9-86]
+;
+;	End of WCC edit history
+
+.psect	code	exe,nowrt
+.library	/sys$library:lib.mlb/
+.entry	mail_lib	^m<>
+.title mail library
+
+.page
+.subtitle error routines
+
+;	Die on these errors
+
+tcperr::ret
+rmserr::ret
+
+
+
+.page
+.subtitle addressing routines
+
+;	Build a return path.
+;	Format:	ascic "Return-path:<@reverse-path>"
+
+rpath::	moval	retbuf,r3			;point to the buffer
+	incl	r3				;reserve a byte
+	moval	rpar,r1				;point to the start of msg
+	movzbw	(r1)+,r7			;get its size
+	movc3	r7,(r1),(r3)			;put the start of the msg in
+	moval	revbuf,r4			;point to the reverse path
+	movzbw	(r4)+,r5			;get the size of the reverse path
+	addw2	r5,r7				;size of the reverse path
+	movc3	r5,(r4),(r3)			;store the reverse path
+	movb	#62,(r3)+			;close the return path ">"
+	incw	r7				;increment for the closure
+	movb	r7,retbuf			;save the size
+	rsb
+
+.page
+
+;	If the rcpt line contains only one host.domain:
+;		check for my name (local mail), if not my name
+;		check for a known host or known domain (simple relay)
+;	If the rcpt line contains more than one host.domain:
+;		check for my name first (rfc822 relay), if not my name
+;		check for my name last (TOPS 20 relay format)
+
+
+;	Check for a single host.domain in rcpt line (@ and % are valid)
+
+
+chkadd::movc5	r7,(r6),#0,#mbxbufsz,mbxbuf+2	;zero the buffer-store address
+	movw	r7,mbxbuf
+	moval	mbxbuf+2,r6			;reset r6
+10$:	clrl	r9				;set up a host counter
+	movl	r7,r2				;set up for a loop (size)
+	movl	r6,r3				;the pointer
+30$:	matchc	#1,#64,r2,(r3)			;search for an @
+	bneq	40$				;if not found check for a %
+	incl	r9				;increment the counter
+	jmp	30$				;check for another
+40$:	movl	r7,r2				;set up for a loop (size)
+	movl	r6,r3				;the pointer
+45$:	matchc	#1,#37,r2,(r3)			;search for a %
+	bneq	50$				;if not found check stop
+	incl	r9				;increment the counter
+	jmp	45$				;check for another
+
+;	See how many hosts we have
+
+50$:	cmpl	r9,#1				;compare against one host
+	blss	68$				;if no hosts must be local
+	beql	60$				;if only one check for my name
+55$:	jmp	90$				;check for a relay	
+
+;	Check for my name if found local mail.  If not found check for
+;	a simple relay to a known host or domain.
+
+60$:	bsbw	ucase				;uppercase the name
+	movq	r6,r8				;save our pointers
+	matchc	#1,#64,r7,(r6)			;isolate the username from host
+	beql	65$				;if no host error
+	matchc	#1,#37,r7,(r6)			;search for a %
+	beql	65$				;if no host error
+	moval	r501t,r1			;to parameter error
+	jmp	200$				;go send the msg
+65$:	subl3	r6,r3,r7			;r7 has length of username
+	decl	r7				;don't count the "@"
+
+;	Check for local host and domain name
+
+	movzbw	lhnasz,r1			;make the size a word
+	matchc	r1,lhna,r2,(r3)			;check for our host name
+	bneq	80$				;if our host name continue
+	cmpb	#46,(r3)+			;seperator
+	bneq	80$				;if our host name continue
+	movzbw	lnnasz,r1			;make the size a word
+	matchc	r1,lnna,r2,(r3)			;check for our domain name
+	bneq	80$				;if our host name continue
+
+;	Attempt local host name translation (mailing_lists.txt)
+	
+	bsbw	mailbox				;attempt name translation
+	cmpl	#ss$_normal,r0			;if success start again
+	bneq	67$				;else validate username
+	jmp	10$				;success-- try again
+
+;	Did we get a file spec?
+
+67$:	cmpl	#-1,r0				;check the return code
+	bneq	68$				;add it as local if filespec
+	movq	r8,r6				;restore our pointers
+	jmp	75$
+
+;	Local host name check user name
+
+68$:	bsbw	vallcl				;validate the local user
+	movq	r8,r6				;restore our pointers
+	tstb	r0				;was the name (valid r0=0 error)
+	bgtr	75$				;if name ok set local flag
+	beql	70$				;zero if user not found
+	moval	r554,r1				;error: error opening file
+	jmp	200$				;send the message
+70$:	moval	r550l,r1			;error no such local user
+	jmp	200$				;send the message
+75$:	bsbw	addlcl				;add user to local mail list
+	movb	#1,f.lcl			;set the local mail flag
+	jmp	195$				;go process local mail
+
+;	Not our host name check for a known host or domain.
+
+80$:	movq	r8,r6				;restore our pointers
+	bsbw	valadd				;validate the address
+	tstb	r0				;is the address valid?
+	beql	85$				;if r0=0 error
+	jmp	190$				;address is valid save it
+85$:	moval	r551a,r1			;bad domain or host address	
+	jmp	200$				;send the error
+
+;	We have a complex relay, check if this is a rfc822 standard relay.
+
+90$:	cmpb	#64,(r6)			;check for a relay ="@"
+	beql	100$				;if found rfc822 else tops20
+	jmp	140$				;check for a TOPS20 style
+
+;	This is a relay the first address must be ours.  The next address is
+;	either another relay or a mailbox.
+
+100$:	incl	r6				;skip the "@"
+	bsbw	getadd				;get the address
+	tstb	r0				;was the parse successful?
+	bneq	105$				;r0=0 on failure
+	moval	r551r,r1			;error in parsing address	
+	jmp	200$				;send the error
+105$:	bsbw	ucase				;uppercase the address
+	movzbw	lhnasz,r1			;make the size a word
+	matchc	r1,lhna,r7,(r6)			;check for our host name
+	beql	110$				;must be ours for a relay
+	moval	r551n,r1			;error in parsing address	
+	jmp	200$				;send the error
+110$:	movzbw	lnnasz,r1			;make the size a word
+	matchc	r1,lnna,r2,(r3)			;check for our domain name
+	beql	115$				;must be our for a relay
+	moval	r551n,r1			;error in parsing address	
+	jmp	200$				;send the error
+
+;	The relay name was our get the next address.  This is the start of the
+;	new forward path.
+
+115$:	movl	r8,r6				;get the pointer to the path
+	movl	r9,r7				;get the length of the path
+	cmpb	#64,(r6)			;is this a relay?
+	beql	125$				;if so get the address
+	bsbw	valadd				;its a mbx validate the address
+	tstb	r0				;is the address valid?
+	bneq	120$				;if r0=0 error
+	moval	r551a,r1			;bad domain or host address	
+	jmp	200$				;send the error
+120$:	jmp	190$				;save the address
+125$:	cmpb	#64,(r6)			;if a relay must start with "@"
+	beql	130$				;skip past the "@"
+	moval	r551r,r1			;give a vague error
+	jmp	200$				;send the error
+130$:	pushr	#^m<r6,r7>			;save the pointer and length
+	incl	r6				;bump up the pointer
+	decw	r7				;down the counter
+	bsbw	getadd				;get the next address
+	tstb	r0				;did we get the address
+	bneq	135$				;if r0=0 error
+	moval	r551r,r1			;error in parsing address	
+	popr	#^m<r6,r7>			;restore the pointer and length
+	jmp	200$				;send the error
+135$:	bsbw	valadd				;validate the address
+	popr	#^m<r6,r7>			;restore the pointer and length
+	tstb	r0				;did we get the address
+	beql	137$				;if r0=0 error
+	jmp	190$				;address was ok process it
+137$:	moval	r551a,r1			;error in parsing address	
+	jmp	200$				;send the error
+
+;	Check for the nonstandard TOPS 20 relay. The format will be
+;
+;	user%host1.domainA%host2.domainB@host3.domainC
+;
+;	host3.domainC may or may not be my name.  R6 is a pointer, R7 is 
+;	the string size
+	
+;	Make sure there is an @ if not replace the last % with one
+
+140$:	matchc	#1,#64,r7,(r6)			;is there a "@" here?
+	beql	145$				;if so skip ahead
+	movl	r7,r2				;set up to transmogrify
+	movl	r6,r3				;set up pointer and size
+	bsbw	tmog				;do it
+
+;	If the last name is mine strip it off and tmog again.
+;	R3 points and R2 is the size of the last name
+
+145$:	movq	r6,r8				;save the start of the address
+	movzwl	r2,r7				;uppercase the last host.domain
+	movl	r3,r6	
+	bsbw	ucase				;uppercase the address
+	movzbw	lhnasz,r1			;make the size a word
+	matchc	r1,lhna,r7,(r6)			;check for our host name
+	bneq	150$				;might be ours for a relay
+	incl	r3				;skip the period
+	decw	r2
+	movzbw	lnnasz,r1			;make the size a word
+	matchc	r1,lnna,r2,(r3)			;check for our domain name
+	bneq	150$				;must match both to remove
+
+;	We matched both host and domain stip it off and tmog
+
+	subw2	r7,r9				;strip off my name
+	decw	r9				;and the @
+	movl	r9,r2				;set up to tmog
+	movl	r8,r3
+	bsbw	tmog
+
+;	The last name in the string is the next point in the relay
+;	R9 is the string size, R8 ponits to the string
+
+150$:	matchc	#1,#64,r9,(r8)			;get to the last name
+	movl	r2,r7
+	movl	r3,r6
+	bsbw	ucase				;uppercase the last name
+
+;	Validate the address.
+
+	bsbw	valadd				;validate the address
+	tstb	r0				;is the address valid?
+	beql	155$				;if r0=0 error
+	movq	r8,r6				;restore the pointer
+	jmp	190$				;add the recpient
+155$:	moval	r551a,r1			;bad domain or host address	
+	jmp	200$				;send the error
+
+;	Save the path on one of the remote lists
+
+190$:	bsbw	addrem				;add to one of the remote lists
+
+;	Forward path validated.  Set the flag and setup a success message.
+
+195$:	movb	#1,f.rcpt			;set the rcpt flag
+	moval	r250r,r1			;mail cmd success
+
+;	Check for an expanded mailing list
+
+200$:	bsbw	rmbx				;remove the address we did
+	moval	mbxbuf,r6			;point to the start of the buffer
+	movw	(r6)+,r7			;get size of next address
+	tstw	r7				;any address(s) to process?
+	beql	210$				;if not stop
+	jmp	10$				;start again
+
+;	Determine if we had any success
+	
+210$:	tstb	f.rcpt				;chk the recpient flag
+	beql	220$				;not set then no success at all
+	movl	#ss$_normal,r0			;signal success
+	rsb
+220$:	movl	#ss$_abort,r0			;signal failure
+	rsb
+
+.page
+;	Validate the username passed.
+;	Input:	r6 pointer to address
+;		r7 length of address
+;	Output:	r0 1=success 0=username not found -1=error opening file
+
+vallcl::tstl	r7				;length of name must be > zero
+	bgtr	20$				;> zero continue
+	jmp	150$				;error no user name
+20$:	cmpw	#uaf$s_username,r7		;must also <= maximum size
+	bgeq	30$				;else error
+	jmp	150$				;error user name too large
+30$:	pushr	#^m<r1,r2,r3,r4,r5>
+	movc5	r7,(r6),#32,#uaf$s_username,gbuf ;working buffer padded with sp
+	popr	#^m<r1,r2,r3,r4,r5>
+
+;  Open authorization file and find username
+
+	movzbl	#50,r5				; allow for a temp locked file
+40$:	$open	fab=uaffab			;open the uaf file
+	blbs	r0,60$				;if open continue
+
+; Error - check if file was locked.  If so try again.
+
+	cmpl	r0,#rms$_flk			;was the error a locked file?
+	bneq	50$				;if not quit trying
+	$close	fab=uaffab			;locked file, close it
+	sobgtr	r5,40$				;try again
+
+; File open error, return error code.
+
+50$:	$close	fab=uaffab			;close the uaf file
+	jmp	160$				;error opening file
+
+; File opened, connect to RMS record stream.
+
+60$:	$connect rab=uafrab			;connect to the record
+	blbs	r0,70$				;read the first record
+	jmp	160$				;error on the connect
+
+;  Read through the file and find username
+
+70$:	$get	rab=uafrab			;get a record from the file
+	blbs	r0,80$	
+
+; EOF or Error, release the accounting file.
+
+	$disconnect rab=uafrab
+	$close	fab=uaffab
+	jmp	150$
+
+;  Compare this entry against username we are looking for
+
+80$:	matchc	#uaf$s_username,gbuf,#uaf$s_username,uafbuf+uaf$t_username
+	bneq	70$				;if this is not the record get another
+
+;  Got it, give the authorization file back to the system
+
+	$disconnect rab=uafrab			;disconnect from the record stream
+	$close	fab=uaffab			;close the file
+	movl	#1,r0				;set a success flag
+	rsb
+
+;	Here on errors
+
+150$:	clrl	r0				;set a user not found error flag
+	rsb
+
+160$:	movb	#-1,r0				;set a rms error flag
+	rsb	
+
+.page
+;	Validate the address passed.
+;	Input:	r6 pointer to address
+;		r7 length of address
+;	Output:	r0 1=success 0=address invalid 
+;		On success either:
+;		the single site flag will be set
+;		or
+;		the relay flag will be set
+
+valadd::pushr	#^m<r1,r2,r3,r4,r5,r6,r7,r8,r9>
+	clrb	f.single			;clear the flags
+	bsbw	ucase				;uppercase the address
+	subl3	domst,domed,domsz		;compute size of the file
+	matchc	#1,#64,r7,(r6)			;isolate the host.domain
+	beql	5$				;not found try a %
+	matchc	#1,#37,r7,(r6)			;isolate the host.domain
+	bneq	10$				;match fails means its done already
+5$:	movzwl	r2,r7				;get the size
+	movl	r3,r6				;update the pointer
+	
+;	First search for a known host site.  The format is:
+;	host host_name.domain_name
+
+10$:	moval	host,r1				;point to the word "host"
+	movzbw	(r1)+,r2			;get the size of the word
+	addw3	r2,r7,r9			;save the word and domain size
+	movc3	r2,(r1),mbuf+maxpth		;get the word into  buffer
+	movc3	r7,(r6),(r3)			;get the host.domain into the buffer
+	moval	cadd,r1				;point to the current address holder
+	movb	r7,(r1)+			;make it an ascii string
+	movc3	r7,(r6),(r1)			;save the current address
+	movl	domst,r1			;point to the start of the section
+	matchc	r9,mbuf+maxpth,domsz,(r1)	;search the domains.txt file
+	bneq	20$				;if found return success
+	movb	#1,f.single			;set the single site flag
+	movb	#1,f.kwn			;set the known site flag
+	jmp	80$				;return success
+
+;	We did not mmatch an individual site.  Search for a known
+;	gateway.  The format is domain domain_name
+
+20$:	moval	domain,r1			;point to the word "domain"
+	movzbw	(r1)+,r9			;get the size of the word
+	movc3	r9,(r1),mbuf+maxpth		;store the keyword
+	movl	r3,r8				;save the buffer pointer
+	matchc	#1,#46,r7,(r6)			;isolate the domain name
+	beql	30$				;if no domain signal error
+	jmp	90$				;error	
+
+
+;	We have at least one domain.  Make sure it is the last one.
+
+30$:	movq	r2,r10				;save the current pointer and size
+	matchc	#1,#46,r2,(r3)			;any more domains?
+	beql	30$				;if so save info and check again
+	movq	r10,r2				;if not get the last info back
+	addw2	r2,r9				;save the size of the string
+	movc3	r2,(r3),(r8)			;save the domain name
+	movl	domst,r1			;point to the start of the section
+	matchc	r9,mbuf+maxpth,domsz,(r1)	;search the domains.txt file
+	bneq	90$				;if not found error	
+	movb	#1,f.rly			;set the relay flag
+
+;	Here on success.
+
+80$:	movl	#1,r0				;signal success
+	jmp	100$
+
+;	Here on errors.
+
+90$:	clrl	r0				;signal error
+100$:	popr	#^m<r1,r2,r3,r4,r5,r6,r7,r8,r9>
+	rsb	
+
+
+.page
+;	Add a user to the local mailing list.
+;	Input:	r6 pointer to username
+;		r7 length of username
+;	local maing list format:	<.ascic name><.ascic name>
+
+addlcl::movl	lclptr,r3			;point to the end of the local mailing list
+	movb	r7,(r3)+			;make it an ascic string
+	movc3	r7,(r6),(r3)			;store this name
+	movl	r3,lclptr			;update list
+	addw2	r7,lclsz			;update the buffer counter
+	rsb
+
+
+.page
+;	Determine whether this is a for a single site or for
+;	a relay site.  Then add the host.domain (single) or domain (relay)
+;	to the respective unique list.
+;	Input:	cadd an ascic string of the host.domain
+
+addrem::pushr	#^m<r6,r7>			;save the pointer and length
+	tstb	f.single			;known site?
+	beql	5$				;if not it is a relay
+
+;	Process this as a single site.  Add the name (host.domain) if 
+;	not already there.  Bump the count as well.
+
+	moval	cadd,r6				;get the current host.domain
+	movzbw	(r6)+,r7			;isolate the size
+	moval	kwnbuf,r3			;get the known hosts pointer
+	jmp	10$				;and return
+
+;	This is a relay.  Add the name (domain) if not already there.
+;	Bump the count as well.
+
+5$:	moval	cadd,r6				;get the current host.domain
+	movzbw	(r6)+,r7			;isolate the size
+	matchc	#1,#46,r7,(r6)			;isolate the domain name
+
+
+;	We have at least one domain.  Make sure it is the last one.
+
+7$:	movq	r2,r10				;save the current pointer and size
+	matchc	#1,#46,r2,(r3)			;any more domains?
+	beql	7$				;if so save info and check again
+	movq	r10,r2				;if not get the last info back
+	movzbl	r2,r7				;get size of domain
+	movl	r3,r6				;point to the domain only
+	moval	rlybuf,r3			;get the relay pointer
+
+;	Common code.  Traverse a unique list (known site or relay)
+;	If no match is found in the unique add the host info at the
+;	end of the list.  If a match is found in the unique list you
+;	must then traverse the complete list.
+
+10$:	tstb	(r3)				;anything there?
+	beql	30$				;if not add the current name
+	movzbw	(r3)+,r2			;get the size of the host
+	matchc	r7,(r6),r2,(r3)			;check out this name	
+	beql	13$				;match? do the complete list
+	addb2	#4,r3				;no match. skip the address
+	jmp	10$				;get the next
+
+;	Matched in the unique list traverse the complete list and add
+;	the information at the end
+
+13$:	movl	(r3),r3				;get the next address in the complete list
+	addb2	(r3),r3				;point to the next address
+	incl	r3				;add one for the size field
+	tstb	(r3)				;is this the end?
+	bneq	13$				;if not get the next address
+	jmp	35$				;and return
+
+30$:	movb	r7,(r3)+			;make it ascic
+	movc3	r7,(r6),(r3)			;add the current name
+35$:	popr	#^m<r6,r7>			;get the pointer and length
+	movl	fwdptr,(r3)+			;store the forward pointer
+	movl	fwdptr,r3			;point to the end of the forward path buffer
+	movb	r7,(r3)+			;make it an ascic string
+	movc3	r7,(r6),(r3)			;store this forward path
+	movl	#0,(r3)+			;end the link
+	movl	r3,fwdptr			;update fwd path ptr
+	addw2	r7,fwbfsz			;update the buffer counter
+	rsb
+
+.page
+;	Transmogrify routine
+;
+;	exchange the last % in an address with an @
+;	Input:	R2 is the size of the address.  R3 points to the address
+;	Output:	R2 is the size of the last address.  R3 points to the last address
+
+tmog::	pushr	#^m<r1,r4,r5,r6,r7,r8,r9>
+10$:	matchc	#1,#37,r2,(r3)			;find a %
+	bneq	20$				;if not found stop
+	movq	r2,r8				;save the address, pointer
+	jmp	10$				;if found look again
+20$:	movq	r8,r2				;get the last one found
+	decl	 r3				;point at the last %
+	movb	#64,(r3)+			;replace the % with an @
+	popr	#^m<r1,r4,r5,r6,r7,r8,r9>
+	rsb
+
+
+.page
+;	Parse the path passed to us.
+;	Input:	r6 pointer to the path
+;		r7 length of the path
+;	Output:	r6 pointer to the address parsed
+;		r7 length of the address parsed
+;		r8 pointer to next address in path
+;		r9 length of the reset of the path
+;		r0 1= success, 0=failure
+
+getadd::matchc	#1,#44,r7,(r6)			;search for another relay ","
+	beql	10$				;if found compute length
+	matchc	#1,#58,r7,(r6)			;not a relay. is it a mailbox? ":"
+	beql	10$				;if found compute length
+	clrl	r0				;not a mailbox; signal error
+	rsb					;return error
+10$:	subl3	r6,r3,r1			;size of the address parsed
+	subl3	r1,r7,r9			;size of the reset of the path
+	subl2	#1,r9				;don't count the skipped ch
+	subl3	#1,r1,r7			;save the size of the address
+	movl	r3,r8				;save the pointer to the path
+	movb	#1,r0				;signal success
+	rsb					;and return
+
+.page
+.subtitle general routines
+
+;	Remove leading white space 
+
+;	Input:	r7	size of string
+;		r6	pointer to string
+;	Output:	r6 and r7 updated
+
+eatwht::cmpb	(r6),#9				;eat leading tabs and spaces
+	beql	30$				;is there a tab?
+	cmpb	(r6),#32			;or a space
+	bneq	35$				;if not continue.. if so trash 
+30$:	incl	r6				;trash this character (tab,sp)
+	decw	r7				;bump the line count down
+	jmp	eatwht				;check for another tab or space
+35$:	rsb
+
+
+.page
+;	Set a wake up call and then hibernate
+
+sleep::	$bintim_s timbuf=aslep,-		;ascii time to sleep
+		  timadr=bslep			;binary time to sleep
+	$schdwk_s daytim=bslep			;wake me in x time
+	$hiber_s				;sleep until x time
+	rsb
+
+;	Make sure all characters in the word are uppercase.  Uppercase
+;	all characters that already are not uppercase.
+;	r6 is a pointer to the cmd to be uppercased
+;	r7 is the length of the word to be uppercased
+
+ucase::	pushr	#^m<r1,r2,r3,r4,r5,r6,r7>	;save some registers
+10$:	cmpb	(r6),#sma			;compare with lowercase a
+	blss	20$				;if less than small a leave it	
+	cmpb	(r6),#smz			;compare with lowercase z
+	bgtr	20$				;if greater than sml z leave it
+	subb2	#cse,(r6)			;uppercase the character
+20$:	incl	r6				;point to the next character
+	sobgtr	r7,10$				;get the next character
+	popr	#^m<r1,r2,r3,r4,r5,r6,r7>	;restore the saved registers
+	rsb
+
+
+.page
+;	Map into a global section the file domains.txt.  If the mapping in
+;	fails create the section.  If this too fails exit.
+
+mapfil::$mgblsc_s -				;map the global section
+		inadr	= dumadd,-		;dummy address
+		retadr	= domst,-		;start of the file
+		flags	= #sec$m_expreg!sec$m_sysgbl,-	;map file anywhere
+		gsdnam	= domains		;name of the section
+	blbc	r0,20$				;return on success
+	subl3	domst,domed,domsz		;get size of the section
+	rsb
+
+;	Could not map the section.  Attempt to open the file and create 
+;	a section.  Exit program on error!!
+
+20$:	$erase	fab = tdfab			;delete any existing section
+
+;	Copy the domains.txt file to a new file called domains.tmp.  This
+;	file will be mapped into memory.
+
+	$create	fab = tdfab			;create the tmp file
+	$open	fab = dofab1			;open the txt file
+	$connect rab = tdrab			;connect for io
+	$connect rab = dorab1			;connect for io
+
+;	Copy the file
+
+24$:	$get	rab = dorab1			;get a record
+	blbs	r0,25$				;if ok write the record 
+	cmpl	r0,#rms$_eof			;is this the end?
+	beql	27$				;if so close up
+	ret					;else error
+25$:	movw	dorab1+rab$w_rsz,tdrab+rab$w_rsz ;size of the record
+	$put	rab = tdrab			;write the record
+	blbs	r0,24$				;get the next record
+	ret					;else error
+
+27$:	$disconnect rab = tdrab			;break the stream
+	$disconnect rab = dorab1		;both files
+	$close	fab = tdfab			;close the files
+	$close	fab = dofab1			;close the files
+
+;	Open the tmp file to map it
+
+	$open	fab	= dofab			;open the file
+	blbs	r0,30$				;check for rms error
+	ret					;die a terrible death
+
+30$:	$crmpsc_s chan	= dofab+fab$l_stv,-	;channel to the file
+		flags	= #sec$m_gbl!sec$m_perm!sec$m_expreg!sec$m_wrt!sec$m_sysgbl,-
+		inadr	= dumadd,-		;dummy address
+		retadr	= domst,-		;start of the file
+		gsdnam	= domains		;name of the section
+	blbs	r0,40$				;check for an error
+	ret		
+40$:	subl3	domst,domed,r7			;uppercase the section
+	movl	domst,r6			;pointer
+	bsbw	ucase				;doit
+	subl3	domst,domed,domsz		;get size of the section
+	rsb
+
+.page
+;Get the local hosts name and domain
+;	Input: hosts.txt file (first record is local host name)
+;	Output:	lclhst (the local hosts name as an ascic string)
+;		lcldom (the local domain name as an ascic string)
+getlcl::$open	fab = hofab			;open the file
+	blbs	r0,30$
+	jmp	rmserr				;signal an rms error
+30$:	$connect rab = horab			;connect to record stream
+	blbs	r0,40$
+	jmp	rmserr				;signal an rms error
+
+;	The first record of the hosts.txt file must be the local host.
+
+40$:	$get 	rab = horab			;get the local host info
+	blbs	r0,50$
+	jmp	rmserr				;signal an rms error
+50$:	$disconnect rab = horab			;disconnect from record stream
+	blbs	r0,60$
+	jmp	rmserr				;signal an rms error
+60$:	$close	fab = hofab			;close the hosts.txt file
+	blbs	r0,70$
+	jmp	rmserr				;signal an rms error
+70$:	moval	mbuf,r6				;point to the buffer
+	matchc	#1,#58,horab+rab$w_rsz,(r6)	;get the end of my name ":"
+	subl3	r6,r3,r1			;compute the size of my name
+	decl	r1				;don't count the ":"
+	movq	r2,r8				;save the size of unparsed string
+
+;	Save the local host name as an ascic string	
+
+	movw	r1,lclhst			;size of the name	
+	movc3	r1,(r6),lclhst+2		;and the name
+
+;	Get to the domain name.
+
+	movq	r8,r2				;size of string
+	movl	#6,r6				;number of fields to skip
+80$:	matchc	#1,#58,r2,(r3)			;skip the next few fields
+	sobgtr	r6,80$				;get the the node name
+	decw	r2				;skip the terminating ":"
+
+;	Save the domain name.
+
+	movw	r2,lcldom			;size of the name	
+	movc3	r2,(r3),lcldom+2		;save the domain name
+	rsb
+
+
+
+.page
+;	Get the users login device and directory and build the mail.txt
+;	file name.
+;	Input:	a full uaf buffer
+
+getdir::moval	uafbuf+uaf$t_defdev,r5		;point to the login device
+	movzbw	(r5)+,r4			;get its size
+	movw	r4,lcldirsz			;add it in
+	movc3	r4,(r5),lcldir			;move the device name
+	moval	uafbuf+uaf$t_defdir,r5		;point to the login directory
+	movzbw	(r5)+,r4			;get its size
+	addw2	r4,lcldirsz			;add it in
+	movc3	r4,(r5),(r3)			;move the directory name
+	moval	mailtxt,r5			;get the name "mail.txt"
+	movzbw	(r5)+,r4			;and its size
+	addw2	r4,lcldirsz			;add the size
+	movc3	r4,(r5),(r3)			;move the name
+	rsb
+
+
+.subtitle mailq: routines
+
+;	Write out a queue files.  Separate local mail into individual
+;	files.  Mail to remote sites should be put into individual 
+;	
+
+wfile::	tstb	f.user				;don't time stamp a user message
+	bneq	5$				;time stamp servers f.user = 1
+	bsbw	tstmp				;get a time stamp
+;	bsbw	rpath				;build a return path
+5$:	tstb	f.lcl				;any local mail?
+	beql	10$				;if there is process it
+	bsbw	p.lcl				;process the local mail
+10$:	tstb	f.kwn				;any kniwn sites mail?
+	beql	20$				;if there is process it
+	bsbw	p.kwn				;process the known site mail
+20$:	tstb	f.rly				;any relay mail?
+	beql	30$				;if there is process it
+	bsbw	p.rly				;process the relay mail
+
+;	All the mail has been written out to mailq:files.  Wake up
+;	the daemon to deliver the mail.
+
+30$:;	bsbw	rmaiser
+	rsb
+
+.page
+;	Write out mailq: files for all known sites recipents.
+;	Traverse the host.domain list.  Off of each entry in
+;	the host.domain list will be a linked list in the
+;	complete list.  Process each entry in the complete list.
+
+p.kwn::	clrb	f.fmt				;clear the mail format flag
+	moval	kwnbuf,kwnptr			;get the known hosts pointer
+10$:	movl	kwnptr,r6			;set up for a read
+	tstb	(r6)				;anything there?
+	bneq	15$				;if non zero process the entry
+	jmp	90$				;if zero exit
+
+;	Build the ascic string keyword_host host.domain
+
+15$:	moval	host,r4				;point to the word "host"
+	movzbw	(r4)+,r5			;get the size of the word
+	moval	cadd,r3
+	movb	r5,(r3)+			;make it ascic
+	movc3	r5,(r4),(r3)			;get the host.domain 
+	movzbw	(r6)+,r8			;size of the host.domain
+	movc3	r8,(r6),(r3)			;store host.domain r1 dispatch address
+	addb2	r8,cadd				;add the host.domain size in	
+	movl	(r1),r6				;point to the complete list entry
+	addl3	#4,r1,kwnptr			;skipping address 	
+
+;	Matched in the unique list traverse the complete list processing
+;	mail for each user.	
+
+20$:	tstb	r6				;is this the end?
+	beql	10$				;if not get next entry in host.domain
+	$create	fab = quefab			;create the file
+	blbs	r0,30$
+	jmp	rmserr				;signal an rms error
+30$:	$connect rab = querab			;connect to record stream
+	blbs	r0,40$
+	jmp	rmserr				;signal an rms error
+40$:	movzbl	(r6)+,r7			;get the size of the name
+	addl3	r6,r7,r9			;update the pointer
+	movb	#1,f.single			;signal a single known site
+	bsbw	chkfmt				;check the mail format
+	pushr	#^m<r6,r7>
+	tstb	f.fmt				;are we using a special format
+	beql	50$				;if not skip
+	moval	cadd,r6				;get the mail id pointer
+	movzbl	(r6)+,r7			;and size of the mail id
+50$:	bsbw	whdr				;write out the header
+	popr	#^m<r6,r7>
+	tstb	f.fmt				;are we using a special format
+	beql	60$				;if not skip
+	bsbw	spfmt				;handle special mail format
+	jmp	70$				;skip the data
+60$:	bsbw	wdat				;write out the data
+70$:	$disconnect rab = querab		;break from the record stream
+	$close	fab = quefab			;close the file
+	movl	(r9),r6				;point to the next entry
+	jmp	20$				;process the next entry
+90$:	rsb
+
+
+.page
+;	Handle special mail formats.
+;	Input:	r6 points to first recpient in the chain
+;		r7 size of first recpients name
+;		r9 points to the next entry in the complete list
+;	This routine performs most of the code executed by the caller,
+;	in that it loops through the complete list for this paticular
+;	host.  R6 will point to a zero when done.
+
+;	Build the bsmtp opening lines. HELO first.
+
+spfmt::	moval	sm1,r1				;point to the helo msg
+	movzbw	(r1)+,r2			;get its size
+	movw	r2,querab+rab$w_rsz		;add the size
+	movc3	r2,(r1),mbuf			;store the message
+	moval	me,r1				;point to my ascic string
+	movb	(r1)+,r2			;get my size
+	addw2	r2,querab+rab$w_rsz		;add it in
+	movc3	r2,(r1),(r3)			;add my name
+	$put	rab = querab			;output the text
+
+;	Add the verbose message.
+
+	moval	sm2,r1				;point to the verb on msg
+	movzbw	(r1)+,r2			;get its size
+	movw 	r2,querab+rab$w_rsz		;add the size
+	movc3	r2,(r1),mbuf			;store the message
+	moval	on,r1				;make it verbose
+	movb	(r1)+,r2			;size of on
+	addw2	r2,querab+rab$w_rsz		;add the size
+	movc3	r2,(r1),(r3)			;store the message
+	$put	rab = querab			;output the text
+
+;	Add the tick message
+
+	moval	sm3,r1				;point to the tick msg
+	movzbw	(r1)+,r2			;get its size
+	movw 	r2,querab+rab$w_rsz		;add the size
+	movc3	r2,(r1),mbuf			;store the message
+	moval	num,r1				;point to a fixed number for now
+	movzbw	(r1)+,r2			;get its size
+	addw2	r2,querab+rab$w_rsz		;add the size
+	movc3	r2,(r1),(r3)			;store the message
+	$put	rab = querab			;output the text
+
+;	Add the Mail from: message.
+
+	moval	sm4,r1				;point to the mail from: msg
+	movzbw	(r1)+,r2			;get its size
+	movw 	r2,querab+rab$w_rsz		;add the size
+	movc3	r2,(r1),mbuf			;store the message
+	movb	#60,(r3)+			;enclose the name "<"
+
+;	Add my name as known on this network
+
+	movb	#64,(r3)+			;start with an @
+	moval	me,r1				;point to my ascic string
+	movb	(r1)+,r2			;get my size
+	addw2	r2,querab+rab$w_rsz		;add it in
+	movc3	r2,(r1),(r3)			;add my name
+
+;[Wx]	pushr	#^m<r1,r2,r3,r4,r5>		;[W1] save the pointer
+;[Wx]	movzbw	revbuf,r2			;[W1] size of reverse buffer
+;[Wx]	matchc	#1,#58,r2,revbuf+1		;[W1] [W4] (changed @ to :) is this a relay?
+;[Wx]	popr	#^m<r1,r2,r3,r4,r5>		;[W1] restore the pointer
+;[Wx]	bneq	10$				;[W1] not a relay add a ":"	
+;[Wx]	movb	#44,(r3)+			;[W1] "," seperator 
+;[Wx]	jmp	15$				;[W1] and continue
+
+10$:	movb	#58,(r3)+			;[W1] ":" seperator 
+15$:	addw2	#2,querab+rab$w_rsz		;[W1] account for @ and comma
+
+;	Add the reverse path
+
+	moval	revbuf,r1			;point to the reverse path
+	movzbw	(r1)+,r2			;get the size
+	addw2	r2,querab+rab$w_rsz		;add it in
+	movc3	r2,(r1),(r3)			;add the senders name
+	movb	#62,(r3)+			;enclose the name ">"
+	addw2	#2,querab+rab$w_rsz		;account for the enclosure
+	$put	rab = querab			;output the text
+
+;	Loop through all the recpients building a rcpt to: lines
+
+20$:	moval	sm5,r1				;point to the rcpt to: msg
+	movzbw	(r1)+,r2			;get its size
+	movw 	r2,querab+rab$w_rsz		;add the size
+	movc3	r2,(r1),mbuf			;store the message
+	movb	#60,(r3)+			;enclose the name "<"
+	movc3	r7,(r6),(r3)			;store the recpient
+	movb	#62,(r3)+			;enclose the name ">"
+	addw2	#2,r7				;account for the enclosure
+	addw2	r7,querab+rab$w_rsz		;and the name
+	$put	rab = querab			;output the text
+	movl	(r9),r6				;point to the next entry
+	tstb	r6				;is this the end?
+	beql	40$				;if so go add the data
+	movzbl	(r6)+,r7			;get the size of the name
+	addl3	r6,r7,r9			;update the pointer
+	jmp	20$				;process the next entry
+
+;	Add the data message
+
+40$:	moval	sm6,r1				;point to the data msg
+	movzbw	(r1)+,r2			;get its size
+	movw 	r2,querab+rab$w_rsz		;add the size
+	movc3	r2,(r1),mbuf			;store the message
+	$put	rab = querab			;output the text
+
+;	Now add the actual data.
+	
+	bsbw	wdat				;add the data
+
+;	End the data with a period
+	
+	movw	#1,querab+rab$w_rsz		;size of a period 
+	movb	#46,mbuf			;store the period
+	$put	rab = querab			;output the text
+
+;	End the mail message with a quit
+
+	moval	sm7,r1				;point to the quit msg
+	movzbw	(r1)+,r2			;get its size
+	movw 	r2,querab+rab$w_rsz		;add the size
+	movc3	r2,(r1),mbuf			;store the message
+	$put	rab = querab			;output the text
+
+	movb	#0,r6				;make sure we don't get lost
+	rsb
+
+
+.page
+;	Write out mailq: files for all relay sites recipents.
+;	Traverse the domain list.  Off of each entry in
+;	the domain list will be a linked list in the
+;	complete list.  Process each entry in the complete list.
+
+p.rly::	clrb	f.fmt				;clear the mail format flag
+	moval	rlybuf,rlyptr			;get the relay hosts pointer
+10$:	movl	rlyptr,r6			;set up for a read
+	tstb	(r6)				;anything there?
+	bneq	15$				;if non zero process the entry
+	jmp	90$				;if zero exit
+
+;	Build the ascic string keyword_domain domain
+
+15$:	moval	domain,r4			;point to the word "host"
+	movzbw	(r4)+,r5			;get the size of the word
+	moval	cadd,r3
+	movb	r5,(r3)+			;make it ascic
+	movc3	r5,(r4),(r3)			;get the domain 
+	movzbw	(r6)+,r8			;size of the domain
+	movc3	r8,(r6),(r3)			;store domain r1 dispatch address
+	addb2	r8,cadd				;add the domain size in	
+	movl	(r1),r6				;point to the complete list entry
+	addl3	#4,r1,rlyptr			;skipping address 	
+
+;	Matched in the unique list traverse the complete list processing
+;	mail for each user.	
+
+20$:	tstb	r6				;is this the end?
+	beql	10$				;if not get next entry in host.domain
+	$create	fab = quefab			;create the file
+	blbs	r0,30$
+	jmp	rmserr				;signal an rms error
+30$:	$connect rab = querab			;connect to record stream
+	blbs	r0,40$
+	jmp	rmserr				;signal an rms error
+40$:	movzbl	(r6)+,r7			;get the size of the name
+	addl3	r6,r7,r9			;update the pointer
+	clrb 	f.single			;signal a relay site
+	bsbw	chkfmt				;check the mail format
+	pushr	#^m<r6,r7>
+	tstb	f.fmt				;are we using a special format
+	beql	50$				;if not skip
+	moval	cadd,r6				;get the mail id pointer
+	movzbl	(r6)+,r7			;and size of the mail id
+50$:	bsbw	whdr				;write out the header
+	popr	#^m<r6,r7>
+	tstb	f.fmt				;are we using a special format
+	beql	60$				;if not skip
+	bsbw	spfmt				;handle special mail format
+	jmp	70$				;skip the data
+60$:	bsbw	wdat				;write out the data
+70$:	$disconnect rab = querab		;break from the record stream
+	$close	fab = quefab			;close the file
+	movl	(r9),r6				;point to the next entry
+	jmp	20$				;process the next entry
+90$:	rsb
+
+
+.page
+;	Write out mailq: files for all local mail recipents.
+
+p.lcl::	clrb	f.fmt				;clear the mail format flag
+	moval	lclbuf,lclptr			;point to the local buffer
+5$:	movl	lclptr,r6			;get the pointer
+	tstb	(r6)				;anything there
+	beql	50$				;if not quit
+	$create	fab = quefab			;create the file
+	blbs	r0,10$
+	jmp	rmserr				;signal an rms error
+10$:	$connect rab = querab			;connect to record stream
+	blbs	r0,20$
+	jmp	rmserr				;signal an rms error
+20$:	movzbl	(r6)+,r7			;get the size of the name
+	addl3	r6,r7,lclptr			;update the pointer
+	bsbw	whdr				;write out the header
+	bsbw	wdat				;write out the data
+	$disconnect rab = querab		;break from the record stream
+	$close	fab = quefab			;close the file
+	jmp	5$				;get the next recpient
+50$:	rsb
+
+.page
+;	Check nonlocal mail for a special mail formt.
+;	Input:	cadd  an ascic string of key_word_host host.domain 
+;		or key_word_domain domain
+;		f.single 1= single known site 0= relay site
+;	Output:	flag f.fmt will be set for a special mail format
+;		cadd an ascic name_of_mail_service@host.domain
+;		and
+;		me an ascic string with my name for this domain
+;		or
+;		flag f.fmt will be clear and cadd unchanged for no sp format
+
+chkfmt::pushr	#^m<r1,r2,r3,r4,r5,r6,r7,r8,r9>
+	clrb	f.fmt				;clear the format flag
+	moval	cadd,r8				;set the pointer to the string	
+	movzbw	(r8)+,r9			;get the size of the sting
+	movl	domst,r3			;get the start of the tcp$domain
+	matchc	r9,(r8),domsz,(r3)		;the matchc has to succeed
+	tstb	f.single			;is this a known site or relay
+	beql	20$				;zero means a relay site
+
+;	Checking a single known site
+
+	cmpb	(r3)+,#space			;is the next ch a space?
+	beql	10$
+	jmp	100$				;if not no special format
+10$:	movl	r3,r6				;save the start of the mail id
+	matchc	#1,#44,#9,(r3)			;search for end of mail id ","
+	beql	15$
+	jmp	100$				;wierd error set no sp format
+15$:	subl3	r6,r3,r7			;compute size of mail id
+	decl	r7				;dont include the ","
+
+;	Move the host.domain back to where it belongs
+
+	moval	cadd,r1				;get the pointer back
+	addl3	#2,r7,r10			;point past the mail id
+	addl2	r1,r10
+	movzbw	(r1)+,r2			;get the size of cadd
+	matchc	#1,#space,r2,(r1)		;skip the key word
+	addb3	r2,r7,cadd			;store the new size
+	movc3	r2,(r3),(r10)			;save the host.domain
+
+;	Now store the mail id and seperator
+
+	movc3	r7,(r6),cadd+1			;save the mail id
+	movb	#64,(r3)+			;store a seperator "@"
+	incb	cadd				;one for the "@"
+	movb	#1,f.fmt			;set the format flag
+	jmp	90$
+
+;	Checking a relay site.
+
+20$:	cmpb	(r3)+,#44			;is the next ch a comma?
+	beql	30$
+	jmp 	100$				;if not no special format
+30$:	movl	r3,r6				;save the start of the host.domain
+	matchc	#1,#space,#40,(r3)			;find the end of the host name
+	subl3	r6,r3,r7			;compute the size of the host name
+	decl	r7				;not the space
+	movl	r3,r8				;save the start of the mail id
+	matchc	#1,#44,#9,(r3)			;search for end of mail id ","
+	beql	40$
+	jmp	100$				;wierd error set no sp format
+40$:	subl3	r8,r3,r9			;compute size of mail id
+	decl	r9				;dont include the ","
+	moval	cadd,r1				;get the pointer
+	addb3	r7,r9,(r1)+			;store the size
+	movc3	r9,(r8),(r1)			;store the mail id
+	movb	#64,(r3)+			;store a seperator "@"
+	incb	cadd				;one for the "@"
+	movc3	r7,(r6),(r3)			;store the host.domain	
+	movb	#1,f.fmt			;set the format flag
+
+;	Build the true reverse path and put it into retbuf.
+
+;	First shift the old revbuf to the right
+
+90$:	jmp	100$				;[W1] Skip this code
+
+	moval	revbuf,r6			;point to old reverse buffer
+	movzbw	(r6)+,r7			;size
+	addl3	r6,#3,r1			;compute the size of my name
+	addb3	lhnasz,lnnasz,r0
+	movzbl	r0,r0				;make it long
+	addl2	r0,r1				;make it an offset
+	movc3	r7,revbuf+1,(r1)		;shift the old name to the right
+
+;	Now add my name
+
+	moval	revbuf,r3			;point to the reverse buffer
+	incl	r3				;past the size
+	movb	#64,(r3)+			;store a seperator
+	movzbw	lhnasz,r2			;get the size
+	addb2	r2,revbuf			;r7 size of buffer to ouput
+	movc3	r2,lhna,(r3)			;save our name
+	addb2	#1,revbuf			;one for the period
+	movb	#period,(r3)+			;a period
+	movzbw	lnnasz,r2			;get the size
+	addb2	r2,revbuf			;size of domain name
+	movc3	r2,lnna,(r3)			;save our domain
+	movl	r3,r8				;save the pointer
+	matchc	#1,#58,r7,(r6)			;seperate with a comma or colon
+	bneq	95$				;if one colon use a comma
+	movb	#44,(r8)+			;store a comma
+	jmp	98$
+95$:	movb	#58,(r8)+			;store a colon
+98$:	addb2	#2,revbuf			;increment the size
+
+;	Get my identity for this network.
+
+100$:	moval	cadd,r1				;get the receiver id
+	movzbw	(r1)+,r2			;get its size
+	matchc	#1,#46,r2,(r1)			;isolate the domain
+	movq	r2,r6				;save the size and pointer
+	moval	ident,r1			;build an identity string
+	movzbw	(r1)+,r8			;get its size
+	movc3	r8,(r1),me			;store ident string
+	movc3	r6,(r7),(r3)			;store the domain
+	addw2	r6,r8				;size of the string
+	movl	domst,r1			;start of the domain
+	matchc	r8,me,domsz,(r1)		;search for my identity
+	addl3	#1,r3,r6			;skip the space and save it
+	matchc	#1,#58,#40,(r6)			;get the end of my name ":"
+	subl3	r6,r3,r4			;compute the size of my name
+	decl	r4				;don't count the ":"
+	moval	me,r1				;point to me
+	movb	r4,(r1)+			;store the size
+	movc3	r4,(r6),(r1)			;store my name
+	popr	#^m<r1,r2,r3,r4,r5,r6,r7,r8,r9>
+	rsb
+
+
+.page
+;	Write out the header information to a queue: file.	
+;	Input:	r6 size of Recpients name
+;		r7 pointer to recpients name
+;		f.del type of delivery service where
+;		1= mail, 2= send, 3= soml, 4=saml
+
+;	Write out the delivery option message.
+
+whdr::	pushr	#^m<r1,r2,r3,r4,r5,r6,r7,r8,r9>
+	moval	h1,r1				;get the delivery options msg
+	movzbw	(r1)+,querab+rab$w_rsz		;get the size of the msg
+	movc3	querab+rab$w_rsz,(r1),mbuf	;store the msg
+	caseb	f.del,#1,#4			;get the specific option
+5$:	.word	10$-5$
+	.word	15$-5$
+	.word	20$-5$
+	.word	25$-5$
+10$:	moval	mail,r1				;get the mail msg
+	movzbw	(r1)+,r2			;size of the mail msg
+	addw2	r2,querab+rab$w_rsz		;add the size
+	movc3	r2,(r1),(r3)			;tack on the option
+	jmp	30$				;and continue
+15$:	moval	send,r1				;get the send msg
+	movzbw	(r1)+,r2			;size of the send msg
+	addw2	r2,querab+rab$w_rsz		;add the size
+	movc3	r2,(r1),(r3)			;tack on the option
+	jmp	30$				;and continue
+20$:	moval	soml,r1				;get the soml msg
+	movzbw	(r1)+,r2			;size of the soml msg
+	addw2	r2,querab+rab$w_rsz		;add the size
+	movc3	r2,(r1),(r3)			;tack on the option
+	jmp	30$				;and continue
+25$:	moval	saml,r1				;get the saml msg
+	movzbw	(r1)+,r2			;size of the saml msg
+	addw2	r2,querab+rab$w_rsz		;add the size
+	movc3	r2,(r1),(r3)			;tack on the option
+30$:	$put	rab = querab			;output the text
+
+;	Write the notify msg.
+
+	moval	h2,r1				;get the notify msg
+	movzbw	(r1)+,querab+rab$w_rsz		;get the size of the msg
+	movc3	querab+rab$w_rsz,(r1),mbuf	;store the msg
+	$asctim_s timbuf = dtime		;get the current ascii time
+	addw2	dtime,querab+rab$w_rsz		;size of the time
+	movc3	dtime,time,(r3)			;save the time
+	$put	rab = querab			;output the text
+
+;	Write the dequeue msg.
+
+	moval	h3,r1				;get the dequeue msg
+	movzbw	(r1)+,querab+rab$w_rsz		;get the size of the msg
+	movc3	querab+rab$w_rsz,(r1),mbuf	;store the msg
+	$gettim_s stime				;now get the dequeueing time
+	addl2	#604,stime+4			;it needs to be three days
+	$asctim_s timbuf=dtime,timadr=stime	;from now
+	addw2	dtime,querab+rab$w_rsz		;size of the time
+	movc3	dtime,time,(r3)			;save the time
+	$put	rab = querab			;output the text
+
+;	Write the from msg.
+
+	moval	h4,r1				;get the from msg
+	movzbw	(r1)+,querab+rab$w_rsz		;get the size of the msg
+	movc3	querab+rab$w_rsz,(r1),mbuf	;store the msg
+	movl	r3,r9				;save the pointer
+
+;	Pick off the last name in the revbuf
+
+	pushr	#^m<r6,r7>
+	moval	revbuf,r7			;point to the reverse path
+	movzbw	(r7)+,r6			;get the size
+	matchc	#1,#58,r6,(r7)			;look for a colon
+	beql	40$				;if found use the last name
+	movq	r6,r2				;move the size and pointer
+40$:	addw2	r2,querab+rab$w_rsz		;add it in
+	movc3	r2,(r3),(r9)			;add the senders name
+	$put	rab = querab			;output the text
+	popr	#^m<r6,r7>
+
+;	Write the to msg.
+
+	moval	h5,r1				;get the to msg
+	movzbw	(r1)+,querab+rab$w_rsz		;get the size of the msg
+	movc3	querab+rab$w_rsz,(r1),mbuf	;store the msg
+	addw2	r7,querab+rab$w_rsz		;size of the recpients name
+	movc3	r7,(r6),(r3)			;the recpients name
+	$put	rab = querab			;output the text
+
+;	Send a blank line
+
+	clrw	querab+rab$w_rsz		;send a blank line
+	$put	rab = querab			;output the text
+	popr	#^m<r1,r2,r3,r4,r5,r6,r7,r8,r9>
+	rsb
+
+.page
+;	Output the data.  Tag onto the top of the real data a timestamp
+;	and a return path.
+
+;	Add the time stamp.
+
+wdat::	pushr	#^m<r1,r2,r3,r4,r5,r6,r7,r8,r9>
+	tstb	f.user				;don't time stamp a user message
+	bneq	5$				;time stamp servers f.user = 1
+
+	moval	timbuf,r6			;point to the buffer
+	movzbw	(r6)+,r5			;get its size
+	cmpw	#80,r5				;do we need to fold this header?
+	bgeq	2$				;don't fold this line
+	bsbw	fldhdr				;fold this header
+	jmp	3$				;don't send it twice
+
+2$:	movw	r5,querab+rab$w_rsz		;store the size
+	movc3	querab+rab$w_rsz,(r6),mbuf	;get the text
+	$put	rab = querab			;output the text
+
+;	Add the return path.
+
+3$:
+;	moval	retbuf,r3			;get the return path buffer
+;	movzbw	(r3)+,querab+rab$w_rsz		;store the size
+;	movc3	querab+rab$w_rsz,(r3),mbuf	;get the text
+;	$put	rab = querab			;output the text
+
+
+;	We will use the standard data buffer
+
+	moval	datbuf,r6			;point to the data buffer
+	movw	dtbfsz,r9			;size of the data buffer
+	jmp	10$				;headers for f.user = 0
+
+;	Add the headers to the data and use the modified data buffer
+	
+5$:	bsbw	addhdr				;add the headers
+	moval	datbufalt,r6			;point to the data buffer
+	movw	dtbfaltsz,r9			;size of the data buffer
+
+;	Add the data.
+
+10$:	clrl	r10				;clear the mail header flag
+20$:	matchc	#1,#cr,r9,(r6)			;find an eol
+	beql	30$				;if not found use rest of input
+	movw	r9,querab+rab$w_rsz		;store the size
+	movc3	querab+rab$w_rsz,(r6),mbuf	;get the text
+	$put	rab = querab			;output the text
+	jmp	90$				;and exit
+30$:	subl3	r6,r3,r5			;get the size of this line
+	subw2	r5,r9				;bump the count down
+	decl	r5				;don't count the cr
+	cmpb	#lf,(r3)			;did we get a lf
+	bneq	35$				;if so skip it
+	decw	r9				;bump the count down
+	incl	r3				;skip the lf
+
+;	Fold any mail header lines over 80 characters
+
+35$:	tstb	r10				;are we past the mail headers?
+	bneq	80$				;we are past the headers
+	tstb	r5				;is this the last header line?
+	bneq	70$				;if so set the flag
+	jmp	75$				;set the flag
+
+;	Here if we are dealing with headers.  Check for a trashed header.
+
+70$:	bsbw	chkrfc				;if trashed add white space
+
+;	Do we need to fold this header?
+
+	cmpw	#80,r5				;do we need to fold this header?
+	bgeq	80$				;don't fold this line
+
+;	If here we need to fold this header line
+
+	bsbw	fldhdr
+	jmp	20$				;get the next line
+
+;	Here to signal we are past the headers.
+
+75$:	movb	#1,r10				;set the end of headers flag
+
+;	Write out non header data and non folded headers
+
+80$:	movw	r5,querab+rab$w_rsz		;store the size
+	pushr	#^m<r1,r2,r3,r4,r5>
+	movc3	querab+rab$w_rsz,(r6),mbuf	;get the text
+	$put	rab = querab			;output the text
+	popr	#^m<r1,r2,r3,r4,r5>	
+	movl	r3,r6				;update the pointer
+	jmp	20$				;get the next line
+90$:	popr	#^m<r1,r2,r3,r4,r5,r6,r7,r8,r9>
+	rsb
+
+
+.page
+;	Fold a rfc822 header (fold on a space if possible)
+;	Input:	r5 size of the line
+;		r6 pointer to the line
+;	Output:	r6 updated
+
+fldhdr::pushr	#^m<r1,r2,r3,r4,r9,r10>		;save some registers
+	matchc	#1,#32,#80,(r6)			;search for a space not more than 80
+	bneq	70$				;no spaces use a nasty fold
+40$:	movq	r2,r9				;save the current size and location
+	matchc	#1,#32,r2,(r3)			;get to the next space
+	beql	40$				;found one check for another
+
+;	Do the folding.  Write out the first part of the line.
+
+60$:	subw3	r6,r10,querab+rab$w_rsz		;save the line size of the 1st part
+	pushr	#^m<r1,r2,r3,r4,r5>
+	movc3	querab+rab$w_rsz,(r6),mbuf	;save the text of the 1st part
+	$put	rab = querab			;write out the first part
+	popr	#^m<r1,r2,r3,r4,r5>
+	subw2	querab+rab$w_rsz,r5		;compute size of the 2nd part
+	movl	r10,r6				;point to the 2nd part
+	incw	r5				;add some white space
+	decl	r6				;account for white space 
+	movb	#9,(r6)				;store white space
+	popr	#^m<r1,r2,r3,r4,r9,r10>
+
+;	Does the remaining part exceed 80 characters?
+
+	cmpw	#80,r5				;test it
+	blss	fldhdr				;fold it again if it does
+
+;	Write out the remaining part of the header.
+
+	movw	r5,querab+rab$w_rsz		;store the size
+	pushr	#^m<r1,r2,r3,r4,r5>
+	movc3	querab+rab$w_rsz,(r6),mbuf	;get the text
+	$put	rab = querab			;output the text
+	popr	#^m<r1,r2,r3,r4,r5>	
+	movl	r3,r6				;update the pointer
+	rsb					;get the next line
+
+;	If here we could not find a comma.  Do a nasty fold
+
+70$:	subw3	#70,r5,r9			;nasty fold (fold at 65 characters)
+	addl3	#70,r6,r10			;bump up the pointer
+	jmp	60$				;go do the fold
+
+
+
+.page
+;	Build a time stamp.
+;	Format:	ascic
+;	"Received: from foreign_host (nickname) by local_host date time"
+
+tstmp::	moval	timbuf,r3			;point to the buffer
+	incl	r3				;reserve the first byte
+	moval	dpar,r1				;point to the parameter
+	movzbw	(r1)+,r7			;get its size
+	movc3	r7,(r1),(r3)			;store the start of the msg
+	movzbw	fhnasz,r2			;get the their size
+	addw2	r2,r7				;size of hostname
+	movc3	r2,fhna,(r3)			;save their name
+	addw2	#1,r7				;one for the period
+	movb	#period,(r3)+			;a period
+	movzbw	fnnasz,r2			;get the size
+	addw2	r2,r7				;size of domain name
+	movc3	r2,fnna,(r3)			;save their name
+	tstb	f.nic				;did they give us a nicname?
+	beql	10$				;if so tack it on
+	movb	#40,(r3)+			;enclose the nickname in "()"
+	moval	ncknam,r6			;point to the nickname
+	movzbw	(r6)+,r8			;size of the nickname	
+	addw2	r8,r7				;add the nick name size
+	movc3	r8,(r6),(r3)			;add the nickname
+	movb	#41,(r3)+			;close the ")"
+	addw2	#2,r7				;bump size for the "()"
+
+;	We have their name and nickname if given.  Now add my name.
+
+10$:	moval	bpar,r1				;point to the  string " by "
+	movzbw	(r1)+,r2			;get its size
+	addw2	r2,r7				;add the size of the string 
+	movc3	r2,(r1),(r3)			;add the string
+	movzbw	lhnasz,r2			;get the size
+	addw2	r2,r7				;size of hostname
+	movc3	r2,lhna,(r3)			;save our name
+	addw2	#1,r7				;one for the period
+	movb	#period,(r3)+			;a period
+	movzbw	lnnasz,r2			;get the size
+	addw2	r2,r7				;size of domain name
+	movc3	r2,lnna,(r3)			;save our domain
+
+;	Now add the date and time.
+	
+	addw2	#1,r7				;one for the space
+	movb	#space,(r3)+			;a space
+	$asctim_s timbuf = dtime		;get the current ascii time
+	addw2	dtime,r7			;size of the time
+	movc3	dtime,time,(r3)			;save the time
+	movb	r7,timbuf			;save the size
+	rsb
+
+.page
+;	Check for a valid rfc822 header
+;	Input:	r6 pointer to line to check
+;		r5 size of line to check
+;	Output:	if valid header no change
+;		if invalid header r6 backed up one byte and
+;		white space is put into the byte
+;		r5 incremented by one
+
+chkrfc:	cmpb	#32,(r6)			;is fist ch white space?
+	beql	40$				;if so ok
+	cmpb	#9,(r6)				;check for tabs too
+	beql	40$
+	
+;	Not white space, so check for a legitimate rfc822 header
+
+	pushr	#^m<r1,r2,r3,r4,r5,r6,r7,r8,r9,r10>
+	movl	r5,r7				;save the line size
+	movc3	r5,(r6),mbuf			;get a working buffer
+	moval	mbuf,r6				;point to it
+	bsbw	ucase				;uppercase the buffer
+	moval	rfc1,r1				;point to the rfc headers
+10$:	movzbw	(r1)+,r2			;get the size or terminator
+	tstb	r2				;zero = terminator
+	bneq	20$				;nonzero = header size
+
+;	Hit a terminator check for a second one. Double means end all headers
+
+	movzbw	(r1)+,r2			;get the size or terminator
+	tstb	r2				;zero = terminator
+	bneq	20$				;nonzero = header size
+	popr	#^m<r1,r2,r3,r4,r5,r6,r7,r8,r9,r10>
+	jmp	30$				;not a rfc822 header	
+
+20$:	matchc	r2,(r1),r2,(r6)			;is this a header?
+	bneq	10$				;if no match check next header
+	popr	#^m<r1,r2,r3,r4,r5,r6,r7,r8,r9,r10>
+	jmp	40$				;this is a valid header
+	
+30$:	incw	r5				;not a header so add white space
+	decl	r6				;account for white space 
+	movb	#9,(r6)				;store white space
+40$:	rsb					;is a header so do nothing
+	
+.page
+;	Add the individual headers to the top of the data.
+
+;	If the message is not for the local net then add the appropiate ending
+;	to the from header so that it can be replied to.
+
+addhdr::pushr	#^m<r1,r2,r3,r4,r5,r6,r7,r8,r9>
+	movw	corg,mbuf			;must preserve corg
+	movc3	corg,corg+2,mbuf+2		;for other msgs
+	pushr	#^m<r1,r2,r3,r4,r5,r6>
+	movzbw	me,r1				
+	matchc	#1,#46,r1,me+1			;get to the domain
+	matchc	r2,(r3),lcldom,lcldom+2		;is it local?
+	beql	10$				;if not add my name as known elsewhere
+	
+;	Add my identity as known elsewhere
+
+	matchc	#1,#64,mbuf,mbuf+2		;reverse tmog
+	decl	r3				;backup
+	movb	#37,(r3)			;exchange @ for %
+
+	matchc	#1,#cr,mbuf,mbuf+2		;get to the end of from line
+	decl	r3				;backup past cr
+	subl3	#1,r3,r6			;point to the last character
+
+;	Adjust for a personal name
+
+	cmpb	(r6),#62			;is there a personal name here?
+	bneq	5$				;if not do nothing
+	decl	r3				;backup past the "<"
+	clrl	r6				;clear a personal name flag	
+
+5$:	movzbw	me,r1				
+	addw2	r1,mbuf				;add my size in
+	movb	#64,(r3)+			;insert a seperator
+	incw	mbuf				;account for seperator
+	movc3	r1,me+1,(r3)			;add my identity
+	tstl	r6				;did we have a personal name?
+	bneq	8$				;if not do nothing
+	movb	#62,(r3)+			;close off the address ">"
+8$:	movb	#cr,(r3)+			;replace the crlf
+	movb	#lf,(r3)+
+10$:	popr	#^m<r1,r2,r3,r4,r5,r6>
+
+;	Compute the size of the headers 
+
+	clrl	r7				;start clean
+	addw2	cdate,r7			;add the date
+	addw2	mbuf,r7				;add the orginator 
+	addw2	ccc,r7				;get the cc field
+	addw2	cto,r7				;get the to field
+	addw2	csub,r7				;get the subject field
+	addw2	#2,r7				;terminating crlf
+	
+;	Now add the headers
+
+	moval	datbufalt,r3			;point to the data buffer
+	movc3	cdate,cdate+2,(r3)		;add the date
+	movc3	mbuf,mbuf+2,(r3)		;add the org
+	movc3	ccc,ccc+2,(r3)			;add the cc
+	movc3	cto,cto+2,(r3)			;add the to
+	movc3	csub,csub+2,(r3)		;add the subject
+
+;	Finish  off the headers with a blank line.
+
+	movb	#cr,(r3)+			;store a crlf
+	movb	#lf,(r3)+
+	addw3	r7,dtbfsz,dtbfaltsz		;add the fields size to data size
+
+;	Add the data
+
+	movc3	dtbfsz,datbuf,(r3)		;add the data
+	popr	#^m<r1,r2,r3,r4,r5,r6,r7,r8,r9>
+	rsb
+
+.page
+;	Run maiser if it is not already running
+
+rmaiser:	$creprc_s -
+		image = mimage,-		;run maiser
+		prcnam = maisernm,-		;registered mail name***
+		uic = #10006,-
+		stsflg = #prc$m_detach
+	rsb
+
+.page
+;	Translate the username passed.
+;	Input:	r6 pointer to address
+;		r7 length of address
+;	Output:	r0 normal=success abort=username not found -1=filspec
+;		r6 and r7 updated on success
+
+mailbox::pushr	#^m<r1,r2,r3,r4,r5,r8,r9,r10,r11>
+	pushr	#^m<r6,r7>
+	$open	fab = mlstfab			;open the mailing_lists.txt file
+	blbs	r0,10$				;if open continue
+	jmp	300				;can not open then error	
+10$:	$connect rab = mlstrab			;connect to the record stream
+	blbs	r0,20$				;continue if ok
+	jmp	300				;can not open then error	
+
+;	Start looking for the user id passed
+
+20$:	$get	rab = mlstrab			;get a record
+	blbs	r0,25$				;continue if we have one
+	jmp	300$
+	
+;	Is this line commented out?
+
+25$:	cmpb	mlstbuf,#33			;is this a comment line?
+	beql	20$				;if so get the next line
+
+;	Isolate the id on the line
+
+	matchc	#1,#61,mlstrab+rab$w_rsz,mlstbuf ;search for "="
+	bneq	20$				;not there then error (skip line)
+	movq	r2,r8				;save the last part of the line
+
+;	Compute the size of mailing_lists id
+
+	subw3	r2,mlstrab+rab$w_rsz,r3		;compute the size
+	decw	r3				;don't count the "="
+	
+;	Check for our user id
+
+	cmpw	r3,r7				;must have an exact match
+	bneq	20$				
+
+	matchc	r7,(r6),r3,mlstbuf		;check for a match
+	bneq	20$				;if not try again
+
+;	Match if here but DON'T count a filespec as normal success
+
+	cmpb	#42,(r9)			;is the match a filespec
+	bneq	28$
+	jmp	305$				;if so signal filespec
+
+;	Add the new address(s) to the end of the list
+
+28$:	clrl	r7				;set up a counter
+	moval	mbxbuf,r6			;point to the start of buffer
+30$:	tstw	(r6)				;at the end?
+	beql	40$				;stop if we are
+	addw2	(r6),r7				;add the size	
+	addw2	#2,r7				;account for the ascii (word)
+	addw2	(r6)+,r6			;point to the next size
+	jmp	30$				;try again
+
+;	Seperate the address(s) and add them on one at a time ascic (word)
+
+40$:	pushr	#^m<r6,r7>	
+	movq	r8,r4				;set up for a match failure
+	matchc	#1,#44,r8,(r9)			;search for a comma
+	bneq	50$				;if not found skip size computation
+	subl3	r9,r3,r4			;compute the size of address
+	decl	r4				;don't count the comma
+	movl	r9,r5				;r5 point and r4 is size of userid
+50$:	movq	r2,r8				;r9 point and r9 is size of rest of list
+	movw	r4,r7				;set up for addadd routine
+	movw	r7,(r6)+			;add the size to list
+	movc3	r7,(r5),(r6)			;add the user name
+
+;	If the userid is local add the local host/domain to the list
+
+	bsbw	addadd				;add host.domain if not there
+
+;	Reset r7 to size of the master list and r6 to point to the end of list
+
+	movq	r6,r4				;preserve pointer and size
+	popr	#^m<r6,r7>	
+	addw2	r5,r7				;add to master list size
+	addw2	#2,r7				;account for the ascii (word)
+	movw	r5,(r6)+			;reset the size of the address
+	addw2	r5,r6				;update pointer to master list
+	tstw	r8				;are we done?
+	bneq	40$				;if not get the next address
+
+;	Remove the address we are currently parsing
+
+	moval	mbxbuf,r1			;point to the start of the buf
+	movw	(r1),r2				;get the size
+	addw2	(r1)+,r1			;point to the next address
+	subw2	r2,r7				;compute size of rest of the line
+	subw2	#2,r7				;size too
+	movc5	r7,(r1),#0,#mbxbufsz,mbxbuf	;shift  to the left
+
+;	Signal success
+	
+	movl	#ss$_normal,r8			;signal success
+	popr	#^m<r6,r7>
+
+;	Update r6 and r7
+
+	moval	mbxbuf,r6			;point to the start of the buf
+	movw	(r6)+,r7			;get the size
+	jmp	310$				;continue
+
+;	Error if here
+
+300$:	movl	#ss$_abort,r8			;signal error
+	popr	#^m<r6,r7>
+	jmp	310$				;continue
+
+305$:	movl	#-1,r8				;signal file spec
+	popr	#^m<r6,r7>
+
+;	Finish up
+
+310$:	$disconnect rab = mlstrab		;break it off
+	$close	fab = mlstfab			;close it off
+	movl	r8,r0				;replace the code	
+	popr	#^m<r1,r2,r3,r4,r5,r8,r9,r10,r11>
+	rsb
+
+
+.page
+;	Add my host.domain to the end of an address that has no host.domain
+;	Input:	r7 size of the address
+;		r6 pointer to the address
+;	Output:	r7 updated if necessary
+
+addadd:	pushr	#^m<r1,r2,r3,r4,r5,r8,r9,r10>
+	matchc	#1,#64,r7,(r6)			;any hosts?
+	beql	40$				;if a "@" found assume a host
+	matchc	#1,#37,r7,(r6)			;any hosts?
+	bneq	60$				;if a "%" found assume a host
+40$:	tstw	r2				;any text left (must have some)
+	bneq	50$				;text continue
+	decw	r7				;back up one and add local host
+	jmp	60$
+
+;	Check for a domain name
+
+50$:	matchc	#1,#46,r7,(r6)			;is there a domain name
+	bneq	70$				;if "." then yes
+	tstw	r2				;any text left (must have some)
+	bneq	80$				;text continue
+	decw	r7				;back up one and add local host
+	jmp	70$				;add the local domain name
+
+;	No host or domain means it must be local
+
+60$:	movb	#64,(r3)+			;add a user host seperator
+	incw	r7
+	movc3	lclhst,lclhst+2,(r3)		;add my hostname
+	addw2	lclhst,r7
+70$:	movb	#46,(r3)+			;add a host domain seperator
+	incw	r7
+	movc3	lcldom,lcldom+2,(r3)		;add my domain name
+	addw2	lcldom,r7
+80$:	popr	#^m<r1,r2,r3,r4,r5,r8,r9,r10>
+	rsb
+
+.page
+
+;	Remove the address at the start of the mailbox.
+
+rmbx:	pushr	#^m<r1,r2,r3,r4,r5,r6,r7>
+	clrl	r7				;set up a counter
+	moval	mbxbuf,r6			;point to the start of buffer
+10$:	tstw	(r6)				;at the end?
+	beql	20$				;stop if we are
+	addw2	(r6),r7				;add the size	
+	addw2	#2,r7				;account for the ascii (word)
+	addw2	(r6)+,r6			;point to the next size
+	jmp	10$				;try again
+
+20$:	moval	mbxbuf,r1			;point to the start of the buf
+	movw	(r1),r2				;get the size
+	addw2	(r1)+,r1			;point to the next address
+	subw2	r2,r7				;compute size of rest of the line
+	subw2	#2,r7				;size too
+	movc5	r7,(r1),#0,#mbxbufsz,mbxbuf	;shift  to the left
+	popr	#^m<r1,r2,r3,r4,r5,r6,r7>
+	rsb
+
+
+.page
+.psect dat,noexe,wrt,long
+
+$iodef
+$fabdef
+$rabdef
+$rmsdef
+$uafdef
+$prcdef
+
+;	Map information
+
+dumadd:	.long	^x200				;dummy address pointing to
+	.long	^x200				;map into p0 space
+domst::	.blkl	1				;start of the global section
+domed::	.blkl	1				;end of the global section
+domains:.ascid	/tcp$domains/			;name of the section
+domsz::	.blkl	1				;size of the file in blocks
+
+;	End of Map information
+;	Data terminator
+
+term::	.byte	13,10,46,13,10			;data terminator
+termsz	==	.-term
+
+;	End of data terminator
+;	Ucase information
+
+sma	=	97				;uppercase a
+smz	=	122				;lowercase z
+cse	=	32				;difference between up/lo case
+
+;	End of Ucase information
+;	Local mail message control information offsets
+
+msg_w_num	== 1
+msg_l_siz	== 3
+msg_b_new	== 7
+msg_b_read	== 8
+msg_b_ans	== 9
+msg_b_del	== 10
+msg_b_flag	== 11
+msg_b_key	== 12
+msg_t_date	== 226
+msg_control_siz	== 250
+
+;	End local mail message control information offsets
+;	Start of current mail message buffers
+
+cdate::	.blkb	160				;current date
+corg::	.blkb	160				;current sender
+ccc::	.blkb	160				;current recpient CC
+cto::	.blkb	160				;current recpient TO
+csub::	.blkb	160				;current subject
+
+;	End of current mail message buffers
+;	Start of RFC 822 header fields.
+
+rfc1::	.ascic	/TO:/				;Originator fields
+	.ascic	/CC:/
+	.ascic	/BCC:/
+	.ascic	/RESENT-TO:/
+	.ascic	/RESENT-CC:/
+	.ascic	/RESENT-BCC:/
+	.byte	0				;Terminator
+rfc2::	.ascic	/FROM:/				;Recpient fields
+	.ascic	/SENDER:/
+	.ascic	/REPLY-TO:/
+	.ascic	/RESENT-FROM:/
+	.ascic	/RESENT-SENDER:/
+	.ascic	/RESENT-REPLY-TO:/
+	.byte	0				;Terminator
+rfc3::	.ascic	/RETURN-PATH:/			;General fields
+	.ascic	/RECEIVED:/
+	.ascic	/DATE:/
+	.ascic	/RESENT-DATE:/
+	.ascic	/MESSAGE-ID:/
+	.ascic	/IN-REPLY-TO:/
+	.ascic	/REFERENCES:/
+	.ascic	/KEYWORDS:/
+	.ascic	/SUBJECT:/
+	.ascic	/COMMENTS:/
+	.ascic	/ENCRYPTED:/
+	.byte	0,0				;Double Terminator
+	
+;	End of RFC 822 header fields.
+;	General info
+
+cr	==	13				;carriage return
+lf	==	10				;line feed
+space	==	32				;space
+period	==	46				;period
+timout	==	30				;time out (in seconds)
+page	==	512				;number of bytes in a page
+parity	==	127				;parity bit
+mbuf::	.blkb	page				;medimum input buffer
+mbufsz	==	.-mbuf				;size of medimum buffer
+gbuf::	.blkb	page				;general manipulation buffer
+
+;	End of General info
+;	Start of Mailing_lists.txt info
+
+mlstbuf::.blkb	80
+mbxbuf::.blkb	page
+mbxbufsz	==	.-mbxbuf
+
+;	End of Mailing_lists.txt info
+;	Maiser pointer and name
+
+
+maisernm:	.ascid	/Mailer/		;name of process
+mimage:		.ascid	/sys$mail:Maiser.exe/	;location of Maiser
+
+;	End of Maiser pointer and name
+;	Maximum sizes
+
+maxdat	==	120*page			;maximum data buffer 120 pages
+maxrcp	==	100				;maximum number of recipients
+maxpth	==	256				;maximum length of a path
+maxdom	==	64				;maximum size of a domain name
+
+;	End of Maximum sizes
+;	Special buffers/pointers
+
+datptr::.blkl	1				;data buffer pointer
+datbuf::.blkb	maxdat				;data buffer
+dtbfsz::.blkw	1				;size of the data buffer
+datbufalt::.blkb maxdat				;alternate data buffer
+dtbfaltsz::.blkw 1				;size of the alternate data buffer
+
+fwdptr::.blkl	1				;forward buffer pointer
+fwdbuf::.blkb	maxrcp*maxpth			;forward buffer
+fwbfsz::.blkw	1				;size of the forward buffer
+
+revptr::.blkl	1				;reverse buffer pointer
+orevbuf::.blkb	maxrcp*maxpth			;old reverse buffer
+revbuf::.blkb	maxrcp*maxpth			;reverse buffer
+rebfsz::.blkw	1				;size of the reverse buffer
+
+lclptr::.blkl	1				;local mailing list
+lclbuf::.blkb	maxrcp*maxpth			;local mail list buffer
+lclsz::.blkw	1				;size of the local mailing list
+
+kwnptr::.blkl	1				;known hosts mailing list
+kwnbuf::.blkb	maxrcp*maxpth			;known hosts mail list buffer
+kwnsz::	.blkw	1				;size of the known mailing list
+
+rlyptr::.blkl	1				;relay mailing list
+rlybuf::.blkb	maxrcp*maxpth			;relay mail list buffer
+rlysz::.blkw	1				;size of the relay mailing list
+
+retbuf:	.blkb	maxpth				;return path buffer
+
+timbuf:	.blkb	maxpth				;date/time stamp buffer
+
+cadd::	.blkb	maxpth				;current host.domain being processed
+
+ncknam::.blkb	maxdom				;nickname storage
+
+uafbuf::.blkb	uaf$c_length			;uaf record buffer
+
+me:	.blkb	80
+
+lclhst::.blkb	maxdom				;storage for the local host name	
+lcldom::.blkb	maxdom				;and domain
+
+sysnam::.ascic	/Postmaster/
+
+;	End of Special buffers/pointers
+;	Flags
+
+f.user::.blkb	1				;user/server flag
+f.nic::	.blkb	1				;nickname flag
+f.helo::.blkb	1				;helo cmd flag
+f.mail::.blkb	1				;mail cmd flag
+f.rcpt::.blkb	1				;rcpt cmd flag
+f.single::.blkb	1				;single site flag
+f.relay::.blkb	1				;relay site flag
+f.lcl::	.blkb	1				;local mail flag
+f.del::	.blkb	1				;delivery options flag
+f.kwn::	.blkb	1				;known site flag
+f.rly::	.blkb	1				;relay site flag
+f.fmt::	.blkb	1				;mail format flag
+f.data::.blkb	1				;data cmd flag
+f.quit::.blkb	1				;quit cmd flag
+f.err::	.blkb	1				;processing error flag
+
+;	End of Flags
+;	Smtp server reply codes
+
+r211::	.ascic	/211 System status, or system help reply/<cr><lf>
+r214::	.ascic	/214 Supported SMTP commands include::/<cr><lf>
+	.ascic	/214 HELO  MAIL  SEND  SOML  SAML  RCPT  RSET  HELP  NOOP  QUIT  DATA/<cr><lf>
+r220::	.ascic	/220-/
+	.ascic	/ SMTP-BSMTP Service, Version /
+	.ascic	/220 Bugs-Gripes.  	Contact Deck@Weslyn.Bitnet/<cr><lf>
+r221::	.ascic	/221 /
+	.ascic	/ closing transmission channel/<cr><lf>
+r250::	.ascic	/250 Requested action okay, completed/<cr><lf>
+oknam::	.ascic	/250 /
+	.ascic	/ Hello, /
+badnam::	.ascic	/250 /
+	.ascic	/ You are an imposter /
+r250n::	.ascic	/250 Noop command executed./<cr><lf>
+r250m::	.ascic	/250 Mail from command executed./<cr><lf>
+r250r::	.ascic	/250 Rcpt to command executed./<cr><lf>
+r250d::	.ascic	/250 Data command executed./<cr><lf>
+r250s::	.ascic	/250 Reset command executed./<cr><lf>
+r251::	.ascic	/251 User not local; will forward to <forward-path>/<cr><lf>
+r254::	.ascic	/354 Start mail input; end with <CRLF>.<CRLF>/<cr><lf>
+r421::	.ascic	/421 <domain> Service not available,  closing transmission channel/<cr><lf>
+r450::	.ascic	/450 Requested mail action not taken:: mailbox unavailable/<cr><lf>
+r451::	.ascic	/451 Requested action aborted:: local error in processing/<cr><lf>
+r452::	.ascic	/452 Requested action not taken:: insufficient system storage/<cr><lf>
+r500::	.ascic	/500 Syntax error, command unrecognized/<cr><lf>
+r500m::	.ascic	/500 Missing parameter/<cr><lf>
+r501::	.ascic	/501 Syntax error in parameters or arguments/<cr><lf>
+r501f::	.ascic	/501 Syntax error in parameters Mail From::<reverse path>/<cr><lf>
+r501t::	.ascic	/501 Syntax error in parameters Mail To::<forward path>/<cr><lf>
+r502::	.ascic	/502 Command not implemented/<cr><lf>
+r503::	.ascic	/503 Bad sequence of commands/<cr><lf>
+r503h::	.ascic	/503 Helo command must come before mail command./<cr><lf>
+r503m::	.ascic	/503 Mail command must come before rcpt command./<cr><lf>
+r503r::	.ascic	/503 Rcpt command must come before data command./<cr><lf>
+r503p::	.ascic	/503 Mail is already in progress. You must finish transaction or use RSET./<cr><lf>
+r504::	.ascic	/504 Command parameter not implemented/<cr><lf>
+r550::	.ascic	/550 Requested action not taken:: mailbox unavailable/<cr><lf>
+r550l::	.ascic	/550 No such local user./<cr><lf>
+r551::	.ascic	/551 User not local; please try <forward-path>/<cr><lf>
+r551r::	.ascic	/551 Error parsing relay address in path./<cr><lf>
+r551n::	.ascic	/551 First name in a path must be mine to relay the message./<cr><lf>
+r551a::	.ascic	/551 Unknown domain or host name./<cr><lf>
+r552::	.ascic	/552 Requested mail action aborted:: exceeded storage allocation/<cr><lf>
+r553::	.ascic	/553 Requested action not taken:: mailbox name not allowed/<cr><lf>
+r554::	.ascic	/554 Transaction failed/<cr><lf>
+
+;	End of Smtp server reply codes
+;	Bsmtp commands
+
+sm1::	.ascic	/HELO /
+sm2::	.ascic	/VERB /
+sm3::	.ascic	/TICK /
+sm4::	.ascic	/MAIL FROM:/
+sm5::	.ascic	/RCPT TO:/
+sm6::	.ascic	/DATA/
+sm7::	.ascic	/QUIT/
+on::	.ascic	/ON/
+off::	.ascic	/OFF/
+num::	.ascic	/777/
+
+;	End of Bsmtp commands
+;	Domains.txt keywords
+
+host::	.ascic	/HOST /
+domain::.ascic	/DOMAIN /
+ident::	.ascic	/IDENT /
+
+;	End of Domains.txt keywords
+;	Queued_mail.txt keywords
+
+h1::	.ascic	/DELIVERY-OPTIONS:/
+mail::	.ascic	/MAIL/
+send::	.ascic	/SEND/
+soml::	.ascic	/SOML/
+saml::	.ascic	/SAML/
+h2::	.ascic	/NOTIFY:/
+h3::	.ascic	/DEQUEUE:/
+h4::	.ascic	/FROM:/
+h5::	.ascic	/TO:/
+
+;	End of queued_mail.txt keywords
+;	Smtp keywords
+
+helo::	.ascic	/HELO /
+data::	.ascic	/DATA/
+rcpt::	.ascic	/RCPT/
+quit::	.ascic	/QUIT/
+fpar::	.ascic	/FROM:/
+tpar::	.ascic	/TO:/
+rpar::	.ascic	/Return-Path: <@/
+dpar::	.ascic	/Received: from /
+bpar::	.ascic	/ by /
+
+;	End of smtp keywords
+;	Time descriptor
+
+dtime::	.long	23				;ascii time descriptor
+	.address time
+time::	.blkb	23				;ascii time buffer
+stime::	.blkq	1				;system version of the time
+
+;	End of Time descriptor
+;	Time to sleep
+
+bslep:	.blkq	1				;binray of time to sleep
+aslep:	.ascid	/0 00:01:00.00/			;hibernate for awhile
+
+;	End of Time to sleep
+;	Command line info
+
+cmdptr::.blkl	1				;command line pointer
+cmdcnt::.blkw	1				;counter for commands examined
+cmdsiz::.blkw	1				;length of the command line
+cmdbufd::.long	80				;[W2] command buffer descriptor
+	.address cmdbuf				;[W2]
+cmdbuf::.blkb	80				;[W2] command buffer
+
+;	End of Command line info
+;	TCP/IP port info
+
+piosb::	.blkw	1				;Storage for the port status
+piolen:: .blkw	1				;storage for the first parameter
+pioex::	.blkl	1				;storage for the second param
+port::	.ascid	/thc:/				;Name of the net device
+pchan::	.blkw	1				;Storage for the port channel
+lcid::	.blkl	1				;storage for the local port
+
+;	End of TCP/IP port info
+;	TCP/IP information buffer (must be contigeous)
+
+fhnasz::.blkb	1				;foreign host name size
+fnnasz::.blkb	1				;foreign node name size
+lhnasz::.blkb	1				;local host name size
+lnnasz::.blkb	1				;local node name size
+fhna::	.blkb	20				;foreign host name
+fprt::	.blkb	4				;foreign port
+fnna::	.blkb	40				;foreign node name
+lhna::	.blkb	20				;local host name
+lprt::	.blkb	4				;local port
+lnna::	.blkb	40				;local node name
+where::	.blkb	8				;I don't know why this is needed
+inbufsz	==	.-fhnasz			;size of the information buffer
+
+;	End of TCP/IP information buffer (must be contigeous)
+;	Well known internet ports.
+
+daytime	==	13
+discard	==	9
+echo	==	7
+locate	==	79
+ftp	==	21
+smtp	==	25
+systat	==	11
+telnet	==	23
+
+;	End of Well known internet ports.
+;	TCP QIO function Codes.
+
+tcp$open	== io$_create
+tcp$close	== io$_delete
+tcp$send	== io$_writevblk
+tcp$receive	== io$_readvblk
+tcp$abort	== io$_deaccess
+tcp$status	== io$_acpcontrol
+tcp$info	== io$_modify
+
+;	End of TCP QIO function Codes.
+;	TCP QIO function Modes
+
+active		== 1		; true == 1
+passive		== 0		; false == 0
+wild		== 0		; wild port specifier.
+asynch		== 1		; $qio's
+synch		== 0		; $qiow's
+
+;	End of TCP QIO function Modes
+; 	Tcb connection states
+
+cs$closed		== 0	; fictious, connection does not exist.
+cs$listen		== 1
+cs$syn_sent		== 2
+cs$syn_recv		== 3
+cs$established		== 4
+cs$fin_wait_1		== 5
+cs$fin_wait_2		== 6
+cs$time_wait		== 7
+cs$close_wait		== 8
+cs$closing		== 9
+cs$reset		== 10
+cs$inactive		== 11
+
+; 	End of Tcb connection states
+; 	Tcp error codes.
+
+er$ir	== 1	; insufficient resources.
+er$ifc	== 2	; invalid function code.
+er$uct	== 3	; unable to create tcb
+er$ifs	== 4	; invalid foreign socket
+er$ilp	== 5	; invalid local port
+er$nuc	== 6	; non-unique connection.
+er$cse	== 7	; connection table space exhausted.
+er$ipu	== 8	; insufficient privileges to use local port
+er$cip	== 9	; connection illegal for this process
+er$cc	== 10	; error: connection closing
+er$cde	== 11	; connection does not exist.
+er$cr	== 12	; error: connection reset
+er$fsu	== 13	; foreign-socket unspecified.
+er$unn	== 14	; unknown network node.
+er$vtf	== 15	; valid-tcb table full
+er$cto	== 16	; connection timeout.
+er$twt	== 17	; time-wait timeout.
+er$fto	== 18	; user function timeout. network event didn't happen.
+er$cref	== 19	; connection refused, reset in syn-recv state. active open.
+er$ccan	== 20	; connection cancelled by process abort.
+er$te	== 21	; tcp is exiting.
+er$fip	== 22	; io function in progress.
+er$bts	== 23	; user specified buffer is too small.
+er$ihi	== 24	; invalid known host index
+er$max_user_mesg == 24	; size of message pointer vector.
+er$abort	== 44	;abort received
+; 	End of Tcp error codes.
+
+.page
+.psect	datfil	pic,usr,con,rel,lcl,noshr,noexe,rd,wrt
+;
+
+dofab1:	$fab	fna = donam,-			;address of the file name
+		fns = donamsz,-			;size of the file name
+		fac = get			;read access
+dorab1::$rab	fab = dofab1,-			;address of the fab
+		ubf = mbuf,-			;address of input buffer
+		usz = mbufsz,-			;size of input buffer
+		rbf = mbuf			;address of the output buffer
+
+dofab:	$fab	fna = domap,-			;address of the file name
+		fns = domapsz,-			;size of the file name
+		fac = <get,put>,-		;write access
+		fop = ufo			;map the file, 
+tdfab:	$fab	fna = domap,-			;address of the file name
+		fns = domapsz,-			;size of the file name
+		fac = <get,put>,-		;write access
+		fop = sup			;superceed existing files
+tdrab::$rab	fab = tdfab,-			;address of the fab
+		ubf = mbuf,-			;address of input buffer
+		usz = mbufsz,-			;size of input buffer
+		rbf = mbuf			;address of the output buffer
+
+uaffab:	$fab	fac = get,-			;read access
+		fna = uafnam,-			;address of the filename
+		fns = uafnamsz,-		;size of the filename
+		mrs = uaf$c_length,-		;max record size
+		fop = sqo,-			;sequential
+		org = idx,-			;indexed
+		rfm = var,-			;variable records
+		shr = <get,put,upd>		;read/write/update
+uafrab:	$rab	fab = uaffab,-
+		rac = seq,-
+		rop = <nlk,rrl>,-
+		ubf = uafbuf,-
+		usz = uaf$c_length
+
+quefab::$fab	fna = quenam,-			;address of the file name
+		fns = quenamsz,-		;size of the file name
+		nam = namque,-			;name block for parse search
+		fac = <get,put>,-		;write to the file
+		rfm = var,-			;variable length records
+		rat = cr,-			;use crlf
+		mrs = page,-			;maximum record one page
+		fop = <sup,nam>			;superceed existing files
+querab::$rab	fab = quefab,-			;address of the fab
+		ubf = mbuf,-			;address of input buffer
+		usz = mbufsz,-			;size of input buffer
+		rbf = mbuf			;address of the output buffer
+
+smtpfab::$fab	fna = smtpnam,-			;address of the file name
+		fns = smtpnamsz,-		;size of the file name
+		fac = <get,put>,-		;write/read to the file
+		rfm = var,-			;variable length records
+		rat = cr,-			;use crlf
+		mrs = page,-			;maximum record one page
+		fop = sup			;superceed existing files
+smtprab::$rab	fab = smtpfab,-			;address of the fab
+		ubf = mbuf,-			;address of the input buffer
+		usz = page,-			;maximum input buffer size
+		rbf = mbuf			;address of the output buffer
+
+hofab::	$fab	fna = honam,-			;address of the file name
+		fns = honamsz,-			;size of the file name
+		fac = get,-			;read the file
+		rfm = var,-			;variable length records
+		rat = cr,-			;use crlf
+		mrs = page			;maximum record one page
+horab::	$rab	fab = hofab,-			;address of the fab
+		ubf = mbuf,-			;buffer
+		usz = page			;buffer size
+
+mlstfab::$fab	fac = get,-			;read access
+		fna = mlstnam,-			;address of the filename
+		fns = mlstnamsz,-		;size of the filename
+		mrs = page,-			;max record size
+		fop = sqo,-			;sequential
+		rfm = var,-			;variable records
+		shr = get			;read
+mlstrab::$rab	fab = mlstfab,-
+		rac = seq,-
+		ubf = mlstbuf,-
+		usz = page
+
+namque::$nam	rsa = res_str,-
+		rss = nam$c_maxrss,-
+		esa = esa_str,-
+		ess = nam$c_maxrss
+
+res_str::.blkb	nam$c_maxrss
+esa_str::.blkb	nam$c_maxrss
+
+smtpnam:.ascii	/sys$mailq:smtp.log/
+smtpnamsz	= .-smtpnam
+uafnam:	.ascii	/sys$system:sysuaf.dat/
+uafnamsz	== .-uafnam
+quenam::.ascii	/sys$mailq:queued_mail.txt/
+quenamsz	== .-quenam
+	.ascii	/.*/
+quewild		== .-quenam
+donam:	.ascii	/sys$mail:domains.txt/
+donamsz		= .-donam
+domap:	.ascii	/sys$mail:domains.tmp/
+domapsz		= .-domap
+honam:	.ascii	/tcp$prod:hosts.txt/
+honamsz		= .-honam
+mailtxt::.ascic	/mail.txt.1/
+lcldir::.blkb	uaf$c_length
+lcldirsz::.blkw	1
+mlstnam:	.ascii	/sys$mail:mailing_lists.txt/
+mlstnamsz	== .-mlstnam
+
+
+.end

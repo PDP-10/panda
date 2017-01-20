@@ -1,0 +1,1273 @@
+%TITLE 'DIU Controller IPCF routines'
+
+MODULE DIUPC2 (IDENT = '257',
+               LANGUAGE(BLISS36),
+               ENTRY(
+                     ipc_master,        ! Declare ourself as IPCF master
+                     ipc_hndlr          ! IPCF interrupt handler
+                     )
+               )=
+BEGIN
+
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+! FACILITY:    DIU (Data Interchange Utility for TOPS-20)
+!
+!
+! ABSTRACT:    This module provides the IPCF (Interprocess 
+!              Communication Facility) routines required by
+!              the DIU Controlling Job.
+!
+! ENVIRONMENT: TOPS-20 V6.1               RMS V3
+!              BLISS-36 V4                XPORT
+
+! HISTORY:
+!
+!  257  Change library BLI:MONSYM to just MONSYM.
+!       Gregory A. Scott 7-Jul-86
+!
+!  253  Change IPCF20 library to DIUIP2.
+!       Gregory A. Scott 1-Jul-86
+!
+!  252	Remove library of CONDIT.
+!	Sandy Clemens  1-Jul-86
+!
+!  165  Use page 276 for ipcf page to avoid race problem  with  doing  commands
+!       from the spooler job.
+!       Gregory A. Scott 16-May-86
+!
+!  164  Clean up ipc_master.
+!       Gregory A. Scott 16-May-86
+!
+!  156  Modify the dependent field of the incore copy of the request block when
+!       a request is entered with a prerequisite switch.
+!       Gregory A. Scott 13-May-86
+!
+!  154  Rename s$death to j$death and kill_job to  j$kill.  Add XPN  conditions
+!       XPN$_DEVOFFLINE and XPN$_THIRD to requeueable errors.
+!       Gregory A. Scott 12-May-86
+!
+!  152  Check access to  log file (if  any) in IPC_ENTER.   Write the  "request
+!       created" message to both user and system log files from here, now  that
+!       we know that access to the user log file has been checked.
+!       Gregory A. Scott 11-May-86
+!
+!  147  If a request being cancelled has a prerequisite then the prerequisite's
+!       dependent id  wasn't  being  killed;  solution  is  to  call  the  fine
+!       IPC_MPREREQ routine from IPC_DELETE.  Clean  up Q$GIVEUP and rename  it
+!       to be IPC_GIVEUP.
+!       Gregory A. Scott 8-May-86
+!
+!  146  Major  changes  to  IPC_MPREREQ,  including  making  it  callable  from
+!       IPC_ENTER, check for illegal  modification of the prerequisite  request
+!       number.     Add     error    messages     DIU$_PREREQ_NOT_YOURS     and
+!       DIU$_PREREQ_NON_EXIST.
+!       Gregory A. Scott 7-May-86
+!
+!  135  Routines  IPC_CONNECT_ME  and Q$GIVEUP  shouldn't  be global, and  they
+!       aren't anymore.
+!       Gregory A. Scott 1-May-86
+!
+!  127  Routine ipc_msequence is now ipc_mprereq, and it  deals  with  changing
+!       the prerequisite  id  with  no  funny  negation  hacks  included.   Fix
+!       Q$GIVEUP so that it will return  a value.  Change module name to  match
+!       filename (DIUPC2).
+!       Gregory A. Scott 26-Apr-86
+!
+!  126  Routines IPC_CONNECT_ME  and  IPC_STATUS  shouldn't try  and  return  a
+!       value.
+!       Gregory A. Scott 26-Apr-86
+!
+!  122  Make sure that the location that would point to a byte pointer for the
+!       sender's node  name  is  0 in  routine  ipc_hndlr  or we  will  get  an
+!       occasional unexpected string from the monitor.
+!       Gregory A. Scott 22-Apr-86
+!
+!    52	Make sure PDB size is large enough so that the account string can
+!       be retrieved in routine IPC_HNDLR.  Update IPC_HANDLER and IP_ENTER
+!       routines with missing edit from FTS which enables use of account
+!       string.
+!	Sandy Clemens	12-Nov-85
+! 
+!   43  Clean up the Q$GIVEUP routine.
+!	Sandy Clemens   16-Oct-85
+!
+! 05 - (AN) Put the sender's account in the request block when we receive it.
+! 04 - Look before trying to read IPCF message
+! 03 - Requeue on file-locked
+! 02 - Put in ENTRY points
+! 01 - beginning
+!--
+
+! TABLE OF CONTENTS:
+
+FORWARD ROUTINE
+    ipc_prvchk,                         ! Check caller's privileges
+    ipc_hndlr : NOVALUE,                ! IPCF interrupt handler
+    ipc_handle : NOVALUE,               ! Handle one IPCF message
+    ipc_giveup,                         ! Decide if we should reque or discard
+    ipc_master,                         ! Declare ourself as IPCF master
+    ipc_enter : NOVALUE,                ! Handle received enter request
+    ipc_delete : NOVALUE,               ! Handle received delete request
+    ab_delete,                          ! Condition handler for above
+    ipc_find : NOVALUE,                 ! Handle received find request
+    ipc_modify : NOVALUE,               ! Handle received modify request
+    ipc_mprereq,                        ! Modify /PREREQUISITE chain
+    ipc_status : NOVALUE,               ! Handle received status request
+    ipc_connect_me : NOVALUE;           ! Handle "connect me" request
+
+! LIBRARIES:
+
+LIBRARY 'MONSYM';                       ! TOPS-20 Monitor symbols
+LIBRARY 'BLI:XPORT';
+LIBRARY 'DIU';
+LIBRARY 'BLISSNET';
+LIBRARY 'RMSINT';
+LIBRARY 'DIUIP2';
+
+! External references
+
+BIND ip_page = %O'276000' : BLOCK [512] FIELD (DIUQ$$MESSAGE_FIELDS);
+
+EXTERNAL rcvpid,                        ! PID master receives queries on
+         jobstatus : BLOCKVECTOR [DIU$K_MAX_MJOB, DIUJ$K_LEN]
+                     FIELD (DIUJ$$JOBSTAT_FIELDS);
+
+EXTERNAL ROUTINE
+    ip$send,                            ! Send an IPCF message
+    ip$receive,                         ! Receive an IPCF message
+    ip$declare,                         ! Declare name/PID association
+    ip$qtest,                           ! Test emptiness of IPCF receive queue
+    lj$event : NOVALUE,                 ! Log a event in system log file
+    l$event : NOVALUE,                  ! Log a event in system log file
+    l$uevent : NOVALUE,                 ! Log event about slave in sys log file
+    l$new_request : NOVALUE,            ! Log a new request
+    l$check_access,                     ! Check access to log file
+    diu$errmsg : NOVALUE,               ! Expand (don't type) error code
+    diu$abort : NOVALUE,                ! Condition handler
+    sched : NOVALUE,                    ! Scheduler routine
+    j$kill,                             ! Kill a slave job
+    abort : NOVALUE,                    ! Abort dependent requests
+    notify : NOVALUE,                   ! Notify requestor of job disposition
+    j$death : NOVALUE,                  ! Process slave job death report
+    s$username,                         ! Translate user no. to name string
+    s$jobno,                            ! Get our job number
+    s$dirno,                            ! Convert string to directory number
+    s$connect,                          ! Connect a job to a directory
+    s$time,                             ! Return current date/time
+    s$dtstr : NOVALUE,                  ! Convert date/time to string
+    q$copy_req_block : NOVALUE,         ! Copy a request block
+    q$release_chain : NOVALUE,          ! Release chain of request blocks
+    q$req_block_init : NOVALUE,         ! Zap a request block
+    q$valid_req_block,                  ! Validate a request block
+    q$enter,                            ! Enter a request in the queue
+    q$delete,                           ! Delete a request from the queue
+    q$find,                             ! Find one or more requests
+    q$modify,                           ! Modify a request
+    moveaz;                             ! Move ASCIZ string
+
+GLOBAL ROUTINE ipc_master (p_name_desc, p_pid) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Declare ourself as a system process.
+!
+! FORMAL PARAMETERS:
+!
+!       p_name_desc: pointer to descriptor for name string
+!       p_pid: pointer to PID to associate with name, if that location is zero
+!              assign a new pid.
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!       DIU$_NORMAL: success
+!       DIU$_TWO_MASTERS: another one already declared
+!       DIU$_BUG: unexpected error
+!
+!--
+BEGIN
+
+BIND name = .p_name_desc,
+     pid = .p_pid;
+
+LOCAL retcode;
+
+retcode = ip$declare (name, pid);
+
+IF NOT .retcode
+THEN BEGIN
+     SELECTONE (.retcode ^ -18) OF
+                SET
+                [$IPCPI, $IPCEN, IPCF11, IPCF13] : SIGNAL (DIU$_INSUFF_PRIVS);
+                [$IPCDN] : SIGNAL (DIU$_TWO_MASTERS);
+                [OTHERWISE] : SIGNAL (DIU$_BUG, .retcode ^ -18);
+                TES
+     END
+ELSE RETURN (DIU$_NORMAL)
+END;                                    ! End of ipc_master
+
+ROUTINE ipc_prvchk (p_pdb, p_req_block) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Check to make sure an IPCF caller is privileged to hack a request.
+!
+! FORMAL PARAMETERS:
+!
+!       p_pdb: pointer to Packet Data Block for IPCF message
+!       p_req_block - pointer to request block
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!
+!       FALSE: not caller's request and no privs, don't allow it
+!       TRUE: OK, caller's request, or caller is godly
+!
+!--
+BEGIN
+
+BIND pdb = .p_pdb : $$PDB_DECL,
+     req_block = .p_req_block : $DIU_BLOCK;
+
+! First, if caller is WHEEL or OPERATOR, allow anything
+
+IF .pdb[PDB$$V_WHEEL] OR .pdb[PDB$$V_OPERATOR]
+THEN RETURN (TRUE);
+
+! Not privileged, must sniff at request block and see if usernumber
+! of request originator is same as usernumber of message sender
+
+IF .pdb[PDB$$G_SENDER_USER_NUMBER]
+    NEQ .req_block[DIU$G_USER_NUMBER]
+THEN RETURN (FALSE)
+ELSE RETURN (TRUE)
+
+END;                                    ! End of ipc_prvchk
+
+GLOBAL ROUTINE ipc_hndlr : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       IPCF message receipt interrupt handler.  This routine repeatedly  pulls
+!       messages from the IPCF input  queue and dispatches to handler  routines
+!       based on the function code in each message.  It establishes a condition
+!       handler (the  default  one)  so  that an  unwind  will  terminate  this
+!       routine, and not  some other one,  so that we  return to the  interrupt
+!       handler and DEBRK.  The handler routine in turn establishes a condition
+!       handler (again the default  one) so that errors  in processing any  one
+!       request return to the top loop here, rather than DEBRKing, which  would
+!       cause IPCF messages to be lost.
+!
+!--
+BEGIN
+
+LOCAL retcode,
+      ipcode,
+      accountstring: VECTOR[ CH$ALLOCATION(40) ],
+      pdb : $$PDB_DECL;
+
+ENABLE DIU$ABORT;
+
+pdb[PDB$$A_SENDER_NODE_NAME] = 0;   ! Zero this for compatibility
+
+WHILE ip$qtest (.rcvpid)            ![4] Look before we try to read
+DO BEGIN
+   pdb[PDB$$A_SENDER_ACCOUNT]=CH$PTR(accountstring); ! We want the account 
+   pdb[PDB$$H_MESSAGE_ADDRESS] = ip_page;
+   pdb[PDB$$H_MESSAGE_LENGTH] = 512;
+   ipcode = ip$receive (rcvpid, pdb, $IPCLL + 1);
+
+   ! Quit immediately if failure
+
+   IF NOT .ipcode
+   THEN RETURN;
+
+   ! Go handle this message and loop back for more
+
+   ipc_handle (pdb, CH$PTR (accountstring));
+   END;
+
+END;                                    ! End of ipc_hndlr
+
+ROUTINE ipc_handle (p_pdb, accountpointer) : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Process one incoming  IPCF message.   We ENABLE  the default  condition
+!       handler so  that an  error  (which will  unwind)  returns to  the  IPCF
+!       message eating loop.
+!
+! FORMAL PARAMETERS:
+!       p_pdb: pointer to the PDB for the message
+!       accountpointer: pointer to account string
+!
+!--
+BEGIN
+
+BIND pdb = .p_pdb : $$PDB_DECL;
+
+ENABLE DIU$ABORT;
+
+! Dispatch on function code.  First see if this message
+! is from the monitor, reporting the death of a subjob.
+
+IF .ip_page EQL $IPCLO
+THEN j$death (pdb)
+
+! Not from monitor, must be from an DIU job.
+
+ELSE SELECTONE .ip_page[DIUQ$B_FUNCTION] OF
+               SET
+               [DIUQ$K_ENTER]      : ipc_enter (pdb, .accountpointer);
+               [DIUQ$K_DELETE]     : ipc_delete (pdb);
+               [DIUQ$K_FIND]       : ipc_find (pdb);
+               [DIUQ$K_MODIFY]     : ipc_modify (pdb);
+               [DIUQ$K_STATUS]     : ipc_status (pdb);
+               [DIUQ$K_CONNECT_ME] : ipc_connect_me (pdb);
+               [OTHERWISE]         : SIGNAL (DIU$_INV_IPCF_MSG);
+               TES;
+END;                                    ! End of ipc_handle
+
+ROUTINE ipc_enter (p_pdb, accountpointer) : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Handle an IPCF message to ENTER a request in the queue.
+!
+! FORMAL PARAMETERS:
+!
+!       p_pdb: pointer to PDB (Packet Descriptor Block)
+!       accountpointer: pointer to account string
+!
+! IMPLICIT INPUTS:
+!
+!       The PDB points to the message.
+!
+! SIDE EFFECTS:
+!
+!       An IPCF message is sent to the originator of the request informing
+!       it of the success or failure of the request.  In addition, if the
+!       enter succeeded, the scheduler is called to try to start the request.
+!
+!--
+BEGIN
+
+BIND pdb = .p_pdb : $$PDB_DECL,
+     req_block = ip_page[DIUQ$Z_REQ_BLOCK] : $DIU_BLOCK;
+
+LOCAL user_descriptor : $STR_DESCRIPTOR (),
+      connected_descriptor : $STR_DESCRIPTOR (),
+      retcode;
+
+! Make some cursory validity checks on the request block
+
+req_block[DIU$V_ACTIVE] = 0;
+IF .req_block[DIU$B_PRIORITY] GTR 63
+THEN retcode = DIU$_INVALID_PRIORITY
+ELSE retcode = q$valid_req_block (req_block);
+
+IF NOT .retcode
+THEN BEGIN
+     ip_page[DIUQ$G_COMP_CODE] = .retcode;
+     ip_page[DIUQ$B_FUNCTION] = DIUQ$K_NACK;
+     ip$send (.pdb[PDB$$G_SENDER_PID], rcvpid, ip_page, 512);
+     RETURN;
+     END;
+
+! Get user number from packet data block.  Store it and the corresponding
+! username string in the request block.  Insure username is ASCIZ.
+
+req_block[DIU$G_USER_NUMBER] = .pdb[PDB$$G_SENDER_USER_NUMBER];
+$STR_DESC_INIT (DESCRIPTOR = user_descriptor,
+                STRING = (RMS$K_USERID_SIZE,
+                          CH$PTR (req_block[DIU$T_USERNAME])));
+req_block[DIU$H_USERNAME] =
+    s$username (.pdb[PDB$$G_SENDER_USER_NUMBER], user_descriptor);
+
+! Get connected directory number and enabled capabilities from packet
+!  and store in req block.
+
+req_block[DIU$G_CAPABILITIES] = .pdb[PDB$$V_SENDER_CAPABILITIES];
+
+$STR_DESC_INIT (DESCRIPTOR = connected_descriptor,
+                STRING = (DIU$K_TOPS20_DIRECTORY_SIZE,
+                          CH$PTR (req_block[DIU$T_CONNECTED_DIRECTORY])));
+req_block[DIU$H_CONNECTED_DIRECTORY] =
+s$username (.pdb[PDB$$G_SENDER_DIRECTORY],
+            connected_descriptor);
+
+! Put the account string and it's length in the request block
+
+req_block[DIU$H_ACCOUNT] =              ! store length of the account string
+moveaz (%REF(.accountpointer),          ! non-updated pointer
+        %REF(CH$PTR(req_block[DIU$T_ACCOUNT])));   ! updated by Moveaz
+
+! Supply creation date-time
+
+req_block[DIU$G_CREATION] = s$time ();
+
+! See if user can write to the log file specified, if one was specifed.
+
+IF .req_block[DIU$H_LOG_FILESPEC] NEQ 0
+THEN retcode = L$CHECK_ACCESS(.pdb[PDB$$G_SENDER_USER_NUMBER],  ! Check access
+                              .pdb[PDB$$G_SENDER_DIRECTORY],    !  to the log
+                              .pdb[PDB$$V_SENDER_CAPABILITIES], !   file if any
+                              req_block[DIU$T_LOG_FILESPEC])    !    specified
+ELSE retcode = TRUE;                    ! Success if no log file
+
+! Enter the request and log it if successful
+
+IF .retcode                             ! If we are OK so far
+THEN IF (retcode = q$enter (req_block)) !  then try and enter the request
+     THEN BEGIN
+          LOCAL new_req_line : $STR_DESCRIPTOR (CLASS = DYNAMIC);
+          $STR_DESC_INIT (DESCRIPTOR = new_req_line, CLASS = DYNAMIC);
+          l$new_request (req_block, new_req_line);      ! ASCIIze the request
+          l$event(DIU$_REQ_CREATED,0,new_req_line);     ! Log to system log
+          l$uevent(DIU$_REQ_CREATED,0,new_req_line,req_block); ! Log to user
+          $XPO_FREE_MEM (STRING = new_req_line);        ! Thanks for the memory
+          END;
+
+! If there  is  a prerequisiste  specified,  call someone  to  set it  up.   If
+! something went  wrong, delete  the request  from the  queue.  If  the  modify
+! forked, then we want to check for an incore copy of the request and modify it
+! so that the prerequisite request number matches the on disk copy.
+
+IF .retcode AND .req_block[DIU$H_PREREQUISITE_ID] NEQ 0
+THEN BEGIN
+     IF NOT (retcode = ipc_mprereq (pdb,                                ! pdb
+                                    0,                                  ! old
+                                    .req_block[DIU$H_PREREQUISITE_ID],  ! new
+                                    .req_block[DIU$H_REQUEST_ID]))      ! req
+     THEN q$delete (.req_block[DIU$H_REQUEST_ID])
+     ELSE BEGIN                         ! modify worked, check incore copy
+          INCR job_handle FROM 0 TO DIU$K_MAX_MJOB - 1
+          DO IF (.jobstatus[.job_handle, DIUJ$H_REQUEST_ID]
+                             EQL .req_block[DIU$H_PREREQUISITE_ID])
+                 AND .jobstatus[.job_handle, DIUJ$V_INUSE]
+                 THEN BEGIN             ! Incore copy, set its dependent req
+                      BIND dep_blk = .jobstatus[.job_handle,
+                                                DIUJ$A_REQ_BLOCK] : $DIU_BLOCK;
+                      dep_blk[DIU$H_DEPENDENT_ID] = 
+                              .req_block[DIU$H_REQUEST_ID];
+                      END;
+          END;
+     END;
+
+! Now respond with a success or failure message, as appropriate
+
+IF NOT .retcode
+THEN BEGIN
+     ip_page[DIUQ$G_COMP_CODE] = .retcode;
+     ip_page[DIUQ$B_FUNCTION] = DIUQ$K_NACK
+     END
+ELSE ip_page[DIUQ$B_FUNCTION] = DIUQ$K_ACK;
+
+ip$send (.pdb[PDB$$G_SENDER_PID], rcvpid, ip_page, 512);
+
+SCHED();                                ! Try to start the request
+
+END;                                    ! End of ipc_enter
+
+ROUTINE ipc_delete (p_pdb) : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Handle an IPCF  message to DELETE  a request in  the queue.  Note  that
+!       this routine ALWAYS signals and NEVER returns.  This turns out to be  a
+!       more convenient  way  of  insuring  that all  the  dynamic  storage  it
+!       allocates gets  deallocated.   Our condition  handler  simply  releases
+!       storage, reports  the  condition  code  to the  sender  of  the  delete
+!       request, and unwinds.
+!
+! FORMAL PARAMETERS:
+!
+!       p_pdb: pointer to PDB (Packet Descriptor Block)
+!
+! SIDE EFFECTS:
+!
+!       The request is deleted from the queue.  A notification message is  sent
+!       to the originator of the request informing him/her of the  cancellation
+!       of the request.
+!
+!--
+BEGIN
+
+BIND pdb = .p_pdb : $$PDB_DECL;
+
+LOCAL retcode,
+      usr_line : VECTOR[CH$ALLOCATION(80)],
+      usr_descr : $STR_DESCRIPTOR (CLASS = BOUNDED,
+                                   STRING = (80,CH$PTR(usr_line))),
+      log_line : VECTOR[CH$ALLOCATION(200)],
+      log_descr : $STR_DESCRIPTOR (CLASS = BOUNDED,
+                                   STRING = (200,CH$PTR(log_line))),
+      chain_head : VOLATILE,
+      tmp_blk_ptr : VOLATILE REF $DIU_BLOCK,
+      req_block : REF $DIU_BLOCK,
+      job_handle,
+      tpdb : VOLATILE;
+
+ENABLE ab_delete (chain_head, tmp_blk_ptr, tpdb);
+
+tpdb = pdb;
+IF .ip_page[DIUQ$G_REQ_ID] LSS 2        ! If illegal request id,
+THEN SIGNAL (DIU$_INVALID_REQUEST);     ! then give a fatal error
+
+! Allocate and init a template request block
+
+IF NOT (retcode = $XPO_GET_MEM (UNITS = DIU$K_LEN,
+                                RESULT = tmp_blk_ptr))
+THEN SIGNAL (.retcode);
+q$req_block_init (.tmp_blk_ptr);
+tmp_blk_ptr[DIU$H_REQUEST_ID] = .ip_page[DIUQ$G_REQ_ID];
+
+! Get the actual request block
+
+IF NOT (retcode = q$find (.tmp_blk_ptr, chain_head))
+THEN SIGNAL (.retcode);
+req_block = .chain_head + 1;
+
+! Check to make sure this guy is allowed to delete
+
+IF NOT ipc_prvchk (pdb, .req_block)
+THEN SIGNAL (DIU$_INSUFF_PRIVS);
+
+! Get username of killer for log file
+
+s$username (.pdb[PDB$$G_SENDER_USER_NUMBER], usr_descr);
+
+! Construct a line of text to be sent to the system and user log files.
+
+$STR_COPY(TARGET = log_descr,
+          STRING = $STR_CONCAT('Request ',
+                               $STR_ASCII (.req_block[DIU$H_REQUEST_ID]),
+                               ' (',
+                               (.req_block[DIU$H_JOBNAME],
+                                CH$PTR(req_block[DIU$T_JOBNAME])),
+                               ') killed by user ',
+                               usr_descr));
+
+! If request is active, stomp on the corresponding slave job (dependent jobs
+! will be killed by slave job cleanup code).  If not active, must kill
+! dependents now.
+
+job_handle = -1;                        ! Set job_handle to "not found"
+IF .req_block[DIU$V_ACTIVE]             ! If the job was active, kill it
+THEN job_handle = j$kill (.req_block[DIU$H_REQUEST_ID],
+                          DIU$_KILLED_BY_USER);
+
+IF .job_handle NEQ -1
+THEN BEGIN                              ! If the job was active and we found it
+     jobstatus[.job_handle, DIUJ$V_ALREADY_DELETED] = 1;
+     $STR_COPY (TARGET = jobstatus[.job_handle, DIUJ$T_EXTRA_TEXT],
+                STRING = log_descr);
+     END
+ELSE BEGIN                              ! The job wasn't active
+     l$event(DIU$_KILLED_BY_USER, 0, log_descr);
+     l$uevent(DIU$_KILLED_BY_USER, 0, log_descr, .req_block);
+     notify (DIU$_KILLED_BY_USER, 0, log_descr, .req_block);
+     IF .req_block[DIU$H_DEPENDENT_ID] NEQ 0
+     THEN abort (.req_block[DIU$H_DEPENDENT_ID]);
+     END;
+
+! Clear any prerequisiste request's dependecy on this request
+
+IF .req_block[DIU$H_PREREQUISITE_ID] NEQ 0      ! If request has prerequisite
+THEN ipc_mprereq(pdb,                                   ! clear it
+                 .req_block[DIU$H_PREREQUISITE_ID],     ! Old value
+                 0,                                     ! New value
+                 .req_block[DIU$H_REQUEST_ID]);         ! Req id
+
+! Delete the request block from the queue.
+
+retcode = q$delete (.req_block[DIU$H_REQUEST_ID]);
+
+! Now respond with a success or failure message, as appropriate
+
+SIGNAL (.retcode)
+
+END;                                ! End of ipc_delete
+
+ROUTINE ab_delete (sig, mech, enbl) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Condition handler for ipc_delete.  We first free up any dynamic
+!   storage we have lying around and then try to reply to the delete
+!   request via IPCF.  We then unwind, which causes ipc_delete to return.
+!
+! FORMAL PARAMETERS:
+!   sig         - signal vector
+!   mech        - mechanism vector
+!   enbl        - enable vector (see BLISS Language Guide for definitions
+!                 of these)
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   NONE
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+    BEGIN
+
+    MAP
+        sig : REF VECTOR,
+        mech : REF VECTOR,
+        enbl : REF VECTOR;
+
+    BIND
+        chain_head = .enbl[1],
+        tmp_blk_ptr = .enbl[2],
+        pdb = .enbl[3] : REF $$PDB_DECL,
+        retcode = sig[1];
+
+    IF .sig[1] EQL STS$K_UNWIND
+    THEN
+        RETURN (STS$K_NORMAL);
+    IF .chain_head NEQ 0
+    THEN
+        $XPO_FREE_MEM (BINARY_DATA = (DIU$K_LEN + %UPVAL,
+                                      .chain_head, UNITS));
+    IF .tmp_blk_ptr NEQ 0
+    THEN
+        $XPO_FREE_MEM (BINARY_DATA = (DIU$K_LEN, .tmp_blk_ptr, UNITS));
+    IF NOT .retcode
+    THEN
+        BEGIN
+        ip_page[DIUQ$G_COMP_CODE] = .retcode;
+        ip_page[DIUQ$B_FUNCTION] = DIUQ$K_NACK
+        END
+    ELSE
+        ip_page[DIUQ$B_FUNCTION] = DIUQ$K_ACK;
+    ip$send (.pdb[PDB$$G_SENDER_PID], rcvpid, ip_page, 512);
+    SETUNWIND ()
+    END;                                ! End of ab_delete
+
+ROUTINE ipc_find (p_pdb) : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Handle an IPCF message to FIND one or more requests in the queue.
+!
+! FORMAL PARAMETERS:
+!   p_pdb       - pointer to PDB (Packet Descriptor Block)
+!
+! IMPLICIT INPUTS:
+!   The PDB points to the message.
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   NONE
+!
+! SIDE EFFECTS:
+!   Request blocks are returned to the sender, one per IPCF message,
+!   until all matching requests have been returned.
+!
+!--
+    BEGIN
+
+    BIND
+       pdb = .p_pdb : $$PDB_DECL,
+       req_block = ip_page[DIUQ$Z_REQ_BLOCK] : $DIU_BLOCK;
+
+    LOCAL
+        retcode,
+        chain_head,
+        current,
+        sequence_number;
+
+    retcode = q$find (req_block, chain_head);
+    !
+    ! If q$find failed, return exactly one failure message.
+    !
+    IF NOT .retcode
+    THEN
+        BEGIN
+        ip_page[DIUQ$G_COMP_CODE] = .retcode;
+        ip_page[DIUQ$B_FUNCTION] = DIUQ$K_NACK;
+        ip$send (.pdb[PDB$$G_SENDER_PID], rcvpid, ip_page, 512);
+        RETURN;
+        END;
+    !
+    ! q$find returned at least one request block.  Send them all to the sender.
+    !
+    sequence_number = 1;
+    current = chain_head;
+    WHILE (current = ..current) NEQ 0
+    DO
+        BEGIN
+        BIND
+            this_request = .current + 1 : $DIU_BLOCK;
+        q$copy_req_block (this_request, req_block);
+        !
+        ! Zero fields of interest to DIU master job only
+        !
+        req_block[DIU$H_NEXT_RECORD] = 0;
+        req_block[DIU$H_PREV_RECORD] = 0;
+        !
+        ! If caller is neither privileged nor the owner of the request,
+        ! zero sensitive fields.
+        !
+        IF NOT ipc_prvchk (pdb, req_block)
+        THEN
+            BEGIN
+            req_block[DIU$H_SOURCE_FILESPEC] = 0;
+            CH$FILL (0,
+                     DIU$K_FILESPEC_MAXIMUM_LENGTH,
+                     CH$PTR (req_block[DIU$T_SOURCE_FILESPEC]));
+            req_block[DIU$H_DESTINATION_FILESPEC] = 0;
+            CH$FILL (0,
+                     DIU$K_FILESPEC_MAXIMUM_LENGTH,
+                     CH$PTR (req_block[DIU$T_DESTINATION_FILESPEC]));
+            req_block[DIU$H_LOG_FILESPEC] = 0;
+            CH$FILL (0,
+                     DIU$K_FILESPEC_MAXIMUM_LENGTH,
+                     CH$PTR (req_block[DIU$T_LOG_FILESPEC]));
+            req_block[DIU$H_ACCOUNT] = 0;
+            CH$FILL (0, 40,
+                     CH$PTR (req_block[DIU$T_ACCOUNT]));
+            req_block[DIU$H_TERMINAL] = 0;
+            req_block[DIU$H_JOB_NUMBER] = 0;
+            req_block[DIU$G_NOTIFY_PID] = 0;
+            req_block[DIU$G_CAPABILITIES] = 0;
+            END;
+        !
+        ! If this is the last request, return DIU$_NORMAL.  If more
+        ! to come, return DIU$_MORE.
+        !
+        ip_page[DIUQ$G_COMP_CODE] =
+            (IF ..current NEQ 0 THEN DIU$_MORE ELSE DIU$_NORMAL);
+        ip_page[DIUQ$B_FUNCTION] = DIUQ$K_ACK;
+        ip_page[DIUQ$H_SEQUENCE_NUMBER] = .sequence_number;
+        ip$send (.pdb[PDB$$G_SENDER_PID], rcvpid, ip_page, 512);
+        sequence_number = .sequence_number + 1;
+        END;
+    q$release_chain (.chain_head);
+    END;                                ! End of ipc_find
+
+ROUTINE ipc_modify (p_pdb) : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Handle an IPCF message to MODIFY a request in the queue.  This  routine
+!       never explicitly returns, but instead  SIGNALs its success or  failure.
+!       The condition handler sends  the completion code  to the requestor  and
+!       then unwinds.  We use the same handler ipc_delete does.
+!
+! FORMAL PARAMETERS:
+!
+!       p_pdb: pointer to PDB (Packet Descriptor Block)
+!
+! SIDE EFFECTS:
+!
+!       An IPCF message is sent to  the originator of the request informing  it
+!       of the success or failure of  the request.  If the /AFTER parameter  or
+!       /DEADLINE switch  are diddled,  we  call the  scheduler to  update  its
+!       knowledge.
+!
+!--
+BEGIN
+
+BIND pdb = .p_pdb : $$PDB_DECL,
+     message = ip_page : BLOCK [512] FIELD (DIUQ$$MESSAGE_FIELDS);
+
+LOCAL retcode,
+      chain_head : VOLATILE,
+      tmp_blk_ptr : VOLATILE REF $DIU_BLOCK,
+      req_block : REF $DIU_BLOCK,
+      tpdb : VOLATILE;
+
+ENABLE ab_delete (chain_head, tmp_blk_ptr, tpdb);
+
+tpdb = pdb;
+
+! Allocate and init a template request block
+
+IF NOT (retcode = $XPO_GET_MEM (UNITS = DIU$K_LEN, RESULT = tmp_blk_ptr))
+THEN SIGNAL (.retcode);
+
+q$req_block_init (.tmp_blk_ptr);
+tmp_blk_ptr[DIU$H_REQUEST_ID] = .ip_page[DIUQ$G_REQ_ID];
+
+! Get the actual request block
+
+IF NOT (retcode = q$find (.tmp_blk_ptr, chain_head))
+THEN SIGNAL (.retcode);
+req_block = .chain_head + 1;
+
+! Check to make sure this guy is allowed to hack this request
+
+IF NOT ipc_prvchk (pdb, .req_block)
+THEN SIGNAL (DIU$_INSUFF_PRIVS);
+
+! Make sure it isn't active now
+
+IF .req_block[DIU$V_ACTIVE]
+THEN SIGNAL (DIU$_ACTIVE);
+
+! Some items are easier to modify than others.  Do the work now.
+
+SELECTONE .message[DIUQ$B_ITEM_CODE] OF
+SET
+
+[DIUQ$K_LOG_FILESPEC] :                 ! /LOG or /NOLOG
+    BEGIN
+
+    ! If we're being asked to modify the log filespec, we must cons up
+    ! a descriptor that points to the new filespec and pass that to
+    ! q$modify
+
+    LOCAL log_descr : $STR_DESCRIPTOR ();
+    $STR_DESC_INIT (DESCRIPTOR = log_descr, CLASS = FIXED,
+                    STRING = (.message[DIUQ$H_STATUS_TEXT],
+                              CH$PTR (message[DIUQ$T_STATUS_TEXT])));
+    retcode = q$modify (.message[DIUQ$G_REQ_ID],
+                        .message[DIUQ$B_ITEM_CODE],
+                        log_descr)
+    END;
+
+[DIUQ$K_PREREQUISITE_ID] :              ! /PREREQ
+    retcode = ipc_mprereq (pdb,
+                           .req_block[DIU$H_PREREQUISITE_ID],   ! old value
+                           .message[DIUQ$G_NEW_VALUE],          ! new value
+                           .message[DIUQ$G_REQ_ID]);            ! req id
+
+[OTHERWISE] :                           ! /AFTER /DEAD /NOTIFY /PRIO /SEQU
+    BEGIN
+    ! This is the simple case, where the new value is just a number
+    ! Range check priority argument, gods get greater priority
+
+    IF .message[DIUQ$B_ITEM_CODE] EQL DIUQ$K_PRIORITY
+    THEN message[DIUQ$G_NEW_VALUE] =
+                MIN (.message[DIUQ$G_NEW_VALUE],
+                     63+(.pdb[PDB$$V_WHEEL] OR .pdb[PDB$$V_OPERATOR]));
+
+    ! Modify the request
+
+    retcode = q$modify (.message[DIUQ$G_REQ_ID],
+                        .message[DIUQ$B_ITEM_CODE],
+                        .message[DIUQ$G_NEW_VALUE]);
+
+    ! If /AFTER or /DEADLINE or HOLD diddled OK, poke scheduler
+
+    IF .retcode                         ! If the modify succeeded
+       AND ((.message[DIUQ$B_ITEM_CODE] EQL DIUQ$K_AFTER)
+             OR (.message[DIUQ$B_ITEM_CODE] EQL DIUQ$K_DEADLINE)
+             OR (.message[DIUQ$B_ITEM_CODE] EQL DIUQ$K_HOLDING))
+    THEN SCHED();                       ! Time to call scheduler
+    END;
+TES;
+
+! Now respond with a success or failure message, as appropriate
+
+SIGNAL (.retcode)
+
+END;                                    ! End of ipc_modify
+
+ROUTINE ipc_mprereq (p_pdb, old_value, new_value, req_id) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Modify the /PREREQ attributes of a request:  either create a new
+!       dependency or remove an old one.
+!
+! FORMAL PARAMETERS:
+!
+!       p_pdb: pdb to pass to ipc_prvchk
+!       p_old_value: existing prereqisite id field
+!       p_new_value: prereqisite id to change to
+!       p_req_id: request to modify
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!
+!   DIU$_NORMAL: for success
+!   errors: error codes
+!
+!
+!--
+BEGIN
+
+BIND pdb = .p_pdb : $$PDB_DECL;
+
+LOCAL retcode,
+      chain_head,
+      peek_req,
+      prereq_blk : REF $DIU_BLOCK,
+      tmp_prereq_blk : $DIU_BLOCK;
+
+! Check to see if we're adding a new dependency or removing one
+
+IF .new_value NEQ 0
+THEN BEGIN                              ! Adding a new dependency
+
+     ! Make sure that we aren't setting the prereq to ourselves
+
+     IF .new_value EQL .req_id
+     THEN RETURN(DIU$_PREREQ_LOOP);     ! Loop detected
+
+     ! If a prerequisite already exists, we must clear its dependency field
+     ! We can sleaze this out by recursing with a zero prerequisite arg.
+
+     IF .old_value NEQ 0                ! If there was a prereq already
+     THEN BEGIN                         !  then zero it now
+          IF NOT (retcode = ipc_mprereq (pdb, .old_value, 0, .req_id))
+          THEN RETURN (.retcode);
+          END;
+
+     ! Look through the chain of requests to see that we aren't creating
+     ! a loop (deadly embrace) and that we have ownership to all of the
+     ! requests specified.
+
+     peek_req = .new_value;             ! Set the peek request to start
+     WHILE .peek_req NEQ 0              ! Loop until all have been checked
+     DO BEGIN
+
+        ! Look up the prerequisite request
+
+        q$req_block_init (tmp_prereq_blk);
+        tmp_prereq_blk[DIU$H_REQUEST_ID] = .peek_req;
+        IF NOT q$find (tmp_prereq_blk, chain_head)
+        THEN RETURN (DIU$_PREREQ_NON_EXIST);       ! Prereq does not exist
+        prereq_blk = .chain_head + %UPVAL;
+
+        ! Make sure we're allowed to hack the prerequisite request
+
+        IF NOT ipc_prvchk (pdb, .prereq_blk)
+        THEN RETURN (DIU$_PREREQ_NOT_YOURS);    ! Protection failure
+
+        ! Check for deadly embrace of requests (loop of requests)
+
+        IF .prereq_blk[DIU$H_REQUEST_ID] EQL .req_id
+        THEN RETURN (DIU$_PREREQ_LOOP);
+
+        ! sanity check this request if it is the immediate prereq
+
+        IF .prereq_blk[DIU$H_DEPENDENT_ID] NEQ 0
+           AND .peek_req EQL .new_value
+        THEN RETURN (DIU$_HAS_DEPENDENT);
+
+        ! OK so far, set the next request to peek at from the prereq of this
+
+        peek_req = .prereq_blk[DIU$H_PREREQUISITE_ID];
+
+        ! Release req block we are peeking at and loop for more requests
+
+        q$release_chain (.chain_head);            
+        END;                            ! End of WHILE .peek_req NEQ 0 DO loop
+
+     ! No deadly embrace, modify dependent field of prerequisite to point to us
+
+     retcode = q$modify (.new_value,    ! Request to work on
+                         DIUQ$K_DEPENDENT_ID,
+                         .req_id);
+
+     ! If that won, modify this request to have a prerequisite
+
+     IF .retcode
+     THEN retcode = q$modify (.req_id,  ! Request to work on
+                              DIUQ$K_PREREQUISITE_ID,
+                              .new_value);
+     END
+ELSE BEGIN                              ! Removing a dependency
+
+     IF .old_value EQL 0                ! Was there a dependency?
+     THEN RETURN (DIU$_NO_PREREQ);
+
+     ! Look up the prerequisite request
+
+     q$req_block_init (tmp_prereq_blk);
+     tmp_prereq_blk[DIU$H_REQUEST_ID] = .old_value;
+     IF NOT q$find (tmp_prereq_blk, chain_head)
+     THEN RETURN (DIU$_PREREQ_NON_EXIST);       ! Prereq does not exist
+     prereq_blk = .chain_head + %UPVAL;
+
+     ! See if we can hack this request
+
+     IF NOT ipc_prvchk (pdb, .prereq_blk)
+     THEN RETURN (DIU$_PREREQ_NOT_YOURS);       ! Protection failure
+
+     ! Sanity check this request
+
+     IF .prereq_blk[DIU$H_DEPENDENT_ID] EQL 0
+     THEN RETURN (DIU$_INVALID_PREREQ); ! If we get here the queue is mangled
+
+     ! Release storage associated with the request we are peeking at
+
+     q$release_chain (.chain_head);            
+
+     ! OK, zero dependent field of prerequisite
+
+     retcode = q$modify (.old_value,    ! Request to work on
+                         DIUQ$K_DEPENDENT_ID,
+                         0);
+
+     ! If that won, modify this request to have no prerequisite
+
+     IF .retcode
+     THEN retcode = q$modify (.req_id,  ! Request to work on
+                              DIUQ$K_PREREQUISITE_ID,
+                              0);
+     END;
+
+! Return the code we generated here, whatever that is
+
+RETURN (.retcode)
+
+END;                                    ! ipc_mprereq
+
+ROUTINE ipc_status (p_pdb) : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Handle an  IPCF  message that  reports  STATUS of  a  transfer.   These
+!       messages are  generated  by slave  jobs  either in  response  to  error
+!       conditions or to report checkpoints.
+!
+! FORMAL PARAMETERS:
+!
+!       p_pdb: pointer to PDB (Packet Descriptor Block)
+!
+! IMPLICIT INPUTS:
+!
+!       The PDB points to the message.
+!
+! IMPLICIT OUTPUTS:
+!
+!       The job status block for this job is updated with the codes passed.
+!
+! SIDE EFFECTS:
+!
+!       An entry is made to the system log file.
+!
+!--
+BEGIN
+
+BIND pdb = .p_pdb : $$PDB_DECL,
+     message = ip_page : BLOCK [512] FIELD (DIUQ$$MESSAGE_FIELDS);
+
+LOCAL retcode,
+      retcode_2ndary,
+      job,
+      job_handle,
+      msg_descr : $STR_DESCRIPTOR (CLASS = DYNAMIC),
+      msg_length,
+      opt_descr : $STR_DESCRIPTOR (),
+      req_block : REF $DIU_BLOCK,
+      notify_pid;
+
+job = .message[DIUQ$H_SENDER_JOB];              ! Set passed job number
+job_handle = .message[DIUQ$G_JOB_HANDLE];       ! Set passed job handle
+retcode = .message[DIUQ$G_COMP_CODE];           ! Set primary code
+retcode_2ndary = .message[DIUQ$G_2ND_CODE];     ! Set secondary code
+
+! Find the job status block for this slave.
+
+IF .job NEQ .jobstatus[.job_handle, DIUJ$H_JOB_NUMBER]
+THEN BEGIN
+     SIGNAL (DIU$_UNSOLICITED_STATUS);
+     RETURN;
+     END;
+req_block = .jobstatus[.job_handle, DIUJ$A_REQ_BLOCK];
+
+! Make a string descriptor for additonal text (if any).
+
+$STR_DESC_INIT (DESCRIPTOR = opt_descr, CLASS = FIXED,
+                STRING = (.message[DIUQ$H_STATUS_TEXT],
+                          CH$PTR (message[DIUQ$T_STATUS_TEXT])));
+
+! Write this event to system log file
+
+lj$event(.retcode, .retcode_2ndary, opt_descr, .job_handle);
+
+! Copy condition codes to the job status block.  If optional text supplied, 
+! copy it to job status block for NOTIFY's purposes
+
+IF .opt_descr[STR$H_LENGTH] NEQ 0
+THEN $STR_COPY (TARGET = jobstatus[.job_handle, DIUJ$T_EXTRA_TEXT],
+                STRING = opt_descr);
+
+jobstatus[.job_handle, DIUJ$G_LAST_ERROR] = .retcode;
+jobstatus[.job_handle, DIUJ$G_2ND_CODE] = .retcode_2ndary;
+
+! Update job status bits according to the status msg we got
+
+SELECTONE (.retcode) OF
+SET
+   [DIU$_REQUEST_COMPLETED] : jobstatus[.job_handle,
+                                        DIUJ$V_REQ_COMPLETED] = 1;
+   [DIU$_REQUEST_STARTED] : jobstatus[.job_handle,
+                                      DIUJ$V_SIGNED_ON] = 1;
+TES;
+
+! Decide weather to give up now or requeue or what
+
+IF ipc_giveup(.retcode,.retcode_2ndary)
+THEN jobstatus[.job_handle, DIUJ$V_FLUSH_REQUEST] = 1;
+
+! If caller was DIULIB and wanted IPCF notifications, send one
+! Don;t forget to supply user context word for caller's edification
+
+IF (notify_pid = .req_block[DIU$G_NOTIFY_PID]) NEQ 0
+THEN BEGIN
+     message[DIUQ$G_CTX] = .req_block[DIU$G_CTX];
+     ip$send (.notify_pid, rcvpid, ip_page, 512);
+     END;
+END;                                    ! End of ipc_status
+
+ROUTINE ipc_giveup (statuscode, statuscode_2ndary) =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Make the decision to (re)queue a request depending on the return  code.
+!       Almost all failure codes cause us to flush the request.  Unfortunately,
+!       RMS-20 error codes don't follow  BLISS success/fail conventions, so  we
+!       have to treat them separately by translating into codes which do follow
+!       the conventions.  In  addition, RMS$_DCF (DECNET  connect failure)  and
+!       RMS$_DCB (DECNET connection broken) errors don't tell us anything so we
+!       have to examine the  secondary code, which  has the useful  information
+!       for controlling requeuing/flushing of jobs.
+!
+! FORMAL PARAMETERS:
+!
+!       statuscode: primary status code
+!       statuscode_2ndary: secondary status code (or zero)
+!
+! ROUTINE VALUE:
+!
+!       FALSE = don't give up the request (requeue it)
+!       TRUE = give up (don't requeue it)
+!--
+
+MACRO requeue_codes =                   ! Codes to requeue on
+XPN$_ABORTED, XPN$_DISCONN, XPN$_NO_OPEN, XPN$_ABORT, XPN$_DEVOFFLINE,
+XPN$_NO_MEMORY, XPN$_NO_LINKS, XPN$_NOSUCHNODE, XPN$_UNREACH, XPN$_NOSUCHOBJ,
+XPN$_REJECTED, XPN$_TIMEOUT, XPN$_RESALLOC, XPN$_THIRD, XPN$_PMR_ERROR
+%;
+
+LOCAL retcode;
+
+SELECTONE .statuscode OF
+SET
+
+[RMS$_FLK] : retcode = FALSE;           ! File locked? requeue
+
+[RMS$_DCF,
+ RMS$_DCB] : BEGIN                      ! for these two, examin the 2ndary code
+             IF .statuscode_2ndary NEQ 0        ! Is there a valid 2ndary code?
+             THEN SELECTONE .statuscode_2ndary OF
+                  SET
+                  [requeue_codes] : retcode = FALSE;    ! Requeueable 2ndary
+                  [OTHERWISE] : retcode = TRUE;         ! Giveup on any other
+                  TES
+             ELSE retcode = TRUE;       ! And if there is no 2ndary code, punt
+             END;
+
+[RMS$K_SUC_MIN TO
+ RMS$K_SUC_MAX] : retcode = FALSE;      ! If it was an RMS success then requeue
+
+[RMS$K_ERR_MIN TO
+ RMS$K_ERR_MAX] : retcode = TRUE;       ! Giveup on all other RMS errors 
+
+[requeue_codes] : retcode = FALSE;      ! Primary codes that requeue
+
+[OTHERWISE] : IF .statuscode            ! if none of the above,
+              THEN retcode = FALSE      !  and BLISS-style success then reque
+              ELSE retcode = TRUE;      !   otherwise giveup the request
+
+TES;                                    ! End of SELECTONE
+
+RETURN(.retcode);                       ! Return TRUE to giveup the request
+
+END;
+
+GLOBAL ROUTINE ipc_connect_me (p_pdb) : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Handle a request from a slave job to be connected to some directory.
+!
+! FORMAL PARAMETERS:
+!   p_pdb               - pointer to Packet Descriptor Block for message
+!
+! SIDE EFFECTS:
+!   The slave job is connected to the desired directory.
+!
+!--
+BEGIN
+
+BIND pdb = .p_pdb : $$PDB_DECL,
+     message = ip_page : BLOCK [512] FIELD (DIUQ$$MESSAGE_FIELDS);
+
+LOCAL job,
+      job_handle,
+      retcode,
+      target_dir_num,
+      target_dir_descr : $STR_DESCRIPTOR (CLASS = FIXED),
+      req_block : REF $DIU_BLOCK;
+
+! Find the job status block for this slave.
+
+job = .message[DIUQ$H_SENDER_JOB];
+job_handle = .message[DIUQ$G_JOB_HANDLE];
+
+IF .job NEQ .jobstatus[.job_handle, DIUJ$H_JOB_NUMBER]
+THEN BEGIN
+     SIGNAL (DIU$_INV_IPCF_MSG);
+     RETURN;
+     END;
+req_block = .jobstatus[.job_handle, DIUJ$A_REQ_BLOCK];
+target_dir_num = .message[DIUQ$G_COMP_CODE];
+
+! Insure that the directory the slave is requesting is the same as
+! that in the request block.  This MIGHT not be strictly necessary,
+! but is good insurance against security bugs.
+
+$STR_DESC_INIT (DESCRIPTOR = target_dir_descr, CLASS = FIXED,
+                STRING = (.req_block[DIU$H_CONNECTED_DIRECTORY],
+                          CH$PTR (req_block[DIU$T_CONNECTED_DIRECTORY])));
+
+IF s$dirno (target_dir_descr) NEQ .target_dir_num
+THEN retcode = DIU$_NO_CONNECT
+ELSE retcode = s$connect(.job, .target_dir_num);
+
+! Return response to slave job
+
+IF NOT .retcode
+THEN BEGIN
+     ip_page[DIUQ$G_COMP_CODE] = .retcode;
+     ip_page[DIUQ$B_FUNCTION] = DIUQ$K_NACK;
+     END
+ELSE ip_page[DIUQ$B_FUNCTION] = DIUQ$K_ACK;
+
+ip$send (.pdb[PDB$$G_SENDER_PID], rcvpid, ip_page, 512);
+
+END;                                    ! End of ipc_connect_me
+
+END                                     ! End of module
+ELUDOM

@@ -1,0 +1,1513 @@
+MODULE DIUAU2 (%require ('DIUPATSWITCH')
+			IDENT = '253') =
+BEGIN
+
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+
+!++
+!
+!  TITLE:  ACTUT2 			More DDL and Transform Action Utilities
+!
+!  FACILITY:  DIU
+!
+!  ABSTRACT:
+!
+!	This module contains utility routines which use the parser action
+!	routines in ACTION.BLI and the utility routines in ACTUTL.BLI.
+!
+!  ENVIRONMENT:
+!
+!	These routines are written in compatible Bliss.
+!	These routines are probably NOT AST reentrant on the VAX.
+!
+!  AUTHOR:  Charlotte Richardson,	28-May-85
+
+! MODIFICATION HISTORY:
+!
+!  253  Rename file to DIUAU2.
+!       Gregory A. Scott 1-Jul-86
+!
+!  236  Change library of DIXLIB to DIUDIX.
+!       Sandy Clemens  19-Jun-86
+!
+!  174  Change library of TOPS20 to use MONSYM and JSYSDEF, use  JSYS_DFIN  and
+!       JSYS_FLIN.
+!       Gregory A. Scott 20-May-86
+!
+!  166  Modify initial value processing so that it always sets up default
+!       initial values for fields which have not had anything moved into them
+!       (either explicitly with a MOVE statement or with a MOVE-MATCHING or
+!       MOVE-OTHERS-MATCHING statement and for which the user did not already
+!       set up an initial value.  Set up the default initial value based on the
+!       datatype of the field.  Note: initial value defaults are NOT set up for
+!       structures or overlays.
+!       Sandy Clemens 19-May-86
+!
+!   67	Fix problem with initial values (address of initial value buffer
+!	was being passed to DIX incorrectly).
+!	Sandy Clemens  18-Feb-86
+!
+!      40       Put the REQUIRE/LIBRARY of 'TOPS20' into a TOPS-20 only
+!               conditional.
+!               Sandy Clemens  7-Oct-85
+!
+!	3       Change REQUIRE 'TOPS20' to LIBRARY 'TOPS20' to
+!               avoid insufficient dynamic memory when compiling.
+!               Sandy Clemens	30-Sep-85
+!
+!	2	Incorporate Doug Rayner's change for FLIN/DFIn on TOPS10.
+!		Charlotte Richardson	19-Aug-85
+!
+!	1	Account for complex numbers in DIL
+!		Charlotte Richardson	12-July-85
+!
+!--
+
+! INCLUDE FILES:
+
+    LIBRARY 'BLI:XPORT';		! Transportable data structures
+    LIBRARY 'DIUACTION';                ! Structures unique to semantic actions
+    LIBRARY 'DIUPATDATA';               ! Names of lexical tokens
+    LIBRARY 'DIUDIX';			! Define data conversion codes
+%IF %BLISS (BLISS32) %THEN
+    UNDECLARE %QUOTE $DESCRIPTOR;	! Clean up after XPORT
+%FI
+    LIBRARY 'DIUCRX';			! CRX record structures
+%IF %BLISS (BLISS32) %THEN
+    UNDECLARE %QUOTE $DESCRIPTOR;	! Yet again...
+%FI
+    LIBRARY 'DIUTLB';			! Transform data structures
+    LIBRARY 'DIUMLB';                   ! DIU$K_DT_STRUCTURE, DIU$K_DT_OVERLAY 
+%IF %BLISS (BLISS32) %THEN
+    UNDECLARE %QUOTE $DESCRIPTOR;	! Clean up after XPORT
+%FI
+%IF %BLISS (BLISS32) %THEN
+    UNDECLARE %QUOTE $DESCRIPTOR;	! Clean up after XPORT
+    LIBRARY 'SYS$LIBRARY:STARLET';
+%ELSE
+    %IF %SWITCHES (TOPS20) %THEN
+    LIBRARY 'MONSYM';                   ! TOPS-20 monitor symbols
+    REQUIRE 'JSYSDEF';			! JSYS definitions
+    %FI
+%FI
+! TABLE OF CONTENTS:
+
+FORWARD ROUTINE
+
+DIU$INITIAL_VALUE: NOVALUE,	! Fix initial values
+INITIAL_VALUE_WALKER: NOVALUE,	! Internal routine called by DIU$INITIAL_VALUE
+DIU$TAG_FIELD: NOVALUE,		! Fix up tag values
+TAG_FIELD_WALKER: NOVALUE;	! Internal routine called by DIU$TAG_FIELD
+
+LITERAL true = 1,
+        false = 0;
+
+! External routines:
+
+%IF %BLISS(BLISS36) %THEN %IF %SWITCHES(TOPS10) %THEN
+
+EXTERNAL ROUTINE
+    dfin,
+    flin;
+
+%FI
+%FI
+
+EXTERNAL ROUTINE
+
+DIX$$CON_GEN,			! Convert using two FFDs (DIL routine)
+%IF %BLISS (BLISS32) %THEN
+OTS$CVT_T_H,			! Convert ASCII to H-floating (VMS only)
+%FI
+DIU$DEL_TRANS_NODE: NOVALUE,	! Delete transform node
+DIX$$DES_BY_DET,		! Make an FFD
+DIU$FIND_FIELD,			! Find a field's member block
+FREE_STRINGLIST: NOVALUE,	! Free a CRX_STRINGLIST node
+INIT_STRINGLIST: NOVALUE,	! Initialize a CRX_STRINGLIST node
+MAKE_DIMS: NOVALUE,		! Make a dims node
+MAKE_TRANSFORM: NOVALUE;	! Make a transform node
+!++
+!  DIU$INITIAL_VALUE  (INTVAL)
+!
+!  FUNCTIONAL DESCRIPTION:
+!
+!	This routine will replace the existing initial values pointed to by the
+!	crx_member blocks with ones of the correct datatypes and add additional
+!	transform nodes to the end of the existing transform list to cause the
+!	initial values to be inserted into each destination record during
+!	transform processing.  This routine is expected to be called during
+!	transform loading.
+!
+!  CALLING SEQUENCE:
+!
+!	DIU$INITIAL_VALUE (rec, transform_list, sys_org, dest_buffer);
+!
+!  PARAMETERS:
+!
+!	rec			Address of the crx_record block at the head
+!				of the destination record description tree.
+!	transform_list		The root address of the existing loaded
+!				transform list.
+!	sys_org			This value should be SYS_LCG, SYS_8BIT, or
+!				SYS_PRO (which behaves like SYS_8BIT here)
+!				and is the system of origin for the destination
+!				record.
+!	dest_buffer		This is the address of the destination record
+!				description buffer and is used to make the
+!				destination FFD in a transform node.
+!
+!  IMPLICIT INPUTS:
+!
+!	None
+!
+!  IMPLICIT OUTPUTS:
+!
+!	None
+!
+!  COMPLETION STATUS:
+!
+!	None
+!
+!  SIGNALLED STATUS:
+!
+!	This routine does not intercept signals sent by routines it calls.
+!
+!  SIDE EFFECTS:
+!
+!	None
+!--
+GLOBAL ROUTINE DIU$INITIAL_VALUE (rec, transform_list, sys_org,
+    dest_buffer): NOVALUE =
+BEGIN
+MAP
+    rec:		REF crx_record,		! root of destination tree
+    transform_list:	REF transform_str;	! transform list
+
+INITIAL_VALUE_WALKER (.rec, .transform_list, .sys_org, .dest_buffer, 0);
+
+END;
+!++
+!  INITIAL_VALUE_WALKER  (INTVLW)
+!
+!  FUNCTIONAL DESCRIPTION:
+!
+!	This routine does the work for DIU$INITIAL_VALUE recursively.
+!
+!  CALLING SEQUENCE:
+!
+!	INITIAL_VALUE_WALKER (rec, transform_list, sys_org, dest_buffer,
+!	    depth);
+!
+!  PARAMETERS:
+!
+!	rec			Address of the crx_record or crx_member block
+!				at the root of the destination record
+!				description tree or subtree.
+!	transform_list		The root address of the existing loaded
+!				transform list.
+!	sys_org			This value should be SYS_LCG, SYS_8BIT, or
+!				SYS_PRO (which behaves like SYS_8BIT here)
+!				and is the system of origin for the destination
+!				record.
+!	dest_buffer		This is the address of the destination record
+!				description buffer and is used to make the
+!				destination FFD in a transform node.
+!	depth			The recursion depth in this routine, used to
+!				control iteration on the siblings of a node.
+!
+!  IMPLICIT INPUTS:
+!
+!	None
+!
+!  IMPLICIT OUTPUTS:
+!
+!	None
+!
+!  COMPLETION STATUS:
+!
+!	None
+!
+!  SIGNALLED STATUS:
+!
+!	This routine does not intercept signals sent by routines it calls.
+!
+!  SIDE EFFECTS:
+!
+!	None
+!--
+ROUTINE INITIAL_VALUE_WALKER (rec, transform_list, sys_org, dest_buffer,
+    depth): NOVALUE =
+BEGIN
+
+MAP
+    rec:		REF crx_record,		! root of destination tree
+    transform_list:	REF transform_str;	! root of transform list
+
+IF .rec EQLA NULL_PTR
+    THEN RETURN;			! Nothing to do here
+
+SELECTONE .rec [CRX$B_ID] OF
+SET
+
+! Recursively process initial values in the crx_member nodes:
+
+! For record nodes, just recurse.
+
+! For member nodes, iterate on the siblings at this level and recurse on the
+! children.  See explanation of initial value processing of a member node,
+! below.
+
+! For overlay nodes, iterate on the siblings at this level, and recurse on the
+! children.
+
+! For other nodes, just return.  No other node types are expected to be found.
+
+
+[CRX$K_RECORD]:				! CRX_RECORD node
+    INITIAL_VALUE_WALKER (.rec [CRX$A_ROOT], .transform_list, .sys_org,
+	.dest_buffer, .depth+1);
+[CRX$K_MEMBER]:				! CRX_MEMBER node
+    BEGIN
+    LOCAL
+	a_member:	REF crx_member,		! A crx_member node
+	bytsiz,					! Bytesize of new initial value
+	c_member:	REF crx_member,		! Current member for fqn/dims
+	dims_head:	REF dims,		! Head of dims list
+	dst_ffd:	forgn_descr,		! Destination FFD
+	dt:		data_type_sep,		! Datatype of new initial value
+	fqn_head:	REF crx_stringlist,	! Head of fqn list
+	fullword_flag,				! Initial value is fullwords
+	last_trans:	REF transform_str,	! Last existing transform node
+	length,					! DIL length of initial value
+	n_initial_length,			! Length of new initial value
+	n_initial_value,			! Pointer to new initial value
+	n_useable_fw_flag,			! Fullword "useable" value flag
+	n_useable_length,			! Length of "useable" value
+	n_useable_value,			! Pointer to "useable" value
+	new_dims:	REF dims,		! New dims node in dims list
+	new_fqn:	REF crx_stringlist,	! New fqn node in fqn list
+	new_trans:	REF transform_str,	! New transform node
+	p_member:	REF crx_member,		! Parent of c_member
+	src_ffd:	forgn_descr,		! Source FFD
+	status,					! Returned status
+	this_sys: INITIAL ( %BLISS32 (SYS_8BIT) %BLISS36 (SYS_LCG) );
+
+    EXTERNAL
+	dix$adtt_st:	dtt_st,		! String datatypes
+	dix$adtt_fbin:	dtt_fbin,	! Fixed-binary datatypes
+	dix$adtt_fp:	dtt_fp,		! Floating-point datatypes
+	dix$adtt_dn:	dtt_dn,		! Display-numeric datatypes
+	dix$adtt_pd:	dtt_pd;		! Packed-decimal datatypes
+
+    LABEL
+	l_siblings;			! Block to iterate on member siblings
+! Initial value processing of a member node:
+
+! A lot of work is involved here, but it is pretty straightforward.  The
+! sequence of events, for each member node sibling at this level in the
+! record description tree, is:
+
+! 1.  If the node has children, recurse to process them.
+
+! 2.  If there is no initial value, or if the field is used (some field gets
+!     moved into it by a transform), or if the initial value's datatype cannot
+!     be determined (which would be due to a bug; transform loading stores the
+!     initial value's datatype in the additional block for member nodes coming
+!     from CRX when datatype mapping is done, and the parser stores the initial
+!     value's token type for nodes not coming from CRX), no initial value will
+!     be processed for this sibling.
+
+! 3.  A new transform node for the initial value is created and hooked on to the
+!     end of the transform list.  It will be deleted later if the initial
+!     value cannot be created.
+
+! 4.  The existing initial value is converted to one of the right datatype for
+!     the member block (whose datatype has been mapped by transform loading).
+!     If the value came from our parser, it is in ASCII and must be converted to
+!     a "useful" datatype first.  Then, in both cases (node came from CRX or
+!     node processed by our parser), the value must be converted to the right
+!     datatype using DIL (DIX$$CON_GEN).
+
+! 5.  The old initial value is deleted, and the new one put in its place.
+
+! 6.  The FFDs in the initial value transform node are made and stored.
+
+! 7.  The dims and fqn of the member block are computed and stored in the
+!     destination side of the initial value transform node.  Since the
+!     transform's opcode field is set to indicate that this is an initial value,
+!     no source information is expected here.
+    a_member = .rec;			! Get field addressability via REF
+
+    DO BEGIN                            ! Iterate on CRX_MEMBER siblings
+
+l_siblings:
+
+        BEGIN
+	LOCAL
+	    a_facility:	REF crx_additional,	! Current facility block
+	    bytes_per_word,			! Used to compute size of DIX
+	    data_word_size,			! ... storage for converted
+	    total_words;			! ... initial values
+
+	a_facility = .a_member [CRM$A_FACILITY];
+
+	! Compute word size of system of origin for our data:
+	IF .sys_org EQL SYS_LCG
+        THEN data_word_size = 36        ! 10 or 20 data
+        ELSE data_word_size = 32;       ! VAX (or fake it for PRO) data
+
+	! Recurse on node's children, if any:
+	IF .a_member [CRM$A_CHILDREN] NEQA NULL_PTR
+        THEN INITIAL_VALUE_WALKER (.a_member [CRM$A_CHILDREN],
+                                   .transform_list, .sys_org,
+                                   .dest_buffer, .depth+1);
+
+	! Determine whether we need to process an initial value here:
+	IF (.a_member [CRM$A_FACILITY] EQLA NULL_PTR)
+        THEN LEAVE l_siblings;          ! This should not occur
+
+        ! If the field hasn't been used yet then if the initial value isn't
+        ! set, then set up the default initial value based on the datatype of
+        ! the field.  Note:  initial value defaults are NOT set up for
+        ! structures or overlays...
+        IF (.a_member[CRM$W_INITIAL_LENGTH] EQL 0       ! no current init value
+           AND NOT .a_member[CRM$V_FACILITY_USE_2]      ! fld not already moved
+           AND .a_member[CRM$W_DATATYPE] NEQ DIU$K_DT_OVERLAY   ! not overlay
+           AND .a_member[CRM$W_DATATYPE] NEQ DIU$K_DT_STRUCTURE)  ! not strct
+        THEN BEGIN
+             LOCAL addr : INITIAL(0);
+             dt = .a_member [CRM$W_DATATYPE];
+             SELECTONE .dt[DT_CLASS_SEP] OF
+             SET
+             [dt_string] :
+                 BEGIN
+                 !
+                 ! Set the initial value's length field to the number of string
+                 ! units of the member field.  Set the initial type to quoted
+                 ! string since that's what our parser does for string initial
+                 ! values.  Create a field filled with spaces for the initial
+                 ! value and save its address in the member node.
+                 !
+                 a_member[CRM$W_INITIAL_LENGTH]= .a_member[CRM$L_STRING_UNITS];
+                 a_facility[CRA$L_INITIAL_TYPE] = T_QUOTED_STRING;
+                 $XPO_GET_MEM(CHARACTERS = .a_member[CRM$W_INITIAL_LENGTH],
+                              FILL = %O'40',    ! fill with spaces
+                              RESULT = addr);
+                 a_member[CRM$A_INITIAL_VALUE] = .addr;
+                 END;
+
+             [dt_dnum, dt_pdec] :
+                 BEGIN
+                 !
+                 ! Set the initial value's length field to the number of digits
+                 ! in the member field.  Set the initial type to unsigned
+                 ! integer.  Create a field filled with zero characters and
+                 ! save its address in the member node.
+                 !
+                 a_member[CRM$W_INITIAL_LENGTH] = .a_member[CRM$W_DIGITS];
+                 a_facility[CRA$L_INITIAL_TYPE] = T_UNSIGNED_INTEGER;
+                 $XPO_GET_MEM(CHARACTERS = .a_member[CRM$W_INITIAL_LENGTH],
+                              FILL = %O'60',    ! fill with zero chars "0"
+                              RESULT = addr);
+                 a_member[CRM$A_INITIAL_VALUE] = .addr;
+                 END;
+
+             [dt_fbin] :
+                 !
+                 ! Set the initial value's length field to 1 and the initial
+                 ! type to unsigned integer.  Create a one character field
+                 ! filled with a zero character and save its address in the
+                 ! member node.
+                 !
+                 BEGIN
+                 a_member[CRM$W_INITIAL_LENGTH] = 1;
+                 a_facility[CRA$L_INITIAL_TYPE] = T_UNSIGNED_INTEGER;
+                 $XPO_GET_MEM(CHARACTERS = .a_member[CRM$W_INITIAL_LENGTH],
+                              FILL = %O'60',    ! fill with zero chars "0"
+                              RESULT = addr);
+                 a_member[CRM$A_INITIAL_VALUE] = .addr;
+                 END;
+
+             [dt_fp] :
+                 BEGIN
+                 !
+                 ! First check to see if the datatype is a complex floating
+                 ! point datatype:
+                 !
+                 IF .dix$adtt_fp[.dt[DT_CODE_SEP], fpd$v_typ] EQL fpd$k_complex
+                 THEN BEGIN
+                      !
+                      ! If the datatype is complex, then set the initial
+                      ! value's length field to 3 and set the initial type to
+                      ! nt_complex.  Create a field filled with "0 0", since
+                      ! that is what our parser does for complex initial
+                      ! values, and save its address in the member node.  Set
+                      ! the "real" portion initial type and the "imaginary"
+                      ! portion initial type to unsigned integer, and the
+                      ! "real" portions length to 1.  This is to be consistent
+                      ! with what our parser does.
+                      !
+                      a_facility[CRA$L_INITIAL_TYPE] = NT_COMPLEX_NUMBER;
+                      a_member[CRM$W_INITIAL_LENGTH] = 3;
+                      a_facility[CRA$L_INITIAL_TYPE_1] = T_UNSIGNED_INTEGER;
+                      a_facility[CRA$L_INITIAL_TYPE_2] = T_UNSIGNED_INTEGER;
+                      a_facility[CRA$L_INITIAL_LENGTH_1] = 1;
+                      $XPO_GET_MEM(CHARACTERS = 3,
+                                   FILL = 0,
+                                   RESULT = addr);
+                      $STR_COPY(STRING = '0 0',
+                                TARGET = (3, addr));
+                      a_member[CRM$A_INITIAL_VALUE] = .addr;
+                      END
+                 ELSE BEGIN
+                      !
+                      ! Set the initial value's length field to 1 and set the
+                      ! initial type to unsigned integer.  Create a field
+                      ! filled with a zero character for the initial value and
+                      ! save its address in the member node.
+                      !
+                      a_facility[CRA$L_INITIAL_TYPE] = T_UNSIGNED_INTEGER;
+                      a_member[CRM$W_INITIAL_LENGTH] = 1;
+                      $XPO_GET_MEM(CHARACTERS = 1,
+                                   FILL = %O'60',       ! fill with "0" chars
+                                   RESULT = addr);
+                      a_member[CRM$A_INITIAL_VALUE] = .addr;
+                      END;
+                 END;
+             TES;
+             .a_member [CRM$V_FACILITY_USE_2] = 1;
+             END
+        ELSE ! Determine whether we need to process an initial value here:
+             BEGIN
+             IF .a_member [CRM$V_FACILITY_USE_2]
+             THEN LEAVE l_siblings;	! This field is used anyway
+             IF .a_member [CRM$W_INITIAL_LENGTH] EQL 0
+             THEN LEAVE l_siblings;	! This field is used anyway
+             END;
+
+	! Resign ourselves to processing an initial value.
+	! Make new transform node and hook it in:
+	MAKE_TRANSFORM (0, 0, 0, 0, 0, 0, new_trans);
+	! Flag transform as an initial value:
+	new_trans [TRA_OPCODE] = DIU$K_INITIAL;
+	last_trans = .transform_list;
+	UNTIL (.last_trans [TRA_NEXT] EQLA NULL_PTR) DO
+	    last_trans = .last_trans [TRA_NEXT];
+	last_trans [TRA_NEXT] = .new_trans;
+
+	! Set status to indicate initial value is useable:
+	status = TRUE;
+! Convert initial values produced by CRX to the correct datatype.
+
+	! Get the initial value into the right datatype for the transform node
+	IF (.this_sys EQL SYS_8BIT) AND .a_facility [CRA$V_SRC_CRX]
+	    THEN BEGIN			! Initial value came from CRX
+		! Figure out length and bytesize of new initial value,
+		! based on datatype and length:
+		dt = .a_member [CRM$W_DATATYPE];
+		SELECTONE .dt [DT_CLASS_SEP] OF SET
+
+		[DT_STRING, DT_DNUM]:	! String datatypes
+		    BEGIN		!  and display-numeric datatypes
+		    length = .a_member [CRM$L_STRING_UNITS];
+		    IF .dt [DT_CLASS_SEP] EQL DT_STRING
+			THEN bytsiz = .dix$adtt_st [.dt [DT_CODE_SEP],
+			    STD$V_BYT_SIZ]	! Bytsize of a string
+			ELSE bytsiz = .dix$adtt_dn [.dt [Dt_CODE_SEP],
+			    DND$V_BYT_SIZ];	! Bytesize of display-numeric
+		    IF ((.this_sys EQL SYS_8BIT) AND (.bytsiz EQL 8)) OR
+			((.this_sys EQL SYS_LCG) AND (.bytsiz EQL 7))
+			THEN BEGIN	! Character storage
+			    fullword_flag = FALSE;
+			    n_initial_length = .a_member [CRM$L_STRING_UNITS];
+			END		! Character storage
+			ELSE BEGIN	! Word storage
+			    fullword_flag = TRUE;
+			    bytes_per_word = .data_word_size / .bytsiz;
+			    total_words = .a_member [CRM$L_STRING_UNITS]
+				/ .bytes_per_word;
+			    IF .a_member [CRM$L_STRING_UNITS]
+				MOD .bytes_per_word NEQ 0
+				THEN total_words = .total_words + 1;
+			    n_initial_length = (.total_words * .data_word_size)
+				/ %BPVAL;
+			    IF (.total_words * .data_word_size) MOD %BPVAL
+				NEQ 0
+				THEN n_initial_length = .n_initial_length + 1;
+			END;		! Word storage
+		    END;
+
+		[DT_PDEC]:		! Packed-decimal datatypes
+		    BEGIN
+		    length = .a_member [CRM$W_DIGITS];
+		    bytsiz = .dix$adtt_pd [.dt [DT_CODE_SEP], PDD$V_BYT_SIZ];
+		    IF ((.this_sys EQL SYS_8BIT) AND (.bytsiz EQL 8)) OR
+			((.this_sys EQL SYS_LCG) AND (.bytsiz EQL 7))
+			THEN BEGIN	! Character storage
+			    fullword_flag = FALSE;
+			    n_initial_length = .a_member [CRM$L_STRING_UNITS];
+			END		! Character storage
+			ELSE BEGIN	! Word storage
+			    fullword_flag = TRUE;
+			    bytes_per_word = .data_word_size / .bytsiz;
+			    total_words = .a_member [CRM$L_STRING_UNITS]
+				/ .bytes_per_word;
+			    IF .a_member [CRM$L_STRING_UNITS] MOD .bytes_per_word
+				NEQ 0
+				THEN total_words = .total_words + 1;
+			    n_initial_length = (.total_words * .data_word_size)
+				/ %BPVAL;
+			    IF (.total_words * .data_word_size) MOD %BPVAL
+				NEQ 0
+				THEN n_initial_length = .n_initial_length + 1;
+			END;		! Word storage
+		    END;
+
+		[DT_FBIN]:		! Fixed-binary datatypes
+		    BEGIN
+		    length = 0;
+		    bytsiz = .dix$adtt_fbin [.dt [DT_CODE_SEP], FBD$V_SIZ];
+		    n_initial_length = (.bytsiz + %BPVAL-1) / %BPVAL;
+		    fullword_flag = TRUE;
+		    END;
+
+		[DT_FP]:		! Floating-point datatypes
+		    BEGIN
+		    length = 0;
+		    bytsiz = .dix$adtt_fp [.dt [DT_CODE_SEP], FPD$V_SIZ];
+		    n_initial_length = (.bytsiz + %BPVAL-1) / %BPVAL;
+		    ![1] Account for the bytesize of a complex number.
+		    IF .dix$adtt_fp [.dt [DT_CODE_SEP], fpd$v_typ]
+			EQL fpd$k_complex
+			THEN n_initial_length = ((2*.bytsiz) + %bpval-1) /
+			    %BPVAL;
+		    fullword_flag = TRUE;
+		    END;
+
+		TES;
+! Convert initial values coming from CRX:
+
+		! Create an area to store it in:
+		IF .fullword_flag
+		    THEN $XPO_GET_MEM (FULLWORDS = .n_initial_length,
+			RESULT = n_initial_value, FILL = 0)
+		    ELSE $XPO_GET_MEM (CHARACTERS = .n_initial_length,
+			RESULT = n_initial_value, FILL = 0);
+
+		! Make an FFD to the original value:
+		status = DIX$$DES_BY_DET (src_ffd,
+		    .a_member [CRM$A_INITIAL_VALUE], SYS_8BIT, 1, 0, 0,
+		    .a_facility [CRA$L_INITIAL_TYPE], .length,
+		    .a_member [CRM$W_SCALE]);
+
+		! Make an FFD to the new value:
+		IF .status THEN
+		IF .sys_org EQL SYS_8BIT OR .sys_org EQL SYS_PRO
+		    THEN status = DIX$$DES_BY_DET (dst_ffd, .n_initial_value,
+			SYS_8BIT, 1, 0, 0, .a_member [CRM$W_DATATYPE],
+			.length, .a_member [CRM$W_SCALE])
+		    ELSE status = DIX$$DES_BY_DET (dst_ffd,
+			address_of_byte (.n_initial_value),
+			SYS_LCG, 1, (0 + .bytsiz - 1), 0,
+			.a_member [CRM$W_DATATYPE], .length,
+			.a_member [CRM$W_SCALE]);
+
+		! Do the conversion:
+		IF .status THEN
+		status = DIX$$CON_GEN (src_ffd, dst_ffd);
+		! If this fails, this initial value is not useable
+	    END				! Initial value came from CRX
+! Convert initial values produced by our parser to the correct datatype.
+
+	    ELSE BEGIN			! Initial value came from our parser
+		! Figure out length of current initial value after conversion
+		! from ASCII, based on datatype and length, create a place
+		! to store it, and convert current initial value from ASCII
+		! to something useable.
+		! Then, figure out length of new initial value, based on
+		! datatype and length, and make an FFD to it:
+
+		dt = .a_member [CRM$W_DATATYPE];
+		SELECTONE .dt [DT_CLASS_SEP] OF SET
+
+		[DT_STRING]:		! String datatypes
+		    BEGIN
+		    ! Initial value must be a quoted string.
+		    n_useable_length = .a_member [CRM$W_INITIAL_LENGTH];
+		    $XPO_GET_MEM (CHARACTERS = .n_useable_length, FILL=0,
+			RESULT = n_useable_value);
+		    IF .a_facility [CRA$L_INITIAL_TYPE] NEQ T_QUOTED_STRING
+			THEN status = FALSE
+			ELSE BEGIN	! A quoted string
+			$STR_COPY (STRING = (.n_useable_length,
+			    .a_member [CRM$A_INITIAL_VALUE]),
+			    TARGET = (.n_useable_length,
+			    .n_useable_value));
+			IF .this_sys EQL SYS_8BIT
+			    THEN status = DIX$$DES_BY_DET (src_ffd,
+				.n_useable_value, SYS_8BIT, 1, 0, 0,
+			 	DIX$K_DT_ASCII_8, .n_useable_length, 0)
+			    ELSE status = DIX$$DES_BY_DET (src_ffd,
+				address_of_byte (.n_useable_value),
+				SYS_LCG, 1, (0 + 7 - 1), 0,
+				DIX$K_DT_ASCII_7, .n_useable_length, 0);
+			END;		! A quoted string
+		    n_useable_fw_flag = FALSE;
+		    length = .a_member [CRM$L_STRING_UNITS];
+		    bytsiz = .dix$adtt_st [.dt [DT_CODE_SEP], STD$V_BYT_SIZ];
+		    IF ((.this_sys EQL SYS_8BIT) AND (.bytsiz EQL 8)) OR
+			((.this_sys EQL SYS_LCG) AND (.bytsiz EQL 7))
+			THEN BEGIN	! Character storage
+			    fullword_flag = FALSE;
+			    n_initial_length = .a_member [CRM$L_STRING_UNITS];
+			END		! Character storage
+			ELSE BEGIN	! Word storage
+			    fullword_flag = TRUE;
+			    bytes_per_word = .data_word_size / .bytsiz;
+			    total_words = .a_member [CRM$L_STRING_UNITS]
+				/ .bytes_per_word;
+			    IF .a_member [CRM$L_STRING_UNITS]
+				MOD .bytes_per_word NEQ 0
+				THEN total_words = .total_words + 1;
+			    n_initial_length = (.total_words * .data_word_size)
+				/ %BPVAL;
+			    IF (.total_words * .data_word_size) MOD %BPVAL
+				NEQ 0
+				THEN n_initial_length = .n_initial_length + 1;
+			END;		! Word storage
+		    END;
+		[DT_DNUM, DT_PDEC]:		! Display-numeric datatypes
+		    BEGIN			! Packed-decimal datatypes
+		    LOCAL
+			signed_flag,		! Useable value signed
+			useable_datatype,	! Datatype of useable value
+			useable_temporary;	! Used to create this
+		    ! Acceptable initial values: signed or unsigned integers,
+		    ! octal numbers, and hex numbers.
+		    n_useable_length = .a_member [CRM$W_DIGITS] + 1;
+		    n_useable_fw_flag = FALSE;
+		    $XPO_GET_MEM (CHARACTERS = .n_useable_length,
+			FILL = 0, RESULT = n_useable_value);
+		    SELECTONE .a_facility [CRA$L_INITIAL_TYPE] OF SET
+		    [T_UNSIGNED_INTEGER, T_SIGNED_INTEGER]:
+			$STR_BINARY (STRING = (.a_member [CRM$W_INITIAL_LENGTH],
+			    .a_member [CRM$A_INITIAL_VALUE]),
+			    RESULT = useable_temporary);
+		    [T_OCTAL_NUMBER]:
+			$STR_BINARY (STRING = (.a_member [CRM$W_INITIAL_LENGTH],
+			    .a_member [CRM$A_INITIAL_VALUE]),
+			    RESULT = useable_temporary, OPTION = BASE8);
+		    [T_HEX_NUMBER]:
+			$STR_BINARY (STRING = (.a_member [CRM$W_INITIAL_LENGTH],
+			    .a_member [CRM$A_INITIAL_VALUE]),
+			    RESULT = useable_temporary, OPTION = BASE16);
+		    [OTHERWISE]:
+			status = FALSE;
+		    TES;
+
+		    IF .status THEN BEGIN
+			$STR_COPY (STRING = $STR_ASCII (.useable_temporary,
+			    LENGTH = .n_useable_length),
+			    TARGET = (.n_useable_length, .n_useable_value));
+			IF .useable_temporary LSS 0
+			    THEN signed_flag = TRUE
+			    ELSE signed_flag = FALSE;
+			END;
+		    IF .this_sys EQL SYS_8BIT
+			THEN IF .signed_flag
+			    THEN useable_datatype = DIX$K_DT_DN8LS
+			    ELSE useable_datatype = DIX$K_DT_DN8U
+			ELSE IF .signed_flag
+			    THEN useable_datatype = DIX$K_DT_DN7LS
+			    ELSE useable_datatype = DIX$K_DT_DN7U;
+		    IF .status THEN
+		    IF .this_sys EQL SYS_8BIT
+			THEN status = DIX$$DES_BY_DET (src_ffd,
+			    .n_useable_value, SYS_8BIT, 1, 0, 0,
+			    .useable_datatype, .n_useable_length, 0)
+			ELSE status = DIX$$DES_BY_DET (src_ffd,
+			    address_of_byte (.n_useable_value),
+			    SYS_LCG, 1, (0 + 7 - 1), 0,
+			    .useable_datatype, .n_useable_length, 0);
+		    IF .dt [DT_CLASS_SEP] EQL DT_DNUM
+			THEN BEGIN	! Display numeric
+			length = .a_member [CRM$L_STRING_UNITS];
+			bytsiz = .dix$adtt_dn [.dt [DT_CODE_SEP],
+			    DND$V_BYT_SIZ];
+			END		! Display numeric
+			ELSE BEGIN	! Packed decimal
+			    length = .a_member [CRM$W_DIGITS];
+			    bytsiz = .dix$adtt_pd [.dt [DT_CODE_SEP],
+				PDD$V_BYT_SIZ];
+			END;		! Packed decimal
+		    IF ((.this_sys EQL SYS_8BIT) AND (.bytsiz EQL 8)) OR
+			((.this_sys EQL SYS_LCG) AND (.bytsiz EQL 7))
+			THEN BEGIN	! Character storage
+			    fullword_flag = FALSE;
+			    n_initial_length = .a_member [CRM$L_STRING_UNITS];
+			END		! Character storage
+			ELSE BEGIN	! Word storage
+			    fullword_flag = TRUE;
+			    bytes_per_word = .data_word_size / .bytsiz;
+			    total_words = .a_member [CRM$L_STRING_UNITS]
+				/ .bytes_per_word;
+			    IF .a_member [CRM$L_STRING_UNITS]
+				MOD .bytes_per_word NEQ 0
+				THEN total_words = .total_words + 1;
+			    n_initial_length = (.total_words * .data_word_size)
+				/ %BPVAL;
+			    IF (.total_words * .data_word_size) MOD %BPVAL
+				NEQ 0
+				THEN n_initial_length = .n_initial_length + 1;
+			END;		! Word storage
+		    END;		! Display-numeric and packed decimal
+		[DT_FBIN]:		! Fixed-binary datatypes
+		    BEGIN
+		    ! Acceptable initial values: signed or unsigned integers,
+		    ! octal numbers, and hex numbers.
+		    LOCAL
+			temp_dt: INITIAL (DIX$K_DT_SBF36) data_type_sep;
+		    n_useable_length = 1;	! Fullwords
+		    n_useable_fw_flag = TRUE;
+		    $XPO_GET_MEM (FULLWORDS = 1, RESULT = n_useable_value,
+			FILL = 0);
+		    SELECTONE .a_facility [CRA$L_INITIAL_TYPE] OF SET
+		    [T_UNSIGNED_INTEGER, T_SIGNED_INTEGER]:
+			$STR_BINARY (STRING = (.a_member [CRM$W_INITIAL_LENGTH],
+			    .a_member [CRM$A_INITIAL_VALUE]),
+			    RESULT = .n_useable_value);
+		    [T_OCTAL_NUMBER]:
+			$STR_BINARY (STRING = (.a_member [CRM$W_INITIAL_LENGTH],
+			    .a_member [CRM$A_INITIAL_VALUE]),
+			    RESULT = .n_useable_value, OPTION = BASE8);
+		    [T_HEX_NUMBER]:
+			$STR_BINARY (STRING = (.a_member [CRM$W_INITIAL_LENGTH],
+			    .a_member [CRM$A_INITIAL_VALUE]),
+			    RESULT = .n_useable_value, OPTION = BASE16);
+		    [OTHERWISE]:
+			status = FALSE;
+		    TES;
+		    IF .status THEN
+		    IF .this_sys EQL SYS_8BIT
+			THEN status = DIX$$DES_BY_DET (src_ffd,
+			    .n_useable_value, SYS_8BIT, 1, 0, 0, DIX$K_DT_SBF32,
+			    0, 0)
+			ELSE status = DiX$$DES_BY_DET (src_ffd,
+			    address_of_byte (.n_useable_value),
+			    SYS_LCG, 1, (0 +
+			     .dix$adtt_fbin [.temp_dt [DT_CODE_SEP], fbd$v_siz]
+			     - 1), 0, DIX$K_DT_SBF36, 0, 0);
+		    length = 0;
+		    bytsiz = .dix$adtt_fbin [.dt [DT_CODE_SEP], FBD$V_SIZ];
+		    n_initial_length = (.bytsiz + %BPVAL-1) / %BPVAL;
+		    fullword_flag = TRUE;
+		    END;		! Fixed-binary datatypes
+		[DT_FP]:		! Floating-point datatypes
+		    BEGIN
+		    IF .dix$adtt_fp [.dt [DT_CODE_SEP], fpd$v_typ]
+			EQL fpd$k_complex
+			THEN		! Complex datatype
+			%IF %BLISS (BLISS32) %THEN
+			BEGIN			! Use VAX code for complex
+			n_useable_length = 16;	! Use H-FLOAT COMPLEX
+			n_useable_fw_flag = TRUE;
+			$XPO_GET_MEM (FULLWORDS = 16, RESULT = n_useable_value,
+			    FILL = 0);
+			! Acceptable token type is NT_COMPLEX_NUMBER.
+			! Acceptable individual token types are signed and
+			! unsigned inegers, floating-point numbers, and
+			! fixed-point numbers.
+			IF .a_facility [CRA$L_INITIAL_TYPE]
+			    NEQ NT_COMPLEX_NUMBER
+			    THEN status = FALSE
+			    ELSE BEGIN		! Initial value is complex
+			    SELECTONE .a_facility [CRA$L_INITIAL_TYPE_1]
+				OF SET		! Real part of complex number
+			    [T_UNSIGNED_INTEGER, T_SIGNED_INTEGER,
+				T_FLOATING_POINT, T_FIXED_POINT]:
+			    BEGIN
+			    LOCAL des: $STR_DESCRIPTOR (STRING =
+				(.a_facility [CRA$L_INITIAL_LENGTH_1],
+				.a_member [CRM$A_INITIAL_VALUE]));
+			    status = OTS$CVT_T_H (des,
+				.n_useable_value, 0, 0, 0);
+			    END;
+			    [OTHERWISE]:
+			    status = FALSE;
+			    TES;		! Real part of complex number
+			    IF .status THEN
+			    SELECTONE .a_facility [CRA$L_INITIAL_TYPE_2] OF
+				SET		! Imaginary part of complex
+			    [T_UNSIGNED_INTEGER, T_SIGNED_INTEGER,
+				T_FLOATING_POINT, T_FIXED_POINT]:
+			    BEGIN
+			    LOCAL des: $STR_DESCRIPTOR (STRING =
+				(.a_member [CRM$W_INITIAL_LENGTH] -
+				.a_facility [CRA$L_INITIAL_LENGTH_1] - 1,
+				ch$plus (.a_member [CRM$A_INITIAL_VALUE],
+				.a_facility [CRA$L_INITIAL_LENGTH_1] + 1)));
+			    status = OTS$CVT_T_H (des,
+				.n_useable_value + 8*4, 0, 0, 0);
+			    END;
+			    [OTHERWISE]:
+			    status = FALSE;
+			    TES;		! Imaginary part of complex
+			    IF .status THEN
+			    status = DIX$$DES_BY_DET (src_ffd, .n_useable_value,
+				SYS_8BIT, 1, 0, 0, DIX$K_DT_H_CMPLX, 0, 0);
+			    END;		! Initial value is complex
+			END			! Use VAX code for complex
+			%ELSE
+			BEGIN			! Use 20 code for complex
+![1]			n_useable_length = 4;	! Use D-FLOAT COMPLEX
+			n_useable_length = 2;	! Use F-FLOAT COMPLEX for now
+			n_useable_fw_flag = TRUE;
+			$XPO_GET_MEM (FULLWORDS = .n_useable_length,	![1]
+			    RESULT = n_useable_value, FILL = 0);	![1]
+			! Acceptable token type is NT_COMPLEX_NUMBER.
+			! Acceptable individual token types are signed or
+			! unsigned integers, floating-point numbers, and
+			! fixed-point numbers.
+			IF .a_facility [CRA$L_INITIAL_TYPE]
+			    NEQ NT_COMPLEX_NUMBER
+			    THEN status = FALSE
+			    ELSE BEGIN		! Initial value is complex
+			    SELECTONE .a_facility [CRA$L_INITIAL_TYPE_1] OF
+			    SET			! Real part of complex number
+			    [T_UNSIGNED_INTEGER, T_SIGNED_INTEGER,
+				T_FLOATING_POINT, T_FIXED_POINT]:
+			    BEGIN
+			    LOCAL t_err, t_ptr, t_str;
+			    ! Make it an ASCIZ string.
+			    $XPO_GET_MEM (CHARACTERS =
+				.a_facility [CRA$L_INITIAL_LENGTH_1] + 1,
+				RESULT = t_str, FILL = 0);
+			    $STR_COPY (STRING = (
+				.a_facility [CRA$L_INITIAL_LENGTH_1],
+				.a_member [CRM$A_INITIAL_VALUE]),
+				TARGET = (.a_facility [CRA$L_INITIAL_LENGTH_1],
+				.t_str));
+![1]			    status = dfin (.t_str; t_ptr, .n_useable_value,
+![1]				.n_useable_value + 1, t_err);
+%BLISS36(
+%IF %SWITCHES(TOPS20)
+%THEN
+			    status = JSYS_flin (.t_str; t_ptr,		![1]
+				.n_useable_value, t_err);		![1]
+%ELSE
+			    status = flin (.t_str, t_ptr,		![1]
+				.n_useable_value, t_err);		![1]
+%FI)
+			    $XPO_FREE_MEM (STRING = (
+				.a_facility [CRA$L_INITIAL_LENGTH_1] + 1,
+				.t_str));
+			    END;
+			    [OTHERWISE]:
+			    status = FALSE;
+			    TES;			! Real part of complex
+			    IF .status THEN
+			    SELECTONE .a_facility [CRA$L_INITIAL_TYPE_2] OF
+				SET			! Imaginary part
+			    [T_UNSIGNED_INTEGER, T_SIGNED_INTEGER,
+				T_FLOATING_POINT, T_FIXED_POINT]:
+			    BEGIN
+			    LOCAL t_err, t_ptr, t_str;
+			    ! Make it an ASCIZ string.
+			    $XPO_GET_MEM (CHARACTERS =
+				.a_member [CRM$W_INITIAL_LENGTH] -
+				.a_facility [CRA$L_INITIAL_LENGTH_1],
+				RESULT = t_str, FILL = 0);
+			    $STR_COPY (STRING = (
+				.a_member [CRM$W_INITIAL_LENGTH]
+				- .a_facility [CRA$L_INITIAl_LENGTH_1] - 1,
+				ch$plus (.a_member [CRM$A_INITIAL_VALUE],
+				.a_facility [CRA$L_INITIAL_LENGTH_1] + 1)),
+				TARGET = (.a_member [CRM$W_INITIAL_LENGTH] -
+				.a_facility [CRA$L_INITIAl_LENGTH_1] - 1,
+				.t_str));
+![1]			    status = dfin (.t_str; t_ptr, .n_useable_value+2,
+![1]				.n_useable_value+3, t_err);
+%BLISS36(
+%IF %SWITCHES(TOPS20)
+%THEN
+			    status = JSYS_flin (.t_str; t_ptr,		![1]
+				.n_useable_value+1, t_err);		![1]
+%ELSE
+			    status = flin (.t_str, t_ptr,		![1]
+				.n_useable_value+1, t_err);		![1]
+%FI)
+			    $XPO_FREE_MEM (STRING = (
+				.a_member [CRM$W_INITIAL_LENGTH] -
+				.a_facility [CRA$L_INITIAL_LENGTH_1], .t_str));
+			    END;
+			    [OTHERWISE]:
+			    status = FALSE;
+			    TES;			! Imaginary part
+			    IF .status THEN
+			    status = DIX$$DES_BY_DET (src_ffd,
+				address_of_byte (.n_useable_value),
+![1]				SYS_LCG, 1, (0 + 72 - 1), 0,
+![1]				DIX$K_DT_D_CMPLX144, 0, 0);
+				SYS_LCG, 1, (0 + 36 - 1), 0,		![1]
+				DIX$K_DT_F_CMPLX36, 0, 0);		![1]
+			    END;			! Use 20 code
+			END				! Complex initial value
+			%FI
+			ELSE		! Floating-point datatype
+			%IF %BLISS (BLISS32) %THEN
+			BEGIN			! Use VMS code for floating
+			n_useable_length = 8;	! Use H_FLOATING
+			n_useable_fw_flag = TRUE;
+			$XPO_GET_MEM (FULLWORDS = 8, RESULT = n_useable_value,
+			    FILL = 0);
+			! Acceptable initial values here are signed or unsigned
+			! integers, floating-point numbers, and fixed-point
+			! numbers.
+			SELECTONE .a_facility [CRA$L_INITIAL_TYPE] OF SET
+			[T_UNSIGNED_INTEGER, T_SIGNED_INTEGER,
+			    T_FLOATING_POINT, T_FIXED_POINT]:
+			BEGIN
+			LOCAL des: $STR_DESCRIPTOR (STRING =
+			    (.a_member [CRM$W_INITIAL_LENGTH],
+			    .a_member [CRM$A_INITIAL_VALUE]));
+			status = OTS$CVT_T_H (des, .n_useable_value, 0, 0, 0);
+			END;
+			[OTHERWISE]:
+			status = FALSE;
+			TES;
+			IF .status THEN
+			status = DIX$$DES_BY_DET (src_ffd, .n_useable_value,
+			    SyS_8BIT, 1, 0, 0, DiX$K_DT_H_FLOAT, 0, 0);
+			END;			! Use VMS code for floating
+			%ELSE
+			BEGIN			! Use 20 code for floating
+			n_useable_length = 2;	! Use D-float (best we can do)
+			n_useable_fw_flag = TRUE;
+			$XPO_GET_MEM (FULLWORDS = 2, RESULT = n_useable_value,
+			    FILL = 0);
+			! Acceptable initial values here are signed or unsigned
+			! integers, floating-point numbers, and fixed-point
+			! numbers.
+			SELECTONE .a_facility [CRA$L_INITIAL_TYPE] OF SET
+			[T_UNSIGNED_INTEGER, T_SIGNED_INTEGER,
+			    T_FLOATING_POINT, T_FIXED_POINT]:
+			BEGIN
+			LOCAL t_err, t_ptr, t_str;
+			! Make ASCIZ string.
+			$XPO_GET_MEM (CHARACTERS =
+			    .a_member [CRM$W_INITIAL_LENGTH] + 1,
+			    RESULT = t_str, FILL = 0);
+			$STR_COPY (STRING = (.a_member [CRM$W_INITIAL_LENGTH],
+			    .a_member [CRM$A_INITIAL_VALUE]), TARGET =
+			    (.a_member [CRM$W_INITIAL_LENGTH], .t_str));
+%BLISS36(
+%IF %SWITCHES(TOPS20)
+%THEN
+			status = JSYS_dfin (.t_str; t_ptr, .n_useable_value,
+			    .n_useable_value + 1, t_err);
+%ELSE
+			status = dfin (.t_str, t_ptr, .n_useable_value,
+			    .n_useable_value + 1, t_err);
+%FI)
+			$XPO_FREE_MEM (STRING = (
+			    .a_member [CRM$W_INITIAL_LENGTH] + 1, .t_str));
+			END;
+			[OTHERWISE]:
+			status = FALSE;
+			TES;
+			IF .status THEN
+			status = DIX$$DES_BY_DET (src_ffd,
+			    address_of_byte (.n_useable_value),
+			    SYS_LCG, 1, (0 + 72 - 1), 0,
+			    DIX$K_DT_FLOAT_72, 0, 0);
+			END;		! Use 20 code for floating
+			%FI
+		    length = 0;
+		    bytsiz = .dix$adtt_fp [.dt [DT_CODE_SEP], FPD$V_SIZ];
+		    n_initial_length = (.bytsiz + %BPVAL-1) / %BPVAL;
+		    ![1] Account for complex bytesize.
+		    IF .dix$adtt_fp [.dt [DT_CODE_SEP], FPD$V_TYP]
+			EQL FPD$K_COMPLEX
+			THEN n_initial_length = ((2*.bytsiz) + %BPVAL-1) /
+			    %BPVAL;
+		    fullword_flag = TRUE;
+		    END;		! Floating-point datatypes
+
+		TES;
+! Convert initial values coming from our parser:
+
+		! Make the new initial value:
+		IF .status THEN
+		IF .fullword_flag
+		    THEN $XPO_GET_MEM (FULLWORDS = .n_initial_length, FILL = 0,
+			RESULT = n_initial_value)
+		    ELSE $XPO_GET_MEM (CHARACTERS = .n_initial_length, FILL = 0,
+			RESULT = n_initial_value);
+
+		! Make an FFD to the new initial value:
+		IF .status THEN
+		IF .sys_org EQL SYS_8BIT OR .sys_org EQL SYS_PRO
+		    THEN status = DIX$$DES_BY_DET (dst_ffd, .n_initial_value,
+			SYS_8BIT, 1, 0, 0, .a_member [CRM$W_DATATYPE],
+			.length, .a_member [CRM$W_SCALE])
+		    ELSE status = DIX$$DES_BY_DET (dst_ffd,
+			address_of_byte (.n_initial_value),
+			SYS_LCG, 1, (0 + .bytsiz - 1), 0,
+			.a_member [CRM$W_DATATYPE], .length,
+			.a_member [CRM$W_SCALE]);
+
+		! Do the conversion:
+		IF .status THEN
+		status = DIX$$CON_GEN (src_ffd, dst_ffd);
+
+		! Delete the useable value:
+		IF .n_useable_fw_flag
+		    THEN $XPO_FREE_MEM (BINARY_DATA = (.n_useable_length,
+			.n_useable_value, FULLWORDS))
+		    ELSE $XPO_FREE_MEM (STRING = (.n_useable_length,
+			.n_useable_value));
+		n_useable_length = 0;
+	    END;			! Initial value came from our parser
+! Initial value is now of the correct datatype, wherever it came from.
+
+	    ! Delete the old initial value:
+	    $XPO_FREE_MEM (STRING = (.a_member [CRM$W_INITIAL_LENGTH],
+		.a_member [CRM$A_INITIAL_VALUE]));
+	    ! Replace it with the new value:
+	    a_member [CRM$W_INITIAL_LENGTH] = .n_initial_length;
+	    a_member [CRM$A_INITIAL_VALUE] = .n_initial_value;
+	    ! Set flag for FULLWORD allocation if appropriate.
+	    a_member [CRM$V_FACILITY_USE_3] = .fullword_flag;
+
+	    ! Fill in source FFD in new transform node:
+	    IF .status THEN
+	    IF .sys_org EQL SYS_8BIT OR .sys_org EQL SYS_PRO
+		THEN status = DIX$$DES_BY_DET (new_trans [tra_src$V_UNIT],
+		    .a_member [CRM$A_INITIAL_VALUE], SYS_8BIT, 1, 0, 0,
+		    .a_member [CRM$W_DATATYPE], .length,
+		    .a_member [CRM$W_SCALE])
+		ELSE status = DIX$$DES_BY_DET (new_trans [tra_src$V_UNIT],
+		    address_of_byte(.a_member [CRM$A_INITIAL_VALUE]),     ![67]
+                    SYS_LCG, 1, (0 + .bytsiz - 1), 0,
+		    .a_member [CRM$W_DATATYPE], .length,
+		    .a_member [CRM$W_SCALE]);
+
+	    ! Fill in destination FFD in new transform node:
+	    IF .status THEN
+	    IF .sys_org EQL SYS_8BIT OR .sys_org EQL SYS_PRO
+		THEN status = DIX$$DES_BY_DET (new_trans [tra_dst$V_UNIT],
+		    .dest_buffer, SYS_8BIT, 1, .a_member [CRM$L_MEMBER_OFFSET],
+		    0, .a_member [CRM$W_DATATYPE], .length,
+		    .a_member [CRM$W_SCALE])
+		ELSE status = DIX$$DES_BY_DET (new_trans [tra_dst$V_UNIT],
+		    .dest_buffer, SYS_LCG, 1,
+		    (.a_member [CRM$L_MEMBER_OFFSET] + .bytsiz - 1),
+		    0, .a_member [CRM$W_DATATYPE], .length,
+		    .a_member [CRM$W_SCALE]);
+
+	    new_trans [TRA_DST_ADDR] = .a_member;
+	    ! Fill in dims and fqn for destination in initial value transform:
+
+	    dims_head = NULL_PTR;	! Initialize dims list for transform
+	    fqn_head = NULL_PTR;	! Initialize fqn for transform
+	    c_member = .a_member;	! Initialize current member
+
+	    ! Loop on levels of member node parents in record tree.
+	    ! Stop when we get to the record node.
+	    IF .status THEN
+	    WHILE (.c_member [CRM$B_ID] NEQ CRX$K_RECORD) DO
+		BEGIN
+		! Add current field name to fqn list:
+		$XPO_GET_MEM (FULLWORDS = diu$s_crx_stringlist,
+		    RESULT = new_fqn, FILL = 0);
+		INIT_STRINGLIST (.new_fqn);
+		IF .fqn_head EQLA NULL_PTR
+		    THEN fqn_head = .new_fqn	! Lowest name in list
+		    ELSE BEGIN			! Prefix on to name list
+		    fqn_head [CRS$A_PREVIOUS] = .new_fqn;
+		    new_fqn [CRS$A_NEXT] = .fqn_head;
+		    fqn_head = .new_fqn;
+		    END;			! Prefix on to name list
+		new_fqn [CRS$W_STRING_LENGTH] = .c_member [CRM$B_NAME_LENGTH];
+		$XPO_GET_MEM (CHARACTERS = .new_fqn [CRS$W_STRING_LENGTH],
+		    RESULT = new_fqn [CRS$A_STRING]);
+		CH$MOVE (.new_fqn [CRS$W_STRING_LENGTH],
+		    ch$ptr (c_member [CRM$T_NAME]), .new_fqn [CRS$A_STRING]);
+		! Add current dimensions, if any, to dims list:
+		IF .c_member [CRM$B_DIMENSIONS_CNT] GTR 0
+		    THEN BEGIN			! Has dimensions
+		    MAKE_DIMS (new_dims, .c_member);
+		    IF .dims_head EQL NULL_PTR
+			THEN dims_head = .new_dims	! Lowest dims in list
+			ELSE BEGIN			! Prefix on to dims list
+			dims_head [DIMS$A_PREVIOUS] = .new_dims;
+			new_dims [DIMS$A_NEXT] = .dims_head;
+			dims_head = .new_dims;
+			END;				! Prefix on to dims list
+		    END;			! Has dimensions
+
+		! Find the next parent member block for this member node
+		p_member = .c_member [CRM$A_PREVIOUS];
+		WHILE TRUE DO
+		    IF .p_member [CRM$B_ID] EQL CRX$K_MEMBER	! Member parent
+			THEN IF .p_member [CRM$A_CHILDREN] EQLA .c_member
+			    THEN EXITLOOP	! Found parent member node
+			    ELSE BEGIN		! Try previous node as parent
+			    c_member = .p_member;
+			    p_member = .p_member [CRM$A_PREVIOUS];
+			    END
+		    ELSE
+		    IF .p_member [CRM$B_ID] EQL CRX$K_OVERLAY	! Overlay node
+			THEN BEGIN		! Potential parent is overlay
+			LOCAL p_overlay: REF crx_overlay;
+			p_overlay = .p_member;	! Go upward until find a
+			c_member = .p_member;	!  member parent
+			p_overlay = .p_overlay [CRO$A_PREVIOUS];
+			p_member = .p_overlay;
+			END			! Potential parent is overlay
+		    ELSE
+		    IF .p_member [CRM$B_ID] EQL CRX$K_RECORD	! Record node
+			THEN EXITLOOP;		! Found top node - get out fast!
+
+		c_member = .p_member;
+		END;				! Loop on levels of member nodes
+
+	! Put dims and fqn in the new transform
+	new_trans [TRA_DST_NAM] = .fqn_head;
+	new_trans [TRA_DST_DIMS] = .dims_head;
+
+	IF NOT .status
+	    THEN BEGIN			! Initial value is no good - toss it
+	    last_trans [TRA_NEXT] = NULL_PTR;
+	    DIU$DEL_TRANS_NODE (.new_trans);
+	    new_trans = NULL_PTR;
+	    END;			! Initial value is no good - toss it
+
+
+!   Process sibling member nodes at this level:
+
+        END;                            ! end of l_siblings loop
+        a_member = .a_member [CRM$A_NEXT];
+
+    END UNTIL (.a_member EQLA NULL_PTR) OR (.depth EQL 0);
+
+    END;				! Member node
+
+! Initial value processing for other node types:
+
+[CRX$K_OVERLAY]:			! CRX_OVERLAY node
+    RETURN;				! Just return for now
+    ! The code below should be incorporated when VARIANTS are properly
+    ! handled in transforms (especially MOVE MATCHING).
+!    BEGIN
+!    LOCAL
+!	a_overlay:	REF crx_overlay;	! A crx_overlay node
+!
+!    a_overlay = .rec;		! Get field addressability via REF
+!
+!    DO					! Iterate on CRX_OVERLAY siblings
+!	IF .a_overlay [CRO$W_FIELDS_CNT] NEQ 0
+!	    THEN INITIAL_VALUE_WALKER (.a_overlay [CRO$A_FIELDS],
+!		.transform_list, .sys_org, .dest_buffer, .depth+1)
+!    UNTIL ((a_overlay = .a_overlay [CRO$A_NEXT]) EQL NULL_PTR)
+!	OR (.depth EQL 0);
+!    END;
+
+[CRX$K_DIMENSION]:			! CRX_DIMENSION node
+    RETURN;				! Should never get here anyways
+
+[CRX$K_STRINGLIST]:			! CRX_STRINGLIST node
+    RETURN;				! Should never get here anyways
+
+[CRX$K_PLI_SPECIFIC]:			! CRX_PLI_SPECIFIC node
+    RETURN;				! Should never get here anyways
+
+[CRX$K_LITERAL_LIST]:			! CRX_LITERAL_LIST node
+    RETURN;				! Should never get here anyways
+
+TES;
+
+END;
+!++
+!  DIU$TAG_FIELD  (TAGFLD)
+!
+!  FUNCTIONAL DESCRIPTION:
+!
+!	This routine will replace each crx_stringlist which is the tag
+!	variable for an OCCURS DEPENDING with a new block (crx_tag_ffd)
+!	which will contain an FFD to the tag variable field in the
+!	record during transform processing, a block id, the usual pointers,
+!	and a "suspicious tag value" flag.  This routine will be called during
+!	transform loading after datatype mapping has been done for the source
+!	and destination record description trees.
+!
+!  CALLING SEQUENCE:
+!
+!	DIU$TAG_FIELD (root, source_record, sys_org);
+!
+!  PARAMETERS:
+!
+!	root		Address of the crx_record block which is the root of the
+!			record description tree.
+!	source_record	The starting address in memory of the record
+!			buffer to be used during transform processing.  This is
+!			used to construct the FFD to the tag variable's value.
+!	sys_org		System of origin of the record (SYS_8BIT,
+!			SYS_LCG, or SYS_PRO), used to make the FFD.
+!
+!  IMPLICIT INPUTS:
+!
+!	None
+!
+!  IMPLICIT OUTPUTS:
+!
+!	None
+!
+!  COMPLETION STATUS:
+!
+!	None
+!
+!  SIGNALLED STATUS:
+!
+!	This routine does not intercept signals sent by routines it calls.
+!
+!  SIDE EFFECTS:
+!
+!	None
+!--
+GLOBAL ROUTINE DIU$TAG_FIELD (root, source_record, sys_org): NOVALUE =
+BEGIN
+
+MAP
+    root:	REF	crx_record;	! Root of tree
+
+TAG_FIELD_WALKER (.root, .source_record, .sys_org, 0, .root);
+
+END;
+!++
+!  TAG_FIELD_WALKER  (TAGFLW)
+!
+!  FUNCTIONAL DESCRIPTION:
+!
+!	This routine does the work for DIU$TAG_FIELD recursively.
+!
+!  CALLING SEQUENCE:
+!
+!	TAG_FIELD_WALKER (root, source_record, sys_org, depth, top);
+!
+!  PARAMETERS:
+!
+!	root		Address of the crx_record or crx_member block which is
+!			the root of the record description tree or subtree.
+!	source_record	The starting address in memory of the record
+!			buffer to be used during transform processing.  This is
+!			used to construct the FFD to the tag variable's value.
+!	sys_org		System of origin of the record (SYS_8BIT,
+!			SYS_LCG, or SYS_PRO), used to make the FFD.
+!	depth		The recursion depth in this routine.  This is used to
+!			control iteration on the siblings of the root node.
+!	top		Root of record description tree (a crx_record
+!			node).  Used to initialize tree traversals.
+!
+!  IMPLICIT INPUTS:
+!
+!	None
+!
+!  IMPLICIT OUTPUTS:
+!
+!	None
+!
+!  COMPLETION STATUS:
+!
+!	None
+!
+!  SIGNALLED STATUS:
+!
+!	This routine does not intercept signals sent by routines it calls.
+!
+!  SIDE EFFECTS:
+!
+!	None
+!--
+ROUTINE TAG_FIELD_WALKER (root, source_record, sys_org, depth, top) : NOVALUE =
+BEGIN
+
+MAP
+    root:	REF crx_record,		! Root of tree or subtree
+    top:	REF crx_record;		! Root of tree
+
+IF .root EQLA NULL_PTR
+    THEN RETURN;			! Nothing to do here
+
+SELECTONE .root [CRX$B_ID] OF
+SET
+
+[CRX$K_RECORD]:				! CRX_RECORD node
+    TAG_FIELD_WALKER (.root [CRX$A_ROOT], .source_record, .sys_org,
+	.depth+1, .top);
+
+[CRX$K_MEMBER]:				! CRX_MEMBER node
+    BEGIN
+    LOCAL
+	a_dimension:	REF crx_dimension,	! A crx_dimension node
+	a_member:	REF crx_member,		! A crx_member node
+	a_tag_ffd:	REF crx_tag_ffd,	! A crx_tag_ffd node
+	bytsiz,					! Byte size to make FFD
+	length,					! Length to make FFD
+	status,					! Return status
+	t_member:	REF crx_member;		! Tag member block
+
+     LABEL
+	l_dimensions,				! Block inside dimensions loop
+	l_siblings;				! Block inside siblings loop
+
+    a_member = .root;			! Get field addressability via REF
+
+    DO L_SIBLINGS: BEGIN		! Iterate on CRX_MEMBER siblings
+	IF .a_member [CRM$A_CHILDREN] NEQA NULL_PTR
+	    THEN TAG_FIELD_WALKER (.a_member [CRM$A_CHILDREN], .source_record,
+		.sys_org, .depth+1, .top);
+	IF .a_member [CRM$B_DIMENSIONS_CNT] EQL 0
+	    THEN LEAVE L_SIBLINGS;	! No dimensions, so no tag fields
+	a_dimension = .a_member [CRM$A_DIMENSIONS];
+	
+	DO L_DIMENSIONS: BEGIN		! Iterate on CRX_DIMENSION siblings
+	    IF .a_dimension [CRD$B_DEPEND_ITEM_CNT] EQL 0
+		THEN LEAVE L_DIMENSIONS;! No tag field here
+	    ! Process the tag field
+	    status = DIU$FIND_FIELD (.a_dimension [CRD$A_DEPEND_ITEM],
+		.top, t_member);
+	    IF .status			! Found the tag field
+		THEN BEGIN		! Verify tag useable as an integer
+		LOCAL			!  and
+		    dt: data_type_sep;	! Compute length and bytesize
+		EXTERNAL		! Datatype tables
+		    dix$adtt_st:	dtt_st,		! String datatypes
+		    dix$adtt_fbin:	dtt_fbin,	! Fixed-point binary
+		    dix$adtt_fp:	dtt_fp,		! Floating-point
+		    dix$adtt_dn:	dtt_dn,		! Display-numeric
+		    dix$adtt_pd:	dtt_pd;		! Packed decimal
+		dt = .t_member [CRM$W_DATATYPE];
+		CASE .dt [DT_CLASS_SEP] FROM 1 TO DIX$K_MAX_CLASS OF
+		    SET
+		    [DT_STRING]:
+			BEGIN			! String datatypes
+			length = .t_member [CRM$L_STRING_UNITS];
+			bytsiz = .dix$adtt_st [.dt [dt_code_sep],
+			    std$v_byt_siz];
+			status = FALSE;
+			END;			! String datatypes
+
+		    [DT_FBIN]:
+			BEGIN			! Fixed-binary datatypes
+			length = 0;
+			bytsiz = .dix$adtt_fbin [.dt [dt_code_sep],
+			    fbd$v_siz];
+			status = TRUE;
+			END;			! Fixed-binary datatypes
+
+		    [DT_FP]:
+			BEGIN			! Floating-point datatypes
+			length = 0;
+			bytsiz = .dix$adtt_fp [.dt [dt_code_sep],
+			    fpd$v_siz];
+			status = FALSE;
+			END;			! Floating-point datatypes
+
+		    [DT_DNUM]:
+			BEGIN			! Display-numeric datatypes
+			length = .t_member [CRM$L_STRING_UNITS];
+			bytsiz = .dix$adtt_dn [.dt [dt_code_sep],
+			    dnd$v_byt_siz];
+			status = TRUE;
+			END;			! Display-numeric datatypes
+
+		    [DT_PDEC]:
+			BEGIN			! Packed-decimal datatypes
+			length = .t_member [CRM$W_DIGITS];
+			bytsiz = .dix$adtt_pd [.dt [dt_code_sep],
+			    pdd$v_byt_siz];
+			status = TRUE;
+			END;			! Packed-decimal datatypes
+
+		    TES;
+		END;				! Found the tag field
+	    ! Make a Tag FFD block:
+	    $XPO_GET_MEM (FULLWORDS = diu$s_crx_tag_ffd, RESULT = a_tag_ffd,
+		FILL = 0);
+	    ! Fill it in:
+	    a_tag_ffd [CRT$A_PREVIOUS] = .a_dimension;
+	    ! CRT$A_NEXT is always a NULL_PTR, which is zero
+	    a_tag_ffd [CRT$B_ID] = CRX$K_TAG_FFD;
+	    ! Make the FFD:
+	    IF .status
+		THEN IF .sys_org EQL SYS_8BIT OR .sys_org EQL SYS_PRO
+		    THEN status = DIX$$DES_BY_DET (a_tag_ffd [CRT$V_UNIT],
+			.source_record, SYS_8BIT, 1,
+			.t_member [CRM$L_MEMBER_OFFSET], 0,
+			.t_member [CRM$W_DATATYPE], .length,
+			.t_member [CRM$W_SCALE])
+		    ELSE status = DIX$$DES_BY_DET (a_tag_ffd [CRT$V_UNIT],
+			.source_record, SYS_LCG, 1,
+			(.t_member [CRM$L_MEMBER_OFFSET] + .bytsiz - 1),
+			0, .t_member [CRM$W_DATATYPE], .length,
+			.t_member [CRM$W_SCALE]);
+	    IF NOT .status
+		THEN a_tag_ffd [CRT$V_SUSPICIOUS_TAG] = TRUE;
+	    ! Free the stringlist and hook the tag_ffd in in its place:
+	    FREE_STRINGLIST (.a_dimension [CRD$A_DEPEND_ITEM]);
+	    a_dimension [CRD$A_DEPEND_ITEM] = .a_tag_ffd;
+	END UNTIL ((a_dimension = .a_dimension [CRD$A_NEXT]) EQLA NULL_PTR);
+
+    END UNTIL ((a_member = .a_member [CRM$A_NEXT]) EQLA NULL_PTR)
+	OR (.depth EQL 0);
+
+    END;
+[CRX$K_OVERLAY]:			! CRX_OVERLAY node
+    BEGIN
+    LOCAL
+	a_overlay:	REF crx_overlay;	! A crx_overlay node
+
+    a_overlay = .root;			! Get field addressability via REF
+
+    DO					! Iterate on CRX_OVERLAY siblings
+	IF .a_overlay [CRO$W_FIELDS_CNT] NEQ 0
+	    THEN TAG_FIELD_WALKER (.a_overlay [CRO$A_FIELDS],
+		.source_record, .sys_org, .depth+1, .top)
+    UNTIL ((a_overlay = .a_overlay [CRO$A_NEXT]) EQLA NULL_PTR)
+	OR (.depth EQL 0);
+    END;
+
+[CRX$K_DIMENSION]:			! CRX_DIMENSION node
+    RETURN;				! Should never get here anyways
+
+[CRX$K_STRINGLIST]:			! CRX_STRINGLIST node
+    RETURN;				! Should never get here anyways
+
+[CRX$K_PLI_SPECIFIC]:			! CRX_PLI_SPECIFIC node
+    RETURN;				! Should never get here anyways
+
+[CRX$K_LITERAL_LIST]:			! CRX_LITERAL_LIST node
+    RETURN;				! Should never get here anyways
+
+TES;
+
+END;
+
+END
+ELUDOM

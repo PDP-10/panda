@@ -1,0 +1,919 @@
+%TITLE 'Data Interchange Utility DIRECTORY module'
+
+MODULE DIUDIR (IDENT = '272',
+               LANGUAGE(BLISS36),
+               ENTRY(DIU$DIRECTORY)) =
+BEGIN
+
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1986, 1987.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+! FACILITY:	DIU    Data Interchange Utility
+!
+! ENVIRONMENT:  TOPS-20 V6.1    XPORT      RMS V3
+!		BLISS-36 V4     FAO-36
+!
+! ABSTRACT:     This module contains routines to perform file directory
+!               displays. They will look at a set of RMS data structures 
+!               for a file, and dump a directory listing to the passed rab.
+!
+! AUTHOR:  Rick Fricchione			CREATED: 7-Dec-1984
+%SBTTL 'Revision History'
+! HISTORY:
+!
+!  272	In DIUDIR.B36: Add new file system types.
+!	Gregory A. Scott 6-Mar-87
+!
+!  271  In DIUDIR.B36: Add protection XAB and output of protections on /FULL.
+!       Gregory A. Scott  16-Oct-86
+!
+!  252	Remove library of CONDIT.
+!	Sandy Clemens  1-Jul-86
+!
+!  234  Change library of RMSUSR to RMSINT.
+!       Gregory A. Scott 17-Jul-86
+!
+!  207  DIR$INITIALIZE did a crude job of ASCIZing the input spec.
+!       Gregory A. Scott 27-May-86
+!
+!  206  Remove code from DIUDO that opened the  files and so forth and move  it
+!       here for simplicity (module is now entered from DIUDO at  DIU$DIRECTORY
+!       rather than  D$DIR).  Be  smarter about  the grand  total message  (say
+!       pages and blocks if that is the case [yuk]).  Remove DIR$OPEN_OUTPUT.
+!       Gregory A. Scott 27-May-86
+!
+!  177  Add call to S$BREATHE  in  inner  file  processing  loop.   Compilation
+!       /DEBUG didn't work  because the  BIND to  get around  compiler bug  was
+!       after the $TRACE in DIR$NORMAL.
+!       Gregory A. Scott 22-May-86
+!
+!  176  Clean up DIR$_OPEN_OUTPUT, much of it is never used.   Implement  grand
+!       total file size count.  Output long filenames properly.  Clean  up  the
+!       rather gross implementation of $PUT_FAO.
+!       Gregory A. Scott 21-May-86
+!
+!  164  Remove UNDECLARE of $PUT_FAO since it is no longer  in DIU.R36,  remove
+!       cell fal_len since it is never used anymore (pass a 0 to $FAO instead).
+!       Gregory A. Scott 16-May-86
+!
+!  131  Remove usage  fo diudbg  cell, replace  it with  conditional  assembly.
+!       Replace macro $DEBUG_FAO with $TRACE_FAO and $DEBUG_TRACE with  $TRACE,
+!       remove macro $CRLF since it was unreferenced.  Not entirely  clear  why
+!       this module has a private $PUT_FAO macro; maybe someday I'll fix it.
+!       Gregory A. Scott 28-Mar-86
+!
+!      55 Add type block of typ=image and change DIR$FULL to get
+!         display of byte size, format, and record size
+!         Andy Puchrik  2-Dec-85
+!
+!      40 Put the REQUIRE/LIBRARY of 'TOPS20' into a TOPS-20 only
+!         conditional.
+!         Sandy Clemens  7-Oct-85
+!
+!	RDF0001	V01-000		Rick Fricchione		7-Dec-1984
+!		Original version of D$DIR.  Interface with $FAO
+!               for pretty output.  Handle different levels of 
+!               verbosity.
+!
+!
+!--
+%SBTTL 'Libraries and Externals'
+
+! Libraries
+
+LIBRARY 'BLI:XPORT';                    ! XPORT of course
+LIBRARY 'FAO';                          ! FAO services
+LIBRARY 'RMSINT';                       ! RMS services
+LIBRARY 'DIU';                          ! DIU Data Structures
+
+! Externals
+
+EXTERNAL ROUTINE DO$BYPASS,             ! Bypass something do to with RMS
+                 S$BREATHE : NOVALUE,   ! Let spooler take a breath
+                 RMS$FAILURE,           ! RMS condition handler
+                 RMS$SIGNAL;            ! RMS error handler
+
+%SBTTL 'Forward Routine'
+
+FORWARD ROUTINE
+        DIU$DIRECTORY,                  ! Main entry point
+        DIR$DO : NOVALUE,               ! Called for each source spec
+        DIR$TOTAL : NOVALUE,            ! Print totals for this dir
+        DIR$GRAND_TOTAL : NOVALUE,      ! Print total for this request
+        DIR$BREAK_CHECK : NOVALUE,      ! Print header
+        DIR$INITIALIZE : NOVALUE,       ! Initialize RMS data structures
+        DIR$BRIEF : NOVALUE,            ! Show only filename
+        DIR$NORMAL : NOVALUE,           ! Show a mediocre amount of data
+        DIR$FULL : NOVALUE;             ! Show everything
+
+%SBTTL 'Macros'
+
+MACRO $PUT_FAO (control) = 
+      BEGIN
+
+      LOCAL fao_ctl : $STR_DESCRIPTOR(STRING=%STRING(control,%CHAR(13,10)));
+
+      ! Init the FAO record descriptor
+
+      $STR_DESC_INIT(DESC=fao_desc,
+                     CLASS=BOUNDED,
+                     STRING=(fao_buf_size, CH$PTR(fao_buf)));
+
+      ! Call FAO to format the text 
+
+      $FAO(fao_ctl,0,fao_desc,%REMAINING);
+
+      ! Load the $RAB, write it to the file
+
+      fao_rab[RAB$H_RSZ] = .fao_desc[STR$H_LENGTH];
+      $PUT(RAB=.fao_rab,ERR=RMS$FAILURE);
+
+      END%;
+
+MACRO $APPEND_FAO (control) = 
+      BEGIN
+
+      LOCAL fao_ctl : $STR_DESCRIPTOR(STRING=control);
+
+      ! Init the FAO record descriptor
+
+      $STR_DESC_INIT(DESC=fao_desc,
+                     CLASS=BOUNDED,
+                     STRING=(fao_buf_size, CH$PTR(fao_buf)));
+
+      ! Call FAO to format the text 
+
+      $FAO(fao_ctl,0,fao_desc,%REMAINING);
+
+      ! Load the $RAB, write it to the file
+
+      fao_rab[RAB$H_RSZ] = .fao_desc[STR$H_LENGTH];
+      $PUT(RAB=.fao_rab,ERR=RMS$FAILURE);
+
+      END%;
+%SBTTL 'Module Static Storage'
+
+LITERAL fao_buf_size = 200;             ! FAO buffer size
+
+OWN dir_files,                          ! Total files this dir
+    dir_size,                           ! Total size this dir
+
+    list_level,                         ! Directory listing level
+
+    grand_blocks,                       ! Grand total blocks
+    grand_pages,                        ! Grand total pages
+    grand_files,                        ! Grand total files
+    grand_dirs,                         ! Total directories
+
+    dir_fab      : $FAB_DECL,                            ! Input file $FAB     
+    dir_nam      : $NAM_DECL,                            ! Input file $NAM
+    dir_dat      : $XABDAT_DECL,                         ! Input file $XABDAT 
+    dir_cfg      : $XABCFG_DECL,                         ! Input file $XABCFG 
+    dir_sum      : $XABSUM_DECL,                         ! Input file $XABSUM 
+    dir_pro      : $XABPRO_DECL,                         ! Input file $XABPRO
+    dir_typ      : $TYP_DECL,                            ! Input file $TYP
+
+    filename_buf : VECTOR[CH$ALLOCATION(NAM$K_MAXRSS)],  ! $FAB ASCIZ buffer
+    dir_esa      : VECTOR[CH$ALLOCATION(NAM$K_MAXRSS)],  ! $NAM expanded name
+    dir_rsa      : VECTOR[CH$ALLOCATION(NAM$K_MAXRSS)],  ! $NAM resultant name
+
+    sav_node     : VECTOR[CH$ALLOCATION(100)],           ! Saved node + access
+    sav_dev      : VECTOR[CH$ALLOCATION(100)],           ! Saved device spec
+    sav_dir      : VECTOR[CH$ALLOCATION(100)],           ! Saved directory
+    nod_len      : INITIAL(0),                           ! Size of saved node
+    dev_len      : INITIAL(0),                           ! Size of saved device
+    dir_len      : INITIAL(0),                           ! Size of saved dir
+
+    fao_rab      : REF $RAB_DECL,                        ! Output $RAB pointer
+    fao_buf      : VECTOR[CH$ALLOCATION(fao_buf_size)],
+    fao_desc     : $STR_DESCRIPTOR(CLASS=BOUNDED);       
+%SBTTL 'Routine DIR$GRAND_TOTAL'
+
+ROUTINE DIR$GRAND_TOTAL : NOVALUE = 
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION
+!
+!       This routine gets called by us when the request has completed.
+!
+! IMPLICIT PARAMETERS
+!
+!	Module static storage used for directory file and size counters.
+!
+!--
+
+$TRACE('DIR$GRAND_TOTAL');
+
+IF .grand_dirs LEQ 1 AND .grand_files LEQ 1     ! Should we say anything?
+THEN RETURN;                                    ! Nope
+
+! If brief mode, then just list the number of files
+
+IF .list_level EQL DIU$K_LIST_BRIEF
+THEN BEGIN
+     $PUT_FAO('!/  Grand total of !SL file!%S',
+              .grand_files);
+     RETURN;
+     END;
+
+! Output appropriate message based on if we have seen pages and/or blocks.
+
+IF .grand_pages NEQ 0 AND .grand_blocks NEQ 0
+THEN $PUT_FAO('!/  Grand total of !SL page!%S and !SL block!%S in !SL file!%S',
+              .grand_pages,
+              .grand_blocks,
+              .grand_files)
+ELSE IF .grand_blocks EQL 0
+     THEN $PUT_FAO('!/  Grand total of !SL page!%S in !SL file!%S',
+                   .grand_pages,
+                   .grand_files)
+     ELSE $PUT_FAO('!/  Grand total of !SL block!%S in !SL file!%S',
+                   .grand_blocks,
+                   .grand_files);
+END;                                    ! DIR$GRAND_TOTAL
+%SBTTL 'Routine DIR$TOTAL'
+
+ROUTINE DIR$TOTAL : NOVALUE = 
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION
+!
+!       This routine gets called by us when the directory has changed
+!       (not the first time of course..) or we have finished our
+!       work.  We then wish to display the total for the directory we
+!       have just completed.
+!
+! IMPLICIT PARAMETERS
+!
+!	Module static storage used for directory file and size counters.
+!
+!--
+
+! Output the directory total
+
+IF .list_level NEQ DIU$K_LIST_BRIEF
+THEN $PUT_FAO('!/  Total of !SL !AZ!%S in !SL file!%S',
+              .dir_size,
+              (IF ( (.dir_cfg[XAB$B_FILESYS] EQL XAB$K_FILESYS_TOPS20) OR
+                  (.dir_cfg[XAB$B_FILESYS] EQL XAB$K_FILESYS_RMS20))
+              THEN CH$PTR(UPLIT(%ASCIZ'page'))
+              ELSE CH$PTR(UPLIT(%ASCIZ'block'))),
+              .dir_files)
+ELSE $PUT_FAO('!/  Total of !SL file!%S',.dir_files);
+
+! Roll directory totals into grand total
+
+grand_files = .grand_files + .dir_files;
+IF .dir_cfg[XAB$B_FILESYS] EQL XAB$K_FILESYS_TOPS20     ! Is it some
+    OR .dir_cfg[XAB$B_FILESYS] EQL XAB$K_FILESYS_RMS20  !  form of orange?
+THEN grand_pages = .grand_pages + .dir_size     ! Yes, count orange pages (20)
+ELSE grand_blocks = .grand_blocks + .dir_size;  ! No, count blocks (10, VMS)
+
+! Zero out the directory totals
+
+dir_files   = 0;
+dir_size  = 0;
+
+END;                                    ! DIR$TOTAL
+%SBTTL 'Routine DIR$INITIALIZE'
+
+ROUTINE DIR$INITIALIZE (p_file) : NOVALUE = 
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION
+!
+!       Init the module static storage that we will use in this function.
+!
+! FORMAL PARAMETERS
+!
+!       p_file: Address of descriptor for filespec we are going to look up.
+!
+! IMPLICIT PARAMETERS
+!
+!	Module static storage defined above.
+!
+!--
+
+BIND file = .p_file : $STR_DESCRIPTOR(CLASS=DYNAMIC);
+
+! Initialize our counters for a repeat trip
+
+dir_files = 0;                          ! Total files in this directory
+dir_size = 0;                           ! Total file sizes in this directory
+
+! Initialize the $FAB used for lookups
+
+$FAB_INIT(FAB=dir_fab,     FOP=<NAM,DRJ>,     FAC=<GET>,    
+          SHR=GET,         NAM=dir_nam,       XAB=dir_sum,
+          TYP=dir_typ,     MRS=1,             FNA=filename_buf);
+
+! Initialize the $NAM, $TYP, & XABS
+
+$NAM_INIT(NAM=dir_nam,        RSA=CH$PTR(dir_rsa), RSS=NAM$k_MAXRSS,
+                              ESA=CH$PTR(dir_esa), ESS=NAM$K_MAXRSS);
+
+$TYP_INIT(TYP=dir_typ,        CLASS=Typ$k_Image);
+
+! Initialize the directory $XABs and build chain
+
+$XABSUM_INIT(XAB=dir_sum, NXT=dir_cfg);
+$XABCFG_INIT(XAB=dir_cfg, NXT=dir_dat);
+$XABDAT_INIT(XAB=dir_dat, NXT=dir_pro);
+$XABPRO_INIT(XAB=dir_pro);
+
+! Copy the given input spec over, make it ASCIZ so RMS likes it.
+
+CH$COPY(.file[STR$H_LENGTH],.file[STR$A_POINTER],
+        0,(.file[STR$H_LENGTH]+1),CH$PTR(filename_buf));
+
+END;                                    ! DIR$INITIALIZE
+%SBTTL 'Routine DIR$BREAK_CHECK'
+
+ROUTINE DIR$BREAK_CHECK : NOVALUE = 
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION
+!
+!       This routine will check the contents of the NAM block against
+!       the last breakpoint displayed and print node::dev:[dir] information
+!       on a seperate line.
+!
+!       The format of this line is 
+!
+!            LATOUR::DISK$DRACULA:[RDF]   (RMS-32)   or
+!            KL2102::EXODUS:[FRICCHIONE]  (RMS-20)   or
+!            EXODUS:[FRICCHIONE] (Local)
+!
+! FORMAL PARAMETERS
+!
+!       None
+!
+! IMPLICIT PARAMETERS
+!
+!       Module static storage
+!
+! ROUTINE VALUE
+!
+!       None.  It either prints something or doesn't.
+!
+!--
+
+LOCAL rfs             : INITIAL(0),
+      printing_header : INITIAL(FALSE);
+
+$TRACE('DIR$BREAK_CHECK');
+
+!$TRACE_FAO('Old Node: !AD!_ New Node: !AD',
+!                      .nod_len,            CH$PTR(sav_node),
+!                      .dir_nam[NAM$B_NODE], .dir_nam[NAM$A_NODE]);
+
+!$TRACE_FAO('Old Dev:  !AD!_ New Dev:  !AD',
+!                      .dev_len,             CH$PTR(sav_dev),
+!                      .dir_nam[NAM$B_DEV],  .dir_nam[NAM$A_DEV]);
+
+!$TRACE_FAO('Old Dir:  !AD!_ New Dir:  !AD',
+!                      .dir_len,            CH$PTR(sav_dir),
+!                      .dir_nam[NAM$B_DIR], .dir_nam[NAM$A_DIR]);
+
+! Check the node name first to see if it has changed
+
+IF CH$NEQ(.dir_nam[NAM$B_NODE],  .dir_nam[NAM$A_NODE],
+          .nod_len,              CH$PTR(sav_node)) 
+THEN printing_header = TRUE;
+
+! Check the device
+
+IF CH$NEQ(.dir_nam[NAM$B_DEV],   .dir_nam[NAM$A_DEV],
+          .dev_len,              CH$PTR(sav_dev))
+THEN printing_header = TRUE;
+
+! Finally the directory
+
+IF CH$NEQ(.dir_nam[NAM$B_DIR],   .dir_nam[NAM$A_DIR],
+          .dir_len,              CH$PTR(sav_dir))
+THEN printing_header = TRUE;
+
+! If the file belongs to another directory, set up a break.
+
+IF .printing_header
+THEN BEGIN
+     $TRACE('DIR$BREAK_CHECK Printing directory header');
+
+     ! Increment count of how many we've run across
+
+     grand_dirs = .grand_dirs + 1;
+
+     ! Figure out who we are talking to
+
+     SELECTONE .dir_cfg[XAB$B_FILESYS] OF
+               SET
+               [0]                      : rfs = CH$PTR(UPLIT(%ASCIZ'Local'));
+               [XAB$K_FILESYS_RMS11]    : rfs = CH$PTR(UPLIT(%ASCIZ'RMS-11'));
+               [XAB$K_FILESYS_RMS20]    : rfs = CH$PTR(UPLIT(%ASCIZ'RMS-20'));
+               [XAB$K_FILESYS_RMS32]    : rfs = CH$PTR(UPLIT(%ASCIZ'RMS-32'));
+               [XAB$K_FILESYS_FCS11]    : rfs = CH$PTR(UPLIT(%ASCIZ'FCS11'));
+               [XAB$K_FILESYS_RT11]     : rfs = CH$PTR(UPLIT(%ASCIZ'RT-11'));
+               [XAB$K_FILESYS_NONE]     : rfs = CH$PTR(UPLIT(%ASCIZ'None'));
+               [XAB$K_FILESYS_TOPS20]   : rfs = CH$PTR(UPLIT(%ASCIZ'TOPS-20'));
+               [XAB$K_FILESYS_TOPS10]   : rfs = CH$PTR(UPLIT(%ASCIZ'TOPS-10'));
+               [XAB$K_FILESYS_OS8]      : rfs = CH$PTR(UPLIT(%ASCIZ'OS-8'));
+               [XAB$K_FILESYS_RMS32S]   : rfs = CH$PTR(UPLIT(%ASCIZ'RMS-32S'));
+               [XAB$K_FILESYS_CPM]      : rfs = CH$PTR(UPLIT(%ASCIZ'CP/M'));
+               [XAB$K_FILESYS_MSDOS]    : rfs = CH$PTR(UPLIT(%ASCIZ'MSDOS'));
+               [XAB$K_FILESYS_ULTRIX32] : rfs = CH$PTR(UPLIT(%ASCIZ'Ultrix-32'));
+               [XAB$K_FILESYS_ULTRIX11] : rfs = CH$PTR(UPLIT(%ASCIZ'Ultrix-11'));
+               [OTHERWISE]              : rfs = CH$PTR(UPLIT(%ASCIZ'Unknown'));
+               TES;
+
+         ! If not a remote filespec, make sure it reads local
+
+         IF NOT .dir_fab[FAB$V_REMOTE]
+         THEN rfs = CH$PTR(UPLIT(%ASCIZ'Local'));
+
+         ! Print the directory totals if not first time through
+
+         IF .dir_files NEQ 0
+         THEN DIR$TOTAL();
+
+         ! Display the line
+
+         $PUT_FAO('!/!AD!AD!AD   (!AZ)!/',
+                        .dir_nam[NAM$B_NODE],  .dir_nam[NAM$A_NODE],
+                        .dir_nam[NAM$B_DEV],   .dir_nam[NAM$A_DEV],
+                        .dir_nam[NAM$B_DIR],   .dir_nam[NAM$A_DIR],
+                        .rfs);
+
+         ! This is now our control break check
+
+         nod_len = .dir_nam[NAM$B_NODE];
+         dev_len  = .dir_nam[NAM$B_DEV];
+         dir_len  = .dir_nam[NAM$B_DIR];
+         CH$MOVE(.nod_len, .dir_nam[NAM$A_NODE],CH$PTR(sav_node));
+         CH$MOVE(.dev_len, .dir_nam[NAM$A_DEV], CH$PTR(sav_dev));
+         CH$MOVE(.dir_len, .dir_nam[NAM$A_DIR], CH$PTR(sav_dir));
+
+         !$TRACE_FAO('Saved Node: !AD',.nod_len, CH$PTR(sav_node));
+         !$TRACE_FAO('Saved Dev:  !AD',.dev_len, CH$PTR(sav_dev));
+         !$TRACE_FAO('Saved Dir:  !AD',.dir_len, CH$PTR(sav_dir));
+
+         END;
+
+! Add these totals to running directory total
+
+dir_files = .dir_files + 1;
+dir_size  = .dir_size  + .dir_fab[FAB$G_ALQ];
+
+END;                                    ! DIR$BREAK_CHECK
+%SBTTL 'Routine DIR$BRIEF'
+
+ROUTINE DIR$BRIEF : NOVALUE = 
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION
+!
+!       Just display the filespec.  
+!
+! IMPLICIT PARAMETERS
+!
+!	$NAM block from module static storage
+!
+!--
+
+$TRACE('DIR$BRIEF');
+
+$PUT_FAO('  !AD!AD!AD',  .dir_nam[NAM$B_NAME],  .dir_nam[NAM$A_NAME],
+                         .dir_nam[NAM$B_TYPE],  .dir_nam[NAM$A_TYPE],
+                         .dir_nam[NAM$B_VER],   .dir_nam[NAM$A_VER]);
+
+END;                                    ! DIR$BRIEF
+%SBTTL 'Routine DIR$NORMAL'
+
+ROUTINE DIR$NORMAL : NOVALUE  = 
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION
+!
+!         Display filespec info in the following format
+!
+!              GARK_FILE.GREG.33    21      12-JAN-1985 13:21:05
+!
+! IMPLICIT PARAMETERS
+!
+!	$NAM block from module static storage
+!
+!--
+
+BIND compiler_bug_a = .dir_nam[NAM$A_NAME],     ! Get around BLISS v4 compiler
+     compiler_bug_b = .dir_nam[NAM$B_NAME];
+
+$TRACE('DIR$NORMAL');
+
+! If a short file name (fits in 40 characters) then show the files normally
+
+IF .dir_nam[NAM$B_NAME]+.dir_nam[NAM$B_TYPE]+.dir_nam[NAM$B_VER] LEQ 40
+THEN $PUT_FAO('  !40<!AD!AD!AD!> !6SL   !%D',           ! Short file
+!             .dir_nam[NAM$B_NAME],  .dir_nam[NAM$A_NAME],      ! File name
+              compiler_bug_b,        compiler_bug_a,
+              .dir_nam[NAM$B_TYPE],  .dir_nam[NAM$A_TYPE],      ! File type
+              .dir_nam[NAM$B_VER],   .dir_nam[NAM$A_VER],       ! File version
+              .dir_fab[FAB$G_ALQ],                              ! File size
+              .dir_dat[XAB$G_RDT])                              ! Revision date
+ELSE $PUT_FAO('  !AD!AD!AD!/!43* !6SL   !%D',        ! Long file
+              .dir_nam[NAM$B_NAME],  .dir_nam[NAM$A_NAME],      ! File name
+              .dir_nam[NAM$B_TYPE],  .dir_nam[NAM$A_TYPE],      ! File type
+              .dir_nam[NAM$B_VER],   .dir_nam[NAM$A_VER],       ! File version
+              .dir_fab[FAB$G_ALQ],                              ! File size
+              .dir_dat[XAB$G_RDT]);                             ! Revision date
+
+END;                                    ! DIR$NORMAL
+%SBTTL 'Routine DIR$FULL'
+
+ROUTINE DIR$FULL : NOVALUE = 
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION
+!
+!         Display RMS filespec info in the following format
+!
+!         MARCH-PAYROLL.DAT.1         (Local)
+!
+!            Created:  1-Jan-1985 13:22:05     Size:   260 pages
+!            Expires:  1-Sep-1985 13:22:05     
+!            Revised:  1-Jan-1986 08:45:12   
+!
+!            Organization:      Indexed    Keys:        3   Areas:     1
+!            Record Format:     Fixed      Bucket Size: 0   Byte Size: 7
+!            Record Attributes: None       
+!
+! IMPLICIT PARAMETERS
+!
+!	$NAM block from module static storage
+!
+!--
+
+LOCAL org : INITIAL(0),
+      attributes : $STR_DESCRIPTOR(CLASS=DYNAMIC);
+
+! Protection table for verbalizing the protection.  Note the DAP bit lit
+! means that access is denied.
+
+OWN pro_tab : VECTOR[16] INITIAL(%ASCII'RWED',   ! 00
+                                 %ASCII'WED',    ! 01
+                                 %ASCII'RED',    ! 02
+                                 %ASCII'ED',     ! 03
+                                 %ASCII'RWD',    ! 04
+                                 %ASCII'WD',     ! 05
+                                 %ASCII'RD',     ! 06
+                                 %ASCII'D',      ! 07
+                                 %ASCII'RWE',    ! 10
+                                 %ASCII'WE',     ! 11
+                                 %ASCII'RE',     ! 12
+                                 %ASCII'E',      ! 13
+                                 %ASCII'RW',     ! 14
+                                 %ASCII'W',      ! 15
+                                 %ASCII'R',      ! 16
+                                 %ASCII'none');  ! 17
+
+$TRACE('DIR$FULL');
+
+$STR_DESC_INIT(DESC=attributes,CLASS=DYNAMIC);
+
+! Print the filename, creation date/time, and the size of file
+
+$PUT_FAO('  !AD!AD!AD!/  Created: !%D !_Size: !SL !AZ!%S',  
+         .dir_nam[NAM$B_NAME], .dir_nam[NAM$A_NAME],
+         .dir_nam[NAM$B_TYPE], .dir_nam[NAM$A_TYPE],
+         .dir_nam[NAM$B_VER],  .dir_nam[NAM$A_VER],
+         .dir_dat[XAB$G_CDT],
+         .dir_fab[FAB$G_ALQ],
+         (IF   (.dir_cfg[XAB$B_FILESYS] EQL XAB$K_FILESYS_TOPS20)
+            OR (.dir_cfg[XAB$B_FILESYS] EQL XAB$K_FILESYS_RMS20)
+          THEN CH$PTR(UPLIT(%ASCIZ'page'))
+          ELSE CH$PTR(UPLIT(%ASCIZ'block'))));
+
+! Output expiration and revision dates.
+
+IF .dir_dat[XAB$G_EDT] NEQ 0
+THEN $PUT_FAO('  Expires: !%D', .dir_dat[XAB$G_EDT]);
+
+IF .dir_dat[XAB$G_RDT] NEQ 0
+THEN $PUT_FAO('  Revised: !%D', .dir_dat[XAB$G_RDT]);
+
+! Output protection codes like VMS does only if config says we got some there.
+
+IF .dir_cfg[XAB$V_PROTECTION]
+THEN $PUT_FAO('  File protection:   System: !AZ, Owner: !AZ, Group: !AZ, World: !AZ',
+              CH$PTR(pro_tab[.dir_pro[XAB$V_PROTSYS] AND %O'17']),
+              CH$PTR(pro_tab[.dir_pro[XAB$V_PROTOWN] AND %O'17']),
+              CH$PTR(pro_tab[.dir_pro[XAB$V_PROTGRP] AND %O'17']),
+              CH$PTR(pro_tab[.dir_pro[XAB$V_PROTWLD] AND %O'17']));
+
+! Figure out what to print for the organization
+! Print out the keys and areas only when dealing with indexed files
+
+IF .dir_fab[FAB$V_ORG] EQL FAB$K_IDX
+THEN $PUT_FAO('  Organization:      Indexed   !_Keys:        !4<!SB!> Areas:     !SB',
+              .dir_sum[XAB$B_NOK],.dir_sum[XAB$B_NOA])
+ELSE BEGIN
+     BIND org=(SELECTONE .dir_fab[FAB$V_ORG] OF
+                         SET
+                         [0]         : CH$PTR(UPLIT(%ASCIZ'None'));
+                         [FAB$K_SEQ] : CH$PTR(UPLIT(%ASCIZ'Sequential'));
+                         [FAB$K_REL] : CH$PTR(UPLIT(%ASCIZ'Relative'));
+                         [OTHERWISE] : CH$PTR(UPLIT(%ASCIZ'Unknown'));
+                         TES);
+
+      $PUT_FAO('  Organization:      !AZ',org);
+      END;
+
+! Print the record format, bucket size, byte size
+
+IF .dir_fab[FAB$V_RFM] EQL FAB$K_UDF
+THEN BEGIN
+     SWITCHES LIST(EXPAND);
+     $PUT_FAO('  Record Format:     Unknown            Byte Size: !SB',
+              .dir_fab[FAB$V_BSZ]);
+     END
+ELSE BEGIN
+     BIND recordformat=    ! Figure out what to print for the record format.
+          (SELECTONE .dir_fab[FAB$V_RFM] OF
+                     SET
+                     [FAB$K_FIX] : CH$PTR(UPLIT(%ASCIZ'Fixed'));
+                     [FAB$K_LSA] : CH$PTR(UPLIT(%ASCIZ'Line Seq'));
+                     [FAB$K_VAR] : CH$PTR(UPLIT(%ASCIZ'Variable'));
+                     [FAB$K_VFC] : CH$PTR(UPLIT(%ASCIZ'VFC'));
+                     [FAB$K_STM] : CH$PTR(UPLIT(%ASCIZ'Stream'));
+                     [OTHERWISE] : CH$PTR(UPLIT(%ASCIZ'Unknown'));
+                     TES);
+
+     $PUT_FAO('  Record Format:     !9<!AZ!>  Bucket Size: !4<!SW!> Byte Size: !SB',
+              recordformat,
+              .dir_fab[FAB$V_BKS],
+              .dir_fab[FAB$V_BSZ]);
+
+     ! Print the record size if any
+
+     IF .dir_fab[FAB$H_MRS] NEQ 0
+     THEN $PUT_FAO('  Maximum Record Size: !SW', .dir_fab[FAB$H_MRS] );
+
+     ! Now print the record attributes
+
+     IF .dir_fab[FAB$V_FTN]
+     THEN $STR_APPEND(STRING=' Ftn',   TARGET=attributes);
+     IF .dir_fab[FAB$V_BLK]
+     THEN $STR_APPEND(STRING=' Blk',   TARGET=attributes);
+     IF .dir_fab[FAB$V_CR]
+     THEN $STR_APPEND(STRING=' Cr',    TARGET=attributes);
+     IF .dir_fab[FAB$V_CBL]
+     THEN $STR_APPEND(STRING=' Cbl',   TARGET=attributes);
+     IF .dir_fab[FAB$V_MACY11]
+     THEN $STR_APPEND(STRING=' MACY11',TARGET=attributes);
+     IF .dir_fab[FAB$V_EMB]
+     THEN $STR_APPEND(STRING=' Embedded', TARGET=attributes);
+     IF .dir_fab[FAB$V_PRN]
+     THEN $STR_APPEND(STRING=' Print', TARGET=attributes);
+
+     IF .attributes[STR$H_LENGTH] EQL 0    ! Make sure it says something %$#&&%
+     THEN $STR_COPY(STRING='None', TARGET=attributes);
+
+     ! Print the record attributes
+
+     $PUT_FAO('  Record Attributes: !AS',attributes);
+
+     END;
+
+! Output a blank line and then return
+
+$PUT_FAO(' ');                          ! Be neat
+
+END;                                    ! DIR$FULL
+
+%SBTTL 'Routine DIR$DO'
+
+GLOBAL ROUTINE DIR$DO (p_file) : NOVALUE = 
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION
+!
+!       Output the directory specified by p_file to the show_rab.
+!
+! FORMAL PARAMETERS
+!
+!       p_file: Address of a string descriptor indicating files to list.
+!
+! ROUTINE VALUE
+!
+!	DIU$_NORMAL		successful display of request block
+!       DIU$_INVRMSBLK          invalid or incomplete RMS blocks passed
+!
+!--
+BIND dir_file  = .p_file : $STR_DESCRIPTOR();
+
+LABEL process;
+
+LOCAL status;
+
+DIR$INITIALIZE(dir_file);               ! Initialize module static storage
+
+$PARSE(FAB=dir_fab,ERR=RMS$SIGNAL);     ! Set up wildcard context for the call
+
+$TRACE('DIR$DO Parse of input file OK');
+
+$SEARCH(FAB=dir_fab);                   ! Find the first file in the list 
+
+UNTIL .dir_fab[FAB$H_STS] EQL RMS$_NMF  ! Loop for all files in the list
+DO BEGIN
+   process: BEGIN
+
+            ! Check for RMS error (avoid NETSERVER.LOG conflicts)
+
+            IF NOT $RMS_STATUS_OK(dir_fab)      ! RMS error for that file
+            THEN IF DO$BYPASS(dir_fab)          ! bypassable error?
+                 OR .dir_fab[FAB$H_STS] NEQ RMS$_COF
+                 THEN LEAVE process             ! Yes
+            ELSE SIGNAL(.dir_fab[FAB$H_STS], .dir_fab[FAB$H_STV], dir_fab);
+
+            $TRACE('DIR$DO $SEARCH found input file');
+
+            ! Fill in the XAB's for use only when needed
+
+            IF .list_level NEQ DIU$K_LIST_BRIEF
+            THEN BEGIN
+                 $OPEN (FAB=dir_fab);
+                 !$DISPLAY (FAB=dir_fab);
+                 IF NOT $RMS_STATUS_OK(dir_fab)
+                 THEN IF DO$BYPASS(dir_fab)
+                      THEN LEAVE process        ! Handle bypassable RMS errors
+                 ELSE SIGNAL(.dir_fab[FAB$H_STS],! Some other type of RMS error
+                             .dir_fab[FAB$H_STV], 
+                             dir_fab);
+                 $TRACE('DIR$DO XABs filled in OK by $OPEN');
+
+                 $CLOSE(FAB=dir_fab);   ! Close the file now that XABs filled
+                 IF NOT $RMS_STATUS_OK(dir_fab)
+                 THEN SIGNAL(.dir_fab[FAB$H_STS],
+                             .dir_fab[FAB$H_STV], dir_fab);
+                 END;
+
+           DIR$BREAK_CHECK();           ! Print a break line if we need to
+
+           ! Display the file attributes at the appropriate level
+
+           CASE .list_level FROM DIU$K_LIST_BRIEF TO DIU$K_LIST_FULL OF
+                SET
+                [DIU$K_LIST_BRIEF]   : DIR$BRIEF();
+                [DIU$K_LIST_NORMAL]  : DIR$NORMAL();
+                [DIU$K_LIST_FULL]    : DIR$FULL();
+                [INRANGE,OUTRANGE]   : RETURN(DIU$_INV_FUN_CODE);
+                TES;
+
+           END;                         ! End of process block
+
+     $SEARCH(FAB=dir_fab);              ! Loop for each file please
+
+     S$BREATHE();                       ! Take a hit of fresh air and sunshine
+
+END;                                    ! End of for all files loop
+
+dir_fab[FAB$V_DRJ] = 0;                 ! Light "don't release JFN" bit
+
+$CLOSE(FAB=dir_fab);                    ! Flush the link
+
+DIR$TOTAL();                            ! Output directory total
+
+END;
+%SBTTL 'DIU$DIRECTORY - execute DIRECTORY request'
+
+GLOBAL ROUTINE DIU$DIRECTORY (request : REF $DIU_BLOCK) = 
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Take a directory listing.  Search  the comma listed or wildcard  source
+!       files given, calling DO$DIR for each file spec given.
+!
+! FORMAL PARAMETERS:
+!
+!       request: Address of a DIU request block which contains files to list
+!--
+
+LOCAL eob,
+      src,
+      src_len,
+      remaining,   
+      next_ptr,
+      dest,
+      dest_len,
+      status,
+      show_nam : $NAM_DECL,
+      show_fab : $FAB_DECL,
+      show_rab : $RAB_DECL,
+      show_rsa : VECTOR[CH$ALLOCATION(NAM$K_MAXRSS)],
+      current  : $STR_DESCRIPTOR(CLASS=FIXED);
+
+$TRACE(DIU$DIRECTORY);
+
+IF .request[DIU$H_DESTINATION_FILESPEC] EQL 0
+THEN SIGNAL(DIU$_BUG);                  ! Punt if no output filespec
+
+! Save the directory listing level, init grand totals
+
+list_level = .request[DIU$Z_LIST_LEVEL];        ! Copy list level from req blk
+
+grand_files = 0;                        ! Grand total files
+grand_dirs = 0;                         ! Grand total directories
+grand_pages = 0;                        ! Grand total pages (20 only)
+grand_blocks = 0;                       ! Grand total blocks (everything else)
+nod_len = 0;                            ! Remembered node length
+dev_len = 0;                            ! Remembered device length
+dir_len = 0;                            ! Remembered directory length
+
+! Get the output file pointed to for today please
+
+dest = CH$FIND_CH(.request[DIU$H_DESTINATION_FILESPEC],
+                  CH$PTR(request[DIU$T_DESTINATION_FILESPEC]),
+                  $ETG);
+dest_len = CH$A_RCHAR(dest);
+dest = CH$PLUS(.dest,1);
+CH$WCHAR(0,CH$PLUS(.dest,.dest_len));
+
+$TRACE('DIU$DIRECTORY Initializing output RMS structures');
+
+! Init the RMS blocks for the output file, create the output file
+
+$FAB_INIT(FAB=show_fab,  FNA=.dest, FAC=PUT,  RFM=STM,
+          FOP=SUP,       NAM=show_nam);
+$NAM_INIT(NAM=show_nam,  RSS=NAM$K_MAXRSS,   RSA=CH$PTR(show_rsa));
+$CREATE(FAB=show_fab,ERR=RMS$SIGNAL);
+
+! Set up the $RAB for the file and connect it
+
+$TRACE('DIU$DIRECTORY $CREATE went OK, connecting $RAB');
+$RAB_INIT(RAB=show_rab,FAB=show_fab,ROP=WBH);
+$CONNECT(RAB=show_rab,ERR=RMS$SIGNAL);
+
+fao_rab = show_rab;                     ! Point fao to the show rab
+fao_rab[RAB$A_RBF] = fao_buf;           ! Point the RAB to the FAO buffer
+
+$TRACE('DIU$DIRECTORY Output file setup OK');
+
+! Find the first file in the source buffer, if empty send our regrets..
+
+eob = CH$PLUS(CH$PTR(request[DIU$T_SOURCE_FILESPEC]),
+              .request[DIU$H_SOURCE_FILESPEC]);
+src = CH$FIND_CH(.request[DIU$H_SOURCE_FILESPEC],
+                 CH$PTR(request[DIU$T_SOURCE_FILESPEC]),
+                 $ETG);
+IF CH$FAIL(.src)
+THEN SIGNAL(DIU$_INV_STR_LENGTH);
+
+$TRACE('DIU$DIRECTORY Beginning processing of source file list');
+
+DO BEGIN                                ! Start filespec processing loop
+   src_len = CH$A_RCHAR(src);           ! Get length of filespec
+   src = CH$PLUS(.src,1);               ! Point to the filespec
+
+   $STR_DESC_INIT(DESC=current,         ! make fixed descriptor to that please
+                  STRING=(.src_len,.src));
+
+   $TRACE_FAO('DIU$DIRECTORY Calling DIR$DO for !AS', current);
+
+   DIR$DO(current);                     ! Do the work on one source spec
+
+   $TRACE('DIU$DIRECTORY Checking for more files');
+
+   remaining = CH$DIFF(.eob,.src);              ! Get remaining characters
+   src = CH$FIND_CH(.remaining,.src,$ETG);      ! Find the next ETG byte
+   next_ptr  = CH$PLUS(.src,1);                 ! Point to next file length
+
+END UNTIL CH$RCHAR(.next_ptr) EQL $NUL;         ! Exit if filespec length 0
+
+DIR$GRAND_TOTAL();                      ! Write grand totals
+
+$CLOSE(FAB=show_fab,ERR=RMS$SIGNAL);    ! Close output file
+
+! Tell me what you wrote out and return
+
+$MSG_FAO(' Directory listing written to !AD', 
+         .show_nam[NAM$H_RSL],.show_nam[NAM$A_RSA]);
+
+RETURN DIU$_NORMAL; 
+
+END;                                    ! DIU$DIRECTORY
+
+END 
+ELUDOM

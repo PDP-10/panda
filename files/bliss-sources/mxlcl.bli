@@ -1,0 +1,2439 @@
+! Edit= 315 to MXLCL.BLI on 26-May-88 by WADDINGTON
+!Fix edit 314. Replace bad test in PARSE_RCPT.
+! Edit= 314 to MXLCL.BLI on 17-May-88 by WADDINGTON, for SPR #21402
+!Make MX work without DECnet for both TOPS-10 and TOPS-20.
+MODULE mxlcl =
+BEGIN
+
+!
+!			  COPYRIGHT (c) 1985 BY
+!	      DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASS.
+!
+! THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND  COPIED
+! ONLY  IN  ACCORDANCE  WITH  THE  TERMS  OF  SUCH  LICENSE AND WITH THE
+! INCLUSION OF THE ABOVE COPYRIGHT NOTICE.  THIS SOFTWARE OR  ANY  OTHER
+! COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY
+! OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE  IS  HEREBY
+! TRANSFERRED.
+!
+! THE INFORMATION IN THIS SOFTWARE IS SUBJECT TO CHANGE  WITHOUT  NOTICE
+! AND  SHOULD  NOT  BE  CONSTRUED  AS  A COMMITMENT BY DIGITAL EQUIPMENT
+! CORPORATION.
+!
+! DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF  ITS
+! SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.
+!
+
+!++
+! FACILITY:	Decmail/MS Message eXchange (MX) Local Mail Subtasks
+!
+! ABSTRACT:	This module contains the data structures and routines used by
+!          the Local Mail Sub-System.
+!
+! ENVIRONMENT:	Tops-10/Tops-20 User Mode
+!
+! AUTHOR: Tim Grady, CREATION DATE: 18 February 1985
+!
+! MODIFIED BY:  Richard B. Waddington
+!
+!   MX: VERSION 1.0
+! 01	-
+!--
+!
+! INCLUDE FILES:
+!
+%IF %SWITCHES(TOPS20) %THEN
+    LIBRARY 'monsym';
+    UNDECLARE time;
+    LIBRARY 'mxjlnk';
+%FI
+LIBRARY 'mxnlib' ;	! Our version of NML's utility library
+LIBRARY 'mxlib';		! Local mail service symbols
+REQUIRE 'blt';
+!
+! EXTERNAL REFERENCES:
+!
+EXTERNAL ROUTINE
+        mx$file_routines,
+        mx$error_routines,
+        mx$database_routines,
+        mx$message_queue_post,
+        mx$message_queue_checkpoint,
+        mx$release_message,
+        mx$release_asciz,
+        nmu$ipcf_manager,
+        nmu$page_allocator,
+	nmu$text_manager,
+	nmu$sched_manager,
+	nmu$queue_manager,
+	nmu$memory_manager,
+	nmu$table_routines,
+        log;
+
+%IF %SWITCHES(TOPS20) %THEN
+    declare_jsys(odtim);
+%FI
+
+EXTERNAL
+        nodnam,
+        nettab: VECTOR[max_number_of_domains],
+        active_message_table,
+        uc_tab,
+	work_queue:	SQ_HEADER,
+        rtrylc;                     !Retry time in minutes
+
+!
+! TABLE OF CONTENTS
+!
+FORWARD ROUTINE
+    scan_pkt,
+    new_msg,
+    old_msg,
+    get_file: NOVALUE,
+    get_dest: NOVALUE,
+    get_sender: NOVALUE,
+    get_subj: NOVALUE,
+    copy_asciz,
+    copy_string,
+    find_work_req,
+    parse_rcpt,
+    pname,
+    pnode,
+    local_deliver: NOVALUE,
+    append_mail,
+    kleanup: NOVALUE,
+    get_header,
+    get_name,
+    get_quota: NOVALUE,
+    nag: NOVALUE,
+    logged_in,
+    mx$get_username,
+    mx$validate_local_user,
+    mx$build_repair_spec;
+
+!
+! OWN STORAGE
+!
+OWN
+    flag,
+    error_list: VOLATILE REF list_blk;
+
+!
+! EQUATED SYMBOLS
+!
+LITERAL
+    user_name_only = 0,
+    name_and_quota = 1;
+
+%global_routine ('LCLSRV') :NOVALUE =	!
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!	This task listens for connections from User Interface programs and
+!   sets up WORK-REQUESTS and ACTIVE-MESSAGE-TABLE entries for MX.  The
+!   WORK-REQUESTS get queued to the WORK-QUEUE.
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN				        !BEGIN LCLSRV
+    LITERAL
+        page_size = 512;
+
+    MACRO
+        pidname =
+	%IF %SWITCHES(TOPS10) %THEN
+		ch$asciz('MAILER')
+	%ELSE					!TOPS-20
+            %IF %VARIANT EQL 0 %THEN
+                ch$asciz('MXMAIL')
+            %ELSE
+                ch$asciz('MXTEST')
+            %FI  %FI %,
+
+![308] ADD MACRO REBIND_PID_NAME
+        rebind_pid_name(id,nam)[] =
+            BEGIN
+            nmu$sched_sleep(30);
+            %IF %SWITCHES(TOPS20) %THEN
+                BEGIN
+                declare_jsys(msend);
+
+                STACKLOCAL
+                    nfoblk: VECTOR[$ipcfp + 1],
+                    nforeq:  VECTOR[$ipci2 + 2];
+
+                nfoblk[$ipcfl] = 0;                             !NO FLAGS
+                nfoblk[$ipcfs] = nmu$ipcf_map_id(id);           !MY PID
+                nfoblk[$ipcfr] = 0;                             !SEND TO INFO
+                nfoblk[$ipcfp] = (($ipci2 + 2) ^ 18) + nforeq;  !LEN,,ADDRESS 
+
+                nforeq[$ipci0] = $ipcii;                        !GIVE IT A NAME
+                nforeq[$ipci1] = 0;                             !NO DUPS
+                CH$MOVE(7,nam,CH$PTR(nforeq[$ipci2]));          !COPY THE NAME
+
+                $$msend($ipcfp+1, nfoblk);
+                END
+            %FI 
+![310] MOVE FOLLOWING END OUT OF TOPS-20 CONDITIONAL
+            END % ;
+
+    LOCAL
+        ipcf_packet: REF ipcf_msg,	        !address of the ipcf message
+        msg: REF message_table_entry,	        !message block
+        message_id,			        !MX Message Id
+        Sender_caps,			        !Sender's capabilities
+        Sender_pid,			        !IPCF PID of sender
+        Sender_Uid,			        !Sender's User ID
+	Server_Pid,			        !IPCF Process id
+	work_request;
+
+    BIND
+        slpptr = CH$PTR(UPLIT(%ASCIZ' - Sleeping 10 seconds')),
+        name = pidname;
+
+    !
+    ! Create the local mailer PID
+    !
+
+    INCR i FROM 1 TO 30 DO              ![308] CHANGE FROM 10 TO 30
+        BEGIN
+        IF (server_pid = NMU$IPCF_CREATE(name, $false)) NEQ 0
+        THEN
+            EXITLOOP;
+
+        $error(SEVERITY = $warning,
+               FACILITY = $internal,
+               CODE = LS$CCP,
+               MESSAGE_DATA = slpptr);
+
+        nmu$sched_sleep(10)
+        END;
+
+    IF .server_pid EQL 0
+    THEN
+        $error(SEVERITY = $severe,      !Crash MX - NO PID...
+               FACILITY = $internal,
+               CODE = LS$CCP);
+    WHILE 1 DO
+        BEGIN				        !BEGIN main loop
+        ipcf_packet = NMU$IPCF_RECEIVE(
+                       .Server_Pid, Sender_Pid, Sender_Uid, Sender_caps);
+
+![308] ADD TEST FOR PACKETS FROM INFO
+        IF .sender_pid EQL 0                    ![308]
+        THEN                                    ![308]
+            REBIND_PID_NAME(.server_pid,name)   ![308]
+        ELSE                                    ![308]
+            BEGIN                               ![308]
+
+        $TRACE('LCLSRV running');
+
+        msg = scan_pkt(.ipcf_packet, .sender_pid, .sender_uid, .sender_caps);
+
+        nmu$ipcf_transmit(.server_pid, .sender_pid, .ipcf_packet, 512);
+
+            END                                 ![308]
+        END;				        !END of main loop
+
+    END;				! END LCLSRV
+
+
+GLOBAL ROUTINE scan_pkt (packet, pid, uid, cap) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!    This routine scans an incoming IPCF packet, and validates the
+!    format and content of that packet.  There are two types of packets:
+!    primary packets initiate the posting of a message to MX; secondary
+!    packets are used when there is more information needed to complete
+!    the posting of a message.  Primary packets must contain the file
+!    name of the message to be posted.  Primary packets indicate whether
+!    there will be secondary packets for this message by the cell hdr_state
+!    which contains $msg_incomplete if there are more packets to come.
+!    The last packet in a sequence contains the value $msg_complete in this
+!    cell.
+!
+!    Packets are sequenced, and must arrive in sequence.  If a packet is
+!    found to be out of sequence, the message is invalidated, and an error
+!    returned to the user agent (usually MS).
+!
+! FORMAL PARAMETERS:
+!
+!    packet	- IPCF packet
+!    pid	- sender's IPCF PID
+!    uid	- sender's user number (TOPS20) or PPN (TOPS10)
+!    cap	- sender's enabled capabilities (from IPCF header)
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!       The address of the Active Message Table Entry
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!--
+    BEGIN				        !BEGIN scan_pkt
+    MAP
+        packet: REF ipcf_msg;		!reference the IPCF packet
+
+    BIND
+        hdr = packet[ipcf_header]: ipcf_hdr;	!and the header data
+
+    LOCAL
+        rootine,
+        pck: VOLATILE,
+        msg: REF message_table_entry VOLATILE,
+        rec: REF ipcf_rec VOLATILE,             !IPCF record
+        sts;
+
+    ENABLE
+        mx$error_handler (pck,msg,rec);
+
+    $TRACE('SCAN%P called');
+    pck = .packet;
+    !
+    ! If this is a new message, get the file spec and build a message table
+    ! entry, otherwise lookup the old message table entry and continue.
+    !
+
+    CASE .hdr[hdr_type]
+        FROM min_hdr_type TO max_hdr_type OF
+        SET
+        [lcl_post]:	msg = new_msg(.packet, .pid, .uid, .cap);
+        [lcl_cont]:	msg = old_msg(.packet, .pid, .uid, .cap);
+        [OUTRANGE]:     $signal_error(
+                            SEVERITY=$err,
+                            FACILITY=$protocol,
+                            CODE=ls$iht);       
+        TES;
+    !
+    ! We now have the message block, so scan the ipcf packet, and add the
+    ! contents to the message block
+    !
+
+    rec = hdr[hdr_record];		        !get first record
+    INCR i FROM 1 TO .hdr[hdr_record_count] DO
+        BEGIN				        !BEGIN packet scan
+        rootine =
+            (CASE .rec[rec_type]
+                FROM min_rec_type TO max_rec_type OF
+                    SET
+                    [rec_dest]:	    get_dest;
+                    [rec_sender]:   get_sender;
+                    [rec_file]:	    get_file;
+                    [rec_subj]:     get_subj;
+                    [OUTRANGE]:     BEGIN
+                                    $signal_error(
+                                        SEVERITY=$severe,
+                                        FACILITY=$protocol,
+                                        CODE=ls$irt);       
+                                    EXITLOOP;
+                                    END;
+                    TES);
+
+        (.rootine) (CH$PTR(rec[rec_data]), (.rec[rec_length] - 3) * 5, .msg);
+
+        rec = .rec + .rec[rec_length];
+        END;				        !END packet scan
+
+    IF .msg NEQ 0
+    THEN
+        BEGIN
+        sts = .msg[msg_state];
+        CASE .sts FROM 1 TO 4 OF
+            SET
+            [$msg_complete]:    mx$message_queue_post(.msg);
+
+            [$msg_incomplete]:  ; !Do nothing
+            [$msg_warning]:     IF .hdr[hdr_status] EQL $msg_complete
+                                THEN
+                                    mx$message_queue_post(.msg);
+
+            [$msg_canceled]:    mx$release_message(.msg);
+            TES;
+        hdr[hdr_status] = .sts;
+        END
+    ELSE
+        hdr[hdr_status] = $msg_canceled;
+
+    RETURN .msg;
+    END;				! END scan_pkt
+
+ROUTINE new_msg (packet, pid, uid, caps) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!    This routine is called whenever an IPCF packet arrives with hdr_type
+!    set to lcl_post.  The packet is scanned for the message file spec,
+!    and a new message table entry is created for this message.  The
+!    sender field is set to the sending UID's user name (which may be
+!    overridden later, if the sender is privileged) and the address of
+!    the message table entry is returned.
+!
+! FORMAL PARAMETERS:
+!
+!    packet	- IPCF packet address
+!    pid	- sender's IPCF pid
+!    uid	- sender's user number (TOPS20) or PPN (TOPS10)
+!    cap	- sender's enabled capabilities, from IPCF header
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALIE
+!
+!       The address of the Message data block (an Active Table Entry)
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!--
+    BEGIN				        !BEGIN new_msg
+![307] ADD VUFLG DEFINITION.  REMOVE MSG_ID (IT WASN'T BEING USED...)
+    LOCAL
+        pck: VOLATILE,
+        msg: REF message_table_entry VOLATILE,  !address of msg block
+        vuflg;                                ![307] FLAG FOR INVALID SENDERS
+
+    MAP
+        packet: REF ipcf_msg;	        !reference the IPCF packet
+
+    BIND
+        hdr = packet[ipcf_header]: ipcf_hdr;	!and the header data
+
+    ENABLE
+        mx$error_handler(pck, msg);
+
+    pck = .packet;
+    msg = mx$get_message_table_entry;
+
+    IF .msg EQL 0
+    THEN
+        $signal_error(				!It failed...
+            SEVERITY=$warning,
+            FACILITY=$internal,
+            CODE=mx$nom);
+
+    !Now, initialize the message block
+
+    msg[msg_fil_spec] = 0;
+    msg[msg_env_spec] = 0;
+
+![307] CALL MX$GET_USERNAME SO THAT IT TELLS IF SENDER IS AN INVALID USER
+    msg[msg_sender_string] = mx$get_username(.uid,vuflg); ![307]
+
+    msg[msg_work_req_list] = 0;
+    msg[msg_work_req_count] = 0;
+    msg[msg_sender_domain] = .hdr[hdr_domain_id];
+    msg[msg_state] = .hdr[hdr_status];
+    msg[msg_sender_pid] = .pid;
+    msg[msg_sender_uid] = .uid;
+    msg[msg_sender_caps] = .caps;
+    hdr[hdr_id] = .msg[msg_msg_id];
+    $TRACE_ALWAYS('Message submitted by %A',CH$PTR(.msg[msg_sender_string]));
+
+![307] IF VUFLG IS SET, CANCEL THIS MESSAGE
+    IF NOT .vuflg
+    THEN
+        BEGIN
+        msg[msg_state] = $msg_canceled;
+        $TRACE_ALWAYS('...%A is not a valid user - Message rejected',
+                        CH$PTR(.msg[msg_sender_string]))
+        END;
+
+    RETURN (.msg);			        !return the message table entry
+
+    END;				    !END new_msg
+
+ROUTINE old_msg (packet, pid, uid, caps) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       This routine is called whenever an IPCF packet is recieved with header
+!   type lcl_cont.  It fetches the message block from the held message table
+!   and performs some consistancy checks.  In particular, the PID and UID must
+!   match in the held data and the new packet.
+!
+! FORMAL PARAMETERS:
+!
+!	msg_id: The index into the HELD_DATA_TABLE
+!       pid:    The pid of the requesting process
+!       uid:    The user id of the requestor
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! RETURN VALUE:
+!
+!       The address of the message data block
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!--
+    BEGIN
+
+    MAP
+        packet: REF ipcf_msg;	        !reference the IPCF packet
+
+    BIND
+        hdr = packet[ipcf_header]: ipcf_hdr;	!and the header data
+
+    LOCAL
+        msg_id,
+        pck: VOLATILE,
+        msg: REF message_table_entry VOLATILE;
+
+    ENABLE
+        mx$error_handler(pck, msg);
+
+    $TRACE('A continuation block...');
+    pck = .packet;
+    NMU$TABLE_FETCH(active_message_table, .hdr[hdr_id], msg);
+
+    IF .msg EQL 0           
+    THEN                        !Invalid continuation packet
+        $signal_error(
+            SEVERITY=$err,
+            FACILITY=$protocol,
+            CODE=ls$icp);       
+
+    IF .msg [msg_sender_pid] NEQ .pid
+    THEN                        !Invalid Sender Pid
+        $signal_error(
+            SEVERITY=$err,
+            FACILITY=$protocol,
+            CODE=ls$isp);
+
+    IF .msg [msg_sender_uid] NEQ .uid
+    THEN                        !Invalid Sender User id
+        $signal_error(
+            SEVERITY=$err,
+            FACILITY=$protocol,
+            CODE=ls$isu);
+
+    msg[msg_state] = .hdr[hdr_status];
+    RETURN (.msg);				! return message block
+
+    END;
+
+ROUTINE get_file (ptr, len, msg): NOVALUE =
+    BEGIN
+    MAP
+        msg: REF message_table_entry;
+
+    IF .msg[msg_fil_spec] NEQ 0
+    THEN                    !Duplicate Message File
+        $signal_error(
+            SEVERITY=$err,
+            FACILITY=$protocol,
+            CODE=ls$dmf,
+            MESSAGE_DATA=(CH$PTR(.msg[msg_fil_spec]), .ptr));
+
+    IF NOT mx$file_exists(.ptr)
+    THEN                    !No message file
+        BEGIN
+        $signal_error(
+            SEVERITY=$err,
+            FACILITY=$protocol,
+            CODE=ls$nmf,
+            MESSAGE_DATA=.ptr);
+        msg[msg_fil_spec] = 0;
+        END
+    ELSE
+        msg[msg_fil_spec] = copy_asciz(.ptr);
+!        msg[msg_fil_spec] = copy_string(.ptr, .len);
+
+    $TRACE('The message file is %A', CH$PTR(.msg[msg_fil_spec]));
+    END;
+
+GLOBAL ROUTINE get_dest (ptr, len, msg): NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!    This routine adds the destination string pointed to by ptr to the
+!    proper work request for the message specified by msg.  The destination
+!    node is validated, and the destination string is added to the list
+!    of destination strings for the work request for that node.  If no
+!    work request exists for the node, a new work request is created.
+!
+! FORMAL PARAMETERS:
+!
+!    msg	- message table entry block
+!    ptr	- pointer to ASCIZ destination string
+!    len	- length of the source string
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!       NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!--
+    BEGIN				! BEGIN msg_dest
+
+    MAP
+        msg:REF  message_table_entry;
+
+    STACKLOCAL
+        pobbuf: VECTOR[CH$ALLOCATION(max_string_length)];
+
+    LOCAL
+        list:   REF list_blk,
+        domain,
+        rcpt_str,
+        node_str,
+        name_len,
+        sys_flg,
+        err_flg,
+        rcpt_data_blk: REF rb_block,
+        work_request: REF work_request_block;
+
+    err_flg = sys_flg = 0;
+    rcpt_str = copy_asciz(.ptr);
+    rcpt_data_blk = parse_rcpt(CH$PTR(.rcpt_str));
+
+    IF .rcpt_data_blk[rb_node_ptr] EQL 0        ![314]If there's no nodename
+    THEN                                        ![314] then assume the local
+        BEGIN                                   ![314] domain.
+        domain = $local;                        ![314]
+        node_str = 0;                           ![314]
+        END                                     ![314]
+    ELSE                                        ![314]
+        BEGIN
+        node_str =
+            nmu$memory_get(CH$ALLOCATION(.rcpt_data_blk[rb_node_len]+4, 8));
+        ptr = CH$PTR(.node_str,0,8);
+        CH$WCHAR_A(0,ptr);
+        CH$WCHAR_A(0,ptr);
+        CH$WCHAR_A(.rcpt_data_blk[rb_node_len], ptr);
+        ptr = CH$MOVE(.rcpt_data_blk[rb_node_len],
+                  .rcpt_data_blk[rb_node_ptr],
+                  .ptr);
+        CH$WCHAR(0,.ptr);
+
+        domain = mx$data_validate(.node_str,
+                                  .msg[msg_sender_domain],
+                                  -1);
+
+        domain = .domain<0,18,1>;
+        END;
+
+    IF .domain GEQ 0
+    THEN
+        BEGIN                                       ![314]If there's no network
+        IF .node_str EQL 0                          ![314] then there's only
+        THEN                                        ![314] one work request
+            work_request = .msg[msg_work_req_list]  ![314]
+        ELSE                                        ![314]
+            work_request = find_work_req( .msg[msg_work_req_list],
+                                          CH$PTR(.node_str,3,8), 
+                                          .rcpt_data_blk[rb_node_len]);
+
+        IF .domain EQL $local
+        THEN
+            BEGIN
+            IF NOT (sys_flg=mx$validate_local_user(.rcpt_data_blk[rb_name_len],
+                                                   .rcpt_data_blk[rb_name_ptr],
+                                                   pobbuf))
+            THEN
+                BEGIN
+                err_flg = 1;
+                $signal_error(
+                    SEVERITY=$warning,
+                    FACILITY=$protocol,
+                    CODE=mg$nsu,
+                    MESSAGE_DATA=(CH$PTR(UPLIT(%ASCIZ'LOCAL')),
+                                    CH$PTR(pobbuf)));
+                END     
+                                                %IF %SWITCHES(TOPS10) %THEN
+            ELSE                                    !Tops-10 Save the profile
+                rcpt_data_blk[rb_profile] = .pobbuf   %FI ;
+
+            IF .sys_flg LSS 0
+            THEN
+                IF (.msg[msg_sender_domain] NEQ $local) OR
+                %IF %SWITCHES(TOPS20) %THEN
+
+                ((.msg[msg_sender_caps] AND (sc_whl OR sc_opr)) EQL 0)
+
+                %ELSE
+
+                (((.msg[msg_sender_caps] AND ip$jac) EQL 0) AND
+                	(.msg[msg_sender_uid] NEQ 1^18 + 2))
+                %FI
+                THEN
+                    BEGIN
+                    err_flg = $true;
+                    $signal_error(
+                        SEVERITY=$warning,
+                        FACILITY=$protocol,
+                        CODE=mg$ips);
+                    END;
+
+            END;
+        END
+    ELSE
+        BEGIN
+        $signal_error(              !Invalid Node Name
+            SEVERITY=$warning,
+            FACILITY=$protocol,
+            CODE=ls$inn,
+            MESSAGE_DATA=CH$PTR(.node_str,3,8));
+        err_flg = 1;
+        END;
+
+    IF .err_flg
+    THEN
+        BEGIN
+        mx$release_asciz(.node_str);
+        mx$release_asciz(.rcpt_str);
+        nmu$memory_release(.rcpt_data_blk, rb_block_size);
+        END
+    ELSE
+        BEGIN
+        if (.work_request EQL 0)
+        THEN
+            BEGIN
+            work_request = mx$get_work_request;
+            work_request[req_message_id] = 0;
+            work_request[req_domain_id] = .domain;
+            work_request[req_destination_node] = .node_str;
+            work_request[req_recipient_list] = 0;
+            work_request[req_state] = 0;
+            list = mx$get_list_blk;
+            list[lst_next] = .msg[msg_work_req_list];
+            list[lst_data] = .work_request;
+            msg[msg_work_req_list] = .list
+            END;
+
+        list = mx$get_list_blk;
+        list[lst_data] = .rcpt_str;
+        list[lst_next] = .work_request[req_recipient_list];
+        list[lst_xtra] = .rcpt_data_blk;
+        work_request[req_recipient_list] = .list;
+
+        END;
+    $TRACE('Recipient %A', CH$PTR(.rcpt_str))
+    END;				! END get_dest
+
+%global_routine('PARSE_RCPT', ptr) =
+    BEGIN
+    LOCAL
+        parse_data_blk: REF rb_block,
+        len,
+        err,
+        ep,
+        erstr;
+
+    erstr = .ptr;
+    err = $false;
+    parse_data_blk = mx$get_rb_block;
+    IF CH$RCHAR(.ptr) EQL %C'@'
+    THEN
+        BEGIN
+        ptr = ep = CH$PLUS(.ptr,1);
+        len = pnode(ep);
+        parse_data_blk[rb_node_ptr] = .ptr;
+        parse_data_blk[rb_node_len] = .len;
+        parse_data_blk[rb_name_len] = parse_data_blk[rb_name_ptr] = 0;
+
+        WHILE CH$RCHAR(.ep) EQL %C',' DO 
+            BEGIN
+            IF CH$A_RCHAR(ep) NEQ %C'@'
+            THEN
+                BEGIN
+                err = $true;
+                EXITLOOP
+                END;
+            ep = CH$PLUS(.ep,1);
+            pnode(ep);
+            END;
+
+        IF CH$RCHAR_A(ep) EQL %C':'
+        THEN
+            BEGIN
+            pname(ep);
+            IF CH$RCHAR_A(ep) EQL %C'@'
+            THEN
+                BEGIN
+                pnode(ep);
+                IF CH$RCHAR(.ep) NEQ 0
+                THEN
+                    err = $true;
+                END
+            ELSE
+                err = $true
+            END
+        ELSE
+            err = $true;
+
+        IF .err
+        THEN
+            $signal_error(          !Invalid Destination String
+                SEVERITY=$err,
+                FACILITY=$protocol,
+                CODE=ls$ids,
+                MESSAGE_DATA=.erstr);
+        END
+    ELSE
+        BEGIN
+        ep = .ptr;
+        len = pname(ep);
+        IF CH$RCHAR(.ptr) EQL %C'"'
+        THEN
+            BEGIN   !Ignore the quotes
+            parse_data_blk[rb_name_ptr] = CH$PLUS(.ptr,1);
+            parse_data_blk[rb_name_len] = .len - 2;
+            END
+        ELSE
+            BEGIN
+            parse_data_blk[rb_name_ptr] = .ptr;
+            parse_data_blk[rb_name_len] = .len;
+            END;
+
+        SELECTONE CH$RCHAR(.ep) OF
+            SET
+            [0]:            BEGIN
+                            IF .nodnam EQL 0        ![315]If no network then
+                            THEN                    ![314] clear parse data
+                                BEGIN                           ![314]
+                                parse_data_blk[rb_node_ptr] = 0;![314]
+                                parse_data_blk[rb_node_len] = 0;![314]
+                                END                             ![314]
+                            ELSE                                ![314]
+                                BEGIN                           
+                                parse_data_blk[rb_node_ptr] = CH$PTR(nodnam);
+                                parse_data_blk[rb_node_len] =
+                                            CH$LEN(CH$PTR(nodnam));
+                                END
+                            END;
+            [%C' ',%C'@']:  BEGIN
+                            parse_data_blk[rb_node_ptr] = ep = CH$PLUS(.ep,1);
+                            parse_data_blk[rb_node_len] = pnode(ep);
+                            END;
+            TES;
+
+        IF CH$RCHAR(.ep) NEQ 0
+        THEN
+            $signal_error(          !Invalid Destination String
+                SEVERITY=$err,
+                FACILITY=$protocol,
+                CODE=ls$ids,
+                MESSAGE_DATA=.erstr);
+        END;
+
+    RETURN .parse_data_blk
+    END;
+
+GLOBAL ROUTINE pnode(ptr_) =
+    BEGIN
+    BIND
+        ptr = .ptr_;
+
+    LOCAL
+        len;
+
+    len = 0;
+    WHILE $true DO
+        SELECTONE CH$RCHAR(.ptr) OF
+            SET
+            [%C',', %C':', 0]:  EXITLOOP;
+
+            [OTHERWISE]:        BEGIN
+                                ptr = CH$PLUS(.ptr, 1);
+                                len = .len + 1;
+                                END;
+            TES;
+
+    RETURN .len
+    END;
+
+GLOBAL ROUTINE pname(ptr_) =
+    BEGIN
+    BIND
+        ptr = .ptr_,
+        atptr = CH$PTR(UPLIT(%ASCIZ' at '));
+
+    LOCAL
+        erstr,
+        qstr,
+        len;
+
+    erstr = .ptr;
+    len = 0;
+    qstr = 0;
+
+    IF CH$RCHAR(.ptr) EQL %C'"'
+    THEN
+        BEGIN
+        qstr = $true;
+        len = 1;
+        ptr = CH$PLUS(.ptr,1)
+        END;
+
+    WHILE $true DO
+        BEGIN
+        SELECTONE CH$RCHAR(.ptr) OF
+            SET
+            [%C'"']:        IF .qstr
+                            THEN
+                                qstr = 0
+                            ELSE
+                                $signal_error(      !Invalid Destination String
+                                    SEVERITY=$err,
+                                    FACILITY=$protocol,
+                                    CODE=ls$ids,
+                                    MESSAGE_DATA=.erstr);
+
+            [%C'@']:        IF NOT .qstr            !If not inside quotes, exit
+                            THEN
+                                EXITLOOP;
+
+            [%C' ']:        IF NOT .qstr
+                            THEN
+                                IF CH$EQL(4,.ptr,4,atptr)
+                                THEN
+                                    BEGIN
+                                    ptr = CH$PLUS(.ptr,3);
+                                    EXITLOOP
+                                    END;
+!                                ELSE
+!                                    $signal_error(  !Invalid Destination String
+!                                        SEVERITY=$err,
+!                                        FACILITY=$protocol,
+!                                        CODE=ls$ids,
+!                                        MESSAGE_DATA=.erstr);
+
+            [0]:            EXITLOOP;
+            TES;
+
+        ptr = CH$PLUS(.ptr, 1);
+        len = .len + 1;
+        END;
+
+    RETURN .len
+    END;
+
+GLOBAL ROUTINE copy_asciz (ptr) =
+    BEGIN
+    LOCAL
+        p,
+        len,
+        adr;
+
+    p = .ptr;
+    len = 0;
+    WHILE CH$RCHAR_A(p) NEQ 0 DO len = .len + 1;
+    adr = nmu$memory_get(CH$ALLOCATION(.len+1));
+    CH$MOVE(.len, .ptr, CH$PTR(.adr));
+    RETURN .adr
+    END;
+
+GLOBAL ROUTINE copy_string (ptr, len) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!    This routine copies the specified string into a string block, and
+!    returns a pointer to that string block.  The source string is assumed
+!    to be an ASCIZ string (terminated by a null).  The destination string
+!    block is allocated based on the length of the source, including the null.
+!
+! FORMAL PARAMETERS:
+!
+!    ptr	- pointer to source string
+!    len	- length of the source string
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! COMPLETION CODES:
+!
+!    address of string block
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!--
+    BEGIN				! BEGIN copy_string
+
+    LOCAL
+      block,				! place to keep string block
+      dptr;				! pointer into string block
+
+    block = NMU$MEMORY_GET(CH$ALLOCATION(.len));	! get a block
+    dptr = CH$PTR(.block);		! create a pointer to the block
+    CH$MOVE(.len, .ptr, .dptr);		! move the string
+    RETURN (.block);			! return pointer to string block
+
+    END;				! END copy_string
+
+routine find_work_req (list, ptr, len) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!    This routine will return the address of the work request that coresponds
+!    to the node name pointed to by ptr.  The list of work requests is scanned
+!    until the work request for the specified node name is found.  
+!
+! FORMAL PARAMETERS:
+!
+!    list	- address of first list block in the chain
+!    ptr	- pointer to node name
+!    len	- length of the node name
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! COMPLETION CODES:
+!
+!    address of work request, or 0.
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!--
+    BEGIN				! BEGIN find_work_req
+    STACKLOCAL
+        nodb1: VECTOR[CH$ALLOCATION(max_string_length)],
+        nodb2: VECTOR[CH$ALLOCATION(max_string_length)];
+
+    LOCAL
+        list_ptr: REF list_blk,			!save list block address here
+        req,				        !work request address
+        wnode_len;			        !length of work-req node string
+
+    CH$TRANSLATE(uc_tab,                        !Convert node to upper case
+                 .len, .ptr,
+                 0,
+                 .len+1, CH$PTR(nodb1));
+
+    req = 0;				        !assume no match
+    list_ptr = .list;			        !copy list pointer
+    WHILE .list_ptr NEQ 0 AND .req EQL 0 DO
+        BEGIN				        ! BEGIN search loop
+        BIND
+            curr_req = .list_ptr[lst_data]: work_request_block;
+
+        wnode_len = CH$RCHAR(CH$PTR(.curr_req[ req_destination_node ],2,8));
+
+        CH$TRANSLATE(uc_tab,
+                     .wnode_len, CH$PTR(.curr_req[ req_destination_node ],3,8),
+                     0,
+                     .wnode_len+1, CH$PTR(nodb2));
+
+        IF CH$EQL(.wnode_len,  CH$PTR(nodb2),
+                  .len,  CH$PTR(nodb1), 0)
+        THEN
+            req = curr_req;
+
+        list_ptr = .list_ptr [ lst_next ];
+        END;		        		! END of search loop
+
+    RETURN (.req);		        	! return the work request
+
+    END;        				! END find_work_req
+
+ROUTINE get_sender (ptr, len, msg): NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!    This routine processes an IPCF sender record.  If the originator has
+!    privileges, the sender string is copied into a string block and the
+!    existing sender string is superceded with this new string.
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! COMPLETION CODES:
+!
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!--
+    BEGIN				! BEGIN msg_sender
+
+    MAP
+        msg:REF message_table_entry;
+
+    $TRACE('Routine GET_SENDER called');
+
+    %IF %SWITCHES(TOPS20) %THEN
+
+    IF (.msg[msg_sender_caps] AND (SC_WHL OR SC_OPR)) GTR 0
+
+    %ELSE
+
+    IF ((.msg[msg_sender_caps] AND IP$JAC) NEQ 0) OR
+	(.msg[msg_sender_uid] EQL 1^18 + 2)
+
+    %FI
+    THEN
+        BEGIN
+        $TRACE('Sender %A being changed to %A',
+                CH$PTR(.msg[msg_sender_string]),.ptr);
+
+        IF .msg[ msg_sender_string ] NEQ 0
+        THEN
+            mx$release_asciz(.msg[ msg_sender_string ]);
+
+        msg[ msg_sender_string ] = copy_asciz(.ptr);
+        END;
+    END;				! END msg_sender
+
+ROUTINE get_subj (ptr, len, msg): NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!    This routine processes an IPCF sender record.  If the originator has
+!    privileges, the sender string is copied into a string block and the
+!    existing sender string is superceded with this new string.
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! COMPLETION CODES:
+!
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!--
+    BEGIN				! BEGIN get_subject
+
+    MAP
+        msg:REF message_table_entry;
+
+    $TRACE('SUBJECT: %A',.ptr);
+
+    msg[msg_subject_string] = copy_asciz(.ptr);
+!    msg[msg_subject_string] = copy_string(.ptr,.len);
+    END;				! END get_subject
+
+
+%global_routine ('LCLSPL'):NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!	This task takes WORK-REQUESTS from its input queue, and transmits the
+!   message to the appropriate users...
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!    	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!--
+
+    BEGIN
+    BIND
+	domain = .nettab[0]: domain_data_block;
+
+    LOCAL
+        state,
+        sleep_time,
+        did,
+        msg: REF message_table_entry,
+	entry: REF work_request_block;
+
+    WHILE 1 DO
+    	BEGIN
+	entry = nmu$squeue_remove(.domain[dom_spooler_queue]);
+	$TRACE('LCLSPL running...');
+        nmu$table_fetch(active_message_table, .entry[req_message_id], msg);
+
+        IF .nodnam EQL 0            ![314]Init "domain id" in case of no net
+        THEN                        ![314]
+            did = 0                 ![314]
+        ELSE                        ![314]
+            did = mx$data_validate(.entry[req_destination_node],
+                                      .msg[msg_sender_domain],
+                                      .entry[req_domain_id]);
+
+        IF NOT .did<0,18,1> GEQ 0
+        THEN
+            BEGIN                   !Invalid Node Name
+            $error(
+                SEVERITY=$severe,
+                FACILITY=$message,
+                CODE=MG$NNK,
+                MESSAGE_DATA=(CH$PTR(UPLIT(%ASCIZ'LOCAL')), 
+                              CH$PTR(.entry[req_destination_node], 3, 8)),
+                ID=.msg[msg_msg_id]);
+            $mx$change_state(.entry, $reject);
+            END
+        ELSE
+            BEGIN
+            sleep_time = 0;
+            local_deliver(.entry, .msg);
+            IF .entry[req_state] EQL $defer
+            THEN
+                time_current(RTRYLC*60, sleep_time);
+
+            $mx$change_state(.entry,,.sleep_time);
+	    END;
+        mx$message_queue_checkpoint(.msg);
+        END;
+    nmu$sched_deschedule();
+    END;			!End of LCLSPL
+
+%routine('LOCAL_DELIVER', entry: REF work_request_block,
+                          msg: REF message_table_entry): NOVALUE =
+    BEGIN
+    LOCAL
+        head: list_blk,
+        plist: REF list_blk,
+        tlist: REF list_blk,
+        list: REF list_blk,
+	state;
+
+    $TRACE('Routine LOCAL_DELIVER called');
+
+    plist = head;
+    list = head[lst_next] = .entry[req_recipient_list];
+    WHILE .list NEQ 0 DO
+        BEGIN
+        nmu$sched_pause();
+        IF (state = append_mail(.list, .msg))  EQL $done
+        THEN
+            BEGIN
+            mx$release_asciz(.list[lst_data]);
+            nmu$memory_release(.list[lst_xtra],rb_block_size);
+            tlist = plist[lst_next] = .list[lst_next];
+            nmu$memory_release(.list,list_block_size);
+            list = .tlist;
+            END
+        ELSE
+            BEGIN
+            plist = .list;
+            list = .list[lst_next];
+            END;
+
+        entry[REQ_RECIPIENT_LIST] = .head[lst_next];
+        entry[REQ_STATE] = MAX(.entry[REQ_STATE], .state);
+        END;
+    END;
+
+%global_routine('APPEND_MAIL', list: REF list_blk, msg: REF message_table_entry) =
+    BEGIN
+    STACKLOCAL
+        dirbuf: VECTOR[CH$ALLOCATION(max_string_length)],
+        nambuf: VECTOR[CH$ALLOCATION(max_string_length)],
+        iobuf: VECTOR[CH$ALLOCATION(max_string_length)],
+        cleanup_vector: VECTOR[3];
+
+    BIND
+        msgfil = cleanup_vector[0],
+        mailfil = cleanup_vector[1],
+        profile = cleanup_vector[2];
+
+    MACRO proppn(pf) =                  !Get the PPN from a user profile (T10)
+        BEGIN
+        BIND
+            _pf = (pf): VECTOR[];
+
+        ._pf[1]             ! .AEPPN == 1
+        END %;
+
+    KEYWORDMACRO
+        blast_tty(text,user=) =
+        BEGIN
+        %IF %ISSTRING(%REMOVE(text)) %THEN
+            BIND
+                tbuf = UPLIT(%ASCIZ %REMOVE(text)),
+                pt = CH$PTR(tbuf);
+        %ELSE
+            STACKLOCAL
+                tbuf: VECTOR[CH$ALLOCATION(132)];
+            BIND
+                pt = CH$PTR(tbuf);
+            LOCAL
+                tp;
+
+            tp = CH$PTR(tbuf);
+            $nmu$text(tp,132,%REMOVE(text));
+        %FI
+
+        %IF %NULL(user) %THEN
+            nag(-1,pt)
+        %ELSE
+            %IF %SWITCHES(TOPS20) %THEN
+                nag(user,pt)
+            %ELSE
+                nag(proppn(.profile),pt) 
+                                !NOTE:  profile must be set up before this 
+            %FI                 !macro is invoked! The value of user is irrelev
+        %FI 
+        END
+        %;
+
+    LOCAL
+        msg_size,
+	byte_count,
+	written,
+        linlen,
+        error,
+        len,
+        state,
+        used,
+        qta,
+        pages_left,
+        jobnum,
+        ptr,
+        pqta,
+        wqta,
+        sys,
+        rcpt_data_blk: REF rb_block;
+
+    profile = mailfil = msgfil = 0;
+    state = $done;
+    rcpt_data_blk = .list[lst_xtra];
+
+    $TRACE('Delivering local mail to %A', .rcpt_data_blk[rb_name_ptr]);
+
+    CH$WCHAR(0,CH$MOVE(.rcpt_data_blk[rb_name_len],
+                       .rcpt_data_blk[rb_name_ptr],
+                       CH$PTR(nambuf)));
+
+    %IF %SWITCHES(TOPS20) %THEN
+    IF (sys = mx$validate_local_user(.rcpt_data_blk[rb_name_len],
+                                     .rcpt_data_blk[rb_name_ptr], 
+                                     dirbuf))
+    THEN
+        BEGIN
+        get_quota(dirbuf, pqta, wqta, used);
+
+        mx$file_size(.msg[msg_fil_spec], msg_size, byte_count);
+
+        IF .byte_count EQL 0
+        THEN
+            BEGIN
+            $error( FACILITY = $message,
+                    SEVERITY = $severe,
+                    CODE =      mx$mzb,                 !Message has Zero Bytes
+                    MESSAGE_DATA = CH$PTR(.msg[msg_fil_spec]),
+                    ID=         .msg[msg_msg_id]);
+            kleanup(cleanup_vector);
+            RETURN $reject
+            END;
+
+        qta = (IF logged_in(CH$PTR(nambuf), jobnum)
+               THEN
+                   .wqta
+               ELSE
+                   .pqta); 
+
+        IF .msg_size GEQ .qta
+        THEN
+            BEGIN
+            $error( FACILITY = $message,
+                    SEVERITY = $severe,
+                    CODE =      mx$noq,
+                    MESSAGE_DATA = CH$PTR(dirbuf),
+                    ID=         .msg[msg_msg_id]);
+            kleanup(cleanup_vector);
+            RETURN $reject
+            END;
+
+        pages_left = .qta - .used;
+
+        IF .pages_left GTR .msg_size + 1
+        THEN
+            BEGIN
+            $TRACE('User not over quota');
+
+            linlen = get_header(CH$PTR(iobuf),
+                                .byte_count,
+                                CH$PTR(.msg[msg_sender_string]));
+
+            get_name(dirbuf);
+
+            IF NOT (msgfil = mx$file_open(
+                                CH$PTR(.msg[msg_fil_spec]),
+                                file_access_read_only,
+                                error)) GTR 0
+            THEN
+                BEGIN
+                kleanup(cleanup_vector);
+                RETURN $done;
+                END;
+
+            IF NOT (mailfil = mx$file_open(
+                                CH$PTR(dirbuf),
+                                file_access_append_only,
+                                error)) GTR 0
+            THEN
+                BEGIN
+                IF .error EQL opnx9
+                THEN
+                    BEGIN
+                    kleanup(cleanup_vector);
+                    RETURN $defer;
+                    END
+                ELSE
+                    IF NOT (mailfil = mx$file_open(
+                                CH$PTR(dirbuf),
+                                file_access_write_only,
+                                error)) GTR 0
+                    THEN
+                        BEGIN
+                        $error(FACILITY=$message,
+                               SEVERITY=$severe,
+                               CODE=uf$fof,
+                               MESSAGE_DATA=CH$PTR(dirbuf),
+                               OPTIONAL_MESSAGE=$error_code,
+                               OPTIONAL_DATA=.error,
+                               ID=.msg[msg_msg_id]);
+
+                        kleanup(cleanup_vector);
+                        RETURN $reject;
+                        END;
+                END;
+
+            if not mx$file_write(.mailfil, CH$PTR(iobuf), .linlen, error)
+            then
+                BEGIN
+                $error(SEVERITY =          $severe,
+                       CODE =              uf$fwf,
+                       FACILITY =          $message,
+                       MESSAGE_DATA =      CH$PTR(dirbuf),
+                       optional_message =  $error_code,
+                       optional_data =     .error,
+                       ID=.msg[msg_msg_id]);
+
+                kleanup(cleanup_vector);
+                RETURN $reject;
+                END;
+
+	    written = 0;
+            WHILE (
+                linlen = mx$file_read(.msgfil,
+                                      CH$PTR(iobuf),
+                                      max_string_length,
+                                      error)) GTR 0 DO
+		BEGIN
+                IF NOT mx$file_write(.mailfil, CH$PTR(iobuf), .linlen, error)
+                THEN
+                    BEGIN
+                    $error(SEVERITY =          $severe,
+                           CODE =              uf$fwf,
+                           FACILITY =          $message,
+                           MESSAGE_DATA =      CH$PTR(dirbuf),
+                           optional_message =  $error_code,
+                           optional_data =     .error,
+                           ID=.msg[msg_msg_id]);
+
+                    kleanup(cleanup_vector);
+                    RETURN $reject;
+                    END;
+
+		written = .written + .linlen;
+		END;
+
+            IF .linlen NEQ 0
+            THEN
+                BEGIN
+                $error(FACILITY =          $message,
+                       SEVERITY =          $severe,
+                       CODE =              uf$frf,
+                       MESSAGE_DATA =      CH$PTR(.msg[msg_fil_spec]),
+                       OPTIONAL_MESSAGE =  $error_code,
+                       OPTIONAL_DATA =     .error,
+                       ID=.msg[msg_msg_id]);
+
+                kleanup(cleanup_vector);
+                RETURN $reject;
+                END;
+
+            IF NOT mx$file_close(.mailfil, file_keep, error)
+            THEN
+                BEGIN
+                $error(FACILITY =          $message,
+                       SEVERITY =          $severe,
+                       CODE =              uf$fcf,
+                       MESSAGE_DATA =      CH$PTR(dirbuf),
+                       OPTIONAL_MESSAGE =  $error_code,
+                       OPTIONAL_DATA =     .error,
+                       ID=.msg[msg_msg_id]);
+
+                kleanup(cleanup_vector);
+                RETURN $reject;
+                END;
+
+            mx$file_set_writer(CH$PTR(dirbuf),CH$PTR(.msg[msg_sender_string]));
+            mx$file_close(.msgfil, file_abort, error);
+
+            IF .sys EQL -1
+            THEN
+                blast_tty(TEXT = ('New SYSTEM mail available'))
+            ELSE
+                blast_tty(USER = CH$PTR(nambuf),
+                          TEXT = ('You have mail from %A',
+                                  CH$PTR(.msg[msg_sender_string])) );
+            END
+        ELSE                                ! Over quota
+            BEGIN
+            $TRACE_ALWAYS(%STRING('%A is overquota (%D/%D) (p/w)%/',
+                     '                          %D pages in use.'),
+                     CH$PTR(.list[lst_data]),.pqta,.wqta,.used);
+
+            blast_tty(USER = CH$PTR(nambuf),
+                      TEXT = (%STRING('You have undeliverable mail from %A.',
+                                    '%/  The mail is %D pages long and it ',
+                                    'would put you over quota.'),
+                              CH$PTR(.msg[msg_sender_string]),
+                              .msg_size) );
+            state = $defer;
+            END;
+        END
+    ELSE
+        BEGIN
+        $error(SEVERITY=$severe,
+               FACILITY=$message,
+               CODE=mg$nsu,
+               MESSAGE_DATA=(CH$PTR(UPLIT(%ASCIZ'LOCAL')),
+                             CH$PTR(.list[lst_data])),
+               ID=.msg[msg_msg_id]);
+        RETURN $reject
+        END;
+    %ELSE   !BEGIN TOPS10 CONDITIONAL
+
+    profile = .rcpt_data_blk[rb_profile];
+    IF NOT ufdcre(.profile)
+    THEN
+        BEGIN
+        $error( FACILITY = $internal,
+                SEVERITY = $warning,
+                CODE = ufd$cr,
+                MESSAGE_DATA = .list[lst_data]);
+        kleanup(cleanup_vector);
+        RETURN $defer
+        END;
+
+    dirbuf = proppn(.profile);
+    get_name(dirbuf); ! on TOPS10, dirbuf contains the ppn...
+                      !...here it contains "DSK:MAIL.TXT[p,pn]"
+
+    IF NOT (mailfil = mx$file_open(             !Open the MAIL.TXT...
+                        CH$PTR(dirbuf),
+                        file_access_append_only,!...for append if it exists...
+                        error)) GTR 0
+    THEN
+        BEGIN
+        SELECTONE .error OF
+            SET
+            [uf$lok]:                               !File is locked...
+                BEGIN                               !...try again later
+                kleanup(cleanup_vector);
+                RETURN $defer;
+                END;
+            [OTHERWISE]:
+                BEGIN
+                $error(FACILITY=$message,           !Oh well, rejct the message
+                       SEVERITY=$severe,
+                       CODE=uf$fof,
+                       MESSAGE_DATA=CH$PTR(dirbuf),
+                       OPTIONAL_MESSAGE=$error_code,
+                       OPTIONAL_DATA=(.error<0,18,0>,.error<18,18,0>),
+                       ID=.msg[msg_msg_id]);
+
+                kleanup(cleanup_vector);
+                RETURN $reject;
+                END;
+            TES;
+        END;
+
+    !Here if MAIL.TXT file has been successfully opened...
+
+    pqta = mx$file_structure(.mailfil);            !Put the SIXBIT structure in
+                                                   !pqta for use by GET_QUOTA
+    get_quota(proppn(.profile), pqta, wqta, used);    
+
+    IF NOT mx$file_size(.msg[msg_fil_spec], msg_size, byte_count)
+    THEN
+        BEGIN
+        kleanup(cleanup_vector);
+        RETURN $defer;
+        END;
+
+    IF .byte_count EQL 0
+    THEN
+        BEGIN
+        $error( FACILITY = $message,
+                SEVERITY = $severe,
+                CODE =      mx$mzb,                     !Message has Zero Bytes
+                MESSAGE_DATA = CH$PTR(.msg[msg_fil_spec]),
+                ID=         .msg[msg_msg_id]);
+        kleanup(cleanup_vector);
+        RETURN $reject
+        END;
+
+    qta = (IF logged_in(proppn(.rcpt_data_blk[rb_profile]), jobnum)
+           THEN
+               .wqta
+           ELSE
+               .pqta);
+
+    IF .msg_size GEQ .qta
+    THEN
+        BEGIN
+        get_name(dirbuf);
+
+        $error( FACILITY = $message,
+                SEVERITY = $severe,
+                CODE =      mx$noq,
+                MESSAGE_DATA = CH$PTR(dirbuf),
+                ID=         .msg[msg_msg_id]);
+        kleanup(cleanup_vector);
+        RETURN $reject
+        END;
+
+    pages_left = .qta - .used;
+
+    IF .pages_left GTR .msg_size + 1
+    THEN
+        BEGIN
+        $TRACE('User not over quota');
+
+        linlen = get_header(CH$PTR(iobuf),
+                            .byte_count,
+                            CH$PTR(.msg[msg_sender_string]));
+
+        IF NOT (msgfil = mx$file_open(
+                            CH$PTR(.msg[msg_fil_spec]),
+                            file_access_read_only,
+                            error)) GTR 0
+        THEN
+            BEGIN
+            kleanup(cleanup_vector);
+            RETURN $done;
+            END;
+
+        if not mx$file_write(.mailfil, CH$PTR(iobuf), .linlen, error)
+        then
+            BEGIN
+            $error(SEVERITY =          $severe,
+                   CODE =              uf$fwf,
+                   FACILITY =          $message,
+                   MESSAGE_DATA =      CH$PTR(dirbuf),
+                   optional_message =  $error_code,
+                   optional_data =     .error,
+                   ID=.msg[msg_msg_id]);
+
+            kleanup(cleanup_vector);
+            RETURN $reject;
+            END;
+
+        written = 0;
+        WHILE (
+            linlen = mx$file_read(.msgfil,
+                                  CH$PTR(iobuf),
+                                  max_string_length,
+                                  error)) GTR 0 DO
+            BEGIN
+            IF NOT mx$file_write(.mailfil, CH$PTR(iobuf), .linlen, error)
+            THEN
+                BEGIN
+                $error(SEVERITY =          $severe,
+                       CODE =              uf$fwf,
+                       FACILITY =          $message,
+                       MESSAGE_DATA =      CH$PTR(dirbuf),
+                       optional_message =  $error_code,
+                       optional_data =     .error,
+                       ID=.msg[msg_msg_id]);
+
+                kleanup(cleanup_vector);
+                RETURN $reject;
+                END;
+            written = .written + .linlen;
+            END;
+
+        IF .linlen NEQ 0
+        THEN
+            BEGIN
+            $error(FACILITY =          $message,
+                   SEVERITY =          $severe,
+                   CODE =              uf$frf,
+                   MESSAGE_DATA =      CH$PTR(.msg[msg_fil_spec]),
+                   OPTIONAL_MESSAGE =  $error_code,
+                   OPTIONAL_DATA =     .error,
+                   ID=.msg[msg_msg_id]);
+
+            kleanup(cleanup_vector);
+            RETURN $reject;
+            END;
+
+        IF NOT mx$file_close(.mailfil, file_keep, error)
+        THEN
+            BEGIN
+            $error(FACILITY =          $message,
+                   SEVERITY =          $severe,
+                   CODE =              uf$fcf,
+                   MESSAGE_DATA =      CH$PTR(dirbuf),
+                   OPTIONAL_MESSAGE =  $error_code,
+                   OPTIONAL_DATA =     .error,
+                   ID=.msg[msg_msg_id]);
+
+            mailfil = 0;
+            kleanup(cleanup_vector);
+            RETURN $reject;
+            END;
+
+        mx$file_close(.msgfil, file_abort, error);
+
+        blast_tty(USER = CH$PTR(nambuf),
+                  TEXT = ('You have mail from %A',
+                          CH$PTR(.msg[msg_sender_string])) );
+        END
+    ELSE                                ! Over quota
+        BEGIN
+        kleanup(cleanup_vector);
+        $TRACE_ALWAYS(%STRING('%A is over quota (%D/%D) (p/w)%/',
+                 '                          %D pages in use.'),
+                 CH$PTR(nambuf),.pqta,.wqta,.used);
+        blast_tty(USER = CH$PTR(nambuf),
+                  TEXT = (%STRING('You have undeliverable mail from %A.',
+                                '%/  The mail is %D blocks long and it ',
+                                'would put you over quota.'),
+                          CH$PTR(.msg[msg_sender_string]),
+                          .msg_size) );
+        state = $defer;
+        END;
+
+    ufddel(.profile);
+    %FI !END of TOPS10 conditional...
+
+    RETURN .state
+    END;
+
+%global_routine('kleanup',vec: REF vector): NOVALUE =
+    BEGIN
+    LOCAL
+        error;
+
+    BIND
+        msg_file = vec[0],
+        mai_file = vec[1],
+        profile  = vec[2];
+
+    IF .msg_file GTR 0
+    THEN
+        mx$file_close(.msg_file, file_abort, error);
+
+    IF .mai_file GTR 0
+    THEN
+        mx$file_close(.mai_file, file_abort, error);
+
+    %IF %SWITCHES(TOPS10) %THEN
+    IF .profile GTR 0
+    THEN
+        ufddel(.profile);
+    %FI
+    END;
+
+%global_routine('GET_HEADER', ptr, msglen, sndptr) =
+    BEGIN
+    STACKLOCAL
+        buffer: VECTOR[CH$ALLOCATION(30)] INITIAL(REP CH$ALLOCATION(30) OF
+                                                    (0));
+
+    msglen = .msglen + 10 + CH$LEN(.sndptr,max_string_length);
+
+    %IF %SWITCHES(TOPS20) %THEN
+        $$odtim(CH$PTR(buffer),-1,ot_tmz);
+    %ELSE
+	udtdat(-1,buffer);
+    %FI
+
+    $nmu$text(ptr,max_string_length,'%A,%(11)U;000000000000%/Sender: %A%/',
+        CH$PTR(buffer),.msglen,.sndptr) - 1
+
+    END;
+
+%routine('GET_NAME', adr) =
+    BEGIN
+    %IF %SWITCHES(TOPS20) %THEN
+    BIND
+        mptr = CH$PTR(UPLIT(%ASCIZ 'MAIL.TXT.1')),
+        mlen = %CHARCOUNT(%ASCIZ 'MAIL.TXT.1');
+
+    LOCAL
+        len;
+
+    len = CH$LEN(CH$PTR(.adr),max_string_length);
+    CH$MOVE(mlen,mptr,CH$PLUS(CH$PTR(.adr),.len));
+    RETURN .len
+
+    %ELSE
+    BIND
+	buf = .adr;
+
+    LOCAL
+	ptr,
+	ppn;
+
+    ppn = .buf;
+    ptr = CH$PTR(buf);
+    RETURN $nmu$text(ptr, max_string_length, 'DSK:MAIL.TXT[%O,%O]',
+		.ppn<18,18,0>, .ppn<0,18,0>);
+
+    %FI
+    END;
+
+%routine('GET_QUOTA', ptr, perm_, working_, used_):NOVALUE =
+    BEGIN
+    %IF %SWITCHES(TOPS20) %THEN
+    BIND
+        perm = .perm_,
+        working = .working_,
+        used = .used_;
+
+    declare_jsys(rcdir,gtdal);
+    LOCAL
+        dirnum,
+        rcbits;
+
+    $$rcdir(rc_emo,CH$PTR(.ptr),0; rcbits,,dirnum);
+    IF (.rcbits AND rc_nom) EQL 0
+    THEN
+        $$gtdal(.dirnum; working, used, perm);
+
+    RETURN 0;
+    %ELSE
+    !NOTE ptr contains the ppn, and perm contains the SIXBIT structure name
+    BIND
+	perm = .perm_,
+	working = .working_,
+	used = .used_;
+
+    quotas(.ptr,.perm; working, perm, used)
+
+    %FI
+    END;
+
+%global_routine('NAG', too, msg): NOVALUE =
+    BEGIN
+    %IF %SWITCHES(TOPS20) %THEN
+    declare_jsys(ttmsg,odtim,getji,rcusr,mtopr);
+
+    LOCAL
+        jobnum,
+        rcbits,
+        userno,
+        tim,
+        sysmsg,
+        ptr;
+
+    LITERAL
+        jibufsiz = 9;
+
+    STACKLOCAL
+        jibuf:  VECTOR[jibufsiz],
+        buffer: VECTOR[CH$ALLOCATION(30)],
+        msgbuf: VECTOR[CH$ALLOCATION(max_string_length)];
+
+    tim = CH$PTR(buffer);
+    CH$WCHAR_A(%O'7',tim);
+    $$odtim(.tim,-1,ot_nda);
+
+    ptr = CH$PTR(msgbuf);
+    $nmu$text(ptr,max_string_length,'%/[%A %A - %A]%/',
+            CH$PTR(nodnam), CH$PTR(buffer), .msg);
+
+    jobnum = 0;
+    IF .too EQL -1
+    THEN
+        $$ttmsg(-1, CH$PTR(msgbuf))
+    ELSE
+        BEGIN
+        $$rcusr(rc_emo,.too,0;rcbits,,userno);
+        IF NOT (.rcbits AND (rc_dir OR rc_nom)) EQL 0
+        THEN
+            RETURN 0;
+
+
+        WHILE 1 DO
+            BEGIN
+            REGISTER
+                t1 = 1;
+
+            sysmsg = 0;
+            IF $$getji(.jobnum,(-jibufsiz^18)+jibuf,$jitno)
+            THEN
+                BEGIN
+                IF .jibuf[$jiuno-$jitno] EQL .userno            !Right user?
+                THEN
+                    IF .jibuf[$jitno-$jitno] GTR 0              !Yes, Detached?
+                    THEN
+!                        IF .jibuf[$jicpj-$jitno] LSS 0          !No, PTY?
+!                        THEN
+!                            IF .jibuf[$jibat-$jitno] GEQ 0      !No, Batch?
+!                            THEN
+                                BEGIN
+                                $$mtopr(%O'400000' + .jibuf[$jitno-$jitno],
+                                        $mornt;sysmsg);
+                                IF .sysmsg EQL 0
+                                THEN
+                                    $$ttmsg(%O'400000' + .jibuf[$jitno-$jitno],
+                                            CH$PTR(msgbuf));
+                                jibuf[$jitno-$jitno] = 0;
+                                END;
+                END
+            ELSE
+                IF .t1 EQL gtjix3
+                THEN
+                    EXITLOOP;
+
+            jobnum = .jobnum + 1;
+            END;
+        END;
+    RETURN 0;
+    %ELSE
+    BIND
+	ppn = too;
+
+    STACKLOCAL
+        tbuf:   VECTOR[CH$ALLOCATION(40)],
+        msgbuf: VECTOR[CH$ALLOCATION(max_string_length)];
+
+    LOCAL
+	ptr,
+	jobnum;
+
+
+    udttim(-1,tbuf);
+
+    ptr = CH$PTR(msgbuf);
+    $nmu$text(ptr,max_string_length,'%C%/[%A %A - %A]%/',
+	%O'7', CH$PTR(nodnam), CH$PTR(tbuf), .msg);
+
+    IF .too EQL - 1
+    THEN
+        RETURN 0    !*** PUT "blast to everyone" code here
+    ELSE
+        BEGIN
+        REGISTER
+            jobnum;
+
+        jobnum = 0;
+        WHILE fndusr(.ppn,.jobnum; jobnum) DO
+            spltty(msgbuf,.jobnum);
+        END;
+    %FI
+    END;
+%routine('LOGGED_IN', ptr, jobno_) =
+    BEGIN
+    %IF %SWITCHES(TOPS20) %THEN
+    BIND
+        jobno = .jobno_;
+
+    declare_jsys(rcusr,getji);
+    LITERAL
+        jibufsiz = 9;
+
+    STACKLOCAL
+        jibuf:  VECTOR[jibufsiz];
+    LOCAL
+        rcbits,
+        userno,
+        i;
+
+    $$rcusr(rc_emo,.ptr,0;rcbits,,userno);
+    IF (.rcbits AND (rc_dir OR rc_nom)) EQL 0
+    THEN
+        BEGIN
+        i = 0;
+        WHILE 1 DO
+            BEGIN
+            REGISTER t1=1;
+            IF $$getji(.i,(-jibufsiz^18)+jibuf,$jitno)
+            THEN
+                BEGIN
+                IF .jibuf[$jiuno-$jitno] EQL .userno            !Right user?
+                THEN
+                    IF .jibuf[$jitno-$jitno] GTR 0              !Yes, Detached?
+                    THEN
+                        IF .jibuf[$jicpj-$jitno] LSS 0          !No, PTY?
+                        THEN
+                            IF .jibuf[$jibat-$jitno] GEQ 0      !No, Batch?
+                            THEN
+                                BEGIN                           !Found him!
+                                jobno = .i;
+                                RETURN 1;
+                                END
+                END
+            ELSE
+                IF .t1 EQL gtjix3
+                THEN
+                    BEGIN
+                    jobno = -1;
+                    EXITLOOP;
+                    END;
+            i = .i + 1;
+            END;
+        END;
+    RETURN 0;
+    %ELSE
+!       %WARN('LOGGED_IN not yet implemented for TOPS10')
+
+    BIND
+	ppn = ptr,
+	jobno = .jobno_;
+
+    IF NOT fndusr(.ppn, 0; jobno)
+    THEN
+	BEGIN
+	jobno = -1;
+	RETURN 0
+	END
+    ELSE
+	RETURN 1;
+    %FI
+    END;
+
+
+%global_routine('MX$VALIDATE_LOCAL_USER', len, namptr, pobptr) =
+    BEGIN
+    %IF %SWITCHES(TOPS20) %THEN
+    declare_jsys(rcdir,lnmst);
+
+    STACKLOCAL
+        rcbits,
+        nambuf: VECTOR[CH$ALLOCATION(max_local_user_length)];
+
+    OWN
+        logbuf: VECTOR[CH$ALLOCATION(256)];
+
+    LOCAL
+        sptr,
+        eptr,
+        ptr,
+        done,
+        err;
+
+    BIND
+        pobox = CH$PTR(UPLIT(%ASCIZ'POBOX')),
+        poboxc = CH$PTR(UPLIT(%ASCIZ'POBOX:')),
+        logptr = CH$PTR(logbuf);
+
+    IF CH$RCHAR(.namptr) EQL %C'"'
+    THEN
+        BEGIN
+        len = .len - 2;
+        namptr = CH$PLUS(.namptr,1);
+        END;
+
+    IF NOT $$lnmst($lnssy,pobox,logptr;err)     
+    THEN
+        IF .err EQL lnstx1                  !Not a logical name
+        THEN
+            CH$MOVE(7,poboxc,logptr)        !POBOX: might be a real structure
+        ELSE
+            $error( SEVERITY = $severe,
+                    FACILITY = $internal,
+                    CODE = mx$ctp,
+                    OPTIONAL_MESSAGE = $error_code,
+                    OPTIONAL_DATA = .err);
+
+    CH$TRANSLATE(uc_tab,
+                 .len, .namptr,
+                 0,
+                 .len+1, CH$PTR(nambuf));
+
+    IF CH$EQL(7,CH$PTR(UPLIT(%ASCIZ'SYSTEM')),
+              7, CH$PTR(nambuf),
+              0)
+    THEN
+        BEGIN
+        CH$MOVE(%CHARCOUNT('POBOX:<SYSTEM>') + 1,
+                CH$PTR(UPLIT(%ASCIZ'POBOX:<SYSTEM>')),
+                CH$PTR(.pobptr));
+        RETURN -1;
+        END;
+
+    eptr = sptr = logptr;
+    done = $false;
+    WHILE NOT .done DO
+        BEGIN
+        IF CH$RCHAR_A(eptr) EQL %C':'
+        THEN
+            BEGIN
+            IF CH$RCHAR(.eptr) EQL 0
+            THEN
+                done = $true
+            ELSE
+                CH$WCHAR(0,.eptr);
+
+            ptr = CH$PTR(.pobptr);
+            $nmu$text(ptr,max_string_length,'%A<%A>',.sptr,CH$PTR(nambuf));
+
+            $$rcdir(rc_emo,CH$PTR(.pobptr),0;
+                    rcbits);
+            IF ((.rcbits AND (rc_dir OR rc_nom OR rc_amb)) EQL 0)
+            THEN
+                RETURN $true;
+
+            sptr = (eptr = CH$PLUS(.eptr,1));
+            END
+        END;
+
+    RETURN $false
+    %ELSE !  Tops 10
+    STACKLOCAL
+        nambuf: VECTOR[CH$ALLOCATION(max_local_user_length)];
+
+    BIND
+	pobadr = .pobptr;
+
+![303] ADD CHECK FOR QUOTED STRING
+    IF CH$RCHAR(.namptr) EQL %C'"'
+    THEN
+        BEGIN
+        len = .len - 2;
+        namptr = CH$PLUS(.namptr,1);
+        END;
+
+    CH$WCHAR(0, CH$MOVE(.len, .namptr, CH$PTR(nambuf,0,8)));
+    RETURN (namppn(nambuf; pobadr));
+    %FI
+    END;
+
+![307] ADD PARAMETER INVFLG AND ROUTINE COMMENT
+%global_routine('MX$GET_USERNAME', uid, vflg) =   ![307]
+    BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       This routine returns an asciz string representing the userid.  On
+!   TOPS-20 this is the output of a DIRST. On TOPS-10, this is either the
+!   username from the accounting system, or his PPN converted to a string if no
+!   accounting entry exists for the PPN.  If the resulting string contains
+!   special characters, quotes are put around the offending string. An @
+!   followed by the local node name is appended to the string.
+!       In addition, MX's internal servers generate UID's that look like
+!   <-1,,ADDR> where ADDR is the address of an ASCIZ string. In this case, a
+!   copy of the asciz string beginning at ADDR will be returned.  This is used
+!   by MX's internal servers (such as MAIL-11 and SMTP) to set up appropriate
+!   log file entries.
+!
+! FORMAL PARAMETERS:
+!
+!	UID:
+!           TOPS-20: a user number/directory number suitable for DIRST or
+!                    <-1,,ADDR>
+!           TOPS-10: a PPN or <-1,,ADDR>
+!
+!       VFLG:   An address in which to return 1 if this is a valid user, and 
+!               0 otherwise.
+!
+! IMPLICIT INPUTS:
+!
+!    	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!--
+
+![303] ADD SPECIAL-CHARACTER TRANSLATION TABLE
+![306] ADD "." TO SPECIAL-CHARACTER TABLE
+    BIND
+        trntbl = CH$TRANSTABLE(special_characters('	 "(),.;<>@[\]'));
+
+![314] All the possible USERNAME strings:
+![314]  - "User Name"@NODE
+![314]  - USERNAME@NODE
+![314]  - "User Name"
+![314]  - USERNAME
+
+    BIND                                                    ![314]
+        net_quotes =     UPLIT(%ASCIZ %STRING('"%A"@%A')),  ![314]
+        net_noquotes =   UPLIT(%ASCIZ %STRING('%A@%A')),    ![314]
+        nonet_quotes =   UPLIT(%ASCIZ %STRING('"%A"')),     ![314]
+        nonet_noquotes = UPLIT(%ASCIZ %STRING('%A'));       ![314]
+
+    STACKLOCAL                                              ![314]
+        user_string;                                        ![314]
+
+    %IF %SWITCHES(TOPS20) %THEN
+    declare_jsys(dirst);
+
+    LOCAL
+        ptr,
+        nambuf: VECTOR[CH$ALLOCATION(max_string_length)],
+        tmpbuf: VECTOR[CH$ALLOCATION(max_string_length)],
+        quote,
+        len;            ![306]
+
+    .vflg = $true;      ![307] INITIALIZE VFLG TO TRUE
+
+    IF .uid LSS 0
+    THEN
+        RETURN copy_asciz(CH$PTR(.uid<0,18,0>));
+
+![306] CALCULATE LENGTH OF USERNAME AND USE IT
+    uid = .uid OR %O'500000000000';
+    $$dirst(CH$PTR(nambuf), .uid; ptr);     ![306] Save updated byte pointer
+
+    len = CH$DIFF(.ptr,CH$PTR(nambuf));     ![306]
+
+![307] SET VFLG TRUE IF VALID, FALSE OTHERWISE
+    .vflg = mx$validate_local_user(.len, CH$PTR(nambuf), tmpbuf);
+    
+![303] QUOTE THE USERNAME IF IT CONTAINS SPECIAL CHARACTERS
+    ptr = CH$PTR(tmpbuf);
+
+    CH$TRANSLATE(trntbl,
+                 .len, CH$PTR(nambuf), 0,   ![306]
+                 .len, .ptr);               ![306]
+
+    quote = CH$FIND_CH(.len,.ptr,1);
+
+![314] Pick the correct format username string
+    user_string = (IF CH$FAIL(.quote)
+                   THEN
+                   IF .nodnam NEQ 0 THEN net_noquotes
+                                    ELSE nonet_noquotes
+                   ELSE
+                       IF .nodnam NEQ 0 THEN net_quotes
+                                        ELSE nonet_quotes);
+
+    len = $nmu$text(ptr,max_string_length,'%I', ![314]Format the username
+                CH$PTR(.user_string),           ![314]The control string
+                CH$PTR(nambuf),                 ![314]The user name
+                CH$PTR(nodnam));                ![314]The node name
+
+    RETURN
+        copy_asciz(CH$PTR(tmpbuf));
+
+    %ELSE
+    STACKLOCAL
+        tmpbuf: VECTOR[CH$ALLOCATION(max_string_length)],
+        len,
+        ptr,
+	adr,
+        quote;      ![303]
+
+    .vflg = $true;  ![307] SET VFLG TRUE
+
+    IF .uid LSS 0
+    THEN
+        RETURN copy_asciz(CH$PTR(.uid<0,18,0>));
+
+    IF ppnnam(uid; adr)         !Adr contains the address of the user's profile
+    THEN
+        BEGIN
+        ptr = CH$PTR(tmpbuf);
+
+![303] QUOTE THE USERNAME IF IT CONTAINS SPECIAL CHARACTERS
+        CH$TRANSLATE(trntbl,
+                     39, CH$PTR(.adr,0,8), 0,
+                     39, .ptr);
+
+        quote = CH$FIND_CH(39,.ptr,1);
+ 
+![314] Pick the right username format...
+        user_string = (IF CH$FAIL(.quote)
+                       THEN
+                       IF .nodnam NEQ 0 THEN net_noquotes
+                                        ELSE nonet_noquotes
+                       ELSE
+                           IF .nodnam NEQ 0 THEN net_quotes
+                                            ELSE nonet_quotes);
+
+        len = $nmu$text(ptr,max_string_length,'%I', ![314]Format the username
+                    CH$PTR(.user_string),           ![314]The control string
+                    CH$PTR(.adr,0,8),               ![314]The user name
+                    CH$PTR(nodnam));                ![314]The node name
+
+	RETURN copy_string(CH$PTR(tmpbuf),
+       		           CH$LEN(CH$PTR(tmpbuf), max_string_length) + 1);
+        END
+
+![307] ADD "ELSE" CLAUSE SO THAT ALL USERS GET A STRING...
+    ELSE
+        BEGIN
+        .vflg = $false;
+        ptr = CH$PTR(tmpbuf);
+        $nmu$text(ptr,max_string_length,'"[%O,%O]"',
+            .uid<18,18,0>,
+            .uid<0,18,0>);
+        RETURN copy_asciz(CH$PTR(tmpbuf));
+        END;
+    %FI
+    END;
+
+%global_routine('MX$BUILD_REPAIR_SPEC', msg: REF message_table_entry)=
+    BEGIN
+    %IF %SWITCHES(TOPS20) %THEN
+    STACKLOCAL
+        user_buffer: VECTOR[CH$ALLOCATION(50)];
+
+    LOCAL
+        len,
+        ptr;
+
+    BIND
+        p1 = CH$PTR(UPLIT('POBOX:<')),
+        p2 = CH$PTR(UPLIT('>')),
+        ps = CH$PTR(.msg[msg_sender_string]),
+        pe = CH$PTR(.msg[msg_env_spec],3),
+        pbuf = CH$PTR(user_buffer);
+
+    ptr = CH$FIND_CH(31, ps, %C'@');
+    IF CH$FAIL(.ptr)
+    THEN
+        len = CH$LEN( ps )
+    ELSE
+        len = CH$DIFF( .ptr, ps);
+
+    CH$COPY(%CHARCOUNT('POBOX:<'),  p1,
+            .len,                   ps,
+            1,                      p2,
+            CH$LEN(pe),             pe,
+            0,
+            50,                     pbuf);
+    
+    copy_string(pbuf, CH$LEN(pbuf) + 1)
+    %ELSE
+    0
+    %FI
+    END;
+
+GLOBAL ROUTINE getdat(ptr) =
+    BEGIN
+    %IF %SWITCHES(TOPS10) %THEN
+    STACKLOCAL
+        datbuf: VECTOR[CH$ALLOCATION(30)];
+
+    LOCAL
+	ch,
+	p;
+
+    udtdat(-1,datbuf);
+    p = CH$PTR(datbuf);
+    WHILE (ch = CH$RCHAR_A(p)) NEQ 0 DO CH$WCHAR_A(.ch, ptr);
+    RETURN .ptr;
+    %ELSE 0
+    %FI
+    END;
+
+%IF %SWITCHES(TOPS10) %THEN
+%global_routine('MXUFDE', prefix, text): UFD1 NOVALUE =
+    BEGIN
+    log(.text)
+    END;
+%FI
+
+%global_routine('MX$TIME_TIL_SHUTDOWN') =
+!This routine is not yet implemented...
+    BEGIN
+    RETURN 1234567;
+    END;
+END
+ELUDOM

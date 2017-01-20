@@ -1,0 +1,719 @@
+ %TITLE 'PRRANGE - Parse a range'
+MODULE PRRANGE (
+		IDENT = '3-003'		! File: PRRANGE.B36 Edit:CJG3003
+		) =
+BEGIN
+!COPYRIGHT (c) DIGITAL EQUIPMENT CORPORATION 1981, 1988.  ALL RIGHTS RESERVED.
+!
+!THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED ONLY
+!IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH THE INCLUSION OF 
+!THE ABOVE COPYRIGHT NOTICE.  THIS SOFTWARE OR ANY OTHER COPIES THEREOF MAY 
+!NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY OTHER PERSON.  NO TITLE
+!TO AND OWNERSHIP OF THE SOFTWARE IS HEREBY TRANSFERRED.
+!
+!THE INFORMATION IN THIS SOFTWARE IS SUBJECT TO CHANGE WITHOUT NOTICE AND 
+!SHOULD NOT BE CONSTRUED AS A COMMITMENT BY DIGITAL EQUIPMENT CORPORATION.
+!
+!DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR RELIABILITY OF ITS 
+!SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+!
+!++
+! FACILITY:	EDT -- The DEC Standard Editor
+!
+! ABSTRACT:
+!
+!	Parse a range
+!
+! ENVIRONMENT:	Runs on TOPS-20 only
+!
+! AUTHOR: Chris Gill, CREATION DATE: March 15, 1983
+!
+! MODIFIED BY:
+!
+! 3-001 - Creation. CJG 15-Mar-1983
+! 3-002 - Fix "TYPE -1" so that it defaults to "TYPE .-1". CJG 9-Dec-1983
+! 3-003 - Check for control-C being typed. CJG 5-Jan-1984
+!--
+
+
+%SBTTL 'DECLARATIONS'
+
+!
+! TABLE OF CONTENTS
+!
+
+REQUIRE 'EDTSRC:TRAROUNAM';
+
+FORWARD ROUTINE
+    PA_ENDRAN : NOVALUE,		! Complete a compound range
+    EDT$$PA_RANGE;			! Parse a range specifier
+
+!
+! INCLUDE FILES:
+!
+
+REQUIRE 'EDTSRC:EDTREQ';
+
+REQUIRE 'EDTSRC:PARLITS';
+
+REQUIRE 'SYS:JSYS';
+
+!
+! EXTERNAL REFERENCES:
+!
+!	In the routines
+!
+! MACROS:
+!
+
+MACRO
+    BITS (VAL) [] =
+	+(1 ^ (VAL - 1))
+	BITS (%REMAINING) %;
+
+!
+! OWN DATA
+!
+! This table dictates which atoms are allowed to follow which other atoms.
+! The table is indexed by the number of the atom just processed and
+! consists of bits indicating which atom is legal next.
+!
+    OWN
+	RAN_NEXT_TBL : VECTOR [NUM_RAN+1] INITIAL (
+
+	    BITS (RAN_NUMBER, RAN_DOT, RAN_STR, RAN_BEGIN, RAN_END, RAN_ORIG,
+			RAN_PLUS, RAN_MINUS, RAN_LAST, RAN_BUFFER, RAN_REST,
+			RAN_BEFORE, RAN_SELECT, RAN_WHOLE, RAN_ALL),	! Start
+	    BITS (RAN_DOT, RAN_PLUS, RAN_MINUS),			! Number
+	    BITS (RAN_PLUS, RAN_MINUS),					! "."
+	    BITS (RAN_PLUS, RAN_MINUS),					! String
+	    BITS (RAN_PLUS, RAN_MINUS),					! BEGIN
+	    BITS (RAN_PLUS, RAN_MINUS),					! END
+	    BITS (RAN_PLUS, RAN_MINUS, RAN_NUMBER),			! ORIGINAL
+	    0,
+	    0,								! LAST
+	    BITS (RAN_ALL),						! BEFORE
+	    BITS (RAN_ALL),						! REST
+	    BITS (RAN_ALL),						! WHOLE
+	    0,								! SELECT
+	    BITS (RAN_NUMBER, RAN_STR, RAN_BEGIN, RAN_END,
+			RAN_LAST, RAN_BEFORE, RAN_REST,
+			RAN_WHOLE, RAN_PLUS, RAN_DOT,
+			RAN_MINUS, RAN_SELECT, RAN_ALL, RAN_ORIG),	! BUFFER
+	    BITS (RAN_NUMBER),						! "+"
+	    BITS (RAN_NUMBER, RAN_STR),					! "-"
+	    BITS (RAN_NUMBER),						! FOR
+	    BITS (RAN_NUMBER, RAN_DOT, RAN_STR, RAN_BEGIN, RAN_END,
+			RAN_PLUS, RAN_MINUS, RAN_ORIG),			! THRU
+	    0,
+	    BITS (RAN_STR),						! ALL
+	    BITS (RAN_NUMBER, RAN_DOT, RAN_STR, RAN_BEGIN, RAN_END,
+			RAN_PLUS, RAN_MINUS, RAN_ORIG)			! AND
+	    ),
+
+!+
+! RAN_SLR_NEXT has flags which are used when a single line range has
+! been completed.
+!-
+
+	RAN_SLR_NEXT : VECTOR [4] INITIAL (
+	    BITS (RAN_THRU, RAN_FOR, RAN_AND, RAN_ALL),			! Initial
+	    BITS (RAN_ALL),						! THRU
+	    BITS (RAN_ALL),						! FOR
+	    BITS (RAN_AND, RAN_ALL)					! AND
+	    );
+
+%SBTTL 'EDT$$PA_RANGE - Parse a range node'
+
+GLOBAL ROUTINE EDT$$PA_RANGE (			! Parse a range
+		LOCATION ) =			! Where to put result pointer
+
+BEGIN
+
+!+
+! FUNCTIONAL DESCRIPTION
+!
+! This subroutine is called to parse a range. Ranges may consist of
+! two parts - a single line range, and a range type (such as AND, FOR, and
+! THRU). A buffer name may, optionally, be present. Thus, the overall
+! format of a range is,
+!
+!		  { LAST   }
+!		  { SELECT }
+!		  {
+!		  { BEFORE			 }
+! [ BUFFER name ] { REST			 }
+!		  { WHOLE			 } [ ALL string ]
+!		  {	 { THRU SLR	      }  }
+!		  { SLR  { AND SLR [AND ... ] }  }
+!		  {      { FOR number         }  }
+!
+! Where, SLR refers to a single line range.
+!
+! Single line ranges can have the following format,
+!
+! { line-number }
+! { .           }  { + number     }  { + ... }
+! { BEGIN       }  {		  }  {       }
+! { END         }  { - { number } }  { - ... }
+! { string      }  {   { string } }  {       }
+! { -blank-     }
+!
+! The type of range being parsed is held in FLAGS2 and the type of atom
+! just parsed is held in PRVCMD. These are used to index the tables
+! RAN_NEXT_TBL, and RAN_SLR_NEXT which indicate which atom is allowed next.
+! This routine operates in a loop until an error is detected or an atom does
+! not parse.
+!
+! ROUTINE VALUE
+!
+!	-1 - JSYS error or next atom is disallowed
+!	0  - Reparse required
+!	+1 - All correct
+!-
+
+    EXTERNAL
+	PA_BUFRNG : REF NODE_BLOCK,
+	PA_ANDLSTHD : REF NODE_BLOCK,
+	PA_CURCMD : REF NODE_BLOCK,		! Parse node
+	PA_THRURNG : REF NODE_BLOCK,
+	PA_CURRNG : REF NODE_BLOCK,
+	PA_NUMVAL,
+	PA_ERRNO,				! Error number
+	PA_CURTOK,				! Pointer to current atom
+	PA_CURTOKLEN,				! And its length
+	CSB : VECTOR [10],
+	FD_RC1,
+	FD_RC2,
+	FD_RC3,
+	FD_RCM,
+	FD_RS1,
+	FD_RS2,
+	FD_RS3,
+	FD_RS4,
+	FD_RS5,
+	FD_R81,
+	FD_R82,
+	FD_RNM,
+	FD_RNP,
+	FD_RNA,
+	FD_RSR,
+	FD_RNS,
+	FD_RNN,
+	FD_RNG,
+	FD_RNK,
+	FD_RN8,
+	FD_RN7,
+	FD_RN6,
+	FD_RN5,
+	FD_RN4,
+	FD_RN3,
+	FD_RN2,
+	FD_RN1,
+	FD_AND,
+	FD_ANC,
+	FD_VAL,
+	FD_QST,
+	MAX_LINES,
+	LNO0 : LNOVECTOR [14],
+	CC;					! Control-C flag
+
+    EXTERNAL ROUTINE
+	EDT$$CMP_LNO,				! Compare line numbers
+	EDT$$PA_SCANTOK,			! Get atom length
+	EDT$$PA_BUFFER,				! Get buffer name
+	EDT$$PA_LINE_NUM,			! Parse aline number
+	EDT$$PA_NUMBER,				! Get a number
+	EDT$$PA_NEW_NOD,			! Create a new node
+	EDT$$PA_CRERNGNOD;			! Create a new range node
+
+    LOCAL
+	C_FLAG,					! COMND flags
+	C_DATA,					! COMND data or pointer
+	C_FDB,					! FDB used in parse
+	CMDTYP,					! Type of current range atom
+	PRVCMD,					! Save previous node type
+	FLAGS2,					! Extra flags compound ranges
+	FD_PTR,					! Pointer to current FDB
+	MORE,					! Set TRUE if more to parse
+	THRU_SEEN,				! Set TRUE if THRU keyword seen
+	FOR_SEEN,				! Set TRUE if FOR keyword seen
+	AND_SEEN,				! Set TRUE if AND keyword seen
+	FLAG;					! Flags for next node allowed
+
+
+    MESSAGES ((QUOSTRREQ, NUMVALREQ, ERRRANSPC, NUMVALILL));
+
+
+!+
+! Preset the flags and (previous) command, and parse the first atom
+!
+
+    CMDTYP = 0;
+    FLAG = .RAN_NEXT_TBL [0];
+    FLAGS2 = 0;
+    FD_PTR = FD_RNG;
+    THRU_SEEN = 0;
+    AND_SEEN = 0;
+    FOR_SEEN = 0;
+    MORE = 1;
+
+!+
+! Loop parsing range spec until error or end of specification
+!-
+
+    WHILE .MORE DO
+    BEGIN
+	IF (NOT COMMAND (.FD_PTR)) THEN RETURN (-1);
+	IF (.CC NEQ 0) THEN RETURN (-1);
+
+!+
+! Exit loop if no parse
+!-
+
+	IF ((.C_FLAG AND CM_NOP) NEQ 0) THEN EXITLOOP;
+
+!+
+! The atom parsed OK and it is time to do the appropriate thing with it.
+!-
+
+	IF ((.C_FLAG AND CM_RPT) NEQ 0) THEN RETURN (0);
+	IF (.C_FDB<0,18> EQL FD_RNG) THEN
+	    BEGIN
+
+!+
+! If a '%' was found the rescan for the keyword
+!-
+
+	    IF (NOT COMMAND (FD_RNK)) THEN RETURN (-1);
+	    IF (.CC NEQ 0) THEN RETURN (-1);
+	    IF ((.C_FLAG AND CM_NOP) NEQ 0) THEN RETURN (-1);
+	    IF ((.C_FLAG AND CM_RPT) NEQ 0) THEN RETURN (0);
+	    END;
+
+	PRVCMD = .CMDTYP;
+	CMDTYP = (SELECTONE .C_FDB<0,18> OF
+		SET
+		[ FD_RNK, FD_RNA, FD_RCM, FD_RN8, FD_RSR, FD_AND ]  : .(.C_DATA)<0,18>;
+		[ FD_RNN, FD_VAL, FD_RS5 ]  : RAN_NUMBER;
+		[ FD_RNS, FD_QST, FD_RS4 ]  : RAN_STR;
+		[ FD_RN4, FD_RNP, FD_R81, FD_RS1 ]  : RAN_PLUS;
+		[ FD_RN5, FD_RNM, FD_R82, FD_RS2 ]  : RAN_MINUS;
+		[ FD_RN6, FD_RS3 ]  : RAN_DOT;
+		[ FD_RN1, FD_RC3 ]  : RAN_FOR;
+		[ FD_RN2, FD_RC1 ]  : RAN_THRU;
+		[ FD_RN3, FD_RC2, FD_ANC ]  : RAN_AND;
+		[ FD_RN7 ]  : RAN_BUFFER;
+		TES);
+
+!+
+! If this atom was not allowed - return an error
+!-
+
+	IF ((.FLAG AND 1 ^ (.CMDTYP - 1)) EQL 0) THEN
+	    BEGIN
+	    IF ((.RAN_SLR_NEXT [.FLAGS2 <0,18>] AND 1 ^ (.CMDTYP - 1)) EQL 0) THEN
+		BEGIN
+		PA_ERRNO = EDT$_ERRRANSPC;
+		RETURN (-1);
+		END;
+	    PA_ENDRAN (.FLAGS2);
+	    END;
+	FLAG = .RAN_NEXT_TBL [.CMDTYP];
+
+!+
+! Now do the right things for each of the possible cases
+!-
+
+	CASE .CMDTYP FROM RAN_NUMBER TO NUM_RAN OF
+	    SET
+
+	[ RAN_NUMBER ] :
+
+		BEGIN
+!+
+! Set up command table for legal items which can follow
+!-
+		IF ((.THRU_SEEN) OR (.FOR_SEEN)) THEN FD_PTR = FD_RNA ELSE
+		    IF (.AND_SEEN) THEN FD_PTR = FD_AND ELSE
+			FD_PTR = FD_RCM;
+
+
+		IF ((.PRVCMD EQL RAN_PLUS) OR (.PRVCMD EQL RAN_MINUS) OR
+			(.PRVCMD EQL RAN_FOR) OR (.PRVCMD EQL RAN_ORIG)) THEN
+
+!+
+! Treat a number following +, -, ORIGINAL, or FOR as a simple number.
+!-
+
+		    BEGIN
+		    IF ((.C_DATA GEQ 2^17) OR (.C_DATA LSS 0)) THEN
+			BEGIN
+			PA_ERRNO = EDT$_NUMVALILL;
+			RETURN (-1);
+			END;
+		    PA_CURRNG [RAN_VAL] = .C_DATA;
+		    END
+		ELSE
+
+!+
+! If the previous atom was not one of these, then build a line number
+!-
+
+		    BEGIN
+		    LOCAL STS;
+		    IF ((PA_CURRNG = EDT$$PA_NEW_NOD (RANGE_NODE, .CMDTYP)) EQL 0)
+			 THEN RETURN (-1);
+		    STS = EDT$$PA_LINE_NUM (.C_DATA);
+		    IF (.STS LEQ 0) THEN RETURN (.STS);
+		    MOVELINE (PA_NUMVAL, PA_CURRNG [RAN_VAL]);
+		    END;
+		END;
+
+	[ RAN_DOT ] :
+
+		BEGIN
+!+
+! Set up command table for legal items which can follow
+!-
+		IF ((.THRU_SEEN) OR (.FOR_SEEN)) THEN FD_PTR = FD_RN8 ELSE
+		    IF (.AND_SEEN) THEN FD_PTR = FD_AND ELSE
+			FD_PTR = FD_RNP;
+
+		IF ((PA_CURRNG = EDT$$PA_NEW_NOD (RANGE_NODE, .CMDTYP)) EQL 0)
+		    THEN RETURN (-1);
+		END;
+
+	[ RAN_STR ] :
+
+		BEGIN
+		IF (.PRVCMD EQL RAN_ALL) THEN MORE = 0 ELSE
+		    IF (.THRU_SEEN) THEN FD_PTR = FD_RN8 ELSE
+			IF (.AND_SEEN) THEN FD_PTR = FD_AND ELSE
+			FD_PTR = FD_RNP;
+
+
+!+
+! Create a new node when necessary and store the pointer and length
+!-
+
+		IF ((.PRVCMD NEQ RAN_ALL) AND (.PRVCMD NEQ RAN_MINUS)) THEN
+		    IF ((PA_CURRNG = EDT$$PA_NEW_NOD (RANGE_NODE, .CMDTYP)) EQL 0)
+			THEN RETURN (-1);
+		EDT$$PA_SCANTOK (1,0);
+		PA_CURRNG [RAN_VAL] = .PA_CURTOKLEN;
+		PA_CURRNG [STR_PNT] = .PA_CURTOK;
+		IF (.PRVCMD EQL RAN_MINUS) THEN PA_CURRNG [RAN_TYPE] = RAN_MINSTR;
+		END;
+
+	[ RAN_BEGIN, RAN_END, RAN_ORIG ] :
+
+		BEGIN
+		IF ((PA_CURRNG = EDT$$PA_NEW_NOD (RANGE_NODE, .CMDTYP)) EQL 0)
+		    THEN RETURN (-1);
+		IF (.THRU_SEEN) THEN FD_PTR = FD_RN8 ELSE
+		    IF (.AND_SEEN) THEN FD_PTR = FD_AND ELSE
+			FD_PTR = FD_RNP;
+		END;
+
+	[ RAN_BEFORE, RAN_REST, RAN_WHOLE] :
+
+		BEGIN
+		IF ((PA_CURRNG = EDT$$PA_NEW_NOD (RANGE_NODE, .CMDTYP)) EQL 0)
+		    THEN RETURN (-1);
+		FD_PTR = FD_RNA;
+		END;
+
+	[ RAN_LAST, RAN_SELECT ] :
+
+		BEGIN
+		IF ((PA_CURRNG = EDT$$PA_NEW_NOD (RANGE_NODE, .CMDTYP)) EQL 0)
+		    THEN RETURN (-1);
+		MORE = 0;
+		END;
+
+	[ RAN_BUFFER ] :
+
+		BEGIN
+		LOCAL STS;
+
+!+
+! Parse a buffer name and set a flag for later
+!-
+
+		STS = EDT$$PA_BUFFER ();
+		IF (.STS LEQ 0) THEN RETURN (.STS);
+		FLAGS2 = .FLAGS2 OR F_BUFFER;
+		END;
+
+	[ RAN_FOR ] :
+
+		BEGIN
+
+!+
+! Create a new node and set some flags for later. Create a default if required.
+!-
+
+		IF (.PRVCMD EQL 0) THEN
+		    IF ((PA_CURRNG = EDT$$PA_NEW_NOD (RANGE_NODE, RAN_DOT)) EQL 0)
+			THEN RETURN (-1);
+		IF (EDT$$PA_CRERNGNOD (.CMDTYP) EQL 0) THEN RETURN (-1);
+		PA_ERRNO = EDT$_NUMVALREQ;
+		FLAGS2 <0,18> = F_FOR;
+		FOR_SEEN = 1;
+		FD_PTR = FD_VAL;
+		END;
+
+	[ RAN_PLUS, RAN_MINUS ] :
+
+		BEGIN
+
+!+
+! Create a default node if required.
+!-
+
+		IF (.PRVCMD EQL 0) THEN
+		    IF ((PA_CURRNG = EDT$$PA_NEW_NOD (RANGE_NODE, RAN_DOT)) EQL 0)
+			THEN RETURN (-1);
+		IF (EDT$$PA_CRERNGNOD (.CMDTYP) EQL 0) THEN RETURN (-1);
+		FD_PTR = FD_VAL;
+		END;
+
+	[ RAN_THRU ] :
+
+		BEGIN
+
+!+
+! Create a new node and set a flag for later. Create a default if required.
+!-
+
+		IF (.PRVCMD EQL 0) THEN
+		    IF ((PA_CURRNG = EDT$$PA_NEW_NOD (RANGE_NODE, RAN_DOT)) EQL 0)
+			THEN RETURN (-1);
+		IF ((PA_THRURNG = EDT$$PA_NEW_NOD (RANGE_NODE, 0)) EQL 0)
+		    THEN RETURN (-1);
+		PA_THRURNG [RANGE1] = .PA_CURRNG;
+		FLAGS2 <0,18> = F_THRU;
+		FD_PTR = FD_RSR;
+		THRU_SEEN = 1;
+		END;
+
+	[ RAN_ALL ] :
+
+		BEGIN
+		LOCAL
+		    SUB : REF NODE_BLOCK;
+
+!+
+! Complete any compound range outstanding and clear the flag.
+! Then link the new range with the previous one
+!-
+
+		PA_ENDRAN (.FLAGS2);
+		FLAGS2 <0,18> = 0;
+		IF (.PRVCMD EQL 0) THEN
+		    IF ((PA_CURRNG = EDT$$PA_NEW_NOD (RANGE_NODE, RAN_WHOLE)) EQL 0)
+			THEN RETURN (-1);
+		SUB = .PA_CURRNG;
+		IF ((PA_CURRNG = EDT$$PA_NEW_NOD (RANGE_NODE, .CMDTYP)) EQL 0)
+		    THEN RETURN (-1);
+		PA_CURRNG [NEXT_RANGE] = .SUB;
+		SUB [PREV_RANGE] = .PA_CURRNG;
+		PA_ERRNO = EDT$_QUOSTRREQ;
+		FD_PTR = FD_QST;
+		END;
+
+	[ RAN_AND ] :
+
+!+
+! Keep track of the current range for later linking
+!-
+
+		BEGIN
+		IF (.PRVCMD EQL 0) THEN
+		    BEGIN
+		    PA_ERRNO = EDT$_ERRRANSPC;
+		    RETURN (-1);
+		    END;
+		PA_ANDLSTHD = .PA_CURRNG;
+		FLAGS2 <0,18> = F_AND;
+		AND_SEEN = 1;
+		FD_PTR = FD_RSR;
+		END;
+
+	[ INRANGE ] :
+
+		;
+
+	    TES;
+
+    END;
+
+!+
+! Here when error parsing or logical end of specification reached
+!  Complete specification and return
+!-
+
+
+!+
+! If a buffer name was supplied, link it in now unless the last atom
+! should have had something following it.
+!-
+
+    SELECTONE .CMDTYP OF
+	SET
+
+    [ 0 ] :
+
+	BEGIN
+
+!+
+! This is a null range - make sure it is stored as such.
+!-
+
+	IF ((PA_CURRNG = EDT$$PA_NEW_NOD (RANGE_NODE, RAN_NULL)) EQL 0)
+	    THEN RETURN (-1);
+
+	IF (.LOCATION EQL 1) THEN
+	    PA_CURCMD [RANGE1] = .PA_CURRNG
+	ELSE
+	    PA_CURCMD [RANGE2] = .PA_CURRNG;
+	RETURN (1);
+	END;
+
+    [ RAN_FOR ] :
+
+	RETURN (-1);
+
+    [ RAN_ALL ] :
+
+	RETURN (-1);
+
+    [ RAN_THRU ] :
+
+	IF ((PA_CURRNG = EDT$$PA_NEW_NOD (RANGE_NODE, RAN_DOT)) EQL 0)
+	    THEN RETURN (-1);
+
+    [ RAN_BUFFER ] :
+
+	BEGIN
+
+!+
+! This is a null range - make sure it is marked as such
+!-
+
+	IF ((PA_CURRNG = EDT$$PA_NEW_NOD (RANGE_NODE, RAN_NULL)) EQL 0)
+	    THEN RETURN (-1);
+
+	IF (.LOCATION EQL 1) THEN
+	    PA_CURCMD [RANGE1] = .PA_CURRNG
+	ELSE
+	    PA_CURCMD [RANGE2] = .PA_CURRNG;
+	END;
+		
+    [ OTHERWISE ] :
+
+	;
+
+	TES;
+
+    PA_ENDRAN (.FLAGS2);
+    IF ((.FLAGS2 AND F_BUFFER) NEQ 0) THEN
+	BEGIN
+	IF (.PA_BUFRNG NEQ .PA_CURRNG) THEN PA_BUFRNG [RANGE1] = .PA_CURRNG;
+	PA_CURRNG = .PA_BUFRNG;
+	END;
+
+!+
+! Finally, link the range to the command
+!-
+
+    IF (.LOCATION EQL 1) THEN
+	PA_CURCMD [RANGE1] = .PA_CURRNG
+    ELSE
+	PA_CURCMD [RANGE2] = .PA_CURRNG;
+    RETURN (1);
+
+END;
+
+%SBTTL 'PA_ENDRAN - Complete a compound range'
+
+ROUTINE PA_ENDRAN (
+		FLAG) : NOVALUE = 
+
+!+
+! FUNCTIONAL DESCRIPTION
+!
+! This routine tidies up the compound range which was being evaluated last.
+! If no such range was in the command, then the right half of FLAG will
+! be zero. The tidy-up operation depends on the type of compound range
+! being processed.
+!
+
+
+BEGIN
+
+    EXTERNAL
+	PA_THRURNG : REF NODE_BLOCK,
+	PA_ANDLSTHD : REF NODE_BLOCK,
+	PA_CURRNG : REF NODE_BLOCK;
+
+	BEGIN
+
+!+
+! Complete the previous compound range node before continuing
+!-
+
+	    CASE .FLAG<0,18> FROM F_SLR TO F_AND OF
+		SET
+
+	    [ F_SLR ] :
+
+		;				! Nothing to do
+
+	    [ F_THRU ] :
+
+		BEGIN
+
+!+
+! Link the THRU range node in
+!-
+
+		PA_THRURNG [RAN_TYPE] = RAN_THRU;
+		IF (.PA_CURRNG NEQ .PA_THRURNG) THEN
+		    PA_THRURNG [RANGE2] = .PA_CURRNG;
+		PA_CURRNG = .PA_THRURNG;
+		END;
+
+	    [ F_FOR ] :
+
+		;				! Nothing to do
+
+	    [ F_AND ] :
+
+		BEGIN
+		LOCAL ARANGE : REF NODE_BLOCK;
+		ARANGE = .PA_ANDLSTHD;
+
+!+
+! Find the last range so we can add the new one to the end
+!-
+
+		WHILE (.ARANGE [NEXT_RANGE] NEQA 0) DO
+		    ARANGE = .ARANGE [NEXT_RANGE];
+
+		ARANGE [NEXT_RANGE] = .PA_CURRNG;
+		PA_CURRNG [PREV_RANGE] = .ARANGE;
+		PA_CURRNG = .PA_ANDLSTHD;
+		END;
+
+		TES;
+
+	RETURN (1);
+	END;
+
+END;
+
+END
+ELUDOM

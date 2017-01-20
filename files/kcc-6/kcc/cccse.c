@@ -1,0 +1,1048 @@
+/*	CCCSE.C - Peephole Optimizer - fold common subexpressions
+**
+**	(c) Copyright Ken Harrenstien 1989
+**		All changes after v.136, 31-Mar-1988
+**	(c) Copyright Ken Harrenstien, SRI International 1985, 1986
+**		All changes after v.97, 8-Aug-1985
+**
+** Original version by David Eppstein / Stanford University / 30-Jul-84
+*/
+
+#include "cc.h"
+#include "ccgen.h"
+
+/* Local prototypes */
+#ifdef __STDC__
+#define P_(a) a
+#else
+#define P_(a) ()
+#endif
+
+static int cseinit P_((int r,PCODE *p,int safedouble));
+static int findcse P_((int r,PCODE *p,int safedouble));
+static int match P_((PCODE *q,int op));
+static int safematch P_((PCODE *q,int op));
+static int stktop P_((PCODE *p));
+static int chgpush P_((PCODE *p));
+static void flushreg P_((int r));
+static void flushtarget P_((int i));
+static int flushalias P_((PCODE *q));
+
+#undef P_
+
+#define	MAXCSE	10			/* how many ops we will look at */
+
+static PCODE *target[MAXCSE];		/* target op pointers for subexpr */
+static int
+    maxcse,		/* how many ops in subexpr (# ptrs in target[]) */
+    stkoffset,		/* offset in stk from target */
+    maxflush,		/* how far to flush ops */
+    jumped,		/* Flag: found a jump, can't fold P_ILDB */
+    ismod[MAXCSE],	/* P_IDIV used as mod rather than div */
+    regret[NREGS],	/* What reg to return if we match */
+    matchedto[NREGS],	/* Register match machines
+			** Contains index into target[].  -1 if none.
+			*/
+    isindex[NREGS];	/* Contains index into target[].  -1 if reg never
+			** used as an index reg, else "earliest each
+			** reg is used as index".
+			*/
+    /*
+    ** Isindex contains the earliest each register is used
+    ** as an index.  If an opcode changes that register
+    ** we must flush matches for all registers not that far.
+    **
+    ** Maxflush contains the latest use of the register we are
+    ** matching in another op.  It controls how far back we can
+    ** go in dropping the opcodes making the redundant expression.
+    **
+    ** Jumped is true if we have stepped back over some conditional
+    ** jump instruction.  If this is the case then we can't fold
+    ** P_IBP + P_LDB into P_ILDB.
+    */
+#if 0
+	/* Overview of how findcse works (from David Eppstein) */
+      - In the first loop it goes back through the peephole buffer and
+	builds up a list of instructions that taken together calculate
+	the value in the target register (the one given it as an
+	argument).  In this case the list will just be the LDB.
+
+      - For each other register that can hold a computed value, in
+	parallel and with the state of each parallel computation held
+	in what is called in the comments a register match machine,
+	it goes back through the peephole buffer and sees if the
+	instructions which calculate the value in that other register
+	match the built up list of instructions.  This is the big loop.
+
+      - If we ever get such a match, then the built up list of
+	instructions for the target register value is not necessary,
+	because we can instead copy the value in the matching register
+	and it will be the same.  This is the common subexpr elimination.
+	The redundant instructions will be removed from the buffer and
+	the register containing the result will be the return value.
+	The caller might emit a MOVE or might just use that register.
+
+      - If all machines don't match, i.e. they find an instruction
+	which is part of how the value in their result registers was
+	calculated but which isn't part of how the target value was
+	calculated, then we know that the target value is not a common
+	subexpression so we have to keep its calculation (and return
+	zero to show that we are still using the old register).
+
+      - If we get to the beginning of the peephole buffer without any
+	machine matching then again there is no common subexpression.
+
+Building the target calculation instruction list (the first loop) should
+be pretty straightforward.  The second and longer loop is where the
+match machines go about their work.  Actually what happens is that we
+look at each instruction and there will usually be only one register
+changed, so only one match machine needs to be activated.  If the
+instruction changing the register is the same as the one the machine
+expects then the machine advances to the next instruction in the list;
+if it doesn't match the machine aborts.  Most of the state of each
+machine can be found in matchedto[], which says which instruction it
+wants to see next or whether it's aborted.
+
+One complication is that we have to tell whether a register used as an
+index was not changed between the machine's calculation's use of it
+and the target calculation's use.  This information is kept in isindex[].
+Isindex[reg] is the pointer to the earliest use of that register in
+the target calculation; if any machines are not yet that far back when
+we see an instruction changing that reg then all those machines are aborted.
+There is a possible bug here if the same register is used twice as an
+index in the target calculation, with a change to it in between the
+two uses; if this situation happens the first loop that builds the
+target calculation instruction list should abort because the second
+loop can't handle this, but I don't know whether it currently does.
+Something that probably hasn't come up but might be made to with
+sufficiently tricky code.  You should check this anyway (not that it
+is related to your current bug).
+
+Another complication is that, because of IDIVI, the register that a
+machine wakes up on is not always the same as the one it uses as the
+common subexpression value after a successful match.  There is another
+array that keeps track of this information (I forget the name).
+
+Yet another complication is to take care of instructions that can be
+skipped over.  There is a SKIPPED field in the address mode type of
+each instruction which the code should be looking at (I am pretty sure
+it does but it's been a while).
+
+The minor function of findcse was that it turned out to be convenient
+to put ILDB folding there.  LDB folding only happens when there is a
+single LDB (or DPB) as the target calculation.  If we find a matching
+LDB first, this is just a common subexpression like any other.  But if
+we find an IBP, then we want to turn both instructions into an ILDB.
+Currently there is one thing which inhibits this, the jumped flag.  If
+we move back across a jump out of the peephole buffer, this is not a
+problem for common subexpressions but you don't want to pull the IBP
+across the jump because then it won't happen if the jump gets taken.
+
+#endif
+
+/*
+** Fold common subs into changereg
+** Can't handle P_IDIV because looks at op to determine reg
+*/
+
+void
+foldmove(p)
+PCODE *p;
+{
+    int r = p->Preg, s;
+    if (p->Pop == P_IDIV || p->Pop == P_UIDIV) return;
+    if (s = findcse(r, p, 0))
+	code00(P_MOVE, r, s);
+}
+
+/*
+** Ditto for P_IDIV, needs register argument to tell what to fold.
+** We take the register as a vreg for caller's convenience, but it must
+** be an active register.
+*/
+
+int
+folddiv(vr)
+VREG *vr;
+{
+    int r = vrreal(vr), s;
+    if (s = findcse(r, previous, 0))
+	code00(P_MOVE, r, s);
+}
+
+
+
+#if 0
+/*
+** Return result of folding out common sub
+** Used for folding cse's out of index registers
+*/
+
+int
+foldcse(r, p)
+PCODE *p;
+{
+    int s;
+
+    if (s = findcse(r, p, 1))	/* look for match */
+	return s;		/* success, return folded reg */
+    return r;			/* failure, return old one */
+}
+#endif
+
+/* FOLDIDX - Assumes given instruction uses an index reg.
+**	Attempts to find a CSE reg with the same value, and if so
+**	flushes the index reg calculation and changes the index reference
+**	to use the existing reg.
+**	Doesn't pay attention to whether phys regs are still assigned to
+**	virtual regs (assumes that index reg, once used, isn't needed again).
+*/
+void
+foldidx(p)
+PCODE *p;
+{
+    int s;
+
+    if (s = findcse(p->Pindex, before(p), 1))	/* Look for match to index */
+	p->Pindex = s;		/* Won, set new index reg */
+}
+
+/* FOLDRCSE - Folds a CSE paying no attention to whether phys regs are
+**	still assigned to virtual regs or not.
+**	Returns phys register # containing value, or 0 if no folding done.
+*/
+int
+foldrcse(r, p)
+PCODE *p;
+{
+    return findcse(r, p, 1);
+}
+
+/* CSEINIT - auxiliary for FINDCSE to set things up
+*/
+static int
+cseinit(r, p, safedouble)
+PCODE *p;
+{
+    PCODE *q;
+    int i, sideeffect;
+
+    /*
+    ** Do some preliminary initialization of variables.
+    **
+    */
+
+    for (i = 0; i < NREGS; i++) isindex[i] = -1;
+    maxflush = -1;			/* can't flush anything yet */
+    jumped = 0;				/* haven't stepped over a jump */
+    sideeffect = 0;			/* don't depend on side effects yet */
+
+    /*
+    ** We search through the peephole buffer twice; once
+    ** to discover the expression we want to match, and
+    ** once to match it.  We do the former now.
+    */
+
+    maxcse = 0;				/* start at top of cse list */
+    q = p;				/* and top of code */
+    while (1) {				/* until we break out */
+	if (q == NULL) return 0;	/* if had to stop, give up */
+
+	/*
+	** Look at the opcode of each instruction as we go back,
+	** to make sure it is one we understand.  If the register
+	** is the one we are folding, remember the op and if it
+	** determined completely the register, stop there.
+	**
+	** We also stop for P_DPB, so we can fold P_IBP+P_DPB into P_IDPB.
+	** (NO LONGER DONE -- DPB is a mem change! -- KLH)
+	*/
+
+	switch (q->Pop) {
+	case P_FADR:	case P_FSBR:	case P_FMPR:	case P_FDVR:
+	case P_ADD:	case P_IMUL:	case P_SUB:	case P_AND:
+	case P_IOR:	case P_XOR:	case P_ADJBP:	case P_LSH:
+	case P_IDIV:	case P_UIDIV:
+	    i = 0;			/* not final */
+	    break;			/* go handle */
+
+	case P_MOVE:	case P_LDB:
+	case P_MOVN:	case P_SETCM:	case P_SETO:	case P_SETZ:
+	case P_HRRZ:	case P_HLRZ:	case P_HRRE:	case P_HLRE:
+	case P_FIX:	case P_FLTR:
+	    i = 1;			/* this will be the last */
+	    break;			/* go handle */
+
+	default:
+	    return 0;			/* unknown op, give up */
+	}
+
+	/*
+	** If we got this far we approve of the opcode.  Variable
+	** i contains 1 if this will be the last op to examine.
+	** It must be maintained for many lines until used.
+	** We take this opportunity to set maxflush.
+	*/
+
+	if ((q->Pop & POF_BOTH)		/* don't go past mem change */
+	  || (popflg[q->Pop&POF_OPCODE]&PF_MEMCHG))
+		return 0;
+
+	if ((q->Pop == P_IDIV || q->Pop == P_UIDIV) && q->Preg == r - 1) {
+	    r--;			/* division used for modulus */
+	    ismod[maxcse] = 1;		/* change target reg and remember so */
+	} else ismod[maxcse] = 0;	/* otherwise don't remember as mod */
+
+	if (maxflush < 0 && q->Preg != r) switch (q->Ptype & PTF_ADRMODE) {
+	case PTA_BYTEPOINT:
+	case PTA_MINDEXED:
+	    if (q->Pindex == r) maxflush = maxcse;
+				/* inst. depends on target register? */
+	    if (q->Pindex == (r + 1)) sideeffect++;
+				/* inst. depends on side effects? */
+	    break;
+	case PTA_REGIS:
+	    if (q->Pr2 == r) maxflush = maxcse;
+				/* inst. depends on target register? */
+	    if (q->Pindex == (r + 1)) sideeffect++;
+				/* inst. depends on side effects? */
+	}
+
+	/*
+	** If the register of the opcode is not what we are looking for,
+	** the op is irrelevant and we can now safely ignore it.
+	*/
+
+	if (q->Preg != r) {		/* irrelevant op? */
+	    q = before (q);		/* yes, skip over */
+	    continue;			/* and try for more */
+	}
+
+	/*
+	** Check for dependency on side effects. If a previous
+	** instruction depends on the side effects of this instruction
+	** (IDIV/UIDIV), then we can't flush this instruction.
+	*/
+
+	if ((maxflush < 0) && sideeffect
+	    && ((q->Pop == P_IDIV) || (q->Pop == P_UIDIV)))
+	  maxflush = maxcse;
+
+	/*
+	** Now we must make sure the pseudo-op type is acceptible.
+	** For instance, we can not accept PTA_REGIS operations.
+	** We also take this opportunity to note index registers needed.
+	**
+	** Note we don't mask out PTF_SKIPPED or POF_BOTH before switching.
+	*/
+
+	switch (q->Ptype) {
+	case PTA_REGIS:
+	    isindex[q->Pr2] = maxcse + 1; /* treat mem reg as index */
+	    break;
+
+	case PTA_BYTEPOINT:
+	case PTV_IINDEXED:
+	case PTA_MINDEXED:
+	    isindex[q->Pindex] = maxcse + 1;	/* extract index register */
+	    break;				/* accept */
+
+	case PTV_IMMED:
+	case PTA_ONEREG:
+	case PTA_FCONST:
+	case PTA_DCONST:
+	case PTA_DCONST1:
+	case PTA_DCONST2:
+	    break;
+
+	default:
+	    return 0;
+	}
+
+	/*
+	** An opcode making it this far has also passed the opcode type test.
+	** Add it to the codes we are looking to match and either continue
+	** looking for such ops or break out now that we are done looking.
+	*/
+
+	target[maxcse++] = q;		/* remember op we found */
+	if (i) break;			/* break out of while loop */
+	if (maxcse >= MAXCSE) return 0;	/* too much, give up */
+	q = before (q);			/* or skip back and try for more */
+    }					/* end while(1) */
+
+    /*
+    ** We have discovered complete expression, now set up register
+    ** match machines.  If a register is still assigned, we ignore it
+    ** to save later confusion in code generation.
+    */
+    for (i = 0; i < NREGS; i++) {
+	if ((rfree(i) || safedouble) && isindex[i] < 0)
+	    matchedto[i] = 0;	/* OK to check this reg, set initial match */
+	else matchedto[i] = -1;	/* Not OK, don't use it */
+
+/*
+	if ((!rfree(i) && !safedouble) || isindex[i] >= 0)
+	    matchedto[i] = -1;
+	else matchedto[i] = 0;
+*/
+	regret[i] = i;			/* reg starts returning self */
+    }
+    if (isindex[r] >= 0)	/* If R used (as index) in its own */
+	return 0;		/* calculation, give up... */
+    matchedto[r] = 0;		/* OK to re-use main reg */
+
+    if (maxflush < 0) maxflush = maxcse; /* remember top flush margin */
+    else if (maxflush == 0) return 0;	/* If nothing to flush, give up */
+    isindex[0] = isindex[R_SP] = -1;	/* ignore zero as index */
+    stkoffset = 0;			/* no stack hackery yet */
+    return 1;				/* OK, say target is ready! */
+}
+
+/* FINDCSE() - Fold common subexpressions
+*/
+
+static int
+findcse(r, p, safedouble)
+PCODE *p;
+{
+    PCODE *q;
+    int i, flushfound;
+
+    if (!cseinit(r, p, safedouble))
+	return 0;
+
+    /*
+    ** Now all the preliminaries are done, we can go look for a match.
+    ** We go back through all the ops, advancing the state machine of
+    ** the register of the op until we find a complete match.
+    ** This is the second loop and the big one.
+    */
+
+    q = p;				/* start again */
+    flushfound = 0;			/* haven't found flushes yet */
+    while (1) {				/* until we match or give up */
+	if (q == NULL) return 0;	/* nothing there, give up */
+	if (flushfound < maxflush && target[flushfound] == q) {
+	    flushfound++;		/* going to go away, move marker on */
+	    q = before (q);		/* ignore this one */
+	    continue;			/* try something more substantial */
+	}
+
+	switch (q->Pop & (POF_OPCODE | POF_BOTH)) {
+
+	/*
+	** Byte instructions.  P_LDB doesn't change memory, but the
+	** rest do (the pointer, the contents, or both).
+	** We also handle folding P_IBP + P_LDB => P_ILDB here.
+	*/
+
+	case P_LDB:
+	    if (r = safematch (q, P_LDB)) break; /* matched, return */
+	    q = before (q);		/* not, back one */
+	    continue;			/* and try again */
+
+	case P_DPB:
+	    if (q == target[0]) {	/* are we looking for P_IDPB fold? */
+		q = before (q);		/* yes, just skip over the P_DPB */
+		continue;		/* and look for a real match */
+	    }
+	case P_IDPB:
+	    /* This used to drop through to the ILDB case.  However, this
+	    ** caused lossage because it's unsafe to assume that the DPB
+	    ** operand is correctly masked off, thus the register contents
+	    ** don't necessarily correspond to what an LDB would get.  Someday
+	    ** this could be improved to check for masking instructions.
+	    */
+	    return 0;
+
+	case P_ILDB:
+	    if (match (q, P_LDB)) {
+		r = q->Preg;		/* matched, set reg */
+		break;			/* and return success */
+	    }
+	    if (flushalias (q)) return 0;
+	    q = before (q);		/* back up */
+	    continue;			/* and try again */
+
+	case P_IBP:
+
+/* Bug here, the sequence
+**		IBP x ? MOVEM x,addr ? LDB r,x
+** becomes zapped into
+**		MOVEM x,addr ? ILDB r,x
+** which is real wrong.
+** Until this is figured out and protected against, we enforce a
+** restriction that the IBP must immediately precede the DPB/LDB.
+*/
+	    if (match (q, P_IBP)) switch(target[0]->Pop) {
+	    case P_LDB:			/* turn P_IBP x + P_LDB R,x */
+/* Temp fix */	if (q != before(target[0]))
+/* Temp fix */	    break;
+		target[0]->Pop = P_ILDB;	/* into P_ILDB R,x */
+		q->Pop = P_NOP;
+		return 0;
+	    case P_DPB:			/* same with P_DPB */
+/* Temp fix */	if (q != before(target[0]))
+/* Temp fix */	    break;
+		target[0]->Pop = P_IDPB;
+		q->Pop = P_NOP;
+		return 0;
+	    }
+
+	    if (flushalias (q)) return 0;
+	    q = before (q);		/* back up */
+	    continue;			/* try again */
+
+	/*
+	** Binary operations.  If they are not of type POF_BOTH, then
+	** they must match the individual op, and if it matches
+	** keep looking for the instruction before that in the sequence.
+	**
+	** If they are POF_BOTH explicitly or implicitly, then they can
+	** only match a P_MOVE, and we have to be careful about mem changes.
+	*/
+
+	case P_DFMP:	case P_DFDV:	case P_DFSB:	case P_DFAD:
+	case P_DMOVE:	case P_DMOVN:
+	    flushreg(q->Preg + 1);
+	case P_FADR:	case P_FSBR:	case P_FMPR:	case P_FDVR:
+	case P_ADD:	case P_IMUL:	case P_SUB:
+	case P_IDIV:	case P_UIDIV:
+	case P_AND:	case P_IOR:	case P_XOR:
+	case P_TRO:   	case P_TRZ:   	case P_TRC:
+	case P_TDO:   	case P_TDZ:   	case P_TDC:
+	case P_ADJBP:	case P_LSH:
+	    if (r = safematch(q, q->Pop))
+		matchedto[r]++;
+	    q = before (q);		/* whether or no success, back one */
+	    continue;			/* and try again */
+
+	case P_SETO+POF_BOTH:	case P_SETZ+POF_BOTH:
+	    if (r = match (q, q->Pop &~ POF_BOTH)) break;
+	case P_MOVEM:	case P_DMOVEM:
+	case P_AOS:   	case P_SOS:
+	case P_MOVN+POF_BOTH:	case P_MOVM+POF_BOTH:
+	case P_ADD+POF_BOTH:	case P_IMUL+POF_BOTH:
+	case P_FADR+POF_BOTH:	case P_FSBR+POF_BOTH:
+	case P_FMPR+POF_BOTH:	case P_FDVR+POF_BOTH:
+	case P_XOR+POF_BOTH:	case P_IOR+POF_BOTH:	case P_AND+POF_BOTH:
+	case P_SETCM+POF_BOTH:
+	case P_IDIV+POF_BOTH:
+	    if (r = match (q, P_MOVE)) break; /* matched, set reg and return */
+	    if (flushalias (q)) return 0;
+	    if (q->Pop != P_MOVEM) flushreg (q->Preg);
+	    if (q->Pop == P_DMOVEM) flushreg (q->Preg + 1);
+	    q = before (q);		/* back one */
+	    continue;			/* and try again */
+
+	/*
+	** Unary operations.  These are treated the same as binary ops,
+	** except that a successful match means we have found the whole
+	** common subexpression.
+	*/
+
+	case P_SETCM:	case P_MOVN:	case P_SETO:	case P_SETZ:
+	case P_HRRZ:	case P_HLRZ:	case P_HRRE:	case P_HLRE:
+	case P_FIX:	case P_FLTR:
+	    if (r = safematch (q, q->Pop)) break; /* matched, return */
+	    q = before (q);		/* move back */
+	    continue;			/* try again */
+
+	case P_HRRM:
+	case P_HRLM:
+#if 0
+	/*
+	** This code removed July 24, 1993 by R. Helliwell.
+	** Same logic applies as above at P_IDPB.
+	** It is unsafe to assume that the argument to HRRM/HRLM
+	** has been correctly masked off, thus the register contents
+	** don't necessarily correspond to what a HRRZ/HLRZ would get.
+	*/
+	    if (match (q, (q->Pop == P_HRRM)? P_HRRZ : P_HLRZ)) {
+		r = q->Preg;
+		break;
+	    }
+	    if (flushalias (q)) return 0;
+	    flushreg (q->Preg);
+	    q = before (q);
+	    continue;
+#endif
+	    return 0;
+
+	/*
+	** Simple moves.  The moves cause the subexpression finder to
+	** succeed as above with the unary operations.
+	**
+	** The !dropsout(q) check is in case this is a P_SKIPA to a P_JRST
+	** or P_POPJ, in which case it would still be safe to check for a match
+	** but we don't want deadjump() spoiling a perfectly good register
+	** when we find that there isn't the match we want.
+	*/
+
+	case P_SKIP:
+	    if (q->Pop == P_SKIP+POF_ISSKIP+POS_SKPE && dropsout (after (q)) &&
+		(r = match (q, P_SETZ))) break; /* P_SKIPE+P_JRST leaves 0 in reg */
+	case P_MOVE:
+	    if (!dropsout (q) && (r = safematch (q, P_MOVE))) break;
+	    q = before (q);		/* not, move back */
+	    continue;			/* try again */
+
+	/*
+	** Jumps.  These cause the flow of control to split, so we can't
+	** pull P_IBPs across them.  Also, we remember unconditional jumps
+	** in case they are preceded by a P_CAME or cascaded P_SKIP.
+	*/
+
+	case P_JRST: case P_POPJ: case P_JUMP:
+	    if (q->Pop == P_JUMP+POS_SKPN && (r = match (q, P_SETZ))) break;
+	    jumped = 1;			/* can't fold P_IBP before here */
+	    q = before (q);		/* move back */
+	    continue;
+
+	case P_AOJ: case P_SOJ:
+	    if ((q->Pop & POF_OPSKIP) == POS_SKPN && (r = match (q, P_SETZ))) break;
+	    jumped = 1;			/* this is a jump */
+	    flushreg (q->Preg);		/* we can't deal with the reg change */
+	    q = before (q);		/* so just move back */
+	    continue;			/* and try again */
+
+	/*
+	** We handle here P_PUSH and P_ADJSP, which effectively change only the
+	** stack pointer.
+	*/
+	case P_PUSH:
+	    if (r = match (q, P_MOVE)) break; /* register pushed matches 0(17) */
+	    if (chgpush (q))		/* change refs to here into pushed x */
+		return findcse (target[0]->Preg, p, safedouble); /* retry */
+	    stkoffset++;		/* remember change to stack */
+	    q = before (q);		/* move back */
+	    continue;			/* try for another */
+
+	case P_ADJSP:
+	    stkoffset += q->Pvalue;	/* remember change to stack */
+	    q = before (q);		/* move back */
+	    continue;			/* try for another */
+
+	/*
+	** Comparisons
+	**
+	** We already did P_SKIP; these ones don't change their register.
+	** But if we are past a P_CAME / P_JRST, we know the P_CAME skipped
+	** and therefore the register contains the value compared to.
+	*/
+
+	case P_CAI: case P_CAM:
+	    if (dropsout (after (q)) && (q->Pop & POF_OPSKIP) == POS_SKPE &&
+		match (q, P_MOVE)) {	/* P_CAME+P_JRST is like P_MOVE */
+		r = q->Preg;		/* (except that reg not munged) */
+		break;
+	    }
+	case P_TRN: case P_TDN:
+	    q = before (q);		/* innocuous op, move back */
+	    continue;			/* and look for more */
+
+	default:
+	    return 0;			/* unknown op, give up */
+	}
+	break;				/* propagate escape */
+    }
+
+    /*
+    ** Here when we've found a complete match.  The register containing
+    ** the match is now in R instead of the initial register.
+    ** Eliminate the old ops and return success.
+    */
+
+    for (i = 0; i < maxflush; i++) target[i]->Pop = P_NOP; /* drop op */
+    fixprev();				/* update previous from drop */
+    return regret[r];			/* return the successful register */
+}
+
+/*
+** Test two instructions to see if they refer to the same place
+*/
+int
+sameaddr(p, q, stkoffset)
+PCODE *p, *q;
+{
+    if ( (p->Ptype &~ (PTF_IMM + PTF_SKIPPED))
+      != (q->Ptype &~ (PTF_IMM + PTF_SKIPPED)))
+	return 0;
+    switch (p->Ptype & PTF_ADRMODE) {
+    case PTA_REGIS:
+	return (p->Pr2 == q->Pr2);
+
+    case PTA_BYTEPOINT:
+	if (p->Pbsize != q->Pbsize) return 0;
+    case PTA_MINDEXED:
+	if ((p->Ptype & PTF_IMM) != (q->Ptype & PTF_IMM)) return 0;
+	if (p->Pindex != q->Pindex || p->Pptr != q->Pptr) return 0;
+	if (p->Pindex == R_SP) return (p->Poffset == q->Poffset - stkoffset);
+	else return (p->Poffset == q->Poffset);
+
+    case PTA_FCONST:
+	return (p->Pfloat == q->Pfloat);
+
+    case PTA_DCONST:
+	return (p->Pdouble == q->Pdouble);
+    case PTA_DCONST1:
+	return (p->Pdouble1 == q->Pdouble1);
+    case PTA_DCONST2:
+	return (p->Pdouble2 == q->Pdouble2);
+
+    case PTA_RCONST:
+	return (p->Pvalue == q->Pvalue);
+    case PTA_PCONST:
+	return (   p->Pptr == q->Pptr
+		&& p->Pbsize == q->Pbsize
+		&& p->Poffset == q->Poffset);
+
+    case PTA_ONEREG:
+	return 1;
+    default:
+	int_error("sameaddr: bad Ptype");
+	return 0;
+    }
+}
+
+/*
+** See if two ops can possibly refer to the same place
+**
+** We know they aren't exactly the same address, but maybe they're
+** aliases of each other, in which case we want to know so we can
+** be careful around ops that change memory.
+*/
+int
+alias (p, q, soff)
+PCODE *p, *q;
+int soff;		/* Stack offset */
+{
+    int pt, qt;
+
+    /* Only need to check further if both instrs reference memory */
+    if ( (  (p->Ptype&PTF_ADRMODE) == PTA_BYTEPOINT
+	 || (p->Ptype&PTF_ADRMODE) == PTA_MINDEXED)
+      && (  (q->Ptype&PTF_ADRMODE) == PTA_BYTEPOINT
+	 || (q->Ptype&PTF_ADRMODE) == PTA_MINDEXED)) {
+	pt = p->Ptype;
+	qt = q->Ptype;
+
+	/* Duplicate sameaddr() checking here, since we want to test
+	** for either a PTA_MINDEXED and PTA_BYTEPOINT reference, and
+	** sameaddr() only does this if both are the same type.
+	*/
+	if (p->Pindex == q->Pindex && p->Pptr == q->Pptr) {
+	    if (p->Pindex == R_SP) {
+		if (p->Poffset == (q->Poffset - soff))
+		    return 1;		/* Same location on stack */
+	    } else if (p->Poffset == q->Poffset)
+		return 1;
+	}
+
+	/* If either has the indirect bit set, give up. */
+	if ((pt | qt) & PTF_IND) return 1;	/* May alias */
+
+#if 0 /* Old stuff, flush */
+	/* P_XMOVEI != P_MOVEM != P_DPB */
+	if ( (q->Ptype &~ (PTF_IMM + PTF_SKIPPED))
+	  != (p->Ptype &~ (PTF_IMM + PTF_SKIPPED)))
+	    return 0;
+#endif
+#if 0	/* Finish coding this later */
+	/* Byte ptrs to different parts of a word? */
+	if ( (pt&PTF_ADRMODE) == PTA_BYTEPOINT
+	  && (pt&PTF_ADRMODE) == PTA_BYTEPOINT) {
+	    /* Check to see if bytes overlap or not */
+	    return 0;			/* If no overlap */
+	}
+#endif
+	/* stack can't alias with much */
+	if (p->Pindex == R_SP && !(pt & PTF_IMM)) {
+	    if (!stackrefs) return 0;
+	    if (q->Pindex == R_SP && !(qt & PTF_IMM)) return 0;
+	    return (q->Pptr == NULL || (qt & PTF_IMM));
+	}
+
+	/* same for other word from stack */
+	if (q->Pindex == R_SP && !(qt & PTF_IMM)) {
+	    if (!stackrefs) return 0;
+	    return (p->Pptr == NULL || (pt & PTF_IMM));
+	}
+
+	/* non-indirect with same index or with different symbols */
+	if (!(pt & PTF_IMM) && !(qt & PTF_IMM)) {
+	    if (p->Pindex == q->Pindex) return 0;
+	    if (p->Pptr != NULL && q->Pptr != NULL && p->Pptr != q->Pptr)
+		return 0;
+	}
+
+	/* none of the above, it can alias */
+	return 1;
+    }
+    return 0;			/* Not mem refs, can't alias with anything */
+}
+
+/* --------------------------- */
+/*      see if op matches      */
+/* --------------------------- */
+
+static int
+match (q, op)
+PCODE *q;
+{
+    int i;
+
+    /* make sure not possible to skip over this one */
+    if (prevskips (q) && !dropsout (after (q))) return 0;
+
+    /* do funny matches */
+    switch (q->Pop & POF_OPCODE) {
+    case P_IBP:			/* no useful reg, but fold into P_DPB */
+	return (!jumped && sameaddr(target[0], q, stkoffset));
+
+    case P_PUSH:				/* might be push of register */
+	return ((q->Ptype &~ PTF_SKIPPED) == PTA_REGIS && (i = matchedto[q->Pr2]) >= 0
+		&& target[i]->Pop == op && stktop (target[i]))?
+	    q->Pr2 : 0;			/* ret pushed reg if success, else 0 */
+
+    case P_IDIV: case P_UIDIV:
+	i = matchedto[q->Preg + 1];	/* save target */
+	flushreg (q->Preg + 1);		/* from certain destruction */
+
+	/* see if construable as used as mod, if not treat normally */
+	/* do not check matchedto[q->Preg] -- will unnecessarily lose */
+	if (i < 0 || !ismod[i] || !sameaddr (target[i], q, stkoffset)) break;
+
+	matchedto[q->Preg] = i;		/* set match to other reg */
+	regret[q->Preg] = regret[q->Preg + 1]; /* chain return val */
+	return q->Preg;			/* return success */
+    }
+
+    /* now the boring cases */
+    if ((i = matchedto[q->Preg]) < 0 || ismod[i]) return 0; /* get target */
+    if (op == P_SETZ && target[i]->Pop == P_SETZ) return q->Preg;
+    if (target[i]->Pop == op && sameaddr(target[i], q, stkoffset)) /* match */
+	return q->Preg;			/* success! return with reg */
+
+    /* Maybe MOVEI matches MOVNI */
+    if (((op == P_MOVN && target[i]->Pop == P_MOVE)
+	|| (op == P_MOVE && target[i]->Pop == P_MOVN))
+      && (q->Ptype & PTF_ADRMODE) == PTA_RCONST
+      && (target[i]->Ptype & PTF_ADRMODE) == PTA_RCONST
+      && q->Pvalue == - target[i]->Pvalue)
+	return q->Preg;			/* Yes, win! */
+
+    return 0;				/* not even that, give up */
+}
+
+/* ------------------------------------ */
+/*      jacket routine for match ()      */
+/* ------------------------------------ */
+
+static int
+safematch (q, op)
+PCODE *q;
+{
+    int r;
+    if ((r = match (q, op)) == 0) flushreg (q->Preg); /* fail, give up reg */
+    return r;				/* return result of match */
+}
+
+/*
+** See if op refers to the top of the stack.
+** Should be safe to fail for non-stack-top-refs.
+*/
+
+static int
+stktop (p)
+PCODE *p;
+{
+    return p->Ptype == PTA_MINDEXED && p->Pptr == NULL &&
+	   p->Poffset == - stkoffset && p->Pindex == R_SP;
+}
+
+/* CHGPUSH - Replace refs to thing PUSHed on top of stack with pushed value.
+**	 Returns 1 if anything changed.
+** Only called from one place in findcse().
+*/
+
+static int
+chgpush (p)
+PCODE *p;
+{
+    PCODE *q;
+    int found, i, so, sop, sreg;
+
+    /* see if this push uses a bad register */
+    switch (p->Ptype) {
+	case PTV_IMMED:			/* Immediate RCONST is OK */
+	case PTA_FCONST:
+	case PTA_DCONST1:
+	case PTA_DCONST2:
+	    break;
+	case PTA_REGIS:			/* Not sure about this --KLH */
+	    if (p->Pr2 == 0
+		|| p->Pr2 == R_SP
+		|| matchedto[p->Pr2] == 0)
+		break;			/* Check that 2nd reg OK */
+	    return 0;			/* Else fail */
+	case PTA_MINDEXED:
+	    if (p->Pindex == 0
+		|| p->Pindex == R_SP
+		|| matchedto[p->Pindex] == 0)
+		break;			/* Check that index reg OK */
+					/* Else drop thru to fail */
+
+	case PTA_BYTEPOINT:	/* Shouldn't be pushing this anyway */
+	default:
+	    return 0;
+    }
+
+    /* maybe it uses a killed value */
+    for (so = 0, q = target[0]; q != p; q = before(q))
+	switch (q->Pop & POF_OPCODE) {
+	    case P_ADJSP:		/* stack adjustment */
+		if (q->Preg == R_SP)
+		    so += q->Pvalue;
+		continue;		/* No mem change */
+
+	    /* This one can screw up if we PUSH through an AC that isn't R_SP,
+	    ** since we can't know for sure where the AC is pointing.  Oh well.
+	    */
+	    case P_PUSH:		/* ignorable mem chg, also stk adj */
+		if (q->Preg == R_SP) {
+		    so++;
+		    continue;
+		}
+		return 0;		/* Unknown change */
+
+	    case P_POP:		/* Stack adj, must also check mem change */
+		if (q->Preg == R_SP)
+		    so--;	/* Adjust, then drop through */
+
+	    default:			/* non-stack-change op */
+		if ( ((q->Pop & POF_BOTH)		/* If op changes mem */
+		      || (popflg[q->Pop&POF_OPCODE]&PF_MEMCHG))
+		  && (sameaddr(p, q, stkoffset + 1 - so)	/* same mem? */
+		      || alias (p, q, stkoffset + 1 - so)))
+			return 0;		/* Then fail */
+	}
+
+    /* it is ok, change the targets to reflect it */
+    found = 0;				/* none hacked up yet */
+    for (i = 0; i < maxcse; i++) if (stktop (target[i])) { /* find stack ref */
+	sop = target[i]->Pop;	/* Save op and reg of target */
+	sreg = target[i]->Preg;
+	*(target[i]) = *p;	/* Copy entire pseudo-code struct */
+	target[i]->Pop = sop;	/* Then restore old op and reg */
+	target[i]->Preg = sreg;
+
+	/* Verify index reg value is valid before checking it -- then adjust to
+	** proper stack offset if necessary.
+	*/
+	if ( (((target[i]->Ptype)&PTF_ADRMODE) == PTA_MINDEXED
+	     || ((target[i]->Ptype)&PTF_ADRMODE) == PTA_BYTEPOINT)
+	    && target[i]->Pindex == R_SP)
+		target[i]->Poffset -= 1 + stkoffset;
+	found = 1;			/* remember we got one */
+    }
+    return found;
+}
+
+/* -------------------------------- */
+/*      get rid of useless reg      */
+/* -------------------------------- */
+
+static void
+flushreg(r)
+{
+    flushtarget(isindex[r]);
+    matchedto[r] = -1;
+}
+
+/* ----------------------------------------------- */
+/*      get rid of obsoleted target registers      */
+/* ----------------------------------------------- */
+
+static void
+flushtarget(i)
+{
+    int r;
+    for (r = 0; r < NREGS; r++) if (matchedto[r] < i) matchedto[r] = -1;
+}
+
+/* ----------------------------------------- */
+/*      get rid of ops with same memory      */
+/* ----------------------------------------- */
+
+/* Called only for instructions which modify memory operand.
+** Returns 1 if we should give up and quit findcse immediately.
+*/
+
+static int
+flushalias (q)
+PCODE *q;
+{
+    int i, pregmatch, flushtop;
+
+    /* If instruction modifies register as memory,
+       then flush that register's match. */
+    if ((q->Ptype & PTF_ADRMODE) == PTA_REGIS) flushreg (q->Pr2);
+
+    /* Find earliest instruction in target subexpr with and address */
+    /* which references the same place as the current instruction */
+    /* under consideration. */
+    flushtop = -1;		/* Index of earliest match in subexpr */
+    for (i = 0; i < maxcse; i++)
+	if (sameaddr(target[i], q, stkoffset)
+	  || alias(target[i], q, stkoffset))
+	    flushtop = i + 1;
+/* KLH 1/29/87 Not sure if this is right fix, but don't have time to
+** figure it all out.
+** If this op (which is assumed to change memory) has an address which
+** matches anything in the target subexpr and this op is also
+** conditionalized (prev instr is a skip) then give up immediately,
+** since we can't know whether the op changed memory or not.
+*/
+    if (flushtop >= 0 && prevskips(q)) return 1;
+/* End of hasty fix */
+
+    /* Save index of instruction in target subexpression which is last */
+    /* match for register used by instruction under consideration. */
+
+    pregmatch = matchedto[q->Preg];
+
+    /* Abort any register machines which haven't yet matched the */
+    /* instruction with the same memory (explicit or alias) as the */
+    /* one under consideration. If a register machine has not yet */
+    /* matched all accesses to the memory which is changed, then they */
+    /* will not get the correct value of this data by matching */
+    /* earlier, thus we abort such register machines. */
+    /* Don't think this allows for target instructions which modify */
+    /* the same address as the instruction under consideration, which */
+    /* does not invalidate the cse match, since they don't depend on */
+    /* the previous value. */
+
+    flushtarget(flushtop);
+
+    /* If current op is not MOVEM, then don't restore the state of the */
+    /* register machine for the register of the instruction under */
+    /* consideration, else restore previous state for this register */
+    /* machine. MOVEM does not change the previous value of the */
+    /* current register, thus we leave its match alone in this case. */
+
+    if (q->Pop != P_MOVEM) pregmatch = -1;
+    else matchedto[q->Preg] = pregmatch;
+
+    /* If first instruction of subexpression references same memory as */
+    /* the one under consideration, and the match for the register of */
+    /* the instruction under consideration was previously aborted or */
+    /* the instruction under consideration is not MOVEM, then abort. */
+    /* I think this catches the case where all register machines have */
+    /* been aborted (none have matched to end, so all except current */
+    /* were aborted by flushtarget() above if flushtop == maxcse) so */
+    /* we terminate findcse early. */
+
+    return (flushtop == maxcse && pregmatch < 0);
+}

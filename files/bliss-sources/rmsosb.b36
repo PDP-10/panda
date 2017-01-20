@@ -1,0 +1,960 @@
+%TITLE 'O S C A L L   -- OS dependent code'
+!<BLF/REQUIRE 'RMSBLF.REQ'>
+MODULE oscall (IDENT = '3.0'
+		) =
+BEGIN
+
+GLOBAL BIND
+    oscv = 2^24 + 0^18 + 615;			! Edit date: 14-Apr-86
+
+!+
+!
+!
+!    FUNCT:	THIS MODULE CONTAINS ALL OPERATING-SYSTEM CALLS EXCEPT
+!    FOR THOSE MODULES WHOSE OVERALL FLOW IS MONITOR-DEPENDENT,
+!    NAMELY RMSOPN AND MORE?.
+!
+!    AUTHOR:	S. COHEN, A. UDDIN
+!
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1979, 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+!
+!
+!    **********	TABLE OF CONTENTS	**************
+!
+!
+!    ROUTINE			FUNCTION
+!    =======			========
+!    ABORTFILE			ABORTIVELY CLOSES FILE
+!    ADJEOF			ADJUST EOF PTR OF FILE
+!    ASCREAD			READ STREAM OF BYTES FROM SPEC FILE
+!    ASCWRITE			WRITE STREAM OF BYTES TO SPEC FILE
+!    CLOSEFILE			CLOSE THE FILE
+!    CREPAGE			CREATES A PAGE ON THE TOPS-10(PAGE. UUO)
+!    DATOFILE			RETURN DATES (EG. CREATE TIME) OF FILE
+!    DEVCHAR			RETURNS DEV CHAR WORD IN TOPS-20 FMT
+!    IOERROR			MAP JSYS I/O ERROR TO RMS STATUS CODE
+!    KILLPAGE			REMOVE PAGE FROM PROCESS (DO IO ON 10)?
+!    LOFFALL			CLEAR ALL THE LOCKS
+!    NEXTPAGE			RETS NEXT EXISTING P# IN FILE (IF NONE RETS -1)
+!    PAGEXIST			RETS TRUE IF SPECIFIED PAGE EXISTS
+!    PAGIN			READS ONE OR MORE PAGES INTO MEMORY
+!    PAGOUT			WRITES PAGES TO DISK
+!    POSASCFIL			SET THE CURRENT LOC OF FILE TO BEGIN OR END
+!    READTTY			READ STREAM OF ASCII BYTES FROM TTY
+!    SIZEFILE			RETURNS # OF BYTES IN SPECIFIED FILE
+!    TRUNCFILE			DELETE TRAILING PAGES FROM A FILE
+!    PSIZEFILE			RETURNS # OF PAGES IN SPECIFIED FILE
+!    RLSJFN			RELEASE JFN
+!
+!    *************************************************
+!    *						*
+!    *		NEW REVISION HISTORY		*
+!    *						*
+!    *************************************************
+!
+!    PRODUCT	MODULE	 SPR
+!    EDIT	 EDIT	 QAR		DESCRIPTION
+!    ======	======	=====		===========
+!
+!
+!    ***** END OF REVISION HISTORY *****
+!
+!    ***** Start Version 2 Development *****
+!
+!    PRODUCT	MODULE	 SPR
+!    EDIT	 EDIT	 QAR		DESCRIPTION
+!    ======	======	=====		===========
+!
+!    300	300	XXXXX		Make DBUG=1 work.
+!
+!    400	400	xxxxx	    Clean up BLISS code (RL,22-Apr-83)
+!    403        403                 Make LPT work (AWN, 26-Apr-83)
+!    453	453	xxxxx	    Check for "Quota exceeded" error in
+!				    IOERROR and return ER$EXT.
+! Version 3 development
+!    504                            Image Mode
+!    614			    Add Psizefile to return file's page count
+!    615			    Add RLSJFN
+!-
+
+REQUIRE 'RMSREQ';
+
+REQUIRE 'RMSOSD';				! This module is OS-dependent
+
+%SBTTL 'ABORTFILE - close abortively'
+
+GLOBAL ROUTINE abortfile (file_id, user_fab : REF BLOCK) : NOVALUE =
+! ABORTFILE
+! ======
+!
+!	CLOSES A  FILE ABORTIVELY
+!
+! INPUT:	1. VALUE OF JFN.
+!		2. ADDR OF USER'S FAB.
+!
+! OUTPUT:	NONE
+    BEGIN
+
+    LOCAL
+	keep_jfn,				! Set if user gave us JFN
+	close_error,				! Error code from CLOSF, if any
+	close_word : monword;			! CLOSF JSYS bits
+
+    TRACE ('ABORTFILE');
+    keep_jfn = (.user_fab [fabjfn, 0] NEQ 0);	! If user gave JFN, keep it
+    close_word = .file_id OR cz_abt;		! Set abort bit for CLOSF JSYS
+
+    IF .keep_jfn				! He gave us a JFN
+    THEN
+	close_word [co_nrj] = 1;		! Don't release JFN
+
+    IF NOT closf (.close_word; close_error)	! Close the file
+    THEN
+	BEGIN					! Oops
+	!
+	!   If we are here, the CLOSF failed.  If it
+	!   failed because the file had not yet been opened,
+	!   then we must release the JFN (unless, of course,
+	!   the user gave it to us).  Otherwise, we are
+	!   in this routine because of an error anyway, so
+	!   ignore the CLOSF error.
+	!
+
+	IF .close_error EQL clsx1		! File not opened?
+	THEN
+	    BEGIN				! Release JFN manually...
+
+	    IF NOT .keep_jfn			! ...if the user allows
+	    THEN
+		rljfn (.file_id);		! NOTE: no error handling
+
+	    END
+	ELSE
+	    RETURN;				! Ignore error.
+
+	END;
+
+    RETURN;
+    END;					! End ABORTFILE
+
+%SBTTL 'ADJEOF - adjust EOF in FDB'
+
+GLOBAL ROUTINE adjeof (file_id, our_eofbyte, trunc_flag) : NOVALUE =
+! ADJEOF
+! ======
+!
+! ROUTINE TO ADJUST THE FILE'S EOF POINTER IN THE FILE DESCRIPTOR BLOCK (FDB)
+!	THIS ROUTINE IS CALLED ONLY IF WE HAVE WRITTEN INTO THE FILE
+!	WITH THE CURRENT STREAM, OR IF THERE WAS A $TRUNCATE DONE ON
+!	THE STREAM. THIS ROUTINE MUST CHECK THE FILE EOF POINTER IN
+!	THE FDB AND DETERMINE IF OUR NEW EOF IS GREATER THAN THE
+!	OLD ONE. IF SO, THE FDB EOF IS CHANGED; IF NOT, NO ACTION
+!	IS PERFORMED.
+!
+! INPUT:
+!	FILE_ID		=	FILE ID
+!	OUR_EOFBYTE	=	THE EOF BYTE THAT WE HAVE WRITTEN INTO
+!	TRUNC_FLAG	=	FLAG TO INDICATE IF TRUNCATE WAS DONE
+! OUTPUT:
+!	<NO STATUS RETURNED>
+!
+! NOTES:
+!
+!	1.	THERE IS CURRENTLY NO SYNCHRONIZATION ON THE OPERATION
+!		OF UPDATING THE FILE'S EOF POINTER. THUS, BETWEEN THE
+!		TIME THAT WE CHECK THE FDB VALUE AND THEN WE CHANGE IT,
+!		SOMEONE ELSE COULD SLIP IN AND CHANGE IT ALSO. HOWEVER,
+!		THIS IS NOT REALLY A PROBLEM SINCE THE EOF WILL BECOME
+!		CORRECT AGAIN AS SOON AS SOMEONE WRITES INTO THE FILE.
+!		ALSO, THE QUEUEING OVERHEAD OF THE LOCK TO ACHIEVE
+!		MUTUAL EXCLUSION IS EXCESSIVE AND IS NOT DEEMED SUFFICIENT.
+!
+    BEGIN
+
+    LOCAL
+	eofbyte;				! THE REAL EOF BYTE IN THE FDB
+
+    TRACE ('ADJEOF');
+    !
+    !   Get the file size word from the FDB into EOFBYTE.
+    !
+
+    IF NOT gtfdb (.file_id, $xwd (1, $fbsiz), eofbyte)	! Read size
+    THEN
+	monerr ();
+
+    !+
+    !	Should we update the FDB?
+    !-
+
+    IF (.our_eofbyte GTR .eofbyte) OR 		! If file has grown
+	(.trunc_flag NEQ 0)			! Or if we did a $TRUNCATE
+    THEN
+	BEGIN
+
+	LOCAL
+	    chfdb_word;
+
+	chfdb_word = cf_nud OR 			! Do not wait for update
+	fld ($fbsiz, cf_dsp) OR 		! Update size word
+	fld (.file_id, cf_jfn);			! JFN
+
+	IF NOT chfdb (.chfdb_word, allones, .our_eofbyte)	! Change EOF
+	THEN
+	    monerr ();
+
+	END;
+
+    lookat ('	HYBYTE = ', our_eofbyte);
+    lookat ('	EOF # = ', eofbyte);
+    RETURN
+    END;
+
+%SBTTL 'ASCREAD - read ASCII bucket'
+
+GLOBAL ROUTINE ascread (file_id, bkt_to_use, buf_ptr, ch_in_buf) : =
+! ASCREAD
+! =======
+!	READ IN BUCKET ENCOMPASSED BY SPECIFIED BYTE IN FILE
+!
+! INPUT:	1. FILE ID
+!		2. NUMBER OF BKT WE WANT TO READ
+!		3. ADDRESS OF BUFFER TO READ INTO
+!		4. LENGTH OF BUFFER IN CHARS
+!
+! OUTPUT:	1. COUNT OF CHARS READ
+!
+! NOTES:	1. ASSUMES THAT A FILE IS ALWAYS READ WITH SAME SIZE BUFFER
+!
+    BEGIN
+
+    LOCAL
+        bytes_per_word,                   	! # of bytes per word   !a504
+        bytes_per_page,                   	! # of bytes per page   !a504
+	input_pointer,				! Input byte pointer
+	bytes_to_read,				! Bytes to input
+	bytes_we_got,				! Bytes actually input
+	byte_in_file,				! Byte number in file
+	temp,
+	w_in_buf;				! Words in a buffer
+
+    TRACE ('ASCREAD');
+
+    bytes_per_word = %BPVAL / .Fst[Fst$h_Bsz] ;   !  bytes per word       !a504
+    bytes_per_page = .bytes_per_word * pagesize;
+
+    ! Get Buff Size in Words
+    w_in_buf = ( .ch_in_buf + .bytes_per_word-1 ) / .bytes_per_word ;
+
+    IF .bkt_to_use NEQ .fst [fstseqbkt]		! POSIT TO RIGHT PLACE?
+    THEN
+	BEGIN					! NO
+	byte_in_file = 				! Byte position of bucket
+	.bkt_to_use*.cbd [bkdbktsize] * .bytes_per_page;
+	!
+	!   Use 36-bit bytes for LSA files
+	!
+
+	IF sequenced THEN byte_in_file = (.byte_in_file + 4)/5;
+
+	IF NOT tty
+	THEN
+	    BEGIN
+
+	    IF NOT sfptr (.file_id, .byte_in_file)	! Set pointer
+	    THEN
+		monerr ();
+
+	    END;
+
+	END;
+
+    IF sequenced
+    THEN
+	BEGIN
+	input_pointer = CH$PTR (.buf_ptr, 0, 36);	! Use 36-bit bytes
+	bytes_to_read = -(.ch_in_buf + 4)/5	! Number of words to move
+	END
+    ELSE
+	BEGIN
+	input_pointer = CH$PTR (.buf_ptr, 0, .Fst[Fst$h_Bsz] );  !m504
+	bytes_to_read = -.ch_in_buf;
+	END;
+
+    IF NOT sin (				! Read in the record
+	    .file_id, 				! JFN
+	    .input_pointer, 			! Destination pointer
+	    .bytes_to_read, 			! Read this much
+	    0; 					! No ending byte
+	    acc$1, 				! Save results
+	    acc$2, 				!   in global
+	    acc$3)				!     storage
+    THEN
+	ioerror (.file_id);			! Process JSYS error
+
+    IF sequenced				! For LSA file, we got words...
+    THEN
+	bytes_we_got = -.acc$3*asciibytperword	! ...convert them to bytes
+    ELSE
+	bytes_we_got = -.acc$3;			! ...or leave them be.
+
+    bytes_we_got = .ch_in_buf - .bytes_we_got;	! Chars read = max - residue
+    currentfilepage = .bkt_to_use*asciibktsize;	! Keep track of current page
+    fst [fstseqbkt] = .currentfilepage + asciibktsize;	! Now after it
+    RETURN .bytes_we_got
+    END;
+
+%SBTTL 'ASCWRITE - write stream to file'
+! ASCWRITE
+! =========
+!	WRITE A STREAM OF BYTES TO THE SPECIFIED FILE
+! INPUT:	1. FILE ID
+!		2. NUMBER OF BKT WE WANT TO WRITE
+!		3. POINTER TO BUFF TO OUTPUT IN CALLERS ADDRESS SPACE
+!		3. LENGTH OF STRING TO OUTPUT
+! OUTPUT:	<NONE>
+!
+!
+!
+!
+
+GLOBAL ROUTINE ascwrite (file_id, bkt_to_use, buf_ptr, ch_in_buf) : NOVALUE =
+    BEGIN
+
+    LOCAL
+	output_pointer,				! Pointer to stream to output
+	bytes_to_write,				! Bytes we should output
+	bucket_position,			! Number of bucket's first byte
+	n,					! Num of bits of cruft
+	lw,					! Ptr to last partial wd in buf
+	temp,
+	w_in_buf,				! Data words in this buffer
+        bytes_per_word,                         	 		  !a504
+        bytes_per_page;                         	 		  !a504
+
+    TRACE ('ASCWRITE');
+
+    bytes_per_word = %BPVAL / .Fst[Fst$h_Bsz];
+    bytes_per_page = .bytes_per_word * pagesize;        		  !m530
+
+    ! Get words of data (based on actual byte size)		
+    w_in_buf = (.ch_in_buf + .bytes_per_word - 1 )/.bytes_per_word;	  !m504
+
+    IF .bkt_to_use NEQ .fst [fstseqbkt]		! Positioned to right place?
+    THEN
+	BEGIN					! No
+	bucket_position = 			! Bucket's first byte
+	.bkt_to_use*.cbd [bkdbktsize]*.bytes_per_page;
+
+	IF sequenced THEN bucket_position = (.bucket_position + 4)/5;
+
+	IF NOT (tty OR llpt)                    ![403] If not TTY: or LPT:
+	THEN
+	    BEGIN
+
+	    IF NOT sfptr (.file_id, .bucket_position)	! Find right place
+	    THEN
+		monerr ();
+
+	    END;
+
+	END;
+
+    IF sequenced				! LSA file?
+    THEN
+	BEGIN
+	output_pointer = CH$PTR (.buf_ptr, 0, 36);
+	bytes_to_write = -(.ch_in_buf + 4)/5
+	END
+    ELSE
+	BEGIN
+	output_pointer = CH$PTR (.buf_ptr,
+                                 0,
+                                 .Fst[Fst$h_Bsz] );
+	bytes_to_write = -.ch_in_buf;
+	END;
+
+    IF NOT sout (				! Output stream of bytes
+	    .file_id, 				! JFN
+	    .output_pointer, 			! Source pointer
+	    .bytes_to_write, 			! Number of bytes to output
+	    0; 					! No special end byte
+	    acc$1, 				! Output to
+	    acc$2, 				!    global AC
+	    acc$3)				!       storage
+    THEN
+	ioerror (.file_id);
+
+    currentfilepage = .bkt_to_use*asciibktsize;	! Keep track of current page
+    fst [fstseqbkt] = .currentfilepage + asciibktsize;	! Now after it
+    RETURN
+    END;
+
+%SBTTL 'CLOSEFILE - close a file'
+
+GLOBAL ROUTINE closefile (file_id, user_fab : REF BLOCK) : NOVALUE =
+! CLOSEFILE
+! =========
+!	CLOSES A  FILE
+! INPUT:	1. FILE ID OF THE FILE TO BE CLOSED (JFN ON 20)
+!		2. POINTER TO USER'S FAB.
+! OUTPUT:	1. TRUE IF MON SUCCEEDED, ELSE ERROR CODE
+!
+    BEGIN
+
+    LOCAL
+	closf_word : monword;
+
+    TRACE ('CLOSEFILE');
+
+    !+
+    !	We will set up the flags and the JFN for the CLOSF JSYS.
+    !	Then, we will check to see if the user wants us to keep
+    !	his JFN for him when we close the file.
+    !-
+
+    closf_word = .file_id OR cz_nud OR co_nrj;	! Set up arg to CLOSF JSYS
+
+    IF .user_fab [fabjfn, 0] EQL 0
+    THEN 					! He didnt want to save the JFN
+	closf_word [co_nrj] = 0;
+
+    IF NOT closf (.closf_word) THEN monerr ();	! Close the file
+
+    RETURN;
+    END;
+
+%SBTTL 'CREPAGE - create page (10 only)'
+
+GLOBAL ROUTINE crepage (page_num, pages) : NOVALUE =
+! CREPAGE
+!============
+!	CREATES A PAGE ON THE TOPS-10. A NO-OP ON THE -20.
+!
+! INPUT:	1. PAGE NO.OF THE FIRST PAGE OF THE BLOCK TO BE CREATED
+!		2. NO OF PAGES IN THE BLOCK
+!
+!
+! OUTPUT:	<NONE>
+!
+!
+    BEGIN
+    TRACE ('CREPAGE');
+    !WHEREAS THE 10 REQS AN EXPLIC OS CALL TO CRE A PROCESS PAGE,
+    !THE 20 DOES IT AUTOMATICALLY WHEN YOU ACCESS A WORD IN THE PAGE
+    RETURN
+    END;
+
+%SBTTL 'DATOFILE - return file dates'
+
+GLOBAL ROUTINE datofile (fst_jfn, date_blk, date_blk_size) : NOVALUE =
+! DATOFILE
+! =========
+!	RETURNS DATES AND TIMES ASSOCIATED WITH THE SPECIFIED FILE.
+! INPUT:	1. FILE ID OF THE FILE IN FST.
+!		2. POINTER TO A BLOCK THAT WILL CONTAIN DATES
+!		3. SIZE OF THE BLOCK
+!
+! OUTPUT:	INDIRECTLY, DATES AND TIMES IN THE BLOCK
+!
+    BEGIN
+    TRACE ('DATOFILE');
+
+    IF NOT rftad (.fst_jfn, .date_blk, .date_blk_size)	! Get times and dates
+    THEN
+	monerr ();
+
+    RETURN
+    END;
+
+%SBTTL 'DEVCHAR - get device characteristics'
+
+GLOBAL ROUTINE devchar (file_id) =
+! DEVCHAR
+! =========
+!	RETURNS DEVCHAR FLAGS IN 20 FORMAT
+! INPUT:	1. JFN OF THE DESIRED DEVICE
+!
+! OUTPUT:	THE 20-FORMAT FLAG WORD
+!
+    BEGIN
+
+    LOCAL
+	dummy1,					! Protect against BLISS bug
+	dummy3,					! Ditto
+	device_characteristics;			! Returned device info
+
+    TRACE ('DEVCHAR');
+
+    IF NOT dvchr (.file_id; dummy1, device_characteristics, dummy3)	!
+    THEN
+	monerr ();
+
+    RETURN .device_characteristics;
+    END;
+
+%SBTTL 'IOERROR - processes SIN/SOUT errors'
+
+GLOBAL ROUTINE ioerror (file_id) : NOVALUE =
+! IOERROR
+! =========
+!
+!  THIS ROUTINE PROCESSES AN ERROR RETURN FROM EITHER  THE SIN JSYS
+!	OR THE SOUT JSYS. EACH MONITOR ERROR CODE IS MAPPED INTO
+!	A CORRESPONDING RMS-20 ERROR CODE. THE MAPPING IS AS FOLLOWS:
+!
+!		MONITOR CODE	MEANING		RMS-20 CODE
+!		============	=======		===========
+!
+!		IOX4		EOF		<NO MAPPING DONE>
+!		IOX5		DATA ERROR	ER$RER, ER$WER
+!		ALL OTHERS	INTERNAL BUG	ER$BUG
+!
+!
+! INPUT:
+!	1. JFN OF FILE THAT HAD IO ERROR
+!
+! OUTPUT:
+!	<NONE>
+! NOTES:
+!
+!	1.	THE STV FIELD WILL ALWAYS BE SET TO BE THE MONITOR CODE
+!		RETURNED.
+!
+!	2.	THIS ROUTINE EXITS TO THE USER UNLESS THE ERROR WAS ER$EOF
+!
+    BEGIN
+
+    LOCAL
+	last_error;
+
+    TRACE ('IOERROR ');
+    !
+    !	Get the last error code.
+    !
+
+    IF NOT geter ($fhslf; last_error) THEN monerr ();
+
+    !+
+    !	Is this an EOF? If so, we can ignore it because the
+    !	user probably won't see an EOF until he reads all the
+    !	records in the current buffer.
+    !-
+
+    IF .last_error<rh> EQL iox4 THEN RETURN;	! Return on EOF
+
+    usrstv = .last_error<rh>;			! Save code in STV
+
+    selectone .usrstv of 			! Handle error		!A453
+	set					!			!A453
+	[iox5]:					! Device or data error	!A453
+	    BEGIN				! Yes
+	    usrsts = er$rer;			! Assume read error
+
+	    IF currentjsys EQL c$put 		! Doing output?
+	    THEN 				!
+		usrsts = er$wer;		! Make it a write error
+
+	    END;
+	[iox11,iox34]:				! Quota exceeded	!A453
+	    usrsts = er$ext;			! ...
+	[otherwise]:				! Unexpected error	!A453
+	    BEGIN				! No -- some other bug
+	    usrsts = er$bug;			! Show it's a bug
+
+	    IF prichk (.usrstv)			! Displaying internal errs?
+	    THEN
+		txtout (mf$iom, .usrstv);	! Yes, stream i/o error
+
+	    END;
+
+	tes;					!			!A453
+
+    usrerr ()					! Do failure return to user
+    END;					! End IOERROR
+
+%SBTTL 'KILLPAGE - kill mapped pages'
+
+GLOBAL ROUTINE killpage (page_num, pages) : NOVALUE =
+! KILLPAGE
+! =======
+!	UNMAPS (KILLS) A FILE'S PAGES IN A PROCESS.
+! INPUT:	1. PAGE NUMBER OF THE FIRST PAGE OF THE BLOCK TO BE KILLED
+!		2. NO. OF PAGES TO BE UNMAPPED
+! OUTPUT:	<NONE>
+!
+!
+!
+!
+    BEGIN
+    TRACE ('KILLPAGE');
+
+    !+
+    !	Set up ACs for PMAP JSYS.
+    !-
+
+    IF NOT pmap (				!
+	    -1, 				! Kill the pages
+	    $xwd ($fhslf, .page_num), 		! Handle,,page number
+	    pm_cnt OR .pages)			! Use page count,,page count
+    THEN
+	monerr ();
+
+    RETURN
+    END;					! End KILLPAGE
+
+%SBTTL 'LOFFALL - unlock all records'
+
+GLOBAL ROUTINE loffall (request_id) : NOVALUE =
+! LOFFALL
+! =======
+!	TURNS OFF ALL LOCKS ON RECORDS OF A STREAM
+! INPUT:	1. REQUEST ID. THIS IS THE SAME REQUEST ID
+!		   USED TO LOCK THE RECORDS
+! OUTPUT:	<NONE>
+!
+!
+    BEGIN
+    TRACE ('LOFFALL');
+
+    IF NOT deq ($deqid, .request_id) THEN monerr ();
+
+    RETURN;
+    END;					! End LOFFALL
+
+%SBTTL 'NEXTPAGE - return next page in file'
+
+GLOBAL ROUTINE nextpage (fst_jfn, page_no) : =
+! NEXTPAGE
+! ========
+!	RETURNS THE NEXT USED PAGE IN THE FILE. APPLIES TO 20 ONLY.
+! INPUT:	1. VALUE OF JFN IN FST.
+!		2. PAGE NUMBER OF PAGE TO FIND.
+! OUTPUT:	1. PAGE NUMBER, IF IT EXISTS
+!		2. ELSE, FALSE
+!
+    BEGIN
+
+    LOCAL
+	next_file_page;
+
+    TRACE ('NEXTPAGE');
+    !
+    !	Get first used page, starting at PAGE_NO
+    !
+
+    IF ffufp ($xwd (.fst_jfn, .page_no); next_file_page)
+    THEN
+	RETURN .next_file_page<0, 18>		! If it worked, return page
+    ELSE
+	RETURN false;				! If not, return false
+
+    END;					! End NEXTPAGE
+
+%SBTTL 'PAGEXIST - check if file page exists'
+
+GLOBAL ROUTINE pagexist (file_id, p_to_chk) : =
+! PAGEXIST
+! ========
+!	CHECKS TO SEE WHETHER A PARTICULAR PAGE OF A FILE EXISTS.
+! INPUT:	1. FILE ID
+!		2. PAGE NO. TO CHECK
+! OUTPUT:	1. TRUE IF THE PAGE EXISTS.
+!		2. FALSE OTHERWISE
+!
+    BEGIN
+
+    LOCAL
+	page_access : monword;
+
+    TRACE ('PAGEXIST');
+
+    IF NOT rpacs ($xwd (.file_id, .p_to_chk); page_access) THEN monerr ();
+
+    IF .page_access [pa_pex] THEN RETURN true ELSE RETURN false;
+
+    END;					! End PAGEXIST
+
+%SBTTL 'PAGIN - read pages'
+
+GLOBAL ROUTINE pagin (file_id, file_page, mem_page, pagacc, count) : NOVALUE =
+! PAGIN
+! =====
+!	READ ONE OR MORE CONSECUTIVE PAGES INTO MEMORY
+!	DOES "IN" ON 10 AND "PMAP" ON 20
+! INPUT:
+!	FILE TO READ (JFN OR CHANNEL)
+!	PAGE IN FILE TO READ (0 IS 1ST PAGE)
+!	WHERE TO PUT IT (PAGE NUMBER)
+!	LEVEL OF ACCESS TO PAGE
+!	NUMBER OF PAGES (=512 WORDS) TO READ
+! OUTPUT:	(IMPLICITLY)
+!	DATA IN MEMORY PAGE(S)
+    BEGIN
+
+    LOCAL
+	access_bits : monword;
+
+    TRACE ('PAGIN');
+    access_bits = pm_rd OR pm_pld OR pm_cnt;	! Read, preload, and use count
+
+    IF (.pagacc AND axwrt) NEQ 0		! Writing?
+    THEN
+	access_bits [pm_wr] = 1;		! Write access also
+
+    access_bits [pm_rpt] = .count;		! Number of pages to read
+
+    IF NOT pmap (				!
+	    $xwd (.file_id, .file_page), 	! JFN,,page number
+	    $xwd ($fhslf, .mem_page), 		! Fork handle,,memory page
+	    .access_bits)			! Page access
+    THEN
+	monerr ();
+
+    okcreate (.mem_page^p2w, .file_page);	! Prevent illegal memory read
+    RETURN
+    END;					! End PAGIN
+
+%SBTTL 'PAGOUT - update file pages'
+
+GLOBAL ROUTINE pagout (file_id, file_page, mempage, count) : NOVALUE =
+! PAGOUT
+! ======
+!
+!	UPDATE PAGES OF THE SPECIFIED FILE.
+! INPUT:
+! -----
+!	1. FILE ID
+!	2. PAGE NUMBER IN FILE TO BE UPDATED.
+!	3. COUNT OF PAGES TO BE UPDATED
+! OUTPUT:
+! ------
+!	<NONE>
+!
+!
+    BEGIN
+    TRACE ('PAGOUT');
+
+    IF NOT ufpgs (				!
+	    $xwd (.file_id, .file_page), 	! JFN,,page number
+	    uf_now OR .count)			! page count, non-blocking bit
+    THEN
+	monerr ();
+
+    RETURN
+    END;					! End PAGOUT
+
+%SBTTL 'POSASCFIL - get page for byte'
+
+GLOBAL ROUTINE posascfil (file_id, byte_no) : NOVALUE =
+! POSASCFIL
+! =========
+!
+!	DETERMINE PAGE # OF DESIRED BYTE AND READ IT IN.
+!	THEN SETUP BYTE PTR TO IT IN MEMORY.
+!	ALSO SETUP COUNT OF CHARACTERS IN BUFFER
+! INPUT:	1. FILE ID
+!		2. BYTE NO IN FILE TO POSITION TO
+! OUTPUT:	<NONE>
+    BEGIN
+
+    LOCAL
+        bytesperpage,                  		! # of bytes in a page !a504
+    	bkt_to_use,				! Bucket containing byte
+	ch_per_bkt,				! Number of chars in bucket
+	cc_in_buf,				! Offset of byte_no(th)
+						! char in buffer
+	temp;
+
+    TRACE ('POSASCFIL');
+
+    bytesperpage = (%BPUNIT/.Fst[Fst$h_Bsz])*pagesize; ! bytes  per page  !a504
+
+    ch_per_bkt =
+     .cbd [bkdbktsize] * .bytesperpage;    	! Calc buff size in bytes !m504
+    cc_in_buf = .byte_no MOD .ch_per_bkt;	! Offset of byte within page
+    bkt_to_use = .byte_no/.ch_per_bkt;		! Calc bkt to pos to
+    temp = 					! Read bkt & ret chars in it
+    ascread (.file_id, .bkt_to_use, .curentbufferadr, .ch_per_bkt);
+
+    IF endoffile				!
+    THEN
+	BEGIN
+	rst [rstnrp] = .bkt_to_use;		! Next I/O will be rewrite
+						!   of this bucket
+	rst [rstbytecount] = .cc_in_buf;	! Indicate fullness of bucket
+	END
+    ELSE
+	BEGIN
+	rst [rstnrp] = .bkt_to_use + 1;		! next I/O will be read
+						!   of subsequent bkt
+	rst [rstbytecount] = .temp - .cc_in_buf	! Chars left to read
+	END;
+
+    rst [rstpagptr] = CH$PTR (.curentbufferadr,	!PT TO DESIRED BYTE
+                              .cc_in_buf,
+                              .Fst[Fst$h_Bsz] );! with desired byte size  !m504
+    RETURN
+    END;					! End POSASCIF
+
+%SBTTL 'READTTY - read from TTY'
+
+GLOBAL ROUTINE readtty (buffer_address, size) : =
+! READTTY
+! =======
+!	ROUTINE TO READ A LINE FROM THE TTY.
+! INPUT:	1. ADDRESS OF BUFFER FOR STRING
+!		2. NO OF BYTES AVAILABLE IN STRING
+! OUTPUT:	1. REMAINING BYTE COUNT
+!
+    BEGIN
+
+    LOCAL
+	last_byte,
+	updated_pointer,
+	bytes_left;
+
+    TRACE ('READTTY');
+
+    IF NOT rdtty (				! Get string from TTY:
+	    CH$PTR (.buffer_address), 		! Pointer to buffer
+	    rd_top OR .size, 			! Break set, buffer size
+	    0; 					! Pointer to prompt (not v2)
+	    updated_pointer, 			! Returned pointer
+	    bytes_left)				! Unused bytes
+    THEN
+	monerr ();
+
+    !
+    !	Check for control-Z, which will generate an EOF.
+    !
+    last_byte = CH$RCHAR (CH$PLUS (.updated_pointer, -1));
+
+    IF .last_byte EQL $chcnz THEN usrsts = er$eof;
+
+    RETURN .size - .bytes_left;			! Chars read = max-residue
+    END;					! End READTTY
+
+%SBTTL 'SIZEFILE - return file length'
+
+GLOBAL ROUTINE sizefile (file_id) : =
+! SIZEFILE
+! ======
+!	RETURNS THE LENGTH OF AN EXISTING FILE
+! INPUT:	1. FILE ID
+! OUTPUT:	1. NO OF BYTES IN THE FILE:
+!			WORDS FOR RMS FILES
+!			CHARS FOR LSA AND ASCII FILES
+    BEGIN
+
+    LOCAL
+	dummy1,					! Prevent BLISS bug
+	dummy3,					! Ditto
+	file_size;				! Count of file bytes
+
+    TRACE ('SIZEFILE');
+
+    IF NOT sizef (.file_id; dummy1, file_size, dummy3) THEN monerr ();
+
+    IF sequenced
+    THEN
+	RETURN .file_size*asciibytperword	! LSA: Convert words to bytes
+    ELSE
+	RETURN .file_size;			! ASCII: Already in bytes
+
+    END;					! End SIZEFILE
+
+%SBTTL 'PSIZEFILE - return file length in pages'
+
+GLOBAL ROUTINE psizefile (file_id) : =		!614
+! PSIZEFILE
+! ======
+!	RETURNS THE LENGTH OF AN EXISTING FILE
+! INPUT:	1. FILE ID
+! OUTPUT:	1. NO OF PAGES IN CURRENT FILE
+
+    BEGIN
+
+    LOCAL
+	dummy1,					! Prevent BLISS bug
+	dummy2,					! Ditto
+	file_size;				! Count of file bytes
+
+    TRACE ('PSIZEFILE');
+
+    IF NOT sizef (.file_id; dummy1, dummy2, file_size) THEN monerr ();
+
+    RETURN .file_size;				! RETURN PAGES
+
+    END;					! End PSIZEFILE
+
+
+%SBTTL 'RLSJFN - release a JFN'
+
+GLOBAL ROUTINE rlsjfn (file_id) :  =			!615
+! RLSJFN
+! ======
+!	RELEASE JFN
+! INPUT:	1. FILE ID
+! OUTPUT:	1. TRUE if JFN released, else FALSE
+!
+! 
+    BEGIN
+
+    TRACE ('RLSJFN');
+
+    IF NOT Rljfn (.file_id) THEN RETURN false
+    ELSE  RETURN true;
+
+    END;					! End RLSJFN
+
+%SBTTL 'TRUNCFILE - delete trailing pages'
+
+GLOBAL ROUTINE truncfile (file_id, page_no, no_of_pages) : NOVALUE =
+! TRUNCFILE
+! =========
+!	DELETE TRAILING PAGES FROM A FILE
+! INPUT:	1. FILE ID OF FILE TO BE TRUNCATED
+!		2. PAGE NO OF FIRST PAGE OF A BLOCK OF PAGES TO BE KILLED
+!		3. NO OF PAGES TO BE KILLED
+! OUTPUT:	<NONE>
+!
+    BEGIN
+    TRACE ('TRUNCFILE');
+    !
+    !	Truncation has two aspects, setting EOF pointer and
+    !	physically destroying pages for efficiency's sake.
+    !	Unfortunately the 20 only
+    !	has facility for destroying pages LSS 777 (Octal)
+    !
+
+    IF NOT pmap (				! Remove file pages
+	    -1, 				! Kill the pages
+	    $xwd (.file_id, .page_no), 		! JFN,,page number
+	    pm_cnt OR .no_of_pages)		!
+    THEN
+	monerr ();
+
+    RETURN
+    END;					! End TRUNCFILE
+
+END
+
+ELUDOM
+   

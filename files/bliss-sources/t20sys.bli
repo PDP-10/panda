@@ -1,0 +1,1173 @@
+ %TITLE 'T20SYS - TOPS20 system specific storage'
+MODULE T20SYS (				! TOPS20 system specific storage
+		IDENT = '1-007'			! File: T20SYS.B36 Edit: GB1007
+		) =
+BEGIN
+!COPYRIGHT (c) DIGITAL EQUIPMENT CORPORATION 1981, 1988.  ALL RIGHTS RESERVED.
+!
+!THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED ONLY
+!IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH THE INCLUSION OF 
+!THE ABOVE COPYRIGHT NOTICE.  THIS SOFTWARE OR ANY OTHER COPIES THEREOF MAY 
+!NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY OTHER PERSON.  NO TITLE
+!TO AND OWNERSHIP OF THE SOFTWARE IS HEREBY TRANSFERRED.
+!
+!THE INFORMATION IN THIS SOFTWARE IS SUBJECT TO CHANGE WITHOUT NOTICE AND 
+!SHOULD NOT BE CONSTRUED AS A COMMITMENT BY DIGITAL EQUIPMENT CORPORATION.
+!
+!DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR RELIABILITY OF ITS 
+!SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+!
+!++
+! FACILITY:	EDT -- The DEC Standard Editor
+!
+! ABSTRACT:
+!
+!	This module contains system specific code for the TOPS20
+!	environment.
+!
+! ENVIRONMENT:	TOPS20 only
+!
+! AUTHOR: Graham Beech, CREATION DATE: January 12, 1982
+!
+! MODIFIED BY:
+!
+! 1-001 - Add EDT$$GET_LOGDIR so that login directory is also searched
+!         for startup command files. CJG 7-Oct-1983
+! 1-002 - Add call to EDT$$DEA_ALLMEM to deallocate all memory. CJG 11-Oct-1983
+! 1-003 - Make EDT$$SYS_EXI return a status to the superior fork. CJG 8-Nov-1983
+! 1-004 - Move interrupt code to this module (from IOMOD) and fix up the
+!         timer interrupt for the working message. CJG 24-Nov-1983
+! 1-005 - Fix up control-C handling so it works in line mode. CJG 5-Jan-1984
+! 1-006 - Trap over quota in an AST and give appropriate message etc. GB 30-Jul-1984
+! 1-007 - Fix over quota handling in line mode. GB 15-Oct-1984
+!--
+
+
+%SBTTL 'Declarations'
+
+!
+! AST LINKAGE
+!
+
+LINKAGE
+    AST_LINKAGE = PUSHJ : LINKAGE_REGS (15, 14, 4)
+			  PRESERVE (0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13);
+
+!
+! TABLE OF CONTENTS:
+!
+
+REQUIRE 'EDTSRC:TRAROUNAM';
+
+LIBRARY 'EDTSRC:KEYPADDEF';
+
+LIBRARY 'EDTSRC:SUPPORTS';
+
+FORWARD ROUTINE
+    EDT$$GET_LOGDIR : NOVALUE,
+    EDT$$INTER_ERR : NOVALUE,
+    EDT$$SYS_EXI : NOVALUE,
+    EDT$$GET_DATE : NOVALUE,
+    EDT$$DEA_ALLHEAP : NOVALUE,
+    EDT$$START_WKINGMSG : NOVALUE,
+    EDT$$STOP_WKINGMSG : NOVALUE,
+    EDT$$INT_CONTROL,
+    CC_ISR : NOVALUE,
+    CC_AST : AST_LINKAGE NOVALUE,
+    OVRQTA_ISR : NOVALUE,
+    OVRQTA_AST : AST_LINKAGE NOVALUE,
+    TIMER_ISR : NOVALUE,
+    TIMER_AST : AST_LINKAGE NOVALUE;
+
+!
+! INCLUDE FILES:
+!
+
+REQUIRE 'EDTSRC:EDTREQ';
+
+REQUIRE 'SYS:JSYS';
+
+!
+! MACROS:
+!
+!	NONE
+!
+! EQUATED SYMBOLS:
+!
+!    	NONE
+!
+! OWN STORAGE:
+!
+
+
+!
+! EXTERNAL REFERENCES:
+!
+
+EXTERNAL ROUTINE
+    EDT$$CAN_KDEF,
+    EDT$$TI_WRSTR,
+    EDT$$FMT_STR,
+    EDT$$FMT_CRLF,
+    EDT$$OUT_FMTBUF,
+    EDT$$SC_ERATOEOL,
+    EDT$$SC_POSCSIF,
+    EDT$$SC_INIT,
+    EDT$$SC_RESET,
+    EDT$$TI_WRLN : NOVALUE,
+    EDT$$TI_RES,
+    EDT$$TI_OPN,
+    EDT$$DEA_HEAP : NOVALUE,
+    DEAMEM : NOVALUE,
+    EDT$$MSG_TOSTR : NOVALUE;
+
+EXTERNAL
+    EDIT_MOD,
+    FST_AVLN,
+    FST_SCRPTR,
+    TRN_TBL : VECTOR,
+    US_TXT : VECTOR,
+    US_ENT : VECTOR,
+    MESSAGE_LINE,
+    FMT_WRRUT,
+    WORKCOUNT,
+    SCR_CHGD,
+    SECOND : VOLATILE,
+    BUF_LST,
+    TI_RESET,
+    TT_OPEN,
+    TXT_ONSCR,
+    CC_WAIT,
+    CC : VOLATILE;
+
+LITERAL
+    CHUNK_SIZE = 16,
+    MAP_SIZE = 256*512/CHUNK_SIZE;
+
+
+    MESSAGES ((COMFILNOP, NOJNLFIL, CTRC__IGN, INPFILCLO, JOUFILCLO, COMFILCLO,
+	       EDITORABO, WRKFILOVF))
+
+
+GLOBAL
+    HDEF_NAM : BLOCK [1] PRESET ([DSC$W_LENGTH] = 15,
+		[DSC$A_POINTER] = UPLIT (%ASCIZ 'HLP:EDTHELP.HLB')),
+    HELP_DFLT : VECTOR [DSC$K_SIZE] INITIAL (
+	    0,
+	    0,
+	    CH$PTR (UPLIT (%ASCIZ 'HLP')),
+	    0,
+	    CH$PTR (UPLIT (%ASCIZ 'EDTHELP')),
+	    CH$PTR (UPLIT (%ASCIZ 'HLB'))),
+
+    CMD_NAM_DEF1 : BLOCK [1] PRESET ([DSC$W_LENGTH] = 14,
+			[DSC$A_POINTER] = UPLIT (%ASCIZ 'SYS:EDTSYS.EDT')),
+    CMD_NAM_DEF2 : BLOCK [1] PRESET ([DSC$W_LENGTH] = 10,
+			[DSC$A_POINTER] = UPLIT (%ASCIZ 'EDTINI.EDT')),
+    CMD_DFLT : VECTOR [DSC$K_SIZE] INITIAL (
+	    0,
+	    0,
+	    0,
+	    0,
+	    CH$PTR (UPLIT (%ASCIZ 'EDTINI')),
+	    CH$PTR (UPLIT (%ASCIZ 'EDT')));
+
+OWN
+    MAP_BUILT,
+    FIRST_FREE,
+    MEM_USE : INITIAL (0),
+    MEMORY_MAP : BITVECTOR [MAP_SIZE];
+
+
+%SBTTL 'EDT$$GET_LOGDIR - Get login directory and device'
+GLOBAL ROUTINE EDT$$GET_LOGDIR (		! Get login directory and device
+	SOURCE : REF BLOCK,			! Address of source block
+	DEST   : REF BLOCK ) : NOVALUE =	! Destination block address
+
+!++
+! FUNCTIONAL SPECIFICATION:
+!
+!	This routine takes the file name and type from the source
+!	block, and places these together with the login device
+!	and directory into the destination block. This is used
+!	in searching for the startup command file.
+!
+! FORMAL PARAMETERS:
+!
+!	SOURCE	Source block address
+!	DEST	Destination block address
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+    MESSAGES ((INSMEM));
+
+    EXTERNAL ROUTINE
+	EDT$$FMT_MSG,
+	EDT$$ALO_HEAP;			! Allocate memory for the string
+
+    LOCAL
+	TEMP_PTR,
+	TEMP_LEN,
+	DIR_NO,
+	DIR_ADR;
+
+!
+! Get the login directory number and convert it to a string.
+!
+
+    _GETJI (-1, FLD (-1,FLD_LHS) + FLD (DIR_NO,FLD_RHS), $JILNO);
+    IF NOT EDT$$ALO_HEAP (%REF (80), DIR_ADR)
+    THEN
+	BEGIN
+	EDT$$FMT_MSG (EDT$_INSMEM);
+	RETURN;
+	END;
+
+    DIR_ADR = CH$PTR (.DIR_ADR);
+    _DIRST (.DIR_ADR, .DIR_NO; TEMP_PTR);
+
+!
+! Now copy the filespec defaults from the source and fill in the rest
+!
+
+    TEMP_LEN = CH$DIFF (.TEMP_PTR, .DIR_ADR);
+    DEST [DSC$L_DESC] = 0;
+    DEST [DSC$A_FNAME] = .SOURCE [DSC$A_FNAME];
+    DEST [DSC$A_FEXTN] = .SOURCE [DSC$A_FEXTN];
+    DEST [DSC$A_DEVICE] = .DIR_ADR;
+
+    TEMP_PTR = CH$FIND_CH (.TEMP_LEN, .DIR_ADR, %C':');
+    CH$WCHAR_A (0, TEMP_PTR);
+    DEST [DSC$A_DIRECT] = CH$PLUS (.TEMP_PTR, 1);
+    TEMP_PTR = CH$FIND_CH (.TEMP_LEN, .DIR_ADR, %C'>');
+    CH$WCHAR_A (0, TEMP_PTR);
+    END;
+
+%SBTTL 'EDT$$INTER_ERR  - internal error'
+
+GLOBAL ROUTINE EDT$$INTER_ERR (			! Internal error
+    CODE					! Error number
+    ) : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	If an internal error is detected in EDT, come here to
+!	print a cryptic error code and bail out.
+!
+! FORMAL PARAMETERS:
+!
+!	CODE		The error code number
+!
+! IMPLICIT INPUTS:
+!
+!	MESSAGE
+!
+! IMPLICIT OUTPUTS:
+!
+!	MESSAGE
+!
+! ROUTINE VALUE:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	Never returns to its caller.
+!
+!--
+
+    BEGIN
+
+!+
+! Output the code and address. This is done directly with JSYS's because
+! we have no octal output routine, nor can we trust the output routines.
+!-
+
+    _PSOUT (CH$PTR (UPLIT (%ASCIZ 'Internal error detected - code : ')));
+    _NOUT  ($PRIOU, .CODE, 10);
+    _PSOUT (CH$PTR (UPLIT (%ASCIZ ' at address : ')));
+    _NOUT  ($PRIOU, (.(CODE + 1) - 1) AND %O'777777', 8);
+    _PSOUT (CH$PTR (UPLIT (%CHAR (ASC_K_CR, ASC_K_LF, 0))));
+    EDT$$SYS_EXI (EDT$_EDITORABO);
+    END;
+
+%SBTTL 'EDT$$SYS_EXI  - exit back to the operating system'
+
+GLOBAL ROUTINE EDT$$SYS_EXI (			! Exit back to the operating system
+    STATUS					! Exit status code
+    ) : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Final clean-up
+!
+! FORMAL PARAMETERS:
+!
+!	STATUS		Exit status code.
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	Deallocates all heap memory and returns the status to the
+!	superior fork.
+!
+!--
+
+    BEGIN
+
+    OWN
+	PRARG_BLK : VECTOR [3] INITIAL (1, %O'400740000002', 0);
+
+    EXTERNAL
+	EXE_CURCMD : REF NODE_BLOCK;	! Current command pointer
+
+    LOCAL
+	CMD : REF NODE_BLOCK;		! A local pointer
+
+    EDT$$DEA_ALLHEAP ();
+
+!+
+! If the status is non-zero then don't look for EXIT/GO
+!-
+
+    IF (.STATUS EQL 0)
+    THEN
+	BEGIN
+
+!+
+! If the command was EXIT/GO, then tell EXEC about it.
+!-
+
+	IF ((.EXE_CURCMD [NODE_TYPE] EQL COM_NODE)
+	    AND (.EXE_CURCMD [COM_NUM] EQL COM_EXIT)) THEN
+	    BEGIN
+	    CMD = .EXE_CURCMD [SWITS];
+	    WHILE 1 DO
+		BEGIN
+
+!+
+! Search the command nodes for /GO.
+!-
+
+		IF (.CMD NEQ 0)
+		THEN
+		    IF ((.CMD [SW_BITS] AND OPT_GO) NEQ 0)
+		    THEN
+			EXITLOOP
+		    ELSE
+			CMD = .CMD [SWITS]
+		ELSE
+		    EXITLOOP;
+		END;
+
+	    IF (.CMD NEQ 0) THEN
+		_PRARG (FLD ($PRAST,FLD_LHS) + $FHSLF, PRARG_BLK, 3);
+	    END;
+	END;
+
+!+
+! Get a status code to return to the superior fork.
+!-
+
+    CMD = (SELECTONE .STATUS OF
+	SET
+	[0]              : 0;		! Good return
+	[EDT$_EDITORABO] : 2;		! Internal abort
+	[EDT$_COMFILNOP] : 3;		! No command file
+	[EDT$_NOJNLFIL]  : 4;		! Journal file not open
+	[-1]             : 5;		! /NOCREATE and file not found
+	[EDT$_INPFILCLO] : 6;		! Input file not closed
+	[EDT$_COMFILCLO] : 7;		! Command file not closed
+	[EDT$_JOUFILCLO] : 8;		! Journal file not closed
+	[EDT$_WRKFILOVF] : 9;		! Work file overflowed
+	[EDT$_CTRC__IGN] : 10;		! Recovery aborted
+	TES);
+	
+!+
+! Watch out for user typing continue
+!-
+
+    WHILE 1 DO _HALTF (.CMD);
+
+    END;
+
+%SBTTL 'EDT$$GET_DATE  - return the date as an ASCII string'
+
+GLOBAL ROUTINE EDT$$GET_DATE (			! Return the date as an ASCII string
+    LEN, 					! Length of the buffer to return the date in
+    BUFFER					! Address of the buffer
+    ) : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Return the date and time as an ASCII string.
+!
+! FORMAL PARAMETERS:
+!
+!  LEN			Length of the buffer in which the date is returned
+!
+!  BUFFER		Address of that buffer.
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	STRING_PTR;
+
+
+!
+! Get Date & time from system
+!
+
+    STRING_PTR = CH$PTR (.BUFFER,, BYTE_SIZE);
+
+    CH$WCHAR_A (%C' ', STRING_PTR);		! begin with a space
+
+    _ODTIM (.STRING_PTR, -1, 0; STRING_PTR);
+
+    CH$WCHAR_A (%C' ', STRING_PTR);		! and end with a space
+
+    IF CH$RCHAR (CH$PTR (.BUFFER, 1, BYTE_SIZE))  EQL %C' '
+    THEN
+	BEGIN
+	CH$MOVE (18, CH$PTR (.BUFFER, 2, BYTE_SIZE),
+		    CH$PTR (.BUFFER, 1, BYTE_SIZE));	! shift left one space
+	.LEN = 19;
+	END
+    ELSE
+	.LEN = 20;
+
+    END;
+
+%SBTTL	'EDT$$DEA_ALLHEAP - Deallocate all memory'
+
+GLOBAL ROUTINE EDT$$DEA_ALLHEAP 		! Deallocate all memory
+    : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Deallocate all memory which was allocated for the screen database,
+!	buffer headers, entities, and key definitions.
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	Frees up memory.
+!--
+
+    BEGIN
+!
+!EXTERNAL REFERENCES
+!
+
+
+    LOCAL
+	NEW_PTR : REF SCREEN_LINE,
+	NEW_BUF : REF TBCB_BLOCK,
+	LEN;
+
+!+
+! Deallocate all buffer headers
+!-
+    NEW_BUF = .BUF_LST;
+
+    WHILE .NEW_BUF NEQ 0 DO
+	BEGIN
+	LEN = .NEW_BUF [TBCB_NAME_LEN] + TBCB_SIZE;
+	BUF_LST = .NEW_BUF [TBCB_NEXT_BUF];
+	EDT$$DEA_HEAP (LEN, NEW_BUF);
+	NEW_BUF = .BUF_LST;
+	END;
+!+
+! Deallocate memory used for screen data structure.
+!-
+    NEW_PTR = .FST_SCRPTR;
+
+    WHILE (.NEW_PTR NEQA 0) DO
+	BEGIN
+	FST_SCRPTR = .NEW_PTR [SCR_NXT_LINE];
+	EDT$$DEA_HEAP (%REF (SCR_SIZE), NEW_PTR);
+	NEW_PTR = .FST_SCRPTR;
+	END;
+
+    NEW_PTR = .FST_AVLN;
+
+    WHILE (.NEW_PTR NEQA 0) DO
+	BEGIN
+	FST_AVLN = .NEW_PTR [SCR_NXT_LINE];
+	EDT$$DEA_HEAP (%REF (SCR_SIZE), NEW_PTR);
+	NEW_PTR = .FST_AVLN;
+	END;
+
+!+
+! Deallocate virtual storage allocated for entities
+!-
+
+    INCR ENT_NUM FROM 0 TO 3 DO
+	BEGIN
+	LEN = ..US_ENT [.ENT_NUM];
+	EDT$$DEA_HEAP (%REF (.LEN + 1), US_ENT [.ENT_NUM] + 1);
+	END;
+
+    INCR TEXT_NUM FROM 0 TO 1 DO
+	BEGIN
+	LEN = ..US_TXT [.TEXT_NUM];
+	EDT$$DEA_HEAP (%REF (.LEN + 1), US_TXT [.TEXT_NUM] + 1);
+	END;
+
+!+
+! Deallocate virtual storage reserved for the key definitions
+!-
+
+    INCR TBL_PTR FROM 0 TO K_KPAD_HASHSIZ - 1 DO
+	BEGIN
+
+	WHILE (.TRN_TBL [.TBL_PTR] NEQA 0) DO
+	    BEGIN
+
+	    LOCAL
+		KEY_PTR : REF BLOCK [] FIELD (KEY_DEF_FIELD);
+
+	    KEY_PTR = .TRN_TBL [.TBL_PTR];
+	    EDT$$CAN_KDEF (.KEY_PTR [KEY_DEF_KEY]);
+	    END;
+
+	END;
+
+    DEAMEM ();
+    END;
+
+
+
+
+%SBTTL 'EDT$$START_WKINGMSG  - initiate the "working" timer'
+
+GLOBAL ROUTINE EDT$$START_WKINGMSG 		! Initiate the "working" timer
+    : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Start the timer which will cause the "working" message
+!	to print occasionally until it is cancelled.
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	WORKING set to zero
+!
+! ROUTINE VALUE:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	Starts a one second timer which will cause an interrupt on channel 2.
+!-
+
+    BEGIN
+    _TIMER (FLD ($FHSLF, FLD_LHS) + $TIMEL, 1000, 2);
+    SECOND = 0;
+    WORKCOUNT = 0;
+    END;
+
+%SBTTL 'EDT$$STOP_WKINGMSG  - cancel the "working" timer'
+
+GLOBAL ROUTINE EDT$$STOP_WKINGMSG 		! Cancel the "working" timer
+    : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Cancel the "working" timer.  The "working" message will not print
+!	until it is initiated again.  Also, erase the working message.
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	WORKCOUNT set to -1
+!
+! ROUTINE VALUE:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	The timer is stopped.
+!--
+
+    BEGIN
+
+    LOCAL
+	TEMP,
+	FORMAT_ROUTINE;
+
+!+
+! If the "working" message is not running, then do nothing.
+!-
+
+    IF (.WORKCOUNT LSS 0) THEN RETURN;
+
+!+
+! Stop all timer interrupts up to 2 seconds from now.
+!-
+
+    _GTAD (;TEMP);
+    _TIMER (FLD ($FHSLF, FLD_LHS) + $TIMBF, .TEMP + 6, 0);
+
+!+
+! Erase the working message when it is stopped if not already done.
+!-
+
+
+    FORMAT_ROUTINE = .FMT_WRRUT;
+    FMT_WRRUT = EDT$$TI_WRSTR;
+
+    IF .WORKCOUNT
+    THEN
+	BEGIN
+	EDT$$SC_POSCSIF (.MESSAGE_LINE + 1, 0);
+	EDT$$SC_ERATOEOL ();
+	EDT$$OUT_FMTBUF ();
+	END;
+
+!+
+! If "working" was printed, then reposition the cursor to the leftmost
+! position of the prompt.
+!-
+
+    IF (.WORKCOUNT NEQ 0)
+    THEN
+	BEGIN
+	EDT$$SC_POSCSIF (.MESSAGE_LINE + 1, 0);
+	EDT$$OUT_FMTBUF ();
+	END;
+
+
+    FMT_WRRUT = .FORMAT_ROUTINE;
+    WORKCOUNT = -1;
+    END;
+
+
+%SBTTL 'EDT$$INT_CONTROL - enable for control C/T traps'
+GLOBAL ROUTINE EDT$$INT_CONTROL (		! Enable for control C/T traps
+	MODE ) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Enable for control-C or control-T traps.  When a control-C is
+!	intercepted, CC_ISR is called. 
+!
+! FORMAL PARAMETERS:
+!
+!	MODE - one of the following:
+!	  1  - enable control-C interrupts
+!	  2  - disable control-C interrupts
+!	  3  - enable control-T interrupts (stop EXEC seeing it)
+!	  4  - disable control-T interrupts (let EXEC see it again)
+!
+! IMPLICIT INPUTS:
+!
+!	FMT_WRRUT
+!	CTRL_T
+!
+! IMPLICIT OUTPUTS:
+!
+!	CT
+!
+! ROUTINE VALUE:
+!
+!	Success = 1, Failure = 0.
+!
+! SIDE EFFECTS:
+!
+!	Enables or disables interrupts
+!
+!--
+
+    BEGIN
+
+    OWN
+	CHAN2_ADDR,				! Channel 2 interrupt address
+
+	LEVEL_TAB : VECTOR [3]			! Interrupt level table
+		    INITIAL (CC,		! Control-C
+			     CHAN2_ADDR,	! Timer and over quota
+			     0),
+
+	CHAN_TAB  : VECTOR [36]			! Channel table
+		    INITIAL (FLD (1, FLD_LHS) + FLD (CC_ISR, FLD_RHS),
+			     0,
+			     FLD (2, FLD_LHS) + FLD (TIMER_ISR, FLD_RHS),
+			     REP 9 OF (0),
+			     FLD (2, FLD_LHS) + FLD (OVRQTA_ISR, FLD_RHS),
+			     REP 23 OF (0));
+
+    LOCAL
+	TEMP_1,
+	TEMP_2;
+
+    EXTERNAL
+	FMT_WRRUT,				! Address of terminal O/P
+	EDT$$TI_WRSTR,				! Possible value of FMT_WRRUT
+	TXT_ONSCR,				! Text on screen flag
+	TT_OPEN,				! Terminal opened flag
+	CTRL_T;					! SET [NO]CONTROL-T flag
+
+    LITERAL
+	CC_CHAN = %O'400000000000',		! ^C channel = 0
+	TIM_CHAN= %O'100000000000',		! Timer channel = 2
+	OVRQTA_CHAN= %O'40000000';		! Over quota channel
+
+    CASE .MODE FROM 1 TO 4 OF
+	SET
+
+	[1]:					! Enable ^C interrupt
+	    BEGIN
+
+!+
+! Set the interrupt table addresses and enable the system.
+! Also activate the timer and over quota interrupt channels.
+!-
+
+	    _SIR ($FHSLF, FLD (LEVEL_TAB, FLD_LHS) + FLD (CHAN_TAB, FLD_RHS));
+	    _EIR ();
+	    _AIC ($FHSLF, TIM_CHAN);
+	    _AIC ($FHSLF, OVRQTA_CHAN);
+	
+%IF SUPPORT_CTLC
+%THEN
+!+
+! If we can trap control-C, then assign channel 0 to it, else return 0.
+!-
+
+	    _RPCAP ($FHSLF; TEMP_1, TEMP_2);
+	    IF ((.TEMP_1 AND SC_CTC) EQL 0) THEN RETURN (0);
+
+	    _EPCAP ($FHSLF, .TEMP_1, .TEMP_2 OR SC_CTC);
+	    _ATI (FLD ($TICCC, FLD_LHS) + 0);
+	    _AIC ($FHSLF, CC_CHAN);
+%FI
+	    CC = 0;
+	    END;
+
+	[2]:					! Disable ^C interrupt
+	    BEGIN
+	    _DIC ($FHSLF, CC_CHAN);
+	    _DTI ($TICCC);
+	    END;
+
+	[3]:					! Enable ^T catcher
+
+!+
+! If we are in change mode then either enable interrupts for ^T or just
+! stop EXEC seeing it as defined by CTRL_T.
+!-
+
+	    IF (.FMT_WRRUT EQL EDT$$TI_WRSTR)
+	    THEN
+		IF (.CTRL_T NEQ 0)
+		THEN
+
+		    BEGIN			! Stop EXEC seeing ^T
+		    _RTIW ($FHJOB; TEMP_1);
+		    _STIW ($FHJOB, .TEMP_1 AND NOT %O'100000');
+		    END;
+
+	[4]:					! Disable ^T interrupts
+
+!+
+! If we are in change mode, then stop ^T interrupting or let it be seen
+! by EXEC as appropriate.
+!-
+
+	    IF (.FMT_WRRUT EQL EDT$$TI_WRSTR)
+	    THEN
+		IF (.CTRL_T NEQ 0)
+		THEN
+
+		    BEGIN			! Let EXEC see ^T
+		    _RTIW ($FHJOB; TEMP_1);
+		    _STIW ($FHJOB, .TEMP_1 OR %O'100000');
+		    END;
+
+	TES;
+
+	RETURN (1);
+	END;
+
+%SBTTL	'CC_ISR - deal with a control-C interrupt'
+
+ROUTINE CC_ISR : NOVALUE =			! Deal with an interrupt
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine simply DEBRK's out of an interrupt. CC has
+!	already been set by the interrupt mechanism.
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+    CC_AST ();
+    _DEBRK ();
+
+    END;
+
+%SBTTL	'CC_AST - Process control-c interrupt'
+
+ROUTINE CC_AST: AST_LINKAGE	NOVALUE =		! Process interrupt
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine is called to check if the interrupt occurred in
+!	user code or in monitor code. If in monitor and EDT was waiting
+!	for terminal input (CC_WAIT set) then the PC is incremented to
+!	cause the monitor call to complete.
+!
+!	It must	be done this way so that AC's can be saved.
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	May abort outstanding terminal I/O.
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	TEMP_1,
+	TEMP_2;
+
+    _RWM ($FHSLF; TEMP_1, TEMP_2);
+    IF (((.TEMP_2 AND %O'200000') NEQ 0) AND (.CC_WAIT NEQ 0))
+    THEN
+	CC = .CC + 1;
+    END;
+
+
+%SBTTL	'OVRQTA_ISR - handle over quota interrupt'
+
+ROUTINE OVRQTA_ISR : NOVALUE =			! Deal with an interrupt
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine simply DEBRK's out of an interrupt after calling
+!	OVRQTA_AST to exit and allow the user to delete some files
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+    OVRQTA_AST ();
+    _DEBRK ();
+
+    END;
+
+%SBTTL	'OVRQTA_AST - Process over quota interrupt'
+
+ROUTINE OVRQTA_AST: AST_LINKAGE	NOVALUE =		! Process interrupt
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine is called to handle over quota interrupts.
+!	It exits to EXEC after printing a message and allows
+!	the user to delete some files to make space, then
+!	type continue to return. It then DEBRKs from the
+!	interrupt after resetting the terminal mode.
+!
+!	It must	be done this way so that AC's can be saved.
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	FORMAT_ROUTINE;
+
+    OWN
+	CUR_MODE;
+
+!+
+! First reset the terminal to its original state
+!-
+
+    IF (.EDIT_MOD EQL CHANGE_MODE)
+    THEN
+	CUR_MODE = CHANGE_MODE
+    ELSE
+	CUR_MODE = LINE_MODE;
+
+    IF .TI_RESET THEN EDT$$SC_RESET ();
+!+
+! Output a suitable message 
+!-
+
+    EDT$$TI_RES ();
+    _PSOUT (CH$PTR (UPLIT (%ASCIZ '?Over quota or disk full -')));
+    _PSOUT (CH$PTR (UPLIT (%CHAR (ASC_K_CR, ASC_K_LF, 0))));
+    _PSOUT (CH$PTR (UPLIT (%ASCIZ ' If you wish to continue with this edit')));
+    _PSOUT (CH$PTR (UPLIT (%CHAR (ASC_K_CR, ASC_K_LF, 0))));
+    _PSOUT (CH$PTR (UPLIT (%ASCIZ ' EXPUNGE some files and type CONTINUE')));
+
+!+
+! Wait for him to CONTINUE
+!-
+    _HALTF ();
+!+
+! Now we must reopen the terminal and repaint the screen we were in change mode
+!-
+    TT_OPEN = 0;
+    EDT$$TI_OPN ();
+    IF (.CUR_MODE EQL CHANGE_MODE)
+    THEN
+	BEGIN
+	EDT$$SC_INIT ();
+	SCR_CHGD = 2;
+	END;
+    END;
+
+
+%SBTTL	'TIMER_ISR - deal with a timer interrupt'
+
+ROUTINE TIMER_ISR : NOVALUE =			! Deal with a timer interrupt
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine calls TIMER_AST to reset the timer and set a flag.
+!	This has to be done since this routine cannot use any AC's.
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!--
+
+    BEGIN
+
+    TIMER_AST ();
+    _DEBRK ();
+
+    END;
+
+%SBTTL	'TIMER_AST - Reset the timer'
+
+ROUTINE TIMER_AST : AST_LINKAGE	NOVALUE =		! Reset the timer
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine is called to reset the timer and set a flag. It must
+!	be done this way so that AC's can be saved.
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	Restarts the timer.
+!
+!--
+
+    BEGIN
+
+    IF (.WORKCOUNT GEQ 0) THEN
+	BEGIN
+	SECOND = -1;
+	_TIMER (FLD ($FHSLF, FLD_LHS) + $TIMEL, 1000, 2);
+	END;
+
+    END;
+
+END
+ELUDOM

@@ -1,0 +1,622 @@
+%TITLE 'DIU Request Scheduler'
+
+MODULE DIUSCH (         IDENT = '252',
+                        LANGUAGE(BLISS36),
+                        ENTRY(Sched)
+      		       ) =
+BEGIN
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+!++
+! ABSTRACT:
+!   This module contains the job scheduler for DIU-20.  It selects
+!   jobs from the DIU queue for processing, and calls the create job
+!   service to create a job to handle each request.  It can be called
+!   at interrupt level, in response to timer requests, IPCF messages,
+!   or network topology changes.
+!
+! ENVIRONMENT:
+!   User mode, XPORT.
+!
+! VARIANTS:
+!    /VARIANT (on TOPS-10) will compile code to support TOPS-10 V7.02
+!
+! CREATION DATE: 17-Jun-85
+!
+! AUTHOR: Andrew Nourse
+!         Adapted from FTSSCH, which was written by Larry Campbell
+
+! HISTORY:
+!
+!  252	Remove library of CONDIT.
+!	Sandy Clemens  1-Jul-86
+!
+!  234  Change library of RMSUSR to RMSINT.
+!       Gregory A. Scott 17-Jul-86
+!
+!  174  Remove library TOPS20.
+!       Gregory A. Scott 20-May-86
+!
+!  167  Remove external for s$node_check since it is not used here.
+!       Gregory A. Scott 19-May-86
+!
+!  154  Rename start_job to j$start and kill_job to j$kill.   We  were  calling
+!       lj$event and lj$uevent when we meant l$event and l$uevent.  
+!       Gregory A. Scott 12-May-86
+!
+!  152  The routine that tried to expire requests whose  deadlines  had  passed
+!       did a rather incomplete job.  Same way with the  timeout routine.   So,
+!       now we do it the same way that ipc_delete does.
+!       Gregory A. Scott 11-May-86
+!
+!  126  Change module name to DIUSCH for  DDT and GLOB.  DO_SCHED is a  NOVALUE
+!       routine, so why should  it return a value.   S$TIMINT always takes  the
+!       channel from t_channel on  the -20, so now  it only takes one  argument
+!       which is the time to wake up.
+!       Gregory A. Scott 26-Apr-86
+!
+!      40 Put the REQUIRE/LIBRARY of 'TOPS20' into a TOPS-20 only
+!         conditional.
+!         Sandy Clemens  7-Oct-85
+!
+! 02 -    Change the interrupt code for TOPS-10 [Doug Rayner, 25-Jul-85]
+! 01 -    Initial version of DIUSCH, extracted from FTSSCH
+!--
+
+!************************************************************************
+!                        L I B R A R I E S                      
+!************************************************************************
+
+LIBRARY 'BLI:XPORT';                    ! XPORT of course
+LIBRARY 'FAO';                          ! FAO services
+LIBRARY 'RMSINT';                       ! RMS services
+LIBRARY 'DIU';                          ! DIU Data Structures
+
+
+!
+! TABLE OF CONTENTS:
+!
+FORWARD ROUTINE
+    sched : NOVALUE,                    ! Schedule a request
+    do_sched : NOVALUE,                 ! The actual work routine
+    expire : NOVALUE,                   ! Stomp on an expired request
+    timeout : NOVALUE,                  ! Requeue a timed-out request
+    abort_sched;                        ! Condition handler for scheduler
+
+!
+! EQUATED SYMBOLS:
+!
+LITERAL
+    bignum =
+        %BLISS16 (%O'177777')
+        %BLISS32 (%X'FFFFFFFF')
+        %BLISS36 (%O'377777777777');    ! Largest positive integer
+
+LITERAL
+    timeout_interval =
+     %IF %SWITCHES (TOPS20)
+     %THEN
+        (5 * 60 / 3);                   ! 5 minute timeout
+     %ELSE
+	(%O'1000000' / (24 * 60)) * 5;	! Five minute timeout checks
+     %FI
+
+LITERAL
+    short_sleep =
+        (%O'1000000' / (24 * 60)) * 10; ![10] Ten minute sleep if PMR
+
+LITERAL
+    long_sleep = (%O'1000000' / (24 * 60)) * 20; ! Twenty minute sleep
+
+!
+! OWN STORAGE:
+!
+
+OWN
+    ssleep : INITIAL (short_sleep),     ! [5] Make sleep intervals
+    lsleep : INITIAL (long_sleep);      !   patchable
+
+OWN TIMOUT : INITIAL(timeout_interval); ![7] 5 minute timeout **PATCHABLE**
+
+OWN SCHTIM: INITIAL(0);                 ![7] Time of last scheduler pass
+
+GLOBAL
+    mjob : INITIAL (4),                 ! Max jobs running concurrently
+    njob;                               ! Number of current jobs
+
+OWN
+    next_event_time;                    ! Earliest /AFTER to expire next
+
+%IF %SWITCHES (TOPS10) %THEN
+%IF %VARIANT ! TOPS-10 V7.02 support
+%THEN
+OWN
+    query_pid : INITIAL(0);		! Pid to use to query SYSTEM[INFO]
+%FI
+%FI
+
+!
+! EXTERNAL REFERENCES:
+!
+EXTERNAL
+    jobstatus : BLOCKVECTOR [DIU$K_MAX_MJOB, DIUJ$K_LEN]
+                FIELD (DIUJ$$JOBSTAT_FIELDS),
+    shutdown,                           ! Spooler shut down
+    mst_flag : VOLATILE;                ! We are the master job
+
+EXTERNAL ROUTINE
+    s$strchk,                           ! Check to see if structure online
+    q$find,                             ! Find a request in the queue
+    q$delete,                           ! Delete a request
+    q$reque,                            ! Requeue a request
+    q$modify,                           ! Modify a request
+    j$start : NOVALUE,                  ! Start a request
+    j$kill,                             ! Kill an active job
+    l$event : NOVALUE,                  ! Log an event to system log file
+    l$uevent : NOVALUE,                 ! Log an event to user log file
+    abort : NOVALUE,                    ! Abort dependents of dying request
+    notify : NOVALUE,                   ! Notify owner of request disposition
+    q$req_block_init : NOVALUE,         ! Init a request block
+    q$release_chain : NOVALUE,          ! Release chain of request blocks
+    diu$abort : NOVALUE,                ! Condition handler
+    s$noint : NOVALUE,                  ! Disable interrupts
+    s$okint : NOVALUE,                  ! Reenable interrupts
+    s$time,                             ! Return current time of day
+    s$jobtime,                          ! get runtime for job
+    s$timint;                           ! Post timer interrupt
+
+%IF %SWITCHES (TOPS10) %THEN
+%IF %VARIANT ! TOPS-10 V7.02 support
+%THEN
+EXTERNAL ROUTINE
+    ip$check_pid;			! Check to see if a PID is still valid
+%FI
+%FI
+
+GLOBAL ROUTINE sched : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   The job scheduler for DIU.  This routine can be called at command
+!   level (START, for example) or at interrupt level (on receipt of a new
+!   request).  Because we can be called at interrupt level we ENABLE
+!   the default condition handler here to catch errors so we DEBRK properly.
+!
+! FORMAL PARAMETERS:
+!   NONE
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   NONE
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+    BEGIN
+
+    ENABLE
+        diu$abort;
+
+    IF NOT .mst_flag
+    THEN
+        RETURN (DIU$_NO_SPOOLER);
+    IF .shutdown
+    THEN
+        RETURN (DIU$_SHUTDOWN);
+    IF .njob GEQ .mjob
+    THEN
+        RETURN (DIU$_MJOB_EXCEEDED);
+    do_sched ();                        ! Call the work routine
+    END;                                ! End of sched
+
+ROUTINE do_sched : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Schedule a request.  If MJOB is not full yet (slots are available),
+!   the queue is searched for eligible requests.  For each one found,
+!   a job is created and logged in and the request initiated.  We establish
+!   a condition handler here in order to free up any memory we may have
+!   allocated in the event of errors.
+!--
+    BEGIN
+    LOCAL
+        retcode,
+        req_id,
+        chain_head : VOLATILE,
+        chain_copy,                     ! Hold copy of chain head
+        current_block,
+        req_block : $DIU_BLOCK,
+        now,                         ! current time
+        check_for_hung_requests;     ! nonzero if time to look for hung jobs
+
+    ENABLE
+        abort_sched (chain_head);
+    !
+    ! Disable interrupts to prevent confusion
+    !
+    s$noint ();
+
+
+
+    now=S$TIME();                       ! what time is it? 
+    IF .SCHTIM EQL 0                    ! If first time here, 
+    THEN SCHTIM = .now;                 ! do not check timeout
+
+    IF (check_for_hung_requests=(.now-.SCHTIM) GTR .TIMOUT) ! time to look?
+    THEN SCHTIM=.now;                   ! yes remember this time
+
+    ! Must do pass even if MJOB exceeded,
+    ! to expire deadlined & timed-out jobs
+    ! Just return immediately if we're full.
+    !
+
+    !
+    ! Get a list of all requests in the queue.
+    !
+    q$req_block_init (req_block);
+    q$find (req_block, chain_head);
+    current_block = chain_head;
+    chain_copy = .chain_head;           ! Make copy of chain head
+                                        ! so we can remember if queue empty
+    ! 
+    ! Set artificial value (largest positive number) for earliest /AFTER
+    ! 
+    next_event_time = bignum;
+
+    !
+    ! Now chase the chain of request blocks, picking and starting eligible ones
+    !
+    WHILE ((current_block = ..current_block) NEQ 0)
+    DO
+        BEGIN
+        BIND
+            req_block = .current_block + 1 : $DIU_BLOCK;
+        !
+        ! If deadline expired, kill the request and don't make any other tests
+        !
+        IF .req_block[DIU$G_DEADLINE] NEQ 0
+            AND .req_block[DIU$G_DEADLINE] LEQ s$time ()
+        THEN
+            expire (req_block)
+        ELSE
+            BEGIN
+            !
+            ! Deadline is not expired...  keep checking...
+            !
+            IF (.check_for_hung_requests neq 0)     ! If time to check
+            AND .req_block[DIU$V_ACTIVE]            ! If request is active
+            THEN                                    ! see if it timed out
+                BEGIN                               ! 
+                LOCAL jobtime;                      ! runtime now
+                LOCAL oldjobtime: INITIAL(0);       ! runtime on last pass
+                LOCAL jobnum;                       ! job number 
+                LOCAL reqid;                        ! job number 
+                LOCAL index: INITIAL(0);            ! index in JOBSTATUS
+                                                    !
+                reqid=.req_block[DIU$H_REQUEST_ID]; !
+
+                DO  BEGIN                                                  !
+                    IF (.JOBSTATUS[.index,DIUJ$H_REQUEST_ID] EQL .reqid)   !
+                    AND .JOBSTATUS[.index,DIUJ$V_INUSE]                    !
+                    THEN EXITLOOP                                          !
+                    ELSE index=.index+1;                                   !
+                    END WHILE .index LSS DIU$K_MAX_MJOB;                   !
+
+                IF .index EQL DIU$K_MAX_MJOB   ! Can't find request! OOPS  !
+                THEN SIGNAL(DIU$_BUG,DIU$_REQ_NOT_FOUND);                  !
+
+                jobnum=.JOBSTATUS[.index,DIUJ$H_JOB_NUMBER];
+
+%IF %SWITCHES (TOPS20)
+%THEN                                   ! TOPS-20 ONLY
+                jobtime=s$jobtime(.jobnum);     ! get current runtime
+                oldjobtime=.JOBSTATUS[.index,DIUJ$G_JOB_RUNTIME];
+                JOBSTATUS[.index,DIUJ$G_JOB_RUNTIME]=.jobtime;
+                IF (.jobtime EQL .oldjobtime)   ! If it used NO time,
+                THEN timeout(req_block)         !   time it out
+
+%ELSE                                   ! TOPS-10 ONLY
+		IF .jobnum LSS 0
+		THEN
+		    IF .jobnum EQL -1
+		    THEN
+			JOBSTATUS[.index,DIUJ$H_JOB_NUMBER] = -2
+			! Remember seen this pass.  Timeout next pass if
+			!  still not started.
+		    ELSE
+		    timeout(req_block)		! Long overdue to start
+
+		ELSE
+
+		    BEGIN
+%IF %VARIANT ! TOPS-10 V7.02 support
+%THEN
+		    IF .JOBSTATUS[.index,DIUJ$V_PID_INVALID]
+		    THEN
+			timeout(req_block)	! Second time around so timeout
+		    ELSE
+			IF NOT ip$check_pid(query_pid,
+					.JOBSTATUS[.index, DIUJ$G_SLAVE_PID])
+			THEN
+			    JOBSTATUS[.index,DIUJ$V_PID_INVALID] = 1
+			    ! If the PID is not valid anymore,
+			    ! mark to timeout next pass
+			ELSE
+%FI
+			BEGIN
+                        jobtime=s$jobtime(.jobnum);     ! get current runtime
+                        oldjobtime=.JOBSTATUS[.index,DIUJ$G_JOB_RUNTIME];
+                        JOBSTATUS[.index,DIUJ$G_JOB_RUNTIME]=.jobtime;
+                        IF (.jobtime EQL .oldjobtime)   ! If it used NO time,
+                        THEN timeout(req_block)         !   time it out
+			END;
+		    END;
+%FI                                     ! END OF TOPS-10 / TOPS-20 CONDITIONAL
+                END;
+
+            ! Check /AFTER switch, holding bit,
+            !  active bit, and dependency
+
+            IF  (.req_block[DIU$G_AFTER] LEQ .now)  ! use remembered time
+                AND (NOT .req_block[DIU$V_HOLDING])
+                AND (NOT .req_block[DIU$V_ACTIVE])
+                AND (.req_block[DIU$H_PREREQUISITE_ID] EQL 0)
+                AND (.njob lss .mjob)               ! check mjob here
+            THEN
+                !
+                ! Request passes all tests, start it up
+                !
+                j$start (req_block)
+            ELSE
+                !
+                ! Keep track of earliest unexpired /AFTER time
+                !
+                IF .req_block[DIU$G_AFTER] NEQ 0
+                    AND .req_block[DIU$G_AFTER] GTR .now    ! use remembered
+                THEN
+                    next_event_time = MIN (.next_event_time,
+                                           .req_block[DIU$G_AFTER]);
+            !
+            ! If this request has a deadline, consider it for next event...
+            !
+            IF .req_block[DIU$G_DEADLINE] NEQ 0
+            THEN
+                next_event_time = MIN (.next_event_time,
+                                       .req_block[DIU$G_DEADLINE]);
+            END;
+        END;                            ! Loop
+
+    q$release_chain (.chain_head); 
+    chain_head = 0;
+
+    !+
+    ! Post a timer interrupt for now plus a couple of minutes.
+    !-
+
+    IF .next_event_time NEQ 0
+    THEN
+        next_event_time = MIN (.now + .ssleep, ! use remembered time
+                               .next_event_time)
+    ELSE
+        next_event_time = .now + .ssleep;       ! use remembered time
+
+
+    !+
+    ! If we have an event to wake up on, post a timer interrupt for it
+    !-
+
+    IF .chain_copy neq 0                ! If Q empty, sleep forever
+    THEN
+        BEGIN
+        IF .next_event_time NEQ 0
+            AND .next_event_time NEQ bignum
+        THEN s$timint (.next_event_time)        ! Wake for next request
+        ELSE s$timint (.now+.lsleep);   ! wake occasionally
+        END;
+
+    s$okint();                          ! Reenable interrupts
+    END;                                ! End of do_sched
+
+ROUTINE expire (p_req_block) : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Stomp on an expired request (/DEADLINE passed)
+!
+! FORMAL PARAMETERS:
+!
+!       p_req_block: pointer to request block
+!
+! SIDE EFFECTS:
+!
+!       The request is deleted from the queue and the user notified if desired.
+!       Any requests dependent on the expired request are killed if queued with
+!       /SEQUENCE:ABORT.  Requests depending on this one have their dependencys
+!       removed.  A line is written to the user and system log files.
+!
+!--
+BEGIN
+
+LOCAL job_handle,
+      log_descr : $STR_DESCRIPTOR(CLASS=DYNAMIC);
+
+BIND req_block = .p_req_block : $DIU_BLOCK;
+
+! Make a supplementary message up for passing along
+
+$STR_DESC_INIT(DESC = log_descr, CLASS = DYNAMIC);
+
+$STR_COPY(TARGET = log_descr,
+          STRING = $STR_CONCAT ('Request ',
+                                $STR_ASCII (.req_block[DIU$H_REQUEST_ID]),
+                                ' (',
+                                (.req_block[DIU$H_JOBNAME],
+                                 CH$PTR(req_block[DIU$T_JOBNAME])),
+                                ') killed, deadline expired'));
+
+! If request is active, stomp on the corresponding slave job (dependent jobs
+! will be killed by slave job cleanup code).  If not active, must kill
+! dependents now.
+
+job_handle = -1;                        ! Set job_handle to "not found"
+IF .req_block[DIU$V_ACTIVE]             ! If the job was active, kill it
+THEN job_handle = j$kill (.req_block[DIU$H_REQUEST_ID],
+                          DIU$_DEADLINE_EXPIRED);
+
+IF .job_handle NEQ -1
+THEN BEGIN                              ! If the job was active and we found it
+     jobstatus[.job_handle, DIUJ$V_ALREADY_DELETED] = 1;
+     $STR_COPY (TARGET = jobstatus[.job_handle, DIUJ$T_EXTRA_TEXT],
+                STRING = log_descr);
+     END
+ELSE BEGIN                              ! The job wasn't active
+     l$event(DIU$_DEADLINE_EXPIRED, 0, log_descr);
+     l$uevent(DIU$_DEADLINE_EXPIRED, 0, log_descr, .req_block);
+     notify (DIU$_DEADLINE_EXPIRED, 0, log_descr, .req_block);
+     IF .req_block[DIU$H_DEPENDENT_ID] NEQ 0
+     THEN abort (.req_block[DIU$H_DEPENDENT_ID]);
+     END;
+
+! Clear any prerequisiste request's dependency on this request, I know this is
+! rather obscure but it should work
+
+IF .req_block[DIU$H_PREREQUISITE_ID] NEQ 0      ! If request has prerequisite
+THEN Q$MODIFY (.req_block[DIU$H_PREREQUISITE_ID],       ! Zap it
+               DIUQ$K_DEPENDENT_ID,
+               0);
+
+! Delete the request block from the queue.
+
+q$delete (.req_block[DIU$H_REQUEST_ID]);
+
+END;                                    ! end of expire
+
+ROUTINE timeout (p_req_block) : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Requeue on a timed-out request
+!
+! FORMAL PARAMETERS:
+!
+!       p_req_block: pointer to request block
+!
+!
+! SIDE EFFECTS:
+!
+!       The request is requeued, events written to user and system log file
+!--
+BEGIN
+
+LOCAL job_handle,
+      log_descr : $STR_DESCRIPTOR(CLASS=DYNAMIC);
+
+BIND req_block = .p_req_block : $DIU_BLOCK;
+
+$STR_DESC_INIT(DESC = log_descr, CLASS = DYNAMIC);
+
+$STR_COPY(TARGET = log_descr,
+          STRING = $STR_CONCAT ('Request ',
+                                $STR_ASCII (.req_block[DIU$H_REQUEST_ID]),
+                                ' (',
+                                (.req_block[DIU$H_JOBNAME],
+                                 CH$PTR(req_block[DIU$T_JOBNAME])),
+                                ') requeued due to time out'));
+
+! If request is active, stomp on the corresponding slave job.
+
+job_handle = -1;                        ! Set job_handle to "not found"
+IF .req_block[DIU$V_ACTIVE]             ! If the job was active, kill it
+THEN job_handle = j$kill (.req_block[DIU$H_REQUEST_ID],
+                          DIU$_REQ_TIME_OUT);
+
+IF .job_handle NEQ -1
+THEN BEGIN                              ! If the job was active and we found it
+     $STR_COPY (TARGET = jobstatus[.job_handle, DIUJ$T_EXTRA_TEXT],
+                STRING = log_descr);
+     END
+ELSE BEGIN                              ! The job wasn't active
+     l$event(DIU$_REQ_TIME_OUT, 0, log_descr);
+     l$uevent(DIU$_REQ_TIME_OUT, 0, log_descr, .req_block);
+     END;
+
+! Requeue the request
+
+q$reque (.req_block[DIU$H_REQUEST_ID]);
+
+END;                                ! End of timeout
+
+ROUTINE abort_sched (sig, mech, enbl) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Condition handler for scheduler.  This routine releases
+!   the chain of (one) request blocks and then resignals.
+!   We also try to reenable interrupts (all since all signals
+!   in DO_SCHED occur NOINT, we always OKINT here).
+!
+! FORMAL PARAMETERS:
+!   sig         - signal vector
+!   mech        - mechanism vector
+!   enbl        - enable vector (element 1 is head of chain)
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   0           - to force resignalling
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+    BEGIN
+
+    MAP
+        sig : REF VECTOR,
+        mech : REF VECTOR,
+        enbl : REF VECTOR;
+
+    ENABLE                              ! Prevent nested signals here
+        diu$abort;
+
+    IF .sig[1] EQL STS$K_UNWIND
+    THEN
+        RETURN (0);
+    IF ..enbl[1] NEQ 0
+        AND NOT .sig[1]                 ! Only release memory on errors
+    THEN
+        BEGIN
+        q$release_chain (..enbl[1]);
+        .enbl[1] = 0;                   ! Empty chain
+        s$okint ();                     ! Reenable interrupts
+        END;
+    RETURN (0)                          ! Resignal
+    END;                                ! End of abort_sched
+
+END                                     ! End of module
+ELUDOM

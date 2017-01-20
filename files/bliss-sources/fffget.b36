@@ -1,0 +1,516 @@
+
+%TITLE 'FFFGET -- $GET service routines for non-RMS file types'
+!<BLF/REQUIRE 'BLI:BLF.REQ'>
+MODULE fffget (IDENT = 'get'
+		) =
+BEGIN
+!
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1985, 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+!
+!
+!
+!    ********** TABLE OF CONTENTS **********
+!
+!
+!
+!    ROUTINE                    FUNCTION
+!    -------                    --------
+!
+!    F$Get
+!    Getsix
+!    Getftnasc
+!    Getfbin
+!    Getftnimg
+!    .
+!    .
+!    .
+!
+!
+!
+!+
+!  Need a require file similar to RMSREQ.R36
+!  which contains library of all FGNLIB
+!  routines.
+!-
+
+REQUIRE 'fffreq';
+
+EXTERNAL ROUTINE
+    uaddr,
+    uapointer,
+    tgupointer,
+    uclass,
+    raddr;
+
+EXTERNAL ROUTINE
+!
+!   $FIND processor
+!
+    f$find,
+!
+!   $FIND routines for foreign file types
+!
+    findfbin,
+    findsix,
+    findebc,
+    findisam,
+!
+!   File/process handler
+!
+    getwindow,
+    moverec,
+    rd_rec,					! Read character data
+    rd_wrd,					! Read binary data
+!
+!   Error handler/etc
+!
+    checkeof,					! Check for end of file
+    getisam;				! Old COBOL ISAM file GET routine
+
+FORWARD ROUTINE
+!
+!   $GET processor
+!
+    f$get,
+!
+!   $GET routines for foreign file types
+!
+    getfbin,
+    getsix,
+    getebc;					! EBCDIC files
+
+%SBTTL 'F$Get -- $GET dispatcher'
+
+GLOBAL ROUTINE f$get (usrrab : REF $rab_decl) =
+    BEGIN
+
+    LOCAL
+	crp : BLOCK [1],
+	headersize,
+	recordsize;
+
+    rab = .usrrab;
+    rst = raddr (.rab [rab$a_isi]);
+    fst = raddr (.rst [rst$a_fst]);
+    cbd = raddr (rst [rst$z_current_bucket]);
+    !
+    !   Locate record (if necessary) and dispatch
+    !   to appropriate $GET routine.
+    !
+
+    IF .rst [rst$v_last_operation] EQL op$k_find
+    THEN
+	BEGIN
+	crp = .rst [rst$g_data_rfa];
+	headersize = .rst [rst$v_rec_header_size];
+
+%IF 0
+%THEN
+
+	IF .crp EQL 0
+	THEN
+	    BEGIN
+	    SIGNAL (ff$_zero_crp);		! Routine failure
+	    RETURN false
+	    END;
+
+	!? Cobol EBCDIC does not always start records on word boundaries!
+	!? The following will not work in that case
+	rst [rst$g_next_record_pointer] = .crp + .headersize + .rst [
+	    rst$h_record_size_words];
+%FI
+
+	END
+    ELSE
+	BEGIN
+	!
+	!   Call $FIND processor
+	!
+
+	IF NOT f$find (.rab)			! Return on error
+	THEN
+	    RETURN false;
+
+	END;
+
+    !+
+    !    Get the header size (again).
+    !-
+
+    headersize = .rst [rst$v_rec_header_size];
+
+    !+
+    !    Dispatch to the proper "GET" routine for this file class
+    !-
+
+    recordsize = (CASE .fst [fst$h_file_class] FROM typ$k_fff_class_min TO
+	typ$k_fff_class_max OF
+	SET
+	[typ$k_sixbit] : getsix ();		! COBOL SIXBIT
+	[typ$k_ebcdic] : getebc ();		! COBOL EBCDIC
+	[typ$k_fortran_binary] : getfbin ();	! FORTRAN BINARY
+	[typ$k_isam] : getisam ();
+	TES);
+
+    !+
+    !    Set RST [LASTOPER] and success flags (if any).
+    !-
+
+    setsuccess (op$k_get);
+    RETURN true;
+    END;
+
+%SBTTL 'GETFTNIMG -- $GET for Fortran image files'
+
+GLOBAL ROUTINE getftnimg =
+    BEGIN
+
+    LOCAL
+	wordcount,
+	bytecount,
+	bytesize,
+	headersize,
+	size_of_file,
+	bytesword,
+	crp : BLOCK [1],
+	byteadr,
+	nextfilepage,
+	userbuffsize,
+	userptr,
+	recordptr : BLOCK [1];
+
+    REGISTER
+	tempac;					! USED FOR TEMP CALCULATIONS
+
+    !+
+    !    GET THE POINTER TO THE CURRENT RECORD
+    !-
+
+    recordptr = .rst [rst$g_page_pointer];
+
+    !+
+    !    GET VARIOUS VALUES
+    !-
+
+    userptr = uaddr (.rab [rab$a_ubf]);		! User buffer pointer
+    bytesize = .fst [fst$h_bsz];		! FILE BYTE SIZE
+    bytecount = .rst [rst$h_record_size];	! RECORD BYTE COUNT
+    wordcount = .rst [rst$h_record_size_words];	! RECORD WORD COUNT
+    size_of_file = .fst [fst$g_sof];		! SIZE OF FILE (IN BYTES)
+!+
+!    RECORD WILL BE MOVED INTO THE USER'S BUFFER
+!-
+!+
+!    Skip over the header bytes.
+!    (No-op here, no header)
+!-
+!+
+!    Check if data portion of record begins on next page.
+!
+!    Note that this check makes no allowance for block
+!    headers (which will be a concern for COBOL EBCDIC
+!    only).
+!-
+
+    IF .recordptr [page] NEQ .currentwindow	! Did we go over the file page?
+    THEN
+	BEGIN					! assuming 1-word header,
+						! header is last word on page
+	nextfilepage = .currentfilepage + 1;
+
+	!+
+	!   This code is adapted from GTBYTE.
+	!-
+
+	IF checkeof ()				! End of file ???
+	THEN
+	    SIGNAL (ff$_end_of_file);
+
+	!+
+	!   Now, get the next page.
+	!-
+
+	IF getwindow (.nextfilepage, true) EQL false
+	THEN
+	    SIGNAL (ff$_page_not_exist);
+
+	!+
+	!   Update the record pointer.
+	!-
+
+	recordptr = (rst [rst$g_page_pointer] = (.curentbufferadr) + .recordptr
+	[ofset]);
+	END;
+
+!+
+!    THE DATA PORTION OF THE RECORD IS NOW
+!    IN THE WINDOW AND PAGPTR POINTS TO IT.
+!    WE MUST ALLOCATE THE USER'S BUFFER.
+!-
+    userbuffsize = .rab [rab$h_usz];		! Size of user buffer
+    userptr = uaddr (.rab [rab$a_ubf]);
+
+    IF .wordcount GTR .userbuffsize
+    THEN
+	BEGIN					! Record can't fit in buffer
+						! Partial record in
+	bytecount = (36/.bytesize)*.userbuffsize;	! user-buffer
+	wordcount = $size_in_words (.bytecount, rms$k_bin_size);
+	END;
+
+!+
+!    Truncate # of bytes to be transferred if the specified
+!    record size extends beyond the end-of-file.
+!-
+
+    IF .rst [rst$g_highest_byte] GTR .size_of_file
+    THEN
+	bytecount = .bytecount - (.rst [rst$g_highest_byte] - .size_of_file);
+
+!+
+!    AT THIS POINT, WE HAVE THE FOLLOWING VALUES:
+!    BYTECOUNT = # OF BYTES TO BE TRANSFERRED
+!    RECORDPTR = ADDRESS OF 1ST DATA WORD IN RECORD
+!
+!    WE CAN NOW MOVE THE RECORD INTO USERS BUFFER
+!-
+
+    IF moverec (.recordptr, 			! From here...
+	    .userptr, 				! To here
+	    false, 				! This is a $GET
+	    .bytecount, 			! Bytes to move
+	    .bytesize) EQL false		! Size of each byte
+    THEN
+	BEGIN
+	rst [rst$g_highest_byte] = .rst [rst$g_highest_byte] - .rst [
+	    rst$h_record_size];
+	SIGNAL (ff$_moverec_failed);		! ROUTINE FAILURE
+	RETURN false;
+	END;
+
+    !+
+    !    RETURN THE SIZE OF THE RECORD MOVED
+    !-
+
+    RETURN .bytecount				! RETURN # OF BYTES MOVED
+    END;					! End GETFTNIMG
+
+%SBTTL 'GETFASC -- $GET for Fortran ascii files'
+
+GLOBAL ROUTINE getfasc =
+    BEGIN
+    RETURN true
+    END;
+
+%SBTTL 'GETFBIN -- $GET for Fortran binary files'
+
+GLOBAL ROUTINE getfbin =
+    BEGIN
+
+    EXTERNAL
+	stksec;					! Stack's section
+
+    LOCAL
+	flag_rtb,				! RTB error occurring
+	user_pointer,				! Pointer to user buffer
+	user_left,				! Words left in user buffer
+	words_to_move,				! Words to be input
+	words_moved,				! Words already moved
+	segment_size;				! Size of this segment
+
+    STACKLOCAL
+	this_segment : $rms_lscw;		! This segment header
+
+    !
+
+    !	Set up user parameters
+    !
+    user_left = .rab [rab$h_usz];		! Size of user buffer
+    user_pointer = uaddr (.rab [rab$a_ubf]);	! Pointer to user buffer
+    !
+    !	Read the first LSCW.
+    !
+
+    IF NOT rd_wrd (lscw$k_bln, .stksec OR this_segment)	! Read OK?
+    THEN
+	RETURN false;
+
+    !
+    !	$FIND has already verified the LSCW, so we can continue
+    !	and get the data.  Move as much of the segment as
+    !	will fit in the user's buffer.
+    !
+    segment_size = .this_segment [lscw$h_count_value] - 1;
+    words_to_move = MIN (.segment_size, .user_left);
+
+    IF NOT rd_wrd (.words_to_move, .user_pointer)	! OK?
+    THEN
+	RETURN false;				! Clearly not
+
+    user_pointer = .user_pointer + .words_to_move;
+    user_left = .user_left - .words_to_move;
+    words_moved = .words_to_move;
+    !
+    !	If we moved less than the size of this segment,
+    !	it was because of an RTB error.
+    !
+    if .words_to_move lss .segment_size		! Record Too Big?
+    then
+	BEGIN
+	rab [rab$h_sts] = rms$_rtb;		! Record is too big!
+	rab [rab$h_stv] = .rst [rst$h_record_size];	! Actual length
+	rab [rab$h_rsz] = .words_moved;		! Size we got
+	rab [rab$a_rbf] = .rab [rab$a_ubf];	! Where we put it
+	RETURN false;				! Say this is buggy return
+	END;
+    
+    !
+    !	Get the next LSCW, whatever it is.
+    !
+
+    IF NOT rd_wrd (lscw$k_bln, .stksec OR this_segment)	! Read OK?
+    THEN
+	RETURN false;
+
+    !+
+    !	If this is an LSCW 2, then we have to process some
+    !	intermediate LSCWs.
+    !-
+
+    WHILE .this_segment [lscw$b_code] EQL 2 DO 	!
+	BEGIN
+	!
+	!   Move as much of the segment as
+	!   will fit in the user's buffer.
+	!
+	segment_size = .this_segment [lscw$h_count_value] - 1;
+	words_to_move = MIN (.segment_size, .user_left);
+
+	IF NOT rd_wrd (.words_to_move, .user_pointer)	! OK?
+	THEN
+	    RETURN false;			! Clearly not
+
+	user_pointer = .user_pointer + .words_to_move;
+	user_left = .user_left - .words_to_move;
+	words_moved = .words_moved + .words_to_move;
+	!
+	!	If we moved less than the size of this segment,
+	!	it was because of an RTB error.
+	!
+	if .words_to_move lss .segment_size		! Record Too Big?
+	then
+	    BEGIN
+	    rab [rab$h_sts] = rms$_rtb;		! Record is too big!
+	    rab [rab$h_stv] = .rst [rst$h_record_size];	! Actual length
+	    rab [rab$h_rsz] = .words_moved;	! Size we got
+	    rab [rab$a_rbf] = .rab [rab$a_ubf];	! Where we put it
+	    RETURN false;			! Say this is buggy return
+	    END;
+	!
+	!   Get the next LSCW
+	!
+
+	IF NOT rd_wrd (lscw$k_bln, .stksec OR this_segment)	! Read OK?
+	THEN
+	    RETURN false;
+
+	END;
+
+    !
+    !	We have gotten an LSCW 3 (presumably) and are now
+    !	at the end of the record.  Let's stop now.
+    !
+    rab [rab$g_rfa] = .rst [rst$g_data_rfa];
+    rab [rab$h_sts] = rms$_normal;
+    rab [rab$h_stv] = 0;			! No STV
+    rab [rab$h_rsz] = .rst [rst$h_record_size];
+    rab [rab$a_rbf] = .rab [rab$a_ubf];		! Where we put it
+    rst [rst$v_last_operation] = op$k_get;
+    RETURN true;
+    END;					! End GETFBIN
+
+%SBTTL 'GETCASC -- $GET for Cobol ascii files'
+
+GLOBAL ROUTINE getcasc =
+    BEGIN
+    RETURN true
+    END;
+
+%SBTTL 'GETSIX -- $GET for Cobol sixbit files'
+
+GLOBAL ROUTINE getsix =
+    BEGIN
+
+    LOCAL
+	status;
+
+    !
+    !	Read the record, now that it is found.
+    !
+    status = rd_rec ();
+
+    IF .status					! All OK?
+    THEN
+	BEGIN
+	rab [rab$g_rfa] = .rst [rst$g_data_rfa];
+	rab [rab$h_sts] = rms$_normal;
+	rab [rab$h_stv] = 0;			! No STV
+	rab [rab$h_rsz] = .rst [rst$h_record_size];
+	rab [rab$a_rbf] = .rab [rab$a_ubf];	! Where we put it
+	rst [rst$v_last_operation] = op$k_get;
+	RETURN true;
+	END
+    ELSE
+	RETURN false
+
+    END;					! End GETSIX
+
+%SBTTL 'GETEBC -- $GET for Cobol ebcdic files'
+
+GLOBAL ROUTINE getebc =
+    BEGIN
+
+    LOCAL
+	status;
+
+    !
+    !	Read the record, now that it is found.
+    !
+    status = rd_rec ();
+
+    IF .status					! All OK?
+    THEN
+	BEGIN
+	rab [rab$g_rfa] = .rst [rst$g_data_rfa];
+	rab [rab$h_sts] = rms$_normal;
+	rab [rab$h_stv] = 0;			! No STV
+	rab [rab$h_rsz] = .rst [rst$h_record_size];
+	rab [rab$a_rbf] = .rab [rab$a_ubf];	! Where we put it
+	rst [rst$v_last_operation] = op$k_get;
+	RETURN true;
+	END
+    ELSE
+	RETURN false
+
+    END;					! End GETEBC
+
+END
+
+ELUDOM
+    

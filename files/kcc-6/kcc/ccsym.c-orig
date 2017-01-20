@@ -1,0 +1,1978 @@
+/*	CCSYM.C - Symbol table management (type table too)
+**
+**	(c) Copyright Ken Harrenstien 1989
+**		All changes after v.165, 9-Mar-1988
+**	(c) Copyright Ken Harrenstien, SRI International 1985, 1986
+**		All changes after v.39, 8-Aug-1985
+**
+**	Original version (C) 1981  K. Chen
+*/
+
+#include "cc.h"
+#include "ccchar.h"
+#include <stdlib.h>	/* malloc, realloc, free */
+
+/* Exported functions - Symbol stuff */
+void syminit();		/* CC */
+SYMBOL *symfind();
+SYMBOL *symftag(), *symfmember(), *symflabel();
+SYMBOL *symfidstr(), *symfnext();
+SYMBOL *symqcreat();
+SYMBOL *creatsym(), *symgcreat(), *uniqsym(), *shmacsym();
+void freesym(), copysym();
+int isdupsym();
+int hash();		/* Crock for CCEVAL's ecanon() */
+SYMBOL *beglsym();
+void endlsym(), ridlsym();
+void symdump();
+
+/* Exported functions - Label stuff */
+SYMBOL *newlabel();			/* Label functions */
+void reflabel(), freelabel(), cleanlabs();
+
+/* Exported functions - Mapping stuff */
+int mapextsym();
+void mapintsym();
+
+/* Exported functions - Type stuff */
+TYPE *findtype(), *findsztype(), *findctype(),
+	*findftype(), *findutype(), *findqtype();
+TYPE *tcomposite();
+int sizetype();		/* For CCDECL, CCSTMT, CCGEN* */
+int sizeptobj();	/* For CCGEN2 */
+int sizearray();	/* For CCGEN, CCSTMT */
+int elembsize();	/* ditto */
+
+/* Imported functions */
+int sixbit();		/* CCASMB */
+
+/* Local functions */
+static void typeinit(), labinit();
+static TYPE *tcomproto();
+static void inisymlist();
+static SYMBOL *symfflag();
+static void makelsym(), makegsym();
+static SYMBOL *getsym();
+static void retsym();
+static SYMBOL *mksym();
+static SYMBOL *symmk();
+static int symhash(), symcmp();
+static int idcmp(), idcpy();
+static void smapinit();
+static int smapmatch();
+
+#if 0	/* For debugging */
+#define BUGMSG(a) if(symdeb) printf a;
+static int symdeb = 0;
+#else
+#define BUGMSG(a) ;	/* Null stmt */
+#endif
+
+#if 0
+		SYMBOL TABLE STRUCTURE
+
+The "symbol table" is implemented as a collection of dynamically allocated
+symbol entries.  A symbol is always linked either to the global symbol
+list, or the local symbol list.  In addition to this linkage, all symbols
+also belong to some hash chain list.
+
+The hash table is used to look up symbols.  The identifier is hashed
+to produce a index into the hash table, which contains pointers to all
+of the hash chains; a given chain consists of all symbols whose
+identifiers produce that specific hash value.  This chain is then
+searched sequentially, doing full string comparison on the identifiers,
+until the matching symbol (if any) is found.
+
+Symbols on a hash chain are linked MOST-RECENT-FIRST, and the first
+matching symbol is considered to hide or shadow all other instances of
+that identifier (unless it is flagged as no longer active).  This is how
+the scope and visibility of symbols are implemented for symbol lookup.
+Some special checking is done for macro symbols; see further comments at
+end of this page.
+
+Symbols must also be linked into either the global or local symbol
+list.  These lists are doubly linked and new entries are added
+MOST-RECENT-LAST (as opposed to the hash chain lists).  All symbols on
+the global list have the same scope, and no duplicate identifiers
+should exist on that list.  Symbols may initially be linked onto the
+global list for a short time before being flushed or re-linked onto
+the global list, but in general nothing is deleted from the global
+symbol list unless re-initializing to compile a new file.
+
+The local symbol list, however, is more dynamic.  During the parsing,
+local symbols are added on the end of this list as they are
+encountered; once their scope has expired (the end of a block was
+reached), they are marked inactive but remain on the list for the
+benefit of the code generation routines.  Once the entire function
+has been generated, all local symbols are flushed and the list
+re-initialized.
+
+The tricky part of the local symbol list has to do with how the block
+structure of a C function is represented so that local symbols have
+only their proper scope.  At any given moment, the pointer "lsymhead"
+points to the symbol preceding the first symbol of the innermost active
+block; if there is no active block (i.e.  parsing at top level) this
+pointer is NULL.  The symbols belonging to this active block consist of
+this first symbol and all succeeding symbols on the list, except for
+those which are marked inactive (by setting the SF_XLOCAL flag).
+Inactive symbols, if they exist, will be those belonging to inner
+blocks (inside the current block) that have been exited.
+
+When a block is first entered (via beglsym()) the old value is saved,
+and lsymhead is set to the current tail of the local symbol list.  Now,
+whenever a local symbol is defined in this block, it will be added to
+the end of the list; to see whether a duplicate definition of the
+symbol already exists, it suffices to scan the list starting at the
+lsymhead pointer (the first symbol is lsymhead->Snext; see isdupsym()).
+When the block is finally ended (via endlsym()), all symbols belonging
+to this block will be marked inactive, and the old value of lsymhead
+restored so that it now points to the next outer block.
+
+The hash chain lists and the global/local lists are completely independent
+of each other.
+
+Note that the global and local lists are doubly linked and each has a "dummy"
+initial symbol entry to render checks for NULL unnecessary.  These are the
+only two "symbols" not also on a hash chain.  The hash chain lists are singly
+linked and end in NULL.  Unused symbol entries are kept around on a freelist
+to avoid the overhead of calls to malloc/free; they are never given to free(),
+even at the start of a new file compilation, under the assumption that the
+efficiency improvement is worth the (very slight) risk that storage will
+become excessively fragmented over many compilations.
+
+MACRO SYMBOLS:
+	Although normally macro symbols are unique, and thus shadowing is
+never an issue, ANSI makes it possible for macro self-references to generate
+non-macro symbols that are identical to macro names.  In other words, macro
+symbols can also be shadowed.  But because this should only happen in
+special circumstances, special checking is needed.
+	There are only two places where a macro symbol is looked for,
+both in CCPP: findident() to handle an identifier token, and
+findmacsym() to explicitly look for a macro name.  These two places
+both invoke symfind(), which finds the first hashed symbol (whether
+macro or not).  All other symbol lookups can safely assume that any
+identifiers they deal with have already been expanded if necessary, and
+so they all use other routines like symfidstr() or symftag(), etc,
+which ignore any macro symbols they encounter and will thus find any
+shadowed symbols.
+	In order to ensure that symfind() finds the macro symbol first
+if one exists, that symbol always has to come BEFORE the shadowed symbol
+on the hash chain.  This ordering is ensured by the shmacsym() function,
+which findident() invokes whenever a new symbol is being shadowed by a
+macro.  uniqsym() also invokes this routine if it is about to create
+a duplicate of a macro-shadowed symbol.
+
+Handling of SC_XEXTREF:
+	There is a special category of block-scope symbols which
+must actually become global symbols.  Declarations within a block that
+have storage class "extern" must not be forgotten when the block ends,
+because appropriate linkage commands must be generated for the assembler,
+and multiple references to the same symbol must not generate multiple
+linkage commands.
+	When a SC_EXTREF symbol is about to be flushed by endlsym(), it
+is instead (1) given the type SC_XEXTREF to distinguish it from
+SC_EXTREF, (2) moved from the local list to the global list so it will
+stay around for the duration of the file compilation, and (3) flagged
+with SF_XLOCAL to put it out-of-scope, i.e. so it will not be found by
+any normal symbol-finder routine.
+	Another external declaration of the same identifier needs to
+refer to the same symbol, which is why symfxext() exists to find it.
+External declarations are handled in two places: CCDECL's funchk() and
+dodecl().
+
+#endif
+
+SYMBOL *lsymhead;	/* NULL at top level, else points to head of
+			** current local symbol block.  The first sym
+			** on the list is lsymhead->Snext.
+			** Only reason this isn't static is cuz CCDECL
+			** wants to know if we're in a local block.
+			*/
+static SYMBOL *symflist = NULL;	/* Symbol entry freelist, for efficiency */
+
+static SYMBOL
+/*  *symbol,	*/	/* Global symbol list head (CCDECL, CCOUT) */
+    *symtail,		/* ptr to tail of global list */
+    *locsymbol,		/* Local symbol list head */
+    *loctail;		/* ptr to tail of local list */
+static int nsymbols = 0;	/* # of symbols allocated (except dummies) */
+
+/* Semi-portable char masks for ident strings.
+** chmask[n] has mask for N bytes in word, to quickly clear rest of word.
+** lastwd has mask for last byte in word, to check for end of string.
+*/
+static int chmask[sizeof(int)+1];	/* Char mask table for ident strings */
+static int lastwd;			/* Mask for last byte in word */
+
+/* SYMINIT - Initialize symbol table stuff.
+*/
+void
+syminit()
+{
+    register int i, f;
+    union {int wd; char ch[sizeof(int)]; } mask;
+    SYMBOL *s;
+
+    /* Initialize char mask table used by identifier handling stuff */
+    chmask[0] = 0;
+    for (mask.wd = 0, i = 0; i < sizeof(int); ++i) {
+	mask.ch[i] = ~0;
+	chmask[i+1] = mask.wd;
+    }
+    lastwd = ~chmask[sizeof(int)-1];
+
+    /* Initialize labels, symbols, and types */
+    labinit();				/* Initialize internal label stuff */
+    smapinit();				/* Init symbol map stuff */
+
+    inisymlist(&symbol, &symtail);	/* Initialize global symbol list */
+    inisymlist(&locsymbol, &loctail);	/* Initialize local symbol list */
+    lsymhead = NULL;			/* Currently at top level */
+
+    /* Clear out symbol hash table and set initial reserved-word symbols */
+    for (i = 0 ; i < MAXHSH ; i++)	/* Clear hash table */
+	htable[i] = NULL;
+    for (i = 0; ++i < NTOKDEFS;) {	/* Enter all reserved words */
+	switch (tok[i].tktype) {	/* Check token table for RW's */
+	default:
+	    continue;			/* Nope, keep scanning */
+	case TKTY_RWTYPE:
+	case TKTY_RWSC:
+	case TKTY_RWCOMP:
+	case TKTY_RWOP:
+	    break;			/* Is reserved word, hack it! */
+	}
+	if ((f = tok[i].tkprec)&(RWF_ANSI+RWF_KCC)) {	/* Any flags set? */
+	    if (((f & RWF_ANSI) && clevel >= CLEV_ANSI)	/* If ANSI and OK, */
+		|| ((f & RWF_KCC) && clevkcc))		/* or KCC and OK, */
+		; else continue;	/* then go ahead, else skip sym. */
+	}
+	/* Make reserved-word symbol! */
+	s = symgcreat(tokstr[i]);	/* Make symbol for the word */
+	s->Sclass = SC_RW;		/* Say it's a reserved word */
+	s->Stoken = i;			/* Set token number */
+	s->Skey = tok[i].tktype;	/* and token's type */
+    }
+    minsym = symtail;		/* Crock for CCDUMP's symdump, someday flush */
+
+    typeinit();		/* Now initialize tables etc. for C data types */
+}
+
+static void
+inisymlist(ahead, atail)
+SYMBOL **ahead, **atail;
+{
+    SYMBOL *s, *head;
+
+    if (*ahead == NULL) {	/* Initialize for first time only */
+	s = (SYMBOL *) malloc(sizeof(SYMBOL));	/* Allocate a sym entry */
+	if (s == NULL) efatal("No memory for symbols");
+    }
+    else {			/* Symbols already exist, free them. */
+	for (head = (*ahead)->Snext; s = head;) {	/* For all but 1st */
+	    if (s->Sclass == SC_MACRO && s->Smacptr)
+		free(s->Smacptr);	/* If macro body exists, free it */
+	    head = s->Snext;
+	    retsym(s);			/* Free up the symbol */
+	}
+	s = *ahead;			/* Done, re-use 1st sym */
+    }
+
+    /* Initialize the 1st sym on list, which is just a dummy that
+    ** is never used for anything.  Its existence allows the list routines
+    ** to skip some checks for NULL-ness of pointers.
+    */
+    *ahead = *atail = s;		/* Head and tail point to dummy sym */
+    s->Snext = s->Sprev = NULL;		/* Nothing else on list */
+    s->Sclass = SC_UNDEF;		/* Just in case... */
+}
+
+/* Symbol lookup routines */
+
+/* SYMFIND - Given string, finds or makes symbol for it.
+**	This is the main symbol find/create routine.
+**	It is used primarily by CCPP and sometimes by CCLEX.
+**	Only searches for macros and ordinary identifiers (not tags,
+**	labels, members, or out-of-scope local symbols).
+**	If "creatf" is true and no symbol was found, makes a global symbol
+**	with class SC_UNDEF.
+** Subtle point: if the found symbol already has SC_UNDEF, then don't
+** use it -- leave it alone because some other part of the parser is
+** almost certainly hanging on to it while doing token read-ahead!
+** This can happen for "struct foo foo".
+**	Issues a warning [Note] if symbol is being returned for
+**	an identifier string that was truncated.
+*/
+SYMBOL *
+symfind(str, creatf)
+char *str;
+int creatf;
+{
+    register SYMBOL *sym;
+    int trunc;
+    SYMBOL stmp;
+
+BUGMSG(("symfind \"%s\" %d\n", str, creatf))
+    trunc = idcpy(&stmp, str);		/* Set up, puts hash value in Svalue */
+    for (sym = htable[stmp.Svalue]; sym != NULL; sym = sym->Snhash)
+	if (((sym->Sflags&(SF_XLOCAL|(SF_OVCLS&~SF_MACRO))) == 0)
+	  && symcmp(sym, &stmp)
+	  && sym->Sclass != SC_UNDEF) {
+	    sym->Srefs++;
+	    break;
+	}
+
+    /* Symbol not found, so make it if OK to do so */
+    if (!sym) {
+	if (!creatf)
+	    return NULL;
+	sym = symmk(&stmp, stmp.Svalue, &symtail);	/* Put on global list */
+    }
+    if (trunc) note("Identifer truncated: %S", sym);
+    return sym;
+}
+
+
+/* SYMFIDSTR - Given string, finds symbol for an ordinary identifier.
+**	Similar to symfind() but never creates a symbol and ignores macros.
+**	This is only used for easy lookup of certain literal identifiers:
+**		CC: "main"
+**		CCDECL: "setjmp"
+**		CCOUT: "`$$$CRT" and "`$$$CPU"
+*/
+SYMBOL *
+symfidstr(str)
+char *str;
+{
+    register SYMBOL *sym;
+
+BUGMSG(("symfidstr \"%s\"\n", str))
+    if (sym = symfind(str, 0)) {
+	if (sym->Sclass == SC_MACRO)	/* If got macro, */
+	    sym = symfnext(sym);	/* get non-macro instead if any */
+    }
+    return sym;
+}
+
+/* SYMFNEXT - Finds Next Symbol.
+**	Used only by CCPP (and symfidstr() above) to find non-macro
+** instance of a symbol when the macro instance is being suppressed.
+** Note that the argument is a symbol pointer to the macro instance,
+** not an identifier string.
+*/
+SYMBOL *
+symfnext(osym)
+SYMBOL *osym;
+{
+    register SYMBOL *sym = osym;
+BUGMSG(("symfnext \"%s\"\n", sym->Sname))
+    while (sym = sym->Snhash)			/* Scan hash list */
+	if (((sym->Sflags&(SF_XLOCAL|SF_OVCLS)) == 0)
+	 && symcmp(sym, osym)) {
+	    sym->Srefs++;
+	    break;
+	}
+    return sym;
+}
+
+/* FINDGSYM - Find global (file-scope) non-macro symbol.
+**	Starts searching from the specified sym, rather
+**	than taking an identifier string.
+*/
+SYMBOL *
+findgsym(osym)
+SYMBOL *osym;
+{
+    register SYMBOL *sym = osym;
+BUGMSG(("findgsym \"%s\"\n", sym->Sname))
+    while (sym = sym->Snhash)
+	if (((sym->Sflags&(SF_LOCAL|SF_XLOCAL|SF_OVCLS)) == 0)
+	 && symcmp(sym, osym)) {
+	    sym->Srefs++;
+	    break;
+	}
+    return sym;
+}
+
+/*
+** SYMFLABEL - Find a label symbol.
+** SYMFTAG - Find a struct/union/enum tag symbol.
+** SYMFMEMBER - Find a structure member symbol.  Takes tag arg also.
+*/
+SYMBOL *symflabel(sym)	SYMBOL *sym; {	return symfflag(sym, SF_LABEL); }
+SYMBOL *symftag(sym)	SYMBOL *sym; {	return symfflag(sym, SF_TAG); }
+
+/* SYMFFLAG - Auxiliary to find a non-ordinary symbol
+**	(special overloading class) matching the given flag.
+**	Starts with given symbol (NOTE: not a string and not next sym!).
+**	If symbol provided is at start of hash list (is undefined) then
+**	we can skip the initial hash!
+*/
+SYMBOL *
+symfflag(sym, flag)
+SYMBOL *sym;
+{
+    register SYMBOL *s = sym;
+BUGMSG(("symfflag \"%s\"\n", s->Sname))
+
+    if (s->Sclass != SC_UNDEF) {	/* Hack: see if at start of hash */
+	s->Srefs--;			/* Undo ref to original sym */
+	s = htable[symhash(s)];		/* No, must find start.  Bleah. */
+    }
+    do {
+	if (((s->Sflags&(SF_XLOCAL|SF_OVCLS)) == flag)
+	  && (s == sym || symcmp(sym, s))) {
+	    s->Srefs++;
+	    break;
+	}
+    } while (s = s->Snhash);
+    return s;
+}
+
+SYMBOL *
+symfmember(sym, tag)
+SYMBOL *sym, *tag;
+{
+    register SYMBOL *s = sym;
+BUGMSG(("symfmember \"%s\"\n", s->Sname))
+
+    if (s->Sclass != SC_UNDEF) {	/* Hack: see if at start of hash */
+	s->Srefs--;			/* Undo ref to original sym */
+	s = htable[symhash(s)];		/* No, must find start.  Bleah. */
+    }
+    do {
+	if (((s->Sflags&(SF_XLOCAL|SF_OVCLS)) == SF_MEMBER)
+	  && s->Ssmtag == tag
+	  && (s == sym || symcmp(sym, s))) {
+	    s->Srefs++;
+	    break;
+	}
+    } while (s = s->Snhash);
+    return s;
+}
+
+
+/* SYMFXEXT - Find an SC_XEXTREF (out-of-scope external reference) symbol,
+**	if any exists.
+**	Argument is a SC_UNDEF symbol (thus at the start of hash chain).
+**	Returns a pointer either to the same symbol, if no SC_XEXTREF exists,
+**	or to the SC_XEXTREF symbol.  In the latter case, the SC_UNDEF
+**	symbol is flushed!  This is unlike the other symbol finding routines.
+**
+** Only invoked by CCDECL's funchk() and dodecl().
+*/
+SYMBOL *
+symfxext(sym)
+SYMBOL *sym;
+{
+    register SYMBOL *s = sym;
+BUGMSG(("symfxext \"%s\"\n", s->Sname))
+
+    if (sym->Sclass != SC_UNDEF)
+	return sym;
+    while (s = s->Snhash)		/* Get next sym on hash chain */
+	if (s->Sclass == SC_XEXTREF && symcmp(sym, s)) {
+	    freesym(sym);		/* It's a winner!  Flush undef sym */
+	    s->Sflags &= ~SF_XLOCAL;	/* bring old back into scope */
+	    s->Srefs++;			/* and bump ref count */
+	    return s;
+	}
+    return sym;
+}
+
+/* -------------------------------------- */
+/*	free a symbol table location      */
+/* -------------------------------------- */
+void
+freesym(s)
+SYMBOL *s;
+{
+    register SYMBOL *sym;
+    int h;
+
+BUGMSG(("freesym \"%s\"\n", s->Sname))
+    sym = htable[h = symhash(s)];	/* Find head of hash chain */
+    if (sym == s)
+	htable[h] = s->Snhash;
+    else {
+	for (;; sym = sym->Snhash) {
+	    if (!sym) {
+		int_error("freesym: sym not on hash list");
+		return;
+	    }
+	    if (sym->Snhash == s)
+		break;
+	}
+	sym->Snhash = s->Snhash;	/* Found, take off hash list */
+    }
+    retsym(s);				/* give sym back to mem allocator */
+}
+
+/* CREATSYM - Create a symbol table entry.
+**	Symbol will be local or global depending on current context,
+** i.e. the setting of lsymhead.  If NULL, current "block" is top level
+** and symbol will be put on the global list.  Otherwise, it is put on
+** the local list.
+*/
+
+SYMBOL *
+creatsym(id)
+char *id;
+{
+    SYMBOL *s;
+    BUGMSG(("creatsym %s \"%s\"", (lsymhead?"local":"global"), id))
+    if (!lsymhead)
+	return symgcreat(id);	/* Create and return global symbol */
+    s = mksym(id, &loctail);	/* Nope, do local symbol */
+    s->Sflags |= SF_LOCAL;
+    return s;
+}
+
+/* SYMGCREAT - create a global symbol table entry
+*/
+SYMBOL *
+symgcreat(id)
+char *id;
+{
+    BUGMSG(("symgcreat \"%s\"", id))
+    return mksym(id, &symtail);
+}
+
+/* MAKELSYM - Make global symbol a local one.
+**	Sometimes needed when lexer creates a global entry for
+** a new identifier, and it later needs to be made local instead.
+*/
+static void
+makelsym(s)
+SYMBOL *s;
+{
+    /* Remove from global list */
+    if (s == symtail)		/* If sym is most recent one on global list, */
+	symtail = s->Sprev;	/* must update the tail pointer. */
+    if (s->Sprev)
+	s->Sprev->Snext = s->Snext;
+    if (s->Snext)
+	s->Snext->Sprev = s->Sprev;
+
+    /* Add to local list */
+    s->Sprev = loctail;
+    s->Snext = (SYMBOL *) NULL;
+    loctail->Snext = s;
+    loctail = s;
+    s->Sflags |= SF_LOCAL;
+}
+
+/* MAKEGSYM - Make local symbol a global one.
+**	Used by ridlsym() when preserving tags defined within a
+**	function prototype.
+*/
+static void
+makegsym(s)
+SYMBOL *s;
+{
+    /* Remove from local list */
+    if (s == loctail)		/* If sym is most recent one on global list, */
+	loctail = s->Sprev;	/* must update the tail pointer. */
+    if (s->Sprev)
+	s->Sprev->Snext = s->Snext;
+    if (s->Snext)
+	s->Snext->Sprev = s->Sprev;
+
+    /* Add to global list */
+    s->Sprev = symtail;
+    s->Snext = (SYMBOL *) NULL;
+    symtail->Snext = s;
+    symtail = s;
+    s->Sflags &= ~SF_LOCAL;
+}
+
+/* SYMQCREATE - Quick symbol creation.  Given a symbol pointer, returns
+**	a pointer to an unique symbol table entry with the same name.  This
+**	will either re-use the current entry (if it is undefined)
+**	or will create a new duplicate symbol of the appropriate scope.
+**	No reference counts are adjusted by this routine.  CCDECL and
+**	CCSTMT rely on this for creating new tag/label/member symbols since
+**	the symftag() routines etc have already done the mistaken-reference
+**	correction.
+**
+** UNIQSYM - Just like SYMQCREATE, except that
+**	if a new duplicate symbol is made, the reference count of the
+**	original symbol is decremented to compensate for what was a mistaken
+**	reference.  This is commonly used in CCDECL.
+**
+** Any checks for duplicate definition errors should be made before
+** these routines are called!
+*/
+SYMBOL *
+uniqsym(s)
+SYMBOL *s;
+{
+    if (s->Sclass != SC_UNDEF)	/* If sym is already defined, */
+	s->Srefs--;		/* correct its ref count. */
+    return symqcreat(s);	/* Now create it quickly */
+}
+SYMBOL *
+symqcreat(s)
+SYMBOL *s;
+{
+    if (s->Sclass != SC_UNDEF) {	/* If sym already exists, */
+
+	/* If this symbol has same identifier as a macro symbol, then
+	** after creating it, the shadow flag needs to be propagated, and
+	** the macro sym entry needs to be moved up.  shmacsym() does this.
+	*/
+	if (s->Sflags & SF_MACSHADOW)	/* Shadowing a macro def? */
+	    return shmacsym(creatsym(s->Sname));	/* Yes, shadow after create! */
+	return creatsym(s->Sname);	/* No, just return a duplicate. */
+    }
+
+    /* Can use this symtab entry, just make sure it has right scope. */
+    if (lsymhead && !(s->Sflags & SF_LOCAL))	/* If current scope is local */
+	makelsym(s);			/* change sym from global to local */
+    return s;
+}
+
+/* ISDUPSYM - Returns TRUE if symbol is already defined in current block
+*/
+int
+isdupsym(sym)
+SYMBOL *sym;
+{
+    SYMBOL *ls;
+
+    if (sym->Sclass == SC_UNDEF)	/* If it has this class */
+	return 0;			/* then it was never defined before */
+    if (lsymhead == NULL)	/* Symbol is defined.  If now at top level, */
+	return 1;		/* the symbol is always top-level also. */
+    /* We are in a local block.  To see whether the symbol is defined
+    ** within this block, we start scanning the local symbol list beginning
+    ** with the current local block head.  If we encounter the symbol then
+    ** it is defined in the current block.
+    ** Symbols from inner blocks will never be given as args since symfidstr
+    ** never returns inactivated symbols.
+    ** Symbols from outer blocks will never be scanned because all symbols
+    ** for outer blocks precede those of the current block in the local
+    ** symbol list.
+    */
+    for (ls = lsymhead; ls = ls->Snext;)
+	if (ls == sym) return 1;
+    return 0;
+}
+
+/* MKSYM - Create a symbol table entry - internal workhorse auxiliary.
+**	Symbol will be added to whatever list is provided (locsym or symtail).
+*/
+static SYMBOL *
+mksym(id, tailptr)
+char *id;
+SYMBOL **tailptr;
+{
+    register SYMBOL *sym;
+
+    sym = getsym(tailptr);	/* Get a free symbol struct */
+    (void) idcpy(sym, id);	/* Copy ident, get hash, ignore any trunc */
+
+    sym->Snhash = htable[sym->Svalue];
+    htable[sym->Svalue] = sym;
+
+    BUGMSG((" = %o, hash %o\n", sym, sym->Svalue)) /* Finish bug msg if one */
+
+    sym->Sclass = SC_UNDEF;	/* Set common initial values */
+    sym->Sflags = 0;
+    sym->Stype = NULL;
+    sym->Svalue = 0;		/* This clobbers hash, oh well */
+    sym->Srefs = 0;
+    return sym;
+}
+
+/* SYMMK - Create a symbol table entry - internal workhorse auxiliary.
+**	Symbol will be added to whatever list is provided (locsym or symtail).
+*/
+static SYMBOL *
+symmk(s, hval, tailptr)
+SYMBOL *s, **tailptr;
+int hval;			/* Pre-computed hash value */
+{
+    register SYMBOL *sym;
+
+    sym = getsym(tailptr);
+    BUGMSG((" = %o, hash %o\n", sym, hval))	/* Finish off bug msg if one */
+
+    sym->Snhash = htable[hval];
+    htable[hval] = sym;
+    sym->Scontents.Sid = s->Scontents.Sid;	/* Copy symbol identifier */
+    sym->Sclass = SC_UNDEF;
+    sym->Sflags = 0;
+    sym->Stype = NULL;
+    sym->Svalue = 0;
+    sym->Srefs = 0;
+    return sym;
+}
+
+/* SHMACSYM - Say this symbol shadows a macro symbol.
+**	Sets flag and moves macro symbol matching this one to top of hash list.
+**	This is used by uniqsym() and CCPP's findident() whenever they
+**	create a new symbol which shadows an existing macro symbol; the
+**	macro symbol needs to be moved up to the head of the hash list
+**	to ensure that it is always found by symfind() before the new symbol.
+** Always returns its arg, for convenience.
+*/
+SYMBOL *
+shmacsym(sym)
+SYMBOL *sym;
+{
+    register SYMBOL *s, *prev = NULL;
+    int n;
+
+    sym->Sflags |= SF_MACSHADOW;		/* Set flag in this symbol */
+    for (s = htable[n = symhash(sym)]; s != NULL; prev = s, s = s->Snhash)
+	if (s->Sclass == SC_MACRO && symcmp(sym, s)) {
+	    /* Found the matching macro symbol!  Unlink from hash chain */
+	    if (!prev)			/* If already at start of chain, */
+		break;			/* nothing to do, just return */
+	    prev->Snhash = s->Snhash;	/* Unlink */
+	    s->Snhash = htable[n];	/* Then put at start */
+	    htable[n] = s;
+	    break;
+	}
+    return sym;
+}
+
+/* GETSYM - allocate a symbol entry.
+*/
+static SYMBOL *
+getsym(tailptr)
+SYMBOL **tailptr;
+{
+    SYMBOL *newptr;
+
+    if (newptr = symflist)	/* If freelist has one, take it off */
+	symflist = newptr->Snext;
+    else if ((newptr = (SYMBOL *) malloc(sizeof(SYMBOL))) == NULL)
+	    efatal("Out of memory for symbols");
+    else nsymbols++;		/* Bump # of symbols allocated */
+    newptr->Sprev = *tailptr;
+    newptr->Snext = (SYMBOL *) NULL;
+    (*tailptr)->Snext = newptr;
+    *tailptr = newptr;
+    return newptr;
+}
+
+/* RETSYM - De-allocate a symbol entry.
+*/
+static void
+retsym(syment)
+SYMBOL *syment;
+{
+    if (syment == symtail)
+	symtail = syment->Sprev;
+    else
+	if (syment == loctail)
+	    loctail = syment->Sprev;
+    if (syment->Sprev)
+	syment->Sprev->Snext = syment->Snext;
+    if (syment->Snext)
+	syment->Snext->Sprev = syment->Sprev;
+/*    free((char *)syment); */
+    syment->Snext = symflist;		/* Put entry on freelist */
+    symflist = syment;
+}
+	
+/* COPYSYM - Copy basic parts of symbol struct.
+**	Does not copy Snhash, Sprev, Snext, or Srefs.
+*/
+void
+copysym(s,t)
+SYMBOL *s, *t;
+{			/* Use struct assignment since have unions inside */
+    s->Scontents = t->Scontents;
+}
+
+/* IDCMP - Compare symbol identifiers for equality
+**	Can do without count since existing symbol string is null-terminated
+*/
+static int
+idcmp(s,t)
+char *s, *t;
+{
+    if (*s == *t)
+	while (*++s == *++t)
+	    if (*s == '\0')
+		return 1;
+    return 0;
+}
+
+/* SYMCMP - Compare symbol identifiers for equality
+**	Can do without count since symbol strings are null-terminated
+*/
+static int
+symcmp(s1, s2)
+SYMBOL *s1, *s2;
+{
+    register int *p1 = s1->Sidwds, *p2 = s2->Sidwds;
+    for (; *p1 == *p2; ++p1, ++p2)	/* Do word compare */
+	if ((*p1 & lastwd) == 0)
+	    return 1;
+    return 0;
+}
+
+
+/* IDCPY - Copy string into a symbol structure, ensuring that remainder of
+**	last word of string is zeroed out.
+**	Returns non-zero if identifier was truncated.
+**	Bonus points: puts hash value in Svalue!
+*/
+static int
+idcpy(s, cp)
+SYMBOL *s;
+char *cp;
+{
+    register int i = IDENTSIZE;
+    register char *to = s->Sname;
+    register int hash;
+
+    if (hash = *to = *cp) {
+	--i;
+	while (*++to = *++cp)
+	    if (--i > 0) hash += hash + *cp;
+	    else {		/* Stop if written into last char */
+		*to = '\0';	/* Change last char to a null */
+		s->Svalue = hash & (MAXHSH-1);	/* Return hash value */
+		return 1;	/* And say truncated */
+	    }
+    }
+
+    /* Zap all remaining bits in last word. "i" has # bytes left, not
+    ** counting the terminating null char.  Get # bytes untouched in last wd.
+    */
+    if (i = (IDENTSIZE - (i-1)) % sizeof(int))	/* # bytes in last word */
+	*(int *)to &= chmask[i];		/* Zap em if any */
+    s->Svalue = hash & (MAXHSH-1);	/* Return hash value */
+    return 0;				/* And say identifier length was OK */
+}
+
+
+/* HASH - Compute symbol hash for a string.
+**	The MAXHSH macro must have a value of 2^N.
+*/
+int
+hash(s)
+register char *s;
+{
+    register int i, count;
+  
+    if (i = *s) {
+	count = IDENTSIZE-1;
+	while (--count > 0 && *++s)
+	    i += i + *s;
+    }
+    return (i & (MAXHSH-1));
+}
+
+/* SYMHASH - Compute hash value for a symbol.
+*/
+int
+symhash(s)
+SYMBOL *s;
+{
+    register char *cp = s->Sname;
+    register int i;
+  
+    if (i = *cp)
+	while (*++cp)
+	    i += i + *cp;
+    return (i & (MAXHSH-1));
+}
+
+/* BEGLSYM - Begin a local symbol block.
+**	Called when a block (compound statement or function) is entered.
+** Sets up a new block pointer, a global variable which points to the start of
+** the local symbol list for this block.
+** Returns the PREVIOUS value of this pointer (the parent block).  This
+** should be saved by the caller and given back to endlsym() when the
+** new block is finished.
+**	Only called by CCSTMT's compound() and CCDECL's funcdef().
+*/
+SYMBOL *
+beglsym()
+{
+    SYMBOL *retsym;
+    BUGMSG(("beglsym %o => %o\n", lsymhead, loctail))
+    retsym = lsymhead;		/* Remember current block head */
+    lsymhead = loctail;		/* Set new head */
+    return retsym;		/* Return what is now previous block head */
+}
+
+/* ENDLSYM - End a local symbol block.
+**	Deactivates all symbols in the current block, and restores the
+** previous block head pointer (which must be furnished by caller).
+** As part of the cleanup, we check for local symbols created with
+** linkage elsewhere -- these should always be SC_EXTREF.  They are
+** moved onto the global list and changed to SC_XEXTREF.
+**	Only called by CCSTMT's compound().
+*/
+void
+endlsym(prevptr)
+SYMBOL *prevptr;
+{
+    register SYMBOL *sym, *s;
+
+    BUGMSG(("endlsym %o => %o\n", lsymhead, prevptr))
+    if ((sym = lsymhead) == NULL)
+	int_error("endlsym: treating top level as block");
+    else
+	while ((sym = sym->Snext) != NULL) {
+	  switch (sym->Sclass) {
+	    default:			/* Zap everything except labels */
+		break;			/* Zap the sym */
+	    case SC_AUTO:
+	    case SC_RAUTO:
+		if (sym->Srefs == 0
+		  && !(sym->Sflags&SF_XLOCAL))	/* Only barf first time */
+		    note("Auto %S not used", sym);
+		break;
+	    case SC_ARG:		/* Only complain about params if */
+	    case SC_RARG:		/* flushing final function block. */
+		if (prevptr == NULL && sym->Srefs == 0)
+		    note("Parameter %S not used", sym);
+		break;
+	    case SC_ISTATIC:
+		if (sym->Srefs == 0
+		  && !(sym->Sflags&SF_XLOCAL))	/* Only barf first time */
+		    note("Internal static %S not used", sym);
+		break;
+
+	    case SC_LABEL:	/* Labels are active throughout function */
+	    case SC_ULABEL:
+		continue;
+	    case SC_EXTREF:
+		s = sym->Sprev;		/* Remember previous */
+		if (sym->Srefs == 0) {
+		    note("External %S not used", sym);
+		    break;		/* No special handling, just flush */
+		}
+		/* Turn a block-scope external into a global. */
+		sym->Sclass = SC_XEXTREF;
+		sym->Sflags |= SF_XLOCAL;	/* Render sym invisible */
+		makegsym(sym);		/* Put it on global list */
+		sym = s;		/* Set up to get next local sym */
+		continue;
+	  }
+	sym->Sflags |= SF_XLOCAL;	/* Zap the sym, get next */
+    }
+    lsymhead = prevptr;		/* Then restore ptr to parent block */
+}
+
+/* RIDLSYM - Flush local symbols in current and inner blocks.
+**	Harsher than endlsym() because the symbols are actually freed.
+**	See ccsym.h for explanation of SF_PROTOTAG checking.
+**	If arg is NULL, flushes all local symbols.  This is normally
+**	only done after the code generation for a function is completely
+**	finished, by CCGEN's gencode(),
+**	but the top level parser in CCDECL also uses it for error recovery.
+*/
+void
+ridlsym(prevptr)
+SYMBOL *prevptr;
+{
+    SYMBOL *beg;
+
+    BUGMSG(("ridlsym %o => %o\n-----", lsymhead, prevptr))
+    if (prevptr == NULL) beg = locsymbol;	/* NULL means flush all */
+    else if (!(beg = lsymhead)) {
+	int_error("ridlsym: treating top level as block");
+	return;
+    }
+
+    if (debsym && beg->Snext) symdump(beg->Snext, curfn->Sname);
+    while (loctail != beg) {
+	switch (loctail->Sclass) {
+	case SC_TAG:
+	case SC_UTAG:
+	    if (loctail->Sflags & SF_PROTOTAG) {
+		loctail->Sflags |= SF_XLOCAL;	/* Ensure sym never found */
+		loctail->Ssmnext = NULL;	/* Forget any members */
+		makegsym(loctail);		/* and move to global list */
+		continue;
+	    }
+	    break;
+	case SC_ULABEL:			 /* Undefined label? (fall through) */
+	    error("Goto label %S never defined", loctail);
+	case SC_ISTATIC:
+	    freelabel(loctail->Ssym);	/* Flush no longer useful label */
+	    break;
+	case SC_LABEL:
+	    if (loctail->Srefs == 0)
+		note("Label %S never used", loctail);
+	    freelabel(loctail->Ssym);	/* Flush no longer useful label */
+	    break;
+	}
+	freesym(loctail);
+    }
+    lsymhead = prevptr;		/* Then restore ptr to parent block */
+    BUGMSG(("ridlsym done---"))
+}
+
+/* SYMBOL NAME MAPPING CODE */
+
+/* Because almost all PDP-10 utilities (in particular, the assemblers and
+** debuggers) are limited to 6-char monocase external symbols, C identifiers
+** must be mapped into these limitations.
+**
+** For identifiers with external linkage (class SC_EX*):
+**	The first 6 chars are monocased, and "_" mapped into ".".
+**	An error message is generated if any mappings conflict.
+**
+** For identifiers with internal linkage (class SC_IN*):
+**	The resulting mapped name must always be unique, but since these
+**	identifiers are internal, we are at liberty to do anything
+**	necessary to ensure this uniqueness.  The current algorithm is
+**
+**	[0] Always prefix with "%" - this avoids conflicts with
+**		external linkage symbols as well as the C runtime syms.
+**	[1] Add the first 5 monocase identifier chars.  If unique, win.
+**	[2] Else, remove vowels (a,e,i,o,u) and underscores from the
+**		identifier (except for its first char), and try the
+**		first 5 chars of the result, as before.
+**	[3] Else, begin adding digits to the result of [2].  The sequence
+**		produced is: x0 ... x9, x10 ... x99, etc.
+**		This will ultimately succeed.
+*/
+typedef int mpdsym;
+static mpdsym *maptab;	/* Pointer to table of maps thus far */
+static int maptlen;	/* # elements in map table */
+static int maptused;	/* # elements actually used */
+#define MAPTINC 50	/* # elements to ask for each time we realloc */
+
+/* SMAPINIT - Initialize symbol mapping tables.
+*/
+static void
+smapinit()
+{
+    if (maptab) free((char *)maptab);
+    maptab = NULL;
+    maptlen = maptused = 0;
+}
+
+/* SMAPMATCH - returns TRUE if mapped sym matches one already in table.
+**	Otherwise, adds to table and returns 0.
+*/
+static int
+smapmatch(ms)
+mpdsym ms;
+{
+    register mpdsym *p = maptab;
+    register int i = maptused;
+
+    /* Simple-minded table search */
+    while (--i >= 0)
+	if (*p++ == ms)
+	    return 1;
+
+    /* Not in table, add it. */
+    if (maptused >= maptlen) {		/* Get larger table if needed */
+	char *nptr;
+	if (!(nptr = realloc((char *)maptab,
+				(maptlen + MAPTINC)*sizeof(mpdsym)))) {
+	    error("Out of memory for symbol linkage map");
+	    return 0;
+	} else {
+	    maptab = (mpdsym *)nptr;
+	    maptlen += MAPTINC;
+	}
+    }
+    maptab[maptused++] = ms;
+    return 0;
+}
+
+/* MAPEXTSYM - Map a symbol with external linkage.
+**	Returns 0 if a conflict exists.
+*/
+int
+mapextsym(s)
+SYMBOL *s;
+{
+    register int i = 6*6, c;
+    register unsigned val = 0;
+    register char *str;
+
+    str = s->Sname;
+    if (*str != SPC_IDQUOT) --str;	/* Skip 1st char if `ident` */
+    while (i > 0 && (c = *++str)) {
+	if (c == '_') c = '.';
+	val |= tosixbit(c) << (i -= 6);
+    }
+    s->Smaplab = val;
+    return !smapmatch((mpdsym)val);	/* Succeed if no existing match */
+}
+
+/* MAPINTSYM - Map a symbol with internal linkage.
+**	Always wins.
+*/
+void
+mapintsym(s)
+SYMBOL *s;
+{
+    char sym6[6+1];
+    mpdsym ms;
+    register int i = 6;
+    register char *cp = sym6, *sp = s->Sname;
+
+    if (*sp == SPC_IDQUOT) {	/* Treat `ident` specially */
+	i = 6;
+	--cp;
+    } else {
+	i = 5;
+	--sp;			/* Normal sym */
+	*cp = '%';		/* Always starts with this prefix */
+    }
+    while (--i >= 0)
+	if (!(*++cp = (*++sp == '_' ? '.' : *sp)))
+	    break;
+    if (i < 0) *++cp = 0;	/* Tie off */
+
+    /* Now have mapped ident in temp buff */
+    if (!smapmatch(ms = sixbit(sym6))) {		/* Won right off? */
+	s->Smaplab = ms;
+	return;
+    }
+
+    /* Sigh, try step 2 -- flush vowels and underscores after 1st char. */
+    for (i = 4, cp = sym6+1, sp = s->Sname; *++sp && i;)
+	if (!isvowel(*sp) && *sp != '_')
+	    --i, *++cp = *sp;
+    *++cp = 0;
+    if (!smapmatch(ms = sixbit(sym6))) {
+	s->Smaplab = ms;
+	return;
+    }
+
+    /* Sigh sigh, fall into step 3 -- add digits on end */
+    if (i > 0) {		/* Fill out rest of name with '0's */
+	while (--i >= 0)
+	    *++cp = '0';
+	*++cp = 0;
+    }
+    for (;;) {
+	if (!smapmatch(ms = sixbit(sym6))) {
+	    s->Smaplab = ms;
+	    return;
+	}
+	/* Increment number again */
+	cp = &sym6[5];
+	for (;;) {
+	    if (!isdigit(*cp)) { *cp = '1'; break; }
+	    else if (*cp != '9') { ++(*cp); break; }
+	    *cp = '0';		/* Wrap from 9 to 0 */
+	    --cp;		/* and carry to prev digit */
+	}
+    }
+}
+
+/* LABEL MANAGEMENT CODE */
+
+static int maxlabel;		/* Current highest-numbered label */
+static SYMBOL *fllist = NULL;	/* Free label list */
+static SYMBOL *flprev = NULL;	/* queue of almost-free labels */
+static int nlabels = 0;		/* # labels allocated */
+
+/* LABINIT - Initialize label stuff.
+**	Called by SYMINIT at start of compilation for each file.
+*/
+static void
+labinit()
+{
+    maxlabel = 0;		/* Reset internal label numbering to 0 */
+    cleanlabs();		/* Ensure no queued labels */
+	/* Note that "fllist" is left alone in case it contains free labels,
+	** which will save us the bother of allocating them.
+	*/
+}
+
+/*
+** Get a new label to play with.
+**
+** The argument should be nonzero if the label will be emitted after all
+** uses of it, rather than before.  If it is zero, the label is emitted.
+*/
+
+SYMBOL *
+newlabel()
+{
+    SYMBOL *lab;
+
+    /* find a free label */
+    if (lab = fllist)			/* If have one already free, */
+	fllist = fllist->Snext;		/* remove it from freelist */
+    else if ((lab = (SYMBOL *) malloc(sizeof (*lab))) == NULL)	/* make new */
+	efatal("Out of memory for labels");
+    else nlabels++;			/* Bump # of labels allocated */
+
+    /* fill it out */
+    lab->Sclass = SC_ILABEL;		/* this is an internal label */
+    sprintf(lab->Sname, "$%d", ++maxlabel); /* give it a name */
+    lab->Svalue = 0;			/* no uses yet */
+    return lab;
+}
+
+/* REFLABEL - Reference or dereference a label.
+**
+** The second argument is how much to add to the reference count.
+** The label may be NULL or not a SC_ILABEL; in that case nothing happens.
+*/
+void
+reflabel(lab, count)
+SYMBOL * lab;
+{
+    if (lab != NULL && lab->Sclass == SC_ILABEL)
+	lab->Svalue += count;
+}
+
+/* FREELABEL - release a label
+**
+** Unfortunately we can't know when the last instance in the peephole
+** buffer has been emitted, at least until we flush the whole thing out.
+** So we keep explicitly freed labels on another list and only transfer
+** them after we have emitted a new label (and thus called flushcode()).
+**
+** This list chains through sprev rather than snext to keep things simple.
+*/
+void
+freelabel(lab)
+SYMBOL *lab;
+{
+    lab->Sprev = flprev;		/* chain old freelist onto it */
+    flprev = lab;			/* it is now head of freelist */
+}
+
+/* CLEANLABS() - actually free up all "almost-free" labels.
+*/
+static void realfreelabel();
+void
+cleanlabs()
+{
+    while (flprev != NULL) {	/* peephole buffer is now empty */
+	realfreelabel(flprev);	/* so free the list of labels queued */
+	flprev = flprev->Sprev;	/* by freelabel() */
+    }				/* (nb sprev unchanged by realfree) */
+}
+
+/* REALFREELABEL - Really free a label.
+**
+** This should be called after the last possible reference to the label.
+** It will be called automatically on emission of forward labels.
+** Note sprev must not be changed (see cleanlabs()).
+*/
+static void
+realfreelabel(lab)
+SYMBOL *lab;
+{
+    lab->Snext = fllist;		/* chain old freelist onto it */
+    fllist = lab;			/* it is now head of freelist */
+}
+
+/* SYMDUMP - Dump symbol table info to debugging output.
+*/
+static void shoffset();
+extern FILE *fsym;
+void
+symdump(table, name)
+SYMBOL *table;
+char *name;
+{
+    int u;
+    char *str, *c, tmpstr[50];
+    SYMBOL *s;
+
+    fprintf(fsym, "\n-- Symbols for %s --\n\n", name);
+    for (s = table; s != NULL; s = s->Snext) {
+	switch (u=s->Sclass) {
+	case SC_UNDEF:	str = "undefined"; break;
+	case SC_RW:	str = "reserved word"; break;
+	case SC_MACRO:	str = "macro"; break;
+	case SC_TAG:	str = "structure tag"; break;
+	case SC_UTAG:	str = "undef structure tag"; break;
+	case SC_TYPEDEF: str = "typedef"; break;
+	case SC_XEXTREF: str = "ex-extern-ref"; break;
+	case SC_EXTREF:	str = "extern-ref"; break;
+	case SC_EXTDEF:	str = "extern-def"; break;
+	case SC_EXLINK:	str = "extern-tntdef"; break;
+	case SC_INTREF:	str = "intern-ref"; break;
+	case SC_INTDEF:	str = "intern-def"; break;
+	case SC_INLINK:	str = "intern-tntdef"; break;
+	case SC_ISTATIC: str = "local-static"; break;
+	case SC_ARG:	str = "argument"; break;
+	case SC_RARG:	str = "register-arg";	break;
+	case SC_REGISTER: str = "register";	break;
+	case SC_MEMBER:	str = "struct member";	break;
+	case SC_AUTO:	str = "auto";		break;
+	case SC_RAUTO:	str = "register-auto";	break;
+	case SC_LABEL:	str = "goto label"; break;
+	case SC_ENUM:	str = "enumerated type"; break;
+	case SC_ULABEL:	str = "undefined goto label"; break;
+	default: sprintf(tmpstr, "ILLEGAL symbol class %d", u);
+		str = tmpstr;
+	}
+	c = s->Sname;
+	fprintf(fsym, "%-10s: %s", c, str);
+	if (s->Sflags)
+	    fprintf(fsym," (%o)", s->Sflags);
+	fprintf(fsym,", refs %d", s->Srefs);
+	if (u != SC_MACRO && u != SC_TAG && s->Stype) {
+	    fprintf(fsym, ", type %d", s->Stype-types);
+	    if (s->Stype->Tspec == TS_STRUCT
+		|| s->Stype->Tspec == TS_UNION)	/* struct or union? */
+		fprintf(fsym, ", struct %s", s->Stype->Tsmtag->Sname+1);
+	    fprintf(fsym, ", tsize %d", sizetype(s->Stype));
+	}
+	switch (u) {
+	case SC_AUTO: case SC_RAUTO:
+	    fprintf (fsym, ", offset %d", s->Svalue + 1);
+	    break;
+
+	case SC_ARG: case SC_RARG:
+	    fprintf (fsym, ", offset %d", - s->Svalue);
+	    break;
+
+	case SC_ENUM: case SC_TAG:
+	    fprintf(fsym, ", value %d", s->Svalue);
+	    break;
+
+	case SC_EXTDEF:
+	case SC_INTDEF:
+	    if (s->Stype->Tspec == TS_FUNCT && s->Shproto)
+		fprintf(fsym, ", Shproto %d", s->Shproto - types);
+	    break;
+
+	case SC_MEMBER:
+	    shoffset(s->Svalue);
+	    break;
+
+	case SC_MACRO:
+	    fprintf(fsym, ", nargs %d, parlen %d, len %d=",
+			s->Smacnpar, s->Smacparlen, s->Smaclen);
+	    if (!s->Smacptr) fputs("NULL", fsym);
+	    else {
+		int i = s->Smaclen;
+		char *cp = s->Smacptr;
+		putc('"', fsym);
+		while (--i >= 0)
+		    putc(*cp++, fsym);
+		putc('"', fsym);
+	    }
+	    break;
+	}
+	putc ('\n', fsym);
+    }
+}
+
+static void
+shoffset(off)
+int off;
+{
+    if (off >= 0) fprintf(fsym, ", offset %d", off);
+    else {
+	unsigned int o = -off;			/* negate */
+	fprintf(fsym, ", offset %d, width %d, bit offset %d",
+		      o >> 12, o & 077, 36 - ((o & 07700) >> 6) - (o & 077));
+    }    
+}
+
+#if 0	/* debug stuff */
+shohash()
+{
+    int n;
+    SYMBOL *s;
+    for(n=0; n < MAXHSH; n++)
+	if(s = htable[n]){
+	    printf("Hash %o:", n);
+	    do printf(" %o=%s", s, s->Sname);
+	    while (s = s->Snhash);
+	    printf("\n");
+	}
+}
+#endif
+
+/* TYPEINIT - Initialize things for support of C types.
+** Mainly initializes the type table with the supported basic types.
+*/
+static void
+typeinit()
+{
+    int i;
+
+    /* First a crock to ensure "char" byte size selection has effect */
+    typbsiztab[TS_CHAR] = typbsiztab[TS_UCHAR] = tgcsize;
+
+    maxtype = 0;
+    for (i = 0 ; i < MAXTYPE ; i++)  ttable[i] = NULL;	/* Clear hash table */
+    for (i = 0; i < TS_MAX; i++)
+	if (i == TS_VOID || typsiztab[i] != 0)
+	    typeptr[i] = findtype(i, (TYPE *)NULL);
+	else typeptr[i] = NULL;
+
+    /* Machine-dependent... clobber table so some types are equivalent */
+    /* Someday clean this up and make it table-driven also */
+    chartype = uchartype;	/* Say plain "char" is "unsigned char" */
+    deftype = inttype;		/* Default type is "int" */
+    strcontype = findtype(TS_PTR, chartype);	/* Type of string constant */
+    voidptrtype = findtype(TS_PTR, voidtype);	/* (void *) */
+    siztype = (clevel >= CLEV_ANSI) ? uinttype	/* Std C wants unsigned, ugh */
+				: inttype;
+    ptrdifftype = inttype;			/* What ptrdiff_t is */
+}
+
+
+/* NOTE on the various "type finding" routines below:
+**	Much of KCC relies on being able to compare types simply by
+** comparing the pointers to TYPE nodes.  This, and the desire to share
+** type definitions, means that all type declarations must first look for
+** an identical existing type, and only create a new type if no existing
+** definition matches.
+**	In order to do this most efficiently, we indulge in non-portable
+** type punning for the arguments to these routines.  Specifically, the
+** values of the two unions in the TYPE structure are declared below as
+** being (int) and (TYPE *) but may in fact contain other things.
+**	This is a deliberate but reasonable sacrifice of clumsy theoretical
+** portability in return for speed.
+*/
+
+/* FINDTYPE - Find or create an unqualified type.
+**	Note CCDECL's tagspec() calls this with a symbol (tag) pointer instead
+**	of a type pointer.
+*/
+TYPE *
+findtype(tsp, subt)
+TYPE *subt;
+{    return findctype(tsp,
+		typbsiztab[tsp],	/* Use default flags and  # bits */
+		typsiztab[tsp],		/* Use default size in words */
+		subt);
+}
+
+/* FINDSZTYPE - Same, but use specified Tsize instead of default.
+*/
+TYPE *
+findsztype(tsp, siz, subt)
+TYPE *subt;
+{    return findctype(tsp,
+		typbsiztab[tsp],	/* Use default flags and  # bits */
+		siz,			/* Use specified size in words */
+		subt);
+}
+
+/* FINDUTYPE - Find or create the unqualified version of a given type.
+*/
+TYPE *
+findutype(t)
+TYPE *t;
+{
+    return !(t->Tflag&(TF_QUALS|TF_SIQUALS)) ? t /* No prob if no quals */
+	: findctype(t->Tspec, t->Tflag&(~(TF_QUALS|TF_SIQUALS)),
+					t->Tsize, t->Tsubt);
+}
+
+/* FINDQTYPE - Find or create the qualified version of a given type.
+**	The given qualifier flags are added into any that already exist.
+*/
+TYPE *
+findqtype(t, quals)
+TYPE *t;
+{
+    return findctype(t->Tspec, t->Tflag|(quals & ~TF_QUALS),
+			t->Tsize, t->Tsubt);
+}
+
+/* FINDFTYPE - Find or create a function type.
+**	Tspec is always set to TS_FUNCT and flags to 0.
+**	The two arguments are the return type and prototype list pointer.
+*/
+TYPE *
+findftype(rtyp, plist)
+TYPE *rtyp, *plist;
+{    return findctype(TS_FUNCT, 0,	/* Always function, no qualifiers */
+		plist,			/* Param list - note type punning! */
+		rtyp);			/* Return type */
+}
+
+/* FINDPTYPE - Find or create a prototype-list "type".
+**	Important thing to note is that only the unqualified version of
+**	the original type is used.
+*/
+TYPE *
+findptype(tsp, plist, t)
+TYPE *plist, *t;
+{
+    return findctype(tsp, 0, 	/* Never any flags or qualifiers */
+	plist,			/* Param list - note type punning! */
+	((!t || !(t->Tflag&(TF_CONST|TF_VOLATILE)))	/* Parameter type */
+		? t			/* Type is OK as is */
+		: findctype(t->Tspec,	/* Ugh, use unqualified version */
+			(t->Tflag & (~(TF_CONST|TF_VOLATILE))),
+			t->Tsize,
+			t->Tsubt)));
+}
+
+/* FINDCTYPE - Main routine to find or create a type.
+**	Permits full specification of all type info; this is the only
+**	routine that allows setting the type-qualifier flags.
+*/
+TYPE *
+findctype(tsp, flags, siz, subt)
+TYPE *subt;
+{
+    TYPE *t;
+    int hash;
+
+    flags |= tfltab[tsp];	/* Ensure usual flags are added in */
+
+    /* Hash up attributes of this type and look up in table */
+    hash = ( ((int) subt) + (tsp * 43) + (siz * 101) ) % THASHSIZE;
+    for (t = ttable[hash]; t != NULL; t = t->Tnhash)
+	if (t->Tspec == tsp && t->Tflag == flags
+		&& t->Tsize == siz && t->Tsubt == subt)
+	    return t;		/* Found identical existing type! */
+
+    /* Not found, have to make up a new one */
+    t = &types[maxtype++];		/* someday this should be a malloc() */
+    if (maxtype >= MAXTYPE)
+	efatal("Type table overflow");
+    t->Tspec = tsp;			/* Store type specifications */
+    t->Tflag = flags;
+    t->Tsize = siz;
+    t->Tsubt = subt;
+    t->Tnhash = ttable[hash];		/* link old types with same hash */
+    ttable[hash] = t;			/* add this one in to hash table */
+    return t;
+}
+
+/* CMPTYPE - Compare two types for compatibility
+*/
+int
+cmptype(t1, t2)
+TYPE *t1, *t2;
+{
+#if 1	/* New version */
+    return (t1 == t2 || tcomposite(t1, t2));
+#else
+    if (t1 == t2) return 1;
+    if (t1->Tspec != TS_ARRAY || t2->Tspec != TS_ARRAY) return 0;
+    if (t1->Tsubt != t2->Tsubt) return 0;
+    return (t1->Tsize == 0 || t2->Tsize == 0 || t1->Tsize == t2->Tsize);
+#endif
+}
+
+/* CMPUTYPE - Compare two types "unqualifiedly", i.e. ignore const/volatile.
+**	This is different from normal type compat checking because the
+**	top type's qualifiers must be ignored.
+*/
+int
+cmputype(t, u)
+TYPE *t, *u;
+{
+    if (t == u) return 1;
+    if (t->Tspec == u->Tspec
+      && (t->Tflag&(~TF_QUALS))	== (u->Tflag&(~TF_QUALS))) {
+	switch (t->Tspec) {
+	case TS_FUNCT:
+	    return tcomposite(t, u) != NULL;
+	case TS_ARRAY:
+	    /* If both arrays have sizes, the size must be identical.
+	    ** The element types must be compatible.
+	    */
+	    if (t->Tsize && u->Tsize && (t->Tsize != u->Tsize))
+		break;
+	    /* Sizes OK, fall thru to check element type */
+	case TS_PTR:
+	    return (t->Tsubt == u->Tsubt || tcomposite(t->Tsubt, u->Tsubt));
+
+	case TS_STRUCT:
+	case TS_UNION:
+	    return t->Tsmtag == u->Tsmtag;
+
+	default:
+	    return 1;
+	}
+    }
+    return 0;
+}
+
+
+/* TCOMPOSITE - Return the composite type for two types, or NULL if
+**	they are not compatible types.
+**	Whenever possible, just the "best" of the two is returned, rather
+**	than constructing a new type.
+*/
+TYPE *
+tcomposite(t1, t2)
+TYPE *t1, *t2;
+{
+    TYPE *t;
+
+    if (t1 == t2) return t1;		/* Quick check */
+    if (t1->Tflag != t2->Tflag		/* Must have same qualifiers */
+      || t1->Tspec != t2->Tspec)	/* and same top-level type */
+	return NULL;
+
+    /* Types have same qualifiers and same top-level type, so their
+    ** size or subtype must be different.  For some things, that's OK.
+    */
+    switch (t1->Tspec) {
+
+    case TS_ARRAY:		/* For array types, */
+	/* If both arrays have sizes, the size must be identical.
+	** The element types must always be compatible.
+	*/
+	if (t1->Tsize && t2->Tsize && t1->Tsize != t2->Tsize)
+	    break;			/* Different sizes, fail */
+	if (t1->Tsubt != t2->Tsubt) {	/* must have same element types */
+	    if (t = tcomposite(t1->Tsubt, t2->Tsubt))
+		return findctype(TS_ARRAY, t1->Tflag,
+			(t1->Tsize ? t1->Tsize : t2->Tsize), t);
+	    break;
+	}
+	return (t1->Tsize ? t1 : t2);	/* Won!  Return whichever has size */
+
+    case TS_PTR:		/* For pointer, subtypes must be compatible */
+	if (t = tcomposite(t1->Tsubt, t2->Tsubt))
+	    return findctype(TS_PTR, t1->Tflag, t1->Tsize, t);
+	break;
+
+    case TS_FUNCT:		/* For function, hairier */
+	if (t1->Tsubt == t2->Tsubt) {		/* Check for quick win */
+	    if (!t1->Tproto) return t2;		/* Same return type, so use */
+	    if (!t2->Tproto) return t1;		/* whichever has a proto */
+	    t = t1->Tsubt;			/* Diff protos, sigh */
+	} else if (!(t = tcomposite(t1->Tsubt, t2->Tsubt)))
+	    break;			/* Return types not compatible */
+
+	/* Have new return type in t, now determine new prototype in t2 */
+	if      (!t1->Tproto) t2 = t2->Tproto;
+	else if (!t2->Tproto) t2 = t1->Tproto;
+	else if (!(t2 = tcomproto(t1->Tproto, t2->Tproto)))
+	    break;			/* Prototypes not compatible */
+	return findftype(t, t2);	/* Win! */
+    }
+    return NULL;
+}
+
+/* TCOMPROTO - Build composite prototype
+**	Returns NULL if couldn't.
+*/
+static TYPE *
+tcomproto(t1, t2)
+TYPE *t1, *t2;
+{
+    TYPE *t;
+
+    if (t1 == t2) return t1;	/* Win if same -- TS_PARVOID, TS_PARINF */
+    if (t1->Tspec != t2->Tspec || t1->Tspec != TS_PARAM)
+	return NULL;			/* Mismatch of (void) or ,...) */
+
+    /* OK, have real parameter, build composite type for it */
+    if (!(t = tcomposite(t1->Tsubt, t2->Tsubt)))
+	return NULL;			/* Param types not compatible */
+    if (t1->Tproto && t2->Tproto) {	/* More params? */
+	if (!(t2 = tcomproto(t1->Tproto, t2->Tproto)))
+	    return NULL;		/* Remaining params not compatible */
+    } else if (!t1->Tproto && !t2->Tproto) {	/* No more params? */
+	t2 = NULL;			/* Terminated OK! */
+    } else return NULL;			/* Mismatch of # params! */
+
+    /* Here, have all the parts needed for new composite prototype. */
+    return findptype(TS_PARAM, t2, t);
+}
+
+/* SIZETYPE - Find size of type, in words.
+**	Note this is words, not bytes such as "sizeof" evaluates to!
+** The only "funny" value is that for "char" which is simply 1 (no smaller
+** value can be represented).  This requires interpreting the size specially
+** when the type is char (see sizeptobj below for an example).
+*/
+int
+sizetype(t)
+TYPE *t;
+{
+    int s;
+
+    if (t == NULL) {			/* izlist => izer0/1 does this, why? */
+	int_error("sizetype: null type");	/* Flush later if never hit */
+	return 0;
+    }
+
+    /* calculate factor for array dimensions */
+    s = 1;				/* nothing multiplied in yet */
+    while (t->Tspec == TS_ARRAY) {	/* array has to multiply out ranges */
+	s *= t->Tsize;			/* so multiply it in with rest */
+	t = t->Tsubt;			/* and go to next in chain */
+    }
+
+    /* Multiply that by size of base type */
+    if (tisbyte(t)) {		/* Bytes are special case, round up. */
+	if (!tbitsize(t)) return 0;	/* Check for TS_VOID (0-size byte) */
+	return (s + (TGSIZ_WORD/tbitsize(t)) - 1) / (TGSIZ_WORD/tbitsize(t));
+    }
+
+    switch (t->Tspec) {
+	case TS_STRUCT:
+	case TS_UNION:				/* If structure or union, */
+	    if (t->Tsmtag->Sclass != SC_TAG)	/* make sure it's defined */
+		/* Otherwise must be SC_UTAG (undefined) and size is unknown */
+		error("Structure %S undefined, size unknown",
+			t->Tsmtag);	/* Complain */
+	    break;
+
+	case TS_PTR:		/* Temporary check installed when changing to
+				** new type-size scheme, take out if never hit
+				** and just use default.
+				*/
+	    if (t->Tsize != typsiztab[TS_PTR]) {
+		int_error("bad pointer size: %d", t->Tsize);
+		return s * typsiztab[TS_PTR];
+	    }			/* Drop thru to normal case */
+	    break;
+    }
+    return s * t->Tsize;	/* return final number of words */
+}
+
+/* SIZEPTOBJ - Find size of object that a pointer points to.
+**	This helps determine how much to increment/decrement pointers by.
+** The return value is funny, however.  If the pointer is a normal word
+** pointer then the "size" is size in words.  If the pointer is a byte
+** pointer then its "size" is expressed in terms of bytes.
+*/
+int
+sizeptobj(t)
+TYPE *t;
+{
+    return (tisbytepointer(t)		/* If byte pointer, handle specially */
+	? sizearray(t->Tsubt)		/* Bytes: either 1 or # elements */
+	: sizetype(t->Tsubt));		/* Words: use # words */
+}
+
+/* SIZEARRAY - returns number of elements in array (1 if not an array).
+**	This has nothing to do with the size or type of the elements.
+**	This is used to find the # of bytes in a byte array.
+*/
+int
+sizearray(t)
+register TYPE *t;
+{
+    register int s = 1;
+
+    while (t->Tspec == TS_ARRAY) {
+	s *= t->Tsize;			/* Multiply size for each index */
+	t = t->Tsubt;			/* of the array structure. */
+    }
+    return s;
+}
+
+/* ARYERR - Auxiliary for errors invoked by several following rtns */
+static void
+aryerr(s)
+char *s;
+{
+    int_error("%s: array of null", s);
+}
+
+/* ELEMBSIZE - Returns size in bits of an element (in an array, or pointed to)
+**	Value is zero if element is not a scalar object.
+**	In particular, TS_VOID is zero even though it pretends to be a "byte".
+*/
+int
+elembsize(t)
+TYPE *t;
+{
+    if (t->Tspec != TS_PTR && t->Tspec != TS_ARRAY) return 0;
+    while (t = t->Tsubt)
+	if (t->Tspec != TS_ARRAY)
+	    return (tisscalar(t) ? tbitsize(t) : 0);
+    aryerr("elembsize");
+    return 0;
+}
+
+
+/* TISPURE - Return true if type can be considered completely "pure";
+**	that is, it is completely const-qualified and there are no
+**	volatile qualifiers.
+*/
+int
+tispure(t)
+TYPE *t;
+{
+    while (t->Tspec == TS_ARRAY) t = t->Tsubt;	/* Get to bottom of array */
+    return (!tisanyvolat(t) && tisconst(t));
+}
+
+/* TISCHARPOINTER - Return true if pointer representation for this type
+**	is a pointer to some kind of char.
+** TISBYTEPOINTER - Likewise for bytes.
+*/
+int
+tischarpointer(t)
+TYPE *t;
+{
+    if (t->Tspec != TS_PTR && t->Tspec != TS_ARRAY) return 0;
+    while (t = t->Tsubt)
+	if (t->Tspec != TS_ARRAY)
+	    return(tischar(t));
+    aryerr("tischarpointer");
+    return 0;
+}
+
+int
+tisbytepointer(t)
+TYPE *t;
+{
+    if (t->Tspec != TS_PTR && t->Tspec != TS_ARRAY) return 0;
+    while (t = t->Tsubt)
+	if (t->Tspec != TS_ARRAY)
+	    return(tisbyte(t));
+    aryerr("tisbytepointer");
+    return 0;
+}
+
+/* TISCHARARRAY - Return true if type is "array of char".
+**	This works for either signed or unsigned chars.
+** TISBYTEARRAY - Similar, true if elements are "bytes" (smaller than words).
+*/
+int
+tischararray(t)
+TYPE *t;
+{
+    if (t->Tspec != TS_ARRAY) return 0;
+    while (t = t->Tsubt)
+	if (t->Tspec != TS_ARRAY)
+	    return(tischar(t));
+    aryerr("tischararray");
+    return 0;
+}
+
+int
+tisbytearray(t)
+TYPE *t;
+{
+    if (t->Tspec != TS_ARRAY) return 0;
+    while (t = t->Tsubt)
+	if (t->Tspec != TS_ARRAY)
+	    return tisbyte(t);
+    aryerr("tisbytearray");
+    return 0;
+}
+
+/* TYPEDUMP - Dump type table info to debugging file
+*/
+
+static struct typflg {
+	int flag; int flchar; char *flstr;
+} tflagtb[] = {
+	TF_CONST,	'C', "Const-qualified",
+	TF_VOLATILE,	'V', "Volatile-qualified",
+	TF_INTEG,	'i', "Integral",
+	TF_FLOAT,	'f', "Floating-point",
+	TF_SCALAR,	's', "Scalar",
+	TF_UNSIGN,	'u', "Unsigned",
+	TF_CHAR,	'c', "Char",
+	TF_BITF,	'b', "Bitfield",
+	TF_BYTE,	'B', "Byte (non-word)",
+	TF_STRUCT,	'S', "Struct or Union",
+	TF_SICONST,	'n', "S/U contains a const",
+	TF_SIVOLAT,	'v', "S/U contains a volatile",
+	0, 0, 0,
+};
+
+void
+typedump()
+{
+    int u, size, idx;
+    char *str;
+    TYPE *t;
+    SYMBOL *sm;
+    char flagstr[30], *cp;
+    struct typflg *fp;
+
+    fprintf(fsym,"\n\n-- Types --\n\n\tType flags:\n");
+    for (fp = tflagtb; fp->flag; ++fp)
+	fprintf(fsym,"\t  %c - %s type\n", fp->flchar, fp->flstr);
+    fprintf(fsym, " Idx Flags  Bits Type\n");
+
+    for(idx = 0; idx < maxtype; idx++) {
+	t = &types[idx];		/* Get pointer to a type */
+	cp = flagstr;
+	size = 0;
+	str = NULL;
+	if (0 <= (u = t->Tspec) && u < TS_MAX) {
+	    str = tsnames[u];		/* Get name of basic type */
+	    if (u != TS_FUNCT)
+		size = tbitsize(t);
+	} else switch (u) {
+	    case TS_PARVOID:	str = "param \"void\"";	break;
+	    case TS_PARINF:	str = "param \"...\""; break;
+	    case TS_PARAM:	str = "param"; break;
+	}
+	/* Get string representation for type flags */
+	for (fp = tflagtb; fp->flag; ++fp)
+	    if (t->Tflag & fp->flag) *cp++ = fp->flchar;
+	*cp = 0;
+
+	/* Now print basic information about type */
+	if (str)
+	    fprintf(fsym, "%4d %-7s %3d %s", idx, flagstr, size, str);
+	else
+	    fprintf(fsym, "%4d %-7s ??? BAD - unknown Tspec %#o, Tflag %#o, Tsize%#o, Tsubt %#o (%d)",
+			idx, flagstr,
+			t->Tspec, t->Tflag, t->Tsize, t->Tsubt,
+			t->Tsubt - types);
+
+	str = NULL;
+	switch (u) {
+        case TS_PTR:
+	    str = "to";
+	    break;
+
+	case TS_ARRAY:
+	    fprintf(fsym, ", size %d", t->Tsize);
+	    str = "of";
+	    break;
+
+	case TS_PARVOID:
+	case TS_PARINF:
+	    if (t->Tsubt) fprintf(fsym, ", BAD type: %d", t->Tsubt-types);
+	    if (t->Tproto) fprintf(fsym, ", BAD next: %d", t->Tproto-types);
+	    break;
+
+	case TS_PARAM:
+	    if (t->Tsubt) fprintf(fsym, ", of %d", t->Tsubt - types);
+	    else fprintf(fsym, ", BAD type: NULL");
+	    if (t->Tproto) fprintf(fsym, ", next: %d", t->Tproto - types);
+	    break;
+
+	case TS_FUNCT:
+	    if (t->Tproto) fprintf(fsym, ", proto %d", t->Tproto - types);
+	    else fprintf(fsym, ", no proto");
+	    str = "returns";
+	    break;
+
+        case TS_STRUCT:
+	case TS_UNION:
+	    fprintf (fsym, ", tag %s", t->Tsmtag->Sname);
+	    if (t->Tsmtag->Sclass != SC_TAG)
+		fprintf (fsym, " (not defined)");
+	    else {			/* defined, show tags and size */
+		fprintf (fsym, ", size %d", sizetype(t));
+		sm = t->Tsmtag->Ssmnext;	/* get struct mem list */
+		while (sm != NULL) {
+		    fprintf (fsym, "\n      %s: type %d",
+			    sm->Sname, sm->Stype - types);
+		    shoffset (sm->Ssmoff); /* display offset of member */
+		    sm = sm->Ssmnext;
+		}
+	    }
+	    break;
+        }
+	if (str && t->Tsubt)
+	    fprintf(fsym, ", %s %d", str, t->Tsubt - types);
+
+	putc('\n', fsym);
+    }
+}

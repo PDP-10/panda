@@ -1,0 +1,4 @@
+@TAKE CBLD:DEFBLD
+@KCC: -i -q -o=NCCX @CKCC:KCC.CCL
+@KCC: -i=extend+ronly -q -o=NCC @CKCC:KCC.CCL
+@VDIR NCCX.EXE.0,NCC.EXE.0

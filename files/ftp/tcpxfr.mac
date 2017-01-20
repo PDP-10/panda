@@ -1,0 +1,1686 @@
+;<FTP>TCPXFR.MAC.144, 26-Sep-2005 08:32:56, Edit by MRC
+; Handle remote not implementing MODE/STRU (thank you Tom Debellis)
+;<FTP>TCPXFR.MAC.143,  5-Mar-85 19:18:30, Edit by LOUGHEED
+; Zero last page on a paged receive so that the EXEC's checksumming
+;  routine works on files received in such a fashion.
+;<FTP>TCPXFR.MAC.142, 29-Oct-84 16:23:20, Edit by LOUGHEED
+; From Rutgers: send file attributes according to KEEP parameters
+;<FTP>TCPXFR.MAC.141, 21-Aug-84 18:00:49, Edit by KRONJ
+; Try slight rearrangement in T36GET so that P1 doesn't get messed
+; up at end of buffer refill by the ADDI P1,9 at T36TOP
+;<FTP>TCPXFR.MAC.140, 27-Apr-84 14:54:04, Edit by KRONJ
+; Clean up paged transfer code a little - use symbolic names for page
+; types and for offsets in page block header.  I know, if it ain't broke...
+;<FTP>TCPXFR.MAC.139, 26-Apr-84 21:59:38, Edit by KRONJ
+; Not quite counting bits correctly in T36GET
+; (was screwing paged receives of more than 770 words of data)
+
+	SEARCH FTPDEF
+	TTITLE(TCPXFR, -- Low-level data transfer for user/server TCP FTP)
+	SUBTTL David Eppstein / Stanford University / 2-Feb-1984
+
+	;; Copyright (C) 1984 Board of Trustees, Stanford University
+	;; The information in this software is subject to change without
+	;; notice and should not be construed as a commitment by Stanford
+	;; University.  Stanford assumes no responsibility for the use or
+	;; reliability of this software.
+
+	EXTERN SHXINI,SHXUMP,SHXEND,UNMAP,TCXCLS,TCXABT,FILJFN
+	EXTERN FILPRP,NETBUF,NETJFN,BCOUNT,FILBSZ,NBYTES,FILPAG,FILBYT
+	EXTERN SFBSZ,PUTPAG,FILPTR,NBFPTR,NETPAG,NXTPAG,TEMP,NETBYT,NETROT
+	EXTERN SETFDB,SETPAG,PADCHR,NETPSV,NETHDR,INPPAG,SETBSZ,GETPAG
+
+LS TCXJFN			; JFN for data connection
+LS MODCOR			; Which coroutine to use for net I/O
+
+; Definitions for paged transfer header
+; these are DEFINE rather than real constants because FILPAG is EXTERN
+DEFINE PAGHDR <FILPAG-5>	; Header starts five words before file data
+DEFINE HDRLEN <FILPAG-5>	; First word is number of header words
+DEFINE PAGNO <FILPAG-4>		; Second word is number of page in file
+DEFINE DATLEN <FILPAG-3>	; Third word is number of words of data
+DEFINE PAGTYP <FILPAG-2>	; Fourth word is type of page
+	PGT$LP==:0		; Last page
+	PGT$SP==:1		; Simple data page
+	PGT$DP==:2		; Descriptor page
+	PGT$AP==:3		; Access controlled page
+DEFINE PAGACS <FILPAG-1>	; Fifth word is page access (known by SETPAG)
+
+; Table of coroutines, indexed by mode number
+MODCTB::TCSBLK,,TCRBLK		; MD.ABK auto-block uses block unless can't
+	TCSSTR,,TCRSTR		; MD.STR stream mode
+	TCSBLK,,TCRBLK		; MD.BLK block mode
+	TCSCMP,,TCRCMP		; MD.CMP compressed mode
+	TCSSTR,,TCRSTR		; MD.NON stream mode
+
+SUBTTL Reception of data from net
+
+; TCXREC - Receive file from net
+; takes opened JFN in FILJFN, file properties in FILPRP
+; TCPSET and TCXOPN must already have been done
+; TCXCLS will be done if necessary
+; returns +1/failure, +2/success
+
+TCXREC::SAVEAC <P1>		; Save register to use for coroutine
+	HRRZ P1,MODCOR		; Get output coroutine to use
+	CALL SHXINI		; Start typing excls
+	SETZM NBYTES		; No bytes put yet
+	SETOM NXTPAG		; No pages either
+	MOVE A,FILPRP+P.TYPE
+	JRST @[	TCRBIN		; TT.UNS unspecified - image
+		TCRTXT		; TT.TXT text
+		TCRBIN		; TT.BIN binary
+		TCRPAG		; TT.PAG paged
+		TCRDIR		; TT.DIR directory
+		TCRPAG		; TT.MEI other style paged
+		TCREBC		; TT.EBC EBCDIC
+		TCRBIN		; TT.IMG image (treated as binary)
+		TCRTXT ](A)	; TT.NON none (treated as text)
+
+TCRDIR:	TYPE <%% Directory transfers not possible%/>
+	RET
+
+; Receive EBCDIC transfer
+
+TCREBC:	SAVEAC <P2>		; Use this register
+	MOVEI P2,TREBCC		; Get coroutine
+	MVI. 5000,BCOUNT	; One page of 5 bytes per word
+	MVI. 7,FILBSZ		; 7 bits per byte
+	MVI. <-1,,FILPAG>,FILPTR ; Into where PUTPAG expects it
+	DO.
+	  SETZM FILBYT		; Don't count bytes yet
+	  MOVE B,[POINT 7,FILPAG] ; Point to start of page
+	  JSP P2,(P2)		; Get data
+	   JRST SFBSZ		; No more
+	  JSP P2,(P2)		; Get other half of data
+	   NOP			; Got some, make sure page goes out
+	  CALL PUTPAG		; Send them off
+	  LOOP.			; Back for next page
+	ENDDO.
+
+TREBCC:	PUSH P,B		; Save pointer
+	MOVE B,[POINT 8,NETPAG]	; Point to another buffer
+	MOVNI C,2400		; Half a pageful of ASCII
+	JSP P1,(P1)		; Get some
+	 JRST TREBCR		; Done
+	ADDM C,FILBYT		; Count some bytes
+	ADDI C,2400		; Get number of bytes
+	POP P,B			; Get pointer back
+	MOVE D,[POINT 8,NETPAG]	; and point to start of net page
+TREBCL:	ILDB A,D		; Get EBCDIC byte
+	HRRZ A,EBCTAB(A)	; Convert to ASCII
+	IDPB A,B		; Deposit in receive buffer
+	SOJG C,TREBCL		; Count off and go back for more
+	JSP P2,1(P2)		; Return success
+	JRST TREBCC		; Back for another load
+
+TREBCR:	POP P,B			; Get pointer back
+TREBCZ:	JSP P2,(P2)		; Return +1 for out of data
+	JRST TREBCZ		; Allow caller to try again but don't give any
+
+; Receive paged transfer
+
+TCRPAG:	SAVEAC <P2>		; Save register for coroutine
+	XMOVEI P2,T36COR	; Get 36-bit coroutine
+	MVI. 1000,BCOUNT	; Set count of bytes per page
+	MVI. ^D36,FILBSZ	; And size of each byte
+
+; Here to read the next paged block of data from the connection
+TCRPGL:	MOVE D,[-4,,PAGHDR]	; Set up pointer for start of header
+	JSP P2,(P2)		; Read that much in
+	 JRST SHXEND		; No more data, done
+
+	;; Set up access control word from header or make it up if not given
+	MOVE D,HDRLEN		; Get header count
+	CAIE D,5		; If we have an access word
+	IFSKP.
+	  HRROI D,PAGACS	; Point to it
+	  JSP P2,(P2)		; Read that much in
+	   JRST TCRPGE		; Unexpected end of data
+	ELSE.
+	  SETOM PAGACS		; Not access controlled, use all ones
+	  CAIE D,4		; Header length not 5, must be 4
+	   JRST TCRPGH		; Not 4 or 5, complain about strange length
+	ENDIF.
+
+	;; Now read in page data
+	SKIPN D,DATLEN		; Get number of words in this page
+	 JRST TCRPG0		; No data, so go figure out what to do
+	CAIN D,1000		; Not a full page of data?
+	IFSKP.
+	  SETZM FILPAG		; Yes, clear first word of page
+	  MOVE A,[XWD FILPAG, FILPAG+1]	; Set up BLT pointer
+	  BLT A,FILPAG+777	; Ensure zeros on unused part of page 
+	ENDIF.
+	MOVNS D			; Negate the word count
+	HRLZS D			; Into left half
+	HRRI D,FILPAG		; Into file page
+	JSP P2,(P2)		; Read page contents
+	 JRST TCRPGE		; Unexpected end of data
+
+	;; Page all read, figure out what to do with it
+TCRPG0:	SKIPN D,PAGTYP		; Last page?
+	 JRST TCRPGZ		; Yes
+	CAIE D,PGT$SP		; Simple page
+	 CAIN D,PGT$AP		; or access controlled page?
+	  JRST TCRPGP		; Yes
+	CAIN D,PGT$DP		; FDB?
+	 JRST TCRPGD		; Yes
+	TYPE <%_%% Unknown page type %4D in paged transfer, ignored%/>
+	JRST TCRPGL		; Don't do anything with strange type
+
+; Here with an actual page of data
+TCRPGP:	MOVE D,PAGNO		; Get page number
+	HRRM D,PAGACS		; Add to access bits where SETPAG expects it
+	CALL SETPAG		; Put the page into the file
+	JRST TCRPGL			; Back for another page
+
+; Here when the header length was other than 4 or 5
+TCRPGH:	ETYPE <Unexpected length %4D for paged header%/>
+	JRST TCXABT		; Lose lose
+
+; Here when we didn't get as much data as we expected there to be
+TCRPGE:	ETYPE <Unexpected end of data in paged connection%/>
+	JRST TCXABT		; Flush data conn
+
+; Here for descriptor page PGT$DP, i.e. FDB
+TCRPGD:	CALL SETFDB		; Go set FDB up
+	JRST TCRPGL		; Back for another page
+
+; Here when page type is PGT$LP, last page
+TCRPGZ:	SKIPE D,DATLEN	; Yes, any data?
+	 TYPE <%_%% %4D words of data on terminal page%/>
+	JRST SHXEND		; Done with reading pages
+
+; Receive binary or image transfer
+; we tell the server different things for binary and image,
+; but treat them the same ourself - packed bits to be
+; broken into bytes.
+
+TCRBIN:	SKIPN B,FILPRP+P.BYTE	; Get byte size
+	 MOVEI B,^D8		; Eight if not specified
+	MOVEM B,FILBSZ		; Save
+	MOVE C,B		; Copy
+	LSH C,^D24		; Shift into place
+	IOR C,[440000,,FILPAG]	; To make byte pointer
+	MOVEM C,FILPTR		; Save
+	MOVEI C,^D36		; Get number of bits in a word
+	IDIVI C,(B)		; Divide by number of bits in a byte
+	IMULI C,1000		; And multiply by number of words in a page
+	MOVEM C,BCOUNT		; To get number of bytes in a page
+	JRST @[ REPEAT ^D4,<TCRB36> ; 1 through 4 bits fit into 36
+		TCRBSH		; 5 bits - shuffle
+		TCRB36		; 6 bits fit into 36
+		TCRBSH		; 7 bits - shuffle
+		TCRB8		; 8 bits don't need any shuffling
+		TCRB36		; 9 bits fit into 36
+		TCRBSH		; 10 bits - shuffle
+		TCRBSH		; 11 bits - shuffle
+		TCRB36		; 12 bits fit into 36
+		REPEAT ^D3,<TCRBSH> ; 13 through 15 bits - shuffle
+		TCRB8		; 16 bits don't need any shuffling
+		TCRBSH		; 17 bits - shuffle
+		TCRB36		; 18 bits fit into 36
+		REPEAT ^D13,<TCRBSH> ; 19 through 31 bits - shuffle
+		TCRB8		; 32 bits don't need any shuffling
+		REPEAT ^D3,<TCRBSH> ; 33 through 35 bits - shuffle
+		TCRB36 ]-1(B)	; 36 bits fit into 36
+
+; Here for 8, 16, 32-bit logical bytes - read in 8-bit, send without shuffle
+TCRB8:	SAVEAC <P2>		; Use this register
+	JFFO B,.+2		; Find number of bit
+	 FATAL <No bits at TCRB8>
+	HRREI P2,-^D32(C)	; Get shift factor
+	DO.
+	  MOVE B,[POINT 8,FILPAG] ; With appropriate pointer
+	  MOVNI C,4000		; And appropriate number of bytes
+	  JSP P1,(P1)		; Get some data
+	   JRST SFBSZ		; Done, finish up
+	  LSH C,(P2)		; Shift count appropriately
+	  MOVEM C,FILBYT	; Save number of bytes for PUTPAG
+	  CALL PUTPAG		; Send them off
+	  LOOP.			; Back for next page
+	ENDDO.
+
+; Binary transfer for random byte sizes
+
+; NETBYT contains any bits left over from previous words, right-aligned
+; NBFPTR contains a byte pointer to the next place to put a word
+; NETROT contains the number of data bits in NETBYT
+
+; This code is intentionally not very efficient.
+; I don't expect it to be run very often - in fact perhaps
+; not for years.  It is much more important for it to run bug-free
+; than for it to run quickly, as by the time any bug is noticed
+; there may be no one around to fix it.
+
+; Main entry point
+TCRBSH:	SAVEAC <P2>		; Use another register
+	SETZM NETBYT		; No bits left over
+	SETZM NETROT		; Zero of them
+	JRST TCRBS0		; Start new page
+
+
+; Here from TCRBS3 when we didn't have enough data for a full word.
+; Read in another set of bytes from the data connection.
+; First we have to store away the rest of the old data for later.
+TCRBS4:	MOVE B,A		; Copy count of total bits
+	SUB B,NETROT		; Don't include the old ones
+	LSHC C,(B)		; Shift them all into one word
+	MOVEM A,NETROT		; Save as new count of bits
+	MOVEM C,NETBYT		; and extra bits
+
+	;; Old data set, now get some new stuff
+	MOVE B,[POINT 8,P2]	; Drop bits into this register
+	MOVNI C,4		; Four whole bytes
+	JSP P1,(P1)		; Get net data
+	 JRST TCRBS2		; No more, done
+	MOVEI A,4(C)		; Make number of bytes received
+	LSH A,3			; As number of bits
+	ADD A,NETROT		; As total bits of this word and prev
+	MOVE C,NETBYT		; Get previous bits word
+	MOVE D,P2		; and current bits
+; 	JRST TCRBS3		; Go store word if we now have enough
+
+; Here to put data
+; A/total bits left, NETROT/bits in first word, C+D/the bits
+; send them off to NBFPTR until we run out of bits or fill a page
+TCRBS3:	CAIGE A,FILBSZ		; Do we have enough for one byte?
+	 JRST TCRBS4		; No, go store data out
+
+	;; Have enough for a whole word, make one and store it
+	MOVE B,FILBSZ		; Get count
+	SUB B,NETROT		; Not including what we have now
+	SUB A,FILBSZ		; Count off from total bits left
+	LSHC C,(B)		; Shift word in
+	IDPB C,NBFPTR		; Deposit byte
+	SETZB C,NETROT		; Clear bits for next byte
+	AOSGE FILBYT		; Count off a byte sent
+	 JRST TCRBS3		; Page not full yet, get another byte
+
+	;; Have filled a page, store values back for later and send off
+	;; all the bits are currently in D
+	LSHC C,(A)		; Shift rest of bits in
+	MOVEM C,NETBYT		; Save as new leftover bits
+	MOVEM A,NETROT		; and save how many of them there are
+	CALL PUTPAG		; Send page off to file
+; 	JRST TCRBS0		; Back to start of a new page
+
+; Here to set up vars to fill start of a new input page.
+TCRBS0:	MV. FILPTR,NBFPTR	; Point to start of buffer
+	MOVN A,BCOUNT		; Get negative byte count
+	MOVEM A,FILBYT		; Set up number of words to store
+	MOVE A,NETROT		; Get bit count in first word
+	MOVE C,NETBYT		; and the bits themselves
+	SETZ D,			; Nothing in second word
+	JRST TCRBS3		; See if can make a byte with what was left
+
+
+; Here when receive data coroutine returned nothing left
+TCRBS2:	CALL PUTPAG		; Out of data, send off what we have
+	JRST SFBSZ		; And finish transfer
+
+; 36-bit binary transfer
+
+TCRB36:	SAVEAC <P2>		; Save register for coroutine
+	XMOVEI P2,T36COR	; Get 36-bit coroutine
+	DO.
+	  MOVN D,BCOUNT		; Get byte count
+	  MOVEM D,FILBYT	; Count in bytes put
+	  MOVX D,<-1000,,FILPAG> ; Make aobjn pointer to data storage block
+	  JSP P2,(P2)		; Get some data
+	   JRST SFBSZ		; Done, finish up
+	  CALL PUTPAG		; Send them off
+	  LOOP.			; Back for next page
+	ENDDO.
+
+; Coroutine for 36-bit data
+; Call with D/aobjn pointer to words wanted
+; returns +1/no more data, +2/success, FILBYT updated for PUTPAG
+; will get an integral number of words unless EOF encountered
+
+; Have to be very careful about not trying to read too much as
+; paged transfers will signal end with a page type zero and not
+; include any data with it.
+
+; Data locations for coroutine:
+;   A and B are scratch for putting words together
+;   C contains 36-bit words left in buffer
+;   D contains AOBJN pointer to data storage area
+;   P1 contains pointer to buffer
+;   NETROT saves the coroutine normally found in P1
+;   NBFPTR points to the next place to read in data
+;   NETBYT contains max bytes to fill buffer with in left half,
+; 	   number of bits left over from fullword in right half
+
+DEFINE T36MAC (SH1,SH2,OFF,%TG1,%TG2) <
+	LSHC A,^D<SH1>		;; Shift first word into place
+	MOVE B,OFF(P1)		;; Get word at offset
+	LSHC A,^D<SH2>		;; Now shift over again
+	MOVEM A,(D)		;; Store into user space
+	AOBJN D,%TG1		;; Count off words returned
+	JSP P2,1(P2)		;; That was the last, get another request
+	CALL T36GET		;; Refill buffer
+	IFSKP.
+	  MOVE B,OFF(P1)	;; Got more, get word again
+	  LSH B,^D<SH2>		;; Shift into place
+	  JRST %TG2		;; Go on to next word
+	ENDIF.
+	HRRZ B,NETBYT		;; Get count of left over bits
+	IDIV B,FILBSZ		;; Get count of bytes
+	JUMPE B,T36EOF		;; If none, done now
+	ADDM B,FILBYT		;; Else count into byte count
+	MOVE B,OFF(P1)		;; Lost, get last word again
+	LSH B,^D<SH2>		;; Shift into place
+	MOVEM B,(D)		;; Store away
+	JSP P2,1(P2)		;; Return with them
+	JRST T36EOF		;; Now have EOF
+
+%TG1:!	SOJLE C,T36END		;; Count off data, if still left then go on
+%TG2:!
+>; DEFINE T36MAC
+
+; 36-bit receive coroutine continued
+
+; Here for the actual coroutine
+T36COR:	MOVEM P1,NETROT		; Save other coroutine
+	SETZM NETBYT		; No more bytes in buffer
+T36FIL:	CALL T36GET		; Fill buffer
+	 JRST T36EOF		; No more, done
+T36TOP:	ADDI P1,9		; Adjust pointer to top of next frame
+	MOVE B,0(P1)		; Get first word
+	T36MAC(32,4,1)		; Put word
+	T36MAC(28,8,2)		; and another
+	T36MAC(24,12,3)		; and another
+	T36MAC(20,16,4)		; and another
+	T36MAC(16,20,5)		; and another
+	T36MAC(12,24,6)		; and another
+	T36MAC(8,28,7)		; and another
+	T36MAC(4,32,8)		; and another
+	JRST T36TOP		; Back for more
+
+
+; Here when ran out of data in middle of transfer
+T36END:	SKIPN NETBYT		; Was that the real end?
+	IFSKP.
+	  MOVEM B,(D)		; Yes, save last word
+	  HRRZ B,NETBYT		; Get count of left over bits
+	  IDIV B,FILBSZ		; Get count of bytes
+	  ADDM B,FILBYT		; Count in number of bytes left
+	ELSE.
+	  CALL T36GET		; Get more data
+	   IFSKP. <JRST T36TOP>	; Got some, go use it
+	ENDIF.
+	JSP P2,1(P2)		; Done, return with last batch
+T36EOF:	JSP P2,0(P2)		; Done with transfer
+	FATAL <Paged receive coroutine called after EOF>
+
+; Here from T36GET (below) when out out data
+T36GTX:	MV. ONTBYT,NETBYT	; Here when out of data, restore old NETBYT
+	MOVE D,OAOBJN		; and AOBJN pointer
+	EXCH P1,NETROT		; and pointer to input buffer
+	RET			; and return +1
+
+; 36-bit receive coroutine continued
+
+; Here to refill buffer
+T36GET:	STKVAR <ONTBYT,OAOBJN,ASKBTS>
+	MOVEM D,OAOBJN		; Save AOBJN pointer
+	MV. NETBYT,ONTBYT	; and old NETBYT
+
+	;; Calculate A/num bits needed
+	HLRE A,D		; Get number of words wanted
+	IMULI A,^D36		; Turn into number of bits
+
+	;; Calculate B/ptr to buffer, C/bits to buffer top
+	SKIPE C,NETBYT		; Want to start over?
+	IFSKP.
+	  MOVE B,[POINT 8,NETPAG] ; Yes, point to net page
+	  MOVNI C,37400		; Can use this many (770 wds, 40 bits/wd)
+	  MOVEI P1,NETPAG-9	; Set ptr, adjust for ADDI at T36TOP
+	ELSE.
+	  ADDI A,(C)		; Already have some bits, don't count twice
+	  MOVE B,NBFPTR		; Not starting over, get old pointer
+	  HLRE C,NETBYT		; and number of bits allowed
+	ENDIF.
+
+	;; Check bits needed against buffer top
+	CAMG C,A		; Is there room?
+	IFSKP.			; No
+	  SETZM NETBYT		; Won't have anything after this
+	ELSE.			; Is room
+	  TXZ A,4		; Make multiple of eight bits wanted
+	  SUB C,A		; Make number of bits we can use after that
+	  HRLZM C,NETBYT	; Save for next time through
+	  MOVE C,A		; Get number of bits we want
+	ENDIF.
+
+	;; Ask lower level coroutine for more data
+	MOVEM C,ASKBTS		; Save number of bits we ask for
+	ASH C,-3		; Turn bits into bytes
+	EXCH P1,NETROT		; Get data coroutine back
+	JSP P1,(P1)		; Ask for some data
+	 JRST T36GTX		; None more, lose
+	EXCH P1,NETROT		; Restore buffer pointer and save coroutine
+	MOVEM B,NBFPTR		; Save latest pointer to end of buffer
+
+	;; Count the data we got back
+	LSH C,3			; Get count of bits back
+	SUB C,ASKBTS		; Form count of bits read in
+	HRRZ D,ONTBYT		; Get old extra bit count
+	ADD C,D			; Count them
+	IDIVI C,^D36		; Count words
+	HRRM D,NETBYT		; Save new number of extra bits
+	MOVE A,C		; Copy word count
+	IMULI A,^D36		; Just those bits
+	IDIV A,FILBSZ		; Number of bytes
+	ADDM A,FILBYT		; Count off
+	MOVE D,OAOBJN		; Restore AOBJN pointer
+	RETSKP			; Return success
+
+; Receive text transfer
+
+TCRTXT:	MVI. 5000,BCOUNT	; One page of 5 bytes per word
+	MVI. 7,FILBSZ		; 7 bits per byte
+	MVI. <-1,,FILPAG>,FILPTR ; Into where PUTPAG expects it
+	DO.
+	  MOVE B,FILPTR		; With appropriate pointer
+	  MOVN C,BCOUNT		; With number of bytes
+	  JSP P1,(P1)		; Get some data
+	   JRST SFBSZ		; Done, finish up
+	  MOVEM C,FILBYT	; Save number of bytes for PUTPAG
+	  CALL PUTPAG		; Send them off
+	  LOOP.			; Back for next page
+	ENDDO.
+
+; Coroutines for network data reception
+; call by JSP P1,(P1) with B/byte pointer, C/-count
+; may expect F%TEMP preserved over calls but will end with it zero
+; return +1/EOF, +2/B and C updated (C all used unless EOF)
+
+; Stream mode
+TCRSTR:	MOVE A,TCXJFN		; Get network JFN
+	SIN%			; Read in data
+	 ERJMP TCREOF		; No more, must be done
+	JSP P1,1(P1)		; Return success
+	JRST TCRSTR		; And get more
+
+; Here from various modes when nothing left
+TCRBBY:	DMOVE B,NETPSV		; Get byte pointer and count back
+TCREOF:	CALL TCXCLS		; Done, close data connection
+TCREND:	JSP P1,1(P1)		; Return success
+	JSP P1,0(P1)		; Nothing more
+	FATAL <TCP receive coroutine called after EOF>
+
+; Here to restore ACs from save block and go signal EOF
+TCRNBY:	DMOVE B,NETPSV		; Yes, Get ACs back for caller
+	JRST TCREND		; Go finish up
+
+; Here on error in SIN% when extra bytes needed are counted in NETHDR
+TCRHBY:	ADD C,NETHDR		; Remember extra bytes in count
+	JRST TCREOF		; Go return EOF
+
+; Block mode receive
+; see RFC765 pages 17-19
+
+; Here on startup of coroutine
+TCRBLK:	TXZ F,F%TEMP		; Set flag to say no EOF yet
+				; Drop into...
+
+; Here when we know not EOF, to get another block from the net
+TCRBK1:	DMOVEM B,NETPSV		; Save pointer and count
+	SKIPA A,TCXJFN		; Get network JFN
+				; Skip into...
+
+; Here with saved ACs, read in some more data (A still contains JFN)
+; jumped into at TCRBK0 when previous block was worthless - read another
+; skipped into from TCRBK1 to avoid EOF check
+TCRBK0:	 TXZN F,F%TEMP		; EOF yet?
+	  SKIPA B,[POINT 8,NETHDR] ; No, point to block header
+	   JRST TCRNBY		; Yes, go handle
+	MOVNI C,3		; Three bytes
+	SIN%			; Read them in
+	 ERJMP TCRBBY		; None more?  Signal EOF
+
+	;; Now we have header bytes (see RFC765 page 18 for details).
+	;; Separate the count out and look at the bits in the first byte.
+	MOVE C,NETHDR		; Get pointer back
+	LSH C,^D12		; Shift number into place
+	ANDI C,177777		; Keep only number
+	MOVE B,NETHDR		; Copy header again
+	TXNE B,1B1		; EOF?
+	 TXO F,F%TEMP		; Yes, light flag to remember that
+	JUMPE C,TCRBK0		; If no bytes, ignore this block
+	IFXN. B,1B3		; Restart marker?
+	  MOVE B,[POINT 8,TEMP]	; Yes, point to trash space
+	  MOVNS C		; Negate count
+	  SIN%			; Read and flush
+	   ERJMP TCRBBY		; EOF?
+	  JRST TCRBK0		; Back for some real data
+	ENDIF.
+	MOVNM C,NETHDR		; Save negation of byte count for later
+	DMOVE B,NETPSV		; Get pointer and requested byte count back
+
+	;; Here with ACs normal and negative data count in NETHDR
+	;; Read until we get a request too big for the rest of this block.
+	DO.
+	  CAMG C,NETHDR		; Do we want less bytes than available?
+	   EXIT.		; No, need more or equal, go handle specially
+	  EXCH C,NETHDR		; Yes, exchange for subtraction
+	  SUB C,NETHDR		; Count off bytes we will use
+	  EXCH C,NETHDR		; and exchange back
+	  SIN%			; Just read things in
+	   ERJMP TCREOF		; Failed?  Assume ran out
+	  JSP P1,1(P1)		; Return success with data
+	  MOVE A,TCXJFN		; Get network JFN again
+	  LOOP.			; Back for more
+	ENDDO.
+
+	;; Requested data too much for remainder of this block
+	;; Read in last of block and go back for more data.
+	SUB C,NETHDR		; Get how many extra bytes we will want
+	EXCH C,NETHDR		; Keep safe for transfer, get block count
+	SIN%			; Read as much as we know is there
+	 ERJMP TCRHBY		; Lost, go get byte count back
+	MOVE C,NETHDR		; Get count left
+	TXZE F,F%TEMP		; If that was the last block
+	 JRST TCREND		; Go return EOF
+	SKIPN C			; If those were all the bytes we wanted
+	 JSP P1,(P1)		; Get another caller request
+	JRST TCRBK1		; Go get more data
+
+; Compressed mode receive
+; see RFC765 pages 19-20
+
+; Main entry
+TCRCMP:	CALL SETPAD		; Set pad char
+	TXZ F,F%TEMP		; No EOF yet
+	JRST TCRCP0		; Go get some
+
+; Here when ran out of filler bytes.  Back to very top of loop...
+TCRCP5:	AOJL C,TCRCP0		; Count off user space, if want more back now
+;	JRST TCRCP6		; Else need to make another request
+
+; Here when finished with user request, ask for more
+TCRCP6:	TXZE F,F%TEMP		; More to come?
+	 JRST TCREND		; No, that was it
+	JSP P1,1(P1)		; Yes, more, ask for another request
+;	JRST TCRCP0		; And go back with new request
+
+; Here with a new request, read in some data
+TCRCP0:	DMOVEM B,NETPSV		; Save ACs
+	MOVE A,TCXJFN		; Get connection JFN
+;	JRST TCRCP1		; Check for more data and get it
+
+; First make sure there is more data to get
+TCRCP1:	TXZE F,F%TEMP		; EOF?
+	 JRST TCREND		; Yes, stop
+;	JRST TCRCP2		; Start up reading data
+
+; Read first char of block header
+TCRCP2:	BIN%			; Read char from it
+	 ERJMP TCRBBY		; End of file, go restore ACs and close
+
+	;; Got header byte, see what it is
+	;; First check if it's the escape byte
+	IFE. B			; Escape is all zeros.  Is that what we have?
+	  BIN%			; Yes, read in following byte
+	   ERJMP TCRBBY		; Lost
+	  TXNE B,100		; EOF?
+	   TXO F,F%TEMP		; Yes, remember that
+	  TXNN B,20		; Restart marker?
+	   JRST TCRCP2		; No, just go back for more
+	  BIN%			; Yes, see what kind
+	  TXZE B,200		; Top bit lit?
+	  IFSKP.
+	    MOVN C,B		; Yes, get count
+	    MOVE B,[POINT 8,TEMP] ; Point to throwaway buffer
+	    SIN%		; Read trash in
+	     ERJMP TCRBBY	; Lost
+	    JRST TCRCP1		; Go back for more
+	  ENDIF.
+	  TXNN B,100		; Filler?
+	   BIN%			; No, replicated byte, flush that
+	    ERJMP TCRBBY	; Lost
+	  JRST TCRCP1		; Ignore marker and go back for next real data
+	ENDIF.
+
+	;; Next possibility is number of bytes to read
+	TXZE B,200		; Top bit lit?
+	IFSKP.			; No, must be pure string
+	  MOVNM B,NETHDR	; Save number of bytes in string
+	  DMOVE B,NETPSV	; Get pointers back
+	  DO.
+	    CAMG C,NETHDR	; Room for request and more?
+	     EXIT.		; No, don't ask for more
+	    EXCH C,NETHDR	; Have room, switch counts
+	    SUB C,NETHDR	; To count off bytes in how much left
+	    EXCH C,NETHDR	; Now exchange back again
+	    SIN%		; Ask for full amount of user request
+	     ERJMP TCREOF	; Lost, assume end of file
+	    JSP P1,1(P1)	; Get another request
+	    MOVE A,TCXJFN	; Get JFN back again
+	    LOOP.		; Back until we overflow string length
+	  ENDDO.
+	  SUB C,NETHDR		; No room, find out how much will be left over
+	  EXCH C,NETHDR		; Get how much we can get now
+	  SIN%			; Read that much in
+	   ERJMP TCRHBY		; Lost, go finish losing
+	  SKIPE C,NETHDR	; Success, get extra bytes back.  If want more
+	   JRST TCRCP0		; Go get them now
+	  JRST TCRCP6		; More wanted, go get request
+	ENDIF.
+
+	;; Replicated byte, either padding or given in next byte
+	;; see which then do it (input pointers are still in NETPSV)
+	MOVE C,B		; Copy that byte
+	TXZE C,100		; Filler?
+	 SKIPA B,PADCHR		; Yes, get padding character
+	  BIN%			; Replicated byte, get which one
+	   ERJMP TCRBBY		; Lost, treat as end of file
+	HRRM B,NETHDR		; Save fill byte
+	HRLM C,NETHDR		; And count
+	DMOVE D,NETPSV		; Get saved caller pointers back
+
+	;; Loop dropping that byte into caller space until we run out of reps.
+	;; If we run out of user pointer, just ask for some more...
+	;; NETHDR contains count,,byte - first put them in ACs for easy access
+	DO.
+	  HLRZ A,NETHDR		; Get count of bytes
+	  HRRZ D,NETHDR		; and byte to use
+	  DO.
+	    IDPB D,B		; Drop in
+	    SOJLE A,TCRCP5	; Count off bytes used
+	    AOJL C,TOP.		; Count off in user space
+	  ENDDO.
+	  HRLM A,NETHDR		; Ran out, save count
+	  JSP P1,1(P1)		; Ask for another input request
+	  LOOP.			; And go back for it
+	ENDDO.
+
+SUBTTL Sending of data to net
+
+; TCXSND - Send file to net
+; takes opened JFN in FILJFN, file properties in FILPRP
+; TCPSET and TCXOPN must already have been done
+; TCXCLS will be done if necessary
+; returns +1/failure, +2/success
+
+TCXSND::SAVEAC <P1>		; Save register to use for coroutine
+	HLRZ P1,MODCOR		; Get output coroutine to use
+	CALL SHXINI		; Start typing excls
+	SETOM INPPAG		; No input page found yet
+	MOVE A,FILPRP+P.TYPE
+	JRST @[	TCSBIN		; TT.UNS unspecified - image
+		TCSTXT		; TT.TXT text
+		TCSBIN		; TT.BIN binary
+		TCSPAG		; TT.PAG paged
+		TCSDIR		; TT.DIR directory
+		TCSPAG		; TT.MEI other style paged
+		TCSEBC		; TT.EBC EBCDIC
+		TCSBIN		; TT.IMG image (treated as binary)
+		TCSTXT ](A)	; TT.NON none (treated as text)
+
+TCSDIR:	TYPE <%% Directory transfers not possible%/>
+	RET
+
+; Send ASCII data
+
+TCSTXT:	MVI. 5000,BCOUNT	; Set number of bytes per page
+	MVI. <-1,,FILPAG>,FILPTR ; Set pointer to where to get input from file
+	MVI. <POINT 7,FILPAG>,NBFPTR ; And what to use to output to the net
+	SETZM NETROT		; No shift of count
+
+; Here to send simple data streams off to net
+; BCOUNT/number of file bytes per buffer
+; FILPTR/pointer to buffer for file input (must be to FILPAG)
+; NBFPTR/pointer to same buffer for net output
+; NETROT/how much to shift file byte count to make net byte count
+
+TCSLOP:	CALL SETBSZ		; Set file number of bytes
+	DO.
+	  CALL GETPAG		; Read file page
+	   EXIT.		; That was all
+	  SKIPN C,NBYTES	; Get number of bytes left
+	   EXIT.		; Didn't get any, done
+	  CAMLE C,BCOUNT	; Have more than that?
+	   MOVE C,BCOUNT	; Yes, just use one buffer full
+	  MOVNS C		; Negate for sending
+	  ADDM C,NBYTES		; Count off in total byte count
+	  MOVE B,NETROT		; Get shift count
+	  LSH C,(B)		; Shift word count up to make bytes
+	  MOVE B,NBFPTR		; Get pointer to top of buffer
+	  JSP P1,2(P1)		; Send it off
+	   RET			; Lost
+	  LOOP.			; Sent that page, now go on to the next
+	ENDDO.
+
+; All data sent, now clean up tail of connection
+TCSEND:	SETZ C,			; No more data
+TCSFIN:	JSP P1,0(P1)		; Force last data out and close connection
+	 RET			; Lost
+	CALLRET SHXUMP		; Won
+
+; Send binary data
+
+TCSBIN:	SKIPN B,FILPRP+P.BYTE	; Get byte size
+	 MOVEI B,^D8		; Eight if not specified
+	MOVEM B,FILBSZ		; Save
+	MOVE C,B		; Copy
+	LSH C,^D24		; Shift into place
+	IOR C,[440000,,FILPAG]	; To make byte pointer
+	MOVEM C,FILPTR		; Save
+	MOVEI C,^D36		; Get number of bits in a word
+	IDIVI C,(B)		; Divide by number of bits in a byte
+	IMULI C,1000		; And multiply by number of words in a page
+	MOVEM C,BCOUNT		; To get number of bytes in a page
+	JRST @[ REPEAT ^D4,<TCSB36> ; 1 through 4 bits fit into 36
+		TCSBSH		; 5 bits - shuffle
+		TCSB36		; 6 bits fit into 36
+		TCSBSH		; 7 bits - shuffle
+		TCSB8		; 8 bits don't need any shuffling
+		TCSB36		; 9 bits fit into 36
+		TCSBSH		; 10 bits - shuffle
+		TCSBSH		; 11 bits - shuffle
+		TCSB36		; 12 bits fit into 36
+		REPEAT ^D3,<TCSBSH> ; 13 through 15 bits - shuffle
+		TCSB8		; 16 bits don't need any shuffling
+		TCSBSH		; 17 bits - shuffle
+		TCSB36		; 18 bits fit into 36
+		REPEAT ^D13,<TCSBSH> ; 19 through 31 bits - shuffle
+		TCSB8		; 32 bits don't need any shuffling
+		REPEAT ^D3,<TCSBSH> ; 33 through 35 bits - shuffle
+		TCSB36 ]-1(B)	; 36 bits fit into 36
+
+; Here for 8, 16, and 32
+TCSB8:	MVI. <POINT 8,FILPAG>,NBFPTR ; Make pointer for sending data off
+	JFFO B,.+2		; Find bit in byte size
+	 FATAL <No bits in 8-bit binary byte size>
+	MOVNI C,-40(C)		; Get correct count in right half
+	HRRZM C,NETROT		; Save how much to shift to get 8-bit count
+	JRST TCSLOP		; Join common code with ASCII mode
+
+; Send binary data with strange byte sizes
+
+; NETROT/number of bits left over, negated
+; NETBYT/the bits, right justified
+; NETPAG/used as scratch
+
+TCSBSH:	SETZM NETROT		; No bits left from previous cycle
+	CALL SETBSZ		; Set file number of bytes
+
+; Here to get a new page full of data
+TCSBST:	CALL GETPAG		; Read page full of data
+	 JRST TCSBSX		; That was all
+	SKIPN C,NBYTES		; Get number of bytes left
+	 JRST TCSBSX		; Didn't get any, done
+	CAMLE C,BCOUNT		; Have more than that?
+	 MOVE C,BCOUNT		; Yes, just use one buffer full
+	MOVNS C			; Negate for sending
+	ADDM C,NBYTES		; Count off in total byte count
+	IMUL C,FILBSZ		; Turn into number of bits
+	MOVE D,FILPTR		; Get byte pointer to start
+
+; Here to send the data off
+; here with NETROT, NETBYT as above, number of bits and byte pointer in C,D
+TCSBSL:	ILDB B,D		; Get next byte
+	ADD C,FILBSZ		; Count off bits
+	MOVN A,FILBSZ		; Number of bits in it
+	LSH B,^D36(A)		; Left justify byte
+	SKIPLE C		; Did we run out of bits?
+	 ADD A,C		; Yes, don't count what we don't have
+	DMOVEM C,NETPAG		; Save pointer and count
+	MOVE C,A		; Get number of bits in new byte
+	MOVE A,NETBYT		; Get old bits left
+	MOVE D,NETROT		; And how many there were
+
+	;; Loop sending quads of 8-bit bytes from the that file byte
+	;; A,B/bits, C/neg bits in B, D/neg bits in A
+	DO.
+	  LSHC A,^D32(D)	; Get four bytes in A
+	  ADDI C,^D32(D)	; Count off in file bit count
+	  JUMPG C,ENDLP.	; If not enough for full byte, stop
+	  DMOVEM B,NETPAG+2	; Save old bits
+	  LSH A,4		; Left justify new ones
+	  MOVEM A,NETPAG+4	; Save for coroutine
+	  MOVE B,[POINT 8,NETPAG+4] ; Point to those bytes
+	  MOVNI C,4		; Four of them
+	  JSP P1,2(P1)		; Send them off
+	   RET			; Lost
+	  DMOVE B,NETPAG+2	; Get old bits back
+	  SETZ D,		; Nothing in A
+	  LOOP.			; Iterate so we can exit correctly
+	ENDDO.
+
+	;; That byte all sent, get the next
+	LSH A,(C)		; Right justify remaining bits
+	MOVEM A,NETBYT		; Save as new remaining bits
+	MOVNI C,^D32(C)		; Count how many there are
+	MOVEM C,NETROT		; Count off
+	DMOVE C,NETPAG		; Get counters back
+	JUMPG C,TCSBSL		; If have more data, go send it
+	JRST TCSBST		; No more, get another page
+
+; Here when that was the last of the data
+TCSBSX:	MOVE A,NETBYT		; Get last bits
+	MOVE C,NETROT		; Negative of how many there are
+	LSH A,^D36(C)		; Left justify
+	MOVEM A,NETBYT		; Save new bits
+	ASH C,-3		; Turn number of bits into number of bytes
+	MOVE B,[POINT 8,NETBYT]	; Point to the bytes we have
+	CALLRET TCSFIN		; Send last data and return
+
+; Send binary data in integral 36-bit words
+
+TCSB36:	MOVEM B,FILBSZ		; Save byte size
+	SETZM NETROT		; No bits left over
+	CALL SETBSZ		; Set bytes in file
+	DO.
+	  CALL GETPAG		; Read file page
+	   EXIT.		; That was all
+	  SKIPN C,NBYTES	; Get number of bytes left
+	   EXIT.		; Didn't get any, done
+	  CAMLE C,BCOUNT	; Have more than that?
+	   MOVE C,BCOUNT	; Yes, just use one buffer full
+	  MOVN D,C		; Negate for sending
+	  ADDM D,NBYTES		; Count off in total byte count
+	  IMUL C,FILBSZ		; Get as number of bits
+	  MOVEI D,FILPAG	; Point to file page again
+	  CALL T36SND		; Send 36-bit data
+	   RET			; Lost
+	  LOOP.			; Sent that page, now go on to the next
+	ENDDO.
+	TXO F,F%TEMP		; Need to close connection
+	CALL T36LST		; Send out last bits of data
+	 RET			; Lost
+	CALLRET SHXUMP		; Won
+
+; Send paged data
+
+TCSPAG:	SETZM NETROT		; No bits left over
+	DO.
+	  ;; Get page of data and information about page
+	  CALL GETPAG		; Get page of file
+	   EXIT.		; That was all, go finish transfer
+	  MVI. 5,HDRLEN		; Five words in header
+	  HRRZM A,PAGNO		; Save page number
+
+	  ;; Count data words in the page
+	  MOVEI D,1000		; Get how many words we think there are
+	  DO.
+	    SKIPN FILPAG-1(D)	; Anything there?
+	     SOJG D,TOP.	; No, don't send that word
+	  ENDDO.
+	  SKIPG D		; If we ran off the edge of the whole page
+	   MOVEI D,1		; Send one data word to avoid confusion
+	  MOVEM D,DATLEN	; Save data length in words
+
+	  ;; Always use access controlled pages, set access bits
+	  MVI. PGT$AP,PAGTYP	; Save page type - access controlled page
+	  RPACS%		; Read page access control words
+	  MOVEM B,PAGACS	; Save in header
+
+	  ;; Send the data page off
+	  MOVEI C,5(D)		; Get header and data length
+	  IMULI C,^D36		; In number of bits
+	  MOVEI D,PAGHDR	; Pointing to top of header
+	  CALL T36SND		; Send words off
+	   RET			; Lost
+	  LOOP.			; Done with that page, on to next
+	ENDDO.
+
+	;; Actual pages all sent, now send FDB and final page together
+	CALL UNMAP		; Lose last page of file
+	MVI. 4,HDRLEN		; Four words in this header
+	SETZM PAGNO		; No page number
+	MVI. PGT$DP,PAGTYP	; This is a descriptor block
+	HRRZ A,FILJFN		; With source file
+	MOVSI B,.FBLEN		; Full FDB starting at the top
+	MOVEI C,PAGACS		; Into buffer immediately after header words
+	GTFDB%			; Read FDB words in
+	MOVE C,PAGACS		; Find next free word - this is FDB size
+	ANDI C,77
+	HRROI A,PAGACS(C)	; Now have first string
+	TXNN KF,K%RDAT		; read date?
+	 SETOM PAGACS+.FBREF	; no, kill it
+	TXNN KF,K%CDAT		; creation date?
+	 SETOM PAGACS+.FBCRV	; no, kill it
+	TXNN KF,K%WDAT		; write date?
+	 SETOM PAGACS+.FBCRE	; no, kill both
+	TXNN KF,K%WDAT
+	 SETOM PAGACS+.FBWRT
+	MOVX D,<-FDTXTN,,FDTXT>	; Make up the string section
+	DO.
+	 HLRZ B,(D)		; FDB offset
+	 SKIPGE B,PAGACS(B)	; Get time
+	 IFSKP.			; if we want to pass it
+	  MOVX C,<OT%4YR!OT%TMZ!OT%SCL>
+	  ODTIM%
+	   ERJMP .+1
+	 ELSE.
+	  HRROI B,[ASCIZ /none/] ;if not, generate an error
+	  SETZ C,
+	  SOUT%
+	 ENDIF.
+	 SETZ B,		; make asciz
+	 IDPB B,A
+	 HRROI A,1(A)		; get to next free word
+	 AOBJN D,TOP.
+	ENDDO.
+	MOVE B,A		; pointer must now be in B
+	TXNN KF,K%AUTH
+	IFSKP.
+	 MOVX D,<-FDTXUN,,FDTXUG>
+	 DO.
+	  HRRZ A,FILJFN		; File
+	  HLL A,(D)		; Function
+	  GFUST%
+	  SETZ A,
+	  IDPB A,B		; make asciz
+	  HRROI B,1(B)		; get to next free word
+	  AOBJN D,TOP.
+	 ENDDO.
+	ENDIF.
+	HRRZI C,-<PAGACS>(B)	; number of words sent
+	MOVEM C,DATLEN		; put it in header
+	MVI. 4,(B)		; Next block also has four words in header
+	SETZM 1(B)		; No page number
+	SETZM 2(B)		; No data
+	SETZM 3(B)		; This is an EOF page (PGT$LP)
+	ADDI C,^D8		; number of words in data plus 2 headers
+	IMULI C,^D36		; number of bits
+	MOVEI D,PAGHDR		; Starting at top of buffer
+	CALL T36SND		; Send them off
+	 RET			; Propagate fail return
+	TXZ F,F%TEMP		; Want to keep actual data connection open
+	CALL T36LST		; Force rest of buffer
+	 RET			; Propagate fail return
+	CALLRET SHXEND		; Done, return success
+
+FDTXT:	XWD .FBCRV,PAGACS+50	; Times  FDB offset,,String variable
+	XWD .FBWRT,PAGACS+60
+	XWD .FBREF,PAGACS+70
+FDTXTN==.-FDTXT
+
+FDTXUG:	XWD .GFAUT,PAGACS+100	; User name  Function code,,String variable
+	XWD .GFLWR,PAGACS+110
+FDTXUN==.-FDTXUG
+
+
+; Send 36-bit data for binary and paged transfers
+
+; NETROT/count of bits left over from previous time
+; NETBYT/bits that were left, right justified
+
+; Call with D/pointer to data, C/number of bits, NETROT/zero first time
+; Must always be an integral multiple of 36 bits except the last call
+; returns +1/failed, +2/success, all bits sent
+T36SND:	SAVEAC <P2>		; Get another register
+T36SNT:	MOVX P2,<-770,,NETPAG>	; Set output pointer
+	MOVE A,NETBYT		; Get last time's leftover bytes
+	MOVN B,NETROT		; And how many there were
+	ADDI C,(B)		; Take into account bits we had left over
+	LSH B,-2		; Count nibbles
+	JRST @[ T36SN0		; Jump to middle of coroutine
+		T36SN1
+		T36SN2
+		T36SN3
+		T36SN4
+		T36SN5
+		T36SN6
+		T36SN7
+		T36SN8 ](B)	; Depending on how many nibbles there were
+
+DEFINE T36SNM (SH,LAB) <	;; Helper macro:
+    IFN <^D<SH>>,<
+	MOVE B,(D)		;; Get data word
+	LSHC A,^D<SH>		;; Shift into place
+	AOS D			;; Count off word
+    >
+	SUBI C,^D32		;; Sending 32 of them off
+	JUMPL C,T36SNZ		;; No more, done
+	LSH A,^D4		;; Left justify
+	MOVEM A,(P2)		;; Put away
+    IFN <^D<SH>>,<LSHC A,^D<36-SH>> ;; Shift rest of bits in
+    IFE <^D<SH>>,<SETZB A,B>	;; None left, clear out for next cycle
+	AOBJN P2,LAB		;; Count off in how much we have buffered
+    IFN <^D<SH>>,<
+	MOVNI B,^D<36-SH>	;; Get how many of them there are
+	JRST T36SNB		;; Send buffer out
+    >
+>
+
+T36SN0:	T36SNM (32,T36SN1)
+T36SN1:	T36SNM (28,T36SN2)
+T36SN2:	T36SNM (24,T36SN3)
+T36SN3:	T36SNM (20,T36SN4)
+T36SN4:	T36SNM (16,T36SN5)
+T36SN5:	T36SNM (12,T36SN6)
+T36SN6:	T36SNM (8,T36SN7)
+T36SN7:	T36SNM (4,T36SN8)
+T36SN8:	T36SNM (0,T36SN0)
+
+; Here when out of buffer in which to put data
+; this must be immediately after the T36SNM(0).
+T36SNB:	MOVEM A,NETBYT		; Save last bits
+	MOVEM B,NETROT		; and how many there are
+	ADD C,B			; Don't count twice when we do it again
+	CALL T36SNS		; Send buffer
+	 RET			; Propagate fail return
+	JRST T36SNT		; Start it all over again
+
+; Here when out of data to send
+T36SNZ:	LSH A,(C)		; Shift bits into right justification
+	ADDI C,^D32		; Count back bits
+	MOVEM A,NETBYT		; Save last byte
+	MOVNM C,NETROT		; Remember how much to use next time
+T36SNS:	SAVEAC <C,D>		; Enter here for end of buffer routine
+	MOVNI C,-NETPAG(P2)	; Get count of 32-bit words stuffed
+	LSH C,2			; Make into count of 8-bit bytes
+	MOVE B,[POINT 8,NETPAG]	; Point to the buffer
+	JSP P1,2(P1)		; Send away
+	 RET			; Lost
+	RETSKP			; Won
+
+; Here to send off last bit of info
+; set F%TEMP to close data conn, clear F%TEMP not to
+T36LST:	TXZN F,F%TEMP		; Want to close?
+	 AOS P1			; No, so don't do so
+	MOVE C,NETROT		; Get count of bits left
+	MOVE B,NETBYT		; Get the bits
+	LSH B,^D36(C)		; Shift into left justification
+	MOVEM B,NETBYT		; Save again
+	ASH C,-3		; Turn into number of 8-bit bytes
+	MOVE B,[POINT 8,NETBYT]	; Pointing to the bits left over
+	JSP P1,(P1)		; Send off last data
+	 RET			; Lost
+	RETSKP			; Won
+
+; Send EBCDIC data
+
+TCSEBC:	MVI. 5000,BCOUNT	; One page of 5 bytes per word
+	MVI. <-1,,FILPAG>,FILPTR ; Into where GETPAG expects it
+	MVI. <POINT 7,FILPAG>,NBFPTR ; And where coroutine can find
+	CALL SETBSZ		; Set file number of bytes
+	DO.
+	  CALL GETPAG		; Read file page
+	   JRST TCSEND		; That was all
+	  MOVE A,NBFPTR		; Point to start
+	  CALL TSEBCC		; Send some
+	   RET			; Propagate fail return
+	  CALL TSEBCC		; Send other half
+	   RET			; Propagate fail return
+	  LOOP.			; All done with that page, back for the next.
+	ENDDO.
+
+; Send a 1.25k-char block of EBCDIC to the net
+; call with A/ptr to input, returns +1/fail, +2/success
+TSEBCC:	SKIPN C,NBYTES		; Get number of bytes left
+	 RETSKP			; None, done
+	CAILE C,2400		; Room for them in net buffer?
+	 MOVEI C,2400		; No, just use what we can take
+	MOVNS C			; Negate for send count
+	ADDM C,NBYTES		; Count off in total byte count
+	MOVE B,[POINT 8,NETPAG]	; Point to buffer
+	PUSH P,C		; Save count
+	DO.
+	  ILDB D,A		; Get next 7-bit byte
+	  HLRZ D,EBCTAB(D)	; Convert to EBCDIC
+	  IDPB D,B		; Add to EBCDIC string
+	  AOJL C,TOP.		; Back for more
+	ENDDO.
+	MOVE B,[POINT 8,NETPAG]	; Point to buffer again
+	POP P,C			; Restore count
+	SAVEAC <A>		; Don't lose byte pointer to source
+	JSP P1,2(P1)		; Send bytes off
+	 RET			; Lost
+	RETSKP			; Won
+
+; Coroutines for network data transmission
+; call by JSP P1,(P1) with B/byte pointer, C/-count
+; call +1/this is the last data to send, +2/last data but keep connection,
+;      +3/more data to come, so don't do anything special
+; C may be zero iff this is the last block (if so nothing sent).
+; may use F%TEMP but don't need it preserved (if used will zero it).
+; after +1 end call, call again +1 to signal EOF unless page mode.
+; return +1/some error, +2/success on all styles of call
+
+; Stream mode write
+TCSSTT:	JSP P1,1(P1)		; Return success and get another request
+TCSSTR: JRST TCSSTC		; Want to push data and close
+	JRST TCSSTP		; Want to push data but not close
+	MOVE A,TCXJFN		; Yes, get connection JFN
+	SKIPE C			; Have anything?
+	 SOUT%			; Yes, send data off
+ 	  ERJMP TCSERR		; Couldn't
+	JRST TCSSTT		; Go ask for another request
+
+; Here to push last data, maybe closing connection
+TCSSTC:	TXOA F,F%TEMP		; Want to close connection
+TCSSTP:	 TXZ F,F%TEMP		; Force data but don't close connection
+	MOVE A,TCXJFN		; Get connection JFN
+	SKIPN C			; Have anything?
+	 HRROI B,C		; No, point to a zero since we end on null
+	SOUTR%			; Send off and push
+	 ERJMP TCSERR		; Couldn't
+	TXZE F,F%TEMP		; If we wanted to do so,
+	 CALL TCXCLS		; close down data connection
+	JSP P1,1(P1)		; Return success at closing it
+	FATAL <TCP send coroutine called after EOF>
+
+
+; Here on output error
+; don't send an ABOR because it is not clear whether or not to wait
+; for the 226 reply that might come after a 426 reply.
+; Also then I would have to do a complicated sequence of IACs,
+; and it was likely that the same error already got to the server anyway.
+
+TCSERR:	SKTERS VB.NRM		; Unless being terse
+	 TYPE <%_%% Unexpected error sending data to connection - %J%/>
+	CALL TCXABT		; Flush losing data connection
+	JSP P1,0(P1)		; Return failure
+	FATAL <TCP send coroutine called after error>
+
+; Block mode send
+
+TCSBK0:	JSP P1,1(P1)		; Here to return success from previous call
+TCSBLK:	 NOP			; EOF and close, same as not close
+	 TXOA F,F%TEMP		; EOF
+	  TXZ F,F%TEMP		; Normal entry
+	MOVE A,TCXJFN		; Get connection JFN
+	DMOVEM B,NETPSV		; Save pointers given us
+	TXNN F,F%TEMP		; Was that EOF?
+	 TDZA B,B		; No, descriptor is zero
+	  MOVEI B,^D64		; Yes, use flag signifying EOF
+	BOUT%			; Send off
+	MOVN D,NETPSV+1		; Get positive byte count
+	MOVE B,[POINT 8,D,23]	; Point to byte count
+	MOVNI C,2		; Two bytes
+	SOUT%			; Send them off
+	 ERJMP TCSERR		; Lost
+	DMOVE B,NETPSV		; Get pointers back
+	TXZE F,F%TEMP		; Was that EOF?
+	 JRST TCSSTP		; Yes, send last block off
+	SOUT%			; No, send off normally
+	 ERJMP TCSERR		; Error, die
+	JRST TCSBK0		; Won, go return success
+
+; Compressed mode send
+
+DEFINE TCSCENT (MORE) <		;;Macro to enter TCSCMP coroutine
+	NOP			;;+1, same as +2
+	TXOA F,F%TEMP		;;+2, EOF
+	 TXZA F,F%TEMP		;;+3, not EOF
+	  IFSKP. <JUMPE C,MORE>	;;    check if there still is data
+>
+
+; Main entry point
+TCSCMX:	JSP P1,1(P1)		; Here if we had no data
+TCSCMP:	TCSCENT(TCSCMX)		; Set up EOF etc
+	SAVEAC <P2>		; Need another register
+	CALL SETPAD		; Set up padding character
+	IFE. C			; If that was all
+	  MOVE B,[POINT 8,[BYTE (8) 0, ^D64, 300]]
+	  MOVNI C,3		; Point to this special sequence
+	  MOVE A,TCXJFN		; With data connection
+	  SOUTR%		; Send it off
+	   ERJMP TCSERR
+	  JRST TCSSTP		; Done sending compressed data
+	ENDIF.
+	ILDB D,B		; Get next byte
+
+; Here when we have a char (in D) to do something with
+TCSCMC:	CAME D,PADCHR		; Padding?
+	 JRST TCSCMS		; No, string
+;	JRST TCSCMF		; Yes, handle it
+
+; Here with D/new padding char
+; enter at TCSCFC with NETPSV+1/count already set (e.g. +1 for dupl byte)
+TCSCMF:	SETZM NETPSV+1		; No bytes yet
+TCSCFC:	MOVEM D,NETPSV		; Save new padding char
+TCSCFN:	AOS NETPSV+1		; Count byte
+	SOJG C,TCSCFD		; More?
+	IFXE. F,F%TEMP		; No, was that EOF?
+	  DO.
+	    JSP P1,1(P1)	; More data expected, get some
+	    TCSCENT(TOP.)	; Reenter coroutine
+	  ENDDO.
+	  JUMPN C,TCSCFD	; If have data now, go use it
+	ENDIF.
+
+	;; Out of data, send final replications off
+	MOVE B,[POINT 8,[BYTE (8) 0, ^D64, 300]] ; Yes, point to fin seq
+	CALL TCSCFF		; Get fill seq including EOF marker
+	JRST TCSSTP		; All done sending
+
+; Compressed mode send, handling padding, ready to read next char
+TCSCFD:	ILDB D,B		; Get next char
+	CAMN D,NETPSV		; Same?
+	 JRST TCSCFN		; Yes, count and back again
+	PUSH P,D		; No, save char
+	CALL TCSCFF		; Get fill sequence and save ptrs in NETPSV
+	POP P,D			; Get char back
+	SOUT%			; Send sequence off
+	 ERJMP TCSERR		; Lost
+	DMOVE B,NETPSV		; Restore pointers
+	JRST TCSCMC		; And go handle the new char
+
+; Compressed mode send, make pointers to send pad string off
+; mungs D, returns +1/always with A,B,C ready to SOUTR%, old ptrs in NETPSV
+TCSCFF:	MOVE A,NETPSV		; Get byte
+	MOVE D,NETPSV+1		; and how many of it there are
+	DMOVEM B,NETPSV		; Now save pointers
+	MOVE B,[POINT 8,NETBUF]	; Get pointer to buffer
+	SETZ C,			; No bytes put yet
+
+	;; First reduce until it will fit in one sequence
+	DO.
+	  CAIG D,77		; Got more than one countfull?
+	   EXIT.		; No, ok
+	  SUBI D,77		; Yes, count off
+	  CAME A,PADCHR		; Pad char?
+	  IFSKP.
+	    MOVEI CX,377	; Yes, get full pad sequence
+	    IDPB CX,B		; Drop in
+	    SOJA C,TOP.		; Count bytes put and back for next
+	  ENDIF.
+	  MOVEI CX,277		; Full replicated byte
+	  IDPB CX,B		; Drop in
+	  IDPB A,B		; Drop byte in too
+	  SUBI C,2		; Two more bytes
+	  LOOP.
+	ENDDO.
+
+	;; Now check for EOF
+	SKIPN NETPSV+1		; Did we have any more chars to read?
+	 TXZN F,F%TEMP		; No, was that all?
+	  IFSKP.
+	    MOVEI CX,0		; Yes, get escape
+	    IDPB CX,B		; Drop in
+	    MOVEI CX,^D64	; And EOF bit
+	    IDPB CX,B		; Drop that in too
+	    SUBI C,2		; Count off bits put
+	  ENDIF.
+
+	;; Now finish up output buffer with final replicated byte
+	CAME A,PADCHR		; Fill char?
+	IFSKP.
+	  TXO D,300		; Yes, use fill char bits
+	  IDPB D,B		; Drop in
+	  SOS C			; Count
+	ELSE.
+	  TXO D,200		; Normal replicated byte, get that
+	  IDPB D,B		; Drop in
+	  IDPB A,B		; With the byte itself
+	  SUBI C,2		; Count off
+	ENDIF.
+
+	;; Buffer all set, return ready for SOUT%
+	MOVE A,TCXJFN		; Get JFN
+	RET			; All done
+
+; Compressed mode send, unreplicated string
+
+TCSCMS:	SETZM NETPSV+1		; No bytes yet
+	MVI. <POINT 8,NETBUF>,NETPSV ; Init pointer to buffer
+TCSCSC:	MOVE P2,D		; Get char
+	SOJG C,TCSCSD		; Count off in input data
+	IFXE. F,F%TEMP		; Any more expected?
+	  DO.
+	    JSP P1,1(P1)	; Else ask for more data
+	    TCSCENT(TOP.)	; Reenter coroutine
+	  ENDDO.
+	  JUMPN C,TCSCSD	; If more data, go use it
+	ENDIF.
+
+	;; Here on EOF, send string and return
+	IDPB P2,NETPSV		; Drop last byte in
+	MOVE B,[POINT 8,[BYTE (8) 0, ^D64, 300]] ; Point to end seq
+	MOVNI C,2		; Two bytes
+	MOVE A,TCXJFN		; To net JFN
+	SOUT%			; Send off
+	 ERJMP TCSERR		; Lost
+	AOS B,NETPSV+1		; Get count
+	BOUT%			; Send that too
+	 ERJMP TCSERR
+	MOVN C,NETPSV+1		; Now get negation of count
+	MOVE B,[POINT 8,NETBUF]	; and pointer to start of buffer
+	JRST TCSSTP		; Go finish up sending
+
+; Compressed mode send, unreplicated string continued
+
+; Now we have more data to read, go look at it
+TCSCSD:	ILDB D,B		; Get next char
+	CAMN D,PADCHR		; Padding?
+	 JRST TCSCSP		; Yes
+	CAMN D,P2		; Same as previous?
+	 JRST TCSCSF		; Yes
+	IDPB P2,NETPSV		; Not same, drop old byte in
+	AOS P2,NETPSV+1		; Get how many bytes left
+	CAIE P2,177		; Time to finish this buffer?
+	 JRST TCSCSC		; No, back for the next char
+
+	;; Buffer is full, send off before asking for more
+	DMOVEM B,NETPSV		; Save net pointers
+	MOVE A,TCXJFN		; Get net JFN
+	MOVEI B,177		; Full count
+	BOUT%			; Send off count
+	 ERJMP TCSERR
+	MOVE B,[POINT 8,NETBUF]	; Point to buffer
+	MOVNI C,177		; Negative count
+	SOUT%			; Send off string
+	 ERJMP TCSERR
+	DMOVE B,NETPSV		; Now restore user pointers
+	JRST TCSCMS		; And go start fresh string
+
+; Here when we have a fill byte, send string and go handle
+TCSCSP:	IDPB P2,NETPSV		; Yes, put away last char
+	AOS NETPSV+1		; And save count
+TCSCSF:	MOVE P2,NETPSV+1	; Get count
+	DMOVEM B,NETPSV		; Save pointers
+	MOVE A,TCXJFN		; Get net connection
+	MOVE B,P2		; And count
+	BOUT%			; Send off count
+	 ERJMP TCSERR
+	MOVE B,[POINT 8,NETBUF]	; Point to net buffer
+	MOVN C,P2		; Get count negated
+	SOUT%			; Send string off
+	 ERJMP TCSERR
+	DMOVE B,NETPSV		; Now get pointers back
+	CAMN D,PADCHR		; Was that a padding char?
+	 JRST TCSCMF		; Yes, only one of them
+	MVI. 1,NETPSV+1		; No, set count for two
+	JRST TCSCFC		; And go handle duplicated byte
+
+; Setup of padding character for compressed sends and receives
+
+; Note that we use P.XTYP rather than P.TYPE, whereas the rest of the
+; code in this module uses P.TYPE.  This is because the server is not
+; going to know about P.TYPE and this layer should be completely
+; transparent.  Padding should expand at the remote end as exactly
+; the byte it was encoded as here (and vice versa).
+
+SETPAD:	SAVEAC <A,B>		; Don't mung registers
+	MOVE A,FILPRP+P.XTYP	; Get file type remote system is using
+	SETZ D,			; Assume no pad char
+	CAIN A,TT.TXT		; For text
+	 MOVEI D," "		; Pad char is space
+	CAIN A,TT.EBC		; For EBCDIC
+	 HLRZ D,EBCTAB+" "	; Pad char is whatever space converts to
+	MOVEM D,PADCHR		; Save it
+	RET
+
+SUBTTL Translation table: ASCII->EBCDIC,,EBCDIC->ASCII
+
+; Stolen from TAPEIO, written by Brian Cox at Stanford GSB, 1979.
+; I don't know where he got it from.
+
+; Non-translatables are translated to SUB'S
+; Believed to be the same as OPTCD=Q, except:
+;    ASCII->EBCDIC: ! -> ! (instead of Vert Bar)
+; 		    ^ -> Cent (instead of Not)
+; 		    Tilde -> Not (instead of Tilde)
+;    EBCDIC->ASCII: Cent -> ^ (instead of [)
+; 		    Not -> Tilde (instead of ^)
+; 		    ! > ! (instead of ])
+; 		    [ -> [ (instead of Ctrl/Z)
+; 		    ] -> ] (instead of Ctrl/Z)
+
+EBCTAB:	0,,0			; NULL,,NULL
+	1,,1			; SOH,,SOH
+	2,,2			; STX,,STX
+	3,,3			; ETX,,ETX
+	67,,32			; EOT,,PF
+	55,,11			; ENQ,,HT
+	56,,32			; ACK,,LC
+	57,,177			; BEL,,DEL
+	26,,32			; BS,,GE
+	5,,32			; HT,,RLF
+	45,,32			; LF,,SMM
+	13,,13			; VT,,VT
+	14,,14			; FF,,FF
+	15,,15			; CR,,CR
+	16,,16			; SO,,SO
+	17,,17			; SI,,SI
+	20,,20			; DLE,,DLE
+	21,,21			; DC1,,DC1
+	22,,22			; DC2,,DC2
+	23,,23			; DC3,,TM
+	74,,32			; DC4,,RES
+	75,,32			; NAK,,NL
+	62,,10			; SYN,,BS
+	46,,32			; ETB,,IL
+	30,,30			; CAN,,CAN
+	31,,31			; EM,,EM
+	77,,32			; SUB,,CC
+	47,,32			; ESC,,CU1
+	34,,34			; FS,,IFS
+	35,,35			; GS,,IGS
+	36,,36			; RS,,IRS
+	37,,37			; US,,IUS
+	100,,32			; BLANK,,DS
+	132,,32			; !,,SOS
+	177,,32			; ",,FS
+	173,,32			; #,,
+	133,,32			; $,,BYP
+	154,,12			; %,,LF
+	120,,27			; &,,ETB
+	175,,33			; ',,ESC
+	115,,32			; (,,
+	135,,32			; ),,
+	134,,32			; *,,SM
+	116,,32			; +,,CU2
+	153,,32			; ,,,
+	140,,5			; -,,ENQ
+	113,,6			; .,,ACK
+	141,,7			; /,,BEL
+	360,,32			; 0,,
+	361,,32			; 1,,
+	362,,26			; 2,,SYN
+	363,,32			; 3,,
+	364,,32			; 4,,PN
+	365,,32			; 5,,RS
+	366,,32			; 6,,UC
+	367,,4			; 7,,EOT
+	370,,32			; 8,,
+	371,,32			; 9,,
+	172,,32			; :,,
+	136,,32			; ;,,CU3
+	114,,24			; <,,DC4
+	176,,25			; =,,NAK
+	156,,32			; >,,
+	157,,32			; ?,,SUB
+	174,,40			; @,,BLANK
+	301,,32			; A,,
+	302,,32			; B,,
+	303,,32			; C,,
+	304,,32			; D,,
+	305,,32			; E,,
+	306,,32			; F,,
+	307,,32			; G,,
+	310,,32			; H,,
+	311,,32			; I,,
+	321,,136		; J,,CENT SIGN
+	322,,56			; K,,.
+	323,,74			; L,,<
+	324,,50			; M,,(
+	325,,53			; N,,+
+	326,,41			; O,,VERTICAL BAR
+	327,,46			; P,,&
+	330,,32			; Q,,
+	331,,32			; R,,
+	342,,32			; S,,
+	343,,32			; T,,
+	344,,32			; U,,
+	345,,32			; V,,
+	346,,32			; W,,
+	347,,32			; X,,
+	350,,32			; Y,,
+	351,,41			; Z,,!
+	255,,44			; [,,$
+	340,,52			; \,,*
+	275,,51			; ],,)
+	112,,73			; ^,,;
+	155,,176		; _,,NOT SIGN [136]
+	171,,55			; GRAVE,,-
+	201,,57			; a,,/
+	202,,32			; b,,
+	203,,32			; c,,
+	204,,32			; d,,
+	205,,32			; e,,
+	206,,32			; f,,
+	207,,32			; g,,
+	210,,32			; h,,
+	211,,32			; i,,
+	221,,174		; j,,|
+	222,,54			; k,,,
+	223,,45			; l,,%
+	224,,137		; m,,_
+	225,,76			; n,,>
+	226,,77			; o,,?
+	227,,32			; p,,
+	230,,32			; q,,
+	231,,32			; r,,
+	242,,32			; s,,
+	243,,32			; t,,
+	244,,32			; u,,
+	245,,32			; v,,
+	246,,32			; w,,
+	247,,32			; x,,
+	250,,140		; y,,GRAVE
+	251,,72			; z,,:
+	300,,43			; {,,#
+	152,,100		; |,,@
+	320,,47			; },,'
+	137,,75			; TILDE,,=
+	7,,42			; DEL,,"
+	77,,32
+	77,,141			; ,,a
+	77,,142			; ,,b
+	77,,143			; ,,c
+	77,,144			; ,,d
+	77,,145			; ,,e
+	77,,146			; ,,f
+	77,,147			; ,,g
+	77,,150			; ,,h
+	77,,151			; ,,i
+	77,,32
+	77,,32
+	77,,32
+	77,,32
+	77,,32
+	77,,32
+	77,,32
+	77,,152			; ,,j
+	77,,153			; ,,k
+	77,,154			; ,,l
+	77,,155			; ,,m
+	77,,156			; ,,n
+	77,,157			; ,,o
+	77,,160			; ,,p
+	77,,161			; ,,q
+	77,,162			; ,,r
+	77,,32
+	77,,32
+	77,,32
+	77,,32
+	77,,32
+	77,,32
+	77,,32
+	77,,176			; ,,TILDE
+	77,,163			; ,,s
+	77,,164			; ,,t
+	77,,165			; ,,u
+	77,,166			; ,,v
+	77,,167			; ,,w
+	77,,170			; ,,x
+	77,,171			; ,,y
+	77,,172			; ,,z
+	77,,32
+	77,,32
+	77,,32
+	77,,133			; ,,[
+	77,,32
+	77,,32
+	77,,32
+	77,,32
+	77,,32
+	77,,32
+	77,,32
+	77,,32
+	77,,32
+	77,,32
+	77,,32
+	77,,32
+	77,,32
+	77,,32
+	77,,32
+	77,,135			; ,,]
+	77,,32
+	77,,32
+	77,,173			; ,,{
+	77,,101			; ,,A
+	77,,102			; ,,B
+	77,,103			; ,,C
+	77,,104			; ,,D
+	77,,105			; ,,E
+	77,,106			; ,,F
+	77,,107			; ,,G
+	77,,110			; ,,H
+	77,,111			; ,,I
+	77,,32
+	77,,32
+	77,,32
+	77,,32
+	77,,32
+	77,,32
+	77,,175			; ,,}
+	77,,112			; ,,J
+	77,,113			; ,,K
+	77,,114			; ,,L
+	77,,115			; ,,M
+	77,,116			; ,,N
+	77,,117			; ,,O
+	77,,120			; ,,P
+	77,,121			; ,,Q
+	77,,122			; ,,R
+	77,,32
+	77,,32
+	77,,32
+	77,,32
+	77,,32
+	77,,32
+	77,,134			; ,,\
+	77,,32
+	77,,123			; ,,S
+	77,,124			; ,,T
+	77,,125			; ,,U
+	77,,126			; ,,V
+	77,,127			; ,,W
+	77,,130			; ,,X
+	77,,131			; ,,Y
+	77,,132			; ,,Z
+	77,,32
+	77,,32
+	77,,32
+	77,,32
+	77,,32
+	77,,32
+	77,,60			; ,,0
+	77,,61			; ,,1
+	77,,62			; ,,2
+	77,,63			; ,,3
+	77,,64			; ,,4
+	77,,65			; ,,5
+	77,,66			; ,,6
+	77,,67			; ,,7
+	77,,70			; ,,8
+	77,,71			; ,,9
+	77,,32
+	77,,32
+	77,,32
+	77,,32
+	77,,32
+	77,,32
+
+	END

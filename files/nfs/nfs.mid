@@ -1,0 +1,2342 @@
+;to do:   
+;  redo packet count stuff
+;  redo long file name gtjfn stuff
+;  timeout and closf open files (and readdir jfn cache)
+;  create makes multiple versions?
+;  re-read nfs-access file sometimes
+;  write $DUSW kludge
+
+	Title NFS -- Network File System server
+
+;Copyright (C) 1987 by Mark K. Lottor.  All Rights Reserved.
+
+.DECSAV
+
+$PRSW==-1			;pre-read switch (win)
+$GWSW==-1			;fast getwd kludge
+$DUSW==0			;directory update tad kludge (N.Y.I.)
+
+.INSRT MID:MACROS
+.INSRT MID:SYMBOLS
+.INSRT MID:SOUT
+
+PPKT==0				;packet printer
+.INSRT DSK:UDP.MID
+.INSRT DSK:XDR.MID
+RTXSW==-1			;rpc retransmit cache
+.INSRT DSK:RPC.MID 
+
+;preserved acs
+Q1==5
+Q2==6
+Q3==7
+P1==10
+P2==11
+P3==12
+P4==13
+;acs 14 (RP) and 15 (SP) are defined in RPC
+
+Define RetSkp
+	Jrst Popj1
+Termin
+
+PDLen==40
+PDL:	Block PDLen
+
+
+;debugging stuff
+
+Debug:	0			;non-zero for debugging messages
+$DBTIM==0			;if debugging, print time data too
+
+;do crlf
+Define DEBUGX
+	Skipe Debug
+	 Call OUT.X
+Termin
+
+;debugs (start of a debug line)
+Define DEBUGS
+	Skipe Debug
+	 Call OUT.S
+Termin
+
+;debug "foo"
+Define DEBUGM *string
+	Skipe Debug
+	 Call [Push P,1
+	       Move 1,[440700,,[asciz \string\]]
+	       PSOUT%
+	       Pop P,1
+	       Ret]
+Termin
+
+;debug foo
+Define DEBUGA addr
+	Skipe Debug
+	 Call [Push P,1
+	       Hrroi 1,addr
+	       PSOUT%	
+	       Pop P,1
+	       Ret]
+Termin
+
+;debug foo (8-bit foo)
+Define DEBUG8 addr
+	Skipe Debug
+	 Call [Push P,1
+	       Move 1,[441000,,addr]
+	       PSOUT%	
+	       Pop P,1
+	       Ret]
+Termin
+
+;debugo octal
+Define DEBUGO num
+	Skipe Debug
+	 Call [Push P,2
+	       Move 2,num
+	       Call OUT.O
+	       Pop P,2
+	       Ret]
+Termin
+
+;debugd decimal
+Define DEBUGD num
+	Skipe Debug
+	 Call [Push P,2
+	       Move 2,num
+	       Call OUT.D
+	       Pop P,2
+	       Ret]
+Termin
+
+;debugf -- display file handle in FH.*
+Define DEBUGF
+	Skipe Debug
+	 Call OUT.F
+Termin
+
+
+Prog==100003.			;NFS
+Vers==2.			;version 2
+OurPrt==2049.			;on this port
+
+RegArg:	4,,RegDat
+RegDat:	Block 4
+
+;Dispatch table, nx4 array, [program ? version ? procedure ? address]
+DspTab:	Prog ? Vers ? 00. ? D.NULL	;null procedure
+	Prog ? Vers ? 01. ? D.GFA	;get file attributes
+	Prog ? Vers ? 02. ? D.SFA	;set file attributes
+	Prog ? Vers ? 04. ? D.LFN	;lookup file name
+	Prog ? Vers ? 06. ? D.RF	;read from file
+	Prog ? Vers ? 08. ? D.WF	;write to file
+	Prog ? Vers ? 09. ? D.CRE	;create file
+	Prog ? Vers ? 10. ? D.DEL	;delete file
+	Prog ? Vers ? 11. ? D.REN	;rename file
+	Prog ? Vers ? 14. ? D.CDIR	;create directory
+	Prog ? Vers ? 15. ? D.DDIR	;delete directory
+	Prog ? Vers ? 16. ? D.RD	;read from directory
+	Prog ? Vers ? 17. ? D.GSA	;get system attributes
+	Prog ? Vers ? 99. ? D.STAT	;get server statistics
+	0				;end of table
+
+PHigh==20.			;highest procedure to do stats on
+;Statistics area
+St.Cnt:	Block	PHigh		;count of calls
+St.CPU:	Block	PHigh		;cpu time
+St.Tim:	Block	PHigh		;elapsed time
+S.CPU:	0
+S.Tim:	0
+S.LTim:	0
+
+
+;the filehandle format (32 bytes)
+;words 0-1: handle type (4 bits)
+;		0 == reserved
+;		1 == directory
+;		2 == file
+;               3 == file with long name
+;	    handle id (24 bits) (index block address for files)
+;                               (zero if directory)
+;           structure code (18 bits)
+;           directory number (18 bits)
+;words 2-7: file name string (24 bytes) (type 2 only)
+FH%TYP==740000,,000000
+FH.TRS==0
+FH.TDI==1
+FH.TFL==2
+FH.TLN==3
+FH%HND==037777,,777400
+FH%ST1==000000,,000360
+FH%ST2==777760,,000000
+FH%DIR==000017,,777760
+FH.TYP:	0
+FH.HND:	0
+FH.STR:	0
+FH.DIR:	0
+FH.NAM:	Block 100
+
+FH:	Block 100		;a file handle
+FN:	Block 100		;a file name
+FN.BYT:	0			;fn byte size if any
+
+;open file cache tables, all parallel
+OFN==10.			;size of cache
+OF.HND:	Block OFN		;open file handle (zero==slot available)
+OF.STR:	Block OFN		;structure code
+OF.TIM:	Block OFN		;TAD of last use
+OF.JFN:	Block OFN		;JFN on file
+OF.ACC:	Block OFN		;access to file (R,W,E, etc.)
+OF.HST:	Block OFN		;host number of file opener
+;pre-read stuff
+OF.PRD:	Block OFN		;status of pre-read buffer,,next buffer
+OF.MIS:	Block OFN		;miss count
+OF%PON==Bit(0)			;pre-reading is in use
+OF%EOF==Bit(1)			;end count is EOF
+IFN $PRSW,[
+OF.BSZ==5.			;buffer size in pages (per file)
+OF.STA:	Block OFN*OF.BSZ	;buffer status (0 = ok)
+OF.BEG:	Block OFN*OF.BSZ	;beginning offset
+OF.CNT:	Block OFN*OF.BSZ	;byte count
+PR.BEG:	0
+PR.CNT:	0
+PR.OFN:	0
+PR.FLAG:0
+OF.BUF:	Block OF.BSZ*1000*OFN	;pre-read buffers 
+]
+
+WF.OFF:	0			;write file offset
+WF.CNT:	0			;write file count
+
+
+;IP address to directory mappings
+ADNam:	Asciz "SYSTEM:NFS-ACCESS.CMD"
+ADJfn:	0
+AD.Siz==200.
+AD.Len:	0
+AD.Adr:	Block AD.Siz
+AD.Dir:	Block AD.Siz
+AD.Acc:	Block AD.Siz
+AD%RD==Bit(0)
+AD%WR==Bit(1)
+
+;attributes
+AT.MOD:	0
+AT.SIZ:	0
+AT.ATM:	0
+AT.MTM:	0
+
+;directory cookie jfn caching stuff
+DC.Siz==10.
+DC.JFN:	Block DC.Siz      
+DC.DIR:	Block DC.Siz      
+DC.KKY:	Block DC.Siz      
+DC.TAD:	Block DC.Siz      
+
+IFN $GWSW,[
+;getwd kludge cache
+GW.Siz==10.
+GW.HST:	Block	GW.Siz
+GW.DIR:	Block	GW.Siz
+GW.PTR:	0
+];IFN $GWSW
+
+InBuf:	Block 1000		;file input buffer
+
+FooBuf:	Block 100		;foo goes here
+TmpJfn:	0			;temp jfn holder
+
+LstDir:	0			;last dir we gtfdb'd...
+LstDPT:	0			; and last prot of it
+
+FdbBlk:	Block .FBSS2+1
+DIRBLK:	Block 20
+
+TSize:	0			;max data transfer size
+;sending: ip/udp/rpc take up 13 words (52 bytes)
+;receiving: ?..
+
+Jimmy==4			;the Jimmy factor
+Page==512.			;words per page
+Psize==Jimmy*Page		;page size (whatever that means)
+
+;statistics counters
+ST.OCR:	0			;OFN cache filled
+ST.LNF:	0			;Long file name cache filled (nyi)
+				
+APRID:	0			;processor serial number
+
+
+Start:	RESET%
+	Move P,[PDL(-PDLen)]	;init stack
+	Movei 1,2000.
+	DISMS%			;give portmapper and mountserver a chance
+	Movei 1,.FHSLF
+	RPCAP%
+	Txne 2,SC%WHL
+	 Txnn 2,SC%NWZ
+	  Jrst [TypeCR "[NFS] Need wheel and net-wizard privs."
+	        Jrst Die]
+	Seto 3,
+	EPCAP%
+
+	Move 1,[SIXBIT /APRID/]
+	SYSGT%
+	Movem 1,APRID
+
+ 	Movei 1,OurPrt
+	Call UDP"GetIQ		;get a udp queue
+	 Jrst [TypeCR "[NFS] Can't get a UDP queue."
+	       Jrst Die]
+	Imuli 2,4		;max pkt size to bytes
+	Subi 2,160.		;minus ip/udp/rpc stuff
+	Movem 2,TSize		;save max transfer size
+	DEBUGM "Max data transfer size = "
+	DEBUGD 2
+	DEBUGM " bytes."
+	DEBUGX
+
+ 	Movei 1,OurPrt
+	Call RPC"Init		;init rpc
+	 Jrst [TypeCR "[NFS] Can't init RPC library."
+	       Jrst Done]
+
+	Movei 2,RegDat
+	Movei 1,Prog
+	PutUns 1,2
+	Movei 1,Vers
+	PutUns 1,2
+	Movei 1,17.			;UDP
+	PutUns 1,2
+	Movei 1,OurPrt
+	PutUns 1,2
+
+ 	Move 1,RegArg
+	Call RPC"Reg		;register with portmapper
+	 Jrst [TypeCR "[NFS] Can't register with portmapper."
+	       Jrst Done]
+
+	Call GetACF		;get access control info
+
+	TypeCR "[NFS] initialized."
+
+	Move 1,[Call D.IRD]
+	Movem 1,RPC"R.IDsp	;setup intermediate dispatch routine
+
+	Movei 1,Dsp
+	Movei 2,DspTab
+	Call RPC"DoRPC		;handle RPC requests forever
+	TypeCR "[NFS] RPC death."
+	Jrst Done
+
+
+;dispatcher
+Dsp:	Move 4,RPC"R.Proc
+	Cail 4,PHigh
+	 Jrst Dsp1
+	Push P,1
+	Movei 1,.HPELP
+	HPTIM%
+	 jfcl
+	Movem 1,S.TIM
+	Sub 1,S.LTIM		;time between requests
+IFN $DBTIM,[
+	DEBUGM "Idle "
+	DEBUGD 1
+	DEBUGX
+];IFN $DBTIM
+	Movei 1,.HPRNT
+	HPTIM%
+	 jfcl
+	Movem 1,S.CPU
+	Pop P,1
+Dsp1:	Call (1)		;DO IT NOW!
+	Move 4,RPC"R.Proc
+	Cail 4,PHigh
+	 Ret
+	Aos St.Cnt(4)		;count calls
+	Movei 1,.HPRNT
+	HPTIM%
+	 jfcl
+	Sub 1,S.CPU
+	Addm 1,St.CPU(4)	;add up runtime
+IFN $DBTIM,[
+	DEBUGM "   CPU/Elapsed	"
+	DEBUGD 1
+];IFN $DBTIM
+	Movei 1,.HPELP
+	HPTIM%
+	 jfcl
+	Movem 1,S.LTIM
+	Sub 1,S.TIM
+	Addm 1,St.TIM(4)	;add up time
+IFN $DBTIM,[
+	DEBUGM "	"
+	DEBUGD 1
+	DEBUGX
+];IFN $DBTIM
+	Ret
+
+
+;return statistics 
+; format:  ok (zero)
+;          [proc#, calls, cpu, time] until (proc# = 0)
+D.STAT:	Setz 1,
+	PutUns 1,SP		;ok
+	Movei 4,DspTab
+D.STAL:	Skipn (4)		;eot?
+	 Jrst D.STAX		;yep, end
+	Move 3,2(4)		;get proc num
+	Jumpe 3,D.STA1		;skip null routine
+	PutUns 3,SP		;proc#
+	Move 2,St.Cnt(3)
+	PutUns 2,SP		;count of calls
+	Move 2,St.CPU(3)
+	PutUns 2,SP		;cpu
+	Move 2,St.Tim(3)
+	PutUns 2,SP		;time	
+D.STA1:	Addi 4,4
+	Jrst D.STAL
+D.STAX:	Setz 1,
+	PutUns 1,SP
+	Ret
+
+
+;the null procedure
+D.NULL:	DEBUGS
+	DEBUGM "Null"
+	DEBUGX
+	Ret
+
+
+;get file attributes
+D.GFA:	DEBUGS
+	DEBUGM "Get file attributes of "
+	Call GetHandle		;read file handle
+	DEBUGF
+	DEBUGX
+	Move 1,FH.TYP
+	Cain 1,FH.TDI		;is it a dir?
+	 Jrst D.GFAD		;yes, do other stuff
+	Call Fh2JFN		;convert it to a JFN
+	 Jrst ER.NSF
+	Movem 1,TmpJFN	
+	Call ChkLst		;check access to file
+	 Jrst [Call ER.ACC
+	       Jrst RelRet]
+SATOK:	Setz 1,			;status OK
+	PutUns 1,SP
+	Move 1,TmpJFN
+	Call PutAtr		;send attributes
+RelRet:	Move 1,TmpJFN
+	RLJFN%
+	 Erjmp .+1
+	Ret
+
+;get file attributes of a directory
+D.GFAD:	Setz 3,			;status OK
+	PutUns 3,SP
+	Hrlz 1,FH.STR
+	Hrr 1,FH.DIR
+	Call PutDat		;send directory attributes
+	Ret
+
+
+;set file attributes
+D.SFA:	DEBUGS
+	DEBUGM "Set file attributes of "
+	Call GetHandle
+	DEBUGF
+	DEBUGX
+	Move 1,FH.TYP
+	Cain 1,FH.TDI		;directory?
+	 Jrst ER.DIR		;yep.  loser.
+	Call Fh2Jfn		;get jfn on file
+	 Jrst ER.NSF
+	Movem 1,TmpJFN
+	Call ChkWr		;check write access
+	 Jrst RelRet
+	Move 1,TmpJFN
+	Call GetAtr		;get new attributes
+	Move 1,TmpJFN
+	Call SetAtr		;set them
+	Jrst SATOK
+
+
+;create file
+D.CRE:	DEBUGS
+	DEBUGM |Create file "|
+	Call GetDA
+	 Ret
+	DEBUGA FN
+	DEBUGM ";b"
+	DEBUGD FN.BYT
+	DEBUGM |" in dir |
+	DEBUGF
+	DEBUGX
+	Hrlz 1,FH.STR
+	Hrr 1,FH.DIR
+	Call ChkWDr		;write access to dir?
+	 Ret
+	GTDAL%
+	Caml 2,3		;over quota?
+	 Jrst ER.OVQ
+	Call Da2Str
+	Movx 1,GJ%SHT\GJ%NEW\GJ%FOU
+	Hrroi 2,FooBuf
+	GTJFN%			;get jfn on new file
+	 Erjmp ER.NSF
+	Movem 1,TmpJfn
+	Movx 2,OF%WR
+	OPENF%			;open for write
+	 Erjmp [Call ER.NSF
+		Jrst RelRet]
+	Txo 1,CO%NRJ
+	CLOSF%
+	 Erjmp .+1
+	Move 1,TmpJfn
+	Hrli 1,.FBBYV
+	Movx 2,FB%BSZ		;mask
+	Move 3,FN.BYT
+	Dpb 3,[.BP FB%BSZ,3]
+	CHFDB%			;set file byte size
+	 Erjmp .+1
+	Call GetAtr
+	Move 1,TmpJfn
+	Call SetAtr		;set new attributes
+	Move 1,TmpJfn
+	Hrli 1,.SFAUT
+	Hrroi 2,[Asciz /NFS-SERVER/]
+	SFUST%			;that's us
+	 Erjmp .+1
+	Hrli 1,.SFLWR
+	Hrroi 2,[Asciz /NFS-SERVER/]
+	SFUST%
+	 Erjmp .+1
+	Move 1,TmpJfn
+	Call Jfn2Fh
+	Setz 1,
+	PutUns 1,SP		;status OK
+	Call PutFH		;send file handle
+	Move 1,TmpJFN
+	Call PutAtr		;send attributes
+	Move 1,TmpJFN
+	RLJFN%
+	 Erjmp .+1
+	Ret
+
+
+;delete file
+D.DEL:	DEBUGS
+	DEBUGM |Delete file "|
+	Call GetDA
+	 Ret
+	DEBUGA FN
+	DEBUGM |" in dir |
+	DEBUGF
+	DEBUGX
+	Hrlz 1,FH.STR
+	Hrr 1,FH.DIR
+	Call ChkWDr		;write to dir allowed?
+	 Ret
+	Call Da2Str
+	Movx 1,GJ%SHT\GJ%OLD
+	Hrroi 2,FooBuf
+	GTJFN%			;get jfn on file to delete
+	 Erjmp ER.NSF
+	Movem 1,TmpJFN
+	Call O.Cls		;close file if in cache
+	Move 1,TmpJFN
+	Txo 1,DF%EXP		;die unix luser!
+	DELF%
+	 Erjmp .+1
+	Setz 1,
+	PutUns 1,SP		;OK     
+	Ret
+
+
+;rename file
+D.REN:	DEBUGS
+	DEBUGM |Rename "|
+	Call GetDA
+	 Ret
+	DEBUGA FN
+	DEBUGM |" in dir |
+	DEBUGF
+	DEBUGX
+	Hrlz 1,FH.STR
+	Hrr 1,FH.DIR
+	Call ChkWDr		;can we write to the 'from' directory?
+	 Ret
+	Call Da2Str
+	Movx 1,GJ%SHT\GJ%OLD
+	Hrroi 2,FooBuf
+	GTJFN%
+	 Erjmp ER.NSF
+	Movem 1,TmpJfn
+	Call ChkRd		;and can we read the 'from' file?
+	 Jrst RelRet
+				;this line intentionally left blank
+	DEBUGM |   to "|
+	Call GetDA
+	 Jrst RelRet
+	DEBUGA FN
+	DEBUGM |" in dir |
+	DEBUGF
+	DEBUGX
+	Hrlz 1,FH.STR
+	Hrr 1,FH.DIR
+	Call ChkWDr		;can we write to 'to' dir?
+	 Jrst RelRet
+	Move 1,TmpJfn
+	Call O.Cls		;close file if in cache
+	Call Da2Str
+	Movx 1,GJ%SHT\GJ%NEW\GJ%FOU
+	Hrroi 2,FooBuf
+	GTJFN%
+	 Erjmp [Call ER.NSF
+		Jrst RelRet]
+	Move 2,1
+	Move 1,TmpJfn
+	RNAMF%			;rename it!
+	 Erjmp ER.IO
+	Move 1,2
+	RLJFN%
+	 Erjmp .+1
+	Setz 1,
+	PutUns 1,SP		;OK
+	Ret
+
+
+;create directory
+D.CDIR:	DEBUGS
+	DEBUGM |Create directory "|
+	Call GetDA
+	 Ret
+	DEBUGM |" in dir |
+	DEBUGF
+	DEBUGM " -- not implemented."
+	DEBUGX
+	Jrst ER.ROS
+
+
+;delete directory
+D.DDIR:	DEBUGS
+	DEBUGM |Delete directory "|
+	Call GetDA
+	 Ret
+	DEBUGM |" in dir |
+	DEBUGF
+	DEBUGM " -- not implemented."
+	DEBUGX
+	Jrst ER.ROS
+
+
+;read from directory
+;Watch out!  This is gross.
+D.RD:	DEBUGS
+	DEBUGM "Read from directory "
+	Call GetHandle		;get directory to read from
+	DEBUGF
+	DEBUGX
+	Move 1,FH.TYP
+	Caie 1,FH.TDI		;is it a dir?
+	 Jrst ER.NOD		;no
+	Hrlz 1,FH.STR
+	Hrr 1,FH.DIR
+	Call ChkDir		;access to dir ok?
+	 Jrst D.RDX		;no, so pretend dir is empty
+	GetUns P1,RP		;read cookie (4 bytes)
+	GetUns P2,RP		;get max byte count to return
+	Subi P2,120.		;minus safety margin (1 entry max size)
+	Call DC.FND		;is jfn in cache?
+	 Jrst D.RD1		;yeah, go continue it
+	Hrroi 1,FooBuf
+	Hrlz 2,FH.STR
+	Hrr 2,FH.DIR
+	DIRST%
+	 Erjmp [TypeCR "[NFS] DIRST% failure #232"
+		Jrst ER.IO]
+	Hrroi 2,[Asciz /*.*.*/]
+	Push P,1
+	Call NRootP
+	 Hrroi 2,[Asciz /*.DIRECTORY/]	;if root only list dirs
+	Pop P,1
+	Setz 3,
+	$SOUT
+	Setz Q1,
+	Movx 1,GJ%SHT\GJ%OLD\GJ%IFG
+	Hrroi 2,FooBuf
+	GTJFN%
+	 Erjmp D.RDX
+	Movem 1,DC.JFN(P4)	;save jfn here
+IFN $GWSW,[
+	Call NRootP
+	 Jrst [Skipn P1
+		Call GW.Snd
+	       Jrst D.RD3]
+	Cain P1,1		;oreo?
+	 Setz P1,		;yeah, make it generic
+];IFN $GWSW
+	Jumpe P1,D.RD1		;no cookie, cold start
+D.RDL1:	Hrrz 1,DC.JFN(P4)
+	Move 2,[1,,.FBADR]
+	Movei 3,Q1
+	GTFDB%
+	 Erjmp [TypeCR "[NFS] GTFDB% failure #72"
+		Jrst ER.IO]
+	Camn Q1,P1		;found cookie?
+	 Jrst D.RDL2		;yep
+	Move 1,DC.JFN(P4)
+	GNJFN%
+	 Erjmp D.RDX
+	Jrst D.RDL1
+D.RDL2:	Move 1,DC.JFN(P4)
+	GNJFN%
+	 Erjmp D.RDX
+D.RD1:	Call NRootP
+	 Jrst [Caile P2,666.
+		Movei P2,666.	;if root dir use smaller packets
+	       Jrst .+1]
+	Setz 1,
+	PutUns 1,SP		;status OK
+	Subi P2,4
+;send an entry
+D.RD3:	Hrrz 1,DC.JFN(P4)
+	Move 2,[8.,,.FBHDR]
+	Movei 3,FDBBlk
+	GTFDB%
+	 Erjmp [TypeCR "[NFS] fatal GTFDB error #2]"
+		Jrst ER.IO]
+	Move Q1,FDBBlk+.FBCTL
+	Txnn Q1,FB%DIR		;is it a dir?
+	 Jrst D.RD35		;no
+	Hrrz Q2,FDBBlk+.FBGEN	;yes, get dir number
+	Hrl Q2,FH.STR		;add in structure code
+	Move 1,Q2
+	Call ChkDir
+	 Jrst D.RDGN		;dir not listable
+	Jrst D.RD03
+D.RD35:	Hrlz 1,FH.STR
+	Hrr 1,FH.DIR
+	Move 2,FDBBlk+.FBPRT
+	Call ChkLsC		;listable
+	 Jrst D.RDGN		;no, get next file
+D.RD03:	Seto 1,
+	PutInt 1,SP		;valid entry
+	Subi P2,4
+	Move 1,[441000,,FooBuf]
+	Hrrz 2,DC.JFN(P4)
+	Move 3,[002000,,000000]	;dir
+	Txnn Q1,FB%DIR		;is it a dir?
+	 Move 3,[002220,,000001];no, do file
+	JFNS%
+	 Erjmp [TypeCR "[NFS] JFNS% death #461"
+		Jrst ER.IO]
+	Move 1,[441000,,FooBuf]
+	Call Lower		;lowercase it
+	Txnn Q1,FB%DIR		;was it a dir?
+	 Jrst D.RD55		;no
+	Hlrz 1,Q2		;get structure code
+	Hrrz 2,Q2		;get dir number
+	Add 1,2			;form fileid (str+dir)
+	SkipA
+D.RD55:	 Move 1,FDBBlk+.FBADR
+	PutUns 1,SP		;fileid
+	Subi P2,4
+
+;now find length of string and send it
+D.RD4:	Movni 2,1
+	Move 1,[441000,,FooBuf]
+D.RD6:	Ildb 3,1
+	Addi 2,1
+	Jumpn 3,D.RD6
+	Movei 3,FooBuf
+	Sub P2,2
+	PutStr 2,SP
+	Subi P2,4		;plus string length word
+
+;cookie for next entry
+	Move 1,FDBBlk+.FBADR
+	PutUns 1,SP		;send cookie
+	Subi P2,4
+	Movem 1,DC.KKY(P4)
+	Call DC.Tim
+
+D.RDGN:	Move 1,DC.JFN(P4)
+	GNJFN%
+	 Erjmp D.RD2
+	Skiple P2		;did we send enough?
+	 Jrst D.RD3		;no, keep going
+	Setz 1,
+	PutUns 1,SP		;say last entry
+	Setz 1,
+	PutUns 1,SP		;send not end of dir
+	Ret
+D.RD2:	Setz 1,
+	PutUns 1,SP		;say last entry
+	Seto 1,
+	PutUns 1,SP		;say it is EOF
+D.RDCJ:	Hrrz 1,DC.JFN(P4)
+	RLJFN%
+	 Erjmp .+1
+	Setzm DC.JFN(P4)
+	Setzm DC.DIR(P4)
+	Setzm DC.KKY(P4)
+	Setzm DC.TAD(P4)
+	Ret
+
+;end of dir entries
+D.RDX:	Setz 1,
+	PutUns 1,SP		;status OK
+	PutUns 1,SP		;end of entries
+	Seto 1,
+	PutUns 1,SP		;no entries in dir
+	Jrst D.RDCJ
+
+;finds cache entry for a directory cookie/jfn
+;takes cookie in P1, rets index to cache in P4
+;retskps if fresh cookie
+DC.FND:	Hrlz 2,FH.STR
+	Hrr 2,FH.DIR
+	Move 3,[.INFIN]
+	Hrlzi 4,-DC.Siz
+DC.FNX:	Caml 3,DC.TAD(4)
+	 Jrst [Move 3,DC.TAD(4)
+	       Hrrz P4,4
+	       Jrst .+1]
+	Came P1,DC.KKY(4)
+	 Jrst DC.FNC
+	Came 2,DC.DIR(4)
+	 Jrst DC.FNC
+	Hrrz P4,4
+	Ret			;found old cookie
+DC.FNC:	Aobjn 4,DC.FNX
+	Hrrz 1,DC.JFN(P4)
+	Skipe 1
+	 RLJFN%
+	  Erjmp .+1
+	Setzm DC.JFN(P4)
+	Setzm DC.KKY(P4)
+	Movem 2,DC.DIR(P4)
+	RetSkp
+
+DC.Tim:	GTAD%
+	Movem 1,DC.TAD(P4)
+	Ret
+
+IFN $GWSW,[
+GW.Snd:	Setz 1,
+	PutUns 1,SP		;status ok
+	Subi P2,4
+;find dir entry, ret if none
+	Call GetHst
+	Hrlzi 4,-GW.Siz
+GW.Snx:	Camn 1,GW.HST(4)
+	 Jrst GW.FnE
+	Aobjn 4,GW.Snx
+	Ret			;didn't find an entry
+GW.FnE:	Seto 1,
+	PutInt 1,SP		;valid entry
+	Subi P2,4
+	Hlrz 1,GW.DIR(4)
+	Hrrz 2,GW.DIR(4)
+	Add 1,2
+	PutUns 1,SP		;fileid
+	Subi P2,4
+
+	Move 1,[440700,,InBuf]
+	Move 2,GW.DIR(4)
+	DIRST%
+	 Erjmp [TypeCR "[NFS] DIRST% death #287"
+		Jrst ER.IO]
+;	Setzm GW.HST(4)		;don't want these anymore
+;	Setzm GW.DIR(4)
+	Move 1,[441000,,FooBuf]
+	Move 2,[440700,,InBuf]
+	Ildb 3,2
+	Caie 3,"<
+	 Jrst .-2
+	Ildb 3,2
+	Cain 3,">
+	 Setz 3,
+	Idpb 3,1
+	Jumpn 3,.-4
+
+	Move 1,[441000,,FooBuf]
+	Call Lower		;lowercase it
+;now find length of string and send it
+	Movni 2,1
+	Move 1,[441000,,FooBuf]
+GW.SnL:	Ildb 3,1
+	Addi 2,1
+	Jumpn 3,GW.SnL
+	Movei 3,FooBuf
+	Sub P2,2
+	PutStr 2,SP
+	Subi P2,4		;plus string length word
+
+	Movei 1,1
+	PutUns 1,SP		;oreo cookie
+	Subi P2,4
+	Call DC.Tim
+	Ret
+];IFN $GWSW
+
+
+;check read access to jfn in ac1
+;retskp if ok, ret if not
+ChkRd:	Push P,Q1
+	Move Q1,1		;save jfn here
+	Movx 1,RC%EMO
+	Move 2,Q1
+	RCDIR%			;get dir jfn is in
+	 Erjmp .+1
+	Move 1,3
+	Call ChkDir		;check dir access
+	 Jrst [Pop P,Q1
+	       Jrst ER.ACC]
+	Push P,1		;save dir num
+	Move 1,Q1
+	Move 2,[1,,.FBPRT]
+	Movei 3,4.
+	GTFDB%
+	 Erjmp [Move 4,[500000,,770000]
+		Jrst .+1]
+	Pop P,1			;this dir
+	Pop P,Q1		;restore jfn
+	Trne 4,40		;world read access?
+	 RetSkp			;yep, ok
+	Movx 2,AD%RD
+	Call ChkAcc		;check for dir read access
+	 Jrst ER.ACC
+	RetSkp			;allowed
+
+
+;see if a host has certain access to a directory
+;uses current host
+;takes ac1/ dir#
+;      ac2/ an access bit
+;retskps if true, kills ac3-4
+ChkAcc:	Push P,1
+	Call GetHst
+	Move 3,1
+	Pop P,1
+	Movn 4,AD.Len
+	Hrlz 4,4
+ChkAc1:	Came 3,AD.Adr(4)	;found host?
+	 Jrst ChkAc2		;no
+	Came 1,AD.Dir(4)	;same dir?
+	 Jrst ChkAc2		;no
+	Move 3,AD.Acc(4)	;get access bits
+	Tdne 3,2		;right access?
+	 RetSkp			;yes, win
+	Jrst ChkAcF		;no, quit
+ChkAc2:	Aobjn 4,ChkAc1
+ChkAcF:	Ret			;lose
+
+
+;check write access to jfn in ac1
+;retskp if ok, ret if not
+ChkWr:	Push P,1		;save jfn
+	Move 2,1
+	Movx 1,RC%EMO
+	RCDIR%			;get dir jfn is in
+	 Erjmp [Pop P,1
+		Jrst ER.IO]
+	Move 1,3		;this dir
+	SkipA
+ChkWDr:	 Push P,1		;check a dir instead of a jfn
+	Movx 2,AD%WR
+	Call ChkAcc
+	 Jrst [Pop P,1
+	       Jrst ER.ACC]
+	Pop P,1
+	RetSkp
+
+
+;retskp if dir access ok
+;ac1/  dir num
+ChkDir:	Hrrz 2,1
+	Cain 2,1
+	 RetSkp			;ok if root
+	Camn 1,LstDir		;same as last time?
+	 Jrst [Move 2,LstDPT	;yep, skip jsys
+	       Jrst ChkDi1]
+	Movei 2,DirBlk
+	Setzm DirBlk
+	Setz 3,
+	GTDIR%
+	Hrrz 2,DirBlk+.CDDPT	;get dir protection
+	Movem 1,LstDir
+	Movem 2,LstDPT
+ChkDi1:	Trne 2,40		;world access?
+	 RetSkp			;yep
+	Movx 2,AD%RD
+	Call ChkAcc
+	 Ret
+	RetSkp
+
+;check if handle is of a root-directory. skip if not.
+NRootP:	Movei 1,1		;root's are always 1
+	Camn 1,FH.DIR
+	 Ret
+	RetSkp
+	
+
+;check list access of jfn in ac1
+;retskp if ok, ret if not
+ChkLst:	Push P,Q1		;save jfn
+	Push P,Q2		;for dir num
+	Move Q1,1
+	Movx 1,RC%EMO
+    	Move 2,Q1
+	RCDIR%			;get dir jfn is in
+	 Erjmp [Pop P,Q2
+		Pop P,Q1
+		Jrst ER.IO]
+	Move Q2,3		;save dir num
+	Move 1,Q2
+	Call ChkDir
+	 Jrst [Pop P,Q2
+	       Jrst ChkLsF]	;no access to dir
+	Move 1,Q1
+	Move 2,[1,,.FBPRT]
+	Movei 3,4.
+	GTFDB%
+	 Erjmp [TypeCR "[NFS] GTFDB error #1"
+		Move 4,[500000,,770000]
+		Jrst .+1]
+	Move 1,Q2		;dir
+	Pop P,Q2
+	Trne 4,02		;dir listing ok?
+	 Jrst ChkLsP		;yep
+	Movx 2,AD%RD
+	Call ChkAcc
+	 Jrst ChkLsF
+	Jrst ChkLsP		;yes
+ChkLsF:	Move 1,Q1
+	Pop P,Q1
+	Ret
+ChkLsP:	Move 1,Q1
+	Pop P,Q1
+	RetSkp
+
+;same as ChkLst but doesn't use jsys calls
+;takes ac1/ dir# file is in, ac2/ file protection
+ChkLsC:	Push P,Q1
+	Push P,Q2
+	Move Q1,1
+	Move Q2,2
+	Call ChkDir
+	 Jrst ChkLcF
+	Trne Q2,02
+	 Jrst ChkLcP
+	Move 1,Q1
+	Movx 2,AD%RD
+	Call ChkAcc
+	 Jrst ChkLcF
+ChkLcP:	Pop P,Q2
+	Pop P,Q1
+	RetSkp
+ChkLcF:	Pop P,Q2
+	Pop P,Q1
+	Ret
+
+
+;Return file system attributes
+D.GSA:	DEBUGS
+	DEBUGM "Read file system attributes of "
+	Call GetHandle
+	DEBUGF
+	DEBUGX
+	Move 1,FH.STR
+	Hrli 1,600000
+	GDSKC%			;Get DiSK Crap
+	 Erjmp ER.NSF
+	Setz 3,			;status OK
+	PutUns 3,SP
+	Move 3,TSize		;max transfer size
+	PutUns 3,SP
+	Movei 3,PSize		;page size in bytes
+	PutUns 3,SP
+	Move 3,1
+	Add 3,2
+	PutUns 3,SP		;total page count
+	PutUns 2,SP		;free pages
+	PutUns 2,SP		;pages available to user
+	Ret
+
+
+;lookup file name
+D.LFN:	DEBUGS
+	DEBUGM |Lookup file name "|
+	Call GetDA		;get directory args
+	 Ret
+	DEBUGA FN
+	DEBUGM |" in dir |
+	DEBUGF
+	DEBUGX
+	Hrroi 1,FooBuf
+	Hrlz 2,FH.STR
+	Hrr 2,FH.DIR
+	DIRST%
+	 Erjmp ER.NOD		;oops
+	Setz 4,			;no dot seen yet
+	Move 2,[440700,,FN]
+D.LFN1:	Ildb 3,2
+	Cain 3,".
+	 Seto 4,		;saw a dot
+	Idpb 3,1
+	Jumpn 3,D.LFN1
+	Jumpe 4,D.LFN2		;it's a dir name (or maybe a file)
+	Move 1,FN
+	Camn 1,[Asciz /./]	;dumb unix machine looking for "."?
+	 Jrst D.LFDT		;yep
+	Camn 1,[Asciz /../]	;dumb unix machine looking for ".."?
+	 Jrst D.LFD2		;yep
+;else its a file
+D.LFNF:	Movx 1,GJ%SHT\GJ%OLD
+	Hrroi 2,FooBuf
+	GTJFN%
+	 Erjmp ER.NSF
+	Movem 1,TmpJFN
+	Call ChkLst
+	 Jrst [Call ER.ACC
+	       Jrst RelRet]
+	Call Jfn2Fh
+;send reply
+	Setz 1,
+	PutUns 1,SP		;status OK
+	Call PutFH		;send file handle
+	Move 1,TmpJFN
+	Call PutAtr		;send attributes
+	Move 1,TmpJFN
+	RLJFN%
+	 Erjmp .+1
+	Ret
+;send dir handle
+D.LFN2:	Movei 3,">
+	Dpb 3,1
+	Setz 3,
+	Idpb 3,1
+	Move 1,[440700,,FooBuf]
+D.LFN3:	Ildb 2,1
+	Caie 2,">
+	 Jrst D.LFN3
+	Movei 2,".
+	Dpb 2,1
+D.LFN4:	Move 1,[440700,,FooBuf]
+	Call Dir2FH
+	 Jrst D.LFN6		;no such dir
+	Push P,1		;save dir num
+	Call ChkDir		;ok?
+	 Jrst [Call ER.ACC
+	       Pop P,1
+	       Ret]
+	Setz 1,
+	PutUns 1,SP		;status OK
+	Call PutFH		;send file handle
+	Pop P,1			;get dir num
+	Call PutDat		;send attributes
+	Ret
+
+;lookup file STR:<DIR>.  (Return handle to same dir)
+D.LFDT:	Move 1,[440700,,FooBuf]
+D.LFD1:	Ildb 2,1
+	Caie 2,">
+	 Jrst D.LFD1
+	Setz 2,
+	Idpb 2,1
+	Jrst D.LFN4
+
+;lookup file STR:<DIR>..  (Return handle to superior dir)
+D.LFD2:	Move 1,[440700,,FooBuf]
+	Setz 3,
+D.LFD3:	Ildb 2,1
+	Cain 2,".
+	 Move 3,1		;save pointer to last dot
+	Caie 2,">
+	 Jrst D.LFD3
+	Jumpe 3,D.LFD4		;no dot found, use root
+	Dpb 2,3
+	Setz 2,
+	Idpb 2,3
+	Jrst D.LFN4
+D.LFD4:	Move 1,[440700,,FooBuf]
+D.LFD5:	Ildb 2,1
+	Caie 2,":
+	 Jrst D.LFD5
+	Hrroi 2,[Asciz /<ROOT-DIRECTORY>/]
+	Setz 3,
+	$SOUT
+IFN $GWSW,[
+	Hrlz 1,FH.STR
+	Hrr 1,FH.DIR
+	Call GW.Add
+];IFN $GWSW
+	Jrst D.LFN4
+
+;dir "foo" doesn't exist, try for file "foo..0"
+D.LFN6:	Hrroi 1,FooBuf
+	Hrlz 2,FH.STR
+	Hrr 2,FH.DIR
+	DIRST%
+	 Erjmp ER.NOD
+	Move 2,[440700,,FN]
+	Setz 3,
+	$SOUT
+	Hrroi 2,[Asciz /..0/]
+	$SOUT
+	Jrst D.LFNF
+
+
+IFN $GWSW,[
+;ac1/ Dir# to remember
+GW.Add:	Move 2,1
+	Call GetHst
+	Hrlzi 4,-GW.Siz
+GW.Anx:	Came 1,GW.HST(4)
+	 Jrst GW.Aob
+	Movem 2,GW.DIR(4)
+	Ret
+GW.Aob:	Aobjn 4,GW.Anx
+	Move 4,GW.PTR
+	Movem 1,GW.HST(4)
+	Movem 2,GW.DIR(4)
+	Addi 4,1
+	Cail 4,GW.Siz
+	 Setz 4,
+	Movem 4,GW.PTR
+	Ret
+];IFN $GWSW
+
+
+;read from file
+D.RF:	DEBUGS
+	DEBUGM "Read from file "
+	Call GetHandle		;what file
+	DEBUGF
+	Call O.Find		;is it in the cache?
+	 Jrst D.RFOF		;no, so add it
+D.RF1:	Move P1,1		;save OF index
+	Call O.ChkR		;do we have read access?
+	 Jrst ER.Acc		;nope
+	DEBUGM " at offset "
+	GetUns Q1,RP		;get offset
+	DEBUGD Q1
+	DEBUGM " get "
+	GetUns Q2,RP		;byte count
+	DEBUGD Q2
+	DEBUGM " bytes."
+	DEBUGX
+	Camle Q2,TSize
+	 Jrst ER.ACC
+IFN $PRSW,[
+	Skipn Q1		;if offset zero
+	 Call D.PON		; then turn on pre-reading
+	Move 4,P1
+	Imuli 4,OF.BSZ
+	Move 3,4		;save offset
+	Hrli 4,-OF.BSZ
+D.SBF:	Skipe OF.STA(4)		;status ok?
+	 Jrst D.NBF
+	Came Q1,OF.BEG(4)	;offset same?
+	 Jrst D.NBF
+	Camle Q2,OF.CNT(4)	;count ok?
+	 Jrst D.NBF
+	DEBUGM " (hit)"
+	Setzm OF.MIS(P1)	;hit
+	Tlz 4,-1
+	Sub 4,3			;make proper index
+	Jrst D.CRD		;yep, read from cache
+D.NBF:	Aobjn 4,D.SBF
+D.NRC:	DEBUGM " (miss)"
+	Aos OF.MIS(P1)		;count misses
+];IFN $PRSW
+D.NRD:	Move 1,OF.JFN(P1)	
+	Move 2,Q1
+	SFPTR%
+	 Erjmp ER.IO
+	Move 2,[441000,,InBuf]
+	Movn 3,Q2
+	SIN%			;read it
+	Add Q2,3		;get count of bytes read
+	
+IFN $PRSW,[
+	Push P,3
+]
+	Setz 1,
+	PutUns 1,SP		;status OK
+	Move 1,OF.JFN(P1)
+	Call PutAtr		;send file attributes
+	Move 1,Q2
+	Movei 2,InBuf
+	PutStr 1,SP		;and send data
+IFN $PRSW,[
+	Pop P,3
+	Jumpn 3,R
+D.PST:	Move 1,OF.PRD(P1)
+	Txnn 1,OF%PON
+	 Ret
+	Add Q1,Q2
+	Movem Q1,PR.BEG
+	Movem Q2,PR.CNT
+	Movem P1,PR.OFN
+	Setom PR.FLAG		;pre-read this stuff
+];IFN $PRSW
+	Ret
+
+;open file and add entry to cache
+D.RFOF:	DEBUGM " (open)"
+	Call Fh2JFN		;get a JFN on it
+	 Jrst ER.NSF
+	Move P1,1		;save JFN
+	Call ChkRd
+	 Jrst [Move 1,P1
+	       RLJFN%
+		Jfcl
+	       Ret]
+	Move 1,P1
+	Call O.Add		;add entry
+	Move P1,1		;save OF index
+	Move 1,OF.JFN(P1)
+	Move 2,[1,,.FBBYV]
+	Movei 3,4
+	GTFDB%
+	 Erjmp [TypeCR "[NFS] GTFDB error #4276"
+		Jrst D.RFER]
+	Movx 2,OF%PLN\OF%RD
+	Ldb 3,[.BP FB%BSZ,4]	;get byte size
+	Caie 3,7.
+	 Cain 3,8.
+	  SkipA
+	   Jrst D.RFER
+	Dpb 3,[.BP OF%BSZ,2]
+	Movem 2,OF.ACC(P1)
+	OPENF%
+	 Erjmp D.RFER
+	Move 1,P1
+	Call O.Tim
+	Move 1,P1
+	Jrst D.RF1
+
+D.RFER:	Call ER.ACC
+	Move 1,OF.JFN(P1)
+	RLJFN%
+	 Erjmp .+1
+	Move 1,P1
+	Call O.Del
+	Ret
+
+IFN $PRSW,[
+D.PON:	Move 1,P1
+	Imuli 1,OF.BSZ
+	Hrli 1,-OF.BSZ
+	Setom OF.STA(1)
+	Aobjn 1,.-1
+	Movx 1,OF%PON
+	Movem 1,OF.PRD(P1)
+	Ret
+
+D.CRD:	Push P,4		;save buffer index
+	Setz 1,
+	PutUns 1,SP		;status OK
+	Move 1,OF.JFN(P1)
+	Call PutAtr		;send file attributes
+	Move 1,Q2
+	Move 2,P1
+	Imuli 2,OF.BSZ*1000
+	Addi 2,OF.BUF
+	Pop P,3			;buffer index
+	Imuli 3,1000
+	Add 2,3
+	PutStr 1,SP
+	Jrst D.PST
+
+D.IRD:	Skipn PR.FLAG		;anything to do?
+	 Ret			;nope
+	
+	Move 1,OF.MIS(P1)
+	Caile 1,5.		;allow 5 misses in a row
+	 Jrst [Setzm OF.PRD(P1)	;then turn off pre-reading
+	       Jrst D.IRDX]
+
+	Move P1,PR.OFN
+	Move Q1,PR.BEG
+	Move Q2,PR.CNT
+	Caige Q2,512.
+	 Movei Q2,512.		;read something reasonable
+
+	Move 4,P1
+	Imuli 4,OF.BSZ
+	Hrli 4,-OF.BSZ
+D.INS:	Skipe OF.STA(4)
+	 Jrst D.IN
+	Came Q1,OF.BEG(4)
+	 Jrst D.IN
+	Jrst D.IRDX		;already got it
+D.IN:	Aobjn 4,D.INS
+	Hrrz Q3,OF.PRD(P1)	;next buffer to use
+
+	DEBUGM " (pre-read)"
+	Move 1,OF.JFN(P1)	
+	Move 2,Q1
+	SFPTR%
+	 Erjmp D.IRDX
+	Move 2,P1
+	Imuli 2,OF.BSZ*1000
+	Addi 2,OF.BUF
+	Move 3,Q3
+	Imuli 3,1000
+	Add 2,3
+	Hrli 2,441000
+	Movn 3,Q2
+	SIN%			;read it
+	Add Q2,3
+	Hrrz 1,OF.PRD(P1)
+	Addi 1,1
+	Cail 1,OF.BSZ
+	 Setz 1,
+	Hrrm 1,OF.PRD(P1)	;point to next buffer
+	Move 1,P1
+	Imuli 1,OF.BSZ
+	Add 1,Q3
+	Movem Q1,OF.BEG(1)
+	Movem Q2,OF.CNT(1)
+	Setzm OF.STA(1)
+
+D.IRDX:	Setzm PR.FLAG		;all done
+	Ret
+];IFN $PRSW
+
+
+;write to file
+D.WF:	DEBUGS
+	DEBUGM "Write to file "
+	Call GetHandle
+	DEBUGF
+	Call O.Find
+	 Jrst D.WFOF
+	Call O.ChkW		;have write access?
+	 Jrst [Move P1,1	;no
+	       Move 1,OF.JFN(P1)
+	       Call ChkWr	;can we write?
+		Ret		;no
+	       Move 1,OF.JFN(P1);yes
+	       Txo 1,CO%NRJ	
+	       CLOSF%		;close file
+		Jfcl
+	       Setzm OF.PRD(P1)	;no more pre-reads
+	       Jrst D.WFO1]	;and re-open for RW
+D.WF1:	Move P1,1
+	Call O.ChkW
+	 Jrst ER.ACC
+	DEBUGM " at offset "
+	Move 1,OF.JFN(P1)
+	GetUns 2,RP		;ignore
+	GetUns 2,RP		;offset
+	Movem 2,WF.OFF
+	DEBUGD 2
+	SFPTR%
+	 Erjmp ER.IO
+	GetUns 2,RP		;ignore
+	GetStr 1,RP		;data
+	Movem 1,WF.CNT
+	DEBUGM " put "
+	DEBUGD 1
+	DEBUGM " bytes."
+	DEBUGX
+	Camle 1,Tsize
+	 Jrst ER.ACC
+	Movn 3,1
+	Move 1,OF.JFN(P1)
+	SOUT%
+
+	Setzm OF.PRD(P1)	;invalidate buffers
+	Setz 1,
+	PutUns 1,SP		;OK
+	Move 1,OF.JFN(P1)
+	Call PutAtr
+	Move 1,OF.JFN(P1)
+	Move 2,[1,,.FBSIZ]
+	Movei 3,4
+	GTFDB%			;get file byte count
+	 Erjmp [Movei 4,8.
+		Jrst .+1]
+       	Move 3,WF.OFF
+	Add 3,WF.CNT		;figure byte count
+	Camg 3,4
+	 Jrst D.WFX
+	Move 1,OF.JFN(P1)
+	Hrli 1,.FBSIZ	
+	Txo 1,CF%NUD
+	Seto 2,
+	CHFDB%			;set file byte count
+	 Erjmp .+1
+	Tlz 1,-1
+	RFBSZ%
+	 Movei 2,8.
+	Cain 2,7.
+	 Movei 2,2561.
+	Cain 2,8.
+	 Movei 2,2049.
+	Idiv 3,2		;figure page size
+	Addi 3,1		;plus one
+	Hrli 1,.FBBYV
+	Txo 1,CF%NUD
+	Movx 2,FB%PGC
+	CHFDB%			;set page size
+	 Erjmp .+1
+	Hrlz 1,OF.JFN(P1)
+	Hrrz 2,3
+;	Txo 2,UF%NOW		;don't wait around
+	UFPGS%			;update modified pages to disk
+	 Erjmp .+1
+D.WFX:	Ret
+
+D.WFOF:	DEBUGM " (open)"
+	Call Fh2Jfn
+	 Jrst ER.NSF
+	Move P1,1
+	Call ChkWr
+	 Jrst [Move 1,P1
+	       RLJFN%
+		Jfcl
+	       Ret]
+	Move 1,P1
+	Call O.Add
+	Move P1,1
+D.WFO1:	Move 1,OF.JFN(P1)
+	Move 2,[1,,.FBBYV]
+	Movei 3,4
+	GTFDB%
+	 Erjmp D.RFER
+	Ldb 4,[.BP FB%BSZ,4]
+	Caie 4,7.
+	 Cain 4,8.
+	  SkipA
+	   Jrst D.RFER
+	Move 2,[OF%PLN\OF%WR\OF%RD]
+	Dpb 4,[.BP OF%BSZ,2]
+	Movem 2,OF.ACC(P1)
+	OPENF%
+	 Erjmp D.RFER
+	Move 1,P1
+	Call O.Tim
+	Move 1,P1
+	Jrst D.WF1
+
+
+;open file cache routines
+
+;see if file is in cache
+;takes FH.* filehandle, returns +1 on failure
+;returns +2 on success with OF index in ac1
+O.Find:	Call GetHst
+	Move 2,1
+	Skipn 1,FH.HND
+	 Ret
+	Move 4,[-OFN,,0]
+	Move 3,FH.STR
+O.Fin2:	Came 1,OF.HND(4)	;same handle?
+	 Jrst O.FinN
+	Came 3,OF.STR(4)	;same structure?
+	 Jrst O.FinN
+	Camn 2,OF.HST(4)	;and same host?
+	 Jrst O.Fin1
+O.FinN:	Aobjn 4,O.Fin2
+	Ret
+O.Fin1:	Hrrz 1,4	
+	RetSkp
+
+;enter file into cache
+;takes FH.* filehandle, JFN in ac1
+;returns +1 (always succeeds) with OF index in AC1
+O.Add:	Push P,1
+O.Ad05:	Move 4,[-OFN,,0]
+O.Add1:	Skipe 1,OF.HND(4)
+	 Aobjn 4,O.Add1
+	Jumpn 1,[Call O.DelO	;no space, must delete something
+		 Aos ST.OCR	;count stats
+		 Jrst O.Ad05]
+	Move 1,FH.HND
+	Movem 1,OF.HND(4)
+	Move 1,FH.STR
+	Movem 1,OF.STR(4)
+	Call GetHst
+	Movem 1,OF.HST(4)
+	Hrrz 1,4
+	Call O.Tim
+	Pop P,1
+	Movem 1,OF.JFN(4)
+	Setzm OF.ACC(4)
+	Setzm OF.PRD(4)
+	Setzm OF.MIS(4)
+	Hrrz 1,4
+	Ret
+
+;set last update time. OF index in ac1
+O.Tim:	Push P,2
+	Move 2,1
+	GTAD%
+	Movem 1,OF.TIM(2)
+	Pop P,2
+	Ret
+
+;delete oldest cache entry
+;returns +1 (always succeeds)
+O.DelO:	Move 4,[-OFN,,0]
+	Move 3,[.INFIN]
+O.Del1:	Camle 3,OF.TIM(4)
+	 Jrst [Move 2,4
+	       Move 3,OF.TIM(4)
+	       Jrst .+1]
+	Aobjn 4,O.Del1
+	Move 1,OF.JFN(2)
+	CLOSF%
+	 Erjmp .+1
+	Move 1,2
+;	Call O.Del
+;	Ret
+
+;delete cache entry
+;takes index in ac1
+;returns +1 (always succeeds)
+O.Del:	Setzm OF.JFN(1)
+	Setzm OF.TIM(1)
+	Setzm OF.HND(1)
+	Setzm OF.STR(1)
+	Setzm OF.ACC(1)
+	Setzm OF.JFN(1)
+	Setzm OF.HST(1)
+	Setzm OF.PRD(1)
+	Setzm OF.MIS(1)
+	Ret
+
+;close jfn filehandle if it's in cache.  ac1/ jfn
+O.Cls:	Push P,Q1
+	Move Q1,1
+	Move 2,[1,,.FBADR]
+	Movei 3,4.
+	GTFDB%
+	 Erjmp [Setz 4,
+		Jrst .+1]
+	Push P,FH.HND
+	Call O.Find
+	 Jrst O.Clsx
+	Move 2,1
+	Move 1,OF.JFN(2)
+	CLOSF%
+	 Erjmp .+1
+	Move 1,2
+	Call O.Del
+O.Clsx:	Pop P,FH.HND
+	Move 1,Q1
+	Pop P,Q1
+	Ret
+
+;check read access
+;takes cache index in ac1
+;retskp if ok
+O.ChkR:	Move 2,OF.ACC(1)
+	Txnn 2,OF%RD
+	 Ret
+	RetSkp
+
+;check write access
+;takes cache index in ac1
+;retskp if ok
+O.ChkW:	Move 2,OF.ACC(1)
+	Txnn 2,OF%WR
+	 Ret
+	RetSkp
+
+
+;reads diropargs (fhandle, fname)
+;returns with handle in FH.XXX, name in FN
+;retskp on success
+GetDA:	Call GetHandle
+	Move 1,FH.TYP
+	Caie 1,FH.TDI		;is it a dir?
+	 Jrst ER.NOD
+	Setzm FN
+	Move 1,[440700,,FN]
+	Movei 3,8.
+	Movem 3,FN.BYT		;default to 8 bits
+	GetStr 2,RP
+	Jumpe 2,ER.NOD
+GetDa1:	Ildb 4,3
+	Cain 4,",
+	 Jrst GetDa2		;jump if attributes
+	Idpb 4,1
+	Sojg 2,GetDa1
+	Setz 4,
+	Idpb 4,1
+GetDAX:	RetSkp
+GetDa2:	Setz 4,
+	Idpb 4,1		;end name
+	Sojle 2,GetDAX
+	Ildb 4,3
+	Caie 4,"b
+	 Cain 4,"B
+	  SkipA
+	   Jrst GetDAX
+	Sojle 2,GetDAX
+	Ildb 4,3
+	Caie 4,"7
+	 Jrst GetDAX
+	Movei 4,7.
+	Movem 4,FN.BYT
+	RetSkp			;success
+
+Da2Str:	Hrroi 1,FooBuf
+	Hrlz 2,FH.STR
+	Hrr 2,FH.DIR
+	DIRST%
+	 Erjmp ER.NOD
+	Move 2,[440700,,FN]
+	Setz 3,
+	$SOUT
+	Ret
+
+
+;reads a file handle
+GetHandle:
+	GetXdr 1,RP
+	Ldb 2,[.BP FH%TYP,1]
+	Movem 2,FH.TYP
+	Ldb 2,[.BP FH%HND,1]
+	Movem 2,FH.HND
+	Ldb 2,[.BP FH%ST1,1]
+	Lsh 2,14.
+	Movem 2,FH.STR
+	GetXdr 1,RP
+	Ldb 2,[.BP FH%ST2,1]
+	Iorm 2,FH.STR
+	Ldb 2,[.BP FH%DIR,1]
+	Movem 2,FH.DIR
+	Hrlz 1,RP
+	Hrri 1,FH.NAM
+	Blt 1,FH.NAM+5
+	Addi RP,6
+	Ret
+
+;send the current file handle in FH
+PutFH:	Hrrz 1,SP
+	Hrli 1,FH
+	Addi SP,8.
+	Blt 1,-1(SP)
+	Ret
+
+
+;attributes stuff
+
+;read attributes
+GetAtr:	GetUns 1,RP		;mode
+	Movem 1,AT.MOD
+	GetUns 1,RP		;uid
+	GetUns 1,RP		;gid
+	GetUns 1,RP		;size
+	Movem 1,AT.SIZ
+	Call GetTim		;atime
+	Movem 1,AT.ATM
+	Call GetTim		;mtime
+	Movem 1,AT.MTM
+	Ret
+
+;set attributes, takes jfn in ac1
+SetAtr:	Move 4,AT.MOD
+	Movei 3,770000		;owner always has full access
+	Trne 4,4		;read?
+	 Tro 3,4242
+	Trne 4,2		;write?
+	 Tro 3,2626
+	Trne 4,1		;execute?
+	 Tro 3,1212
+	Cain 3,777676
+	 Tro 3,777777
+	
+	Txo 1,CF%NUD		;don't wait
+	Hrli 1,.FBPRT
+	Movei 2,777777
+	CHFDB%
+	 Erjmp .+1
+	Txo 1,CF%NUD		;don't wait
+	Hrli 1,.FBREF
+	Seto 2,
+	Move 3,AT.ATM
+	CHFDB%
+	 Erjmp .+1
+	Txo 1,CF%NUD		;don't wait
+	Hrli 1,.FBWRT
+	Seto 2,
+	Move 3,AT.MTM
+	CHFDB%
+	 Erjmp .+1
+	Ret
+
+
+;send attributes for directory in ac1
+PutDat: Movei 3,2		;directory
+	PutUns 3,SP		;file type
+	Movei 3,040000		;more dir flags
+;add in permissions here
+	Tro 3,755		;rwxr-xr-x  (Unix seems to like this)
+	PutUns 3,SP		;mode
+	Movei 3,1
+	PutUns 3,SP		;nlinks
+	Seto 3,
+	PutInt 3,SP		;uid
+	PutInt 3,SP		;gid
+	Movei 3,512.		;fake something being there
+	PutUns 3,SP		;byte count
+	Movei 3,PSize		;page size in bytes
+	PutUns 3,SP	
+	Seto 3,
+	PutInt 3,SP		;rdev 
+	Movei 3,1		;fake something
+	PutUns 3,SP		;page count
+	Move 3,APRID
+	PutInt 3,SP		;fsid
+	Hlrz 3,1		;get structure code
+	Tlz 1,-1
+	Add 3,1			;add in dir number
+	PutUns 3,SP		;fileid
+	GTAD%			;don't know if it changed
+	Call PutTim		;last access time
+	Call PutTim		;last write time
+IFN $DUSW,[
+;this is where the kludge would go
+; do DSKOP%s to read last update time of directory
+]
+	Call PutTim		;last status change time
+	Ret
+
+
+;send file attributes for JFN in ac1
+PutAtr:	Move 2,[.FBSS2+1,,.FBHDR]
+	Movei 3,FDBBlk
+	GTFDB%
+	 Erjmp ER.IO
+	Move 2,FDBBlk+.FBCTL
+	Movei 3,1		;regular file
+	Txne 2,FB%DIR
+	 Movei 3,2		;directory
+	PutUns 3,SP		;file type
+	Movei 3,100000
+	Txne 2,FB%DIR
+	 Movei 3,040000
+;do permissions
+	Hrrz 2,FDBBlk+.FBPRT	;protection bits
+	Trne 2,400000		;read for owner?
+	 Tro 3,400
+	Trne 2,200000		;write for owner?
+	 Tro 3,200
+	Trne 2,100000		;execute for owner?
+	 Tro 3,100
+	Trne 2,000040		;read for world?
+	 Tro 3,4
+	Trne 2,000020		;write for world?
+	 Tro 3,2
+	Trne 2,000010		;execute for world?
+	 Tro 3,1
+	PutUns 3,SP		;mode
+	Movei 3,1
+	PutUns 3,SP		;nlinks
+	Push P,1
+	Move 2,1
+	Movx 1,RC%EMO
+	RCDIR%
+	 Erjmp PutAt1
+	Move 1,3
+	Movx 2,AD%RD
+	Call ChkAcc		;access to dir?
+	 Jrst PutAt1		;no, say no owner
+	Call GetUID		;get uid of caller
+	Move 3,1		;and pretend he is owner
+	SkipA
+PutAt1:	 Seto 3,
+	PutInt 3,SP		;uid
+	Pop P,1
+	PutInt 3,SP		;gid
+	Move 3,FDBBlk+.FBSIZ
+	PutUns 3,SP		;byte count
+	Movei 3,Psize		;page size in bytes
+	PutUns 3,SP	
+	Seto 3,
+	PutInt 3,SP		;rdev
+	Ldb 3,[.BP FB%PGC,FDBBlk+.FBBYV]
+	PutUns 3,SP		;page count
+	Move 3,APRID
+	PutInt 3,SP		;fsid
+	Move 3,FDBBlk+.FBADR
+	PutUns 3,SP		;fileid
+        Move 1,FDBBlk+.FBREF
+	Call PutTim		;last access time
+        Move 1,FDBBlk+.FBWRT
+	Call PutTim		;last write time
+	GTAD%
+	Call PutTim		;you can't observe it without changing it!
+	Ret
+
+
+;layer breakers
+
+;Get the Unix UID of caller
+;takes nothing, returns uid in ac1 (-1 if none)
+GetUid:	Move 1,RPC"A.UID
+	Ret
+
+;returns host of caller in ac1
+GetHst:	Move 1,RPC"RcvBlk+U%SHST
+	Ret
+
+
+;send the tops-20 format time in ac1 in format:
+; seconds since 1970 (32 bits)
+; useconds part (32 bits)
+TMBDIF==<365.*111.>+72.		;1858 BASE VS 1970 BASE, IN DAYS
+PutTim:	Move 2,1
+	Jumpe 2,PutTix
+	MOVEI 3,(2)		;TOPS20 FRACTION OF A DAY
+	HLRZS 2			;DAYS SINCE NOV 1858
+	SUBI 2,TMBDIF		;BRING DOWN TO 1970
+	MULI 3,<24.*60.*60.>	;CONVERT TO SECONDS FROM 1/3 SEC
+	DIV 3,[1,,0]		; ..
+	CAIL 4,400000		;ROUND TO NEAREST SECOND
+	ADDI 3,1		;ROUND UP
+	CAIL 3,<24.*60.*60.>	;WENT TO WHOLE DAY?
+	JRST [	MOVEI 3,0	;YES, COUNT A DAY
+		AOJA 2,.+1]
+	IMULI 2,<24.*60.*60.>	;SECONDS FROM DAYS
+	ADDI 2,(3)		;SECONDS WITHIN TODAY
+PutTix:	PutUns 2,SP		;seconds
+	Setz 2,
+	PutUns 2,SP		;useconds.  who cares.
+	Ret
+
+;reads an NFS format time, returns tops-20 tad in ac1
+GetTim:	GetUns 2,RP		;seconds
+	GetUns 1,RP		;ignore useconds
+	Jumpe 2,GetTiz
+	PUSH P,3		;PRESERVE REGISTERS
+	PUSH P,4		; ..
+	IDIVI 2,<24.*60.*60.>	;GET DAYS AND SECONDS IN TODAY, GMT
+	ADDI 2,TMBDIF		;ADD OFFSET FOR MJD 0
+	MUL 3,[1,,0]		;CONVERT SECONDS TO FRACTION OF DAY
+	DIVI 3,<24.*60.*60.>	; FOR TOPS20 FORMAT GTAD
+	CAIL 4,<24.*60.*60.>/2	;ROUND IT
+	ADDI 3,1		; ..
+	MOVSI 2,(2)		;DAYS TO LH OF GTAD
+	HRRI 2,(3)		;FRACTION OF DAY TO RH
+	POP P,4			;RESTORE REGS
+	POP P,3			; ..
+GetTiz:	Move 1,2
+	Ret			;GTAD FORMAT IN B
+
+
+;convert a filehandle to a JFN
+;takes handle in FH.*
+;rets +2 on success with ac1/ jfn
+Fh2Jfn:	Hrroi 1,FooBuf		;make file name here
+	Hrlz 2,FH.STR
+	Hrr 2,FH.DIR
+	DIRST%
+	 Erjmp R
+	Move 2,FH.TYP
+	Cain 2,FH.TLN		;long name file?
+	 Jrst Fh2Lnj		;yes
+	Move 2,[441000,,FH.NAM]
+Fh2Jf1:	Setz 3,	
+	$SOUT
+	Movx 1,GJ%SHT\GJ%OLD
+	Hrroi 2,FooBuf
+	GTJFN%
+	 Erjmp R
+	RetSkp
+
+;long file name handle
+Fh2Lnj:	Hrroi 2,[Asciz /*.*.*/]
+	Setz 3,
+	$SOUT
+	Movx 1,GJ%SHT\GJ%OLD\GJ%IFG
+	Hrroi 2,FooBuf
+	GTJFN%
+	 Erjmp R
+	Push P,Q1
+	Move Q1,1
+Fh2Ln1:	Hrrz 1,Q1
+	Move 2,[1,,.FBADR]
+	Movei 3,4
+	GTFDB%
+	 Erjmp Fh2Ln2
+	Camn 4,FH.HND
+	 Jrst Fh2LnF
+	Move 1,Q1
+	GNJFN%
+	 Erjmp Fh2Ln2
+	Jrst Fh2Ln1
+Fh2Ln2:	Move 1,Q1
+	RLJFN%
+	 Erjmp .+1
+	Pop P,Q1
+	Ret
+Fh2LnF:	Hrrz 1,Q1
+	Pop P,Q1
+	RetSkp
+
+
+;convert a JFN to a filehandle
+;takes ac1/ jfn
+;rets block FH filled in
+Jfn2Fh:	Push P,Q1
+	Setzm FH+0
+	Setzm FH+1
+	Move Q1,1		;save jfn
+;get dir number
+	Movei 1,FH.TFL		;type file
+	Dpb 1,[.BP FH%TYP,FH+0]
+
+	Move 1,Q1
+	Move 2,[1,,.FBADR]
+	Movei 3,4
+	GTFDB%
+	 Erjmp [TypeCR "[NFS] GTFDB% failure #44"
+		Jrst Die]
+	Dpb 4,[.BP FH%HND,FH+0]
+
+	Setz 1,
+	Move 2,Q1
+	RCDIR%
+	 Erjmp [TypeCR "[NFS] JFN problem with RCDIR%"
+		Jrst Die]
+	Ldb 1,[.BP <740000,,0>,3]
+	Dpb 1,[.BP FH%ST1,FH+0]
+	Ldb 1,[.BP <037777,,0>,3]
+	Dpb 1,[.BP FH%ST2,FH+1]
+	Hrrz 1,3
+	Dpb 1,[.BP FH%DIR,FH+1]
+;and name
+	Move 1,[441000,,FH+2]
+	Move 2,Q1
+	Move 3,[002220,,1]
+	JFNS%
+	 Erjmp [TypeCR "[NFS] JFNS% death #7623"
+		Jrst Die]
+	Setz 2,
+	Idpb 2,1
+	Tlz 1,-1
+	Cail 1,FH+10
+	 Call Jfn2Lf		;long file name...blah
+Jfn2Fx:	Pop P,Q1
+	Ret
+
+Jfn2Lf:	Movei 1,FH.TLN		;long file name type
+	Dpb 1,[.BP FH%TYP,FH+0]
+	Setzm FH+2
+	Setzm FH+3
+	Setzm FH+4
+	Setzm FH+5
+	Setzm FH+6		;huh
+	Setzm FH+7
+	Ret
+
+
+;directory to file handle
+;takes dir string in ac1
+;retskp's with handle in FH, dir num in ac1
+Dir2FH:	Movx 1,RC%EMO
+	Hrroi 2,FooBuf
+	RCDIR%
+	 Erjmp R
+	Txne 1,RC%NOM
+	 Ret
+	Push P,Q1
+	Move Q1,3		;save dir num
+	Setzm FH+0
+	Move 1,[FH+0,,FH+1]
+	Blt 1,FH+6
+	Movei 1,FH.TDI		;type directory
+	Dpb 1,[.BP FH%TYP,FH+0]
+	Setz 1,			;don't need an id for dirs
+	Dpb 1,[.BP FH%HND,FH+0]
+	Ldb 1,[.BP <740000,,0>,Q1]
+	Dpb 1,[.BP FH%ST1,FH+0]
+	Ldb 1,[.BP <037777,,0>,Q1]
+	Dpb 1,[.BP FH%ST2,FH+1]
+	Hrrz 1,Q1
+	Dpb 1,[.BP FH%DIR,FH+1]
+	Move 1,Q1
+	Pop P,Q1
+	RetSkp
+
+
+;lower case a string, pointer in ac1
+Lower:	Ildb 2,1
+	Cail 2,"A
+	 Caile 2,"Z
+	  SkipA
+	   Addi 2,32.
+	Dpb 2,1
+	Jumpn 2,Lower
+	Ret
+
+
+;errors
+;  (should fix these to reset SP to beginning of reply data so
+;  they would always be useable)
+
+ER.ROS:	Movei 1,30.		;Read Only silly!
+	PutUns 1,SP	
+	Ret
+
+ER.NSF:	Movei 1,2.		;No Such File
+	PutUns 1,SP
+	Ret
+
+ER.NOD:	Movei 1,20.		;Not a Directory
+	PutUns 1,SP
+	Ret
+
+ER.IO:	Movei 1,5.		;I/O error
+	PutUns 1,SP
+	Ret
+
+ER.DIR:	Movei 1,21.		;Is a Directory (wanted a file)
+	PutUns 1,SP
+	Ret
+
+ER.ACC:	Movei 1,13.		;permission denied
+	PutUns 1,SP
+	Ret
+
+ER.OVQ:	Movei 1,69.		;over quota
+	PutUns 1,SP
+	Ret
+
+
+;access control file parsing
+GetACF:	Setzm AD.Len
+	Movx 1,GJ%SHT\GJ%OLD
+	Hrroi 2,ADNam
+	GTJFN%
+	 Erjmp R		;no file, no access
+	Movem 1,ADJfn
+	Move 2,[Field(7.,OF%BSZ)\OF%RD]
+	OPENF%
+	 Erjmp [Move 1,ADJfn
+		RLJFN%
+		 Jfcl
+		Ret]
+GetACL:	Move 1,ADJfn
+	Hrroi 2,InBuf
+	Movei 3,80.
+	Movei 4,.CHLFD
+	SIN%
+	 Erjmp GetACX
+	Setz 4,
+	Idpb 4,2
+	Move P1,[440700,,InBuf]
+	Call GetFld		;read a token (host name or ip address)
+	 Jrst GetACL		;if failure skip this line
+	Ldb 3,[.BP <774000,,0>,FooBuf]	;get first char
+	Movei 1,GetHNm
+	Caig 3,"9		;IP address?
+	 Movei 1,GetIP
+	Call (1)
+	 Jrst [TypeCR "[NFS] ACCESS:  Can't get IP address for:"
+	       Type "[NFS]   "
+	       Hrroi 1,InBuf
+	       PSOUT%
+	       Jrst GetACL]	;can't get an address, skip this
+	Move 2,AD.Len
+	Movem 1,AD.Adr(2)
+	Call GetFld		;read next token (access types)
+	 Jrst GetACL
+	Setz 1,			;access bits
+	Move 3,[440700,,FooBuf]
+GetACB:	Ildb 2,3
+	Caie 2,"R
+	 Cain 2,"r
+	  Txo 1,AD%RD
+	Caie 2,"W
+	 Cain 2,"w
+	  Txo 1,AD%WR
+	Jumpn 2,GetACB
+	Move 2,AD.Len
+	Movem 1,AD.Acc(2)
+	Call GetFld		;read token (directory)
+	 Jrst GetACL
+	Movx 1,RC%EMO
+	Hrroi 2,FooBuf
+	RCDIR%
+	 Erjmp .+1
+	Txne 1,RC%NOM\RC%AMB
+	 Jrst [TypeCR "[NFS] ACCESS:  Can't parse directory for:"
+	       Type "[NFS]   "
+	       Hrroi 1,InBuf
+	       PSOUT%
+	       Jrst GetACL]
+	Move 1,AD.Len
+	Movem 3,AD.Dir(1)
+	Aos 1,AD.Len
+	Caige 1,AD.Siz
+	 Jrst GetACL
+	TypeCR "[NFS] Access list full."
+	Jrst GetACX
+
+;get ip address of name in foobuf, retskp with address in ac1
+GetHNm:	Push P,4
+	Movei 1,.GTHSN
+	Hrroi 2,FooBuf
+	GTHST%
+	 Erjmp [Pop P,4
+		Ret]
+	Move 1,3
+	Pop P,4
+	RetSkp
+
+;get ip address of dotted string form from foobuf, retskp with adr in ac1
+GetIP:	Push P,4
+	Setz 4,
+	Move 1,[440700,,FooBuf]
+	Movei 3,10.
+	NIN%
+	 Erjmp GetIPF
+	Dpb 2,[.BP <037700,,0>,4]
+	NIN%
+	 Erjmp GetIPF
+	Dpb 2,[.BP <000077,,600000>,4]
+	NIN%
+	 Erjmp GetIPF
+	Dpb 2,[.BP <0,,177400>,4]
+	NIN%
+	 Erjmp GetIPF
+	Dpb 2,[.BP <0,,000377>,4]
+	Move 1,4
+	Pop P,4
+	RetSkp
+GetIPF:	Pop P,4
+	Ret
+
+GetACX:	CLOSF%
+	 Erjmp .+1
+	Ret
+
+GetFld:	Move 3,[440700,,FooBuf]
+GetFiW:	Ildb 2,P1
+	Jumpe 2,R
+	Cain 2,";
+	 Ret
+	Caie 2,.CHSPC
+	 Cain 2,.CHTAB
+	  Jrst GetFiW
+	Caie 2,.CHCRT		;eol?
+	 Cain 2,.CHLFD
+	  Ret
+	Idpb 2,3
+GetFl1:	Ildb 2,P1
+	Cain 2,";		;comment?
+	 Ret
+	Caie 2,.CHCRT		;eol?
+	 Cain 2,.CHLFD
+	  Setz 2,	
+	Caie 2,.CHSPC
+	 Cain 2,.CHTAB
+	  Setz 2,
+	Idpb 2,3
+	Jumpn 2,GetFl1
+	RetSkp
+
+
+;debugging routines
+
+;do a crlf
+OUT.X:	Push P,1
+	Hrroi 1,[Asciz /
+/]
+	PSOUT%
+	Pop P,1
+	Ret
+
+
+;display file handle in FH.*
+OUT.F:	Push P,1
+	Push P,2
+	Push P,3
+	Hrroi 1,FooBuf		;make file name here
+	Hrlz 2,FH.STR
+	Hrr 2,FH.DIR
+	DIRST%
+	 Erjmp OUT.FX
+	Move 2,[441000,,FH.NAM]
+	Setz 3,	
+	$SOUT
+	Hrroi 1,FooBuf
+	PSOUT%
+OUT.FX:	Pop P,3
+	Pop P,2
+	Pop P,1
+	Ret
+
+OUT.O:	Push P,1
+        Push P,3
+        Movei 1,.PRIOU
+        Movei 3,8.
+        NOUT%
+	 Jfcl
+        Pop P,3
+        Pop P,1
+	Ret
+
+OUT.D:	Push P,1
+        Push P,3
+        Movei 1,.PRIOU
+        Movei 3,10.
+        NOUT%
+	 Jfcl
+        Pop P,3
+        Pop P,1
+	Ret
+
+OUT.S:	Push P,1
+	Push P,2
+	Push P,3
+	Movei 1,.PRIOU
+    	Seto 2,
+	Movx 3,OT%NDA
+	ODTIM%
+	Movei 2,.CHSPC
+	BOUT%
+	Pop P,3
+	Pop P,2
+	Pop P,1
+	Ret
+
+Error:	Call	ErrRet
+	Jrst	Die
+
+ErrRet:	Movei	1,.PRIOU
+	Hrloi	2,.FHSLF
+	Setz	3,
+	ERSTR%
+	 jfcl
+	 jfcl
+	Ret
+
+Done:	Call UDP"RlsIQ
+;	Jrst	Die
+
+Die:	Type "?[NFS] Death.  Last Error: "
+	Call ErrRet
+	TypeCR ""
+	Haltf%
+	Jrst .-1
+
+Popj1:	Aos	(P)
+R:	Ret
+
+	End Start

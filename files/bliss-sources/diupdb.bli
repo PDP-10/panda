@@ -1,0 +1,1417 @@
+module DIUPDB (ident = '253'
+	%require ('DIUPATSWITCH')
+		) =
+begin
+
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+!++
+! FACILITY:	PAT Parser
+!
+! ABSTRACT:
+!
+! 	PATDEB.BLI is the parser debugger.
+!
+! ENVIRONMENT:	VAX/VMS user mode
+!
+! AUTHOR:  C. Mitchell, CREATION DATE:  25-Feb-80
+!
+! MODIFIED BY:
+!
+! 	Charlie Mitchell, 29-Oct-1981 : VERSION X1-001
+! 001 -	Use PATDATA.
+!
+! 002 - C.Richardson 29-May-84 Remove VMS dependencies.
+!
+! 003 - C. Richardson Allow debug compilation without debug output
+!	13 Aug 85
+!
+!--
+!
+! INCLUDE FILES:
+!
+
+require 'DIUPATPROLOG';                 ! BLISS extensions (for parser)
+
+library 'DIUPATDEB';
+
+library 'DIUPATDATA';                   ! PAT interface
+
+library 'DIUPATLANGSP';                 ! Language Specific functions
+
+library 'DIUPATPARSER';                 ! Parser driver
+
+library 'DIUDEB';                       ! Debugging
+
+library 'DIUPATTOKEN';                  ! for PAT$TOKEN_CURRENT_PTR
+
+library 'BLI:XPORT';				! 002
+
+%IF %BLISS (BLISS32) %THEN			! 002
+require 'VMS';					! VMS interface
+%ELSE						! 002
+library 'DIUTPAMAC';                    !  Common Bliss TPARSE
+
+external routine TPARSE;			! 002
+%FI						! 002
+
+%if PATBLSEXT_DEBUGGING %then
+!
+! TABLE OF CONTENTS OF INTERNAL ROUTINES:
+!
+
+forward routine
+    HELP : novalue,
+    SET_BREAK : novalue,
+    SHOW_STATUS : novalue,
+    SRCH : novalue,
+    UP_CASE : novalue;
+! MACROS:
+
+macro
+    TERM_TXT (TOKEN_NUM) =
+	begin
+
+	local
+	    P : ref $STR_DESCRIPTOR ();					! 002
+
+	P = PAT$DATA_SYMBOL_TEXT (TOKEN_NUM);
+	.P [STR$A_POINTER]						! 002
+	end
+    %;
+
+macro
+    TERM_LEN (TOKEN_NUM) =
+	begin
+
+	local
+	    P : ref $STR_DESCRIPTOR ();					! 002
+
+	P = PAT$DATA_SYMBOL_TEXT (TOKEN_NUM);
+	.P [STR$H_LENGTH]						! 002
+	end
+    %;
+
+macro
+    ACT_TXT (ACTION_NUM) =
+%if PATBLSEXT_DEBUGGING %then
+	begin
+
+	local
+	    P : ref $STR_DESCRIPTOR ();					! 002
+
+	P = PAT$DATA_SEMACT_TEXT (ACTION_NUM);
+	.P [STR$A_POINTER]						! 002
+	end
+%fi
+    %;
+
+macro
+    ACT_LEN (ACTION_NUM) =
+	begin
+
+	local
+	    P : ref $STR_DESCRIPTOR ();					! 002
+
+	P = PAT$DATA_SEMACT_TEXT (ACTION_NUM);
+	.P [STR$H_LENGTH]						! 002
+	end
+    %;
+macro
+    CUR_TKN_TXT =
+	begin
+
+	local
+	    P : ref $STR_DESCRIPTOR ();					! 002
+
+	if LS_IS_NON_TERM (LS_LEX_TERM (PAT$TOKEN_CURRENT_PTR))
+	then
+	    begin
+	    P = LS_LEX_TEXT (PAT$TOKEN_CURRENT_PTR);
+	    .P [STR$A_POINTER]						! 002
+	    end
+	else
+	    TERM_TXT (LS_LEX_TERM (PAT$TOKEN_CURRENT_PTR))
+
+	end
+    %;
+
+macro
+    CUR_TKN_LEN =
+	begin
+
+	local
+	    P : ref $STR_DESCRIPTOR ();					! 002
+
+	if LS_IS_NON_TERM (LS_LEX_TERM (PAT$TOKEN_CURRENT_PTR))
+	then
+	    begin
+	    P = LS_LEX_TEXT (PAT$TOKEN_CURRENT_PTR);
+	    .P [STR$H_LENGTH]						! 002
+	    end
+	else
+	    TERM_LEN (LS_LEX_TERM (PAT$TOKEN_CURRENT_PTR))
+
+	end
+    %;
+
+macro
+    CUR_LINENUM =
+	begin
+	LS_LEX_LINE_NUMBER (LS_LEX_LOCATOR (PAT$TOKEN_CURRENT_PTR))
+	end
+    %;
+! EQUATED SYMBOLS:
+
+literal
+    CMD_NULL = 0,
+    CMD_SET = 1,
+    CMD_CANCEL = 2,
+    CMD_GO = 3,
+    CMD_HELP = 4,
+    CMD_DEBUG = 5,
+    CMD_EXIT = 6,
+    CMD_SHOW = 7,
+    !
+    CMD_LAST = 7;
+
+literal
+    BOPT_NAME = 0,
+    BOPT_LINE = 1,
+    BOPT_ALL = 2,
+    BOPT_STATE = 3,
+    BOPT_INPUT = 4,
+    !
+    BOPT_LAST = 4;
+
+literal
+    SRCH_SHOW = 0,
+    SRCH_SET_TRC = 1,
+    SRCH_SET_BRK = 2,
+    SRCH_CAN_TRC = 3,
+    SRCH_CAN_BRK = 4,
+    SRCH_SHOW_ALL = 5,
+    !
+    SRCH_LAST = 5;
+
+bind
+    SPACES = uplit %BLISS32 (byte)			! 002
+	( rep 133 of %BLISS32 (byte) (%c' '));		! 002
+! OWN STORAGE:
+
+own
+    PAT$DEB_WAS_CALLED : initial (FALSE);	! Set true when PAT$DEB has been called
+
+own
+    BRK_REDUCT_VEC : bitvector [PAT$DATA_MAX_TOKEN + 1],	! indexed by token number
+    TRC_REDUCT_VEC : bitvector [PAT$DATA_MAX_TOKEN + 1],	! indexed by token number
+    BRK_SEMACT_VEC : bitvector [PAT$DATA_MAX_SEMACT + 1],	! indexed by action number
+    TRC_SEMACT_VEC : bitvector [PAT$DATA_MAX_SEMACT + 1];	! indexed by action number
+
+own
+    TRACE_ALL_F : initial (FALSE),		! Trace everything not being ignored
+    BREAK_ALL_F : initial (FALSE);		! Break on all reductions
+
+own
+    BRK_STATE : initial (-1),			! State index to break on
+    BRK_TKN_F : initial (FALSE),		! Break on input indicated in BRK_TKN_TXT
+    BRK_TKN_WILD_F,				! Wildcard flag for input text
+    BRK_TKN_TXT : vector [ch$allocation (132)],	! 002 Input text to break on
+    BRK_TKN_LEN,				! Length of input to break on
+    BRK_LINE_F : initial (FALSE),		! Break on input line indicated in BRK_LINENUM
+    BRK_LINENUM,				! Break on this line
+    SAVED_LINENUM : initial (-1);
+
+global routine PAT$DEB_TOKEN (ACTUAL_PARSE) : novalue =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	PAT$DEB_TOKEN is called when the parser gets a new token
+!	and handles tracing and breakpointing for tokens and line
+!	numbers.  This routine is only called by the parser.
+!
+! FORMAL PARAMETERS:
+!
+!	ACTUAL_PARSE	TRUE if actual parse; FALSE if parse-ahead
+!			during error recovery
+!
+! IMPLICIT INPUTS:
+!
+!	None.
+!
+! IMPLICIT OUTPUTS:
+!
+!	None.
+!
+! ROUTINE VALUE:
+!
+!	None.
+!
+! SIDE EFFECTS:
+!
+!	None.
+!
+!--
+
+    begin
+
+    local
+	BREAK_TOKEN_F,
+	BREAK_LINE_F;
+
+    if not .PAT$DEB_WAS_CALLED then return;
+
+    BREAK_TOKEN_F = FALSE;
+    BREAK_LINE_F = FALSE;
+
+    ! Check if this is a new line.  If so, check if a breakpoint
+    ! is set on this line.
+
+    if CUR_LINENUM neq .SAVED_LINENUM
+    then
+	begin
+	SAVED_LINENUM = CUR_LINENUM;
+
+	if .BRK_LINE_F and (CUR_LINENUM eql .BRK_LINENUM)
+	    then BREAK_LINE_F = TRUE;
+
+	end;
+
+    ! Check if should break on this token
+
+    if .BRK_TKN_F
+    then
+
+	if ch$eql (.BRK_TKN_LEN, ch$ptr(BRK_TKN_TXT), CUR_TKN_LEN, CUR_TKN_TXT)
+	    then BREAK_TOKEN_F = TRUE;	! 002
+
+    ! Trace and break if appropriate
+
+    if .BREAK_TOKEN_F or .BREAK_LINE_F or .TRACE_ALL_F or .BREAK_ALL_F
+    then
+	begin
+	PUT_ASCII (CUR_TKN_LEN, CUR_TKN_TXT);
+	if not .ACTUAL_PARSE then PUT_MSG ('	parse-ahead');
+	PUT_EOL ();
+	end;
+
+    if .BREAK_TOKEN_F
+    then
+	begin
+	PUT_MSG ('Break at input token ');
+	PUT_ASCII (CUR_TKN_LEN, CUR_TKN_TXT);
+	PUT_EOL ();
+	PAT$DEB ();
+	end
+    else
+
+	if .BREAK_LINE_F
+	then
+	    begin
+	    PUT_MSG ('Break at source line number ');
+	    PUT_NUMBER (.BRK_LINENUM);
+	    PUT_EOL ();
+	    PAT$DEB ();
+	    end;
+
+    end;
+
+global routine PAT$DEB_STATE (CURRENT_STATE, ACTUAL_PARSE) : novalue =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	PAT$DEB_STATE is called when the parser begins processing
+!	a new state and handles tracing and breakpointing for
+!	state numbers.  This routine is only called by the parser.
+!
+! FORMAL PARAMETERS:
+!
+!	CURRENT_STATE	Current state table index
+!	ACTUAL_PARSE	TRUE if actual parse; FALSE if parse-ahead
+!			during error recovery.
+!
+! IMPLICIT INPUTS:
+!
+!	None.
+!
+! IMPLICIT OUTPUTS:
+!
+!	None.
+!
+! ROUTINE VALUE:
+!
+!	None.
+!
+! SIDE EFFECTS:
+!
+!	None.
+!
+!--
+
+    begin
+
+    if not .PAT$DEB_WAS_CALLED then return;
+
+    if .CURRENT_STATE eql .BRK_STATE
+    then
+	begin
+	PUT_MSG ('  State index:  ');
+	PUT_NUMBER (.CURRENT_STATE);
+	if not .ACTUAL_PARSE then PUT_MSG ('	parse-ahead');
+	PUT_EOL ();
+	PUT_MSG ('Break at state index ');
+	PUT_NUMBER (.CURRENT_STATE);
+	PUT_EOL ();
+	PAT$DEB ();
+	end
+    else
+	if .TRACE_ALL_F or .BREAK_ALL_F
+	then
+	    begin
+	    PUT_MSG ('  State index:  ');
+	    PUT_NUMBER (.CURRENT_STATE);
+	    PUT_EOL ();
+	    end;
+    end;
+global routine PAT$DEB_REDUCE (TOKEN, ACTION_NUM, ACTUAL_PARSE) : novalue =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	PAT$DEB_REDUCE is called when the parser does a reduction
+!	and handles tracing and breakpointing on reductions.
+!	This routine is only called by the parser.
+!
+! FORMAL PARAMETERS:
+!
+!	TOKEN		Non-terminal on left hand side of production.
+!	ACTION_NUM	Semantics action.
+!	ACTUAL_PARSE	TRUE if actual parse; FALSE if parse-ahead
+!			during error recovery.
+!
+! IMPLICIT INPUTS:
+!
+!	None.
+!
+! IMPLICIT OUTPUTS:
+!
+!	None.
+!
+! ROUTINE VALUE:
+!
+!	None.
+!
+! SIDE EFFECTS:
+!
+!	None.
+!
+!--
+
+    begin
+
+    local
+	BREAK_REDUCT_F,
+	BREAK_SEMACT_F,
+	TRACE_REDUCT_F,
+	TRACE_SEMACT_F,
+	TRACE_STACK_F;
+
+    if not .PAT$DEB_WAS_CALLED then return;
+
+    ! Determine if trace/break on reduction or semantics action
+
+    BREAK_REDUCT_F = .BREAK_ALL_F or .BRK_REDUCT_VEC [.TOKEN];
+    TRACE_REDUCT_F = .TRACE_ALL_F or .TRC_REDUCT_VEC [.TOKEN] or .BREAK_REDUCT_F;
+    BREAK_SEMACT_F = .BREAK_ALL_F or .BRK_SEMACT_VEC [.ACTION_NUM];
+    TRACE_SEMACT_F = .TRACE_ALL_F or .TRC_SEMACT_VEC [.ACTION_NUM] or .BREAK_REDUCT_F;
+
+    if .TRACE_REDUCT_F then PAT$DUMP_REDUCTION ();
+
+    if not .ACTUAL_PARSE then PUT_MSG_EOL('			reduction during parse-ahead');
+
+    if .TRACE_SEMACT_F and (.ACTION_NUM neq PAT_NULL)
+    then
+	begin
+	PUT_MSG ('				--- Action:  ');
+%if PATBLSEXT_DEBUGGING %then
+	PUT_STRING (PAT$DATA_SEMACT_TEXT (.ACTION_NUM));
+%fi
+	PUT_EOL ();
+	end;
+
+    if .TRACE_REDUCT_F or .TRACE_SEMACT_F then PUT_EOL ();
+
+    if .BREAK_REDUCT_F
+    then
+	begin
+	PUT_MSG ('Break on reduction to ');
+	PUT_STRING (PAT$DATA_SYMBOL_TEXT (.TOKEN));
+	PUT_EOL ();
+	PAT$DEB ();
+	end
+    else
+
+	if .BREAK_SEMACT_F
+	then
+	    begin
+	    PUT_MSG ('Break on semactics action ');
+%if PATBLSEXT_DEBUGGING %then
+	    PUT_STRING (PAT$DATA_SEMACT_TEXT (.ACTION_NUM));
+%fi
+	    PUT_EOL ();
+	    PAT$DEB ();
+	    end;
+
+    end;
+
+global routine PAT$DEB : novalue =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	?
+!
+! FORMAL PARAMETERS:
+!
+!	None.
+!
+! IMPLICIT INPUTS:
+!
+!	?
+!
+! IMPLICIT OUTPUTS:
+!
+!	?
+!
+! ROUTINE VALUE:
+!
+!	None.
+!
+! SIDE EFFECTS:
+!
+!	?
+!
+!--
+
+    begin
+
+%IF %BLISS (BLISS36) %THEN						! 002
+routine									! 002
+LIB$GET_INPUT (				! 002 get one line from input device
+		get_str,		! 002 Input string, by descriptor
+		prompt_str ): novalue = ! 002 prompt string, by descriptor
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Get one line from input device.  Mimics VMS LIB$GET_INPUT.
+!
+! FORMAL PARAMETERS:
+!
+!	get_str		XPORT descriptor to input string
+!	prompt_str	XPORT descriptor to prompt string
+!
+! IMPLICIT INPUTS:
+!
+!	None.
+!
+! IMPLICIT OUTPUTS:
+!
+!	None.
+!
+! ROUTINE VALUE:
+!
+!	None.
+!
+! SIDE EFFECTS:
+!
+!	Reads input from the terminal.
+!
+!--
+
+begin									! 002
+map get_str: ref $str_descriptor ();					! 002
+map prompt_str: ref $str_descriptor ();					! 002
+register								! 002
+    AC1 = 1,								! 002
+    AC2 = 2,								! 002
+    AC3 = 3;								! 002
+builtin									! 002
+    jsys;								! 002
+AC1 = %o'101';					! 002 .priou
+AC2 = .prompt_str [str$a_pointer];		! 002 pointer to prompt string
+AC3 = .prompt_str [str$h_length];		! 002 length of prompt string
+JSYS (1, %o'532', AC1, AC2, AC3);		! 002 SOUTR JSYS (ycch!)
+AC1 = .get_str [str$a_pointer];						! 002
+AC2 = 132;								! 002
+AC3 = .prompt_str [str$a_pointer];					! 002
+JSYS (1, %o'523', AC1, AC2, AC3);		! 002 RDTTY JSYS (ugh!)
+get_str [str$h_length] = 130 - .AC2<0,18>;	! 002 Subtract off <CRLF>
+end;									! 002
+%FI									! 002
+
+    own
+	PROMPT :$str_descriptor (string='PAT$DEB>'),			! 002
+	CMD_DESC : $str_descriptor ();					! 002
+
+    local
+	STATUS;
+
+    forward routine
+	SAVE_BOPT;
+
+! Note that the tparse macros define their own psect which cannot
+! be referenced within the Ada compiler if word relative addressing
+! is used for non-external references.
+
+%BLISS32 (								! 002
+    switches addressing_mode (nonexternal = long_relative);
+)									! 002
+
+    own
+	COMMAND,
+	BREAK_F,
+	CMD_STRING : $str_descriptor (),				! 002
+%if %bliss (bliss36) %then
+	CMD_TEXT : vector [ch$allocation (132)],			! 002
+%fi
+	CMD_NUMBER,
+	BREAK_OPT,
+	SHOW_ALL_F,
+	WILD_F;
+
+    own
+	TPARSE_BLOCK : block [TPA$K_LENGTH0 %BLISS32 (, byte)];	! 002
+!	The following table is used by TPARSE to parse debugger commands.
+
+    $INIT_STATE(CMDLINE	%BLISS32 (,CMDLINEKEY));			! 002
+    $STATE(START,
+	(  'SET'	,SETCAN	,,CMD_SET	,COMMAND	),
+	(  'SHOW'	,OPTSHO	,,CMD_SHOW	,COMMAND	),
+	(  'CANCEL'	,SETCAN	,,CMD_CANCEL	,COMMAND	),
+	(  'GO'		,DONE	,,CMD_GO	,COMMAND	),
+	(  '?'		,DONE	,,CMD_HELP	,COMMAND	),
+	(  'HELP'	,DONE	,,CMD_HELP	,COMMAND	),
+	(  'DBG'	,DONE	,,CMD_DEBUG	,COMMAND	),
+	(  'DEBUG'	,DONE	,,CMD_DEBUG	,COMMAND	),
+	(  'EXIT'	,DONE	,,CMD_EXIT	,COMMAND	),
+	(  TPA$_LAMBDA	,DONE			)
+	);
+    $STATE(DONE,
+	(  TPA$_BLANK	,TPA$_EXIT	),
+	(  TPA$_EOS	,TPA$_EXIT	)
+	);
+    $STATE(SETCAN,
+	(  'BREAKPOINT'	,BOPT	,,TRUE		,BREAK_F	),
+	(  'TRACEPOINT'	,BOPT	)
+	);
+    $STATE(BOPT,
+	(  'ALL'	,DONE	,SAVE_BOPT	,,		,BOPT_ALL   ),
+	(  'SYMBOL'	,SINPUT	,SAVE_BOPT	,,		,BOPT_NAME  ),
+	(  'LINE'	,SNUM	,SAVE_BOPT	,,		,BOPT_LINE  ),
+	(  TPA$_DECIMAL	,DONE	,SAVE_BOPT	,,CMD_NUMBER	,BOPT_LINE  ),
+	(  'STATE'	,SNUM	,SAVE_BOPT	,,		,BOPT_STATE ),
+	(  'INPUT'	,SINPUT	,SAVE_BOPT	,,		,BOPT_INPUT )
+	);
+    $STATE(SINPUT,
+	(  TPA$_SYMBOL	,WILD	,		,,CMD_STRING	)
+	);
+    $STATE(SNUM,
+	(  TPA$_DECIMAL	,DONE	,		,,CMD_NUMBER	)
+	);
+    $STATE(OPTSHO,
+	(  'ALL'	,DONE	,,TRUE		,SHOW_ALL_F	),
+	(  'SYMBOL'	,SINPUT		),
+	(  TPA$_LAMBDA	,DONE		)
+	);
+    $STATE(WILD,
+	(  '*'		,DONE	,,TRUE		,WILD_F	),
+	(  TPA$_LAMBDA	,DONE			)
+	);
+    routine SAVE_BOPT				! 002
+%BLISS36 ( (ap) ) =				! 002
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	?
+!
+! FORMAL PARAMETERS:
+!
+!	ap	Builtin AP register on VMS, otherwise a parameter
+!
+! IMPLICIT INPUTS:
+!
+!	?
+!
+! IMPLICIT OUTPUTS:
+!
+!	?
+!
+! ROUTINE VALUE:
+!
+!	TRUE
+!
+! SIDE EFFECTS:
+!
+!	None.
+!
+!--
+
+	begin
+%BLISS32 (					! 002
+
+	builtin
+	    ap;
+)						! 002
+
+	map
+	    ap : ref block [%BLISS32 (, byte)];	! 002
+
+	BREAK_OPT = .ap [TPA$L_PARAM];		! This is the parameter in the parse table
+	return TRUE
+	end;
+! Start of code for PAT$DEB
+
+    if not .PAT$DEB_WAS_CALLED
+    then
+	begin
+	PUT_EOL ();
+	! do this so don't lose the first line since IOS_COMMAND may not have been called yet
+	PAT$DEB_WAS_CALLED = TRUE;
+	end;
+
+    TPARSE_BLOCK [TPA$V_ABBRFM] = TRUE;		! Allow abbreviations and match the first
+    						! eligible transition if ambiguous
+
+    while TRUE do
+	begin
+	COMMAND = 0;
+	BREAK_F = FALSE;
+	CMD_NUMBER = 1;
+	$STR_DESC_INIT (DESCRIPTOR = CMD_STRING);			! 002
+	BREAK_OPT = 0;
+	SHOW_ALL_F = FALSE;
+	WILD_F = FALSE;
+	!
+%if %bliss (bliss32) %then						! 002
+	$STR_DESC_INIT (DESCRIPTOR = CMD_DESC, CLASS = DYNAMIC);	! 002
+%else
+	$STR_DESC_INIT (DESCRIPTOR = CMD_DESC,				! 002
+	    STRING = (132, ch$ptr (CMD_TEXT)));				! 002
+%fi
+	LIB$GET_INPUT (CMD_DESC, PROMPT);
+	UP_CASE (.CMD_DESC [STR$H_LENGTH], .CMD_DESC [STR$A_POINTER]);	! 002
+	TPARSE_BLOCK [TPA$L_COUNT] = TPA$K_COUNT0;
+	TPARSE_BLOCK [TPA$L_STRINGCNT] = .CMD_DESC [STR$H_LENGTH];	! 002
+	TPARSE_BLOCK [TPA$L_STRINGPTR] = .CMD_DESC [STR$A_POINTER];	! 002
+	STATUS =							! 002
+	    %BLISS32 (LIB$TPARSE)					! 002
+	    %BLISS36 (TPARSE)						! 002
+		(TPARSE_BLOCK, CMDLINE %BLISS32 (, CMDLINEKEY));	! 002
+
+	if .STATUS neq %BLISS32 (SS$_NORMAL) %BLISS36 (1)		! 002
+	then
+	    begin
+	    PUT_MSG_EOL ('Parse error in command.  Please try again.');
+	    end
+	else
+	    begin
+
+	    case .COMMAND from 0 to CMD_LAST of
+		set
+
+		[CMD_NULL] :
+		;
+
+		[CMD_SET] :
+		    SET_BREAK (TRUE, .BREAK_F, .BREAK_OPT, .WILD_F,	! 002
+			.CMD_STRING [STR$H_LENGTH],			! 002
+			.CMD_STRING [STR$A_POINTER], .CMD_NUMBER);	! 002
+
+		[CMD_CANCEL] :
+		    SET_BREAK (FALSE, .BREAK_F, .BREAK_OPT, .WILD_F,	! 002
+			.CMD_STRING [STR$H_LENGTH],			! 002
+			.CMD_STRING [STR$A_POINTER], .CMD_NUMBER);	! 002
+
+		[CMD_GO] :
+		    return;
+
+		[CMD_HELP] :
+		    HELP ();
+
+		[CMD_DEBUG] :
+%BLISS32 (						! 002
+		    LIB$SIGNAL (SS$_DEBUG);		! 002
+)							! 002
+%BLISS36 (						! 002
+		    return;				! 002
+)							! 002
+
+		[CMD_EXIT] :
+%IF %BLISS (BLISS32) %THEN				! 002
+		    $EXIT (code = SS$_NORMAL);
+%ELSE							! 002
+		    begin				! 002
+		    builtin jsys;			! 002
+		    jsys (0, %o'170');			! 002 HALTF JSYS (ugh!)
+		    end;				! 002
+%FI							! 002
+
+		[CMD_SHOW] :
+		    SHOW_STATUS (.SHOW_ALL_F, .WILD_F,			! 002
+			.CMD_STRING [STR$H_LENGTH],			! 002
+			.CMD_STRING [STR$A_POINTER]);			! 002
+
+		[inrange, outrange] :
+		    DEB_ASSERT (FALSE, 'Case error in PAT$DEB');
+		tes;
+
+	    end;
+
+	end;
+
+    end;
+routine HELP : novalue =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Prints HELP message for parser debugger.
+!
+! FORMAL PARAMETERS:
+!
+!	None.
+!
+! IMPLICIT INPUTS:
+!
+!	None.
+!
+! IMPLICIT OUTPUTS:
+!
+!	None.
+!
+! ROUTINE VALUE:
+!
+!	None.
+!
+! SIDE EFFECTS:
+!
+!	Displays HELP message on terminal.
+!
+!--
+
+    begin
+
+    macro
+	MSGEOL =
+	    %quote PUT_MSG_EOL %;
+PUT_EOL();
+MSGEOL('PAT$DEB commands follow.  Commands can be abbreviated freely with ');
+MSGEOL('exception of set and show.  ("s" is the abbrev. for "set") ');
+PUT_EOL();
+MSGEOL('?				- gives this message ');
+MSGEOL('help				- gives this message ');
+PUT_EOL();
+MSGEOL('set breakpoint		- one of the following');
+MSGEOL('	all			- for all reductions ');
+MSGEOL('	symbol NAME [*]		- at semantics action or reduction');
+MSGEOL('				  to non-terminal specified by NAME ');
+MSGEOL('				  The optional "*" indicates wildcarding.');
+MSGEOL('	[line] INTEGER		- at source line number ');
+MSGEOL('	input NAME [*]		- at source input NAME');
+MSGEOL('	state INTEGER		- at state table index ');
+PUT_EOL();
+MSGEOL('set trace and cancel break/trace are similar to set break.');
+PUT_EOL();
+MSGEOL('show				- show status ');
+MSGEOL('show all			- show status and all non-terminals');
+MSGEOL('				  and semantics action symbols');
+MSGEOL('show symbol NAME [*]		- show status semactics actions and');
+MSGEOL('				  non-terminals specified by NAME');
+PUT_EOL();
+MSGEOL('go				- continue ');
+MSGEOL('exit				- all done ');
+MSGEOL('debug				- enter DEBUG-32 ');
+MSGEOL('dbg				- enter DEBUG-32 ');
+end;
+routine SET_BREAK (SET_F, BREAK_F, BREAK_OPT, WILD_F, LEN, ADDR, CMD_NUMBER) : novalue =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	SET_BREAK sets (and cancels) tracepoints and breakpoints
+!
+! FORMAL PARAMETERS:
+!
+!	SET_F		- Set if true; cancel if false.
+!
+!	BREAK_F		- Set/cancel break if true, trace if false.
+!
+!	BREAK_OPT	- Option specified in command.
+!
+!	WILD_F		- True if wildcarding used for symbol in command.
+!
+!	LEN		- Length of symbol in command (if any).
+!
+!	ADDR		- Addr. of text of symbol in command.
+!
+!	CMD_NUMBER	- Number typed in command (if any).
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    begin
+
+    case .BREAK_OPT from 0 to BOPT_LAST of
+	set
+
+	[BOPT_INPUT] :
+	    begin
+
+	    if .BREAK_F
+	    then
+
+		if .SET_F
+		then
+		    begin
+
+		    if .BRK_TKN_F
+		    then
+			begin
+			PUT_MSG ('	Cancelled previous breakpoint for input:  ');
+			PUT_ASCII (.BRK_TKN_LEN, BRK_TKN_TXT);
+			PUT_EOL ();
+			end;
+
+		    BRK_TKN_F = TRUE;
+		    BRK_TKN_WILD_F = .WILD_F;
+		    BRK_TKN_LEN = .LEN;
+		    ch$move (.LEN, .ADDR, BRK_TKN_TXT);
+		    PUT_MSG ('	Breakpoint set for source input:  ');
+		    PUT_ASCII (.BRK_TKN_LEN, BRK_TKN_TXT);
+
+		    if .BRK_TKN_WILD_F then PUT_MSG ('*');
+
+		    PUT_EOL ();
+		    end
+		else
+		    begin
+		    PUT_MSG ('	Cancelled previous breakpoint for input:  ');
+		    PUT_ASCII (.BRK_TKN_LEN, BRK_TKN_TXT);
+		    PUT_EOL ();
+		    end
+
+	    else
+		PUT_MSG_EOL ('Tracepoints not supported for input tokens');
+
+	    end;
+
+	[BOPT_NAME] :
+
+	    if .SET_F
+	    then 				! set
+
+		if .BREAK_F
+		then
+		    SRCH (SRCH_SET_BRK, .WILD_F, .LEN, .ADDR)
+		else
+		    SRCH (SRCH_SET_TRC, .WILD_F,
+			.LEN, .ADDR)
+
+	    else 				! cancel
+
+		if .BREAK_F
+		then
+		    SRCH (SRCH_CAN_BRK, .WILD_F, .LEN, .ADDR)
+		else
+		    SRCH (SRCH_CAN_TRC, .WILD_F,
+			.LEN, .ADDR);
+
+	[BOPT_LINE] :
+
+	    if .BREAK_F
+	    then
+
+		if .SET_F
+		then
+		    begin
+
+		    if .BRK_LINE_F
+		    then
+			begin
+			PUT_MSG ('	Cancelled breakpoint for line number ');
+			PUT_NUMBER (.BRK_LINENUM);
+			PUT_EOL ();
+			end;
+
+		    BRK_LINE_F = TRUE;
+		    BRK_LINENUM = .CMD_NUMBER;
+		    PUT_MSG ('	Breakpoint set for line number ');
+		    PUT_NUMBER (.BRK_LINENUM);
+		    PUT_EOL ();
+		    end
+		else
+		    begin
+		    PUT_MSG_EOL ('Trace points not supported for source line numbers');
+		    end;
+
+	[BOPT_ALL] :
+
+	    if .SET_F
+	    then 				! set
+
+		if .BREAK_F then BREAK_ALL_F = TRUE else TRACE_ALL_F = TRUE
+
+	    else 				! cancel
+
+		if .BREAK_F
+		then
+		    begin
+		    BREAK_ALL_F = FALSE;
+
+		    incr I from 0 to PAT$DATA_MAX_TOKEN do
+			BRK_REDUCT_VEC [.I] = FALSE;
+
+		    incr I from 0 to PAT$DATA_MAX_SEMACT do
+			BRK_SEMACT_VEC [.I] = FALSE;
+
+		    end
+		else
+		    begin
+		    BREAK_ALL_F = FALSE;
+
+		    incr I from 0 to PAT$DATA_MAX_TOKEN do
+			TRC_REDUCT_VEC [.I] = FALSE;
+
+		    incr I from 0 to PAT$DATA_MAX_SEMACT do
+			TRC_SEMACT_VEC [.I] = FALSE;
+
+		    end;
+
+	[BOPT_STATE] :
+
+	    if .BREAK_F
+	    then
+
+		if .SET_F
+		then
+		    begin
+
+		    if .BRK_STATE geq 0
+		    then
+			begin
+			PUT_MSG ('	Cancelled breakpoint for state index number ');
+			PUT_NUMBER (.BRK_STATE);
+			PUT_EOL ();
+			end;
+
+		    BRK_STATE = .CMD_NUMBER;
+		    PUT_MSG ('	Breakpoint set for state index number ');
+		    PUT_NUMBER (.BRK_STATE);
+		    PUT_EOL ();
+		    end
+		else
+		    begin
+		    BRK_STATE = -1;
+		    PUT_MSG ('	Cancelled breakpoint for line number ');
+		    PUT_NUMBER (.BRK_LINENUM);
+		    PUT_EOL ();
+		    end
+
+	    else
+		begin
+		PUT_MSG_EOL ('Trace points not supported for states');
+		end;
+
+	[inrange, outrange] :
+	    DEB_ASSERT (FALSE, 'Case error in SET_BREAK');
+	tes;
+
+    end;
+routine SHOW_STATUS (SHOW_ALL_F, WILD_F, LEN, ADDR) : novalue =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Shows debugger status.
+!
+! FORMAL PARAMETERS:
+!
+!	SHOW_ALL_F		?
+!	WILD_F			?
+!	LEN			?
+!	ADDR			?
+!
+! IMPLICIT INPUTS:
+!
+!	?
+!
+! IMPLICIT OUTPUTS:
+!
+!	?
+!
+! ROUTINE VALUE:
+!
+!	None.
+!
+! SIDE EFFECTS:
+!
+!	Displays status on terminal.
+!
+!--
+
+    begin
+    PUT_EOL ();
+
+    if .BREAK_ALL_F then PUT_MSG_EOL ('	BREAK ALL') else PUT_MSG_EOL ('	no BREAK ALL');
+
+    if .TRACE_ALL_F then PUT_MSG_EOL ('	TRACE ALL') else PUT_MSG_EOL ('	no TRACE ALL');
+
+    if .BRK_STATE geq 0
+    then
+	begin
+	PUT_MSG ('	Breakpoint set at state index number ');
+	PUT_NUMBER (.BRK_STATE);
+	PUT_EOL ();
+	end
+    else
+	PUT_MSG_EOL ('	State index number breakpoint not set');
+
+    if .BRK_TKN_F
+    then
+	begin
+	PUT_MSG ('	Breakpoint set for source input:  ');
+	PUT_ASCII (.BRK_TKN_LEN, BRK_TKN_TXT);
+	PUT_EOL ();
+	end
+    else
+	PUT_MSG_EOL ('	Source input breakpoint not set');
+
+    if .BRK_LINE_F
+    then
+	begin
+	PUT_MSG ('	Breakpoint set for source line number ');
+	PUT_NUMBER (.BRK_LINENUM);
+	PUT_EOL ();
+	end
+    else
+	PUT_MSG_EOL ('	Source line number breakpoint not set');
+
+    if .SHOW_ALL_F then SRCH (SRCH_SHOW_ALL, .WILD_F, .LEN, .ADDR) else SRCH (SRCH_SHOW, .WILD_F, .LEN, .ADDR)
+
+    ;
+    end;
+routine SRCH (SRCH_TYPE, WILD_F, LEN, ADDR) : novalue =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	?
+!
+! FORMAL PARAMETERS:
+!
+!	SRCH_TYPE	?
+!	WILD_F		?
+!	LEN		?
+!	ADDR		?
+!
+! IMPLICIT INPUTS:
+!
+!	?
+!
+! IMPLICIT OUTPUTS:
+!
+!	?
+!
+! ROUTINE VALUE:
+!
+!	None.
+!
+! SIDE EFFECTS:
+!
+!	?
+!
+!--
+
+    begin
+
+    local
+	MATCH_F,
+	FIRST_NONTRM_F,
+	FIRST_SEMACT_F,
+	FILL_LEN;
+
+    literal
+	MAX_SYM_LEN = 30;
+
+    FIRST_NONTRM_F = TRUE;
+
+    incr I from 0 to PAT$DATA_MAX_TOKEN do
+	begin
+	MATCH_F = FALSE;
+
+	if .SRCH_TYPE eql SRCH_SHOW_ALL
+	then
+	    begin
+
+	    if LS_IS_NON_TERM (.I) then MATCH_F = TRUE
+
+	    end
+	else
+
+	    if .LEN leq 0
+	    then
+		begin
+
+		if (.SRCH_TYPE eql SRCH_SHOW) and (.BRK_REDUCT_VEC [.I] or .TRC_REDUCT_VEC [.I])
+		then
+
+		    if LS_IS_NON_TERM (.I) then MATCH_F = TRUE
+
+		end
+	    else
+
+		if LS_IS_NON_TERM (.I)
+		then
+
+		    if .WILD_F
+		    then
+			MATCH_F = ch$eql (.LEN, .ADDR, .LEN, TERM_TXT (.I))
+		    else
+			MATCH_F = ch$eql (.LEN, .ADDR, TERM_LEN (.I), TERM_TXT (.I));
+
+	if .MATCH_F
+	then
+	    begin
+
+	    if .FIRST_NONTRM_F
+	    then
+		begin
+		FIRST_NONTRM_F = FALSE;
+		PUT_EOL ();
+		PUT_MSG_EOL ('	Non-terminal status:')
+		end;
+
+	    case .SRCH_TYPE from 0 to SRCH_LAST of
+		set
+
+		[SRCH_SHOW, SRCH_SHOW_ALL] :
+		;
+
+		[SRCH_SET_TRC] :
+		    TRC_REDUCT_VEC [.I] = TRUE;
+
+		[SRCH_SET_BRK] :
+		    BRK_REDUCT_VEC [.I] = TRUE;
+
+		[SRCH_CAN_TRC] :
+		    TRC_REDUCT_VEC [.I] = FALSE;
+
+		[SRCH_CAN_BRK] :
+		    BRK_REDUCT_VEC [.I] = FALSE;
+		tes;
+
+	    PUT_MSG ('	');
+	    PUT_STRING (PAT$DATA_SYMBOL_TEXT (.I));
+	    FILL_LEN = MAX_SYM_LEN - TERM_LEN (.I);
+
+	    if .FILL_LEN gtr 0 then PUT_ASCII (.FILL_LEN, SPACES);
+
+	    if .BRK_REDUCT_VEC [.I] then PUT_MSG ('	break		') else PUT_MSG ('	no break 	');
+
+	    if .TRC_REDUCT_VEC [.I] then PUT_MSG_EOL ('trace') else PUT_MSG_EOL ('no trace');
+
+	    end;
+
+	end;
+
+    FIRST_SEMACT_F = TRUE;
+
+    incr I from 0 to PAT$DATA_MAX_SEMACT do
+	begin
+	MATCH_F = FALSE;
+
+	if .SRCH_TYPE eql SRCH_SHOW_ALL
+	then
+	    MATCH_F = TRUE
+	else
+
+	    if .LEN leq 0
+	    then
+		begin
+
+		if (.SRCH_TYPE eql SRCH_SHOW) and (.BRK_SEMACT_VEC [.I] or .TRC_SEMACT_VEC [.I])
+		then
+		    MATCH_F = TRUE
+
+		end
+	    else
+
+		if .WILD_F
+		then
+		    MATCH_F = ch$eql (.LEN, .ADDR, .LEN, ACT_TXT (.I))
+		else
+		    MATCH_F = ch$eql (.LEN, .ADDR, ACT_LEN (.I), ACT_TXT (.I));
+
+	if .MATCH_F
+	then
+	    begin
+
+	    if .FIRST_SEMACT_F
+	    then
+		begin
+		FIRST_SEMACT_F = FALSE;
+		PUT_EOL ();
+		PUT_MSG_EOL ('	Semantics action status:')
+		end;
+
+	    case .SRCH_TYPE from 0 to SRCH_LAST of
+		set
+
+		[SRCH_SHOW, SRCH_SHOW_ALL] :
+		;
+
+		[SRCH_SET_TRC] :
+		    TRC_SEMACT_VEC [.I] = TRUE;
+
+		[SRCH_SET_BRK] :
+		    BRK_SEMACT_VEC [.I] = TRUE;
+
+		[SRCH_CAN_TRC] :
+		    TRC_SEMACT_VEC [.I] = FALSE;
+
+		[SRCH_CAN_BRK] :
+		    BRK_SEMACT_VEC [.I] = FALSE;
+		tes;
+
+	    PUT_MSG ('	');
+%if PATBLSEXT_DEBUGGING %then
+	    PUT_STRING (PAT$DATA_SEMACT_TEXT (.I));
+%fi
+	    FILL_LEN = MAX_SYM_LEN - ACT_LEN (.I);
+
+	    if .FILL_LEN gtr 0 then PUT_ASCII (.FILL_LEN, SPACES);
+
+	    if .BRK_SEMACT_VEC [.I] then PUT_MSG ('	break		') else PUT_MSG ('	no break 	');
+
+	    if .TRC_SEMACT_VEC [.I] then PUT_MSG_EOL ('trace') else PUT_MSG_EOL ('no trace');
+
+	    end;
+
+	end;
+
+    if (.LEN gtr 0) and .FIRST_NONTRM_F and .FIRST_SEMACT_F
+    then
+
+	if .WILD_F
+	then
+	    begin
+	    PUT_EOL ();
+	    PUT_MSG_EOL ('No non-terminal or semantics action symbols starting with');
+	    PUT_MSG ('	');
+	    PUT_ASCII (.LEN, .ADDR);
+	    PUT_MSG_EOL (' were found');
+	    end
+	else
+	    begin
+	    PUT_EOL ();
+	    PUT_ASCII (.LEN, .ADDR);
+	    PUT_MSG_EOL (' is not a non-terminal or semantics action');
+	    end;
+
+    end;
+routine UP_CASE (LEN, STRING_P) : novalue =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine converts a string to upper case.
+!
+! FORMAL PARAMETERS:
+!
+!	LEN - Length of string
+!
+!	STRING_P - Pointer to string
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    begin
+
+    local								! 002
+	ptemp;								! 002
+    ptemp = .string_p;							! 002
+
+    incr I from 0 to .LEN - 1 do
+	begin								! 002
+	if (ch$rchar(.ptemp) geq %c'a') and (ch$rchar(.ptemp) leq %c'z')! 002
+	then
+	    ch$wchar (ch$rchar (.ptemp)-%c' ', .ptemp);			! 002
+	    ptemp = ch$plus (.ptemp, 1);				! 002
+	end;								! 002
+    end;
+
+%else
+    0		! Nothing from this module if not debugging
+%fi
+
+end						!End of module
+
+eludom

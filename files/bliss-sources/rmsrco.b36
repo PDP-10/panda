@@ -1,0 +1,524 @@
+MODULE RCONNECT (	! DAP CONNECT/DISCONNECT Operations
+		IDENT = '3.0(660)'
+                %BLISS36(,ENTRY(
+                                Dap$Connect,
+                                Dap$Find,
+                                Dap$Free_Flush,                     ! 660
+                                Dap$Delete,
+                                Dap$Truncate,
+                                Dap$Disconnect,
+                                D$Display
+                                ))
+		) =
+BEGIN
+!
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1981, 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+
+!++
+! FACILITY:  DAP
+!
+! ABSTRACT:  Routines to transfer records or blocks of file data.
+!
+!
+! ENVIRONMENT:  RMS, BLISSNET, XPORT, Some 36-bit specific code.
+!
+! AUTHOR:	Andrew Nourse, CREATION DATE:  29-JUN-84
+
+! REVISION HISTORY:
+!
+! 660 - Dap$Free_Flush
+! 572 - Complete fixing $display when XABs change
+! 571 - Fix $display when XABs change
+! 560 - Fix $truncate
+! 556 - Fix $delete
+! 533 - CRC checking
+! 506 - Extended addressing gotcha
+!
+! TABLE OF CONTENTS
+!
+!       Dap$Connect
+!       Dap$Find
+!       Dap$Free_Flush
+!       Dap$Delete
+!       Dap$Truncate
+!       Dap$Disconnect
+!       D$Display
+
+!
+! LIBRARY REFERENCES
+!
+REQUIRE 'RMSREQ';
+LIBRARY 'CONDIT';
+
+!
+! EXTERNALS
+!
+EXTERNAL ROUTINE
+    Dap$Handle,			! Condition Handler
+    Dap$Error_Dap_Rms,          ! Convert DAP error to RMS error
+    Dap$Put_Control,            ! Control message sender
+    Dap$Put_Message,            ! Send it out
+    Dap$Get_Ack,                ! Get response
+    Dap$Get_Attributes,         ! Get file attributes from remote system
+    Dap$EndAccess,              ! Close/Disconnect via DAP
+    D$SDisplay,                 ! Set display bits 
+    UAddr;                      ! Extendify user address !a506
+
+GLOBAL ROUTINE Dap$Connect ( P_Rab: REF $Rab_decl,
+                               Err )  =	! Connect RAB to FAB
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Connect RAB to FAB for an open file on another system.
+!
+! FORMAL PARAMETERS:
+!
+!       P_RAB: Addr of RAB as defined by RMS
+!       ERR: Address of error routine
+!
+! IMPLICIT INPUTS:
+!
+!	Fab: Address of Fab
+!       Fst: Address of Fst
+!	Rst: Address of newly-created Rst
+!	Fab: Address of Fab
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!--
+
+    BEGIN
+    BIND
+        URab=.P_Rab: $Rab_decl,          	! The RAB                 !m557
+        UFab=.Fab: $Fab_decl,                   ! FAB pointed to by above !m557
+        URst=.Rst: $Rms_Rst,                    ! RST we are setting up   !m557
+        UFst=.Fst: $Rms_Fst,                    ! FST for file            !m557
+        Odd=.Fst[Fst$a_O_Dd]: $Dap_Descriptor,  ! our output message descriptor
+        Idd=.Fst[Fst$a_I_Dd]: $Dap_Descriptor;  ! our input message descriptor
+
+    BIND ROUTINE $$Errrtn=.Err: Rms_Ercal;
+
+    LOCAL status_code;                          ! success/error code
+    LOCAL Bdata: $XPO_DESCRIPTOR();             ! will point to binary data
+    LOCAL Adata: $STR_DESCRIPTOR();             ! will point to ascii data
+    LOCAL Display: BITVECTOR[28];
+
+    ROUTINE CHandle( Signal_Args: REF VECTOR, Mech_Args, Enable_Args )=  !a575
+        BEGIN
+        $Rms$DeLink( Rst );             ! Remove RST from linked list
+
+        ! Invoke regular handler
+        Dap$Handle( .Signal_Args, .Mech_Args, .Enable_Args )
+        END;
+
+    LOCAL Rabsav: VOLATILE;
+    LOCAL Errsav: VOLATILE;
+
+    ENABLE CHandle(Rabsav,Errsav);
+
+    Errsav=.Err;
+    Rabsav=URab;                        ! Handler will need this
+
+    Clearv(Display);
+
+    !+
+    ! Link into linked list of RSTs
+    !-
+    $Rms$Link( rst, fst );                                              !a557
+
+    !+
+    ! Figure out the stream id to use
+    !-
+    Odd[Dap$b_StreamId]                                                 !a557vv
+    = URst[Rst$v_StreamId]
+    =   (BIND prevrst = .URst[Rst$a_BLink]: $Rms_Rst;
+         IF .prevrst[Rst$h_Bid] EQL Fst$k_Bid
+         THEN 0                         ! This is the first rab connected
+         ELSE .prevrst[Rst$v_StreamId] + 1);                      
+
+    URab[Rab$a_Isi] = URst;             ! Point the rab at the rst      !a557^^
+
+    Dap$Put_Control( Odd, URab, Dap$k_Connect, Display );        
+    Dap$Put_Message( Odd );
+    
+    Rst[Rst$v_No_Send_Control]=0;       ! Send control on first Get or Put
+    Rst[Rst$v_Remote]=1;                ! This is a remote file
+
+    IF .UFst[Fst$v_Accopt_Crc]          ! If CRC Checking !a533
+    THEN URst[Rst$h_Checksum] = %O'177777'; ! Init CRC-16  !a533
+
+    Dap$Get_Ack( Idd );
+    .UsrSts
+    END;			!End of DAP$CONNECT
+
+GLOBAL ROUTINE Dap$Find ( P_Rab: REF $Rab_decl,
+                          Err )  =	! Find record
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Do a $FIND for a remote file
+!
+! FORMAL PARAMETERS:
+!
+!       P_RAB: Addr of RAB as defined by RMS
+!       ERR: Address of error routine
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+
+!--
+
+    BEGIN
+    BIND
+        Rab=.P_Rab: $Rab_decl,          	! The RAB 
+        Fab=UAddr(.Rab[Rab$a_Fab]): $Fab_decl,  ! FAB pointed to by above !M506
+        Rst=.Rab[Rab$a_Isi]: $Rms_Rst,          ! RST we are setting up
+        Fst=.Fab[Fab$a_Ifi]: $Rms_Fst,          ! FST for file
+        Odd=.Fst[Fst$a_O_Dd]: $Dap_Descriptor,  ! our output message descriptor
+        Idd=.Fst[Fst$a_I_Dd]: $Dap_Descriptor;  ! our input message descriptor
+
+    BIND ROUTINE $$Errrtn=.Err: Rms_Ercal;
+
+    LOCAL status_code;                          ! success/error code
+    LOCAL Display: BITVECTOR[28];
+
+    LOCAL Rabsav: VOLATILE;
+    LOCAL Errsav: VOLATILE;
+
+    ENABLE Dap$Handle(Rabsav,Errsav);
+
+    Errsav=.Err;
+    Rabsav=Rab;                        ! Handler will need this
+
+    Clearv(Display);
+
+    Dap$Put_Control( Odd, Rab, Dap$k_Find, Display );        
+    Dap$Put_Message( Odd );
+    
+    Dap$Get_Ack( Idd );
+    .UsrSts
+    END;			!End of DAP$FIND
+GLOBAL ROUTINE Dap$Free_Flush ( P_Rab: REF $Rab_decl,
+                          Err,
+                          Function)  =	! Unlock or Flush record stream ! 660
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Do a $FREE or $FLUSH for a remote file
+!
+! FORMAL PARAMETERS:
+!
+!       P_RAB: Addr of RAB as defined by RMS
+!       ERR: Address of error routine
+!	FUNCTION: Dap function code for $FREE or $FLUSH
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+
+!--
+
+    BEGIN
+    BIND
+        Rab=.P_Rab: $Rab_decl,          	! The RAB 
+        Fab=UAddr(.Rab[Rab$a_Fab]): $Fab_decl,  ! FAB pointed to by above
+        Rst=.Rab[Rab$a_Isi]: $Rms_Rst,          ! RST we are setting up
+        Fst=.Fab[Fab$a_Ifi]: $Rms_Fst,          ! FST for file
+        Odd=.Fst[Fst$a_O_Dd]: $Dap_Descriptor,  ! our output message descriptor
+        Idd=.Fst[Fst$a_I_Dd]: $Dap_Descriptor;  ! our input message descriptor
+
+    BIND ROUTINE $$Errrtn=.Err: Rms_Ercal;
+
+    LOCAL status_code;                          ! success/error code
+    LOCAL Display: BITVECTOR[28];
+
+    LOCAL Rabsav: VOLATILE;
+    LOCAL Errsav: VOLATILE;
+
+    ENABLE Dap$Handle(Rabsav,Errsav);
+
+    Errsav=.Err;
+    Rabsav=Rab;                                 ! Handler will need this
+
+    Clearv(Display);
+
+    Dap$Put_Control( Odd, Rab, .Function, Display );        
+    Dap$Put_Message( Odd );
+    
+    Dap$Get_Ack( Idd );
+    .UsrSts
+    END;			!End of DAP$FREE_FLUSH
+
+GLOBAL ROUTINE Dap$Delete ( P_Rab: REF $Rab_decl,
+                            Err )  =	! Delete record
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Do a $DELETE for a remote file
+!
+! FORMAL PARAMETERS:
+!
+!       P_RAB: Addr of RAB as defined by RMS
+!       ERR: Address of error routine
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+
+!--
+
+    BEGIN
+    BIND
+        Rab=.P_Rab: $Rab_decl,          	! The RAB 
+        Fab=UAddr(.Rab[Rab$a_Fab]): $Fab_decl,  ! FAB pointed to by above !M506
+        Rst=.Rab[Rab$a_Isi]: $Rms_Rst,          ! RST we are setting up
+        Fst=.Fab[Fab$a_Ifi]: $Rms_Fst,          ! FST for file
+        Odd=.Fst[Fst$a_O_Dd]: $Dap_Descriptor,  ! our output message descriptor
+        Idd=.Fst[Fst$a_I_Dd]: $Dap_Descriptor;  ! our input message descriptor
+
+    BIND ROUTINE $$Errrtn=.Err: Rms_Ercal;
+
+    LOCAL status_code;                          ! success/error code
+    LOCAL Display: BITVECTOR[28];
+
+    LOCAL Rabsav: VOLATILE;
+    LOCAL Errsav: VOLATILE;
+
+    ENABLE Dap$Handle(Rabsav,Errsav);
+
+    Errsav=.Err;
+    Rabsav=Rab;                        ! Handler will need this
+
+    Clearv(Display);
+
+    Dap$Put_Control( Odd, Rab, Dap$k_Delete, Display );        
+    Dap$Put_Message( Odd );
+    
+    Dap$Get_Ack( Idd );
+    .UsrSts
+    END;			!End of DAP$DELETE
+GLOBAL ROUTINE Dap$Truncate ( P_Rab: REF $Rab_decl,
+                              Err )  =	! Truncate file
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Do a $Truncate for a remote file
+!
+! FORMAL PARAMETERS:
+!
+!       P_RAB: Addr of RAB as defined by RMS
+!       ERR: Address of error routine
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+
+!--
+
+    BEGIN
+    BIND
+        Rab=.P_Rab: $Rab_decl,          	! The RAB 
+        Fab=UAddr(.Rab[Rab$a_Fab]): $Fab_decl,  ! FAB pointed to by above !M506
+        Rst=.Rab[Rab$a_Isi]: $Rms_Rst,          ! RST we are setting up
+        Fst=.Fab[Fab$a_Ifi]: $Rms_Fst,          ! FST for file
+        Odd=.Fst[Fst$a_O_Dd]: $Dap_Descriptor,  ! our output message descriptor
+        Idd=.Fst[Fst$a_I_Dd]: $Dap_Descriptor;  ! our input message descriptor
+
+    BIND ROUTINE $$Errrtn=.Err: Rms_Ercal;
+
+    LOCAL status_code;                          ! success/error code
+    LOCAL Display: BITVECTOR[28];
+
+    LOCAL Rabsav: VOLATILE;
+    LOCAL Errsav: VOLATILE;
+
+    ENABLE Dap$Handle(Rabsav,Errsav);
+
+    Errsav=.Err;
+    Rabsav=Rab;                        ! Handler will need this
+
+    Clearv(Display);
+
+    Dap$Put_Control( Odd, Rab, Dap$k_Truncate, Display );        
+    Dap$Put_Message( Odd );
+
+    Dap$Get_Ack( Idd );
+    .UsrSts
+    END;			!End of Dap$Truncate
+
+
+GLOBAL ROUTINE Dap$Disconnect (P_Rab: REF $Rab_Decl,  ! Disconnect RAB from FAB
+                        Err)  =
+                                 
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Disconnect RAB from FAB for an open file on another system.
+!
+! FORMAL PARAMETERS:
+!
+!       P_RAB: A RAB as defined by RMS
+!       ERR: Address of error routine
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!--
+BEGIN
+BIND Rab=.P_Rab: $Rab_decl,
+     Fab=UAddr(.Rab[Rab$a_Fab]): $Fab_decl;     ! Get addr of FAB !m506
+
+Dap$EndAccess ( Fab, Dap$k_Accomp_Eos, .Err )
+END; ! of Dap$Disconnect
+GLOBAL ROUTINE D$Display ( P_Fab: REF $Rab_decl,
+                           Err )  =	! Display file
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Do a $Display for a remote file
+!
+! FORMAL PARAMETERS:
+!
+!       P_FAB: Addr of FAB as defined by RMS
+!       ERR: Address of error routine
+!
+!--
+
+    BEGIN
+    BIND
+        Fab=.P_Fab: $Fab_decl,          	! The FAB 
+        Fst=.Fab[Fab$a_Ifi]: $Rms_Fst,          ! FST for file
+        Odd=.Fst[Fst$a_O_Dd]: $Dap_Descriptor,  ! our output message descriptor
+        Idd=.Fst[Fst$a_I_Dd]: $Dap_Descriptor;  ! our input message descriptor
+    LOCAL
+        Rst: $Rms_Rst PRESET([Rst$v_Streamid]=0),   ! dummy RST
+        Rab: $Rab( Fab=fab, rac=seq );              ! dummy RAB
+
+    BIND ROUTINE $$Errrtn=.Err: Rms_Ercal;
+
+    LOCAL status_code;                          ! success/error code
+    LOCAL Display: BITVECTOR[28];
+
+    LOCAL Rabsav: VOLATILE;
+    LOCAL Errsav: VOLATILE;
+
+    ENABLE Dap$Handle(Rabsav,Errsav);
+
+    Errsav=.Err;
+    Rabsav=Rab;                        ! Handler will need this
+
+    Rab[Rab$a_Isi]=Rst;
+
+    ! Recheck xab chain & set display bits, user might have added xabs
+    Fst[Fst$v_Display] = Display = D$SDisplay( Fab );               !m572
+    
+    ! Send the control messages
+    Dap$Put_Control( Odd, Rab, Dap$k_Display, Display );        
+    Dap$Put_Message( Odd );
+
+    ! Get the attributes back
+    Dap$Get_Attributes( Idd, Fab );
+
+    (.UsrSts LSS RMS$K_ERR_MIN)         ! Return True if no error
+    END;			!End of D$Display
+END
+ELUDOM
+  

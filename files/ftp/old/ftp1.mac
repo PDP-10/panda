@@ -1,0 +1,602 @@
+;No TCPSYM
+;#13 14Feb83 /Rcc
+;   Fixes from ISI, PARC and BBNRCC versions
+;#6-12 Were used in various local copies (without hanging VWHO!)
+;#5 Fix problem with not recognizing quoted file names
+;#4 Add RETAIN and NORETAIN commands
+;#3 Fix to cause byte count conversion when byte size of write differs from
+;   byte size of open & Fix to finesse around the vax bbn-tcp close code
+;#2 Temporary fix to prevent copies of FTPSRT from hanging around
+;   Add detach before logout
+;FTP1.MAC.1 CLynn Based on old NCP version, with lots of changes
+;NB: Versions with TCPF or TCPP not 1 are unsupported, untested, etc
+;NB: May have to be modified at each site due to TCP version skew,
+;    see TCPOLD for hints. TCPOLD==1 assumes new TCP on TOPS20 and
+;    old TCP on TENEX.  Differences are CDB format and STAT JSYS/
+;    monitor TCB format.
+
+IFNDEF SERVER,<IFNDEF USER,<IF1 <
+PRINTX ? Must define either USER or SERVER
+PRINTX   The command to compile the FTP User Program is
+PRINTX    @macro
+PRINTX    *ftp=tty:,ftp1,ftp2u,tcpsim,ftp4
+PRINTX    user==1
+PRINTX    ^Z
+PRINTX    [MCREP1 END OF PASS 1]
+PRINTX    user==1
+PRINTX    ^Z
+PRINTX    *
+PRINTX   The server is compiled by substituting
+PRINTX    *ftpsrt=tty:,ftp1,ftp2s,tcpsim,ftp4
+PRINTX   and
+PRINTX    server==1
+> ; End of IF1
+	END		; Don't waste cycles
+>> ; End of IFNDEFs
+
+
+IFDEF  USER,<TITLE FTP - TCP-based File Transfer Protocol - User Program
+DEFINE OURNAME <HRROI B,[ASCIZ / FTP User Process /]>	>
+IFDEF SERVER<TITLE FTPSRT - TCP-based File Transfer Protocol - Server Program
+DEFINE OURNAME <HRROI B,[ASCIZ / FTP Server Process /]>	>
+	SUBTTL C Lynn - BBN - Version 25
+
+	SEARCH MONSYM,MACSYM
+	SALL
+	.DIRECT FLBLST
+
+VWHO==0		; Last edited by SWE
+VMAJOR==5	; Major Version #
+VEDIT==14	; Edit Number
+IFE TCPP,<VMINOR==<"N"&37>>; Revision #
+IFN TCPP,<VMINOR==<"T"&37>>; Revision #
+
+
+	LOC	<.JBVER==137>
+VERSIO:	<VWHO>B2+<VMAJOR>B11+<VMINOR>B17+VEDIT ; Versions for typeout
+	RELOC
+	TWOSEG			; The high seg contains code used after LOGIN
+	RELOC 400000		; Create the high segment
+HSBAS:
+	LOC 2000		; Origin of code in low segment
+
+REPEAT 0,<.DIRECTIVE XSRCVN SRCVNO> ; DEC MACRO doesn't support this
+
+	SUBTTL	Configuration Definitions
+
+DEFINE ND (X,Y)<
+IFNDEF X,<X==Y>>
+
+ND REL4,1	;0 - If not TOPS20 Release 4 or later
+		;1 - If assembling for TOPS20 Release 4 or later
+
+ND TCPF,1	;0 - Use NCP for connections
+		;1 - Use TCP for connections
+ND TCPP,1	;0 - Use NCP protocol over connections
+		;1 - Use IEN-149 protocol over connections
+
+IFN REL4,<	T20FDB==.FBLEN>		; FDB lengths
+IFE REL4,<	T20FDB==30>		; 101B
+		TNXFDB==25		; TENEX
+MINFDB==TNXFDB				; Minimum acceptable FDB
+MAXFDB==37+10				; Maximum FDB - extra for padding
+
+PGSBSY=='FTP'		; Name of subsystem for SETSN JSYS
+IFDEF SERVER,<PGNAME=='FTPSRT'>	; Name of this program for SETNM JSYS
+IFDEF   USER,<PGNAME=='TCPFTP'>	; Name of this program for SETNM JSYS
+
+
+ND PDLL,100	; Stack length
+ND DWTIME,^D120	; Seconds to wait for data connection
+ND DEBUG,0	; Debugging code assembly switch
+ND LCMDIB,^D512	; Words to hold TELNET line. Make ridiculously huge
+		; because of NLS users' inability to type carriage return
+ND LREPLY,^D100	; Words to hold reply. Shouldn't need nearly this much
+
+ND IPCLOG,0	;0 - No ICPF logging (TENEX or TOPS20)
+		;1 - Rudimentary logging via IPCF (TOPS20 only)
+		; Not yet implemented
+
+IFDEF USER,<			; User code
+
+IFE TCPF,<
+ND FTPICS,3	; Protocol ICP socket for FTP
+ND FTPDSK,2	; FTP data socket number
+ND USRSKN,100	; User socket number U before job-translation
+> ; End of IFE TCPF
+
+IFN TCPF,<
+ND FTPICS,<^D21>
+ND USRSKN,FTPICS ; Job-relative byte of User port number U
+> ; End of IFN TCPF
+> ; End of IFDEF USER
+
+
+IFDEF SERVER,<			; Server code
+
+ND ENABL,1	;0 - No special capabilities
+		;1 - Enable all user capabilities
+
+ND ANOP,1	;0 - ANONYMOUS users must supply correct password
+		;1 - ANONYMOUS users do not need password (give USER)
+		;Note: ANONYMOUS logins are not allowed unless
+		;	the file "ANONYMOUS.USERFILE" exists,  see T__.AU
+
+ND MLACTF,0	;0 - Site does not have separate account # for mail
+		;1 - Site has separate account # for mail(see TXX.AC)
+
+ND WATTIM,^D300	; Seconds to wait for user to type something
+
+REPEAT 0,<	; Who knows what this is? As of 3/81 it conflicts
+		; with HERMES's use of the flag word
+MLSKT==^D232	; Foreign socket from which comes authenticated
+		; mail if we trust the site (first of six sockets)
+		; Causes B7 to be set in mail flag word
+  > ; End of REPEAT 0
+
+	SUBTTL	System Dependent String Constants
+; TOPS20 - T20.xx, TENEX - TNX.xx, Same - TXX.xx
+
+DEFINE PARMAC	(SYSTEM<SYSTEM>,SYS<SYS>,SUBSYS<SUBSYS>)<
+				; (Use other names when debugging)
+T20.DV:	ASCIZ /PS:/		; Device prefix
+TNX.DV:	0
+
+TXX.SY:	ASCIZ /SYSTEM/		; System
+
+T20.NV:	ASCIZ /.-1;P770000/	; New version of a file
+TNX.NV:	ASCIZ /;-1;P770000/
+
+TXX.AN:	ASCIZ /ANONYMOUS/	; ANONYMOUS user name
+
+; Filespec of file containing ANONYMOUS user password
+; Note: If this file does not exist, ANONYMOUS logins are not allowed
+T20.AU:	ASCIZ /SYSTEM:ANONYMOUS.USERFILE/
+TNX.AU:	ASCIZ /<SYSTEM>ANONYMOUS.USERFILE/
+
+T20.UE:	ASCIZ /SYS:UDDT.EXE/	; Filespec of file containing UDDT
+TNX.US:	ASCIZ /<SUBSYS>UDDT.SAV/
+
+T20.MB:	ASCIZ /MAIL.TXT.1/	; Mailbox file name
+TNX.MB:	ASCIZ /MESSAGE.TXT;1/
+
+TXX.MT:	ASCIZ /<SYSTEM>--MAIL--./	; Mail temp file name
+
+TXX.M2:	ASCIZ /MAIL2/		; Primary directory for MAIL.LOG file
+
+; Mail forwarder program is run in a fork starting at entry vector
+;	offset 2 to lookup a given USERNAME.  AC1 on entry is 1
+;	for local mode.
+; Page 0 of the program is shared with BLTPAG which contains the
+;	USERNAME string at 140.  The program halts with AC1
+;	greater than zero if the mailee was found.  If found,
+;	the correct USERNAME string begins at 140 and the HOST
+;	name string begins at 150.  Mail for other hosts is
+;	rejected.
+T20.MF:	ASCIZ /SYS:MAILBOX.EXE/
+TNX.MF:	ASCIZ /<SUBSYS>MAILBOX.SAV/
+
+T20.UM:	ASCIZ /SYSTEM:[--UNSENT-MAIL--]./	; Unsent mail file
+TNX.UM:	ASCIZ /<SYSTEM>[--UNSENT-MAIL--]./
+
+TXX.MA:	ASCIZ /@/		; Unsent mail at sign
+
+TXX.ML:	ASCIZ /MAIL.BLOG/	; MAIL.LOG file name
+
+TXX.AC:	IFE MLACTF,<0>		; Mail default account number
+	IFN MLACTF,<ASCIZ /;A/>	; Fill in account #
+
+> ; End of DEFINE PARMAC
+> ; End of IFDEF SERVER
+
+	SUBTTL	AC Definitions
+
+F=0		; Flags
+A=1		; A-D are JSYSI args & temps
+B=2
+C=3
+D=4
+E=5		; AC used in call to mail routines
+
+T1=6		; Temps
+T2=7
+P1=10		; Permanent over subr calls
+P2=11
+P3=12
+
+BP=14		; Byte pointer for collecting, parsing strings
+X=15		; Msg pointer in mail errors
+
+P=17		; Stack
+
+	SUBTTL	Constants
+
+C.NUL==0	; NUL character
+C.CC==3		; Control-C
+C.BELL==7	; Bell
+C.BS==10	; Backspace (character delete)
+C.TAB==11	; Tab
+C.LF==12	; Line Feed
+C.FF==14	; Form Feed
+C.CR==15	; Carriage Return
+C.ESC==33	; Escape
+C.SPACE==" "	; Space
+
+C.COMNT==";"	; Starts comment lines to server
+C.QUOTE=="V"&37	; Quote character in file names, etc
+C.TTYE=="Z"&37	; End of file for TTY:
+C.HRLD=="*"	; The herald for typein
+C.SRVH=="<"	; "Less-Than" prefixes server output
+
+; Editting Characters
+; Backspace (^H) is also a character delete
+
+T20CDL==177	; TOPS20 Character delete (Rubout)
+T20CD2==C.BS	; TOPS20 Character delete (Backspace)
+T20WDL=="W"&37	; TOPS20 Word delete (^W)
+T20WD2==-1	; TOPS20 Word delete
+T20LDL=="U"&37	; TOPS20 Line delete (^U)
+T20LD2==-1	; TOPS20 Line delete
+T20EOL==C.LF	; TOPS20 End-of-line
+
+TNXCDL=="A"&37	; TENEX Character delete (^A)
+TNXCD2==C.BS	; TENEX Character delete (Backspace)
+TNXWDL=="W"&37	; TENEX Word delete (^W)
+TNXWD2==-1	; TENEX Word delete
+TNXLDL==177	; TENEX Line delete (Rubout)
+TNXLD2=="X"&37	; TENEX Line delete (Control-X)
+TNXEOL==37	; TENEX End-of-line
+
+.TTNVT==4	; TENEX NVT terminal type
+.TTIDL==11	; TOPS20 Ideal terminal type
+
+DECRAD==12	; Decimal radix
+OCTRAD==10	; Octal radix
+
+
+..DEVA==FLD(.JSAOF,JS%DEV)	; Abbreviations for JFNS JSYS format
+..DEVD==FLD(.JSSSD,JS%DEV)
+..DIRA==FLD(.JSAOF,JS%DIR)
+..DIRD==FLD(.JSSSD,JS%DIR)
+..NAMA==FLD(.JSAOF,JS%NAM)
+..TYPA==FLD(.JSAOF,JS%TYP)
+..GENA==FLD(.JSAOF,JS%GEN)
+..PROA==FLD(.JSAOF,JS%PRO)
+..ACTA==FLD(.JSAOF,JS%ACT)
+
+	SUBTTL	Macros
+
+DEFINE MSG (XMSG)<		HRROI A,[ASCIZ \XMSG\]
+				PSOUT	>
+
+DEFINE VMSG (XMSG)<		PUSH P,A
+				HRROI A,[ASCIZ \XMSG\]
+				SKIPE F$VBOS		; Verbose typeout?
+				  PSOUT
+				POP P,A	>
+
+DEFINE NOISE (XMSG)<		HRROI A,[ASCIZ \XMSG\]
+				MOVE C,BREAKC
+				CAIN C,C.ESC
+				  PSOUT	>
+
+; Macro to define keyword tables
+; The default is by definition the first entry in each table
+
+DEFINE KM (A,B,C)<ZZ==0
+		XWD N'A'S,N'A'S		; Maybe COMD one day
+IRP B,<	IF2 <IFNDEF A'$'B,<	IFB  <C>,<A'$'B==A'$>
+				IFNB <C>,<A'$'B==C>
+		>>
+		XWD [ASCIZ \B\],A'$'B
+	A'.'B==ZZ
+	ZZ==ZZ+1
+    > ; End of IRP
+	N'A'S==ZZ
+> ; End of DEFINE KM
+
+DEFINE CLOSD (FILE,FLAGS)<	MOVEI A,FILE
+		IFNB <FLAGS>,<	HRLI A,(FLAGS)>
+		IFN TCPF,<	CALL CLOSED>
+		IFE TCPF,<	CALL CLOSER>	> ; End of DEFINE CLOSD
+
+DEFINE CLOSK (FILE,FLAGS)<	MOVEI A,FILE
+		IFNB <FLAGS>,<	HRLI A,(FLAGS)>
+				CALL CLOSEK	> ; End of DEFINE CLOSK
+
+DEFINE CLOSR (FILE,FLAGS)<	MOVEI A,FILE
+		IFNB <FLAGS>,<	HRLI A,(FLAGS)>
+				CALL CLOSER	> ; End of DEFINE CLOSR
+
+DEFINE ASCIZS (NF,NT,S,SF,ST,T)<XLIST
+			IFE TCPP,<ASCIZ \NF'S'SF'T\>
+			IFN TCPP,<ASCIZ \NT'S'ST'T\>
+				LIST> ; End of DEFINE ASCIZS
+
+MSKSTR DV$TYP,B,DV%TYP		; Device type from DVCHR JSYS
+MSKSTR FB$BSZ,FDBBLK+.FBBYV,FB%BSZ ; FDB byte size, in FDBBLK
+MSKSTR OF$BSZ,0,OF%BSZ		; File byte size for OPENF JSYS
+MSKSTR PT$BSZ,0,77B11		; Byte size in POINT N,...
+
+	SUBTTL	Opcode Definitions
+
+IFE TCPF,<	DWTIME==^D120	; Seconds to wait for data connection
+
+		OPDEF	$GTJFN	[GTJFN]
+		OPDEF	$OPENF	[OPENF]
+		OPDEF	$BIN	[BIN]
+		OPDEF	$BOUT	[BOUT]
+		OPDEF	$JFNS	[JFNS]
+		OPDEF	$SIN	[SIN]
+		OPDEF	$SOUT	[SOUT]
+		OPDEF	$CLOSF	[CLOSF]
+		OPDEF	$MTOPR	[MTOPR]
+		OPDEF	$GTSTS	[GTSTS]
+		OPDEF	$SFBSZ	[SFBSZ]
+> ; End of IFE TCPF
+
+
+IFN TCPF,<	TCPOLD==1	; TENEX has old CDB format
+
+		TCPFB==1	; Using external buffers
+		T.BFSZ==1200	; Bigger buffers, page worth
+		CNTMOT==^D30	; Wait for SYN to arrive
+		RXTMOT==^D300	; Retransmission timeout
+		RXPARS==0	; Default retransmission parameters
+
+		OPDEF	$GTJFN	[CALL TCPGJF]
+		OPDEF	$OPENF	[CALL TCPOPN]
+		OPDEF	$BIN	[CALL TCPBIN]
+		OPDEF	$BOUT	[CALL TCPBOU]
+		OPDEF	$SIN	[CALL TCPSIN]
+		OPDEF	$SOUT	[CALL TCPSOU]
+		OPDEF	$CLOSF	[CALL TCPCLO]
+		OPDEF	$MTOPR	[CALL TCPMTP]
+		OPDEF	$GTSTS	[CALL TCPGST]
+		OPDEF	$JFNS	[CALL TCPJFS]
+		OPDEF	$SFBSZ	[CALL TCPSBS]
+		OPDEF	SEND	[JSYS 740]
+		OPDEF	RECV	[JSYS 741]
+		OPDEF	OPEN	[JSYS 742]
+		OPDEF	CLOSE	[JSYS 743]
+		OPDEF	STAT	[JSYS 745]
+		OPDEF	CHANL	[JSYS 746]
+		OPDEF	ABORT	[JSYS 747]
+
+> ; End of IFN TCPF
+
+	SUBTTL	Flags in AC F
+
+; Following flags are in Global Storage for inter-fork communication
+
+;F$SEND ; CD  Non-zero SEND, zero RECEIVE
+;F$FLST ; CR  File status is being requested
+;F$KPGN ; CD  May rename local file to retain generation number
+;F$DOPN ; CD  Data connection open
+;F$DTRQ ; C   Data xfer requested (inhibit pre-mature "no completion" msg)
+;F$DTIP ; CR  Data xfer in progress (set when F$DTRQ cleared)
+;F$WORK ; CD  Data is being received (TIMEOK incrs, Cleared by CWFORK loop)
+;F$DTDR ; CR  Data xfer completion reply received (set when F$DTIP cleared)
+;F$STAR ; CR  Input at command prompt
+;F$TCLS ; CRD (Obsolete) Close TELNET & data connections
+;F$VBOS ; CR  Verbose mode if non-zero
+
+
+; Following used by data fork
+
+F.CLSD==<400000,,0> ; D  Connection should be closed at end of data transfer
+F.DSK==<0200000,,0> ; D  Local file is on DSK
+F.ERR==<0100000,,0> ; D  Error in transfer
+F.FDB==<0040000,,0> ; D  Processed FDB
+F.IMG==<0020000,,0> ; D  CHANNEL mode bit shuffling required
+F.NUL==<0010000,,0> ; D  Receive side going to NUL:
+F.RLPT==<004000,,0> ;sD  On if receiving for spooled LPT
+F.SEND==<002000,,0> ; D  Distinguish data sends (1) from receives (0) F$SEND
+F.TYPX==<001000,,0> ; D  Transfer is PAGED
+
+
+IFDEF USER,<
+F.ABOR==<000400,,0> ;uC  F.ABOR,F.CGFG  00 - no abort, 01 - abort telnet
+F.CGFG==<000200,,0> ;uC	 		10 - abort data, 11 - abort both
+F.AMB==<0000100,,0> ;uC  Ambiguous command
+F.APPE==<000040,,0> ;uC  Append (1) versus Send (0) command
+F.HCOM==<000020,,0> ;uC  Command scanner will accept host name as word
+F.HCM1==<000010,,0> ;uC  Word scanner tried host names
+F.MATC==<000004,,0> ;uC  Match in command scanner
+F.MLFL==<000002,,0> ;uC  Mail file flag in send routine
+F.NOEC==<000001,,0> ;uC  Masking password
+
+F.HELP==<0,,400000> ;uC  Given help message, subsequently just "error"
+F.NOST==<0,,200000> ;uC  Statistics inhibited internally (MULTIPLE, etc)
+F.NST1==<0,,100000> ;uC  User specified no statistics
+F.CHOK==<0,,040000> ;uC  A good character seen in numeric input routine
+F.HDX==<00,,020000> ;uC  Half duplex console for primary I/O
+F.KJFN==<0,,010000> ;uC  Keep local JFN after CWFORK
+F.LCUC==<0,,004000> ;uC  Lower case to upper in word collector
+F.NTIC==<0,,002000> ;u   Counter for network interrupts vs timeout.
+F.QUOC==<0,,001000> ; C  Set when C.QUOTE (^V, Control-V) last char in
+F.SPTC==<0,,000400> ;uC  Space is a term, not data, in TSIN routine
+F.STAT==<0,,000200> ; C  Always zero to omit Server Reply Codes
+F.T1==<000,,000100> ;uC  Temp flag. Used in name parsing in MGET
+F.TOPN==<0,,000040> ;uC  TELNET connection open
+> ; End of IFDEF USER
+
+IFDEF SERVER,<
+F.ABOR==<000400,,0> ;sC  Received ABOR during file activity (not tested)
+F.MLFL==<000200,,0> ;sC  Distinguish MAIL (0) from MLFL (1)
+F.ANON==<000100,,0> ;sC  ANONYMOUS login (1)
+F.APPE==<000040,,0> ;sC  APPEND (1) versus STOR (0)
+F.CMDK==<000020,,0> ;sC  ERRRPL sets this. Causes GETCOM to hang up.
+F.INML==<000010,,0> ;sC  In MAIL, no editing allowed
+F.LOGI==<000004,,0> ;sC  Job is logged in (1)
+F.LTL==<0000002,,0> ;sC  LINEIN sets this. Line was ridiculously long.
+F.MFWD==<000001,,0> ;sC  Will forwarded mail (1) (cannot get JFN/mailbox busy)
+
+F.NALO==<0,,400000> ;sC  Don't auto-logout this job. (Set by MAIL/MLFL)
+F.NLST==<0,,200000> ;sC  Distinguish LIST/STAT (0) from NLST (1)
+F.NUMA==<0,,100000> ;sC  Flag non-numeric string (1) in ACCOUNT command
+F.NXM==	<0,,040000> ;sC  Mailbox found but "nonexistant" (default acct failed)
+F.PASV==<0,,020000> ;sC  In passive mode
+F.PDIR==<0,,010000> ;sC  Print directory name, in LIST and STAT
+F.QUOC==<0,,004000> ; C  Set when C.QUOTE (^V, Control-V) last char in
+F.STAT==<0,,000200> ;sC  STAT (1) versus LIST/NLST (0)
+F.TOPN==<0,,000040> ; C  TELNET connection open
+F.T1==<000,,000020> ;sC  Directory listing routine - need CR
+F.T2==<000,,000010> ;sC  Directory listing routine - extension changed
+;F.XSEM==<00000004> ;sC  Distinguish XSEM from XSEN
+> ; End of IFDEF SERVER
+
+	SUBTTL	Initialization
+
+; Start of program. Initialize stuff.
+
+GO:	RESET			; Start here, clean slate
+	SETZ F,			; All flags off
+	MOVE P,GPDP		; Initial stack pointer
+
+IFDEF SERVER,<
+; NCP Version:	Started up by FTSCTL.EXE system job
+; TCP Version:	Started up by FTSCTT.EXE system job
+; with	AC1/ Foreign Host #			AC3/ Foreign Port #
+;	AC2/ Local Host # (that caller used)	AC4/ Local Port # (=21.)
+
+IFN TCPF,<		; Connection info is passed from superior
+	MOVEM A,FHSTN		; Foreign (User) Host
+	MOVEM B,LHOSTN		; Local (Server) Host (as User addressed us)
+	MOVEM C,FORNS		; Foreign (User) Port
+	SUBI D,1		; Default Local (Server) Data port is one
+	MOVEM D,FTPDAT		; less than control port
+	MOVEM D,MYDATS		; Same as FTPDAT with TCPF
+> ; End of IFN TCPF
+
+	MOVX A,.FHSLF		; Get capabilities
+	SETOB B,C
+	EPCAP
+
+> ; End of IFDEF SERVER
+
+IFDEF USER,<
+IFN TCPF,<
+	GJINF			; Get job number
+	JUMPLE C,[MSG <Cannot get job number from system >
+		 JRST HALTGO]	; Fatal for now
+	LSH C,^D8		; Into high byte
+	ADDI C,USRSKN		; of port number
+	MOVEM C,USRSKT		; Save it
+> ; End of IFN TCPF
+> ; End of IFDEF USER
+
+	MOVX D,<T20PAR,,TENEX>	; Assume TOPS20
+	MOVE A,['PTYPAR']	; Table to check for system type
+	SYSGT
+	CAMN A,['PTYPAR']	; If name still there, no such table
+	  HRLI D,TNXPAR		; If no such table then TENEX
+	BLT D,EOL		; Set system dependent variables
+
+	MOVX A,<.HST20>
+	SKIPE TENEX
+	  MOVX A,<.HS10X>
+	MOVEM A,LHSTYP		; Set our system type
+
+	SUBTTL	Set Program & System Names
+
+IFDEF SERVER,<			; In SERVER, CRJOB may not have set these
+	MOVX A,PGSBSY		; Subsystem name
+	MOVX B,PGNAME		; Program name
+	SKIPN TENEX
+	 SETSN			; TOPS20 sets both
+	  JFCL
+	MOVE A,B
+	SKIPE TENEX
+	 SETNM			; TENEX only has name
+	  JFCL
+> ;End IFDEF SERVER
+
+; Get local host information
+
+	MOVX A,.GTHSZ		; Get local host number from system
+	GTHST
+	 JRST [MSG <Cannot get local host number from system >
+		JRST HALTGO]	; This is fatal for now
+IFE TCPF,<MOVEM D,LHOSTN>	; Save host number
+IFN TCPF,<			; User leaves it wild to get best address
+IFDEF SERVER,<MOVE A,LHOSTN>>	; Server - name as addressed
+IFDEF USER,<MOVEM B,HOSTNP>	; User - save neg. # host names,,0
+
+	MOVE C,D		; And make a string out of it too
+	HRROI B,LHSTNM
+	MOVX A,.GTHNS
+	GTHST			; Ask system for our name
+	  JRST TRYCVH
+	ANDI D,HS%STY		; Extract system type
+	MOVEM D,LHSTYP		; Local host system type
+	JRST SIGNON		; Don't need CVHST
+
+TRYCVH:	MOVE B,C		; Host number from GTHST
+	HRROI A,LHSTNM		; And make a string out of it too
+	CVHST			; Ask system for our own name
+	 JRST [	PUSH P,LHOSTN	; Use LHOSTN as a temp
+		MOVEM B,LHOSTN	;  for numeric form
+		MOVE A,[ASCII /Site /]
+		MOVEM A,LHSTNM
+		HRROI A,LHSTNM+1
+		MOVX D,<POINT 8,LHOSTN,3>
+		CALL HST4DA	; #.#.#.#
+		POP P,LHOSTN
+		JRST .+1]
+
+	SUBTTL	Build Signon Message
+
+SIGNON:	HRROI A,VERSTR		; Build version message here
+	SETZ C,
+	HRROI B,LHSTNM		; Sign on message
+	SOUT
+	OURNAME			; FTP User/Server Program
+	SOUT
+
+	LDB B,[POINT 9,VERSIO,11] ; Get major version
+	MOVX C,OCTRAD		; Octal numbers
+	SKIPE B			; Print if non-zero
+	 NOUT
+	  JFCL
+	LDB B,[POINT 6,VERSIO,17] ; Get minor version
+	JUMPE B,VERSI1		; Skip if 0
+	SUBI B,1
+	IDIVI B,^D26		; Make 2 letters
+	JUMPE B,VERSI0		; Any first letter?
+	HRRZI B,"A"-1(B)	; Yes, print
+	BOUT
+VERSI0:	HRRZI B,"A"(C)		; Print second letter
+	BOUT
+VERSI1:	HRRZ B,VERSIO		; Get edit number
+	MOVX C,OCTRAD		; Octal numbers
+	JUMPE B,VERSI2		; Skip if edit is 0
+	MOVX B,"("		; Print open paren
+	BOUT
+	HRRZ B,VERSIO		; Get edit number again
+	NOUT			; Print it
+	  JFCL
+	MOVX B,")"		; Print close paren
+	BOUT
+VERSI2:	LDB B,[POINT 3,VERSIO,2] ; Get group code
+	JUMPE B,VERSI3		; Skip if zero
+	MOVX B,"-"		; Print -
+	BOUT
+	LDB B,[POINT 3,VERSIO,2] ; Get group code
+	NOUT
+	  JFCL
+VERSI3:
+REPEAT 0,<		; Need directive to get this
+	HRROI B,[ASCIZ / %/]
+	SETZ C,
+	SOUT
+	MOVX B,SRCVNO
+	MOVX C,DECRAD
+	NOUT
+	  JFCL
+> ; End of REPEAT 0
+	MOVX B,C.NUL		; End the string
+	BOUT
+
+	SUBTTL
+

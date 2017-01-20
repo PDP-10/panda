@@ -1,0 +1,1179 @@
+;This software is furnished under a license and may only be used
+;  or copied in accordance with the terms of such license.
+;
+;Copyright (C) 1979,1980,1981,1982 by Digital Equipment Corporation
+;	       1983,1984,1985,1986    Maynard, Massachusetts, USA
+
+
+	TITLE MSTXT - Message text input and editing routines for MS
+
+	SEARCH GLXMAC,MSUNV
+	PROLOG (MSTXT)
+
+	CPYRYT
+	MSINIT
+
+;Declare globals
+
+	GLOBS			; Storage
+	GLOBRS			; Routines
+
+;Routines defined herein
+
+	INTERNAL GETTXT, TXTCHR, TXTCPT, TXTOUT, TXTPUT
+TOPS10<	INTERNAL CTX >
+TOPS20<	INTERNAL .EDITO >
+	INTERNAL .ERST0, .EDTXT
+
+;Routines defined elsewhere
+
+;MS.MAC
+	EXTERNAL BLANK0, CKXRTN, REMAP, WBOT, MSGFAD, SCRLFL, SCRRGR, SCRBTM
+
+;MSUTL.MAC
+	EXTERNAL ALCFOB, CJFNBK, CMDINI, CRIF, CRLF, DPROMP, FSCOPY, FSPEC
+	EXTERNAL MOVST0, MOVSTR, RELFOB, RFIELD, SETIOJ, SSEARC, TSOUT
+
+;MSNET.MAC
+TOPS10<	EXTERNAL SEND >
+
+;Global data items defined elsewhere
+
+;MS.MAC
+	EXTERNAL CRFDEV, CRFDIR, TTXTIB
+TOPS10<	EXTERNAL MYPPN >
+
+;Local storage
+
+   TOPS20<
+DEFPAG EDBPAG			; Editor buffer block page
+DEFPAG EDPAGE,20		; Editor pages for data
+   >;End TOPS20
+
+	IMPUR0			; Impure, but zero at link time
+
+TXTTOT:	BLOCK 1			; Total bytes in entire chain of text blocks
+TXTTT0:	BLOCK 1			; Saved TXTTOT for avoiding leading spaces
+TXTFPG:	BLOCK 1			; Word address of first text page
+TMPTX0:	BLOCK 1			; Storage for editor code
+TMPTX1:	BLOCK 1			; *** WARNING: these 2 locs must be adjacent!!
+   TOPS10<
+TMPNEW:	BLOCK	30		;NEW TMP:EDT FILE BUFFER
+TMPFOB:	BLOCK	FOB.MZ		;FILE OPEN BLOCK
+TMPFIL:	BLOCK	FDXSIZ		;FILE DESCRIPTOR BLOCK
+TMPAFS:	BLOCK	1		;ALTERNATE FOB SIZE
+TMPAFA:	BLOCK	1		;ALTERNATE FOB ADDRESS
+TMPAFD:	BLOCK	1		;ALTERNATE FD ADDRESS
+>
+   TOPS20<
+EDMOD:	BLOCK 5			; Editor TTY modes
+EDITOR:	BLOCK 1			; -1 = EMACS, 1 = something else
+EXECFK:	BLOCK 1			; Saved fork handle for EXEC
+EDFORK:	BLOCK 1			; Editor fork
+EFRKPC:	BLOCK 1			; Editor fork's PC
+EDPAG0:	BLOCK 1			; First page of editor fork mapped in
+FRKACS:	BLOCK 20		; Editor's ACs
+   >;End TOPS20
+
+	PURE
+
+ SUBTTL GETTXT - Main text snarfer
+
+GETTXT:	MOVE T,TAKPTR		; Get current input stream IFn
+	MOVE A,(T)		;  ..
+	TXNE F,F%CONC		; Concise mode?
+	JRST [	CITYPE <Message:>	; Yes, be so then
+		JRST GETTX0]
+
+	CITYPE (<Message (ESC to enter Send Level, ctrl-Z to send, ctrl-K to redisplay,
+	 ctrl-B to insert file, ctrl-E to enter editor):>)
+;	JRST GETTX0		;  continued next page
+;Here after prompting the user to collect the message text.
+
+GETTX0:	CALL CRLF		; Blank line
+	CALL CRLF
+.TEXT1:	$CALL K%FLSH		; Make sure this goes to the terminal now
+	MOVE A,TXTPTR		; Get curren text pointer
+	ANDI A,777000		; Strip all but address of page
+	MOVE B,TXTFPG		; Get address of first text page
+	CAME A,B		; Putting text in first page?
+	SKIPA A,[RD%JFN!RD%RND]	; No, return instead of bell if too many rubouts
+	MOVX A,RD%JFN		; Yes, just ding if too much editing
+	MOVEM A,TTXTIB+.RDFLG	; Save flag bits in TEXTI arg block
+	PUSH P,TXTCNT		; Save original text count
+	MOVEI A,TTXTIB
+	$CALL K%TXTI		; Call TEXTI
+	JUMPF [	MOVE T,TAKPTR		; EOF - get IFN stack ptr
+		POP T,A			; Get IFN of cmd input
+		CAIN A,.PRIIN		; Better be a file
+		JCERR (TEXTI failure)	; Isn't - strange
+		$CALL F%REL		; OK, release the IFN
+		POP T,B			; Get FOB info
+		POP T,A			;  ..
+		CALL RELFOB		; Release FOB storage
+		MOVE A,(T)		; Point to next IFN
+		CALL SETIOJ		; Read commands from it
+		MOVEM T,TAKPTR		; Save updated pointer
+		MOVX A,RD%BTM		; Light break char bit
+		IORM A,TTXTIB+.RDFLG	;  ..
+		MOVEI A,"K"-100		; Force redisplay of text
+		CALL TXTCHR		;  ..
+		SOS TXTTOT		; ADDM at .+3 will account for this
+		JRST .+1]		; Rejoin normal flow
+	POP P,A			; Get original text count for this page
+	SUB A,TXTCNT		; See if it changed
+	ADDM A,TXTTOT		; Update total text count (for all pages)
+	MOVE A,TTXTIB+.RDFLG	; Get flag bits
+	TXNE A,RD%BTM		; Did break char cause return?
+	JRST .TEXT2		; Yes, this is easy
+	TXNE A,RD%BFE		; Deleting to previous buffer?
+	JRST .TEXT3		; Yes, must deallocate page, back up, etc.
+	; ..
+
+	; ..
+
+;None of the above - must be count exhausted - chain on a new page
+
+	SKIPE TXTCNT		; Bug filter
+	FATAL (Unknown return from K%%TXTI at GETTXT)
+	CALL TXTAQP		; Get and chain next page
+	JRST .TEXT1		; Go eat more text
+
+;Backup limit reached - must back up to previous page
+
+.TEXT3:	MOVE A,TXTPTR		; Get current text pointer
+	ANDI A,777000		; Form addr of beginning of page
+	SKIPN C,TB.BAK(A)	; Get backward link (previous page)
+	FATAL (GETTXT - backup limit reached and no previous page)
+	$CALL M%RPAG		; Release this page
+	MOVE A,[POINT 7,777,27]	; Delete the last byte on the page
+	ADD A,C			; Point to this page
+	MOVEM A,TXTPTR		; Save
+	MOVE A,[POINT 7,TB.TXT]	; New backup limit
+	ADD A,C			;  ..
+	MOVEM A,TTXTIB+.RDBFP	; Stuff into arg block
+	MOVEI A,1		; One byte left on this page
+	MOVEM A,TXTCNT
+	MOVE A,TXTTOT		; Get total byte count
+	SUBI A,1		; Account for byte just crudely deleted
+	MOVEM A,TXTTOT		;  ..
+	JRST .TEXT1		; Go talk to user some more
+
+;Here on break character
+
+.TEXT2:	LDB B,TXTPTR
+	MOVEM B,LSTCHR		; Save terminator
+	SETZ A,
+	DPB A,TXTPTR		; Replace terminator with null
+	MOVSI A,(7B5)
+	ADDM A,TXTPTR
+	AOS TXTCNT		; Don't include break char in byte counts
+	SOS TXTTOT		;  ..
+	CAIE B,40		; Space or tab
+	CAIN B,11		;  means we're auto-filling
+	JRST .TEXTA		; Go check it out
+	CAIN B,"E"-100		; ^E - enter editor on text
+	 JRST .EDTXT
+	CAIN B,"K"-100		; Wants retype of whole thing?
+	 JRST RETYPE
+	CAIN B,"B"-100		; Wants to insert a file?
+	JRST CBAGN		; Yes, go do it
+	RET			; No, must have terminated right
+
+
+;Here to check for auto-filling
+
+.TEXTA:	$CALL K%TPOS		; Get horizontal position
+	CAMGE A,FILCOL		; Greater than fill column?
+	JRST .TEXA1		; No, probably don't need to do anything
+	CALL CRLF		; Yes!  Line full!  Type a CRLF
+	MOVEI A,[BYTE (7) 15, 12, 0]	; Put a CRLF into the buffer
+	CALL TXTPUT		;  ..
+	MOVE A,TXTTOT		; Remember total byte count at this point
+	MOVEM A,TXTTT0		;  for avoiding spurious leading spaces caused
+				;  by typist double-spacing after periods
+	JRST .TEXT1		;  and continue eating text
+
+.TEXA1:	MOVE A,TXTTOT		; Get current byte count
+	CAMN A,TXTTT0		; Did we just supply a free CRLF?
+	JRST [	MOVEI A,15		; Yes, go to beginning of line
+		CALL KBFTOR		;  because user probably typed
+		$CALL K%FLSH		;  two spaces after a period
+		JRST .TEXT1]		; Ignore this space and eat more text
+	MOVE A,LSTCHR		; Normal case, just insert the terminator
+	CALL TXTCHR		;  ..
+	JRST .TEXT1		;  and continue
+
+;Erase the text buffer and release any associated storage
+
+.ERST0:	SKIPN A,TXTFPG		; Any text pages allocated at all?
+	JRST .ERST2		; No, this is easy then...
+.ERST1:	MOVE C,TB.FOR(A)	; Get forward link, if any
+	$CALL M%RPAG		; Release this page
+	SKIPE A,C		; Was there any forward link?
+	JRST .ERST1		; Yes, keep going
+.ERST2:	$CALL M%GPAG		; Allocate first page for text
+	MOVEM A,TXTFPG		; Remember its address
+	ADD A,[POINT 7,TB.TXT]	; Point to text area
+	MOVEM A,TXTPTR		; Reset pointer to text space
+	MOVEM A,TTXTIB+.RDBFP	; This is also backup limit
+	MOVEI A,TXTSIZ		; Init buffer size
+	MOVEM A,TXTCNT
+	SETZM TXTTOT		; No bytes in text yet
+	SETOM TXTTT0		; Failing compare please for this guy
+	RET
+SUBTTL Sending subroutines - TXTOUT - Write text of message to file or string
+
+;Call:
+;	A/ IFN or string pointer
+;
+; or, if F%JSYS is on,
+;
+;	A/ JFN or string pointer
+
+TXTOUT:	STKVAR <SVCNT,SVPTR,SIFN0,SINST>
+	MOVEM A,SIFN0		; Save IFN
+	MOVE A,TXTFPG		; Address of first text page
+	ADD A,[POINT 7,TB.TXT]	; Point to text
+	MOVEM A,SVPTR		; Current text pointer
+	MOVE A,TXTTOT		; Get total text count
+	MOVEM A,SVCNT		; Save current text count
+TXTOU0:	MOVE C,SVCNT		; Get current count
+	CAILE C,TXTSIZ		; Is what's left entirely in current page?
+	MOVEI C,TXTSIZ		; No, just do this page
+	MOVE B,SVCNT		; Get current count
+	SUB B,C			; Minus this chunk
+	MOVEM B,SVCNT		; Update count
+	MOVE A,SIFN0		; File to write to
+	MOVE B,SVPTR		; Point to this chunk
+	SETZ D,			; No fancy SOUT terminations
+   TOPS20<
+	TXNE F,F%JSYS		; Use JSYSes instead of GLXLIB?
+	JRST [	SOUT			; Yes
+		 ERJMP .RETF		; Propagate errors
+		JRST TXTOU1]		; OK, continue
+   >;End TOPS20
+    TOPS10<
+	TXNE F,F%UUO		; Use UUO's same flag
+	 JRST [MOVE B,SVPTR	; Get the byte pointer back
+	       PUSHJ P,SEND	; Do the output to the file
+	       JRST TXTOU1]
+    >;End TOPS10
+	CALL TSOUT		; Move it on out
+	 JUMPF R		; Propagate errors
+TXTOU1:	MOVEM A,SIFN0		; Save in case updated pointer
+	SKIPN SVCNT		; Any text left?
+	RET			; No, return OK
+	MOVE A,SVPTR		; Get text pointer
+	ANDI A,777000		; Compute first address in page
+	MOVE A,TB.FOR(A)	; Move to next page
+	ADD A,[POINT 7,TB.TXT]	; Point to text part of it
+	MOVEM A,SVPTR		; Save as current pointer
+	JRST TXTOU0		; Do all chunks
+
+;Here to insert a file into the text buffer
+
+CBAGN:	PROMPT (<(Insert file: >)
+  TOPS20<
+	SETZM CJFNBK+.GJEXT	; [ESM] No default extension
+   >;End TOPS20
+   TOPS10<
+	SETZM CJFNBK		; Zap previous defaults
+	MOVE A,[CJFNBK,,CJFNBK+1]
+	BLT A,CJFNBK+CJFNLN-1
+	SETZM CJFNBK+.FDEXT	; [ESM] No default extension
+   >;End TOPS10
+	CALL FSPEC		; Get file spec
+	 JRST [	WARN <No file specified...)>
+		JRST .TEXT1]		; Just CR - ignore this request
+	CALL RDTEXT		; Read in text
+	 JRST CBAGN		; Error - try again
+	$TEXT (KBFTOR,<...EOF)>)
+	JRST .TEXT1		; Continue getting text
+
+;Insert file into text buffer - FOB size, addr in A, B
+
+RDTEXT:	STKVAR <<TFOB,2>,TIFN>
+	DMOVEM A,TFOB		; Remember for close
+	$CALL F%IOPN		; Open the file
+	JUMPF [	MOVE A,1+TFOB		; Get FOB addr
+		HRRZ A,FOB.FD(A)		; Get FD for error msg
+		$TEXT (KBFTOR,<?Can't open file ^F/(A)/ for read because: ^E/[-1]/>)
+		JRST RDTXTE]		; Clean up
+	MOVEM A,TIFN		; Remember this
+RDTXT0:	MOVE A,TIFN
+	$CALL F%IBYT		; Get a byte
+	JUMPF [	CAIE A,EREOF$		; EOF?
+		JRST [	MOVE A,1+TFOB		; No, set up for err msg
+			HRRZ A,FOB.FD(A)
+			$TEXT (KBFTOR,<%Can't read file ^F/(A)/ because: ^E/[-1]/>)
+			MOVE A,TIFN
+			$CALL F%RREL
+			JRST RDTXTE]		; Give bad return
+		MOVE A,TIFN
+		$CALL F%REL		; Close file
+		JRST RDTXTX]		; Clean up
+	JUMPE B,RDTXT0		; Ignore nulls
+	MOVE A,B
+	CALL TXTCHR		; Stuff into text
+	JRST RDTXT0
+
+RDTXTX:	SETZ A,			; Insure ASCIZ in text buffer
+	MOVE B,TXTPTR		; Leave TXTPTR pointing at null
+	IDPB A,B		;  ..
+	DMOVE A,TFOB		; Deallocate FD and FOB
+	CALL RELFOB		;  ..
+	RETSKP			;  and give good return
+
+
+RDTXTE:	DMOVE A,TFOB		; Here for errors
+	CALL RELFOB
+	RET			; Give bad return
+ SUBTTL Text buffer manipulation routines
+
+;Append ASCIZ string to text buffer, don't include null
+;Call:
+;	A/ Pointer to string
+;	CALL TXTPUT
+;Return	+1: always, A/ pointer to last byte in text buffer
+
+TXTPUT:	TLC A,-1		; See if magic LH (-1)
+	TLCN A,-1		;  ..
+	HRLI A,(POINT 7,)
+	TLNN A,-1		; Even lazier -- zero LH
+	HRLI A,(POINT 7,)
+	MOVE D,A		; Copy pointer
+TXTPT1:	ILDB A,D		; Fetch character
+	JUMPE A,TXTPTX		; Stop on null
+	CALL TXTCHR		; Move to text buffer
+	JRST TXTPT1
+
+;Same as above, but move the null
+
+TXTPT0:	TLC A,-1
+	TLCN A,-1
+	HRLI A,(POINT 7,)
+	TLNN A,-1
+	HRLI A,(POINT 7,)
+	MOVE D,A
+TXTPT2:	ILDB A,D
+	CALL TXTCHR
+	LDB A,TXTPTR		; Get char moved
+	JUMPN A,TXTPT2		; Quit on null
+TXTPTX:	MOVE A,TXTPTR		; Always return pointing to last char moved
+	RET
+
+;Insert one character into text buffer -- allocates pages if needed
+;Call:
+;	A/ char to add
+;	CALL TXTCHR
+
+TXTCHR:	SOSGE TXTCNT		; Any room on current page?
+	JRST [	CALL TXTAQP		; No, acquire new page
+		JRST TXTCHR]		; Stuff it
+	IDPB A,TXTPTR		; Yes, just stuff it
+	AOS TXTTOT		; Count total bytes of text
+	RET
+
+
+;Here if page full -- get and link next page
+
+TXTAQP:	$SAVE <A,B>
+	$CALL M%GPAG		; Get a page for text
+	JUMPF [	CERR (Can't expand text buffer -- insufficient memory)]
+	HRRZ B,TXTPTR		; Get current text pointer
+	ANDI B,777000		; Get just the page address
+	MOVEM A,TB.FOR(B)	; Link new page
+	MOVEM B,TB.BAK(A)	; Maintain backward link too
+	ADD A,[POINT 7,TB.TXT]	; Point to text part of new page
+	MOVEM A,TXTPTR		;  ..
+	MOVEM A,TTXTIB+.RDBFP	; This is also backup limit for editing
+	MOVEI A,TXTSIZ		; Bytes in one T-block
+	MOVEM A,TXTCNT
+	RET
+
+;Move counted string to text buffer
+;Call:
+;	A/ pointer to text
+;	B/ number of bytes to move
+;	CALL TXTCPT
+;Return	+1: always
+
+TXTCPT:	JUMPE B,R		; Just quit if zero count
+	STKVAR  <TXPTR,TXCNT>
+	MOVEM A,TXPTR		; Current ptr to stuff left to move
+	MOVEM B,TXCNT		; Byte count of stuff left to move
+TXTCP0:	MOVE C,TXCNT		; Get count remaining
+	CAMLE C,TXTCNT		; Room on current page?
+	MOVE C,TXTCNT		; No, move just this much
+	MOVE A,TXTCNT		; Get bytes left in current page
+	SUB A,C			; Minus what we're moving now
+	MOVEM A,TXTCNT		; Save bytes left in page
+	MOVE A,TXCNT		; Get total bytes left to move
+	SUB A,C			; Compute bytes left after this chunk
+	MOVEM A,TXCNT		; Save
+	ADDM C,TXTTOT		; Maintain total number of bytes in text
+	MOVE A,C		; Number of bytes in this chunk
+	ADJBP A,TXPTR		; Compute first byte not moved
+	EXCH A,TXPTR		; Save new source ptr, get old
+	MOVE O,TXTPTR		; Destination byte pointer
+	CALL FSCOPY		; Do wizardly string copy
+	MOVEM O,TXTPTR		; Save updated destination pointer
+	SKIPN TXCNT		; Any bytes still left to move?
+	RET			; No, just quit
+	CALL TXTAQP		; Acquire and point to new text page
+	JRST TXTCP0		; Go move this chunk
+ SUBTTL Message draft display and editing routines
+
+
+;Retype buffer so far...
+
+RETYPE:	CALL CRIF		; Yes
+	CALL CRLF
+	MOVX A,.PRIOU		; Output text on TTY
+	CALL TXTOUT		;  ..
+	JRST .TEXT1		; And go get some more
+ SUBTTL Editor interfacing subroutines
+
+TOPS10<
+.EDTXT:	PUSHJ	P,BLANK0	;CLEAR SCREEN
+	TRVAR	<OLDCNT,EDTPNT>	;TEMP STORAGE
+	PUSHJ	P,TMPTXT	;MOVE TEXT TO CONTIGUOUS CORE
+	MOVEM	B,OLDCNT	;SAVE COUNT OF CHARACTERS
+	MOVEM	A,EDTPNT	;SAVE POINTER TO TEXT
+	PUSHJ	P,EDTMP		;WRITE TMP FILE
+	  POPJ	P,		;FAILED
+	PUSHJ	P,EDIT		;RUN FAVORITE EDITOR
+	PUSHJ	P,.ERST0	;ERASE TEXT
+	MOVE	A,TMPAFS	;ALTERNATE FOB SIZE
+	MOVE	B,TMPAFA	;ALTERNATE FOB ADDRESS
+	PUSHJ	P,RDTEXT	;READ FILE IN
+	  POPJ	P,		;CAN'T
+	PUSHJ	P,DLTMP		;DELETE TMP FILE
+	POPJ	P,		;DONE
+; ROUTINE TO WRITE TEXT BUFFER OUT TO A TMP FILE
+EDTMP:	MOVEI	S1,FDXSIZ	;FD SIZE
+	$CALL	M%GMEM		;GET CORE
+	MOVEM	S2,TMPAFD	;SAVE ADDRESS
+	STORE	S1,.FDLEN(S2),FD.LEN ;SAVE LENGTH
+	MOVE	A,S2		;SHUFFLE
+	PUSHJ	P,ALCFOB	;ALLOCATE A FOB AND LINK TO THE FD
+	  JRST	[$TEXT	(KBFTOR,<? Can't allocate core for file storage>)
+		 POPJ	P,]
+	MOVEM	A,TMPAFS	;SAVE ALTERNATE FOB SIZE
+	MOVEM	B,TMPAFA	;SAVE ALTERNATE FOB ADDRESS
+	PUSHJ	P,SETFIL	;SET UP FOB AND FD
+	MOVEI	S1,FOB.MZ	;FOB LENGTH
+	MOVEI	S2,TMPFOB	;FOB ADDR
+	$CALL	F%OOPN		;OPEN FILE FOR OUTPUT
+	JUMPF	[$TEXT	(KBFTOR,<? Can't create tmp file; ^E/[-1]/>)
+		 POPJ	P,]
+	PUSH	P,S1		;SAVE IFN
+	HRLZ	S2,OLDCNT	;GET CHARACTER COUNT
+	HRR	S2,EDTPNT	;POINT TO BUFFER
+	$CALL	F%OBUF		;WRITE DATA TO FILE
+	JUMPF	[$TEXT	(KBFTOR,<? Can't write data to tmp file; ^E/[S1]/>)
+		 POP	P,S1	;GET IFN BACK
+		 $CALL	F%RREL	;RELEASE CHANNEL
+		 POPJ	P,]	;AND GIVE UP
+	MOVE	S1,(P)		;GET IFN BACK
+	MOVNI	S2,1		;WANT ACTUAL FILESPEC
+	$CALL	F%FD		;GET ACTUAL FILESPEC
+	HRLI	S1,TMPFIL	;POINT TO NEW STORAGE
+	MOVSS	S1		;MAKE A BLT POINTER
+	BLT	S1,TMPFIL+FDXSIZ-1 ;COPY FD
+	POP	P,S1		;GET IFN BACK
+	$CALL	F%REL		;RELEASE CHANNEL
+	MOVSI	S1,TMPFIL	;SOURCE
+	HRR	S1,TMPAFD	;DESTINATION
+	MOVE	S2,TMPAFD	;AGAIN
+	BLT	S1,FDXSIZ-1(S2)	;COPY FD
+	JRST	.POPJ1		;AND RETURN
+; ROUTINE TO DELETE TMP FILE(S)
+DLTMP:	MOVEI	S1,TMPFIL	;POINT TO ACTUAL FILESPEC USED
+	MOVEM	S1,TMPFOB	;STUFF IN FOB
+	PUSHJ	P,DLTMP1	;DELETE FILE
+	MOVSI	TF,'BAK'	;ALL GOOD EDITORS WRITE A BAK FILE
+	MOVEM	TF,TMPFIL+.FDEXT;SAVE
+	PUSHJ	P,DLTMP1	;DELETE FILE
+	MOVSI	TF,'QMP'	;FOR SOS FANS
+	MOVEM	TF,TMPFIL+.FDEXT;SAVE
+	PUSHJ	P,DLTMP1	;DELETE FILE
+	MOVSI	TF,'ZMP'	;SOS FILES COME
+	MOVEM	TF,TMPFIL+.FDEXT; IN SEVERAL FLAVORS
+DLTMP1:	MOVEI	S1,2		;2 WORDS LONG
+	MOVEI	S2,TMPFOB	;ADDR
+	$CALL	F%DEL		;DELETE FILE
+	POPJ	P,		;RETURN
+SETFIL:	MOVEI	S1,TMPFIL	;POINT TO FD
+	MOVEM	S1,TMPFOB+FOB.FD;SAVE
+	MOVEI	S1,7		;7 CHARACTER BYTES
+	MOVEM	S1,TMPFOB+FOB.CW;SAVE
+	MOVSI	S1,FDXSIZ	;LENGTH
+	MOVEM	S1,TMPFIL+.FDLEN
+	MOVSI	S1,'DSK'	;DEVICE
+	MOVEM	S1,TMPFIL+.FDSTR
+	PJOB	T1,		;GET OUR JOB NUMBER
+	MOVEI	T4,3		;MAKE TEMP FILE NAME
+	IDIVI	T1,^D10		; BY TRIED AND
+	ADDI	T2,'0'		; TRUE CCL
+	LSHC	T2,-6		; TECHNIQUE
+	SOJG	T4,.-3		; ..
+	HRRI	T3,'MAI'
+	MOVEM	T3,TMPFIL+.FDNAM;FILE NAME
+	MOVSI	S1,'TMP'	;EXTENSION
+	MOVEM	S1,TMPFIL+.FDEXT
+	MOVE	S1,MYPPN	;PPN
+	MOVEM	S1,TMPFIL+.FDPPN
+	POPJ	P,		;RETURN
+; ROUTINE TO EDIT
+; CALL:	PUSH	P,EDIT
+EDIT:	STKVAR	<<PTHBLK,5>>	;PATH BLOCK
+	MOVX	T1,.PTFRN	;INFORMATION ABOUT A LOGICAL NAME
+	MOVEM	T1,.PTFCN+PTHBLK ;SAVE IT
+	MOVX	T1,PT.RCN	;THIS RUN, REALLY
+	MOVEM	T1,.PTLNF+PTHBLK ;SAVE THAT
+	MOVE	T1,EDTRUN	;LOGICAL NAME EDITOR
+	MOVEM	T1,.PTLNM+PTHBLK ;SAVE
+	MOVEI	T1,PTHBLK	;POINT TO THE BLOCK
+	HRLI	T1,5		;5 WORDS LONG
+	PATH.	T1,		;IS EDITOR: DEFINED
+	  SKIPA	T1,[1,,SYSRUN]	;NOPE, GIVE HIM TECO
+	MOVE	T1,[1,,EDTRUN]	;GO TO IT AND GOOD LUCK
+	$TEXT	(<-1,,TMPNEW>,<S^F/TMPFIL/=^F/TMPFIL/}^0>) ;BUILD COMMAND STRING
+	MOVE	T2,[XWD 30,TMPNEW] ;POINT TO BUFFER
+	PUSHJ	P,CTX		;RUN HIS/HER/ITS FAVORITE EDITOR
+	  JFCL			;IGNORE ERRORS
+	POPJ	P,		;RETURN
+SYSRUN:	SIXBIT	/SYS/
+	SIXBIT	/TECO/
+	EXP	0,0,0,0
+EDTRUN: SIXBIT	/EDITOR/
+	EXP	0,0,0,0,0
+; ROUTINE TO SAVE AND OPTIONALLY RUN A PROGRAM IN
+; AN ALTERNATE CONTEXT.
+; CALL:	MOVE	T1, ZERO OR OPTIONAL RUN UUO BLOCK POINTER
+;	MOVE 	T2, ZERO OR OPTIONAL BUFLEN,,BUFFER OF EDT TMPCOR TO WRITE
+;	PUSHJ	P,CTX
+;	  <NON-SKIP>		;CTX. UUO FAILED, ERROR MESSAGE TYPED
+;	<SKIP>			;CONTEXT SAVED AND RESTORED
+CTX:	STKVAR	<<CTXARG,.CTMAX>,<CTXDAT,20>>
+	SKIPN	SCRLFL		;DO WE HAVE THE SCROLLING REGION SET UP?
+	  JRST	CTX1		;NOPE, THEN LETS TAKE THE EASY WAY OUT
+	PUSH	P,T1		;SAVE A COUPLE OF ACS
+	PUSH	P,T2		; ...
+	CALL	@SCRRGR		;UNSET THE SCROLLING REGION
+	CALL	@SCRBTM		;GET TO THE BOTTOM OF THE SCREEN
+	SETZM	SCRLFL		;RESET THE FLAG
+	$CALL	K%FLSH		;MAKE SURE WE FLUSH OUT ALL OF THE OUTPUT
+	POP	P,T2		;RESTORE THE ACS
+	POP	P,T1		; ...
+CTX1:	MOVEI	T3,CTXARG	;POINT TO ARG BLOCK
+	MOVEM	T1,.CTRNB(T3)	;SAVE POSSIBLE RUN UUO BLOCK
+	MOVSI	T4,(T3)		;POINT TO START ADDR
+	HRRI	T4,1(T3)	;MAKE A BLT POINTER
+	SETZM	(T3)		;CLEAR FIRST WORD
+	BLT	T4,.CTMAX-1(T3)	;CLEAR ENTIRE ARGUMENT BLOCK
+	HLRZM	T1,.CTRNO(T3)	;SAVE POSSIBLE RUN OFFSET
+	HRRZM	T1,.CTRNB(T3)	;SAVE POSSIBLE RUN UUO BLOCK
+	HRRZM	T2,.CTTMB(T3)	;SAVE TMPCOR BUFFER ADDRESS
+	SKIPN	T1		;RUNNING A PROGRAM?
+	SKIPA	T1,[.CTSVH]	;FUNCTION CODE TO SAVE AND HALT
+	MOVEI	T1,.CTSVR	;FUNCTION CODE TO SAVE AND RUN
+	HRLI	T1,.CTMAX	;INCLUDE ARGUMENT BLOCK LENGTH
+	MOVEM	T1,.CTFNC(T3)	;SAVE
+	MOVEI	T4,(SIXBIT/EDT/);EDT IS THE TMPCOR FILE NAME
+	HLL	T4,T2		;SAVE LENGTH OF TMPCOR BLOCK JUST IN CASE
+	SKIPE	T2		;WRITING TMPCOR?
+	MOVEM	T4,.CTTMN(T3)	;YES--SAVE TMPCOR FILE
+	SETZM	.CTNAM(T3)	;NO CONTEXT NAME
+	MOVEI	T1,20		;LENGTH OF DATA BLOCK
+	MOVEM	T1,.CTDBL(T3)	;SAVE
+	MOVEI	T1,CTXDAT	;ADDR OF DATA BLOCK
+	MOVEM	T1,.CTDBA(T3)	;SAVE
+	MOVE	T1,T3		;POINT TO ARG BLOCK
+	CTX.	T1,		;FIRE UP AN ALTERNATE CONTEXT
+	  SKIPA			;FAILED
+	JRST	.POPJ1		;RETURN
+	MOVEI	T4,CTXER1	;DEFAULT TO GENERIC ERROR MESSAGE
+	CAMN	T1,T3		;UUO LEAVE AC UNCHANGED?
+	MOVEI	T4,CTXER0	;YES--NOT IMPLEMENTED
+	TXNE	T1,CT.RUN	;RUN UUO ERROR?
+	MOVEI	T4,CTXER2	;YES
+	TXNE	T1,CT.ETX	;CTX. UUO ERROR TEXT IN DATA BUFFER?
+	MOVEI	T4,CTXER3	;YES
+	$TEXT	(,<? Cannot save context; ^I/(T4)/>)
+	POPJ	P,		;RETURN
+CTXER0:	ITEXT	(<CTX. UUO not implemented>)
+CTXER1:	ITEXT	(<CTX. UUO error ^O/T1,CT.ERR/>)
+CTXER2:	ITEXT	(<RUN UUO error ^O/T1,CT.ERR/>)
+CTXER3:	ITEXT	(<^T/CTXDAT/>)
+> ;END TOPS10
+   TOPS20<	; For several pages
+
+;Here to start up a new editor
+;Return	+1: failure of some sort
+;	+2: success
+
+GETED:	HRROI A,[0]		; Clear Rescan buffer
+	RSCAN			;  EMACS occasionally blows it
+	 JFCL
+	MOVSI A,(CR%CAP!CR%ACS)
+	MOVEI B,FRKACS		; Set these initial ac's
+	CFORK
+	 ERJMP [JRETER (Cannot create editor fork)
+		RET]
+	MOVEM A,EDFORK		; Save it
+;**;[3074][3075] Replace 2 lines at GETED:+9L with 9 lines 	MDR	14-AUG-86
+	MOVEI A,.LNSJB		;[3074][3075] Try job-wide definition first
+	HRROI B,[ASCIZ /EDITOR/];[3074][3075] Logical name to expand
+	HRROI C,STRING		;[3074][3075] Where to put expansion
+	LNMST%			;[3074][3075] Get it
+	 ERJMP [MOVEI A,.LNSSY	;[3074][3075] Try system-wide
+		LNMST%		;[3074][3075] Is there one?
+		 ERJMP [SETZM STRING		;[3074][3075] No, use a null string
+			JRST .+1]		;[3074][3075] Rejoin main flow
+		JRST .+1]	;[3074][3075] Rejoin main flow
+	MOVEI A,EMXGJB		;[3074][3075] EMACS GTJFN block 
+	HRROI B,STRING		;[3074][3075] Pointer to editor filename string
+	GTJFN			; Find the editor
+	 ERJMP [JRETER (Cannot get editor)
+		RET]
+	HRL A,EDFORK
+	GET			; Get in the editor
+	MOVE A,EDFORK
+	SKIPN FRKACS+1		; If not passing a jfn,
+	 TDZA B,B		; Start at normal entry
+	 MOVEI B,2		; Else at CCL entry
+	SFRKV
+	JRST WAITE1
+
+;(Still inside TOPS20)
+
+;(Still inside TOPS20)
+
+;Here to restart editor fork
+;Return	+1: failure of some sort
+;	+2: OK
+
+RESTED:	MOVEI D,EDMOD		; Restore editor tty modes
+	CALL SETTYM
+RESTE0:	MOVE A,EDFORK
+	MOVE B,EFRKPC		; Forks old PC
+	SFORK
+	RFORK			; Thaw it
+WAITE1:	WFORK			; And wait for it to terminate
+	FFORK			; Freeze it
+	RFSTS			; Get its status
+	TXZ A,RF%FRZ		; We know it's frozen already
+	HLRZ A,A
+	TXZ F,F%ESND		; Clear flag
+	CAIE A,.RFHLT		; Voluntary termination?
+	 JRST KILLED		; No, kill it off, it's bombed
+	MOVEM B,EFRKPC		; Save the PC for restarting it
+	MOVE A,EDFORK		; Need fork again
+	RWM			; See why it stopped
+	TLNE B,(1B1)		; Level 1 in progress?
+	 JRST CTLCED		; Yes, means the guy ^C'd out
+	MOVE A,EDFORK
+	MOVEI B,FRKACS		; Get its AC's
+	RFACS
+	MOVE A,FRKACS+2		; Pointer to buffer block
+	IDIVI A,1000		; Get page number of block
+	MOVEI T,(B)		; Save position in page
+	HRL A,EDFORK
+	MOVE B,[.FHSLF,,EDBPAG_-9]	; Into our area
+	MOVX C,PM%RD!PM%WR	; Read write
+	PMAP
+	MOVE A,EDBPAG(T)	; Char address of beginning of buffer
+	IDIVI A,BY2PAG		; Get page number
+	HRL A,EDFORK
+	MOVE B,[.FHSLF,,EDPAGE_-9]
+	MOVE C,[PM%CNT+PM%RD+PM%WR+20]
+	PMAP			; Map those pages too, read/write
+	LSH A,9			; Get word address
+	HRREI A,-EDPAGE(A)
+	MOVEM A,EDPAG0		; Save address of first page mapped
+	; .. (Still inside TOPS20)
+	; .. (Still inside TOPS20)
+
+	MOVE A,EDBPAG+4(T)	; End of the buffer
+	CAMN A,EDBPAG+0(T)	; Same as beginning?
+	 RETSKP			; Yes, forget empty buffer
+	SUBI A,2		; Back up two chars
+	CAMGE A,EDBPAG+0(T)	; But not past beginning
+	 RETSKP
+	CALL EDCHRP		; Get byte pointer to it
+	ILDB B,A		; Get character
+	CAIE B,37		; ^_ part of a request?
+	 RETSKP			; Nope
+	ILDB B,A		; Get next char
+	CAIE B,"I"		; Request for insert of message?
+	 CAIN B,"S"		; Or for sending of buffer?
+	 CAIA			; Yes
+	 RETSKP			; No, forget it
+	MOVNI A,2		; Back up buffer over those chars
+	ADDB A,EDBPAG+4(T)	; Back up virtual pointer
+	CAMG A,EDBPAG+5(T)	; And if real end at same place
+	 JRST EDTRM2
+	MOVEM A,EDBPAG+5(T)	; Move it back too
+	MOVEI A,2		; And increase gap size
+	ADDM A,EDBPAG+6(T)
+EDTRM2:	CAIE B,"I"		; Was it an insert request?
+	 JRST EDSEND		; No, go send the buffer off
+	GTMBL (M,B)   		;POINTER TO MESSAGE
+	MOVE V,MSGBOD(B)	; Start of current message
+	CALL REMAP
+	PUSH P,V
+	SUB V,WBOT
+	MOVE A,MSGFAD
+	IMULI A,5
+	ADD V,A
+       	CHR2BP			; Form byte pointer
+	POP P,V
+	MOVE B,MSGBON(B)	; Length of it
+	CALLRET EDINS		; Go insert that string and resume
+
+EDSEND:	MOVEI C,32		; Say terminated with ^Z
+	MOVEM C,LSTCHR
+	TXO F,F%ESND		; Say to send buffer
+	RETSKP			; And return to caller
+
+;(Still inside TOPS20)
+
+;(Still inside TOPS20)
+
+; Convert char address to byte pointer, taking gap into account
+
+EDCHRP:	CAML A,EDBPAG+3(T)
+	 ADD A,EDBPAG+6(T)
+EDCHR1:	IDIVI A,5
+	SUB A,EDPAG0		; Make absolute
+	HRL A,[	440700
+		350700
+		260700
+		170700
+		100700](B)
+	RET
+
+
+; Request editor to insert c(b) chars at PT
+
+EDINSC:	MOVEM B,EDBPAG+8(T)	; Set up as SUPARG
+	MOVE A,EDFORK
+	HRRZ B,EDBPAG+7(T)	; Where to start it
+	SFORK			; Start it
+	RFORK			; Thaw it
+	WFORK			; Wait for it
+	FFORK			; Refreeze it
+	RET
+
+
+;Insert a string into its buffer
+;Return	+1: failure
+;	+2: OK
+
+EDINS:	TRVAR<OLDCNT,NEWCNT,EDTPNT> ; *** must match TRVAR at TVORED and EDREPL
+	MOVEM B,OLDCNT		; Save old count
+	MOVEM A,EDTPNT		; Save text pntr
+	MOVE D,B		; Copy count to d
+	SETZ B,			; Adjust char count (strip nulls)
+EDINS1:	ILDB C,A		; Get char
+	SKIPE C			; Skip if null
+	AOS B			;  else count it
+	SOJG D,EDINS1		; Loop over string
+	MOVEM B,NEWCNT		; Save count less nulls
+EDINS2:	CALL EDINSC		; Request it to insert
+	MOVE A,EDBPAG+2(T)	; Address of current position
+	SUB A,NEWCNT		; Back over the chars to be inserted
+	CALL EDCHR1		; Get byte pointer
+	MOVE C,OLDCNT		; Get back count
+	MOVE B,EDTPNT		; Get back byte pointer
+EDINS3:	ILDB D,B
+	JUMPE D,EDINS4		; Skip nulls
+	IDPB D,A
+EDINS4:	SOJG C,EDINS3		; For all requested
+	CALLRET RESTE0		; Resume editor and return
+
+;(Still inside TOPS20)
+
+;(Still inside TOPS20)
+
+; Replace the editor's buffer with a given string
+
+EDREPL:	TRVAR <OLDCNT,NEWCNT,EDTPNT> ; *** Must match TRVAR at EDINS and TVORED
+	MOVEM A,EDTPNT		; Save pntr
+	MOVEM B,OLDCNT		;  and count
+	MOVEM B,NEWCNT
+	SKIPG EDFORK		; If dont have a fork yet,
+	 JRST [	CALL EDTMP		; Write to temp file
+		 RET			; Error, quit now
+		MOVEM A,FRKACS+1	; Pass JFN of file to EMACS
+		CALLRET GETED]		; Invoke EMACS and then return
+	MOVEI D,EDMOD		; Restore editor tty modes
+	CALL SETTYM
+	MOVE A,FRKACS+2		; Pointer to buffer block
+	IDIVI A,1000		; Get page number of block
+	MOVEI T,(B)		; Get position in page
+	MOVE B,EDBPAG+5(T)	; Save addr of end of buffer
+	MOVSI A,EDBPAG+0(T)	; Start with beginning addr
+	HRRI A,EDBPAG+1(T)	; Into virtual beg
+	BLT A,EDBPAG+5(T)	; Up to end pointer
+	SUB B,EDBPAG+5(T)	; See how many chars we "deleted"
+	ADDM B,EDBPAG+6(T)	; Increase the gap that many
+	SETZM EDBPAG+9(T)	; Not modified yet
+	MOVE B,OLDCNT		; Restore count
+	CALLRET EDINS2		; And go insert the new string
+
+
+;Create temp file and write text out to it
+;Return	+1: failure
+;	+2: OK
+
+EDTMP:	STKVAR <<MFSTR,20>>	; Filespec string
+	HRROI A,MFSTR		; Dest ptr to string
+	SETZB C,D
+	SKIPN CRFDEV		; Any default directory?
+	JRST EDTMP0		; No, skip this
+	HRROI B,CRFDEV		; Yes, default device
+	SOUT			;  ..
+	MOVEI B,"<"		; Punctuate
+	IDPB B,A		;  ..
+	HRROI B,CRFDIR		; Directory
+	SOUT
+	MOVEI B,">"		; Punctuate
+	IDPB B,A		;  ..
+EDTMP0:	HRROI B,[ASCIZ /MSG.TMP;T/]
+	SOUT			; Complete filespec
+	MOVSI A,(GJ%SHT!GJ%FOU)
+	HRROI B,MFSTR		; Filespec we build
+	GTJFN
+	 ERJMP [MOVEI A,MFSTR
+		JRETER <Can't open (GTJFN) TMP file %1S>
+		RET]
+	MOVE B,[7B5+OF%WR]
+	MOVE E,A		; Preserve JFN for possible releasage
+	OPENF
+	 ERJMP [MOVE A,E		; JFN
+		JRETER <Can't open (OPENF) TMP file %1J>
+		MOVE A,E		; Release dangling JFN
+		RLJFN
+		 JFCL
+		RET]
+	MOVN C,OLDCNT		; Get -char cnt
+	MOVE B,EDTPNT		;  and pointer
+	SOUT			; Write it out
+	 ERJMP [JRETER <Can't write to TMP file>
+		MOVE A,E		; Release useless JFN
+		CLOSF
+		 JFCL
+		RET]
+	TLO A,(CO%NRJ)		; Keep the jfn
+	CLOSF
+	 ERJMP [JRETER <Can't close TMP file>
+		RET]
+	HRRZS A			; Return only JFN
+	RETSKP
+
+;(Still inside TOPS20)
+
+;(Still inside TOPS20)
+				; Editor command
+.EDITO:	CONFRM			; Confirm first
+	SKIPN EDITOR		; Know what editor we're using yet?
+	CALL EDITQ		; No, find out
+	SKIPL EDITOR		; EMACS?
+	JRST [	CALL CMDINI		; No, init this level
+		PROMPT <EMACS is not your default editor;  do you wish to make it so? >
+		CALL YESNO
+		 JRST [	WARN <EMACS not invoked>
+			RET]
+		SETOM EDITOR		; User said yes, declare EMACS default
+		SKIPLE A,EDFORK		; Have an old dusty editor lying about?
+		KFORK			; Yes, kill it
+		SETZM EDFORK		;  ..
+		JRST .+1]
+	SKIPLE EDFORK		; Do we have one already?
+	 JRST .EDTO3		; Yes, just resume it then
+	CALL CRIF		; Let him know we are at work
+	SETZM FRKACS+1		; No, make one, without a file
+	CALL GETED
+	 RET			; error, just quit now
+.EDTO1:	TXNE F,F%ESND		; Want to send buffer?
+	CALL .EDTX1		; Yes - get it then
+.EDTO2:	MOVEI D,EDMOD		; Save editor modes
+	CALL GETTYM
+	MOVEI D,SAVMOD		; And restore ours
+	CALLRET SETTYM
+
+.EDTO3:	CALL RESTED		; Restart editor
+	 RET			; Error, just quit
+	JRST .EDTO1
+
+				; Editor terminated badly
+KILLED:	MOVE A,EDFORK
+	KFORK			; Kill it off
+	SETOM EDFORK		; And forget about it
+	MOVEI D,SAVMOD		; Restore program's modes
+	CALL SETTYM
+	CMERR (Editor fork terminated involuntarily.)
+	RET
+
+; ^C typed from editor, make it percolate up
+
+CTLCED:	CALL CKXRTN		; Exit and return if continued
+	CALLRET RESTE0		; And resume it afterwards
+
+;(Still inside TOPS20)
+
+;(Still inside TOPS20)
+
+; Edit fields
+
+.EDTXT:	TXNE F,F%REDI		; REDISTRIBUTE in progress?
+	JRST [	WARN <Editing the text of a REDISTRIBUTEed message is not allowed.>
+		RET]
+	CALL BLANK0		; Fresh start
+	SKIPN EDITOR		; Know which editor to use yet?
+	CALL EDITQ		; No, figure it out
+	SKIPL EDITOR		; EMACS?
+	 JRST [ CALL TVORED	; No, call the routine to do the work
+		  RET		; Error - no big deal
+		 RET ]		; All set
+	CALL TMPTXT		; Move text to contiguous buffer
+	CALL EDREPL		; Run editor over this field
+	 JRST .EDTX2		; Failure, don't snarf junk then
+	CALL .EDTX1		; Snarf text
+.EDTX2:	CALL RELTMP		; Release temp text buffer
+	JRST .EDTO2		; Switch tty modes and return
+
+
+; Get text from EMACS and update pntr and cnt
+
+.EDTX1:	CALL .ERST0		; Erase text
+	CALL GEDTXT		; Get the editted text
+	MOVE B,C		; Copy count to TXTCPT's good place
+	CALL TXTCPT		; Move counted string to text buffer
+	RET			; Return
+
+
+; Get the editted field
+
+GEDTXT:	PUSH P,EDBPAG+4(T)
+	POP P,EDBPAG+2(T)	; ZJ
+	SETZ B,
+	CALL EDINSC		; Move gap to end
+	MOVE C,EDBPAG+4(T)
+	SUB C,EDBPAG+1(T)	; Number of chars in it
+	MOVE A,EDBPAG+1(T)	; Start of virtual buffer
+	JRST EDCHRP		; Get byte pointer and return
+
+> ;END TOPS20
+
+;Allocate temporary buffer for text and move it there.  This is
+; so editors and editor interface routines don't have to deal
+; with noncontiguous text.
+;
+;Returns: A/ pointer to contiguous copy of text
+;	  B/ byte count
+
+TMPTXT:	SKIPN A,TXTTOT		; Get total text char count
+	JRST [	SETZ B,			; No count, no text
+		RET]
+	ADDI A,<1000*5-1>	; Force roundup
+	IDIVI A,<1000*5>	;  ..
+	MOVEM A,TMPTX0		; Save size of buffer
+	$CALL M%AQNP		; Allocate enough pages
+	JUMPF [CWARN (Can't run editor - insufficient memory)]
+	MOVEM A,TMPTX1		; Save page number of buffer
+	LSH A,^D9		; Form address
+	HRLI A,(POINT 7,)	; Form byte pointer
+	CALL TXTOUT		; Move the text there
+	MOVE A,TMPTX1		; Get address of buffer again
+	LSH A,^D9		;  ..
+	HRLI A,(POINT 7,)	; Form byte pointer
+	MOVE B,TXTTOT		; Return count to caller
+	RET
+
+;Release temporary text pages
+
+RELTMP:	DMOVE A,TMPTX0		; Get size, page number
+	$CALL M%RLNP		; Release them
+	SETZM TMPTX0		; Remember nothing left to clean up
+	RET
+
+TOPS20 <
+;Determine what editor we are using
+; Set EDITOR to -1 for EMACS, +1 for anything else
+
+EDITQ:	STKVAR<<LNAME,20>>	; Logical name string goes here
+	SETOM EDITOR		; Assume EMACS
+	SETZB A,D		; Job-wide
+EDITQ1:	HRROI B,[ASCIZ /EDITOR/]
+	HRROI C,LNAME
+	LNMST
+	 ERJMP [JUMPN D,R	; Been here before? Quit if Yes.
+		 SETO	D,	; Mark we've tried this
+		 MOVEI	A,1	; go for system-wide now
+		 JRST	EDITQ1]	; and try again
+	MOVEI A,LNAME		; Start of string
+	HRLI A,(POINT 7)	; Form byte pointer
+	MOVE C,A		; Two copies
+REFIXE:	MOVE B,A		; Three copies!
+	SETZ W,			; Strip, and count remaining chars
+FIXEDD:	ILDB T,C		; Scan string, stripping garbage out
+	JUMPE T,FIXED2		; Null, fine, finish up
+	CAIN T,"!"		;strip comments
+	JRST UNDOCM
+	CAIN T,"V"-100
+	JRST	[ILDB T,C	; ^V? Strip it and take next exactly
+		 JRST FIXED4]
+	CAIN T,":"		; device name?
+	JRST REFIXE		; fine. restart with device name overwritten
+	CAIE T,"."		; We can stop on the extension
+	CAIN T,";"		; Or on semicolon
+	JRST FIXED3
+FIXED4:	IDPB T,B		; write character back
+	AOJA W,FIXEDD
+FIXED3:	SETZ T,
+FIXED2:	IDPB T,B		;Null terminate for good luck
+	CAIGE W,5		;Can it possibly be EMACS?
+	JRST NOTHAK		;No, it isn't that evil, CPU-draining hack
+	BP2CHR			; Form char pointer from BP still in A
+	MOVEI T,[ASCIZ /EMACS/]	; count in W, string in T
+	CALL SSEARC		; Is EMACS in the name anywhere?
+	 JRST NOTHAK		;No
+	RET			;Yes
+NOTHAK:	MOVEI A,1
+	MOVEM A,EDITOR
+	RET
+
+UNDOCM:	ILDB T,C
+	JUMPE T,FIXED2
+	CAIE T,"!"
+	JRST UNDOCM
+	JRST FIXEDD
+;(Still inside TOPS20)
+
+;(Still inside TOPS20)
+
+;Here if using editor other than EMACS
+;Invoke the editor, snarf edited text and return
+;Return	+1: failure
+;	+2: OK
+
+TVORED:	ACVAR<TJFN>
+	TRVAR<OLDCNT,NEWCNT,EDTPNT> ; *** Must match TRVAR at EDREPL and EDINS
+	STKVAR<<STRING,30>>	; MSG.TMP filespec
+	CALL TMPTXT		; Move text to contiguous place
+	MOVEM A,EDTPNT		; Save pointer to it
+	MOVEM B,OLDCNT		;  and count
+	CALL EDTMP		; Write text into tmp file
+	 RET			; Problem, return failure
+	HRRZ TJFN,A		; Remember its JFN
+	MOVEI A,STRING
+	HRLI A,(POINT 7,)
+	MOVEI B,[ASCIZ /EDIT /]	; Build command for editor
+	CALL MOVSTR
+	MOVE B,TJFN
+	MOVX C,<1B2+1B5+1B8+1B11+1B14>!JS%PAF ; Complete filespec
+	JFNS
+	MOVEI B," "		; Plunk a space in there
+	IDPB B,A
+	MOVE B,TJFN
+	MOVX C,<1B2+1B5+1B8+1B11+1B14>!JS%PAF ; Complete filespec
+	JFNS			; Output to this spec too
+	MOVEI B,[BYTE (7) 15, 12, 0]
+	CALL MOVST0		; Move CRLF and null
+	HRROI A,STRING
+	RSCAN			; Command string for editor
+	 JFCL
+	; .. (Still inside TOPS20)
+	; .. (Still inside TOPS20)
+
+; Command string has been built ... now try to fetch and run the editor
+
+	SETZB A,D		; Try job-wide definition first
+	HRROI B,[ASCIZ /EDITOR/]	; Logical name to expand
+	HRROI C,STRING		; Where to put expansion
+	LNMST			; Get it
+	 ERJMP [MOVEI A,1		; Try system-wide
+		LNMST			; Is there one?
+		 ERJMP [SETZM STRING		; No, use a null string
+			JRST .+1]		; Rejoin main flow
+		JRST .+1]		; Rejoin main flow
+	MOVEI A,EDTGJB		; Editor GTJFN block
+	HRROI B,STRING		; Pointer to editor filename string
+	GTJFN			; Find the editor
+	 ERJMP [JRETER (Cannot get editor)
+		RET]
+	PUSH P,A		; Save JFN of editor
+	MOVX A,CR%CAP
+	CFORK
+	 ERJMP [JRETER (Cannot create editor fork)
+		RET]
+	MOVEM A,EDFORK
+	POP P,A			; Restore editor JFN
+	HRL A,EDFORK
+	GET
+	MOVE A,EDFORK
+	SETZ B,
+	SFRKV			; Start the editor
+	WFORK
+	KFORK			; Kill it off
+	SETZM EDFORK
+	CALL .ERST0		; Erase text buffer
+	MOVE A,TJFN		; Re-open TMP file
+	MOVX B,<070000,,0>!OF%RD
+	OPENF			; Read, 7-bit bytes
+	 ERJMP [CAIE A,OPNX2		; Did editor empty the file?
+		JRST [	JRETER (Cannot open tmp file)
+			RET]			; Return failure
+		JRST TVORE1]		; Yes, this is OK then
+	MOVE D,A		; Put JFN into preserved place
+;	JRST TVORE2
+
+; (Still inside TOPS20)
+
+; (Still inside TOPS20)
+
+TVORE2:	MOVE A,D		; Get JFN back
+	BIN
+	 ERJMP TVORE1
+	MOVE A,B		; Set up for TXTCHR
+	CALL TXTCHR		; Stuff next byte into text buffer
+	JRST TVORE2		; Do for all
+
+TVORE1:	MOVE A,TJFN		; Get JFN again
+	TXO A,CO%NRJ		; Keep JFN
+	CLOSF			; Close file
+	 JFCL
+	HRLI A,(DF%EXP)		; Delete and expunge
+	DELF
+	 JFCL
+	RETSKP
+   >;End TOPS20
+
+	END
+
+; Edit 2462 to MSTXT.MAC by PRATT on 4-Nov-85
+; Merge many changes in -10, -20, and common code.
+
+
+; *** Edit 2486 to MSTXT.MAC by PRATT on 22-Nov-85
+; Copyright statements
+
+; *** Edit 2658 to MSTXT.MAC by SANTEE on 19-Feb-86
+; Change MSTXT to match new format of the CTX. UUO so that editing works.
+; *** Edit 2691 to MSTXT.MAC by MAYO on 2-Apr-86
+; Teach MS to examine the EDITOR: definition more carefully before assuming
+; EMACS. Things like EDITOR:=> SYS:TV.EXE !And not EMACS! were causing EMACS to
+; be invoked.
+; *** Edit 2702 to MSTXT.MAC by SANTEE on 21-May-86
+; Change the TMPCOR file for the edit command to be slightly more precise.
+; *** Edit 2712 to MSTXT.MAC by SANTEE on 6-Jun-86
+; PUSH from READ level did not clear the scrolling region. -10 only.
+; *** Edit 3074 to MSTXT.MAC by RASPUZZI on 14-Aug-86, for SPR #21351
+; Make sure MS gets the right EMACS from EDITOR:
+; *** Edit 3075 to MSTXT.MAC by RASPUZZI on 14-Aug-86
+; Silly me. I forgot to put in the edit number for 3074. So now there are 2.

@@ -1,0 +1,1072 @@
+
+%TITLE 'G E T   -- $GET processor'
+!<BLF/REQUIRE 'RMSBLF.REQ'>
+MODULE get (IDENT = '3.0'
+		) =
+BEGIN
+
+GLOBAL BIND
+    getv = 3^24 + 0^18 + 565;			! Edit date: 5-Apr-85
+
+!+
+!
+!
+!    FUNCTION:	THIS MODULE CONTAINS ALL ROUTINES WHICH PROCESS
+!    THE $GET MACRO FOR RMS-20.
+!    AUTHOR:	S. BLOUNT
+!
+!
+!
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1977, 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+!
+!
+!
+!    **********	TABLE OF CONTENTS	**************
+!
+!
+!
+FORWARD ROUTINE
+
+!    ROUTINE			FUNCTION
+!    =======			========
+!
+!    $GET		DISPATCHER FOR $GET USER MACRO
+!
+!    DOGETASCII		PERFORM $GET FOR ASCII FILES
+!
+     DOGET_IMAGE:  NOVALUE; 
+!                       PERFORM $GET FOR IMAGE FILES
+!                       (so named so unique to 6 chars)
+!
+!    DOGETSEQ		PERFORM $GET FOR SEQUENTIAL FILES
+!
+!    DOGETREL		PERFORM $GET FOR RELATIVE FILES
+!
+!    DOGET		PERFORM $GET FOR INDEXED FILES
+!
+!    GETREC		I/O ROUTINE FOR $GET PROCESSOR
+!
+!    PADBUFFER		ROUTINE TO PAD USER'S BUFFER FOR RB$PAD
+!
+!    GET			ROUTINE TO GET A RECORD FROM INDEXED FILE
+!
+!
+!
+!
+!    REVISION HISTORY:
+!
+!    EDIT	DATE		WHO			PURPOSE
+!    ====	====		===			==========
+!
+!    1	1-NOV-76	SEB		NO ABORT FOR GTBYTE
+!    2	16-NOV-76	SEB		ADD GETIDX AND FIX LOCATE MODE BUG
+!    3	16-DEC-76	SEB		CHANGE ERPOS TO ERCUR
+!    4	22-DEC-76	SEB		MAKE UPD,DEL,TRU IMPLY FB$GET IN FAC
+!    5	5-APR-77	SEB		MAKE GETREC USE RSZW FOR ALL FILES
+!    6	4-MAY-77	SEB		RELEASE BUCKET FOR IDX FILE IF READ-ONLY
+!    7	21-JUN-77	SEB		FIX GETIDX SO FIND-GET ON
+!    SEC KEY CLEARS THE RSTNRP FIELD
+!
+!    *************************************************
+!    *						*
+!    *		NEW REVISION HISTORY		*
+!    *						*
+!    *************************************************
+!
+!    PRODUCT	MODULE	 SPR
+!    EDIT	 EDIT	 QAR		DESCRIPTION
+!    ======	======	=====		===========
+!
+!
+!    ***** END OF REVISION HISTORY *****
+!
+!    ***** BEGIN VERSION 2 DEVELOPMENT *****
+!
+!
+!    PRODUCT	MODULE	 SPR
+!    EDIT	 EDIT	 QAR		DESCRIPTION
+!    ======	======	=====		===========
+!
+!    301	300	XXXXX		SUPPORT EXTENDED ADDRESSING.
+!
+!	400	400	xxxxx		Clean up BLISS code (RL,22-Apr-83)
+!
+!	415	-	xxxxx		In GETREC, pass 30-bit address
+!					to MOVEREC (RL,7-Jul-83)
+!
+!    ***** BEGIN VERSION 3 DEVELOPMENT *****
+!
+!    501                                Implement Remote file access (AN, 5-84)
+!    502                                Use new standard names (AN, 6-84)
+!    504                                Implement Image Mode (AN, 7-84)
+!    524                                Dynamic library for funny files (AN)
+!    565				Return STV from FFF call (RL,5-Apr-85)
+!
+!    667                   20-21614     (RLF,27-Apr-88) Make padbuffer (RMSGET)
+!                                       not trash section 3 so DELETE works in
+!                                       BASIC-20.
+!-
+
+REQUIRE 'RMSREQ';
+
+EXTERNAL ROUTINE 
+    DoGetM11: NOVALUE,
+    F$Get;
+
+%SBTTL '$GET - $GET processor'
+
+GLOBAL ROUTINE $get (rabblock, errorreturn) =
+! $GET
+! ====
+! PROCESSOR FOR $GET MACRO
+! INPUT:
+!	ADDRESS OF USER RECORD BLOCK (RAB)
+!	ADDRESS OF USER ERROR ROUTINE
+! OUTPUT:
+!	<STATUS FIELD>
+! GLOBALS USED:
+!	$FIND
+!	FINDASCII
+!	FINDSEQ
+!	FINDREL
+!	GETASCII
+!	GETIMAGE
+!	GETREC
+!	LOCKIT
+! FORMAT OF THE $GET MACRO:
+!
+!		$GET	<RAB-ADDRESS> [,<ERROR-ADDRESS>]
+!
+!! RAB FIELDS USED AS INPUT TO $GET:
+!
+!	ISI		INTERNAL STREAM IDENTIFIER
+!	KBF		KEY BUFFER ADDRESS (RELATIVE/INDEXED)
+!	KRF		KEY OF REFERENCE (INDEXED)
+!	KSZ		SIZE OF KEY IN BUFFER (INDEXED)
+!	RAC		RECORD ACCESS
+!	RFA		RECORD'S FILE ADDRESS
+!	ROP		RECORD OPTIONS
+!		RB$LOC		USE LOCATE MODE
+!		RB$RAH		READ-AHEAD
+!		RB$KGT		KEY IS GREATER THAN (INDEXED)
+!		RB$KGE		KEY IS GREATER THAN OR EQUAL TO (INDEXED)
+!	UBF		ADDRESS OF USER RECORD BUFFER
+!	USZ		SIZE OF USER RECORD BUFFER
+! RAB FIELDS WHICH ARE RETURNED BY $GET:
+!
+!	BKT		RELATIVE RECORD NUMBER OF TARGET RECORD (RELATIVE)
+!	LSN		LINE-SEQUENCED NUMBER (ASCII)
+!	RBF		ADDRESS OF RECORD TRANSFERED
+!	RFA		RECORD'S FILE ADDRESS
+!	RSZ		SIZE OF RECORD TRANSFERED
+!	STS		STATUS OF OPERATION
+!	STV		ADDITIONAL STATUS INFORMATION
+    BEGIN
+    rmsentry ($get);
+
+    !+
+    !    FETCH THE ADDRESS OF THE USER RAB AND ERROR ROUTINE
+    !-
+
+    rab = .rabblock;				! Get RAB address
+    erradr = .errorreturn;			! AND USER ERROR ADDRESS
+!+
+!    PERFORM STANDARD SET-UP AND CHECK FOR READ ACCESS.
+!    NOTE THAT IF ANY BIT IN THE FAC FIELD IS SET OTHER THAN
+!    FB$PUT, THEN A $GET OPERATION IS LEGAL
+!-
+    rsetup (axget + axupd + axdel + axtrn);	! SET UP PARAMETERS
+
+    !+
+    !    SET UP THE USER'S RBF FIELD
+    !-
+
+    IF (Rab [Rab$a_Rbf] = .Rab [Rab$a_Ubf]) LEQ minuserbuff		!m502
+    THEN usererror (er$ubf);
+
+    IF .fst [fst$v_remote]              				!a501
+    THEN                                                                !a501
+        dap$get ( .rab, .erradr )                                       !a501
+    !+
+    !    DISPATCH TO THE PROPER ROUTINE FOR THIS FILE ORGANIZATION
+    !-
+
+    ELSE				      				!a501
+        CASE fileorg FROM  orgasc TO orgidx OF
+            SET
+
+            [orgasc] :
+                SELECT .fst[fst$h_file_class] OF
+                SET
+                [Typ$k_Image, Typ$k_Byte]:				!a504
+                    doget_image ();              ! IMAGE mode		!a504
+                [0, Typ$k_Ascii]:                                       !a504
+                    dogetascii ();              ! ASCII
+                [Typ$k_Macy11]: dogetm11 ();                            !a567
+                [OTHERWISE]:                				!a504
+                    BEGIN
+                    F$Get( .Rab );                                      !m524 
+
+		    usrstv = .rab [rab$h_stv];	! Return STV value	!A565
+                    IF NOT $Rms_Status_Ok( .Rab )                       !a524
+                    THEN Usererror( .Rab[Rab$h_Sts] );                  !a524
+                    END;
+                TES;                    				!a504
+            [orgseq] :
+                dogetseq ();			! Sequential
+
+            [orgrel] :
+                dogetrel ();			! Relative
+
+            [orgidx] :
+                dogetidx ()				! Indexed
+            TES;
+
+    !+
+    !    PAD THE USER'S BUFFER, IF HE WANTS IT.
+    !-
+
+    IF (chkflag (rab [rabrop, 0], roppad) NEQ 0) THEN padbuffer ();
+
+    !+
+    !    INDICATE THAT THIS OPERATION WAS A SUCCESS
+    !-
+
+    setsuccess;					! THIS WAS DONE CORRECTLY
+
+    !+
+    !    EXIT TO THE USER
+    !-
+
+    usrret ()
+    END;					! End $GET
+
+%SBTTL 'DOGETASCII - Get ASCII record'
+
+GLOBAL ROUTINE dogetascii : NOVALUE =
+! DOGETASCII
+! ==========
+! ROUTINE TO PROCESS THE $GET MACRO FOR ASCII FILES.
+!	THIS ROUTINE MUST INSURE THAT THE ASCII FILE
+!	IS CORRECTLY POSITIONED TO THE RECORD, AND THEN
+!	MUST TRANSFER THE DATA INTO THE USER'S BUFFER.
+! INPUT:
+!	<NONE>
+! OUTPUT:
+!	<NO STATUS RETURNED>
+! NOTES:
+!
+!	1.	ON AN ERROR, THIS ROUTINE WILL NOT EXIT TO THE
+!		MAIN $GET PROCESSOR, BUT WILL EXIT DIRECTLY TO
+!		THE USER.
+    BEGIN
+    TRACE ('DOGETASCII');
+!+
+!    IF THE LAST OPERATION WAS NOT A $FIND, THEN WE
+!    MUST INSURE THAT WE ARE POSITIONED AT THE CORRECT
+!    RECORD. IF THE LAST OPERATION WAS A $FIND, THEN WE
+!    ARE ALREADY AT THE TARGET RECORD.
+!-
+
+    IF .rst [rstlastoper] NEQ c$find THEN findasc ( true );             !m575
+
+    !+
+    !    MOVE THE RECORD AND SET UP THE USER'S RSZ FIELD
+    !-
+
+    rab [rabrsz, 0] = getascii (true);		! MOVE THE DATA
+    RETURN
+    END;					! End DOGETASCII
+%SBTTL 'DOGETIMAGE - Get IMAGE record'
+
+ROUTINE doget_image : NOVALUE =
+! DOGETIMAGE
+! ==========
+! ROUTINE TO PROCESS THE $GET MACRO FOR IMAGE FILES.
+!	THIS ROUTINE MUST INSURE THAT THE IMAGE FILE
+!	IS CORRECTLY POSITIONED TO THE RECORD, AND THEN
+!	MUST TRANSFER THE DATA INTO THE USER'S BUFFER.
+! INPUT:
+!	<NONE>
+! OUTPUT:
+!	<NO STATUS RETURNED>
+! NOTES:
+!
+!	1.	ON AN ERROR, THIS ROUTINE WILL NOT EXIT TO THE
+!		MAIN $GET PROCESSOR, BUT WILL EXIT DIRECTLY TO
+!		THE USER.
+    BEGIN
+    TRACE ('DOGETIMAGE');
+!+
+!    IF THE LAST OPERATION WAS NOT A $FIND, THEN WE
+!    MUST INSURE THAT WE ARE POSITIONED AT THE CORRECT
+!    RECORD. IF THE LAST OPERATION WAS A $FIND, THEN WE
+!    ARE ALREADY AT THE TARGET RECORD.
+!-
+
+    IF .rst [rstlastoper] NEQ c$find THEN findima ( true );              !m575
+
+    !+
+    !    MOVE THE RECORD AND SET UP THE USER'S RSZ FIELD
+    !-
+
+    rab [rabrsz, 0] = getimage (true);		! MOVE THE DATA
+    RETURN
+    END;					! End DOGETIMAGE
+
+
+%SBTTL 'DOGETSEQ - Sequential $GET processor'
+
+GLOBAL ROUTINE dogetseq : NOVALUE =
+! DOGETSEQ
+! ========
+! ROUTINE TO ACTUALLY PERFORM THE $GET MACRO FOR SEQUENTIAL FILES.
+!	THIS ROUTINE MUST LOCATE THE CURRENT RECORD AND THEN
+!	TRANSFER ALL ITS DATA INTO THE USER'S BUFFER. IF THE LAST
+!	OPERATION WAS A $FIND, THEN WE ARE ALREADY AT THE CURRENT
+!	RECORD AND THE DATA CAN BE MOVED IMMEDIATELY. IF THE
+!	USER SPECIFIED LOCATE MODE FOR HIS $GET OPERATION, AND IF
+!	HE IS ONLY READING THE FILE, THEN WE WILL MERELY
+!	RETURN A POINTER TO THE RECORD IN HIS RBF FIELD INSTEAD
+!	OF ACTUALLY MOVING THE DATA TO HIS BUFFER.
+! INPUT:
+!	<NONE>
+! OUTPUT:
+!	<NO STATUS RETURNED>
+! NOTES:
+!
+!	1.	IF AN ERROR OCCURS, THIS ROUTINE WILL EXIT DIRECTLY
+!		TO THE USER.
+!
+!	2.	IF THE LAST OPERATION WAS A $FIND, THEN IT IS
+!		ASSUMED THAT THE NRP IS NOT SET UP AND MUST BE
+!		COMPUTED BY THIS ROUTINE.
+    BEGIN
+
+    LOCAL
+	crp;					! ADDRESS OF CURRENT RECORD
+
+    TRACE ('DOGETSEQ');
+!+
+!    IF THE LAST OPERATION WAS A $FIND, AND THIS IS A
+!    $GET SEQUENTIAL, THEN WE ARE ALREADY LOCATED AT
+!    THE TARGET RECORD. IF NOT, WE MUST LOCATE IT
+!-
+
+    IF seqadr AND (.rst [rstlastoper] EQL c$find)
+    THEN
+	BEGIN					! Already have current record
+
+	!+
+	!    Fetch the current record and check it
+	!-
+
+	crp = (rab [rabrfa, 0] = .rst [rstdatarfa]);
+
+	IF .crp EQL 0 THEN usererror (er$cur);	! NO RP
+
+!+
+!    COMPUTE THE NRP VALUE BECAUSE THE $FIND OPERATION
+!    DID NOT RESET IT
+!-
+	rst [rstnrp] = .crp + 			! Current record
+	headersize + 				! Size of header
+	.rst [rstrszw];				! Size of last record
+	END
+    ELSE
+	findseq ();				! We must find the record
+
+    !+
+    !    Transfer the record into the user's buffer
+    !-
+
+    rab [rabrsz, 0] = getrec ();
+    RETURN
+    END;					! End DOGETSEQ
+
+%SBTTL 'GETREC - Get a SEQ/REL record'
+
+GLOBAL ROUTINE getrec =
+! GETREC
+! ======
+! THIS ROUTINE PERFORMS THE ACTUAL "GET"ING OF A
+!	RECORD FROM A SEQUENTIAL OR RELATIVE FILE.
+!	ON INPUT, THE FILE PAGE MUST BE CORRECTLY MAPPED
+!	AND PAGPTR MUST POINT TO THE FIRST WORD
+!	OF THE HEADER.  IF THE FILE IS OPENED
+!	IN LOCATE MODE AND THE RECORD DOESN'T SPAN
+!	THE PAGE BOUNDARIES, THEN THE RECORD IS NOT
+!	MOVED, A POINTER TO IT IS RETURNED.
+! INPUT:
+!	<NONE>
+! OUTPUT:
+!	# OF BYTES MOVED
+! GLOBALS USED:
+!	GTBYTE
+!	MOVEREC
+! NOTES:
+!
+!	1. THE FOLLOWING MACROS ARE USED WITHIN THIS ROUTINE. THESE
+!		ARE DEFINED IN "BUFFER.REQ":
+!
+!			CURRENTWINDOW
+!			CURRENTFILEPAGE
+!
+!	2.	ON INPUT TO THIS ROUTINE, THE FOLLOWING FIELDS ARE
+!		ASSUMED TO SET UP:
+!			RSTRSZ		SIZE IN BYTES OF RECORD
+!			RSTRSZW		SIZE IN WORDS OF RECORD
+    BEGIN
+
+    LOCAL
+	recordptr,
+	wordcount,
+	bytecount,
+	bytesize,
+	bytesword,
+	userptr,
+	crp,
+	byteadr,
+	userbuffsize;
+
+    REGISTER
+	tempac;					! USED FOR TEMP CALCULATIONS
+
+    MAP
+	recordptr : BLOCK [1];
+
+    TRACE ('GETREC');
+
+    !+
+    !    GET THE POINTER TO THE CURRENT RECORD
+    !-
+
+    recordptr = .rst [rstpagptr];
+
+    !+
+    !    GET VARIOUS VALUES
+    !-
+
+    bytesize = .fst [fstbsz];			! FILE BYTE SIZE
+    bytecount = .rst [rstrsz];			! RECORD BYTE COUNT
+    wordcount = .rst [rstrszw];			! RECORD WORD COUNT
+!+
+!    IF THE USER SPECIFIED THAT HE WANTED LOCATE MODE,
+!    AND IF HE IS ONLY READING THE FILE (IF HE IS WRITING
+!    IT, LOCATE MODE IS DISABLED), THEN WE MUST CHECK TO
+!    SEE IF THE RECORD SPANS PAGE BOUNDARIES.
+!-
+
+    IF locatemode AND inputmode
+    THEN
+	BEGIN					! Check for spanning record
+
+	IF (.recordptr [ofset] + 		! Offset into current page
+	    headersize + 			!   plus size of header
+	    .wordcount)				!   plus record length
+	    LEQ pagesize			!   is less than one page
+	THEN
+	    BEGIN				! The record doesn't span pages
+	    rab [rabrbf, 0] = 			! Construct pointer to buffer
+	    .recordptr + headersize;
+	    RETURN .bytecount;			! RETURN
+	    END
+
+	END;
+
+!+
+!    AT THIS POINT, EITHER WE ARE IN MOVE MODE OR
+!    THE RECORD SPANS PAGES.  IN EITHER CASE, THE
+!    RECORD WILL BE MOVED INTO THE USER'S BUFFER
+!-
+    recordptr = .recordptr + headersize;	! COMPUTE START OF DATA
+!+
+!    Check if data portion of record begins on next page.
+!
+!    Note that this next check makes no assumption about
+!    the size of the record header.  If the assumption is
+!    made that the header is always 1 word long, then this
+!    check can be made simpler and faster.
+!-
+
+    IF .recordptr [page] NEQ .currentwindow
+    THEN 					! Did we go over the file page?
+	BEGIN
+	byteadr = (.currentfilepage + 1)^p2w;	! Find byte of next file page
+	gtbyte (.byteadr, 			! RFA address
+	    false);				! No abort
+	recordptr = .rst [rstpagptr]		! GET THE UPDATED DATA POINTER
+	END;
+
+!+
+!    THE DATA PORTION OF THE RECORD IS NOW
+!    IN THE WINDOW AND PAGPTR POINTS TO IT.
+!    WE MUST DETERMINE IF THE RECORD IS TOO BIG
+!    FOR THE USER'S BUFFER.
+!-
+    userbuffsize = .rab [rabusz, 0];
+
+    IF .wordcount GTR .userbuffsize
+    THEN
+	BEGIN					! Record can't fit in buffer
+	usrsts = er$rtb;			! Set "partial record" code
+	usrstv = .bytecount;			! Return size of record
+	bytecount = (36/.bytesize)*.userbuffsize	! User-buffer
+	END;
+
+!+
+!    AT THIS POINT, WE HAVE THE FOLLOWING VALUES:
+!    BYTECOUNT = # OF BYTES TO BE TRANSFERRED
+!    RECORDPTR = ADDRESS OF 1ST DATA WORD IN RECORD
+!
+!    WE CAN NOW MOVE THE RECORD INTO USERS BUFFER
+!-
+    userptr = .rab [rabubf, 0];			! Get address of user buffer
+
+    IF .userptr<lh> EQL 0			! Not 30-bit?		!A416
+    THEN 					!			!A416
+	userptr = .userptr OR .blksec;		! Default 30-bit address!A416
+
+    IF moverec (.recordptr, 			! From here...
+	    .userptr, 				! To here
+	    false, 				! This is a $GET
+	    .bytecount, 			! Bytes to move
+	    .bytesize) EQL false		! Size of each byte
+    THEN
+	rmsbug (msgfailure);			! ROUTINE FAILURE
+
+!+
+!    IF THE FILE IS ONLY BEING READ, THEN WE CAN
+!    IMMEDIATELY UNLOCK THE CURRENT RECORD
+!-
+
+    IF inputmode
+    THEN
+
+	IF datalocked THEN unlock (rst [rstdatarfa]);	! UNLOCK CURRENT RECORD
+
+    !+
+    !    RETURN THE SIZE OF THE RECORD MOVED
+    !-
+
+    RETURN .bytecount				! RETURN # OF BYTES MOVED
+    END;					! End GETREC
+
+%SBTTL 'DOGETREL - Relative $GET processor'
+
+GLOBAL ROUTINE dogetrel : NOVALUE =
+! DOGETREL
+! ========
+! ROUTINE TO ACTUALLY PERFORM THE $GET MACRO FOR RELATIVE FILES.
+!	THIS ROUTINE MUST LOCATE THE CURRENT RECORD AND THEN
+!	TRANSFER ALL ITS DATA INTO THE USER'S BUFFER. IF THE LAST
+!	OPERATION WAS A $FIND, THEN WE ARE ALREADY AT THE CURRENT
+!	RECORD AND THE DATA CAN BE MOVED IMMEDIATELY. IF THE
+!	USER SPECIFIED LOCATE MODE FOR HIS $GET OPERATION, AND IF
+!	HE IS ONLY READING THE FILE, THEN WE WILL MERELY
+!	RETURN A POINTER TO THE RECORD IN HIS RBF FIELD INSTEAD
+!	OF ACTUALLY MOVING THE DATA TO HIS BUFFER.
+! INPUT:
+!	<NONE>
+! OUTPUT:
+!	<NO STATUS RETURNED>
+! NOTES:
+!
+!	1.	IF AN ERROR OCCURS, THIS ROUTINE WILL EXIT DIRECTLY
+!		TO THE USER.
+!
+!	2.	IF THE LAST OPERATION WAS A $FIND, THEN IT IS
+!		ASSUMED THAT THE NRP IS NOT SET UP AND MUST BE
+!		COMPUTED BY THIS ROUTINE.
+    BEGIN
+
+    LOCAL
+	crp;					! ADDRESS OF CURRENT RECORD
+
+    TRACE ('DOGETREL');
+!+
+!    IF THE LAST OPERATION WAS A $FIND, AND THIS IS A
+!    $GET SEQUENTIAL, THEN WE ARE ALREADY LOCATED AT
+!    THE TARGET RECORD. IF NOT, WE MUST LOCATE IT
+!-
+
+    IF seqadr AND 				! Sequential access
+	(.rst [rstlastoper] EQL c$find)
+    THEN
+	BEGIN					! Already have current record
+
+	!+
+	!    FETCH THE CURRENT RECORD AND CHECK IT
+	!-
+
+	crp = (rab [rabrfa, 0] = .rst [rstdatarfa]);
+
+	IF .crp EQL 0 THEN usererror (er$cur);	! NO RP
+
+!+
+!    COMPUTE THE NRP VALUE BECAUSE THE $FIND OPERATION
+!    DID NOT RESET IT
+!-
+	rst [rstnrp] = .crp + 1			! BUMP RP
+	END
+    ELSE
+	findrel ();				! We must find the record
+
+    !+
+    !    TRANSFER THE RECORD INTO THE USER'S BUFFER
+    !-
+
+    rab [rabrsz, 0] = getrec ();
+    RETURN
+    END;					! End DOGETREL
+
+%SBTTL 'DOGETIDX - indexed $GET work'
+
+GLOBAL ROUTINE dogetidx : NOVALUE = 		! DOGETIDX
+! ========
+! ROUTINE TO PERFORM THE PRIMARY PROCESSING FOR THE $GET MACRO
+!	FOR AN INDEXED FILE.  IF THE LAST OPERATION WAS A $FIND,
+!	THEN THE CURRENT RECORD (DATARFA) POSITION IS ALREADY
+!	SET UP AND WE CAN DIRECTLY ACCESS THE RECORD. IF NOT,
+!	WE MUST CALL FINDIDX TO LOCATE THE TARGET RECORD.
+! INPUT:
+!	<NONE>
+! OUTPUT:
+!	<NO STATUS RETURNED>
+    BEGIN
+
+    LOCAL
+	recdesc : BLOCK [rdsize],		! RECORD DESCRIPTOR PACKET
+	databd : BLOCK [bdsize],		! BUCKET DESCRIPTOR
+	keyofreference,				! RP KRF
+	recordptr : REF BLOCK,			! PTR TO CURRENT RECORD
+	savedkdb;				! SAVE THE ADDRESS OF CURRENT KEY
+
+    REGISTER
+	tempac;
+
+    TRACE ('DOGETIDX');
+!+
+!    FOR A $FIND-$GET SEQUENCE, WE MUST LOCATE THE
+!    CURRENT RECORD BY ITS RFA ADDRESS.
+!-
+
+    IF seqadr AND (.rst [rstlastoper] EQL c$find)
+    THEN
+	BEGIN					! We must locate the record
+!+
+!    WE MUST NOW FETCH THE RP RFA AND STORE IT IN THE REC
+!    DESCRIPTOR. NOTE THAT THIS RFA IS OF THE USER
+!    DATA RECORD. THUS, IF THE $FIND WAS DONE ON A
+!    SECONDARY KEY, WE HAVE NO RFA FOR THE SIDR SO WE
+!    MUST MAKE SURE THAT WE DON'T USE THE UDR RFA AS THE
+!    NRP POINTER BECAUSE THE NRP MIGHT REPRESENT THE SIDR
+!    RFA.
+!-
+
+	IF (tempac = .rst [rstdatarfa]) EQL 0	! GET UDR RFA
+	THEN
+	    usererror (er$cur);			! NO CURRENT RECORD
+
+	!+
+	!    IF THE FIND WAS BY SECONDARY KEY, DONT USE THIS VALUE
+	!-
+
+	IF .rst [rstrpref] NEQ refprimary THEN tempac = 0;
+
+	recdesc [rdrfa] = .tempac;
+!+
+!    NOW, SET UP THE SIDR-ELEMENT OFFSET WHICH WE KEEP
+!    IN THE RST. WE WILL NEED IT IN "SETNRP".
+!-
+	recdesc [rdsidrelement] = .rst [rstrpsidr];	![%44] CONV TENTA SIDR ELEM TO ACTUAL 1
+
+	!+
+	!    LOCATE THE CURRENT RECORD
+	!-
+
+	keyofreference = .rst [rstrpref];	! USE RP KEY-OF-REFERENCE
+
+	IF (kdb = getkdb (.keyofreference)) EQL false THEN rmsbug (msgkdb);
+
+	fetchcurrentbkt (databd);		! GET THE CURRENT BUCKET
+
+	IF nullbd (databd) THEN rmsbug (msgbkt);	! CHECK IT OUT
+
+	!+
+	!    GET THE POINTER TO THE CURRENT RECORD
+	!-
+
+	recordptr = (recdesc [rdrecptr] = .rst [rstpagptr]);
+!+
+!    WE MUST NOW SET UP THE ADDRESS OF THE RRV OF THIS
+!    RECORD, SINCE IT IS NOT KEPT INTERNALLY (ONLY THE
+!    NRP RRV ADDRESS IS MAINTAINED IN THE RST).
+!    TO DO THIS, WE MUST ACTUALLY ACCESS THE RECORD
+!-
+	recdesc [rdrrv] = .recordptr [drrrvaddress]
+	END
+    ELSE
+	findidx (recdesc, databd);		! We must locate the record
+
+!+
+!    WE HAVE NOW LOCATED THE RECORD. WE MUST MOVE IT INTO
+!    THE USER'S BUFFER, OR SET UP A POINTER TO IT IF LOCATE
+!    MODE IS BEING USED.
+!-
+    savedkdb = .kdb;				! SAVE CURRENT KEY
+    rab [rabrsz, 0] = getidx (recdesc, databd);
+    kdb = .savedkdb;				! RESTORE CURRENT KEY
+
+    !+
+    !    SET THE RFA IN THE USER'S FAB
+    !-
+
+    rab [rabrfa, 0] = .recdesc [rdrrv];
+!+
+!    WE CAN NOW UPDATE THE INTERNAL DATA BASE BY ADJUSTING
+!    THE NEXT-RECORD-POINTER (NRP) VALUES.
+!-
+    setnrp (recdesc, databd);
+
+    !+
+    !    IF THE FILE IS READ-ONLY, THEN UNLOCK THE CURRENT BUCKET
+    !-
+
+    IF inputmode THEN releascurentbkt;
+
+    RETURN
+    END;					! End DOGETIDX
+
+%SBTTL 'PADBUFFER - RB$PAD processor'
+
+GLOBAL ROUTINE padbuffer : NOVALUE =
+! PADBUFFER
+! =========
+! ROUTINE TO PERFORM USER BUFFER PADDING IF THE RB$PAD OPTION
+!	IS SPECIFIED ON A $GET. THIS ROUTINE IS CALLED ONLY
+!	AFTER THE ENTIRE RECORD (OR AS MUCH OF IT AS WOULD FIT)
+!	IS MOVED INTO THE USER'S RECORD BUFFER. THE REST OF THE
+!	BUFFER IS THEN PADDED WITH THE CHARACTER SPECIFIED IN
+!	THE "PAD" FIELD OF THE RAB.
+! INPUT:
+!	<NONE>
+! OUTPUT:
+!	<NO STATUS RETURNED>
+! IMPLICIT INPUT FIELDS:
+!
+!	RAB:
+!		RBF	ADDRESS OF USER RECORD BUFFER
+!		UBF	ADDRESS OF USER BUFFER
+!		RSZ	SIZE OF USER RECORD
+!
+! ROUTINES CALLED:
+!	<NONE>
+! NOTES:
+!
+!	1.	THIS ROUTINE SHOULD OBVIOUSLY NOT PERFORM ITS
+!		FUNCTION IF THE USER IS OPERATING IN LOCATE MODE
+!		(AND THE RECORD WAS ACTUALLY "LOCATED" IN THE RMS-20
+!		FILE BUFFER). THUS, IF RBF ISNT UBF, THIS ROUTINE WILL
+!		IMMEDIATELY EXIT.
+!
+!	2.	**THIS ROUTINE HAS NOT BEEN OPTIMIZED**
+!		TO SPEED IT UP, THE BYTES IN THE CURRENT WORD
+!		CAN BE DEPOSITED, THEN EACH SUCCESSIVE WORD CAN
+!		BE STORED WITH A FULL WORD OF BYTES UNTIL THE
+!		BUFFER IS FULL.
+    BEGIN
+
+    REGISTER
+	bufferbyteptr,				! PTR TO USER BUFFER
+	ac0 = 0,				! EXTEND AC BLOCK
+	ac1 = 1,
+	ac2 = 2,
+	ac3 = 3,
+	ac4 = 4,
+	ac5 = 5;           ! [667] add reg for extended MOVSLJ
+
+    LOCAL
+	extendblock : BLOCK [extblksize],	! USED FOR OP-CODE OF EXTEND INSTR.
+	bytesleft;				! # OF BYTES LEFT IN BUFFER
+
+    TRACE ('PADBUFFER');
+!+
+!    If the user is in locate mode, then we will exit without
+!    doing anything.  We know that he is in locate mode if
+!    his RBF address is not the same as his UBF address.
+!-
+
+    IF (bufferbyteptr = .rab [rabrbf, 0]) NEQ .rab [rabubf, 0] THEN RETURN;	! Don't pad our own buffer
+
+    !+
+    !    COMPUTE THE SIZE OF HIS BUFFER IN BYTES
+    !-
+
+    bytesleft = 36/.fst [fstbsz];		! # OF BYTES PER WORD
+    bytesleft = (.bytesleft*.rab [rabusz, 0]) - .rab [rabrsz, 0];
+
+    !+
+    !    FORM A POINTER TO THE LAST BYTE IN THE BUFFER
+    !-
+
+    bufferbyteptr = POINT (.bufferbyteptr, 36, .fst [fstbsz]);
+    ac4 = .rab [rabrsz, 0];			! GET RECORD SIZE
+    adjbp (ac4, bufferbyteptr);			! POINTER TO END OF BUFFER
+
+    !+
+    !    SET UP EXTEND OP-CODE BLOCK
+    !-
+
+    extendblock [0, wrd] = ext$k_movslj^27;	! MOVE LEFT OP-CODE
+    extendblock [1, wrd] = .rab [rabpad, 0];	! GET PAD CHAR
+    extendblock [2, wrd] = 0;			! NO FILL
+
+    !+
+    !    FILL IN THE AC BLOCK
+    !-
+
+    ac0 = 0;					! NO SOURCE STRING
+    ac1 = 0;					! NO BYTE POINTER
+    ac2 = 0;                                    ! [667] No byte pointer
+    ac3 = .bytesleft;				! # OF BYTES IN BUFFER
+    ac5 = .ac4<0,18> OR %O'1000000';    	! [667] 2nd part, global ptr
+    ac4 = .ac4<18,18>^18 OR %O'40000000';  	! [667] 1st part of 2wd ptr
+!+
+!    NOW, DO THE BUFFER PADDING...NOTE THAT THERE IS
+!    CURRENTLY NO CHECK TO SEE IF THIS INSTRUCTION
+!    FAILED. HOWEVER, THE IFSKIP MUST PERFORM SOME
+!    DUMMY OPERATION OR BLISS WILL OPTIMIZE OUT THE
+!    SKIP AND THE STACK WILL NOT BE ADJUSTED PROPERLY.
+!-
+
+    IF NOT extend (ac0, extendblock) THEN true ELSE false;
+
+    RETURN
+    END;					! End PADBUFFER
+
+%SBTTL 'GETIDX - get indexed record'
+
+GLOBAL ROUTINE getidx (recdesc, databd) =
+! GETIDX
+! ======
+! ROUTINE TO READ A RECORD FROM AN INDEXED FILE.
+!	THIS ROUTINE IS CALLED ONLY AFTER THE TARGET
+!	RECORD HAS BEEN LOCATED AND ITS ADDRESS HAS BEEN
+!	ESTABLISHED. THIS ROUTINE WILL THEN COMPUTE HOW
+!	MUCH (IF ANY) OF THE RECORD IS TO BE MOVED, AND
+!	WILL MOVE THE RECORD INTO THE USER'S BUFFER.
+!
+! INPUT:
+!	RECDESC		RECORD DESCRIPTOR PACKET
+!		RFA		RFA OF CURRENT RECORD
+!		RECPTR		ADDRESS (IN BUFFER) OF CURRENT RECORD
+!		RRV		RRV ADDRESS OF CURRENT RECORD
+!
+!	DATABD		BKT DESCRIPTOR OF DATA BUCKET
+!
+! OUTPUT:
+!	VALUE RETURNED = SIZE IN BYTES OF RECORD (ACTUAL BYTES MOVED)
+    BEGIN
+
+    MAP
+	recdesc : REF BLOCK,
+	databd : REF BLOCK;
+
+    REGISTER
+	tempac,					! TEMPORARY AC
+	bytesperword,				! # OF BYTES PER WORD FOR THIS FILE
+	recordptr : REF BLOCK;			! PTR TO THE TARGET RECORD
+
+    LOCAL
+	recordsize,				! SIZE IN BYTES OF THIS RECORD
+	wordstomove,				! # OF WORDS IN RECORD
+	extrabytes,				! # OF LEFT-OVER BYTES
+	buffersize,				! SIZE OF USER'S BUFFER
+	fullwords,				! TOTAL # OF WORDS IN RECORD
+	buf2ptr : VECTOR [2],			!two-word BP if needed
+	bufferptr : REF BLOCK;			! PTR TO USER'S BUFFER
+
+    TRACE ('GETIDX');
+!+
+!    ON ENTRY, WE SHOULD HAVE THE ADDRESS OF THE RECORD
+!    IN THE RECORD DESCRIPTOR. LET'S GET IT AND HAVE A LOOK.
+!-
+    recordptr = .recdesc [rdrecptr];
+    lookat ('	READING REC AT: ', recordptr);
+!+
+!    SET UP THE PRIMARY KDB BECAUSE WE ARE ALWAYS MOVING
+!    A PRIMARY USER DATA RECORD
+!-
+    kdb = .fst [fstkdb];			! GET UDR KDB
+
+    !+
+    !    WE CAN NOW GET THE SIZE OF THIS RECORD, IN BYTES
+    !-
+
+    IF fixedlength THEN recordsize = .fst [fstmrs] ELSE recordsize = .recordptr [drrecsize];
+
+    !+
+    !    BUMP THE POINTER PAST THE RECORD HEADER
+    !-
+
+    recordptr = .recordptr + .kdb [kdbhsz];
+!+
+!    IF THIS IS LOCATE MODE, AND THE USE IS ONLY READING THE
+!    FILE, THEN WE CAN SIMPLY SET UP A POINTER TO THE RECORD
+!    IN OUR BUFFER.
+!-
+
+    IF locatemode
+    THEN
+
+	IF inputmode
+	THEN
+	    BEGIN				! We can pass back a pointer
+	    rtrace (%STRING ('	Locate mode found...', %CHAR (13, 10)));
+	    rab [rabrbf, 0] = .recordptr;	! Store record addr
+	    RETURN .recordsize
+	    END;
+
+!+
+!    EITHER THIS IS MOVE MODE, OR THE USER IS NOT IN
+!    READ-ONLY ACCESS. IN EITHER CASE, WE WILL MOVE
+!    THE RECORD INTO THE USER'S BUFFER AREA.
+!-
+
+    !+
+    !    COMPUTE THE SIZE IN WORDS OF THIS RECORD
+    !-
+
+    bytesperword = 36/.fst [fstbsz];		! # OF BYTES IN EACH WORD
+    wordstomove = .recordsize/.bytesperword;	! # OF FULL WORDS
+    extrabytes = .recordsize - (.wordstomove*.bytesperword);
+
+    !+
+    !    LET'S SEE ALL THIS
+    !-
+
+    lookat ('	WORDS-TO-MOVE: ', wordstomove);
+    lookat ('	EXTRA-BYTES: ', extrabytes);
+
+    !+
+    !    LET'S FIND OUT IF THE ENTIRE RECORD WILL FIT IN THE BUFFER
+    !-
+
+    fullwords = .wordstomove;
+
+    IF .extrabytes NEQ 0 THEN fullwords = .fullwords + 1;	! We can fit one more word in
+
+    !+
+    !    Get the size of the user's buffer
+    !-
+
+    buffersize = .rab [rabusz, 0];
+
+    IF .buffersize LSS .fullwords
+    THEN
+	BEGIN					! The record won't fit
+	rtrace (%STRING ('	Record can''t fit...', 	!
+		%CHAR (13, 10)));
+	extrabytes = 0;				! CHOP OFF EXTRA
+	wordstomove = .buffersize;		! MOVE THIS MUCH
+	usrsts = er$rtb;			! PARTIAL RECORD
+	usrstv = .recordsize			! RETURN FULL SIZE
+	END;
+
+    !+
+    !    FORM A PTR TO THE USER'S BUFFER
+    !-
+
+    bufferptr = .rab [rabubf, 0];
+    ! Default section is where RAB is.
+
+    IF .bufferptr<lh> EQL 0 THEN bufferptr = .bufferptr OR .blksec;
+
+    !+
+    !    MOVE THE MAIN BODY OF THE RECORD
+    !-
+
+    IF .wordstomove NEQ 0
+    THEN
+
+	IF .rmssec NEQ 0
+	THEN
+	    xcopy (.recordptr, .bufferptr, .wordstomove)
+	ELSE
+	    movewords (.recordptr,
+		.bufferptr, .wordstomove);
+
+    !+
+    !    BUMP OUR POINTERS AND DECREMENT THE SIZE OF THE BUFFER
+    !-
+
+    bufferptr = .bufferptr + .wordstomove;
+    recordptr = .recordptr + .wordstomove;
+    buffersize = .buffersize - .wordstomove;
+
+    !+
+    !    WE CAN NOW MOVE THE SLACK BYTES
+    !-
+
+    IF .extrabytes NEQ 0
+    THEN
+	BEGIN
+!+
+!    WE WILL CREATE A BYTE POINTER WHICH HAS A
+!    BYTE SIZE OF ( FILE BYTE SIZE * # OF BYTES TO MOVE).
+!    THIS AVOIDS THE NECESSITY OF USING A ILDB LOOP
+!    TO MOVE A SMALL NUMBER OF BYTES.
+!-
+	tempac = .fst [fstbsz]*.extrabytes;	! # OF BITS TO MOVE
+	tempac = (.tempac^6) + nullbp;		! FORM LH OF PTR
+	lookat ('	RECORD-PTR: ', recordptr);
+	lookat ('	BUFF-PTR: ', bufferptr);
+	recordptr<lh> = .tempac;
+!		Now we decide if a 2-word BP is needed and use it if so.
+
+	IF .rmssec NEQ 0
+	THEN
+	    BEGIN
+	    buf2ptr [1] = .bufferptr;
+	    buf2ptr<lh> = .tempac OR %O'40';	!2-WORD BP
+	    buf2ptr<rh> = 0;
+	    ildb (tempac, recordptr);
+	    idpb (tempac, buf2ptr)
+	    END
+	ELSE
+	    BEGIN
+	    bufferptr<lh> = .tempac;		! STORE IN POINTERS
+	    ildb (tempac, recordptr);
+	    idpb (tempac, bufferptr)
+	    END;
+
+	END;
+
+    !+
+    !    COMPUTE THE SIZE OF THE RECORD WE MOVED
+    !-
+
+    recordsize = (.wordstomove*.bytesperword) + .extrabytes;
+    RETURN .recordsize
+    END;					! End GETIDX
+
+END
+
+ELUDOM

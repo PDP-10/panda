@@ -1,0 +1,123 @@
+;;;; -*-Lisp-*-
+;;; This is the optimizer for the JoSH version of the Tops-20
+;;; Common Lisp Compiler.  Copyright (c) 1985,86 J S Hall, C L Hedrick
+
+(in-package "COMPILER")
+(shadow '(lisp::optimize))	;[Victor] not a function in CLtL
+
+;;; Optimizer v 0.010 only peephole stuff yet.
+
+(eval-when (eval)					;all these macros
+(defmacro docode (&body body)
+  `(do* ((prev lap-code (if flag (cdr prev) prev))
+	 (inst (cadr prev) (cadr prev))
+	 (next (cddr prev) (cddr prev))
+	 (op (car inst) (car inst))
+	 (a1 (cadr inst) (cadr inst))
+	 (a2 (caddr inst) (caddr inst))
+	 (flag t t))
+	((null inst))
+	. ,body))
+
+(defmacro zap-inst ()
+  '(progn (setq flag nil) (setf (cdr prev) next)))
+
+(defmacro zap-next ()
+  '(progn (setq flag nil) (setf (cddr prev) (cdr next))))
+
+(defmacro zap-2 ()
+  '(progn (setq flag nil) (setf (cdr prev) (cdr next))))
+
+(defmacro jumpto ()
+  '(cond ((memq op '(jrst jrst1 jumpa jumpa1)) a1)
+	 ((memq op '(jumpe jumpn)) a2)))
+
+(defmacro setsd ()
+  '(progn (setq mem (cond ((null a2) 0)
+			  ((numberp a2) (incf n))
+			  ((memq a2 '(o1 o2 o3 o4 o5 o6))
+			   (or (cdr (assq a2 regs))
+			       (cdar (setq regs (acons a2 (incf n) regs)))))
+			  ((gethash a2 memmap))
+			  (t (setf (gethash a2 memmap) (incf n)))))
+	  (setq ac (or (assq a1 regs)
+		       (car (setq regs (acons a1 (incf n) regs)))))))
+
+)							;end of eval-when
+
+(dolist (x '(skipa skipe skipn label  ;; label can be tgt of jrst1
+	     came camn camg camge caml camle)) ;; and maybe more...
+  (setf (get x 'skipinst) t))
+
+(defun optimize ()
+  (let ((labtab (make-array (1+ *label-counter*))) z)
+    ;; labtab tells if a label is referred to (for removing spurious ones)
+    (dolist (x entry-points) (if (numberp x) (setf (svref labtab x) t)))
+    (docode (case op
+	      (skipa (unless (get (caar prev) 'skipinst)
+			     (case (caar next)
+			       (label nil)
+			       (continue (zap-next))
+			       (t (zap-2)))))
+	      ((continue top-contour contour) (zap-inst))
+	      (t (cond ((and (memq op '(jrst jrst1))
+			     (not (eq 'label (caar next))))
+			(zap-next))
+		  ((and (eq op 'jrst)
+			(do ((x next (cdr x)))
+			    ((or (not (eq (caar x) 'label))
+				 (eq (cadar x) a1))
+			     (and (eq (caar x) 'label) (eq (cadar x) a1)))))
+		   (zap-inst))
+		  ((setq z (jumpto)) (setf (svref labtab z) t))))))
+    (docode (if (and (eq op 'label) (not (svref labtab a1)))
+		(zap-inst)))
+    (docode
+      (let* ((jp (assq op '((jumpa (skipe . jumpn) (skipn . jumpe))
+			    (jumpa1 (skipe . jumpn1) (skipn . jumpe1)))))
+	     (si (cdr (assq (caar prev) (cdr jp))))
+	     (nj (cdr (assq op '((jumpa . jrst) (jumpa1 . jrst1))))))
+	(if jp (if si (cond ((regp (caddar prev))
+			     (rplaca prev `(,si ,(caddar prev) ,a1))
+			     (zap-inst))
+			    (t (rplaca inst nj)))
+		   (rplaca inst nj))))))
+  ;; excise excess loads
+  (let (memmap (n 1) regs ac mem tmp)
+    (docode
+     (case op
+       (move (setsd) (cond ((eq mem (cdr ac)) (zap-inst))
+			   ((setq tmp (rassoc mem regs))
+			    (rplaca (cddr inst) (car tmp))
+			    (rplacd (cddr inst) nil)
+			    (setf (cdr ac) mem))
+			   (t (setf (cdr ac) mem))))
+       ((came camn camg camge caml camle     ; we only skip jumps
+	 jrst jrst1 jumpe jumpn jumpe1 jumpn1) nil)
+       ((add addi sub subi) (setsd) (rplacd ac (incf n)))
+       (movem (setsd) (if (memq a2 '(o1 o2 o3 o4 o5 o6))
+			  (rplacd (or (assq a2 regs)
+				      (car (setq regs (acons a2 nil regs))))
+				  (cdr ac))			  
+			  (setf (gethash a2 memmap) (cdr ac))))
+       (label (setq memmap (make-hash-table) regs nil))
+       (t (setq regs nil)))))
+  ;; remove redundant stores
+  (let ((used (make-hash-table)) (labs (make-hash-table)) flag)
+    (setq lap-code (nreverse lap-code))
+    (docode
+     (case op
+       (movem (if flag (if (symbolp a2) (setf (gethash a2 used) t))
+		  (and (symbolp a2)
+		       (not (gethash a2 used))
+		       (zap-inst))))
+       (label (setf (gethash a1 labs) t))
+       ((jumpe jumpe1 jumpn jumpn1)
+	(unless (gethash a2 labs) (setq flag t)))
+       ((jrst jrst1)
+	(unless (gethash a1 labs) (setq flag t)))
+       (t (if (symbolp a2) (setf (gethash a2 used) t)))))
+    (setq lap-code (nreverse lap-code))
+    (setq *temps* (remove-if-not #'(lambda (x) (or (get x 'gt5arg)
+						   (gethash x used)))
+				 *temps*))))

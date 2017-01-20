@@ -1,0 +1,1437 @@
+%TITLE 'RMSDIR - $PARSE, $SEARCH, $RENAME'
+MODULE RMSDIR (
+		IDENT = '3(661)'
+                %BLISS36(,ENTRY(
+                                $PARSE,        ! Parse filespec into components
+                                $SEARCH,       ! Search (wildcard)
+                                DAP$SEARCH,    ! Search (wildcard) remote
+                                DAP$MERGE,     ! Merge remote filespecs
+                                $RENAME,       ! Rename local or remote file(s)
+                                _SSCAN         ! ^V-handling string scanner
+                                ))
+		) =
+BEGIN
+
+!
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1981, 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+
+!++
+! FACILITY:  DAP, RMS
+!
+! ABSTRACT:  Routines to do wildcarding, renaming, and filespec handling
+!
+!
+! ENVIRONMENT:  RMS, BLISSNET, XPORT, Transportable code.
+!
+! AUTHOR:	Andrew Nourse, CREATION DATE:  3-Jan-82
+
+! 661   - Handle ^V properly in most if not all cases.
+! 651   - DAP$SEARCH and DAP$MERGE didn't stop on a null causing it not to work
+!         sometimes and in particular on TOPS-10 filenames.
+! 650   - DAP$SEARCH didn't update the NAM block lengths and pointers properly
+!         for remote files breaking DIU's directory command and wildcards 
+!         to/from remotes.
+! 575   - Do remote node/user/password correctly
+! 566   - Make some improvements in handling wildcarding
+!
+! 07    - Change to use new-style NAM block
+! 06    - RMS'ify
+! 05    - Make R$RENAME call DAP$NEXTFILE for additional files
+! 04    - Return after DAP$NEXTFILE if not DIRECTORY
+! 03    - Use original punctuation for generation number
+! 02    - Move system-dependant code to DIR20.  
+! 01	- The beginning
+!--
+!
+! INCLUDE FILES:
+!
+
+REQUIRE 'RMSREQ';
+LIBRARY 'BLISSNET';
+LIBRARY 'CONDIT';
+
+!
+! TABLE OF CONTENTS:
+!
+
+FORWARD ROUTINE
+        $PARSE,                         ! Parse filespec into component parts
+        $SEARCH,                        ! Search (wildcard)
+        DAP$SEARCH,                     ! Search (wildcard) remote
+        DAP$MERGE,                      ! Merge remote filespecs
+	$RENAME,                        ! Rename local or remote file(s)
+        _SSCAN;                         ! Special string scanner (handle ^V)
+
+!
+! Feature Tests:
+!
+
+COMPILETIME MULTIPLE_FILESPECS=1;       ! On to allow multiple filespecs in FAB
+
+!
+! MACROS:
+!
+UNDECLARE %QUOTE SUCCESS;               ! This macro screws us            !a545
+
+MACRO SSCAN[]=$STR_SCAN(%REMAINING) %;  ! String Scan macro
+
+
+%IF %BLISS(BLISS36)
+%THEN
+%IF %SWITCHES(TOPS20)
+%THEN
+UNDECLARE %QUOTE SSCAN;
+KEYWORDMACRO
+    SSCAN( string, remainder,  stop, find, span, option, options,
+           substring, target, delimiter, success, failure = STR$FAILURE ) =
+
+	%EXPAND $xpo$required( string remainder, 'STRING= or REMAINDER=' )
+	%EXPAND $xpo$required( find span stop, 'FIND=, SPAN= or STOP=' )
+
+	%IF %EXPAND $xpo$conflict( string, remainder )
+	%THEN
+	    %WARN( 'STRING= and REMAINDER= are mutually exclusive' )
+	    %EXITMACRO
+	%FI
+
+        %IF %EXPAND $xpo$conflict( find, span, stop )
+	%THEN
+	    %WARN( 'FIND=, SPAN= and STOP= are mutually exclusive' )
+	    %EXITMACRO
+	%FI
+
+	%IF %EXPAND $xpo$conflict( option, options )
+	%THEN
+	    %WARN( 'OPTION= and OPTIONS= are mutually exclusive' )
+	    %EXITMACRO
+	%FI
+
+	%IF %EXPAND $xpo$conflict( substring, target )
+	%THEN
+	    %WARN( 'SUBSTRING= and TARGET= are mutually exclusive' )
+	    %EXITMACRO
+	%FI
+
+	%ASSIGN( $str$options, %EXPAND $str$opt_init )
+
+	%IF NOT %NULL( remainder )
+	%THEN
+	    %ASSIGN( $str$options, $str$options OR STR$M_REMAINDER )
+	%FI
+
+	%IF NOT %NULL( find )
+	%THEN
+	    %ASSIGN( $str$function, STR$K_FIND )
+	%ELSE %IF NOT %NULL( span )
+	%THEN
+	    %ASSIGN( $str$function, STR$K_SPAN )
+	%ELSE
+	    %ASSIGN( $str$function, STR$K_STOP )
+	%FI %FI
+
+	%IF NOT %NULL( target )
+	%THEN
+	    %ASSIGN( $str$options, $str$options OR STR$M_TARGET )
+	%FI
+
+	BEGIN
+	! %EXPAND $xpo$force( $xpo$ex_routine( _SSCAN ) )
+	%EXPAND $xpo$ex_failure( failure )
+
+	%IF NOT %NULL( delimiter )
+	%THEN
+	    LOCAL $str$status,
+		$str$delimiter;
+	%ELSE
+	    LITERAL $str$delimiter = 0;
+	%FI
+
+	$str$declare( LOCAL, $str$string, string remainder )
+	$str$declare( LOCAL, $str$pattern, find span stop )
+
+	$str$local_init( $str$string, string remainder )
+	$str$local_init( $str$pattern, find span stop )
+
+	%IF NOT %NULL( delimiter )
+	%THEN
+	    $str$status =
+	%FI
+
+	_SSCAN( %NUMBER( $str$options ) + %NUMBER( $str$function ),
+		$str$string,
+		$str$pattern,
+		$xpo$default( substring target, 0 ),
+		$str$delimiter,
+		$xpo$default( success, 0 ),
+		$xpo$default( failure, 0 ) )
+
+	%IF NOT %NULL( delimiter )
+	%THEN
+	    ;
+	    IF .$str$status
+	    THEN
+		delimiter = .$str$delimiter;
+	    .$str$status
+	%FI
+	END %;
+
+%FI
+%FI
+
+!
+! PURE DATA:
+!
+
+PSECT OWN=$HIGH$;
+
+!
+! EXTERNAL REFERENCES:
+!
+EXTERNAL ROUTINE
+                R$NULL,
+                DAP$OPENFILE,
+                Dap$EndAccess,
+                DAP$GET_MESSAGE,
+                DAP$PUT_MESSAGE,
+                DAP$GET_ATTRIBUTES,
+                DAP$GET_STRING,
+                DAP$GET_STATUS,
+                DAP$PUT_STRING,
+                DAP$PUT_CONTROL,
+                DAP$GET_ACK,
+                DAP$ERROR_DAP_RMS,
+                DAP$HANDLE,             ! Condition handler
+                S$DTSTR,
+                RL$PARSE,
+                RL$MERGE,               ! Merge local filespecs
+                RL$SEARCH,              ! Search (wildcard) local
+                RL$RENAME,              ! Rename local file(s)
+                GetJfn,
+		RlsJfn,			!615
+                XST$SCAN,
+                D$JfnAi,
+                D$FspAi,
+                D$NamAi;
+
+%IF MULTIPLE_FILESPECS
+%THEN EXTERNAL ROUTINE DAP$NEXTFILE; %FI
+
+GLOBAL ROUTINE $Parse ( P_Fab, P_Err )  =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Decompose a filespec & merge in related filespec
+!
+! FORMAL PARAMETERS:
+!
+!       P_FAB: Addr of FAB
+!       P_ERR: Address of error routine
+!
+! COMPLETION CODES:
+!
+!	RMS Codes
+!
+!--
+    BEGIN
+    LOCAL GtJfnBits: BITVECTOR[%BPUNIT];
+    BIND UFab=.P_Fab: $Fab_decl;
+    BIND ROUTINE $$Errrtn=.P_Err: Rms_Ercal;
+    BIND UNam=UAddr(.UFab[Fab$a_Nam]): $Nam_decl;
+MAP
+    !
+    !	RMSLIB cannot define these externals as MONWORD (because
+    !	a library file cannot reference a structure from a library
+    !	file) so MAP them instead.
+    !
+    dvflgs : monword;				! Device flags (from DVCHAR)
+
+
+    rmsentry ('$PARSE');
+!+
+!   Fetch the user's FAB and error address.
+!-
+    fab = Ufab;				        ! Get address of FAB
+    erradr = .P_err;                            !   and user error address
+    errorblock (fab);				! All errors go to the FAB
+
+    !
+    !   Make sure this is a FAB.
+    !
+
+    IF .UFab [Fab$h_Bid] NEQ Fab$k_Bid THEN usererror (Rms$_Fab);
+    IF .UFab [Fab$h_Bln] LSS Fab$k_BLn THEN usererror (Rms$_Bln);
+
+    !
+    !   Make sure there is a NAM block.
+    !
+
+    IF UNam EQL 0 THEN usererror (Rms$_Nam);
+    IF .UNam[Nam$h_Bid] NEQ Nam$k_Bid THEN usererror (Rms$_Nam);
+    IF .UNam[Nam$h_Bln] LSS Nam$k_BLn THEN usererror (Rms$_Bln);
+
+
+    oaflags = 0;                        ! Clear the open-abort flags
+
+    !
+    !   End of setup
+    !
+
+    !
+    !   Make ESA/RSA into byte pointers, if not already
+    !
+        BEGIN
+        BIND Esaptr=UNam[Nam$a_Esa]: $Byte_Pointer;
+        BIND Rsaptr=UNam[Nam$a_Rsa]: $Byte_Pointer;
+
+        UNam[Nam$g_Wcc] = 0;                ! Start at the beginning
+
+        IF .Esaptr[Ptr$v_owg_section_number] EQL 0
+        THEN                                    ! Local Address
+            BEGIN
+            Esaptr[Ptr$v_Byte_Size] = CH$SIZE();
+            Esaptr[Ptr$v_Byte_Position] = %BPVAL;
+            END
+        ELSE
+            IF .Esaptr[Ptr$v_Owg_ps] EQL 0      ! If not already byte pointer
+            THEN Esaptr[Ptr$v_Owg_Ps] = %O'61'; ! One-word global equivalent
+
+        IF .Rsaptr[Ptr$v_owg_section_number] EQL 0
+        THEN                                    ! Local Address
+            BEGIN
+            Rsaptr[Ptr$v_Byte_Size] = CH$SIZE();
+            Rsaptr[Ptr$v_Byte_Position] = %BPVAL;
+            END
+        ELSE
+            IF .Rsaptr[Ptr$v_Owg_Ps] EQL 0      ! If not already byte pointer
+            THEN Rsaptr[Ptr$v_Owg_Ps] = %O'61'; ! One-word global equivalent
+        END;
+
+    IF .UFab[Fab$a_Ifi] EQL 0                                           !m572v
+    THEN
+	BEGIN
+        IF (UFab[Fab$a_Ifi] = fst = gmem (fst$k_bln)) EQL false ! Room for FST?
+        THEN
+	    returnstatus (er$dme);                  ! No - error
+
+        fst [fst$h_bln] = fst$k_bln;		! Set up blocklength      !m502
+        fst [fst$h_bid] = fst$k_bid;		! Set up block id         !a504
+        fst [fst$a_flink] = .fst;               ! No streams active yet   !a572
+        setflag (oaflags, abrfst);			! Flush FST on aborting
+        END;                                                             !m572^
+
+    IF .UFab[Fab$v_Ofp]
+    THEN GtJfnBits = (GJ_FOU+GJ_OFG+GJ_IFG+GJ_FLG+      ! output wildcard  
+                      ((GJ_NEW+$GJLEG)*(.UFab[Fab$v_Sup] EQL 0)))         !m577
+    ELSE GtJfnBits = GJ_OLD+GJ_IFG+GJ_FLG;      ! 
+
+    IF .UFab[Fab$v_Cif]                                                   !a566
+    THEN GtJfnBits = GJ_IFG+GJ_OFG+GJ_FLG;
+
+    IF .UNam[Nam$v_SynChk]              ! Parse-only                      !a566
+    THEN
+        BEGIN
+        IF .UFab[Fab$v_Ofp]
+        THEN GtJfnBits = GJ_OFG+GJ_FLG+GJ_FOU
+        ELSE GtJfnBits = GJ_OFG+GJ_FLG;
+        END;
+
+    GtJfnBits = GetJfn( .GtJfnBits );   ! Get the jfn and flags
+
+    IF .UFab[Fab$h_Jfn] EQL 0           ! If we just got this JFN        !a566
+    THEN UNam[Nam$g_Fnb]=.GtjfnBits<lh>; ! then save the flags
+
+    IF .userjfn LSS $ErBas              ! If we have a JFN, not an error code
+    AND .userjfn GTR 0                  ! or nothing
+    THEN
+        BEGIN
+
+	UFab[Fab$h_Jfn] = .UserJfn;      ! Give JFN back to user    	 !a566
+
+        dvflgs = devchar (.userjfn);   ! Get device flags (20 format)
+        END;
+
+    IF .UFab[Fab$v_Remote]          ! IF File is remote                  !m566v
+    THEN
+        BEGIN                                        
+        Dap$Merge( UFab, 
+                   Merge$m_Expanded+Merge$m_Rlf+Merge$m_Point,
+                   $$ErrRtn );                                            !a600
+
+        IF NOT .UNam[Nam$v_SynChk]      ! Not parse-only, really do things
+        THEN
+            BEGIN                       ! 
+            LOCAL Functioncode;
+
+            IF .UFab[Fab$v_Ofp]         ! If output file
+            THEN Functioncode = 0       ! Just open link & get config
+            ELSE Functioncode = Dap$k_Open+Fab$m_Nam;  ! Open but leave attrs
+
+            IF .UFab[Fab$v_Cif]         ! If Create-if, set $Create       !m570
+            THEN Functioncode = Dap$k_Create;
+
+            fst[fst$h_bid]=fst$k_bid;   ! Set up FST, SETFST is not used here
+            fst[fst$a_flink]=.fst;      ! No streams active yet
+            fab[fab$a_ifi] = .fst;      ! Return file-ID
+
+            Dap$Openfile( UFab,
+                          .Functioncode,
+                          0,                     ! for $Search 
+                          $$ErrRtn ); ! File is remote
+
+            fst[fst$h_rfm] = .fab[fab$v_rfm];
+            fst[fst$b_fac] = .fab[fab$h_fac];
+            fst[fst$h_mrs] = .fab[fab$h_mrs];
+            fst[fst$g_mrn] = .fab[fab$g_mrn];
+            fst[fst$h_fop] = .fab[fab$h_fop];  ! Use new place in FST  !m557
+            fst[fst$v_drj] = 1;         ! Required for wildcarding
+            fst[fst$h_rat] = .fab[fab$h_rat];
+            fst[fst$h_bsz] = .fab[fab$v_bsz];
+            fst[fst$h_org] = .fab[fab$v_org];
+            fst[fst$a_blink]=fst[fst$a_flink]=.fst; ! Link to self 
+            fst[fst$h_device_type]=dvdsk;    !? Assume disk for now
+            END;
+        END                                                             !d600
+    ELSE                                ! Local Parse
+        Rl$Parse( UFab, $$ErrRtn );
+
+    %IF %SWITCHES(TOPS20)						!615
+    %THEN
+    IF .UNam[Nam$v_SynChk]
+    THEN
+        BEGIN
+        LOCAL v;
+        v=Rlsjfn (.Userjfn ) ;
+        UFab[Fab$h_Jfn] = 0;
+        END;
+    %FI
+
+    OaFlags = 0;
+    UsrRet()
+    END;			!End of $PARSE
+
+
+
+GLOBAL ROUTINE $Search (P_Fab,P_Err) =	! Get next file 
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Get directory info for a file
+!
+! FORMAL PARAMETERS:
+!
+!       P_FAB: A FAB as defined by RMS -- Filled in by this routine
+!       P_ERR: Address of error routine
+!
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!--
+
+BEGIN
+BIND UFab=.P_Fab:  $Fab_decl;
+BIND UNam=UAddr(.UFab[Fab$a_Nam]): $Nam_decl;
+BIND ROUTINE $$Errrtn=.P_Err: Rms_ercal;
+
+rmsentry ('$SEARCH');                                               !a566
+!+
+!   Fetch the user's FAB and error address.
+!-
+fab = UFab;				! Get address of FAB        !a566
+erradr = $$Errrtn;			!   and user error address  !a566
+errorblock (fab);			! All errors go to the FAB  !a566
+
+!
+!   Make sure this is a FAB.
+!
+
+IF .UFab [Fab$h_Bid] NEQ Fab$k_Bid THEN usererror (Rms$_Fab);
+IF .UFab [Fab$h_Bln] LSS Fab$k_BLn THEN usererror (Rms$_Bln);
+
+!
+!   Make sure there is a NAM block.
+!
+
+IF UNam EQL 0 THEN usererror (Rms$_Nam);
+IF .UNam[Nam$h_Bid] NEQ Nam$k_Bid THEN usererror (Rms$_Nam);
+IF .UNam[Nam$h_Bln] LSS Nam$k_BLn THEN usererror (Rms$_Bln);
+
+!
+!   Set up Fst pointer & check it
+!
+Fst = .UFab [Fab$a_Ifi];                                                  !a566
+
+
+
+IF .UFab[Fab$v_Remote]
+THEN
+    Dap$Search( UFab, $$ErrRtn )
+ELSE
+    Rl$Search( UFab, $$ErrRtn );
+
+IF .UsrSts NEQ Rms$_Suc                 ! If we got an error, give error  !m566
+THEN UserError( .UFab[Fab$h_Sts] );
+
+OaFlags = 0;
+UsrRet()
+END;			!End of $SEARCH
+
+GLOBAL ROUTINE Dap$Search (P_Fab,P_Err)  =	! Get next file 
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Get directory info for a remote file
+!
+! FORMAL PARAMETERS:
+!
+!       P_FAB: A FAB as defined by RMS -- FNA contains wildcard spec
+!       P_ERR: Address of error routine
+!
+! COMPLETION CODES:
+!
+!	Standard RMS codes
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!--
+
+    BEGIN
+    BIND Fab=.P_Fab: $Fab_decl;
+    BIND ROUTINE $$Errrtn=.P_Err: Rms_ercal;
+    BIND Nam=UAddr(.Fab[Fab$a_Nam]): $Nam_decl;   ! Name block
+    BIND Fst=.FAB[FAB$a_Ifi]: $Rms_Fst;
+    BIND Idd=.Fst[Fst$a_I_DD]: $DAP_DESCRIPTOR;
+    BIND Odd=.Fst[Fst$a_O_DD]: $DAP_DESCRIPTOR;
+
+    LOCAL Fabsav: VOLATILE;
+    LOCAL Errsav: VOLATILE;
+    LOCAL d, uptr, desc : $STR_DESCRIPTOR (CLASS=BOUNDED);
+
+    ENABLE DAP$HANDLE (fabsav, errsav); ! Setup Condition handler
+
+    errsav = $$ERRRTN;
+    fabsav = fab;                       ! Handler will need this
+
+    IF .Fst[Fst$v_Access_Active] EQL 0
+    THEN
+        BEGIN
+        Fab[Fab$h_Sts] = UsrSts = Rms$_Nmf;
+        %IF MULTIPLE_FILESPECS
+        %THEN IF DAP$NEXTFILE(Fab,$$ErrRtn) NEQ 0
+              THEN BEGIN         ! [4] If not a DIRECTORY operation
+                   IF .Fst[Fst$b_Operation] NEQ Dap$k_Directory
+                   THEN RETURN .Fab[Fab$h_Sts]   ![4] Done now
+                   END
+              ELSE BEGIN
+                   $$Error(Get,Fab);
+                   RETURN .Fab[Fab$h_Sts];
+                   END
+        %ELSE 
+              $$Error(Get,Fab);
+              RETURN .Fab[Fab$h_Sts];
+        %FI
+        END;
+
+! Receive info from other system
+
+Nam[Nam$h_Wcc_Count]=.Nam[Nam$h_Wcc_Count]+1; ! Incr wildcard count
+
+        BEGIN
+        ! If the file was not closed yet (and not first time)
+        IF (.Nam[Nam$h_Wcc_Count] NEQ 1) 
+        AND NOT .Fst[Fst$v_Close_Done]                                    !m566
+        THEN
+            BEGIN                   ! Send Access Complete to close it
+            BIND cmpfunc=( IF .Fst[Fst$v_Error]
+                           THEN Dap$k_Accomp_Skip
+                           ELSE Dap$k_Accomp_Command );
+
+            Fst[Fst$h_Fop]=Fab$m_Drj;        ! Don't close the link   !m547
+            Dap$EndAccess( Fab, cmpfunc, R$Null );          !m566
+            IF .Fst[Fst$v_Access_Active] EQL 0
+            THEN
+                BEGIN
+                Fst[Fst$v_Drj]=.Fab[Fab$v_Drj];
+                RETURN ( Fab[Fab$h_Sts] = UsrSts = Rms$_Nmf );        !m566
+                END;
+            END;
+
+        Fst[Fst$v_Close_Done] = 0;      ! Clear Close_Done, not same file !m566
+
+        Fab[Fab$h_Sts] = UsrSts = RMS$_SUC;     ! Assume we will win
+        Fab[Fab$h_Stv]=0;                       ! for now
+
+! Now get the resultant filespec and file attributes back.
+! (Unless we get an error)
+
+DAP$GET_ATTRIBUTES (idd, fab);
+
+! Zero unused part of buffer left over from previous filenames.  This
+! confuses us later if we don't clean it up now.  Then recompute the 
+! pointers for the name block.
+
+CH$FILL (0,                             ! Zero unused part of buffer
+         .nam[NAM$H_RSS] - .nam[NAM$H_RSL],
+         CH$PLUS(UAPOINTER(.nam[NAM$A_RSA]), .nam[NAM$H_RSL]));
+
+! Correct name block pointers and sizes as needed.
+
+$STR_DESC_INIT (DESC = desc, CLASS = BOUNDED,
+                STRING = (.nam[NAM$H_RSS] - .nam[NAM$B_NODE],
+                          UAPOINTER(.nam[NAM$A_DEV])));
+
+uptr = .nam[NAM$A_DEV];                 ! Start at the device name
+
+nam[NAM$B_DEV] =                        ! Clear length of non node filespec
+    nam[NAM$B_DIR] =                    ! components,
+    nam[NAM$B_NAME] =                   ! They will be
+    nam[NAM$B_TYPE] =                   ! set up in the code
+    nam[NAM$B_VER] = 0;                 ! that follows
+
+IF SSCAN (REMAINDER = desc, SUBSTRING = desc,
+          STOP=%STRING(%CHAR(0),':;./ 	'), 
+          DELIMITER = d) EQL STR$_NORMAL
+   AND (.d EQL %C':')
+THEN BEGIN                                              ! device name found
+     desc[STR$H_LENGTH] = .desc[STR$H_LENGTH]+1;        ! Include the colon
+     nam[NAM$B_DEV] = .desc[STR$H_LENGTH];              ! Set the length of dev
+     END;
+
+uptr = CH$PLUS(.uptr, .nam[NAM$B_DEV]); ! Update user pointer
+
+DO  BEGIN                               ! loop thru filespec
+    IF SSCAN (REMAINDER = desc, SUBSTRING = desc,  ! Isolate File Name 
+              DELIMITER = d, STOP=%STRING(%CHAR(0),',+!.([<; 	')) 
+       NEQ STR$_NORMAL
+    THEN EXITLOOP;                      ! Finished if at end of string
+
+    IF .desc[STR$H_LENGTH] NEQ 0                ! If any name here
+    THEN BEGIN
+         nam[NAM$B_NAME] = .desc[STR$H_LENGTH];         ! Set its length
+         nam[NAM$A_NAME] = .uptr;                       ! Say where name is
+         uptr = CH$PLUS (.uptr, .nam[NAM$B_NAME]);      ! Update user pointer
+         END;
+
+    SELECT .d OF
+    SET
+    [%C'.']: BEGIN
+
+             ! Descriptor still points to the filename, Bump the length by one
+             ! so it points to the filename plus dot.  Then we can scan through
+             ! the string for another dot for version, or other delimiter
+
+             desc[STR$H_LENGTH] = .desc[STR$H_LENGTH] + 1; ! Skip the initial
+             SSCAN (REMAINDER = desc, SUBSTRING = desc,
+                    STOP=%STRING(%CHAR(0),'.;,+!<(['), DELIMITER = d);
+
+             ! Having found the end of the file type, we must back up
+             ! the beginning to include the dot again
+
+             desc[STR$A_POINTER] = CH$PLUS(.desc[STR$A_POINTER], -1);
+             desc[STR$H_PFXLEN] = .desc[STR$H_PFXLEN] - 1;
+             desc[STR$H_LENGTH] = .desc[STR$H_LENGTH] + 1;
+
+             nam[NAM$B_TYPE] = .desc[STR$H_LENGTH];
+             nam[NAM$A_TYPE] = .uptr;
+
+             uptr = CH$PLUS (.uptr, .nam[NAM$B_TYPE]);
+
+             SELECT .d OF
+             SET
+             [%C'.',%C';']:             ! Version/Generation number
+                 BEGIN
+                 SSCAN (REMAINDER = desc, SUBSTRING = desc, DELIMITER = d,
+                            SPAN = ';.0123456789-*%?'); ! Generation number
+
+                 ! Don't be fooled by 20-ish file attributes IF we get one of
+                 ! those, find a delimiter & get out
+
+                 IF (.desc[STR$H_LENGTH] EQL 1) AND (.d GEQ %C'A')
+                 THEN SSCAN (REMAINDER = desc, SUBSTRING = desc,
+                                 DELIMITER = .d, STOP=',+!  ')
+                 ELSE nam[NAM$B_VER] = .desc[STR$H_LENGTH];
+
+                 nam[NAM$A_VER] = .uptr;
+                 uptr = CH$PLUS (.uptr, .nam[NAM$B_VER]);
+                 END;
+
+             TES;
+                  END;
+         [%C';']:                               ! Version/Generation number
+              BEGIN
+              SSCAN (REMAINDER = desc, SUBSTRING = desc, DELIMITER = d,
+                         SPAN=';0123456789-%?*');    ! Generation number
+
+              ! Don't be fooled by 20-ish file attributes
+              ! IF we get one of those, find a delimiter & get out
+
+              IF (.desc[STR$H_LENGTH] EQL 1) AND (.d GEQ %C'A')
+              THEN SSCAN (REMAINDER = desc, SUBSTRING = desc,
+                              DELIMITER = D, STOP=',+!         ' );
+              nam[NAM$B_VER] = .desc[STR$H_LENGTH];
+              nam[NAM$A_VER] = .uptr;
+              uptr = CH$PLUS (.uptr, .nam[NAM$B_VER]);
+              END;
+        [%C'[', %C'<', %C'(']:          ! Directory
+              BEGIN
+              SSCAN (REMAINDER = desc, SUBSTRING = desc, STOP=']>)',
+                     DELIMITER = d);
+              SELECT .d OF
+              SET
+              [%C']',%C'>',%C')']: desc[STR$H_LENGTH] = .desc[STR$H_LENGTH]+1;
+              TES;
+              nam[NAM$B_DIR] = .desc[STR$H_LENGTH];
+              nam[NAM$A_DIR] = .uptr;
+              uptr = CH$PLUS (.uptr, .nam[NAM$B_DIR]);
+              END;
+        [0, %C' ', %C'	']: EXITLOOP;
+        TES;
+
+    END WHILE 1;                            ! Loop until filespec is eaten
+
+! End of name block readjustment code
+
+        SELECT .Fab[Fab$h_Sts] OF
+        SET
+        [Rms$_Fnf]:                         ! If file-not-found
+            Fst[Fst$v_Access_Active]=0;     ! then access not active
+        [Rms$k_Suc_Min TO Rms$k_Suc_Max]:
+            BEGIN
+            Fst[Fst$v_Access_Active]
+            =Fst[Fst$v_File_Open]=1;        ! else file is open
+            Fst[Fst$v_Error]=0;             ! No error 
+            END;
+        [OTHERWISE]:
+            BEGIN
+            Fst[Fst$v_File_Open]=0;         ! else file is not open
+            Fst[Fst$v_Error]=1;             ! and we got an error 
+            END;
+        TES;
+
+        RETURN .Fab[Fab$h_Sts]         ! return with it
+        END
+
+    END;			!End of DAP$SEARCH
+GLOBAL ROUTINE Dap$Merge (
+                            P_Fab: REF $Fab_Decl,
+                            Flags: BITVECTOR,
+                            P_Err
+                            ) = 
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Merge the related file spec with the filespec
+!       to get the resultant file spec
+!
+! FORMAL PARAMETERS:
+!
+!	P_FAB: Address of FAB, which may have NAM block attached
+!       FLAGS: Merge flags (defined in RMSSYS)
+!       P_ERR: Address of error routine or 0
+!
+! COMPLETION CODES:
+!
+!	Standard RMS codes
+!
+!--
+BEGIN
+BIND Fab=.P_Fab: $Fab_Decl;
+BIND Nam=UAddr(.Fab[Fab$a_Nam]): $nam_decl;
+BIND RNam=UAddr(.Nam[Nam$a_Rlf]): $Nam_decl;
+
+LOCAL desc: $Str_Descriptor(Class=Bounded);     ! Filespec descriptor
+LOCAL Fdesc: $Str_Descriptor(Class=Bounded);    ! Filespec descriptor   !a600
+LOCAL Odesc: $str_Descriptor( Class=Bounded );
+LOCAL uptr;                             ! Ptr to current user field
+LOCAL tptr;
+LOCAL d;                                ! Delimiter for $STR_SCAN
+LOCAL next;                             ! Offset to next filespec
+
+IF Rnam EQL 0                           ! If nothing to merge
+THEN Flags[Merge$v_Rlf]=0;              ! do not merge anything
+
+IF .Flags[Merge$v_Expanded]             ! Which spec are we writing?
+THEN                                    ! Expanded
+    BEGIN
+    uptr = .nam[NAM$A_ESA];
+    $STR_DESC_INIT (DESC = odesc, CLASS = BOUNDED,
+                    STRING = (.nam[NAM$H_ESS], UAPOINTER(.nam[NAM$A_ESA])))
+    END
+ELSE                                    ! Resultant
+    BEGIN
+    uptr = .nam[NAM$A_RSA];
+    $STR_DESC_INIT (DESC = odesc, CLASS = BOUNDED,
+                    STRING = (.nam[NAM$H_RSS], UAPOINTER(.nam[NAM$A_RSA])));
+    END;
+
+fab[FAB$H_STS] = usrsts = RMS$_SUC;     ! Successful so far
+
+Nam[Nam$b_Node] =                       ! Clear lengths of
+Nam[Nam$b_Dev]  =                       ! filespec
+Nam[Nam$b_Dir]  =                       ! components,
+Nam[Nam$b_Name] =                       ! They will be
+Nam[Nam$b_Type] =                       ! set up in the code
+Nam[Nam$b_Ver]  = 0;                    ! that follows
+
+IF .fab[Fab$v_Ofp]
+THEN next=0                             ! No multiple output filespecs
+ELSE next=.Nam[Nam$h_Wcc_Next];         ! Input multpile filespecs OK
+
+tptr=CH$PLUS(UAPointer(.Fab[Fab$a_Fna]), .next);
+Nam[Nam$a_Node] = .Uptr;
+
+$Str_Desc_Init(Desc=Desc, Class=Bounded,        ! Point to original filespec
+               String=Asciz_Str(.tptr)  );
+
+$Str_Desc_Init(Desc=FDesc, Class=Bounded,       ! Point to original filespec
+               String=(.Desc[Str$h_MaxLen], .tptr));                    !a600
+
+
+IF $STR_SCAN (Remainder=Desc, Substring=Desc, Find='::') ! Isolate node name
+THEN
+    BEGIN     ! Got node name, check for access info in it
+    LOCAL d;
+    LOCAL
+         Nodeid: $Str_Descriptor(CLASS=DYNAMIC, STRING=(0,0)),
+         UserId: $Str_Descriptor(CLASS=DYNAMIC, STRING=(0,0)),
+         Password: $Str_Descriptor(CLASS=DYNAMIC, STRING=(0,0)),
+         Account: $Str_Descriptor(CLASS=DYNAMIC, STRING=(0,0));
+
+    Nam[Nam$v_Node]=1;              ! Filespec has a nodeid
+
+    %IF %SWITCHES(TOPS20)
+    %THEN
+
+    IF (.UserJfn NEQ 0) AND (.UserJfn LSS %O'600000')
+    THEN
+        D$JfnAI( .UserJfn, Nodeid, UserId, Password, Account )
+    ELSE
+    %FI
+        D$FspAI( FDesc, Nodeid, UserId, Password, Account, 0 );
+
+    D$NamAi( Nam, Nodeid, UserId, Password, Account );
+
+    ! Update descr for expanded string to reflect the nodeid we wrote there
+    ODesc[Str$h_Length] = .Nam[Nam$b_Node];
+
+    Uptr = CH$PLUS( .Uptr, .Nam[Nam$b_Node] );   ! Update pointer
+
+    !
+    ! Free the descriptors if they are dynamic
+    ! D$FspAi sets them up as fixed, D$JfnAi makes them dynamic
+    !
+    IF .Nodeid[Str$b_Class] EQL Str$k_Class_D
+    THEN $Xpo_Free_Mem( STRING=Nodeid );
+
+    IF .Userid[Str$b_Class] EQL Str$k_Class_D
+    THEN $Xpo_Free_Mem( STRING=Userid );
+
+    IF .Password[Str$b_Class] EQL Str$k_Class_D
+    THEN $Xpo_Free_Mem( STRING=Password );
+
+    IF .Account[Str$b_Class] EQL Str$k_Class_D
+    THEN $Xpo_Free_Mem( STRING=Account);
+    END;                                                                !m600^
+
+Nam[Nam$a_Dev] = .Uptr;
+
+IF SSCAN (REMAINDER = desc, SUBSTRING = desc,
+          STOP=%STRING(%CHAR(0),':;./ 	'), DELIMITER = d) EQL STR$_NORMAL
+   AND (.d EQL %C':')
+THEN                                      ! device name found
+    BEGIN
+    Desc[Str$h_Length]=.desc[Str$h_Length]+1; ! include :
+
+    IF SSCAN (String=Desc,Stop='?%*') EQL Str$_Normal ! check for wildcards
+    THEN
+        Nam[Nam$v_Wild_Dev]=1;          ! device is wildcarded
+
+    IF .flags[Merge$v_Rlf] AND .nam[Nam$v_Wild_Dev]
+    THEN
+        BEGIN
+        Nam[Nam$b_Dev]=.rnam[Nam$b_Dev];        ! length
+
+        $str_Append( String=(.rnam[Nam$b_Dev], UAPointer(.rnam[Nam$a_Dev])),
+                     Target=Odesc )
+        END
+    ELSE
+        BEGIN
+        Nam[Nam$b_Dev]=.desc[Str$h_Length];
+
+        $str_Append( String=Desc,
+                     Target=Odesc )
+        END
+    END
+ELSE
+    Nam[Nam$b_Dev] = Desc[Str$h_Length] = 0;    ! else let the rest be scanned
+
+Uptr = CH$PLUS( .Uptr, .Nam[Nam$b_Dev] );        ! Update user pointer
+
+DO  BEGIN                               ! loop thru filespec
+    SSCAN (REMAINDER = desc, SUBSTRING = desc,       ! Isolate File Name 
+           DELIMITER = d, STOP = %STRING(%CHAR(0),',+!.([<; 	'));
+
+    If .desc[Str$h_Length] NEQ 0        ! if any name here
+    THEN                                ! File Name found
+        BEGIN
+        IF SSCAN (String=Desc,Stop='?%*') EQL Str$_Normal ! check for wildcards
+        THEN
+            Nam[Nam$v_Wild_Name]=1;          ! device is wildcarded
+
+        IF .flags[Merge$v_Rlf] AND .nam[Nam$v_Wild_Name]
+        THEN
+            BEGIN
+            Nam[Nam$b_Name]=.rnam[Nam$b_Name]; ! Length
+
+            $Str_Append( String=(.RNam[Nam$b_Name],
+                                 UAPointer(.RNam[Nam$a_Name])),
+                         Target=ODesc )
+            END
+        ELSE
+            BEGIN
+            Nam[Nam$b_Name]=.Desc[Str$h_Length];
+            $Str_Append( String=Desc,
+                         Target=Odesc );
+            END;
+
+        Nam[Nam$a_Name] = .Uptr;       ! Say where name is going to start !m546
+        Uptr = CH$PLUS( .Uptr, .Nam[Nam$b_Name] );  ! Update user pointer !m546
+        END;
+
+
+    SELECT .d OF ! What's next
+        SET
+        [%C'.']:
+              BEGIN
+              !+
+              ! Descriptor still points to the filename,
+              ! Bump the length by one so it points to the filename plus .
+              ! Then we can scan through the string for another .
+              ! for version, or other delimiter
+              !-
+
+              Desc[Str$h_Length]=.Desc[Str$h_Length]+1; ! Skip the initial .
+              SSCAN (REMAINDER = desc, SUBSTRING = desc,
+                     STOP=%STRING(%CHAR(0),'.;,+!<(['), DELIMITER = d);
+
+              !+
+              ! Having found the end of the file type, we must back up
+              ! the beginning to include the . again
+              !-
+
+              Desc[Str$a_Pointer]=CH$PLUS(.Desc[Str$a_Pointer], -1);      !m546
+              Desc[Str$h_PfxLen]=.Desc[Str$h_Pfxlen] - 1 ;
+              Desc[Str$h_Length]=.Desc[Str$h_Length] + 1 ;  !add 1 for .  !m546
+
+              IF SSCAN (String=Desc,Stop='?%*') EQL Str$_Normal
+              THEN Nam[Nam$v_Wild_Type]=1; ! Check for wildcards
+
+              IF .Flags[Merge$v_Rlf] AND .Nam[Nam$v_Wild_Type]
+              THEN
+                  BEGIN
+                  Nam[Nam$b_Type]=.Rnam[Nam$b_Type];        ! Length
+
+                  $Str_Append( String=(.RNam[Nam$b_Type],
+                                       UAPointer(.RNam[Nam$a_Type])),
+                               Target=ODesc );
+                  END
+              ELSE
+                  BEGIN
+                  Nam[Nam$b_Type]=.Desc[Str$h_Length];
+
+                  $Str_Append( String=Desc, Target=Odesc );
+                  END;
+
+              Nam[Nam$a_Type] = .Uptr;
+              UPtr = CH$PLUS( .UPtr, .Nam[Nam$b_Type] );
+
+              SELECT .d OF
+                  SET
+                  [%C'.',%C';']:        ! Version/Generation number
+                      BEGIN
+                      SSCAN (REMAINDER = desc, SUBSTRING = desc, DELIMITER = d,
+                             SPAN = ';.0123456789-*%?');        ! Generation
+                                                                         !m575
+                      ! Don't be fooled by 20-ish file attributes
+                      ! IF we get one of those, find a delimiter & get out
+                      IF (.Desc[Str$h_Length] EQL 1) AND (.D GEQ %C'A')
+                      THEN SSCAN (REMAINDER = desc, SUBSTRING = desc,
+                                  DELIMITER = .d, STOP = ',+!  ')
+                      ELSE
+                          BEGIN
+                          IF SSCAN (STRING = desc, STOP = '?%*')
+                          NEQ STR$_END_STRING
+                          THEN Nam[Nam$v_Wild_Ver]=1;   ! Check for wildcards
+                      
+                          IF .Flags[Merge$v_Rlf] AND .Nam[Nam$v_Wild_Ver]
+                          THEN
+                              BEGIN
+                              Nam[Nam$b_Ver]=.Rnam[Nam$b_Ver];
+
+                              $Str_Append(String=(.RNam[Nam$b_Ver],
+                                                  UAPointer(.RNam[Nam$a_Ver])),
+                                          Target=ODesc);
+                              END
+                          ELSE
+                              BEGIN
+                              Nam[Nam$b_Ver]=.Desc[Str$h_Length];
+
+                              $Str_Append( String=Desc, Target=Odesc );
+                              END;
+
+                          Nam[Nam$a_Ver] = .UPtr;
+                          UPtr = CH$PLUS( .UPtr, .Nam[Nam$b_Ver] );
+                          END;
+                      END;
+                  TES;
+              END;
+         [%C';']:        ! Version/Generation number
+              BEGIN
+              SSCAN (REMAINDER = desc, SUBSTRING = desc, DELIMITER = d,
+                     SPAN = ';0123456789-%?*');    ! Generation number !m575
+
+              ! Don't be fooled by 20-ish file attributes
+              ! IF we get one of those, find a delimiter & get out
+              IF (.Desc[Str$h_Length] EQL 1) AND (.D GEQ %C'A')
+              THEN SSCAN (REMAINDER = desc, SUBSTRING = desc,
+                          DELIMITER = d, STOP = ',+!         ' )
+              ELSE
+                  BEGIN
+                  IF SSCAN (STRING = desc, STOP = '?%*') NEQ STR$_END_STRING
+                  THEN Nam[Nam$v_Wild_Ver]=1;        ! Check for wildcards
+
+                  IF .Flags[Merge$v_Rlf] AND .Nam[Nam$v_Wild_Ver]
+                  THEN
+                      BEGIN
+                      Nam[Nam$b_Ver]=.Rnam[Nam$b_Ver];
+
+                      $Str_Append( String=(.RNam[Nam$b_Ver],
+                                           UAPointer(.RNam[Nam$a_Ver])),
+                                   Target=ODesc );
+                      END
+                  ELSE
+                      BEGIN
+                      Nam[Nam$b_Ver]=.Desc[Str$h_Length];
+
+                      $Str_Append( String=Desc,
+                                   Target=Odesc );
+                      END;
+
+                      Nam[Nam$a_Ver] = .UPtr;
+                      UPtr = CH$PLUS( .UPtr, .Nam[Nam$b_Ver] );
+                  END;
+              END;
+        [%C'[', %C'<', %C'(']:          !Directory
+              BEGIN
+              SSCAN (REMAINDER = desc, SUBSTRING = desc, 
+                     STOP = ']>)', DELIMITER = d);
+              SELECT .d OF
+                  SET
+                  [%C']',%C'>',%C')']:  ! Count directory terminator if any
+                      Desc[Str$h_Length]=.Desc[Str$h_Length]+1;
+                  [OTHERWISE]:;
+                  TES;
+
+              IF SSCAN (STRING = desc, STOP='?%*') EQL STR$_NORMAL
+              THEN Nam[Nam$v_Wild_Dir]=1;        ! Check for wildcards
+
+              IF .Flags[Merge$v_Rlf] AND .Nam[Nam$v_Wild_Dir]
+              THEN
+                  BEGIN
+                  Nam[Nam$b_Dir]=.Rnam[Nam$b_Dir];
+
+                  $Str_Append( String=(.RNam[Nam$b_Dir],
+                                       UAPointer(.RNam[Nam$a_Dir])),
+                               Target=ODesc );
+                  END
+              ELSE
+                  BEGIN
+                  Nam[Nam$b_Dir]=.Desc[Str$h_Length];
+
+                  $Str_Append( String=Desc,
+                               Target=Odesc );
+                  END;
+
+
+                  Nam[Nam$a_Dir] = .UPtr;
+                  UPtr = CH$PLUS( .UPtr, .Nam[Nam$b_Dir] );
+              
+              END;
+        TES;
+
+        SELECT .D OF                    ! Check delimiter now
+        SET
+        [%C',', %C'+']: Nam[Nam$v_Multiple]=1;    ! Flag multiple filespecs
+
+        [%C',', %C'+', %C'!', %C' ', 0]:
+              BEGIN
+              IF .Flags[Merge$v_Point]  ! Point to end of spec if requested
+              THEN Nam[Nam$h_Wcc_Next]=
+                  .Nam[Nam$h_Wcc_Next]+.Desc[Str$h_Pfxlen]+.Desc[Str$h_Length];
+              EXITLOOP;
+              END;
+        TES;
+    END WHILE 1;                            ! Loop until filespec is eaten
+
+
+IF (.Nam[Nam$g_Fnb] AND Nam$m_Wildcard_Bits) NEQ 0
+THEN Nam[Nam$v_Wildcard]=1;         ! Wildcard somewhere
+
+    BEGIN
+    LOCAL fsplen;
+
+    fsplen = .Nam[Nam$b_Node]
+           + .Nam[Nam$b_Dev]
+           + .Nam[Nam$b_Dir]
+           + .Nam[Nam$b_Name]
+           + .Nam[Nam$b_Type]
+           + .Nam[Nam$b_Ver];
+    
+    IF .Flags[Merge$v_Expanded]
+    THEN Nam[Nam$h_Esl] = .fsplen
+    ELSE Nam[Nam$h_Rsl] = .fsplen
+
+    END;
+
+.Fab[Fab$h_Sts]                         ! Return status
+END;                                    ! End of DAP$MERGE
+
+GLOBAL ROUTINE $Rename ( P_Sfab, P_Dfab ) =	! Rename a file
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Rename a file
+!       Use RMS if file is local, DAP (via DAP$CONNECT) if remote.
+!
+! FORMAL PARAMETERS:
+!
+!       P_SFAB: A FAB as defined by RMS
+!       P_DFAB: A FAB as defined by RMS
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+
+!--
+
+    BEGIN
+    BIND Sfab=.P_Sfab: $fab_decl;
+    BIND Dfab=.P_Dfab: $fab_decl;
+
+    LOCAL GtJfnBits: BITVECTOR[%BPUNIT];
+   
+    RmsEntry ('$RENAME');
+
+!+
+!   Fetch the user's FAB and error address.
+!-
+    fab = .P_Sfab;				! Get address of FAB
+    erradr = 0;                                 !   and user error address
+    errorblock (fab);				! All errors go to the FAB
+    !
+    !   Make sure this is a FAB.
+    !
+
+    IF .fab [blocktype] NEQ fabcode THEN usererror (er$fab);
+
+    IF .fab [blocklength] LSS v1fabsize THEN usererror (er$bln);
+
+    oaflags = 0;				! Clear the open-abort flags
+
+    !
+    ! End of setup
+    !
+
+    IF .Fab[Fab$v_Ofp]
+    THEN GtJfnBits = GJ_New
+    ELSE GtJfnBits = GJ_Old;
+
+!+
+!   Allocate some core for File Status Table to set up three fields.
+!   If the fst is not already there, and this a open by nam block
+!-
+
+    IF .Fab[Fab$v_Nam] AND (.Fab[Fab$a_Ifi] NEQ 0)      ! If Open by NAM !a547v
+    THEN fst=.Fab[Fab$a_Ifi]                            ! then use this 
+    ELSE                                                                
+        BEGIN
+        IF (fst = gmem (fst$k_bln)) EQL false   ! Room for FST?         
+        THEN
+            returnstatus (er$dme);      ! No - error
+
+        fst [fst$h_bln] = fst$k_bln;		! Set up blocklength    
+        fst [fst$h_bid] = fst$k_bid;		! Set up block id       
+        setflag (oaflags, abrfst);			! Flush FST on aborting
+        END;                                                            !a547^^
+
+    GetJfn( .GtJfnBits );
+
+    IF .userjfn LSS $ErBas              ! If we have a JFN, not an error code
+    AND .userjfn GTR 0                  ! or nothing
+    THEN dvflgs = devchar (.userjfn);   ! Get device flags (20 format)
+
+    !+
+    ! Test remoteness & set for user
+    !-
+    IF (Sfab[Fab$v_Remote]=.Fst[Fst$v_Remote])                            !m571
+    THEN
+        BEGIN
+        !
+        ! Make sure both nodes are the same
+        !
+
+        LOCAL
+            jfn,
+            Id: $Str_Descriptor(String=Asciz_Str(UAPointer(.SFab[Fab$a_Fna])),
+                                Class=Bounded),
+            Od: $Str_Descriptor(String=Asciz_Str(UAPointer(.DFab[Fab$a_Fna])),
+                                Class=Bounded),
+            In: $Str_Descriptor(),
+            On: $Str_Descriptor();
+
+        IF (jfn = .SFab[Fab$h_Jfn]) NEQ 0                                !m600
+        THEN D$jfnAi( .jfn, in, 0, 0, 0 )
+        ELSE D$FspAi( id,  in, 0, 0, 0, 0 );
+
+        IF (jfn = .DFab[Fab$h_Jfn]) NEQ 0                                !m600
+        THEN D$jfnAi( .jfn, on, 0, 0, 0 )
+        ELSE D$FspAi( od,  on, 0, 0, 0, 0 );
+
+        IF $Str_Eql( String1=$Str_Format( in, Up_Case ),
+                     String2=$Str_Format( on, Up_Case ) ) EQL 0
+        THEN UserError( Rms$_Rtn );
+
+        !
+        ! Try to do it now
+        !
+
+        IF .SFab[Fab$v_Nam] AND .Fst[Fst$v_File_Open]  ! By NAM block?
+        THEN
+            BEGIN
+            Dap$EndAccess( .SFab, Dap$k_Accomp_Change_Begin, r$null );
+            Dap$EndAccess( .Dfab, Dap$k_Accomp_Change_End, r$null );
+            END
+        ELSE
+            Dap$openfile( Sfab, Dap$k_Rename, Dfab, r$null )  ! file is remote
+        END
+    ELSE
+        Rl$Rename( Sfab, Dfab, r$null );
+
+    oaflags = 0;                        ! No unwind needed
+    usrret()
+    END;			!End of R$RENAME
+
+
+GLOBAL ROUTINE _SSCAN (Funct,String,Pattern,Target,Delim,Succ,Fail)=
+!++
+! Functional Description:
+!
+!        Do $STR_SCAN actions, except that a STOP= string will
+!        ignore target characters preceded by ^V
+!
+! Formal Parameters: (Same as XST$SCAN)
+!
+!        FUNCT: Function code and option bits (as defined in XPORT.REQ)
+!        STRING: Descriptor from STRING= or REMAINDER=
+!        PATTERN: Descriptor from STOP=, FIND=, or SPAN=
+!        DELIM: Address of where to store delimiter (DELIMITER=)
+!        SUCC: Address of success action routine (SUCCESS=)
+!        FAIL: Address of failure action routine (FAILURE=)
+!
+! Completion Codes: (Same as XST$SCAN)
+!--
+    BEGIN
+    MAP Funct: BLOCK FIELD($Str$Opt_Fields);
+    MAP STRING: REF $Str_Descriptor(Class=Bounded);
+    MAP PATTERN: REF $Str_Descriptor(Class=Bounded);
+    MAP TARGET: REF $Str_Descriptor(Class=Bounded);
+                               
+    LOCAL Tfunct: BLOCK[1] FIELD($Str$Opt_Fields);
+    LOCAL v;
+    LOCAL Tstring: $Str_Descriptor(Class=Bounded);
+
+    IF .Funct[Str$v_Remainder]          
+    THEN $Str_Desc_Init(Desc=Tstring,Class=Bounded,    ! REMAINDER given
+                         String=Str_Remainder(String))
+    ELSE $Str_Desc_Init(Desc=Tstring,Class=Bounded,    ! STRING given
+                        String=(.String[Str$h_Length],.String[Str$a_Pointer]));
+                                 
+    IF (.Target NEQ 0)                  ! Make target pointer point to start
+    AND .Funct[Str$v_Remainder]         ! if REMAINDER
+    THEN
+        BEGIN
+        Target[Str$a_Pointer]=.Tstring[Str$a_Pointer];
+        Target[Str$h_Pfxlen]=.Target[Str$h_Pfxlen]+.Target[Str$h_Length];
+        END;
+
+    Tfunct=.Funct;
+    Tfunct[Str$v_Remainder]=1;          ! Always use remainder with our desc
+
+    WHILE 1                             ! Loop until we find what we want
+    DO  BEGIN                           ! without ^V before it, or end string
+        V=Xst$Scan(.Tfunct,Tstring,.Pattern,Tstring,.Delim,.Succ,.Fail);
+    
+        IF .v EQL Str$_End_String THEN EXITLOOP;
+
+        ! Now check for ^V
+        IF CH$RCHAR(CH$PLUS(.Tstring[Str$a_Pointer],.Tstring[Str$h_Length]))
+           EQL $ChCnv
+        THEN Tstring[Str$h_Length]=.Tstring[Str$h_Length]+1  ! Skip quoted char
+        ELSE EXITLOOP;
+        END;
+
+    IF .Target NEQ 0                    ! If we have a target, compute length
+    THEN Target[Str$h_Length]=.Tstring[Str$h_Length]+
+                     CH$DIFF(.Tstring[Str$a_Pointer],.Target[Str$a_Pointer]);
+                                        ! Substring includes what was
+                                        ! skipped due to ^V
+                                        ! plus what we just found
+
+    .v                                  ! Returned value (value of $STR_SCAN)
+    END;
+
+%(
+GLOBAL ROUTINE DIR$HANDLE (SIGNAL_ARGS,MECH_ARGS,ENABLE_ARGS) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Condition handler for directory operations
+!
+! FORMAL PARAMETERS:
+!
+!	SIGNAL_ARGS: addr of vector of SIGNAL arguments,
+!       MECH_ARGS: not used,
+!       ENABLE_ARGS: args passed when this handler was established
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! COMPLETION CODES:
+!
+!	0: Resignal, 1: Continue
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+    MAP SIGNAL_ARGS: REF VECTOR,
+        MECH_ARGS: REF VECTOR,
+        ENABLE_ARGS: REF VECTOR;
+
+    BIND BLK=..ENABLE_ARGS[1]: $FAB_DECL;          ! RMS block
+    BIND ROUTINE $$ERRRTN=..ENABLE_ARGS[2]: RMS_ERCAL;       ! Error routine
+
+    LOCAL SEVERITY;
+
+    SEVERITY= .(SIGNAL_ARGS[1])<0,3>;
+
+    SELECT .SIGNAL_ARGS[1] OF
+           SET
+           [SS$_UNWIND]:
+                         BEGIN
+                         RETURN STS$K_NORMAL;
+                         END;
+           [RMS$K_SUC_MIN TO RMS$K_SUC_MAX]: SEVERITY=SS$_NORMAL;
+
+           [RMS$K_ERR_MIN TO RMS$K_ERR_MAX]:
+                         SEVERITY=SS$_ERROR;
+           [RMS$K_ERR_MIN TO RMS$K_ERR_MAX, RMS$K_SUC_MIN TO RMS$K_SUC_MAX]:
+                         BEGIN
+                         BLK[FAB$h_Sts] = UsrSts =.SIGNAL_ARGS[1];
+                         BLK[FAB$H_STV]=.SIGNAL_ARGS[2];
+                         END;
+
+           [DAP$K_FACILITY_CODE TO DAP$K_FACILITY_CODE+%O'7777777']:
+                         BEGIN
+                         BLK[FAB$h_Sts] = UsrSts =DAP$ERROR_DAP_RMS(.SIGNAL_ARGS[1]);
+                         BLK[FAB$H_STV]=.(SIGNAL_ARGS[1])<DAPCODE>;
+                         END;
+
+           [XPN$$SELECT_XPN_ERRORS]:
+                         IF NOT .SEVERITY       ! If this is a connect error
+                         THEN                   ! then change to RMS code
+                             BEGIN
+                             BLK[FAB$h_Sts] = UsrSts =Rms$_Dcf;
+                             BLK[FAB$H_STV]=.SIGNAL_ARGS[1]; ! XPN code
+                             END;
+
+           [XPN$_ABORTED, XPN$_DISCONN]:
+                         BEGIN
+                         SEVERITY=STS$K_ERROR;  ! Treat as error
+                         BLK[FAB$h_Sts] = UsrSts =Rms$_Dcb;
+                         END;       ! Network link broken (Abort or Disconnect)
+
+           [XPN$_NO_OPEN, XPN$_REJECTED]:
+                         BLK[FAB$H_STV]=.SIGNAL_ARGS[2];
+                         ! DECnet reason code will be STV for
+                         ! unspecified open error
+
+           [OTHERWISE]:
+                BEGIN
+                BLK[FAB$h_Sts] = UsrSts =RMS$_BUG;        ! Should not occur
+                BLK[FAB$H_STV]=.SIGNAL_ARGS[1]; !
+                SEVERITY=SS$_FATAL;             !
+                END;
+           TES;
+
+
+    CASE .SEVERITY FROM 0 TO 7 OF
+         SET
+         [STS$K_WARNING, STS$K_ERROR]:  
+                BEGIN
+                $$ERROR(PARSE,BLK);
+                RETURN STS$K_NORMAL;
+                END;
+         [STS$K_NORMAL, STS$K_INFO]: RETURN STS$K_NORMAL;
+         [STS$K_FATAL,INRANGE]: ;
+         TES;
+
+    SS$_RESIGNAL
+    END;			!End of DIR$HANDLE
+)%
+END				!End of module
+ELUDOM
+    

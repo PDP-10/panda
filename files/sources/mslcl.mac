@@ -1,0 +1,824 @@
+;This software is furnished under a license and may only be used
+;  or copied in accordance with the terms of such license.
+;
+;Copyright (C) 1979,1980,1981,1982 by Digital Equipment Corporation
+;	       1983,1984,1985,1986    Maynard, Massachusetts, USA
+
+
+	TITLE MSLCL - Deliver mail to local (this host) recipients
+
+	SALL
+
+	SEARCH GLXMAC,MSUNV
+TOPS10 <SEARCH JOBDAT,MACTEN,UUOSYM>
+	PROLOG (MSLCL)
+
+	CPYRYT
+	MSINIT
+
+;Define globals
+
+	GLOBS			; Storage
+	GLOBRS			; Routines
+
+;Routines defined herein
+
+	INTERNAL SNDLCL
+
+;Routines defined elsewhere
+
+;MSDLVR.MAC
+	EXTERNAL BLDHDR, SAVMS0
+
+;MSTXT.MAC
+	EXTERNAL TXTOUT
+
+;MSUTL.MAC
+	EXTERNAL ALCFOB, RELFOB, CRIF, CRLF, MOVST0, MOVSTR
+
+;Global data items defined elsewhere
+
+;MS.MAC
+;**;[3110] Add IPCTIM	MDR	15-Nov-88
+	EXTERNAL PERSON, PIDMX, SUBJEC, EXPRNC, IPCTIM
+
+TOPS20<	EXTERNAL MYSTR>
+
+TOPS10< EXTERNAL MYPPN>
+
+;Local storage
+
+	IMPUR0
+LSTYP:	BLOCK 1			;TO:/CC: List being processed
+MSGNUM: BLOCK 1			;Number of pages in the message
+NOMORE:	BLOCK 1			;Any more destination strings or not
+MSGRCT: BLOCK 1			;Number of records in the message
+IDNUM:	BLOCK 1			;Packet ID
+LSTADR: BLOCK 1			;Last entry in the current address list
+CHLIST: BLOCK 1			;ADR start of CC list sent to MX
+STLIST:	BLOCK 1			;ADR start of TO list sent to MX
+ERRCNT: BLOCK 1			;Number of non-LS$INN errors found
+ABTERR: BLOCK 1			;MX abort error
+TOCNT:	BLOCK 1			;Number of TO: recipients in current msg
+CCCNT:	BLOCK 1			;Number of CC: recipients in current msg
+NETCNT:	BLOCK 1			;Count of network recipients
+NETFLG: BLOCK 1			;Only network recipients found or not
+IPCPGS:	BLOCK 1			;Address of IPCF messages
+NXLST:	BLOCK 1			;Last recipient from previous msg page
+				;first destination string
+
+Z.CPYB:!			;BEGINING OF BLOCK TO ZERO
+CPYFOB:	BLOCK	FOB.MZ		;FOB
+CPYFD:	BLOCK	FDXSIZ		;FD BLOCK
+CPYIFN:	BLOCK	1		;IFN
+Z.CPYE:!			;END OF BLOCK TO ZERO
+
+TOPS20<
+;**;[3096] Change 1 line at MAINAM:	Ned	12-Aug-87
+MAINAM:	BLOCK 2  		;Mail file name sent to MX
+
+INFMSG: 5,,.IPCIW		;INFO function to get MX's PID
+	0			;Don't send this to any other PID
+	ASCIZ/MXMAIL/		;Name for MX
+LMSG==.-INFMSG			;Length of message to INFO
+;**;[3096] Insert 1 line at LMSG: + 1	Ned	12-Aug-87
+>;[3096] End TOPS20
+
+	PURE
+
+
+MG$NSU==25			;No such user
+MG$IPS==35			;Insufficient privileges
+MG$GPE==36			;General Error from MX
+SL$NSU==37			;No such user
+SL$NNK==40			;Node is not known
+LS$DMF==41			;Duplicate message file
+LS$NMF==42			;No message file
+LS$ICP==43			;Invalid continuation packet
+LS$ISP==44			;Invalid sender PID
+LS$ISU==45			;Invalid sender UID
+LS$INN==46			;Invalid node name
+LS$IDS==47			;Invalid destination string
+
+MINCOD==MG$NSU			;Minimum error code value
+MAXCOD==LS$IDS			;Maximum error code value
+PRTUSR==1B34			;Print the user name in the error msg
+NOPRT==1B35			;Don't print an error message
+ERRTAB:	2,,[ASCIZ/No such recipient /]
+REPEAT 7,<
+	0,,[ASCIZ/Invalid error code returned by MX/]
+>
+	0,,[ASCIZ/Insufficient privileges for sending mail to SYSTEM/]
+	0,,[ASCIZ/General error returned from MX/]
+	2,,[ASCIZ/No such recipient  /]
+	2,,[ASCIZ/Node is not known here. Recipient is /]
+	0,,[ASCIZ/Duplicate message file/]
+	0,,[ASCIZ/No message file/]
+	0,,[ASCIZ/Invalid continuation packet/]
+	0,,[ASCIZ/Invalid sender PID/]
+	0,,[ASCIZ/Invalid sender UID/]
+	1,,[ASCIZ/Invalid node name/]
+	2,,[ASCIZ/Invalid destination string. Recipient is /]
+	0,,[ASCIZ/Invalid error code returned by MX/]
+	PURE
+
+ SUBTTL Local mail routines
+
+;Here to attempt to send mail locally.  Lights F%LCL if successful,
+; otherwise network must be invoked.
+; Returns +1: Failure, message already printed
+;	  +2: Success, all mail delivered
+
+SNDLCL:	TRVAR <ERRF>		; Error flag
+
+   TOPS10<
+	CALL CRIF		;Fresh line
+	SETZM ERRF		;No errors yet
+	MOVEI U,TCPAG		;Point to "to" list
+	HRRZ E,TOPTRS		; ..
+	JUMPE E,[WARN (No to list)
+		RET]
+	>;End TOPS10
+	SKIPE PIDMX		;Do we have MX's PID?
+	JRST OPECPY		;Yes, so don't get it again
+	CALL GETPID		; Get PID for local mailer
+	 RET			; Failure
+	MOVEM A,PIDMX		;Save MX's PID
+OPECPY:	CALL OPNCPY		; Open MAIL.CPY file
+	 RET			; Failure
+	SETZM LSTYP		;Assume the TO: list
+	SETZM NOMORE		;Zero means more destination strings
+	SETZM NXLST		;No address of a destination string yet
+	SETZM ABTERR		;No fatal error from MX yet
+	SETZM ERRCNT		;No non-LS$INN errors detected yet
+	SETZM NETFLG		;Assume not all recipients are network
+	SETOM MSGNUM		;Negative means first page of the message
+	SETZM IDNUM		;ID number is zero for first page of msg
+	SETZM LSTADR		;Set the pointer to the last address to 0
+	TXZ F,F%LCL		;Assume no local mail
+	CALL SUBREC		;Build the SUBJECT record
+	CALL WRTDST		;Write the destination records
+	 RETSKP			;No mail found
+CHKMOR:	SKIPN NOMORE		;Any more recipients?
+	 JRST SNDMSG		; Yes, move on
+	CALL SNDREC		;No, so finish off the message
+	 RET			;An error occurred
+SNDMSG:	CALL FINMSG		;Finish up this message packet
+	CALL RDYN		;Send the message
+	 RET			;Error
+	SKIPE NOMORE		;Any more destination strings?
+	 JRST NETCHK		;No, check if all recipients were network
+	CALL WRTCPY		;Build the next part of the message
+	 RET			;Cannot happen
+	JRST CHKMOR		; Any more destination strings?
+
+NETCHK: SKIPN NETFLG		;Only network recipients found?
+	RETSKP			;No, so are finished
+
+;MX returned error code LS$INN for all recipients. Delete the mail file
+;and send the old way
+
+	MOVEI A,FOB.MZ		;Size of the file object block
+	MOVEI B,CPYFOB		;Address of the file object block
+	CALL F%DEL		;Delete and expunge
+	RETSKP
+ SUBTTL Local mail routines - twiddle MAIL.CPY file
+
+OPNCPY:	MOVE	S1,[Z.CPYB,,Z.CPYB+1]	;SET UP BLT
+	SETZM	Z.CPYB			;CLEAR FIRST WORD
+	BLT	S1,Z.CPYE-1		;ZERO COPY DATA STORAGE
+	MOVEI	S1,CPYFD		;POINT TO FD
+	MOVEM	S1,CPYFOB+FOB.FD	;SAVE
+	MOVX	S1,FB.NFO!^D7		;NEW FILE ONLY + BYTE SIZE
+	MOVEM	S1,CPYFOB+FOB.CW	;SAVE IN CONTROL WORD
+TOPS10	<
+	MOVSI	S1,'DSK'		;DEVICE
+	MOVEM	S1,CPYFD+.FDSTR
+	MOVSI	S1,'CPY'		;EXTENSION
+	MOVEM	S1,CPYFD+.FDEXT
+	MOVE	S1,MYPPN		;PPN
+	MOVEM	S1,CPYFD+.FDPPN
+>
+	MOVEI	S1,FDXSIZ		;GET SIZE OF FD
+	HRLZM	S1,CPYFD		;AND SAVE IT AWAY
+	$CALL	I%NOW			;GET CURRENT UDT
+	AND	S1,[000007,,070707]	;MAKE IT NUMERIC
+	TDO	S1,[SIXBIT/MS0000/]	;TURN ON SOME BITS
+TOPS10	<MOVEM	S1,CPYFD+.FDNAM>	;SAVE NAME ON -10
+TOPS20	<$TEXT	(<-1,,CPYFD+.FDFIL>,<^T/MYSTR/[^T/MYDIRS/]^W/S1/.MAI.1;P770000^0>)>
+	MOVEI	S1,FOB.MZ		;FOB SIZE
+	MOVEI	S2,CPYFOB		;FOB ADDRESS
+	$CALL	F%OOPN			;OPEN FILE FOR OUTPUT
+	MOVEM	S1,CPYIFN		;SAVE POSSIBLE IFN
+	JUMPT	.POPJ1			;RETURN IF NO ERRORS
+	CAIN	S1,ERFAE$		;FILE ALREADY EXIST?
+	JRST	OPNCPY			;YES--TRY AGAIN
+;An error occurred with the mail file
+TOPS20<	JRETER (MAIL.CPY failure.) >
+TOPS10<	CALL CRIF		; Insure we're at left margin
+	$TEXT (KBFTOR,<?Can't send message because: ^E/[-1]/>)
+>
+	RET			;  and give bad return
+
+
+;Routine to write MAIL.CPY
+
+WRTCPY:	CALL M%GPAG		;Get a page for the message
+	MOVEM A,IPCPGS		;Save the address for the send
+	MOVEI T,.HDRSZ(A)	;Pointer to the first record
+	SETZM MSGRCT		;Number of records is zero at this point
+	MOVEI D,.HDRSZ		;Number of words in the header
+WRTDST:	SETZM TOCNT		;No TO recipients yet
+	SETZM CCCNT		;No CC recipients yet
+	CALL DSTREC		;Create the Destination record(s)
+	JRST WRTCP4		;No local mail found
+	RETSKP			;This is second page of message, so return
+
+
+BUIFIL:	MOVE A,CPYIFN		;Get the mail file's IFN
+	TXO F,F%F2		;Tell SAVMS0 to not write the message bits
+	CALL SAVMS0		;Write the mail file
+	  SKIPA			;Get rid of the IPCF pages and give bad return
+	RETSKP			;Return true
+WRTCP4:	MOVE A,IPCPGS		;Address of message page to MX
+	CALL M%RPAG		;Release the page
+	RET			;Return false
+
+
+;Build the subject record
+
+SUBREC:	CALL M%GPAG		;Get a page for the message
+	MOVEM A,IPCPGS		;Save for later
+	MOVEI T,.HDRSZ(A)	;Address of this record
+	MOVEI D,1		;This is the first record
+	MOVEM D,MSGRCT		;Remember the record number
+	MOVEM D,.RECNM(T)	;Place in the subject record
+	MOVEI D,.SJSTR		;Subject record
+	MOVEM D,.RECTYP(T)	;Place in the record
+	MOVE A,SUBJEC		;Address of the subject string
+	MOVE E,[POINT 7,0(A)]	;Pick up pointer to the subject record
+	MOVE U,[POINT 7,.RECTX(T)] ;Pointer to the subject record
+	CALL TRANSF		;Copy the subject line to the record
+	ADDI D,.HDRSZ		;Number of words in the message so far
+	RET
+
+;Build the sender record
+
+SNDREC:	AOS D,MSGRCT		;Increment the number of records
+	MOVEM D,.RECNM(T)	;Store it
+	MOVEI D,.FLSPC		;Get the record type
+	MOVEM D,.RECTYP(T)	;Store it
+
+TOPS10<	MOVE S1,CPYIFN		;Ask for the filespec
+	SETO S2,		;For the MAIL.CPY
+	$CALL F%FD		;File....
+	$TEXT (<-1,,.RECTX(T)>,<^A^F/@S1/>) ;And prettily place if for MX
+	HRRZI E,.RECTX(T)	;Set up to count the number of words
+RECCNT:	SKIPE (E)		; the filespec takes
+	AOBJP E,RECCNT		;Loop to find it
+	HLR D,E			;And place the results
+	CALL TRNCOM		;Call common code and proceed
+>
+TOPS20<	MOVE E,[POINT 7,CPYFD+.FDFIL]	;File spec pointer
+	MOVE U,[POINT 7,.RECTX(T)] ;Point to ASCIZ text in record
+	CALL TRANSF		;Transfer file spec to file spec record
+>
+	CALL BUIFIL		;Build the file spec record
+	RET			;And error occurred
+	RETSKP			;
+
+TRANSF:	SETZ D,			;Number of bytes in file spec
+NXTCHR: ILDB V,E		;Get the next byte
+	IDPB V,U		;Store it in the record
+	AOS D			;The number of bytes read
+	JUMPN V,NXTCHR		;Loop if we are not fiished
+	IDIVI D,BY2WRD		;Find the number of words
+	SKIPE E			;A final partial word
+TRNCOM:	AOS D			;Yes, consider as a full word
+	ADDI D,.RECHS		;D contains the record size
+	MOVEM D,.RECLN(T)	;Store it in the record
+	ADD T,D			;Point T to the next record
+	RET
+
+DSTREC:	SETZ L,			;No recipients for this page yet
+	MOVE U,NXLST		;Pick up the last recipient found
+	JUMPN U, [ MOVE E,LSTADR  ;Point to the end of the current list
+		   MOVEM U,STLIST ;Save for MX return IPCF message
+		   SKIPE LSTYP	  ;Is the CC: list the current list
+		   MOVEM U,CHLIST ;Yes, so use CHLIST instead of STLIST
+	           JRST FNDFRT ]  ;There was one, process its record
+	HRRZ E,TOPTRS		;Point to the end of the TO: list
+	JUMPE E,CCLIST		;Nothing in it, check out the CC: list
+	MOVEI U,TCPAG		;Point to the TO: list
+	MOVEM U,STLIST		;Save for MX return IPCF message
+	SOS U			;Point to 1 prior to the TO: list
+	JRST FNDFRT		;
+CCLIST:	HLRZ E,TOPTRS		;Point to the end of the CC: list
+	SKIPN E			;Empty?
+	JRST DSTRT1		;Yes, so return
+	SETOM LSTYP		;Processing the CC: list
+	MOVEI U,TCPAG+NTCENT	;Point to the CC: list
+	MOVEM U,CHLIST		;Save for MX return IPCF message
+	SOS U			;Point 1 prior to the CC: list
+FNDFRT:	CAILE D,BUFEND		;Room for another record in the message?
+	JRST [ MOVEM U,NXLST	  ;Save current pointer for next page
+	       MOVEM E,LSTADR     ;Save last entry in  current adr list
+	       SKIPN LSTYP	  ;TO: list being processed?
+	       ADDM L,TOCNT	  ;Yes, increment its count
+	       SKIPE LSTYP	  ;CC: list being processed?
+	       ADDM L,CCCNT	  ;Yes, increment its count
+	       JRST DSTRT2]	  ;Finish the message and send it
+	CALL SRHREC		;Get the next recipient
+	SKIPE NOMORE		;No more recipients, finished?
+	JRST DSTRT2		;Yes, so return
+	AOS A,MSGRCT		;Increment the number of records we have
+	MOVEM A,.RECNM(T)	;Place in the current record
+	MOVEI A,.DESTN		;Get the record type
+	MOVEM A,.RECTY(T)	;Store it in the record
+	SETZM A			;A contains the number of bytes in string
+	MOVE C,[POINT 7,0(V)]	;Pointer to destination string
+	MOVE W,[POINT 7,.RECTX(T)] ;Pointer to ASCIZ text in record
+NXTBYT:	ILDB B,C		;Get the next byte
+	IDPB B,W		;Place it in the record
+	AOS A			;Increment the number of bytes found
+	SKIPE B			;If finished, calculate record length
+	JRST NXTBYT		;Not finished, so get the next byte
+	IDIVI A,BY2WRD		;Find the number of words in the string
+	SKIPE B			;A partially filled word?
+	AOS A			;Yes, include it in the count
+	ADDI A,.RECHS		;A contains the record length
+	MOVEM A,.RECLN(T)	;Store it in the record
+	ADD T,A			;Position T to the next record
+	ADD D,A			;D contains number of words in message
+	JRST FNDFRT		;Check for another string
+DSTRT1:	RET
+DSTRT2:	RETSKP
+
+SRHREC:	CAIE U,(E)		;End of the current list?
+	JRST NOTEND		;No, get the next recipient
+	SKIPE LSTYP		;Is the current list the TO: list?
+	JRST [SETOM NOMORE	  ;No, it is the CC: list so no more
+	      ADDM L,CCCNT	  ;Number of CC: recipients found
+	      JRST SRHRET]	  ;
+	HLRZ E,TOPTRS		;Point to the end of the CC: list
+	ADDM L,TOCNT		;The number of TO: recipients
+	SETZ L,			;Reset for the CC: recipients
+	SKIPN E			;Is there a CC: list?
+	JRST [ SETOM NOMORE	  ;No, so are finished
+	       JRST SRHRET ]	  ;
+	SETOM LSTYP		;Now processing the CC: list
+	MOVEM E,LSTADR		;Save the end of the CC: list
+	MOVEI U,TCPAG+NTCENT	;Point to the start of the CC: list
+	MOVEM U,CHLIST		;Need for MX return message analysis
+	SOS U			;Prepare to search for first recipient
+NOTEND:	AOS U			;Point U to the next string
+	AOS L			;Increment count of users seen
+	MOVE A,(U)		;Get the entry
+	TXNE A,AD%PFX!AD%SFX!AD%PRN ;Address, or funny entry
+	JRST LASREC		;Funny, so ignore
+	MOVE V,A		;Save for building destination record
+	CALL GETUNM		;Check for net mail
+	CAMN B,[-1]		;Is it?
+	SKIPA			;Yes, so don't set local flag
+	TXO F,F%LCL	        ;No, local mail found
+	JRST SRHRET		;Go create the destination record
+LASREC:	CAIE U,(E)		;Any more?
+	JRST NOTEND		;Yes, get the next
+	SKIPE LSTYP		;Is there another list?
+	JRST [ SETOM NOMORE	  ;No more destination strings
+	       ADDM L,CCCNT	  ;Add to CC: list count
+	       JRST SRHRET ]	  ;
+	ADDM L,TOCNT		;Increment the TO: list user count
+	SETZ L,			;No CC: users yet
+	HLRZ E,TOPTRS		;Point to the CC: list
+	SKIPN E			;Does it have any entries?
+	JRST [ SETOM NOMORE	  ;No more destination strings
+	       JRST SRHRET ]		  ;
+	SETOM LSTYP		;Now looking at the CC: list
+	MOVEM E,LSTADR		;Save for later
+	MOVEI U,TCPAG+NTCENT	;Point U  to the CC: list
+	MOVEM U,CHLIST		;Start of the CC: list
+	SOS U			;Adjust pointer for later increment
+	JRST NOTEND		;Get the next destination string
+SRHRET:	RET
+
+FINMSG:	MOVE T,IPCPGS		;Point to start of the message
+	MOVEI A,.POST		;New message packet
+	AOSE MSGNUM		;Is it really
+	MOVEI A,.CONT	        ;No, so indicate so
+	MOVEM A,.PKTYP(T)	;Store it in the record
+	MOVE B,IDNUM		;Pick up the ID
+        MOVEM B,.PKID(T)	;Store it in the record
+
+	MOVE A,MSGNUM		;Get number of pages less 1
+	AOS A			;Page number for this message
+	MOVEM A,.PKSEQ(T)	;Place in the message
+	MOVEI A,.DONE		;Assume this is the last message page
+	SKIPN NOMORE		;Is it really?
+	MOVEI A,.MORE		;No, more will follow
+	MOVEM A,.PKSTS(T)	;Store in the record
+	MOVE A,MSGRCT		;Get the record count
+	MOVEM A,.PKRCT(T)	;Store it
+	RET
+
+ SUBTTL RDYN - Send IPCF to MAILER (TOPS20 local mail)
+
+;GETPID - Get PID for local mailer
+;No arguments
+;Return	+1: failure, no mailer available
+;	+2: success, A/ PID of MAILER
+
+TOPS10<
+GETPID:	SETZ U,			;Retry flag
+GETPD1:
+>
+TOPS20<
+GETPID:	MOVNI T,5		;Allow 5 tries before informing user
+GETPDA:	SETZ U,			;Retry flag for sending to SYSTEM:INFO
+GETPD1:	MOVX A,SP.INF		;Will be talking with INFO
+	TXO A,SI.FLG		;Special index flag
+	MOVEM A,SAB##+SAB.SI	;Place in the Send Address Block
+	SETZM SAB##+SAB.PD	;Clear the PID word
+	MOVEI A,LMSG		;Length of the message to INFO
+	MOVEM A,SAB##+SAB.LN	;Place in the SAB
+	MOVEI A,INFMSG		;Address of the message
+	MOVEM A,SAB##+SAB.MS	;Place in the SAB
+	MOVEI A,SAB.SZ		;Size of the SAB
+	MOVEI B,SAB##		;Address of the SAB
+	CALL C%SEND		;Tell INFO we want MX's PID
+>
+TOPS10<	MOVEI S1,SP.MAI		;SYSTEM PID index for MAILER
+	CALL C%RPRM		;Find system PID for him
+>
+	JUMPT GETPD2		;Request delivered o.k.
+	SKIPN U			;Tell if first failure
+	WARN <Waiting for MX mailer's PID ...>
+	AOS U			;Increment the failure count
+	CALL DETBCH		;Determine if in batch job
+	JUMPE A,GTPDER		;If zero, not BATCH so go to MS SEND
+   TOPS20<
+	MOVEI A,^D10000		;Wait 10 seconds
+	DISMS
+   >
+   TOPS10<
+	MOVEI A,^D10		;Wait 10 seconds
+	SLEEP A,
+   >
+	CAIGE U,^D30		;Try for upto 5 minutes
+	JRST GETPD1		;Loop back
+GTPDER:	CMERR <Could not obtain MX's PID>
+	JRST WRNUSR		;Issue standard helpfull warning
+
+GETPD2:
+TOPS20<
+GETPD4:	CALL C%RECV		;Get the response from INFO
+	JUMPT CHKPID		;See who message is from
+	CAIE A,ERNMA$		;Was the failure due to no message available?
+	JRST PIDERR		;No, so don't try again
+	AOSN T			;Time to print a message?
+	WARN <Waiting for MX mailer's PID from SYSTEM:INFO ...>
+	CAIL T,MAXTRY		;Time to give up?
+	JRST PIDERR		;Yes
+	MOVEI A,^D1000		;Wait 1 second
+	DISMS
+	JRST GETPD4		;Try again
+CHKPID:	MOVE B,MDB.FG(A)	;Get the flag word
+	MOVE U,B		;Save a copy for later
+	ANDI B,7B32		;Isolate who from
+	CAIE B,1B32		;From the monitor?
+	CAIN B,2B32		;From INFO?
+	SKIPA			;Yes to either
+	JRST [ CALL C%REL	  ;No, release the page
+	       JRST GETPD4  ]	  ;Try again
+	TRNE U,7		;Was the packet undeliverable?
+	JRST [ CALL C%REL	  ;Yes, release the page
+	       AOS T		  ;Increment the retry count
+	       CAIL T,MAXTRY	  ;Time to quit?
+	       JRST PIDERR	  ;Yes, give up
+	       JRST GETPDA ]	  ;No,try again
+	ANDI U,77B29		;Isolate the error field
+	JUMPE U,GETPD3		;Get the PID if no error occurred
+	CALL C%REL		;Release the message
+	CAIN U,<.IPCSN>B29	;Did INFO crash and restart?
+	JRST [ AOS T		  ;Increment the retry count
+	       CAIL T,MAXTRY	  ;Time to quit?
+	       JRST PIDERR	  ;Yes, give up
+	       JRST GETPD4 ]	  ;No, try again
+PIDERR:
+
+	CMERR <Could not send to MX>
+	JRST WRNUSR		;Return false
+
+GETPD3:	HRRZ A,MDB.MS(A)	;Address of the message
+	MOVE U,.IPCI1(A)	;Get MX's PID
+	CALL C%REL		;Release the message
+	MOVE A,U		;Place PID in A for the return
+>
+	RETSKP			;Return true
+
+;**;[3088] Replace 7 lines with 20 at WRNUSR:		NED	9-Apr-87
+WRNUSR:	SKIPN EXPRNC		;[3088]Is this guy an expert?
+	 JRST WRNUS1		;[3088]Yes, then give him his options, otherwise,...
+	$TEXT (KBFTOR,<
+
+ [The mailer does not appear to be running.  At this
+  point, you have the option of trying to SEND again,
+  or you may try to send this message later.  If you
+  would like to be able to save a draft of a message
+  into a file, then you should read the DECmail/MS
+  manual concerning the SET EXPERIENCE-LEVEL EXPERT,
+  SAVE DRAFT, and RETRIEVE DRAFT commands.]
+>)
+	JRST WRNUS2		;[3088]Skip this
+WRNUS1:	$TEXT (KBFTOR,<
+
+ [The  mailer  does  not  appear to be running. At this
+  point,  you have the option of trying SEND again,  or
+  you may issue a SAVE DRAFT command and try later.]
+>)
+WRNUS2:	SETZM PIDMX		;[3088]Need to get MX's PID
+	RET			;Back to MS SEND level then
+
+
+;RDYN - send IPCF message to MAILER
+;Call:	CALL RDYN
+;Returns +1: failure
+;	 +2: success
+
+RDYN:	MOVE A,PIDMX		;Get MX's PID
+AGAIN0:	MOVEM A,SAB##+SAB.PD	;Place in the Send Address Block
+	MOVEI A,WRDPAG		;Message length is a page
+	MOVEM A,SAB##+SAB.LN	;Place in the SAB
+	MOVE A,IPCPGS		;Address of the message
+	MOVEM A,SAB##+SAB.MS	;Place in the SAB
+	SETZM SAB##+SAB.SI	;Not sending to a SYSTEM PID
+	SETZM SAB##+SAB.PB	;Don't send PIB's address
+	MOVEI A,SAB.SZ		;Size of the SAB
+	MOVEI B,SAB##		;Address of the SAB
+	CALL C%SEND		;Send the message to MX
+TOPS20<	JUMPT AGAIN		;Pick up MX's reply
+	CAIE A,ERNSP$		;No such PID?
+	JRST RDYN2		;No, some other error
+	CALL GETPID		;Get MX's latest PID
+	RET			;Couldn't get the PID
+	MOVEM A,PIDMX		;Save a copy for future sends
+	JRST AGAIN0		;Send the message again
+>
+;**;[3100] Change 1 line at AGAIN:+0L	MDR	1-DEC-87
+AGAIN:	MOVE T,IPCTIM		;[3100] Is this long enough for MX?
+AGAIN1:	CALL C%RECV		;Wait for the response from MX
+	JUMPF RDYN0		;Returned false ?
+	MOVE U,MDB.FG(A)	;Get the flag word
+	TRNN U,7B32		;From INFO or the monitor?
+	JRST OK			;No, see if from MX
+	CALL C%REL		;Release the page
+	ANDI U,7B32		;Isolate who from
+	CAIE U,2B32		;From INFO?
+	CAIN U,3B32		;Or private INFO?
+        JRST AGAIN1 		;Get another message
+	CMERR <MX is not running. Message not sent.>
+	JRST WRNUSR		;Return false
+
+RDYN0:	SOJLE T,RDYN1		;Decrement the retry count
+	PUSH P,A
+   TOPS20<
+	MOVEI A,^D1000		;Wait a second
+	DISMS
+   >
+   TOPS10<
+	MOVEI A,^D1		;Wait a second
+	SLEEP A,
+   >
+	POP P,A
+	JRST AGAIN1		;Try again
+
+RDYN1:	CMERR <MX did not respond within timeout period.>
+	JRST WRNUSR		;Return false
+
+TOPS20<
+RDYN2:	CMERR <Could not send the message to MX>
+	JRST WRNUSR
+>
+;DETBCH - Here to determine if this job is a batch job.
+
+DETBCH:
+   TOPS20<
+	SETO A,			;Find out Batch status of this job
+	HRROI B,A		;Dump 1 word of data into A
+	MOVEI C,.JIBAT
+	GETJI			;Get it
+	 ERJMP [SETZ A,		;Have a problem, ignore it
+		JRST .+1]
+   >
+   TOPS10<
+	SETZ A,
+	MOVE B,[-1,,.GTLIM]
+	GETTAB B,		;Get jobs time limit word
+	 RET
+	TXNE B,JB.LBT		;Batch flag lit ?
+	 SETO A,
+   >
+	RET
+
+
+;Here when reply from MAILER received, check it out
+
+OK:	MOVE B,MDB.SP(A)	;Get the sender's PID
+	CAME B,PIDMX		;From MX?
+	JRST [ CALL C%REL	  ;No, release the page
+	       JRST AGAIN1 ]	  ;Wait for another message
+;	TRNE T,77B29		; ANY errors?
+;	JRST ERRORZ		; Yes. Go analyze them
+	HRRZ T,MDB.MS(A)	;Get the address of the message
+	MOVE A,.PKSTS(T)	;Get the status of the message
+	MOVN W,.PKRCT(T)	;Number of records sent to MX
+	MOVEI V,.HDRSZ(T)	;Point to the first record
+	MOVE U,STLIST		;Point to current start of TO/CC list
+	SKIPN TOCNT		;Processing the TO: list?
+	MOVE U,CHLIST		;No, the CC: list
+	MOVN D,TOCNT		;Negative number of TO: list users
+	SKIPN TOCNT		;Processing the TO: list
+	MOVN D,CCCNT		;No, the CC: list
+	SETZM NETCNT		;No network recpients found yet
+	CAIN A,.STABD		;Everything O.K.?
+	JRST [ SETOM ABTERR	  ;No, MX has aborted this request
+	       CMERR <Processing errors occurred. No mail sent.>  ;
+	       CALL CRLF	  ;Prepare for error explaination
+	       JRST DELIVR ]	  ;Find which error occurred
+DELIVR:	HRRZ A,.RECTYP(V)	;Get the record type
+	CAIE A,.DESTN		;Destination record?
+	JRST [ SKIPN ABTERR	  ;Fatal error?
+	       JRST PNTNX3	  ;No, get next record
+	       CAIE A,.FLSPC	  ;File spec record?
+	       JRST PNTNX3	  ;No, get next record
+	       HLRZ A,.RECTYP(V)  ;Yes, get the error code
+	       CAIN A,0		  ;Did the error occur here?
+	       JRST PNTNX3	  ;No, get the next record
+	       JRST PNTNXT ]	  ;Yes, go process the error
+CHKENT: MOVE B,0(U)		;Get current TO/CC list entry
+	TXNN B,AD%PFX!AD%SFX!AD%PRN ;Address or funny entry?
+	JRST FINDEL		;No, so check if it was delivered
+	AOS U			;Yes, so point to the next entry
+	AOSL D			;Finished with this list?
+	JRST [ MOVE U,CHLIST	  ;Yes, point to the CC: list
+	       MOVN D,CCCNT	  ;Pick up the number of CC: users
+	       JRST CHKENT ]	  ;Find the first CC: recipient
+	JRST CHKENT		;And go check it out
+FINDEL:	HLRZ A,.RECTYP(V)	;Pick up the flag field
+	SKIPE ABTERR		;Fatal error?
+	JRST [ CAIE A,LS$IDS	  ;Invalid destination string?
+	       JRST PNTNX2	  ;No, so don't want this one
+	       JRST PNTNXT ]	  ;Yes, so print error
+	CAIE A,0		;Was mail delivered to this destination?
+	JRST [ CAIE A,LS$INN	  ;No, was it a invalid node name?
+	       AOS ERRCNT	  ;No,  some local mail wasn't delivered
+	       CAIN A,LS$INN	  ;Invalid node name?
+	       AOS NETCNT	  ;Yes, increment network recipient count
+	       JRST PNTNXT ]	  ;Print the error message, maybe
+	TXO F,F%MX		;Flag the fact that MX queued up some mail
+	TXO B,AD%DEL		;Yes, so lite the delivered by MX bit
+	MOVEM B,0(U)		;Place back in the TO/CC list entry
+	JRST PNTNX1		;Prepare for the next addressee
+PNTNXT:	CAIGE A,MINCOD		;A valid code?
+	MOVEI A,MAXCOD+1	;No, indicate so
+	CAILE A,MAXCOD		;A valid code?
+	MOVEI A,MAXCOD+1	;No, indicate so
+	SUBI A,MINCOD		;Convert code number to index number
+	HLRZ B,ERRTAB(A)	;Should an error message be printed
+	TRNE B,NOPRT		;Print this error message
+	JRST PNTNX1		;No, get the next record
+	HRRO A,ERRTAB(A)	;Point to the error message
+	PUSH P,B		;Save the flags
+	$CALL KBFTOR		;Print the message
+	POP P,B			;Restore the flags
+	TRNE B,PRTUSR		;Print the user string?
+	JRST [ HRRI A,.RECTX(V)   ;Yes, point to it
+	       HRLI A,(POINT 7)	  ;Make it into a pointer
+	       $CALL KBFTOR	  ;Print the user name
+	       CALL CRLF	  ;Follow with a carriage return
+	       JRST PNTNX1 ]	  ;Get the next record
+	CALL CRLF		;Start a new line
+PNTNX1:	SKIPE ABTERR		;Fatal error occurred?
+	JRST ERRMSG		;Yes, return false
+PNTNX2:	AOS U			;Point to the next TO/CC list entry
+	AOSL D			;Any more users in this list?
+	JRST [MOVE U,CHLIST	  ;No, point to the CC: list
+	      MOVN D,CCCNT	  ;Pick up the neg number of CC: users
+	      JRST PNTNX3 ]	  ;Point to the next record
+PNTNX3:	MOVE A,.RECLN(V)	;Pick up the current record's length
+	ADD V,A			;Point to the next record
+	AOJN W,DELIVR		;Check out the next record
+	SKIPE ABTERR		;Fatal error occurred?
+	JRST ERRMSG		;Yes, return false
+	SKIPN NOMORE		;Any more pages to this message
+	JRST [ MOVE A,.PKID(T)  ;Pick up MX's ID for this message
+	       MOVEM A,IDNUM	    ;Save for the next message page
+	       JRST CHKNET ]	    ;Check if all recipients are network
+	SKIPN ERRCNT		;Any local mail not delivered?
+	JRST [TXZN F,F%MX 	    ;Any mail queued by MX ?
+	      JRST CHKNET	    ;No
+	      CITYPE <Mail queued for delivery by MX>
+TOPS20<	      CALL DELTMP	    ;[MDR] Delete .TMP file is any>
+	      CALL CRIF
+	      JRST CHKNET ]	    ; Return true
+	WARN <Not all mail queued for delivery by MX>
+	CALL CRIF
+ERRMSG:	SETOM NOMORE		;Aborting, so no more mail
+	CALL C%REL		;Release the message
+	RET			;Return false
+CHKNET:	MOVE A,NETCNT		;Number of network recipients
+	SUB A,TOCNT		;Subtract out the TO: recipient count
+	SUB A,CCCNT		;Subtract out the CC: recipient count
+	CAIN A,0		;All recipients network?
+	SETOM NETFLG		;Yes, so will delete the mail file
+	CALL C%REL		;Release the message
+	RETSKP
+
+TOPS20<
+	SUBTTL	DELTMP
+
+; This routine deletes the .TMP file that gets created by invoking
+; an editor (probably with ^E). MDR - April 23, 1986 for QAR 27.
+
+DELTMP:	MOVX A,GJ%SHT!GJ%OLD	;File should exist
+	HRROI B,[ASCIZ /MSG.TMP;T/]
+	GTJFN%
+;**;[3092] Change 2 lines at DELTMP:+3L	MDR	18-MAY-87
+	 ERJMP DELTM3		;[3092] No .TMP files, so try a different file spec
+DELTM1:	TXO A,<DF%EXP>		;[3092] We want to expunge the file too
+	DELF%			;Delete and expunge the .TMP file
+;**;[3092] Change 2 lines at DELTMP:+6L	MDR	18-MAY-87
+	 ERJMP DELTM2		;[3092] Ignore errors
+DELTM2:	RET			;[3092] All done.
+
+;**;[3092] Add 5 lines at DELTM3:+0L	MDR	18-MAY-87
+DELTM3:	MOVX A,GJ%SHT!GJ%OLD!GJ%PHY ;[3092]
+	HRROI B,[ASCIZ /POBOX:MSG.TMP;T/] ;[3092]
+	GTJFN%			;[3092] Now try this file spec
+	 ERJMP DELTM2		;[3092] Give up
+	JRST DELTM1		;[3092] Got one
+>
+	END
+
+; Edit 2448 to MSLCL.MAC by JROSSELL on 30-Sep-85
+; Use GLXLIB'S IPCF interface when communicating with MX
+; Edit 2459 to MSLCL.MAC by JROSSELL on 25-Oct-85
+; Do not append the local node name to a local recipient in the destination
+; record sent to MX
+; Edit 2460 to MSLCL.MAC by PRATT on 27-Oct-85
+; Put interactive users in MS SEND level if MX is not running
+; Edit 2462 to MSLCL.MAC by PRATT on 30-Oct-85
+; Change helpful user warning message about MX.
+; Edit 2462 to MSLCL.MAC by PRATT on 4-Nov-85
+; Merge many changes in -10, -20, and common code.
+; *** Edit 2463 to MSLCL.MAC by PRATT on 5-Nov-85
+; Make sure edit 2459 is put back in.
+; *** Edit 2464 to MSLCL.MAC by JROSSELL on 5-Nov-85
+; Create a SUBJECT record to be passed to MX
+; *** Edit 2478 to MSLCL.MAC by JROSSELL on 20-Nov-85
+; On a MAIL.CPY open failure do not release the message page to MX since it
+; does not yet exist.
+; *** Edit 2481 to MSLCL.MAC by PRATT on 20-Nov-85
+; Give user a warm and fuzzy message about mail being queued up by MX
+; *** Edit 2482 to MSLCL.MAC by PRATT on 20-Nov-85
+; Invent F%MX (mail queued up by MX), use it for warm and fuzzy confirmation
+
+
+; *** Edit 2486 to MSLCL.MAC by PRATT on 22-Nov-85
+; Copyright statements
+; *** Edit 2607 to MSLCL.MAC by SANTEE on 10-Dec-85
+; Make MS/MX get along well together. Have MS write dashes at the end of
+; messages. While we're there remove some of the NETMAI code.
+; *** Edit 2610 to MSLCL.MAC by SANTEE on 12-Dec-85
+; Fix bug that would not allow sending to a single decnet address with DMAILR.
+; *** Edit 2612 to MSLCL.MAC by PRATT on 12-Dec-85
+; Generate MS####.MAI files for MX to pick up instead of ######.CPY
+; *** Edit 2637 to MSLCL.MAC by PRATT on 16-Jan-86
+; Add "determine if batch" routine (DETBCH) for the -10.
+; *** Edit 2649 to MSLCL.MAC by SANTEE on 1-Feb-86
+; Fix bug in 2637 so that it will compile on the -10.
+; *** Edit 2667 to MSLCL.MAC by SANTEE on 3-Mar-86
+; TOPS-20 programmers forget that UUOs usually need an AC specified. Make the
+; two SLEEPs in MSLCL rest for longer than a tic.
+; *** Edit 2675 to MSLCL.MAC by APPELLOF on 6-Mar-86
+; Make MS-10 talk to MX with a system PID
+; *** Edit 2683 to MSLCL.MAC by JROSSELL on 18-Mar-86
+; Change the way MX's PID is picked up to avoid infinite loops
+; *** Edit 2696 to MSLCL.MAC by RASPUZZI on 29-Apr-86
+; Delete & expunge the MSG.TMP files when MS no longer needs them.
+; *** Edit 2706 to MSLCL.MAC by RASPUZZI on 27-May-86
+; Teach MS not to use POBOX: when writing files. Instead, find out what STR: is
+; being used (saved in MYSTR) and go from there.
+; *** Edit 3088 to MSLCL.MAC by SANTEE on 9-Apr-87, for SPR #35535
+; New error message for novices if MX is down. (Let's not tell them to do what
+; they can't do.)
+; *** Edit 3092 to MSLCL.MAC by RASPUZZI on 18-May-87
+; Fix up routine DELTMP to make sure that the MSG.TMP file gets deleted if it
+; get placed by MS in some weird place (like POBOX:)
+; *** Edit 3096 to MSLCL.MAC by SANTEE on 28-Sep-87
+; Move all impure data together.
+; *** Edit 3100 to MSLCL.MAC by RASPUZZI on 1-Dec-87
+; Bump timeout for MX reply. Make patchable location so this can be changed at
+; will and on the fly. 
+; Edit= 3110 to MSLCL.MAC on 15-Nov-88 by RASPUZZI
+;Move IPCTIM out of LOWSEG for TOPS-10.

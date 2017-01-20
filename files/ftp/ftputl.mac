@@ -1,0 +1,1009 @@
+;<FTP>FTPUTL.MAC.75, 26-Sep-2005 07:57:11, Edit by MRC
+; Handle case of remote not implementing MODE/STRU (thank you Tom DeBellis)
+;<FTP>FTPUTL.MAC.74, 28-Dec-2001 13:41:30, Edit by MRC
+; Don't try to close pointers as files
+;<FTP>FTPUTL.MAC.73, 17-Mar-85 17:14:19, Edit by LOUGHEED
+; SRA's more general version of edit 72
+;<FTP>FTPUTL.MAC.72, 16-Mar-85 13:58:21, Edit by LOUGHEED
+; From MIT: .SFUST doesn't quote nulls (or "." or "-")
+;<FTP>FTPUTL.MAC.71, 20-Aug-84 21:07:24, Edit by KRONJ
+; Fix CKSSET for separate remote and local types
+;<FTP>FTPUTL.MAC.70, 16-May-84 12:22:15, Edit by KRONJ
+; Accept any binary transfer w/transfer byte size 36
+;<FTP>FTPUTL.MAC.69,  3-May-84 22:58:12, Edit by KRONJ
+; KILFIL calls UNMAP for a better chance of successfully closing
+;<FTP>FTPUTL.MAC.68, 26-Apr-84 14:36:03, Edit by KRONJ
+; Move OPNSTO here from FTP
+;<FTP>FTPUTL.MAC.67, 23-Apr-84 16:50:11, Edit by KRONJ
+;<FTP>FTPUTL.MAC.66, 23-Apr-84 15:48:04, Edit by KRONJ
+; Account for differences in logical and physical byte sizes when counting
+; bytes in file to be sent.
+;<FTP>FTPUTL.MAC.64, 31-Mar-84 17:43:41, Edit by LOUGHEED
+; CHKPLT/SETPLT in Stanford conditionals
+
+	SEARCH FTPDEF,JOBDAT
+	TTITLE (FTPUTL, -- UUOs and other useful routines for FTP and PUPFSV)
+
+	;; Based on the PUPUUO module of UUOs for the PUP FTP programs
+	;; by E. Taft, March 1977, Copyright 1979 by Xerox Corporation.
+	;;
+	;; Copyright (C) 1984 Board of Trustees, Stanford University
+	;; The information in this software is subject to change without
+	;; notice and should not be construed as a commitment by Stanford
+	;; University.  Stanford assumes no responsibility for the use or
+	;; reliability of this software.
+
+	EXTERN TEMP,FILJFN,SETWDT,OVRQTA,EDISC,STYBAD,PRMCNF
+
+	LOC .JB41		; The place for UUOs
+	CALL DOLUUO		; This is our UUO handler instruction
+	RELOC			; Now go back to normal code
+
+; Double skip (+3)!
+R2SKIP::AOS (P)			; Set +3 return
+	RETSKP			; Do it
+
+
+; UUO handler.  This must be reentrant to handle the WRITE
+; within %LETJ for undefined JSYS errors.
+DOLUUO:	PUSH P,A		; Save an AC
+	MOVE A,.JBUUO		; Pick up LUUO
+	LSH A,-^D27		; Position opcode to RH
+	MOVE A,UUODSP-1(A)	; Get location from UUO dispatch table
+	EXCH A,0(P)		; Restore AC, put location on stack
+	RET			; Fix stack and jump to UUO handler
+
+
+; UUO dispatch table (driven by definitions in FTPDEF)
+; UUO handler routines are responsible for saving their own ac's
+
+UUODSP:	EXPAND(UUOS,<	IF2,<IFNDEF ITEM,<EXTERN ITEM>>
+			EXP ITEM>)
+
+; TYPE <string>
+; Type given string with formatting actions
+
+LS TYPBUF,200			; Hold 640 chars, plenty for any typeout
+
+%UTYPE:	CALL FORMAT		; Call formatter
+	 MOVE A,[POINT 7,TYPBUF] ; Set up byte pointer
+	 CALL %UTYP1		; Send off buffered text
+	RET   			; Return from UUO
+
+%UTYP1:	SETZ B,			; Prepare to store null
+	IDPB B,A		; Append null to buffer
+	HRROI A,TYPBUF		; Point to buffered typeout
+	PSOUT%			; Send it all off at once
+	RET
+
+; ETYPE <string>
+; Type given error message with formatting actions
+; Optional second argument is instruction to execute
+
+%UETYP:	PUSH P,.JBUUO		; Save instruction in case reentrant UUO
+	AOS .JBUUO		; Skip over instruction
+	CALL FORMAT		; Call formatter
+	 MOVE A,[POINT 7,TYPBUF] ; Set up byte pointer
+	 CALL %UETY1		; Send off buffered text
+	POP P,.JBUUO		; Now restore instruction
+	XCT @.JBUUO		; Execute instruction there
+	RET   			; Return from UUO
+
+%UETY1:	SETZ B,			; Prepare to store null
+	IDPB B,A		; Append null to buffer
+	HRROI A,TYPBUF		; Point to buffered typeout
+	ESOUT%			; Send it all off at once
+	RET
+
+; WRITE <string>   or   WRITE ac,<string>
+; Write given string with formatting actions on arbitrary
+;  destination designator given in ac (default ac is A)
+
+%UWRIT:	CALL FORMAT		; Call formatter
+	 CALL %UWRI1		; Setup -- get selected designator
+	 CALL %UWRI2		; Completion -- update designator
+	RET   			; Return from UUO
+
+; Setup routine -- fetch designator from ac specified in UUO
+%UWRI1:	LDB A,[POINT 4,.JBUUO,12]	; Get ac field of UUO
+	CAIG A,D		; Ac in protected range?
+	 ADDI A,-5(P)		; Yes, now on stack
+	HRLM A,-5(P)		; Save address for finishing up
+	MOVE A,0(A)		; Get designator from specified ac
+	RET   
+
+; Completion routine -- store possibly updated designator
+%UWRI2:	HLRZ D,-5(P)		; Recover ac field of UUO
+	MOVEM A,0(D)		; Store updated designator
+	SETZ B,			; Prepare to store null
+	TLNE A,-1		; Outputting to string?
+	 IDPB B,A		; Yes, append null
+	RET   
+
+; Perform output formatting for UUO routines.
+; Assumes ASCIZ string pointed to by .JBUUO (effective adr of UUO).
+; Performs substitution for escape sequences of the form
+;	% <number> <letter>
+; where <number> sometimes specifies an ac and <letter> specifies
+; the operation (see table LETDSP).
+
+; Call by:
+;	CALL FORMAT
+;	 Instruction to set up destination designator in A
+;	 Instruction to finish up after entire string written
+; Returns +3 always
+; No ac's clobbered
+
+FORMAT::PUSH P,A		; Save a block of ac's
+	PUSH P,B
+	PUSH P,C
+	PUSH P,D
+	XCT @-4(P)		; Execute setup instruction
+	MKPTR(A)		; Make sure we have real byte pointer
+	HRRZ B,.JBUUO		; Get the effective address
+	HRLI B,(POINT 7)	; Make byte ptr
+	PUSH P,B		; Put on stack
+
+; Loop here for each character
+; A/ destination designator
+	TRNA			; Skip over FBOUT
+FORMA1:	 CALL FBOUT		; Here to send char before looping
+FORMAL:	ILDB B,0(P)		; Get a char from the string
+	IFE. B			; If null, finished
+	  ADJSP P,-1		; Flush byte pointer
+	  AOS D,-4(P)		; Get caller pc, set up triple skip return
+	  XCT (D)		; Execute completion instruction
+	  POP P,D		; Restore ACs
+	  POP P,C
+	  POP P,B
+	  POP P,A
+	  RETSKP		; Return +3
+	ENDIF.
+
+; Have next character in the string.  Look at it to see if it's a schema.
+	CAIE B,"%"		; Escape?
+	 JRST FORMA1		; No, just type normally
+
+; Here when hit escape sequence.  Find number after it.
+	SETZ C,			; Init number
+	DO.
+	  ILDB D,0(P)		; Get next char
+	  CAIL D,"0"		; A digit?
+	   CAILE D,"7"
+	    EXIT.		; No, done
+	  LSH C,3		; Yes, multiply number by 8
+	  ADDI C,-"0"(D)	; Add value of new digit
+	  LOOP.
+	ENDDO.
+
+	MOVEI B,-5(P)		; Get loc-1 of ac block on stack
+	ADDI B,(C)		; Add ac #
+	CAIG C,D		; One of the protected ac's?
+	 SKIPA B,0(B)		; Yes, get contents from stack
+	  MOVE B,0(C)		; No, get contents directly
+	CAIL D,"A"		; Check bounds
+	 CAILE D,"Z"
+	  IFSKP.
+	    CALL @LETDSP-"A"(D)	; Dispatch on command
+	    JRST FORMAL		; Loop
+	  ENDIF.
+
+	CAIE D,"%"		; %% means just quote %
+	IFSKP.
+	  MOVEI B,"%"
+	  JRST FORMA1
+	ENDIF.
+
+	CAIE D,"_"		; %_ means conditional CRLF
+	IFSKP.
+	  PUSH P,A		; Save output designator
+	  MOVEI A,.CTTRM	; Controlling TTY
+	  RFPOS%		; Read cursor position
+	  POP P,A		; Restore designator
+	  TXNE B,.RHALF		; Are we at column 1?
+	   JRST SCHCRL		; No, add a CRLF
+	  JRST FORMAL		; Back for next char
+	ENDIF.
+
+	CAIE D,"/"		; %/ means crlf
+BADSCH:	 FATAL <Unexpected schema character>
+SCHCRL:	MOVEI B,15
+	CALL FBOUT
+	MOVEI B,12
+	JRST FORMA1		; Go send it off
+
+
+; Dispatch table for escape sequence function letters
+; The routine dispatched to has the calling sequence:
+;	A/ Destination designator
+;	B/ Contents of ac
+;	C/ The ac number itself
+; Returns +1
+; Must update A appropriately;  may clobber B-D
+
+LETDSP:	BADSCH			; A
+	BADSCH			; B
+	%LETC			; C - Character in AC
+	%LETD			; D - Decimal integer in AC
+	BADSCH			; E
+	%LETF			; F - Filename for JFN in AC
+	BADSCH  		; G
+	BADSCH  		; H
+	%LETI			; I - Insert character given octal code
+	%LETJ			; J - String for JSYS error # in ac
+	BADSCH  		; K
+	BADSCH  		; L
+	BADSCH  		; M
+	BADSCH  		; N
+	%LETO			; O - Octal integer in ac
+	BADSCH			; P
+	%LETQ			; Q - like S but quote ) and '
+	%LETR			; R - Runtime interval in ac - HH:MM:SS.S
+	%LETS			; S - ASCIZ string pointed to by ac
+	%LETT			; T - Date and time in ac
+	%LETU			; U - User name for directory # in ac
+	BADSCH			; V
+	BADSCH			; W
+	BADSCH			; X
+	BADSCH			; Y
+	BADSCH			; Z
+
+; Individual functions for escape sequences
+
+; C - Character in AC
+%LETC:	JUMPN B,FBOUT		; Send non-null character off
+	RET			; Or ignore null
+
+; D - Decimal integer in ac
+%LETD:	MOVX C,FLD(^D10,NO%RDX)	; Decimal radix
+	NOUT%			; Output number
+	 JFATAL
+	RET   
+
+
+; F - Filename for JFN in ac
+%LETF:	SKVERB VB.TRS		; Are we in server?
+	 TDZA C,C		; No, use standard form
+	  MOVX C,JS%SPC		; Yes, use all fields
+	JFNS%			; Generate filename string
+	RET   
+
+
+; I - Insert character for given octal code
+%LETI:	MOVE B,C		; Get the code
+;	CALLRET FBOUT		; Output it
+
+
+; Internal BOUT% routine
+; Same as BOUT% except much faster in string pointer case
+; (Does not handle case of lh=-1
+
+FBOUT::	TLNN A,-1		; Outputting to a file?
+	 BOUT%			; Yes, do so in normal manner
+	TLNE A,-1		; To string?
+	 IDPB B,A		; Yes (much faster than BOUT%)
+	RET   
+
+
+; J - String for JSYS error # in ac
+%LETJ:	HRLI B,.FHSLF		; This fork
+	TDZN C,C		; No string limit.  If no AC given
+	 TXO B,.RHALF		; Then use last JSYS error encountered
+	ERSTR%			; Convert error # to string
+	 JRST %LETJU		; Undefined error number
+	 FATAL <JSYS error in ERSTR>
+	RET   			; Done
+
+%LETJU:	PUSH P,A		; Save pointer
+	MOVEI A,.FHSLF		; On self
+	GETER%			; Get error condition
+	POP P,A			; Get pointer back
+	HRRZS B			; Keep only error number
+	WRITE <Undefined error %2O> ; Write this way
+	RET
+
+; O - Octal integer in ac
+%LETO:	MOVX C,NO%MAG!FLD(10,NO%RDX)
+	NOUT%			; Output number
+	 JFATAL
+	RET   
+
+; Q - string pointed to by AC, with ' and ) appropriately quoted
+%LETQ:	MKPTR(B)		; Make sure we have a real byte pointer
+	MOVE C,B		; Get string in more convenient place
+	DO.
+	  ILDB B,C		; Get next char
+	  JUMPE B,ENDLP.	; Done if null
+	  CAIE B,PQUOTE		; Quote?
+	   CAIN B,")"		; or close paren?
+	    IFNSK.
+	      MOVEI B,PQUOTE	; Yes, get quote
+	      CALL FBOUT	; Send it off
+	      LDB B,C		; Now get character to send again
+	    ENDIF.
+	  CALL FBOUT		; Send it off
+	  LOOP.			; Back for the next
+	ENDDO.
+	EXCH B,C		; Clean up
+	RET			; All done
+
+; Individual functions for escape sequences (cont'd)
+
+; R - Runtime interval in ac (ms), in form HH:MM:SS.S
+%LETR:	ADDI B,^D50		; Round up to nearest 0.1 second
+	IDIV B,[^D<60*60*1000>]	; Get hours
+	PUSH P,C		; Save remainder
+	MOVX C,FLD(^D10,NO%RDX)	; Output hours
+	NOUT%
+	 JFATAL
+	MOVEI B,":"		; Colon
+	CALL FBOUT
+	POP P,B			; Recover remainder
+	IDIVI B,^D<60*1000>	; Get minutes
+	IDIVI C,^D1000		; Get seconds
+	PUSH P,C		; Save seconds
+	MOVX C,NO%LFL!NO%ZRO!FLD(2,NO%COL)!FLD(^D10,NO%RDX)
+	NOUT%			; Output minutes
+	 JFATAL
+	MOVEI B,":"		; Colon
+	CALL FBOUT
+	POP P,B			; Recover seconds
+	NOUT%			; Output them
+	 JFATAL
+	MOVEI B,"."		; Decimal point
+	CALL FBOUT
+	MOVE B,D		; Get thousanths
+	IDIVI B,^D100		; Convert to tenths
+	MOVX C,FLD(^D10,NO%RDX)
+	NOUT%			; Output tenths
+	 JFATAL
+	RET   
+
+
+; S - String pointed to by ac
+%LETS:	SETZ C,			; Terminate by null
+	SOUT%			; Append the string
+	RET   
+
+
+; T - Date and time in ac, in standard form DD-MMM-YY HH:MM:SS
+%LETT:	TDZN C,C		; Standard format.  If no AC given
+	 SETO B,		; Then use current date and time
+	ODTIM%			; Output date and time
+	RET   
+
+
+; U - User name for directory # in ac
+%LETU:	PUSH P,A		; Save dest
+	DIRST%
+	IFNJE.
+	  POP P,0(P)		; Clean up stack
+	  RET   
+	ENDIF.
+	POP P,A			; Recover dest (DIRST% clobbers A on error)
+	JRST %LETO		; Go try as an octal number instead
+
+; Compare strings
+;	A/ One string ptr
+;	B/ Another string ptr
+; Returns +1:  Not equal
+;	+2:  Equal
+; Clobbers A-C
+
+STRCMP::SAVEAC <C,D>		; Save some registers
+	MKPTR (A)		; Make one
+	MKPTR (B)		; and the other into real byte pointers.
+	DO.
+	  ILDB C,A		; Get a char
+	  ILDB D,B		; And another
+	  CAME C,D		; If different
+	   RET			; Then go return that
+	  JUMPN C,TOP.		; If non-null, back for more
+	ENDDO.
+	RETSKP			; and return same
+
+; "Super" SFUST emulation.
+; call as for SFUST%, returns +1 always (ignores JSYS errors)
+; uses TEMP
+
+.SFUST::SAVEAC <C,D,P1,P2>	; Save some registers
+	MOVEM A,TEMP		; Save JFN
+	MOVEI A,.CHCNV		; Quote character
+	MKPTR (B)		; Make sure we have a real byte pointer
+	MOVE D,[POINT 7,TEMP+1]	; A convenient place to write it into
+	DO.
+	  ILDB C,B
+	  CAIE C,.CHCNV		; Quote?
+	  IFSKP.
+	    ILDB C,B		; Yes, get next character
+	    JUMPE C,TOP.	; Refuse to quote a null (doubleplusungood)
+	    IDPB A,D		; Drop in the quote
+	    IDPB C,D		; Drop in the quoted char
+	    LOOP.		; Next char
+	  ENDIF.		; Wasn't quoted
+	  MOVE P1,C		; Copy the char so we can mung it
+	  IDIVI P1,^D32		; P1 := C / 32, P2 := C % 32
+	  MOVE P1,[BRINI. USRB0.,USRB1.,USRB2.,USRB3.
+		   UNBRK. 0			; Don't quote nulls
+		   EXP   W0.,W1.,W2.,W3.	; Expand username break mask
+		   PURGE W0.,W1.,W2.,W3.	; Clean up
+		  ](P1)		; Get mask word
+	  LSH P1,(P2)		; Shift to interesting bit
+	  SKIPGE P1		; Is this a legal char for a username?
+	   IDPB A,D		; No, quote it
+	  IDPB C,D		; Write the byte in any case
+	  JUMPN C,TOP.		; Loop if wasn't a null
+	ENDDO.
+	MOVE A,TEMP		; Get JFN and code back
+	HRROI B,TEMP+1		; With string we just consed
+	SFUST%			; Set the author string
+	 ERNOP
+	RET
+
+; Check for device disk
+;	A/ JFN for file being retrieved or stored
+; Returns +1 always
+; Sets F%DSKF flag appropriately
+; Clobbers B, C
+
+CHKDSK::PUSH P,A		; Save JFN
+	SETO B,			; Don't take it as disk if JSYS fails
+	HRRZS A			; Only use left half of JFN
+	DVCHR%			; Get device characteristics
+	 ERNOP			; ignoring any errors.
+	POP P,A			; Restore JFN
+	TXNN B,DV%TYP		; Check device type
+	 TXOA F,F%DSKF		; Device is a disk
+	  TXZ F,F%DSKF		; Device is not a disk
+	RET
+
+; Alternate version takes JFN in B, saves A
+CHDSKB::PUSH P,A		; Save register
+	MOVE A,B		; Copy JFN
+	CALL CHKDSK		; Do the check
+	MOVE B,A		; Get JFN back
+	POP P,A			; Restore saved register
+	RET
+
+IFN STANSW,<
+; Check if a file is a plot file
+; call with A/JFN, B/property list (CHKDSK should already have been called)
+; returns +1/always
+
+CHKPLT::TXNN F,F%DSKF		; Disk file?
+	 RET			; No, nothing to do
+	SAVEAC <A,B,C,D>	; Don't mung registers
+	MOVE D,B		; Copy property list pointer
+	MOVX B,<1,,.FBCTL>	; Get file class field of FDB.
+	MOVEI C,C
+	GTFDB%
+	 ERNOP
+	HLRZS C			; Isolate field.
+	ANDI C,17
+	CAIN C,.FBPLT		; Plot file?
+	 SETOM P.PLOT(D)	; Yes
+	RET
+
+; If a plot file, set that in FDB
+; same calling conventions as CHKPLT
+SETPLT::SKIPE P.PLOT(B)		; Plot file?
+	 TXNN F,F%DSKF		; and disk file?
+	  RET			; No, nothing to do
+	SAVEAC <A,B,C>		; Yes, save some regs
+	HRLI A,.FBCTL		; Set file-class field to .FBPLT.
+	MOVX B,FB%FCF
+	MOVX C,FLD(.FBPLT,FB%FCF)
+	CHFDB%
+	 ERNOP
+	RET
+>;IFN STANSW
+
+IFE STANSW,<			; CHKPLT/SETPLT no-ops if not at Stanford
+CHKPLT::
+SETPLT::RET
+>;IFE STANSW
+
+; "Kill" destination file, i.e. delete all its pages and
+; try very hard to make it go away (works only for disk).
+; Returns +1 always
+; Closes and releases JFN
+; Clobbers A-D
+
+KILFIL::SKIPN A,FILJFN		; Get destination JFN.
+	 RET			; None, just return.
+	TLNE A,-1		; Pointer?
+	 JRST CLRFIL		; Yes
+	CALL UNMAP		; Make sure it is not still mapped
+	HRLI A,(CZ%ABT)		; Abort the file.
+	CLOSF%			; Close it
+	IFJER.
+	  HRRZ A,FILJFN		; Failed, get JFN
+	  RLJFN%		; and try to forget it
+	ANNSK.
+	  SKTERS VB.TRS		; Unless terser than terse
+	   TYPE <%_%% Unlikely local file close error - %J%/>
+	ENDIF.
+CLRFIL:	SETZM FILJFN		; Don't do it again.
+	RET
+
+
+; Step through a wildcard spec in FILJFN
+; returns +1/no more, +2/FILJFN stepped
+NXTFIL::SAVEAC <A>		; Don't lose register
+	MOVE A,FILJFN		; Get JFN
+	GNJFN%			; Step it
+	 JRST CLRFIL		; No more, clear file and return +1
+	RETSKP			; Got one, return with it
+
+; Storage for file transfers
+
+; Some file transfer routines depends on being able to use the location
+; one before FILPAG as scratch (for the page number and access word).
+; Do not change the following order!
+
+LSP NETPAG			; Network i/o buffer (shuffle modes only)
+LSP FILPAG			; One-page i/o buffer
+FPGNUM==<FILPAG/1000>		; Page number
+
+LS FILBSZ			; File byte size
+LS FILPTR			; Pointer to buffer for byte-shuffle xfers
+LS BCOUNT			; Number of bytes per page
+LS NBYTES			; How many bytes we've put total
+LS NXTPAG			; Which page to store into (set to -1)
+LS NBFPTR			; Pointer into it
+LS NETROT			; How many words to rotate in
+LS EBITS			; How much to LSH to get first one
+LS NETBYT			; Number of bytes left in net buffer
+LS FILBYT			; ditto for file buffer (used by PUTPAG)
+LS EOFHIT			; No end of file hit yet (for byte i/o)
+LS PADCHR			; What byte to use when padding data
+LS NETPSV,2			; Net pointer save area
+LS NETHDR			; Block header etc storage
+
+; Paged output to a file
+; call with FILPAG/data, FILJFN/JFN
+; if doing sequential i/o, needs BCOUNT and FILPTR set also
+; doesn't mung any registers, returns +1 always
+;
+; works even for non-disk files by using sequential i/o instead.
+; all file output should come through here.
+
+LS FFREEP			; Return value from FFFFP% for OVRQTA loop
+
+PUTPAG::PUSH P,C		; Save this register
+	MOVN C,FILBYT		; Get number of bytes back
+	SUB C,BCOUNT		; Minus number total to make SOUT counter
+	IFL. C			; If we have something there
+	  PUSH P,A		; Save some more registers
+	  PUSH P,B
+	  IFXE. F,F%DSKF	; Non-disk file?
+	    MOVE A,FILJFN	; Yes, point to destination file
+	    MOVE B,FILPTR	; Get start pointer to file buffer
+	    SOUT%		; Send it out
+	  ELSE.
+	    ADDM C,NBYTES	; Save in negative total bytes mapped out
+	    AOS A,NXTPAG	; Get next page to use
+	    HRL A,FILJFN	; With JFN for file
+	    CALL DOPUTP		; Go send off the page
+	  ENDIF.
+	  POP P,B		; Restore saved registers
+	  POP P,A
+	ENDIF.
+	POP P,C			; and unconditionally saved register
+	JRST SHOXFR		; Show transfer with excls
+
+DOPUTP:	MOVEM A,FFREEP		; Save page and JFN in case we loop
+	DO.
+	  MOVX A,<.FHSLF,,FPGNUM> ; Get source: own fork, file buffer page
+	  MOVE B,FFREEP		; Get JFN and page in B
+	  MOVX C,PM%WR		; Writing
+	  PMAP%			; Put fork page in file
+	  IFJER.
+	    MOVEI A,.FHSLF	; On ourself
+	    GETER%		; Find last error
+	    HRRZS B		; Get the error code
+	    CAIE B,IOX11	; Quota exceeded
+	     CAIN B,IOX34	; or disk structure completely full?
+	      IFSKP.
+		CAIE B,PMAPX6	; This kind of quota exceeded?
+		 FATAL <Unexpected PMAP output error>
+	      ENDIF.
+	    CALL OVRQTA		; Over quota, let PUPFTP or PUPFSV handle
+	    LOOP.		; If continued, go try again
+	  ENDIF.
+	ENDDO.
+	RET
+
+; Here with the first 25 words of the transfer - the FDB - in FILPAG.
+SETFDB::HRRZ A,FILJFN		; With the file
+	HRLI A,.FBBYV		; Byte size info
+	MOVX B,FB%BSZ		; Changing byte size
+	MOVE C,FILPAG+.FBBYV	; With what we got from the net
+	CHFDB%			; Do it
+	HRLI A,.FBSIZ		; Count of bytes
+	SETO B,			; All bits
+	MOVE C,FILPAG+.FBSIZ	; With the size from the FDB
+	CHFDB%			; Set that too
+	SKTERS VB.DEB		; Debugging?
+	 DTYPE "<FDB>"		; Yes, add this to go with the excls
+	RET
+
+; Here with the page access word at FILPAG - 1 and the page itself at FILPAG
+; Access word consists of access bits in left half, page number in right half.
+SETPAG::MOVE A,FILPAG-1		; Get access word
+	HRL A,FILJFN		; Save JFN in left half
+	CALL DOPUTP		; Map the page out to the file
+	HLLZ B,FILPAG-1		; Get page access bits back
+	HRR A,FILPAG-1		; And page number
+	HRL A,FILJFN		; With destination file
+	SPACS%			; Set page access bits
+	JRST SHOXFR		; Go type !! marks
+
+; Set file's byte size and number of bytes
+; returns +2/always by jumping to SHXEND, A-C smashed
+; number of bytes should be in NBYTES
+; byte size should be in FILBSZ
+;
+; This routine will only work with disk files,
+; but then non-PMAP i/o doesn't need it.
+;
+; Do not call this for Tenex-Paged transfers.
+; The size should be set from the FDB sent at the start
+; of the transfer instead.
+
+SFBSZ::	TXNN F,F%DSKF		; Disk file?
+	 JRST SHXUMP		; No, all done
+	HRRZ A,FILJFN		; Else get output file
+	HRLI A,.FBBYV		; Byte size of file
+	MOVX B,FB%BSZ		; That's all we want to set
+	MOVE C,FILBSZ		; Get remembered byte size
+	LSH C,^D35-POS(FB%BSZ)	; Shift into position
+	CHFDB%			; Set it
+	HRLI A,.FBSIZ		; Number of bytes in file
+	SETO B,			; All bits
+	MOVN C,NBYTES		; With number of bytes we sent
+	CHFDB%			; Set that in the file's FDB
+	JRST SHXEND		; Done with the transfer, go finish up
+
+; Paged file input
+
+LS INPPAG
+
+; Set NBYTES to number of bytes in the file
+; sets to infinity for non-disk files - they know when to stop by other means
+
+SETBSZ::SAVEAC <A,B,C>		; Get some registers
+	IFXE. F,F%DSKF		; Do we have a disk file?
+	  MVI. .INFIN,NBYTES	; No, get positive infinity as byte count
+	  RET
+	ENDIF.
+	HRRZ A,FILJFN		; Else with the input file
+	MOVX B,<1,,.FBSIZ>	; With byte count word
+	MOVEI C,NBYTES		; Into appropriate place
+	GTFDB%			; Read FDB word
+
+	;; Now we've got the official count, mung it for our byte size
+	MOVX B,<1,,.FBBYV>	; Byte size word
+	MOVEI C,B		; Into register B
+	GTFDB%			; Read FDB word
+	LOAD B,FB%BSZ,B		; Get the byte size bits
+	JUMPE B,R		; If zero we've lost so just use what we have
+	CAMN B,FILPRP+P.BYTE	; If same as byte size we're using
+	 RET			; Then no need for mungage
+	CAMG B,FILPRP+P.BYTE	; Is real byte size greater than what we want?
+	IFSKP.
+	  IDIV B,FILPRP+P.BYTE	; Yes, get quotient
+	  IMULM B,NBYTES	; That is how much to increase byte count by
+	  RET			; All done
+	ENDIF.
+	MOVE A,FILPRP+P.BYTE	; Real byte size smaller, get what we want
+	IDIV A,B		; Get how much smaller it is
+	MOVE B,NBYTES		; Now get number of real bytes
+	IDIV B,A		; Turn into number of logical bytes
+	SKIPE C			; Any left over?
+	 ADDI B,1		; Yes, count as a full one
+	MOVEM B,NBYTES		; Save new byte count
+	RET
+
+; Read in a page of data
+; doesn't need to save any registers
+; in fact, SNDPAG depends on A being returned with PMAP pointer.
+
+GETPAG::CALL SETWDT		; Set watchdog timer for loop
+	TXNE F,F%DSKF		; Do we have a disk file?
+	IFSKP.			; No...
+	  HRRZ A,FILJFN		; Get source file JFN
+	  MOVE B,FILPTR		; and pointer to file
+	  MOVN C,BCOUNT		; maximum permissable bytes
+	  SIN%			; Read them in
+	   ERCAL RCERR		; Hope error is EOF
+	  ADD C,BCOUNT		; Get how many bytes we read
+	  JUMPE C,R		; If none, return now
+	  CAME C,BCOUNT		; If we got less than a full buffer
+	   MOVEM C,NBYTES	; Then remember and don't come back
+	ELSE.
+	  AOS A,INPPAG		; Disk file, get starting page
+	  HRL A,FILJFN		; With source JFN
+	  FFUFP%		; Find next used file page
+	   RET			; No more, all done
+	  HRRZM A,INPPAG	; Got one, save for the next time
+	  MOVX B,<.FHSLF,,FPGNUM> ; Into file buffer page
+	  MOVX C,OF%RD		; Don't need to write to it
+	  PMAP%			; Map file page in
+	ENDIF.
+	CALL SHOXFR		; Show transfer
+	RETSKP
+
+
+; Unmap FILPAG data buffer to save core and make sure it's clean for next xfer
+
+UNMAP::	SAVEAC <A,B,C>		; Save some registers
+	SETO A,			; From nothing
+	MOVE B,[.FHSLF,,FPGNUM]	; Into file buffer page
+	SETZ C,			; No flags
+	PMAP%			; Unmap
+	RET
+
+; Type excls to show user something is happening
+
+LS SHXCNT			; Counter for excl output
+LS SHXDEF			; How many pages to put between excls
+LS SHXINT			; How many we have yet to see
+
+; Routine to initialize counter for user ! typeout
+SHXINI::IFTERS VB.NRM		; If being terse
+	  SETZM SHXINT		; Clear all the way so can never type out
+	  RET
+	ENDIF.
+	MVI. 1,SHXINT		; Have yet to see none
+	IFVERB VB.DEB		; If debugging
+	  MVI. 1,SHXCNT		; 1 page between outputs
+	  RET			; Nothing now
+	ENDIF.
+	SKIPG CX,SHXDEF		; Get default interval.  Do we want one?
+	 SETZM SHXINT		; No, so don't even print one excl
+	MOVEM CX,SHXCNT		; Save as interval for this transfer
+				; Drop in to do one now
+
+; Routine to type transfer progress.  ! every 10 pages (or as set by SET HASH)
+; Careful with order of SKTERS etc - don't want printout for F%STYO
+SHOXFR:	SOSE SHXINT		; See if we want to type now
+	 RET			; Either never will or count not exhausted
+	TYPE <!>		; Count exhausted, indicate progress
+	MV. SHXCNT,SHXINT	; Reinitialize counter
+	RET			; All done with show and tell
+
+; Finish off display of transfer with [OK]
+; Jump to here to return from RECDAT or SNDDAT
+; Entry SHXUMP makes sure page is unmapped for non-disk xfers.
+SHXUMP::CALL UNMAP		; Unmap file page to clear it out
+SHXEND::SKVERB VB.NRM		; Being terse?
+	 RETSKP			; Yes, don't even include [OK]
+	SKVERB VB.DEB		; If debugging want to be precise about excls
+	 SKIPG SHXINT		; Not debugging, but do we want excls at all?
+	  IFSKP. <TYPE <! >>	; Want them, so type a final one
+	TYPE <[OK]%/>		; Finish transfer progress display
+	RETSKP
+
+; File name manipulation
+
+; Character names
+LANGB=="<"
+RANGB==">"
+
+; Get Name-Body pointer for local GTJFN, or fake it from Server-Filename
+GETNMB::HRROI B,FILPRP+P.NAMB	; Point to name-only part of file name.
+	SKIPE FILPRP+P.NAMB	; If non-zero
+	 RET			; then all done.
+	HRROI B,FILPRP+P.SFIL	; Else point to server-filename
+;	CALLRET SKPDIR		; and skip over directory to get filename only.
+
+; Increment a byte pointer until past all directory terminators.
+
+SKPDIR::SAVEAC <A>		; Don't mung caller's register
+	STKVAR <DRPREF>		; Get temp prefix pointer
+	MKPTR(B)		; Make sure it's a real byte pointer
+	MOVEM B,DRPREF		; Save current point for later.
+	DO.
+	  ILDB A,B		; Get next byte.
+	  IFE. A		; If null, done with directory part
+	    MOVE B,DRPREF	; Get the byte pointer back
+	    RET			; for the return.
+	  ENDIF.
+	  CAIE A,.CHCNV		; Control V?
+	  IFSKP.
+	    ILDB A,B		; Yes, get another and ignore it.
+	    LOOP.
+	  ENDIF.
+
+	  ;; I used to have [ ] in the characters skipped over here.
+	  ;; But as far as I can tell only SAIL/TOPS10 uses them as delimiters
+	  ;; and that style loses for SKPDIR and are covered separately
+	  ;; in the DIRECTORY command anyway...
+	  INSET A,<LANGB,RANGB,":","/">,<MOVEM B,DRPREF>
+	  LOOP.
+	ENDDO.
+
+; Get version of JFN+flags in A, return in B
+
+JFNVRS::MOVX B,.GJNHG		; Assume generation is -1 until shown otherwise
+	TXNE A,GJ%VER		; Wildcard generation?
+	 MOVX B,.GJALL
+	TXNE A,GJ%ULV		; Lowest?
+	 MOVNI B,.GJLEG
+	TXNE A,GJ%VER!GJ%NHV!GJ%UHV!GJ%ULV ; No generation flags, get from JFN
+	 RET			; Wild version, already set up
+	SAVEAC <A,C>		; Save some registers
+	MOVE B,A		; Move JFN into different register
+	HRROI A,TEMP
+	MOVX C,FLD(.JSAOF,JS%GEN)
+	JFNS%
+	HRROI A,TEMP		; From just-created version strin
+	MOVEI C,^D10		; in decimal
+	NIN%			; read in the number.
+	 NOP			; Can't fail
+	RET
+
+; Here to set up property lists for new transfer
+
+LS DEFPRP,PLSIZE		; Default property list
+LS FILPRP,PLSIZE		; File property list (Store/Retrieve)
+LS TMPPRP,PLSIZE		; Temporary property list
+
+SETPRP::TXZE F,F%PSET		; Property list already set?
+	 RET			; Yes, just return
+	SAVEAC <A>		; Don't mung register
+	MOVE A,[DEFPRP,,FILPRP]	; Get where to copy through to
+	BLT A,FILPRP+PLSIZE-1	; Copy whole property list across
+	RET
+
+; Open file in FILJFN for store (properties in FILPRP)
+; Returns +1:  Failed, error message pointed to in AC1
+;	  +2:  Succeeded, file open, JFN in AC1
+; Calls OPSERR on failure with A/point to text
+
+DEFINE OPNERR (TEXT) <
+	JRST [	HRROI C,TEMP	;; Point to temporary buffer
+		WRITE C,<TEXT>	;; Write the message
+		HRROI A,TEMP	;; Now point to it again
+		RET ]		;; Let main program handle it and return
+>
+
+OPNSTO::SAVEAC <B,C,D>		; Save some registers
+	CALL CKSPAR		; Check properties for send
+	 RET			; Lost
+	MOVX B,OF%RD		; Open for read, not thawed.
+	MOVE A,FILPRP+P.BYTE	; Get transfer byte size
+	STOR A,OF%BSZ,B		; Put in position
+	DO.
+	  HRRZ A,FILJFN		; Setup JFN
+	  OPENF%		; Attempt to open
+	   IFSKP. <RETSKP>
+	  TXON B,OF%THW		; Turn thaw on. was it already?
+	   LOOP.		; No, go back and try this way.
+	ENDDO.
+	HRRZ D,FILJFN		; Else get file again
+	OPNERR <Couldn't open %4F - %J>	; To make error message
+
+; Check and/or default parameters for "Store" command
+; Call with FILJFN/ JFN for file being stored, F%DSKF set, properties in FILPRP
+; Returns +1:  Hard error, message typed
+;	  +2:  Ok, type and byte size filled in appropriately
+; Can call STYBAD with A/pointer to failure text
+
+DEFINE CKSBAD(TEXT) <
+	JRST [	HRROI A,TEMP	;; Point to a nice buffer
+		HRRZ C,FILJFN	;; Get file pointer again
+		WRITE <TEXT>	;; Say what was wrong
+		JRST STYCHG ]	;; Go ask caller and try again if lucky
+>
+
+CKSPAR:	HRRZ A,FILJFN		; Get the file
+	SETZ B,			; Assume don't know byte size
+	IFXN. F,F%DSKF		; Local file on disk?
+	  MOVE B,[1,,.FBCTL]	; Yes, want flag word
+	  MOVEI C,C		; Into C
+	  GTFDB%
+	  TXNE C,FB%NEX		; File exists?
+	   OPNERR <File %1F does not exist>
+	  TXNE C,FB%DIR		; Directory?
+	   OPNERR <%1F is a directory file>
+	  MOVE B,[1,,.FBBYV]	; Yes, read byte size from FDB
+	  MOVEI C,C		; Put it here
+	  GTFDB%
+	  LOAD B,FB%BSZ,C	; Extract byte size
+	ENDIF.
+
+; Here after trying a change of settings to check again
+CKSRTY:	HRRZ C,FILPRP+P.TYPE	; Get specified transfer type
+	HRRZ D,FILPRP+P.BYTE	; Get specified byte size
+	JRST @[	STYUNS		; Dispatch on type:  Unspecified
+		STYTXT		; Text
+		STYBIN		; Binary
+		STYPAG		; Tenex-Paged
+		STYDIR		; Directory???  Shouldn't happen...
+		STYPAG		; MEIS-Paged
+		STYTXT		; EBCDIC
+		STYBIN		; Image
+		STYNON ](C)	; None
+
+; Here when we got an error message, call caller routine and retry
+STYCHG:	HRROI A,TEMP		; Point to buffer again
+	CALL STYBAD		; Call main program handler routine
+	 OPNERR <Not confirmed, file bypassed>
+	JRST CKSRTY		; Won, go check again
+
+; Type-specific routines for CKSPAR
+
+; Here for type none
+STYNON:	DMOVE C,[EXP TT.NON,7]	; None assumes seven bits
+	JRST CKSSET		; Go ahead with the transfer
+
+; Here for type directory
+STYDIR:	CKSBAD <Illegal to transfer file %3F with type "Directory">
+
+; Here for type Text
+STYTXT:	SKIPE D,B		; File byte size known?
+	 CAIN D,^D36		; or 36 bit words?
+	  MOVEI D,7		; Not known or 36 bits, use 7 bit
+	INSET D,<7,8>,JRST CKSSET ; Legal byte size?
+	CKSBAD <Type Text inconsistent with byte size %4D of file %3F>
+
+; Here for type unspecified
+STYUNS:	MOVEI C,TT.TXT		; Assume text
+	INSET B,<^D36,7>,JRST STYTXT ; If 7 or 36 bit, assume text
+	MOVEI C,TT.BIN		; No, this is binary
+;	JRST STYBIN		; Go handle as such
+
+; Here for type Binary
+STYBIN:	IFE. D			; Transfer byte size specified?
+	  SKIPE D,B		; No, substitute file byte size
+	   JRST CKSSET		; Got one, now go try it
+	  CKSBAD <Byte size specification required to store %3F>
+	ENDIF.
+	JUMPE B,CKSSET		; If have default but no file size, go ahead
+	CAIE B,^D36		; Same if it is 36
+	 CAMN B,D		; Both known, make sure consistent
+	  JRST CKSSET		; If they are, then done checking
+	CAIN D,^D36		; File byte not 36, but transfer is?
+	 JRST CKSSET		; Yes, that is Ok too.
+	SKTERS VB.TRS		; Unless terser than terse
+	 TYPE <Default of %4D inconsistent with byte size %2D of %1F>
+	HRROI A,[ASCIZ/Using default anyway [Confirm] /]
+	CALL PRMCNF		; Make sure user wants to go through with it
+	 JRST STYCHG		; Didn't, ask for a new type
+	JRST CKSSET		; and go ahead with the transfer
+
+; Here for type Paged
+STYPAG:	TXNN F,F%DSKF		; Is local file on disk?
+	 CKSBAD <%1F is not a disk file>
+	MOVEI D,^D36		; Set local byte size to 36 (unused)
+
+; All cases converge here
+; C/ Transfer type, D/ Transfer byte size
+CKSSET:	SKIPE A,FILPRP+P.XTYP	; Remote type unspecified
+	 CAMN A,FILPRP+P.TYPE	; Or in step with local?
+	  MOVEM C,FILPRP+P.XTYP	; Yes, remain in step
+	MOVEM C,FILPRP+P.TYPE	; Store local type in any case
+	SKIPE A,FILPRP+P.XBYT	; Remote byte size unspecified
+	 CAMN A,FILPRP+P.BYTE	; Or in step with local?
+	  MOVEM D,FILPRP+P.XBYT	; Yes, remain in step
+	MOVEM D,FILPRP+P.BYTE	; .. local byte size
+	RETSKP			; Return +2 for success
+
+; Here with some terrible unrecoverable data error, cause data error PSI
+
+; Here if I/O data error occurs in SIN% from net or file
+RCERR::	MOVEI A,.FHSLF		; On self
+	GETER%			; Find out what the error was
+	HRRZS B			; Keep only error number
+	CAIN B,IOX4		; If end of file
+	 RET			; Then it's OK
+RECNDE::CALL KILFIL		; Try to eliminate the file
+	POP P,A			; Get return address
+	HRRZS A			; Without flags
+	SKTERS VB.TRS		; Unless terser than terse
+	 ETYPE <Unexpected I/O data error at %1O - %J%/>
+	JRST EDISC		; Flush connection
+
+	END

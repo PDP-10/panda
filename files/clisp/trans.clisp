@@ -1,0 +1,894 @@
+;;; This is a -*-Lisp-*- file.
+
+;;; Copyright (c) 1985 J S Hall, C L Hedrick
+
+;;; Source-level transforms for the Common Lisp Compiler.  These
+;;; transforms work like macros, but are only used when compiling.
+
+;;; Original version by Scott Fahlman, Dave Dill, Skef Wholey, et al.
+;;; Modified for the Dec-20 by Dave Steiner.
+
+(in-package "COMPILER")
+;;; **********************************************************************
+
+;;;; Random utilities:
+
+;;; will be expanded later...
+(defun find-type (x) t)
+;;;; Functions for Building the Compiler Environment.
+
+;;; DEFTRANSFORM is like DEFMACRO, but adds the expander function to
+;;; a list kept under the function's TRANSFORMS property.  There can be
+;;; many transforms for a given function, and they are applied until the
+;;; form is changed into something without transforms or until all of the
+;;; transforms pass.  If a transform does not want to change a function,
+;;; it should return the marker %PASS%.
+
+(eval-when (eval)
+(defmacro deftransform (fn name arglist &body body)
+  (let ((local-decs nil)
+	(lisp::%arg-count 0)
+	(lisp::%min-args 0)
+	(lisp::%restp nil)
+	(lisp::%let-list nil)
+	(lisp::%keyword-tests nil))
+    (declare (special lisp::%arg-count lisp::%min-args lisp::%restp
+		      lisp::%let-list lisp::%keyword-tests))
+    ;; Check for local declarations and documentation string.
+    (prog ()
+     LOOP
+      (cond ((atom body)
+	     (setq body '(nil)))
+	    ((and (not (atom (car body))) (eq (caar body) 'declare))
+	     (setq local-decs (append local-decs (cdar body)))
+	     (setq body (cdr body))
+	     (go loop))
+	    ((and (stringp (car body)) (not (null (cdr body))))
+	     (setq body (cdr body))
+	     (go loop))))
+    ;; Analyze the defmacro argument list.
+    (lisp::analyze1 arglist '(cdr **form**) fn '**form**)
+    ;; Now build the body of the transform.
+    (when (null arglist) (push '(ignore **form**) local-decs))
+    (setq body `(let* ,(nreverse lisp::%let-list)
+		  ,@(and local-decs (list (cons 'declare local-decs)))
+		  ,@lisp::%keyword-tests
+		  ,@ body))
+    `(progn
+      (defun ,name (**form**) ,body)
+      (%put ',fn 'clc-transforms (cons ',name (get ',fn 'clc-transforms)))))))
+
+
+;;; Once-Only returns a piece of code in which the body is evaluated with each
+;;; of the variables in Var-List bound to the corresponding form iff the form
+;;; is non-trivial.  This is mainly of use in writing transforms and such.
+;;;
+;;; A typical use looks like:
+;;;
+;;; (deftransform foo foo-transform (a b c)
+;;;   (once-only ((a-name a) (b-name b))
+;;;     `(bar ,a-name ,b-name ,c ,a-name ,b-name)))
+;;;
+;;; <=>
+;;;
+;;; (deftransform foo foo-transform (a b c)
+;;;   (let ((a-name (if (trivialp a) a (new-internal-variable)))
+;;;         (b-name (if (trivialp b) b (new-internal-variable))))
+;;;     `(let (,@(unless (eq a a-name) `((,a-name ,a)))
+;;;            ,@(unless (eq b b-name) `((,b-name ,b))))
+;;;        `(bar ,a-name ,b-name ,c ,a-name ,b-name))))
+
+(eval-when (eval)
+(defmacro once-only (var-list &rest body)
+  (do ((var-list var-list (cdr var-list))
+       (name-bindings ())
+       (variable-bindings ()))
+      ((null var-list)
+       `(let ,name-bindings
+	  (list 'let (nconc ,@variable-bindings) ,@body)))
+    (let ((var-name (caar var-list))
+	  (var (cadar var-list))
+	  (gensym (new-internal-variable)))
+      (push `(,var-name (if (trivialp ,var) ,var ',gensym))
+	    name-bindings)
+      (push `(if  (not (eq ,var-name ,var)) (list (list ',gensym ,var)))
+	    variable-bindings)))))
+
+(eval-when (eval)
+(defmacro new-internal-variable ()
+  '(if *currently-free-internal-variables*
+       (pop *currently-free-internal-variables*)
+       (really-new-internal-variable))))
+
+
+;;; Defsynonym declares NEW to be a synonym for OLD.  Both must be symbols
+;;; appearing the function position of a form.
+
+(defmacro defsynonym (new old)
+  `(%put ',new 'synonym ',old))
+
+;;; needed when compiling code in a running lisp
+
+(deftransform lisp::*macroexpansion* macex-xform (foo bar)
+  (declare (ignore bar))
+  foo)
+
+;;;; SETQ AND FRIENDS.
+
+;;; Turn any multiple SETQ forms into a progn of individual SETQs.
+;;; Setq of 0 pairs is legal, and returns NIL.
+
+(deftransform setq setq-transform (&rest pairs)
+  (let ((n (length pairs)))
+    (cond ((zerop n) nil)
+	  ((= n 2)
+	   (test-varname (car pairs))
+	   '%pass%)
+	  ((oddp n)
+	   (clc-error "Odd number of args to SETQ.")
+	   nil)
+	  (t (do ((m pairs (cddr m))
+		  (l nil))
+		 ((null m)
+		  `(progn ,@(nreverse l)))
+	       (push `(setq ,(car m) ,(cadr m)) l))))))
+
+
+;;; Handle cases of PSETQ with 0, 2 or odd number of args.
+
+(deftransform psetq psetq-transform (&rest pairs)
+  (let ((n (length pairs)))
+    (cond ((zerop n) nil)
+	  ((= n 2)
+	   `(setq ,(car pairs) ,(cadr pairs)))
+	  ((oddp n)
+	   (clc-error "Odd number of args to PSETQ.")
+	   nil)
+	  (t '%pass%))))
+
+  
+
+;;;; PREDICATES
+
+;;; Just turn NULL into NOT.
+
+(defsynonym null not)
+
+
+;;; Handle degenerate case of NOT with constant or null argument.
+
+(deftransform not not-transform (x)
+  (cond ((or (null x) (equal x '(quote nil))) t)
+	((or (eq x t) (equal x '(quote t))) nil)
+	(t '%pass%)))
+
+
+;;; Transform for EQ.  If one arg is NIL, convert form to NOT test.
+
+(deftransform eq eq-transform (x y)
+  (cond ((or (null x) (equal x '(quote nil))) `(not ,y))
+	((or (null y) (equal y '(quote nil))) `(not ,x))
+	(t '%pass%)))
+
+
+;;; Transform for EQL.  Convert to EQ where one arg is constant and not
+;;; a number.
+
+(deftransform eql eql-transform (x y)
+  (cond ((fixnump x) `(eq ,x ,y))
+	((fixnump y) `(eq ,x ,y))
+	((numberp x) '%pass%)
+	((numberp y) '%pass%)
+	((or (constantp x) (constantp y))
+	 `(eq ,x ,y))
+	(t '%pass%)))
+
+
+;;; Transform for =.   This only handles the two-arg case.
+;;; If one arg is zero, convert to ZEROP.
+
+(deftransform = =-transform (x &rest y)
+  (cond ((not (= (length y) 1)) '%pass%)
+	((and (numberp x) (zerop x))
+	 `(zerop ,(car y)))
+	((and (numberp (car y)) (zerop (car y)))
+	 `(zerop ,x))
+	(t '%pass%)))
+
+
+;;;; CONTROL STRUCTURES
+
+
+(deftransform return return-transform (&optional (value nil))
+  `(return-from nil ,value))
+
+
+(deftransform prog prog-transform (varlist &rest forms)
+  (let* ((pb (parse-body2 forms))
+	 (decls (car pb))
+	 (body (cadr pb)))
+    `(let ,varlist
+       (declare ,@decls)
+       (block nil (tagbody ,@body)))))
+
+
+(deftransform prog* prog*-transform (varlist &rest forms)
+  (let* ((pb (parse-body2 forms))
+	 (decls (car pb))
+	 (body (cadr pb)))
+    `(let* ,varlist
+       (declare ,@decls)
+       (block nil (tagbody ,@body)))))
+
+;;; progv now handled directly
+;;; throw and catch now compiled in the right order
+
+
+;;; The following transform only gets called on DEFUN forms not at top level.
+
+;;; It makes sure that the function name gets printed out by setting *verbose*
+;;; on and setting up *inner-function-name*, so that the first function forms
+;;; in the code as we look down (only the one 10 lines below) get compiled as
+;;; if it had that name.
+
+(deftransform defun defun-transform (name varlist &rest forms)
+  (let* ((pb (parse-body1 forms))
+	 (decls (car pb))
+	 (doc (cadr pb))
+	 (body (caddr pb)))
+    `(compiler-let ((*verbose* t)
+		    (*inner-function-name* ',name))
+       ,@(if doc `((%put ',name 'lisp::%fun-documentation ',doc)))
+       (remprop ',name 'lisp::macro-in-compiler)
+       (setf (symbol-function ',name)
+	     (function (lambda ,varlist
+			 (declare ,@decls)
+			 (block ,name ,@body))))
+       ',name)))
+
+
+;;; The following transform catches EVAL-WHEN forms that are not at top level.
+
+(deftransform eval-when eval-when-transform (situations &rest forms)
+  (cond ((or (atom situations)
+	     (eq 'quote (car situations)))
+	 (clc-error "Ill-formed EVAL-WHEN situation list: ~S. ~
+		     Ignoring its contents." situations)
+	 nil)
+	(t (let ((*eval-when-compile* (memq 'compile situations))
+		 (*eval-when-load* (memq 'load situations)))
+	    (dolist (x forms) (process-form x))
+	    (if (memq 'EVAL situations)
+		`(progn ,@forms))))))
+
+;;; For Funcall, if the function is 'symbol or #'symbol (and the symbol isn't
+;;; functionally bound in the current lexical environment), turn it into the
+;;; equivalent form with the symbol in the car.
+
+(deftransform funcall funcall-transform (fn &rest args)
+  (if (and (consp fn)
+	   (consp (cdr fn))
+	   (symbolp (cadr fn))
+	   (or (eq (car fn) 'function)
+	       (and (eq (car fn) 'quote)
+		    (not (assq (cadr fn) *fenv*)))))
+      (cons (cadr fn) args)
+      '%pass%))
+
+;;; IDENTITY turns into its arg.
+
+(deftransform identity identity-transform (x) `(values ,x))
+  
+
+;;;; LIST and SEQUENCE OPERATORS.
+
+(deftransform caar caar-transform (x) `(car (car ,x)))
+(deftransform cadr cadr-transform (x) `(car (cdr ,x)))
+(deftransform cdar cdar-transform (x) `(cdr (car ,x)))
+(deftransform cddr cddr-transform (x) `(cdr (cdr ,x)))
+(deftransform caaar caaar-transform (x) `(car (car (car ,x))))
+(deftransform caadr caadr-transform (x) `(car (car (cdr ,x))))
+(deftransform cadar cadar-transform (x) `(car (cdr (car ,x))))
+(deftransform caddr caddr-transform (x) `(car (cdr (cdr ,x))))
+(deftransform cdaar cdaar-transform (x) `(cdr (car (car ,x))))
+(deftransform cdadr cdadr-transform (x) `(cdr (car (cdr ,x))))
+(deftransform cddar cddar-transform (x) `(cdr (cdr (car ,x))))
+(deftransform cdddr cdddr-transform (x) `(cdr (cdr (cdr ,x))))
+(deftransform caaaar caaaar-transform (x) `(car (car (car (car ,x)))))
+(deftransform caaadr caaadr-transform (x) `(car (car (car (cdr ,x)))))
+(deftransform caadar caadar-transform (x) `(car (car (cdr (car ,x)))))
+(deftransform caaddr caaddr-transform (x) `(car (car (cdr (cdr ,x)))))
+(deftransform cadaar cadaar-transform (x) `(car (cdr (car (car ,x)))))
+(deftransform cadadr cadadr-transform (x) `(car (cdr (car (cdr ,x)))))
+(deftransform caddar caddar-transform (x) `(car (cdr (cdr (car ,x)))))
+(deftransform cadddr cadddr-transform (x) `(car (cdr (cdr (cdr ,x)))))
+(deftransform cdaaar cdaaar-transform (x) `(cdr (car (car (car ,x)))))
+(deftransform cdaadr cdaadr-transform (x) `(cdr (car (car (cdr ,x)))))
+(deftransform cdadar cdadar-transform (x) `(cdr (car (cdr (car ,x)))))
+(deftransform cdaddr cdaddr-transform (x) `(cdr (car (cdr (cdr ,x)))))
+(deftransform cddaar cddaar-transform (x) `(cdr (cdr (car (car ,x)))))
+(deftransform cddadr cddadr-transform (x) `(cdr (cdr (car (cdr ,x)))))
+(deftransform cdddar cdddar-transform (x) `(cdr (cdr (cdr (car ,x)))))
+(deftransform cddddr cddddr-transform (x) `(cdr (cdr (cdr (cdr ,x)))))
+
+(deftransform first first-transform (x) `(car ,x))
+(deftransform second second-transform (x) `(cadr ,x))
+(deftransform third third-transform (x) `(caddr ,x))
+(deftransform fourth fourth-transform (x) `(cadddr ,x))
+(deftransform fifth fifth-transform (x) `(car (cddddr ,x)))
+(deftransform sixth sixth-transform (x) `(cadr (cddddr ,x)))
+(deftransform seventh seventh-transform (x) `(caddr (cddddr ,x)))
+(deftransform eighth eighth-transform (x) `(cadddr (cddddr ,x)))
+(deftransform ninth ninth-transform (x) `(car (cddddr (cddddr ,x))))
+(deftransform tenth tenth-transform (x) `(cadr (cddddr (cddddr ,x))))
+
+
+;;; Transform to open code short NTH and NTHCDR.
+(deftransform nth nth-transform (n l)
+  `(car (nthcdr ,n ,l)))
+
+(deftransform nthcdr nthcdr-transform (n l)
+  (if (and (integerp n) (< -1 n *nthcdr-open-code-limit*))
+      (do ((x n (1- x))
+	   (f l (list 'cdr f)))
+	  ((zerop x) f))
+      '%pass%))
+
+
+;;;; ARITHMETIC and NUMEROLOGY.
+
+(deftransform plusp plusp-transform (x)
+  `(> ,x 0))
+
+(deftransform minusp minusp-transform (x)
+  `(< ,x 0))
+
+(deftransform oddp oddp-transform (x)
+  `(not (zerop (boole 1 ,x 1))))
+
+(deftransform evenp evenp-transform (x)
+  `(zerop (boole 1 ,x 1)))
+
+
+;;; Handler for multi-argument comparisons.  Basically, turn things
+;;; like (> a b c ... ) to (AND (> a b) (> b c) ... ).  But if an
+;;; interior arg is not a number or symbol, have to do a setq to
+;;; avoid evaling the arg twice.  If any setqs are needed, have to
+;;; make one extra local variable with a LET form.
+
+#|  this code commented out. the kernel loop for multi-compare is faster.
+
+(defun multi-compare (form)
+  (cond ((= (length form) 2) 't)
+	((= (length form) 3) '%pass%)
+	;; Simple case, args have no side effects.
+	((do ((args (cdr form) (cdr args))
+	      (result nil))
+	     ((atom (cdr args))
+	      (cons 'and (nreverse result)))
+	   (cond ((trivialp (car args))
+		  (push `(,(car form) ,(car args) ,(cadr args)) result))
+		 (t (return nil)))))
+	;; Bad case, eval all args first, exactly once.
+	(t (do ((args (cddr form) (cdr args))
+		(oldvar (if (numberp (cadr form))
+			    (cadr form)
+			    (new-internal-variable))
+			newvar)
+		(oldarg (cadr form) (car args))
+		(newvar nil)
+		(varlist nil (if (numberp oldvar)
+				 varlist
+				 (cons (list oldvar oldarg) varlist)))
+		(result nil))
+	       ((null args)
+		(or (numberp oldvar)
+		    (push (list oldvar oldarg) varlist))
+		`(let ,(nreverse varlist) (and ,@(nreverse result))))
+	     (setq newvar (if (numberp (car args))
+			      (car args)
+			      (new-internal-variable)))
+	     (push `(,(car form) ,oldvar ,newvar) result)))))
+
+(push 'multi-compare (get '= 'clc-transforms))
+(push 'multi-compare (get '> 'clc-transforms))
+(push 'multi-compare (get '< 'clc-transforms))
+(push 'multi-compare (get '>= 'clc-transforms))
+(push 'multi-compare (get '<= 'clc-transforms))
+
+End of commented-out code.  |#
+
+;;; Convert 2-arg comparisons to equivalents.
+
+(deftransform >= >=-two-arg (x &rest y)
+  (if (= (length y) 1)
+      `(not (< ,x ,(car y)))
+      '%pass%))
+
+(deftransform <= <=-two-arg (x &rest y)
+  (if (= (length y) 1)
+      `(not (> ,x ,(car y)))
+      '%pass%))
+
+
+;;; /= is different, since it requires every element of the arglist to
+;;; be compared to every other -- a doubly-nested DO loop.  Only open-code
+;;; the one arg and two arg cases, and let the rest go call the actual /=
+;;; function.
+
+(deftransform /= /=-transform (x &rest more)
+  (cond ((null more) 't)
+	((null (cdr more))
+	 `(not (= ,x ,(car more))))
+	(t '%pass%)))
+
+
+;;; Transforms for max and min.  Zap one-arg case and open-code
+;;; two-arg case.
+
+(deftransform max max-transform (x &rest more)
+  (cond ((null more) `(values ,x))
+	((null (cdr more))
+	 (once-only ((a x) (b (car more)))
+	   `(if (> ,a ,b) ,a ,b)))
+	(t '%pass%)))
+
+(deftransform min min-transform (x &rest more)
+  (cond ((null more) `(values ,x))
+	((null (cdr more))
+	 (once-only ((a x) (b (car more)))
+	   `(if (< ,a ,b) ,a ,b)))
+	(t '%pass%)))
+
+
+;;; Transform for multi-arg arithmetic and logical functions.
+
+(defun multi-arith (form)
+  (if (< (length form) 4)
+      '%pass%
+      (do ((f form `(,op (,op ,(cadr f) ,(caddr f)) ,@(cdddr f)))
+	   (op (car form)))
+	  ((< (length f) 4) f))))
+
+(push 'multi-arith (get '+ 'clc-transforms))
+(push 'multi-arith (get '- 'clc-transforms))
+(push 'multi-arith (get '* 'clc-transforms))
+(push 'multi-arith (get '/ 'clc-transforms))
+(push 'multi-arith (get 'logior 'clc-transforms))
+(push 'multi-arith (get 'logxor 'clc-transforms))
+(push 'multi-arith (get 'logand 'clc-transforms))
+(push 'multi-arith (get 'logeqv 'clc-transforms))
+
+;;; Some of the following use EQL on numbers deliberately.  If the number
+;;; is merely = to 1 or 0, it might be a float and should cause contagion.
+;; we cheat and use EQ since it works on -20 clisp.  Fix if ported.
+
+(deftransform + +-transform (&rest args)
+  (cond ((null args) 0)
+	((null (cdr args)) `(values ,(car args)))
+	((cddr args) '%pass%)
+	((eq (car args) 0) `(values ,(cadr args)))
+	((eq (car args) 1) `(1+ ,(cadr args)))
+	((eq (cadr args) 0) `(values ,(car args)))
+	((eq (cadr args) 1) `(1+ ,(car args)))
+	(t '%pass%)))
+
+(deftransform - --transform (x &rest args)
+  (cond ((cdr args) '%pass%)
+	((eq (car args) 0) `(values ,x))
+	((eq (car args) 1) `(1- ,x))
+	(t '%pass%)))
+
+(deftransform * *-transform (&rest args)
+  (cond ((null args) 1)
+	((null (cdr args)) `(values ,(car args)))
+	((cddr args) '%pass%)
+	((eq (car args) 1) `(values ,(cadr args)))
+	((eq (cadr args) 1) `(values ,(car args)))
+	((or (eq (car args) 0) (eq (cadr args) 0)) 0)
+	(t '%pass%)))
+
+(deftransform / /-transform (x &rest args)
+  (cond ((null args) `(/ 1 ,x))
+	((cdr args) '%pass%)
+	((eql (car args) 0)
+	 (clc-warning "Dividing by constant 0.")
+	 '%pass%)
+	((eq (car args) 1) `(values ,x))
+	(t '%pass%)))
+
+;;; Transform one-arg forms to two-arg with 1 as second arg.  Also
+;;; if not for value, just eval args for side-effect.
+
+(defun second-arg-is-1 (form)
+  ;; All of these guys return multiple values.
+  (cond ((cddr form) '%pass%)
+	(t `(,(car form) ,(cadr form) 1))))
+
+(push 'second-arg-is-1 (get 'truncate 'clc-transforms))
+(push 'second-arg-is-1 (get 'floor 'clc-transforms))
+(push 'second-arg-is-1 (get 'ceiling 'clc-transforms))
+(push 'second-arg-is-1 (get 'round 'clc-transforms))
+(push 'second-arg-is-1 (get 'ftruncate 'clc-transforms))
+(push 'second-arg-is-1 (get 'ffloor 'clc-transforms))
+(push 'second-arg-is-1 (get 'fceiling 'clc-transforms))
+(push 'second-arg-is-1 (get 'fround 'clc-transforms))
+
+
+;;; Handle degenerate 0 and 1 arg cases of logical functions.
+
+(deftransform logior logior-transform (&rest args)
+  (cond ((null args) 0)
+	((null (cdr args)) `(values ,(car args)))
+	(t '%pass%)))
+
+(deftransform logxor logxor-transform (&rest args)
+  (cond ((null args) 0)
+	((null (cdr args)) `(values ,(car args)))
+	(t '%pass%)))
+
+(deftransform logand logand-transform (&rest args)
+  (cond ((null args) -1)
+	((null (cdr args)) `(values ,(car args)))
+	(t '%pass%)))
+
+;;; Other logical functions.
+
+(deftransform logeqv logeqv-transform (&rest args)
+  (cond ((null args) -1)
+	((null (cdr args)) `(values ,(car args)))
+	((null (cddr args))
+	 `(lognot (boole 6 ,(car args) ,(cadr args))))
+	(t '%pass%)))
+
+(deftransform lognand lognand-transform (x y)
+  `(boole 14 ,x ,y))
+
+(deftransform lognor lognor-transform (x y)
+  `(boole 8 ,x ,y))
+
+(deftransform logandc1 logandc1-transform (x y)
+  `(boole 2 ,x ,y))
+
+(deftransform logandc2 logandc2-transform (x y)
+  `(boole 4 ,x ,y))
+
+(deftransform logorc1 logorc1-transform (x y)
+  `(boole 11 ,x ,y))
+
+(deftransform logorc2 logorc2-transform (x y)
+  `(boole 13 ,x ,y))
+
+(deftransform logtest logtest-transform (x y)
+  `(not (zerop (boole 1 ,x ,y))))
+
+(deftransform logbitp logbitp-transform (x y)
+  `(not (zerop (ldb (byte 1 ,x) ,y))))
+
+;;; Byte specifier is just the cons of Size and Position.
+
+(defsynonym byte cons)
+(defsynonym byte-size car)
+(defsynonym byte-position cdr)
+
+(deftransform ldb-test ldb-test-transform (bytespec x)
+  `(not (zerop (ldb ,bytespec ,x))))
+
+
+;;;; VECTOR and ARRAY HACKERY.
+
+;;; General Lisp-level accessors:
+
+(deftransform aref aref-transform (array &rest indices)
+  (let ((index (car indices)))
+    (if (null (cdr indices))
+	(case (find-type array)
+	  (simple-vector `(svref ,array ,index))
+	  (simple-string `(schar ,array ,index))
+	  (simple-bit-vector `(sbit ,array ,index))
+	  (simple-array `(lisp::%sp-saref1 ,array ,index))
+	  (t '%pass%))
+	'%pass%)))
+
+(deftransform char char-transform (array index)
+  (if (eq (find-type array) 'simple-string)
+      `(schar ,array ,index)
+      `(aref ,array ,index)))
+
+(deftransform bit bit-transform (array index)
+  (if (eq (find-type array) 'simple-bit-vector)
+      `(sbit ,array ,index)
+      `(aref ,array ,index)))
+
+;;; General Lisp-level setters:
+
+(deftransform %aset %aset-transform (array index new &rest more)
+  (if (null more)
+      (case (find-type array)
+	(simple-vector `(%svset ,array ,index ,new))
+	(simple-string `(%scharset ,array ,index ,new))
+	(simple-bit-vector `(%sbitset ,array ,index ,new))
+	(simple-array `(lisp::%sp-saset1 ,array ,index ,new))
+	(t '%pass%))
+      '%pass%))
+
+(deftransform %charset %charset-transform (array index new)
+  (if (eq (find-type array) 'simple-string)
+      `(%scharset ,array ,index ,new)
+      `(%aset ,array ,index ,new)))
+
+(deftransform %bitset %bitset-transform (array index new)
+  (if (eq (find-type array) 'simple-bit-vector)
+      `(%sbitset ,array ,index ,new)
+      `(%aset ,array ,index ,new)))
+
+(defsynonym svref lisp::%sp-svref)
+(defsynonym lisp::%svset lisp::%sp-svset)
+
+
+;;;; CHARACTER FUNCTIONS
+
+;;; CHAR= is just EQ in this system.
+
+(deftransform char= char=-transform (char &rest more)
+  (cond ((null more) t)
+	((null (cdr more)) `(eq ,char ,(car more)))
+	(t '%pass%)))
+
+;;; Handle >2 arg cases just like numerical comparisons.
+#|
+(push 'multi-compare (get 'char= 'clc-transforms))
+(push 'multi-compare (get 'char> 'clc-transforms))
+(push 'multi-compare (get 'char< 'clc-transforms))
+(push 'multi-compare (get 'char>= 'clc-transforms))
+(push 'multi-compare (get 'char<= 'clc-transforms))
+|#
+;;; Like /=, this requires that all chars be compared.
+
+(deftransform char/= char/=-transform (char &rest more)
+  (cond ((null more) t)
+	((null (cdr more)) `(not (eq ,char ,(car more))))
+	(t '%pass%)))
+
+
+;;; A transform for FORMAT, courtesy of Skef.
+
+(deftransform format format-transform (stream control &rest args)
+  (if (and (simple-string-p control)
+	   (trivialp stream)
+	   (or (eq stream t) (eq (find-type stream) 'stream)))
+      (do* ((index 0)
+	    (forms ())
+	    (end (length control))
+	    (penultimus (1- end))
+	    (stream-var (new-internal-variable))
+	    (stream-form (if (eq stream t) () `(,stream-var))))
+	  ((= index end)
+	   `(let (,@(if (eq stream t)
+			()
+			`((,stream-var ,stream))))
+	      ,@(nreverse forms)
+	      nil))
+	(let* ((command-index (position #\~ (the simple-string control)
+					:start index)))
+	  (cond (command-index
+		 (when (= command-index penultimus)
+		   (clc-error "FORMAT control string ends in a ~~: ~S" control)
+		   (return '%pass%))
+		 ;; Get the format directive.
+		 (let ((command-char (schar control (1+ command-index))))
+		   ;; Non-command stuff gets write-string'ed out.
+		   (if (/= index command-index)
+		       (push `(write-string
+			       ,(subseq (the simple-string control)
+					index command-index)
+			       ,@stream-form)
+			     forms))
+		   ;; Generate code for the command.
+		   (push
+		    (case command-char
+		      ((#\b #\B) `(let ((*print-base* 2))
+				    (princ ,(pop args) ,@stream-form)))
+		      ((#\o #\O) `(let ((*print-base* 8))
+				    (princ ,(pop args) ,@stream-form)))
+		      ((#\d #\D) `(let ((*print-base* 10))
+				    (princ ,(pop args) ,@stream-form)))
+		      ((#\x #\X) `(let ((*print-base* 16))
+				    (princ ,(pop args) ,@stream-form)))
+		      ((#\a #\A) `(princ ,(pop args) ,@stream-form))
+		      ((#\s #\S) `(prin1 ,(pop args) ,@stream-form))
+		      (#\% `(terpri ,@stream-form))
+		      (#\& `(fresh-line ,@stream-form))
+		      (#\| `(write-char #\form ,@stream-form)) ; |) for EMACS
+		      (#\~ `(write-char #\~ ,@stream-form))
+		      (#\newline
+		       (let ((new-pos (position-if-not
+				       #'whitespace-char-p
+				       (the simple-string control)
+				       :start (+ command-index 2))))
+			 (if new-pos
+			     (setq command-index (- new-pos 2)))))
+		      (t (return '%pass%)))
+		    forms))
+		 (setq index (+ command-index 2)))
+		(t
+		 ;; Write out the final part of the string.
+		 (push `(write-string ,(subseq (the simple-string control)
+					       index end)
+				      ,@stream-form)
+		       forms)
+		 (setq index end)))))
+      '%pass%))
+
+
+
+;;; Write-Line and Write-String take keyword args, but people call them who 
+;;; don't want to cons.  So we turn them into calls to non-keyword parsing 
+;;; functions.
+
+(deftransform write-string write-string-transform
+  (string &optional (stream '*standard-output*)
+	  &key (start 0) (end))
+  `(lisp::%sp-write-string ,string ,stream ,start ,end))
+
+(deftransform write-line write-line-transform
+  (string &optional (stream '*standard-output*)
+	  &key (start 0) (end))
+  `(progn
+    (lisp::%sp-write-string ,string ,stream ,start ,end)
+    (terpri ,stream)))
+
+(deftransform do do-transform (varlist endlist &body body)
+  (let ((decl nil) (inits nil) (steps nil) (l1 (gensym)) (l2 (gensym)))
+    ;; Check for illegal old-style do.
+    (if (or (and varlist (atom varlist))
+            (and endlist (atom endlist)))
+        (error "Ill-formed DO -- possibly illegal old style DO?" nil))
+    ;; Dig out the declarations.
+    (do ((b body (cdr b)))
+        ((or (atom b)
+             (not (and b (car b) (listp (car b))
+                       (eq (caar b) 'declare))))
+         (setq decl (nreverse decl))
+         (setq body b))
+      (setq decl (cons (car b) decl)))
+    ;; Parse the varlist to get inits and steps.
+    (do ((vl varlist (cdr vl))
+         (v))
+        ((atom vl))
+      (setq v (car vl))
+      (cond ((atom v)
+             (setq inits (cons v inits)))
+            ((and (= (length v) 1) (symbolp (car v)))
+             (setq inits (cons (car v) inits)))
+            ((and (= (length v) 2) (symbolp (car v)))
+             (setq inits (cons v inits)))
+            ((and (= (length v) 3) (symbolp (car v)))
+             (setq inits (cons (list (car v) (cadr v)) inits))
+             (setq steps (cons (caddr v) (cons (car v) steps))))
+            (t (error "~S is illegal form in a DO varlist." v))))
+    ;; And finally construct the new form.
+    `(block nil
+       (let ,(nreverse inits)
+         ,@decl
+         (tagbody
+           (go ,L2)
+          ,L1
+           ,@body
+           (psetq ,@(nreverse steps))
+          ,L2 
+           (unless ,(car endlist) (go ,L1))
+           (return (progn ,@(cdr endlist))))))))
+
+
+
+(deftransform do* do*-transform (varlist endlist &body body)
+  (let ((decl nil) (inits nil) (steps nil) (l1 (gensym)) (l2 (gensym)))
+    ;; Check for illegal old-style do.
+    (if (or (and varlist (atom varlist))
+            (and endlist (atom endlist)))
+        (error "Ill-formed DO -- possibly illegal old style DO?" nil))
+    ;; Dig out the declarations.
+    (do ((b body (cdr b)))
+        ((or (atom b)
+             (not (and b (car b) (listp (car b))
+                       (eq (caar b) 'declare))))
+         (setq decl (nreverse decl))
+         (setq body b))
+      (setq decl (cons (car b) decl)))
+    ;; Parse the varlist to get inits and steps.
+    (do ((vl varlist (cdr vl))
+         (v))
+        ((atom vl))
+      (setq v (car vl))
+      (cond ((atom v)
+             (setq inits (cons v inits)))
+            ((and (= (length v) 1) (symbolp (car v)))
+             (setq inits (cons (car v) inits)))
+            ((and (= (length v) 2) (symbolp (car v)))
+             (setq inits (cons v inits)))
+            ((and (= (length v) 3) (symbolp (car v)))
+             (setq inits (cons (list (car v) (cadr v)) inits))
+             (setq steps (cons (caddr v) (cons (car v) steps))))
+            (t (error "~S is illegal form in a DO varlist." v))))
+    ;; And finally construct the new form.
+    `(block nil
+       (let* ,(nreverse inits)
+         ,@decl
+         (tagbody
+           (go ,L2)
+          ,L1
+           ,@body
+           (setq ,@(nreverse steps))
+          ,L2 
+           (unless ,(car endlist) (go ,L1))
+           (return (progn ,@(cdr endlist))))))))
+
+
+(deftransform dotimes dotimes-transform
+  ((var count &optional (result nil)) &body body)
+  (cond ((numberp count)
+         `(do ((,var 0 (1+ ,var)))
+              ((>= ,var ,count) ,result)
+            ,@body))
+        (t (let ((v1 (gensym)))
+             `(do ((,var 0 (1+ ,var)) (,v1 ,count))
+                  ((>= ,var ,v1) ,result)
+                ,@body)))))
+
+
+(deftransform dolist dolist-transform
+  ((var list &optional (result nil)) &body body)
+  (let ((v1 (gensym)))
+    `(do* ((,v1 ,list (cdr ,v1))
+           (,var (car ,v1) (car ,v1)))
+          ((atom ,v1) ,result)
+        ,@body)))
+
+
+;;; Map-hash
+
+;;; The following code is actually not quite as good as the code
+;;; in the interpreter.  However because it is inline, it allows us
+;;; to avoid producing closures in many cases.  At the moment this
+;;; is a great advantage.
+
+;;; The following is a sneaky way to produce Lisp objects with arbitrary
+;;; binary codes.
+
+;;; delkey is a special key used for deleted objects
+
+(defvar delkey (lisp::%deposit-word 5 #o010000000126))
+
+;;; nilkey is a special key used for NIL, since nil mean unassigned
+
+(defvar nilkey (lisp::%deposit-word 5 #o010000000000))
+
+;;; Now for the actual transform
+
+(deftransform maphash maphash-trans (&rest form)
+  (let (fn key funcallp hashtab)
+    (setq fn (car form)
+	  hashtab (cadr form))
+    (cond ((atom fn) (setq funcallp t))
+	  ((eq (car fn) 'quote)
+	   (error "Use /#/' for functional args.")
+	   (setq fn (cadr fn)))
+	  ((eq (car fn) 'function) (setq fn (cadr fn)))
+	  (t (setq funcallp t)))
+    (setq fn (cond (funcallp `(funcall ,fn key (lisp::%sp-svref hashtab index2)))
+		   (t `(,fn key (lisp::%sp-svref hashtab index2)))))
+    `(let* ((makmaph-hashtab ,hashtab)
+	    (hashsize (lisp::%sp-svref makmaph-hashtab 0))
+	    (hashtab (lisp::%sp-svref makmaph-hashtab 5))
+	    key)
+	(do ((index 0 (1+ index))
+	     (index2 hashsize (1+ index2)))
+	    ((eq index hashsize))
+	  (unless (or (not (setq key (lisp::%sp-svref hashtab index)))
+		      (eq key delkey))
+		  (if (eq key nilkey)
+		      (setq key nil))
+		  ,fn))))))))
+
+(defun whitespace-char-p (c) (lisp::whitespacep c))

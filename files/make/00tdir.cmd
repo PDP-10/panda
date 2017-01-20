@@ -1,0 +1,22 @@
+   
+get make.hlp
+get macro.c
+get 00revhst.txt
+get make.c
+get main.c
+get 00dir.cmd
+get 00dir.lst
+get makefile.vms
+get input.c
+get h.h
+get rules.c
+get system.c
+get reader.c
+get makefile.foo
+get makefile.kcc
+get makefile.
+get check.c
+get makefile.msc
+get 00readme.
+get makefile.unix
+get vaxvms.c

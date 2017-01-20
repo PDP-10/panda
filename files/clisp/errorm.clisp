@@ -1,0 +1,227 @@
+;;; **********************************************************************
+;;; This code was written as part of the Spice Lisp project at
+;;; Carnegie-Mellon University, and has been placed in the public domain.
+;;; If you want to use this code or any part of Spice Lisp, please contact
+;;; Scott Fahlman (FAHLMAN@CMUC). 
+;;; **********************************************************************
+;;;
+;;; Macros & declarations extracted from Errorfuns.slisp
+;;;   Should be incorporated into the standard compiler.
+;;;
+;;; Written by Jim Large
+;;;
+;;; **********************************************************************
+
+(in-package 'lisp)
+
+(export '(condition-bind condition-case condition-psetq check-type
+          assert errset))
+
+;;; condition-bind & condition-setq return forms which use this variable
+
+(defvar condition-handler-bindings ()
+  "The binding stack where condition handlers are stored.")
+
+;;; Condition-Bind
+
+;;; a bind-spec is (cond-spec handler).
+;;; a bind-form is (CONS 'condition-name handler)
+;;; a cond-spec is condition name, or list of condition names.
+
+(defmacro condition-bind (bindings &rest forms)
+  "Eval forms under temporary new condition handlers.  See manual for details."
+  ;;cdr down the bindings list & build a list of bind-forms which will eval to
+  ;;new bindings for the condition-handler-bindings stack
+  (do ((bind-specs bindings (cdr bind-specs))
+       (bind-forms ())
+       (cond-spec  ()))   ;referenced often
+
+      ;;when done building bind-forms, return a let which binds the old stack,
+      ;;pushes the results of the bind-forms on it, and evals the user forms.
+      ((null bind-specs)
+       `(let ((condition-handler-bindings
+		   (list* ,@(nreverse bind-forms)
+			  condition-handler-bindings)))
+	  (declare (special condition-handler-bindings))
+	  ,@forms))
+
+    ;; LOOP BODY
+    (setq cond-spec (caar bind-specs))
+
+    ;;Condition names are quoted, so check the type now.  must be symbol,
+    ;;or a list of symbols.  if not return form which signals error.
+    (if (not (or (symbolp cond-spec)
+		 (and (not (atom cond-spec))		;(not (atom foo)) works
+		      (do ((name cond-spec (cdr name)))	;  in Slisp & Maclisp.
+			  ((null name) 't)
+			(if (not (symbolp (car name)))
+			    (return ()))))))
+	(return `(cerror ':wrong-type-argument
+			 "bad condition spec ~s. should be symbol or list of ~
+			 symbols."
+			,cond-spec)))
+
+    ;;now build a bind-form for each condition-name in cond-spec
+    (if (not (atom cond-spec))
+	(do ((name cond-spec (cdr name)))
+	    ((null name) ())
+	  (push `(cons ',(car name) ,(nth 1 (car bind-specs))) bind-forms))
+	(push `(cons ',cond-spec ,(nth 1 (car bind-specs))) bind-forms))))
+;;; Condition-Psetq
+
+;;; Condition-psetq is the same as condition-bind except that the bind-specs
+;;; list is of the form (cond-spec handler cond-spec handler ... ), and the
+;;; form returned is a setq, not a let.
+
+(defmacro condition-psetq (&rest specs)
+   "Establish new condition handlers for duration of active condition-bind."
+  (if
+   (oddp (length specs))
+  `(cerror ':contradictory-arguments
+	    "conditions and handlers must come in pairs.")
+
+  (do ((bind-specs specs (cddr bind-specs))
+       (bind-forms ())
+       (cond-spec ()))
+
+      ((atom bind-specs)				;Use list* here so if
+       `(cdar (setq condition-handler-bindings		;a handler is unbound
+		    (list* ,@(nreverse bind-forms)	;the whole form fails
+			   condition-handler-bindings))))
+
+    (setq cond-spec (nth 0 bind-specs))
+
+    ;;Condition names are quoted, so check the type now.  must be symbol,
+    ;;or a list of symbols.  if not return form which signals error.
+    (if (not (or (symbolp cond-spec)
+		 (and (not (atom cond-spec))		;(not (atom foo)) works
+		      (do ((name cond-spec (cdr name)))	;  in Slisp & Maclisp.
+			  ((null name) 't)
+			(if (not (symbolp (car name)))
+			    (return ()))))))
+	(return `(cerror ':wrong-type-argument
+			 "bad condition spec ~s. should be symbol or list of ~
+			 symbols."
+			 cond-spec)))
+
+    ;;now build a bind-form for each condition-name in cond-spec
+    (if (not (atom cond-spec))
+	(do ((name cond-spec (cdr name)))
+	    ((null name) ())
+	  (push `(cons ',(car name) ,(nth 1 bind-specs)) bind-forms))
+	(push `(cons ',cond-spec ,(nth 1 bind-specs)) bind-forms)))))
+;;; Condition-Case
+
+;;; returns a form which does the following:
+;;; - condition-binds all of the named conditions to #'condition-case-handler.
+;;;    condition-case-handler handles any condition by leaving the condition's
+;;;    name in the special, handler-finger-print, and throwing to the catch
+;;;    tag condition-case.
+;;; - evaluates the form while catching condition-case
+;;; - if handler-finger-print has been touched use it as the case key.
+;;;    otherwise return all the values returned by form.
+(defmacro condition-case (form &rest clauses)
+  (do ((clauzez clauses (cdr clauzez))
+       (bindings-list () (append bindings-list
+				 (make-handler-bindings (caar clauzez)))))
+      ((null clauzez)
+       `(let* ((condition-handler-bindings
+		(nconc ',bindings-list condition-handler-bindings))
+	       (handler-finger-print ())
+	       (results (multiple-value-list (catch 'condition-case ,form))))
+	  (declare (special condition-handler-bindings))
+	  (if handler-finger-print
+	      (case handler-finger-print
+		,@clauses)
+	      (values-list results))))
+    ))
+
+;;; make-handler-bindings accepts a symbol or a list of symbols and returns
+;;;  a list of forms (symbol . #'condition-case-handler), one for each symbol.
+;;;  several of these lists can be appended to the condition-handler-binding
+;;;  stack to form new condition bindings.
+(eval-when (compile load eval)
+  (defun make-handler-bindings (key-form)
+    (do ((keys (if (listp key-form) key-form (list key-form)) (cdr keys))
+	 (b-list () (cons
+		     (cons (car keys) #'condition-case-handler)
+		     b-list)))
+	((null keys) b-list)))
+  )
+
+
+
+(proclaim '(special handler-finger-print))
+
+(defun condition-case-handler (condition &rest ignore)
+  (declare (ignore ignore))
+  (setq handler-finger-print condition)
+  (throw 'condition-case ()))
+
+;;; Assert & check-type
+
+(defvar *assertion-references* ()
+  "A list of the REFERENCE args to the current failed assertion.")
+
+(defvar *assertion-test* ()
+  "The test form in the current failed assertion.")
+
+(defmacro assert (test &rest args)
+  "Signals an error if the value of TEST-FORM is NIL.  Continuing from this
+  error will allow the user to alter the values of some variables, and ASSERT
+  will then start over, evaluating TEST-FORM again.  Returns NIL."
+  (do ((args args (cdr args)) 
+       (references () (cons (car args) references)))
+      ((or (null args) (stringp (car args)))
+       (let ((format-string (car args))
+	     (format-args (cdr args))
+	     (references (reverse references)))
+	 `(PROG ((*ASSERTION-REFERENCES* ',references)
+		 (*ASSERTION-TEST* ',test))
+	    TOP
+	    (IF ,test (RETURN ()))
+	    (CERROR "Test the assertion again."
+		    ,(if format-string format-string "Failed assertion.")
+		    ,@format-args)
+	    (GO TOP))))))
+
+
+
+(defmacro check-type (place typespec &optional string)
+  "Signals an error if the contents of PLACE are not of the desired type.  If
+  the user continues from this error, he will be asked for a new value;
+  CHECK-TYPE will store the new value in PLACE and start over.  See manual for
+  details."
+  `(PROG ()
+     TOP
+     (IF (TYPEP ,place ',typespec) (RETURN T))
+     (CERROR "Prompt for a value to use."
+	     "~s should hold an object of type ~a."
+	     ',place
+	     ,(if string string `(quote ,typespec)))
+     (FORMAT *QUERY-IO*
+	     "~%Give a value of type ~a for ~s: "
+	     ,(if string string `(quote ,typespec))
+	     ',place)
+     (SETF ,place (EVAL (READ *QUERY-IO*)))
+     (GO TOP)
+     ))
+
+
+(defmacro errset (form flag)
+  "Maclisp errset.  Normally, the values from form are returned.  If
+  an error occurs, then the error message is printed out (if flag is
+  non-nil) and nil is returned."
+  `(catch 'catch-error
+     (condition-bind
+      ((:error (if ,flag
+		   #'(lambda (ignore continue-string function-name
+				     error-string &rest args)
+		       (declare (ignore ignore))
+		       (error-print error-string args function-name
+				    continue-string)
+		       (throw 'catch-error nil))
+		   #'(lambda (&rest ignore)
+		       (declare (ignore ignore))
+		       (throw 'catch-error nil)))))
+      ,form)))

@@ -1,0 +1,1365 @@
+%TITLE 'U T L V F Y -- verify ISAM index structure'
+!<BLF/REQUIRE 'RMSBLF.REQ'>
+MODULE utlvfy (					! Verify ISAM index structure
+		IDENT = '2.0'
+		) =
+BEGIN
+!
+!
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1980, 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+!
+
+!++
+! FACILITY:	RMS UTILITY (RMSUTL)
+!
+! ABSTRACT:	This module contains scanning loop for VERIFY.
+!		It also does fix-ups and shows progress.
+!
+!
+! AUTHOR:	S. Cohen			CREATION DATE:	23 May 80
+!
+!
+! MODIFIED BY:
+!
+!	Ron Lusk, 3-Feb-84 : VERSION 2.0
+! 423	-   Fix up for version 2: reformat, cleanup.
+! 454	-   In SCANBKT, do not scan a bucket with no
+! 	    entries, and set PPLEV1 to 0 so that the
+!	    "previous bucket" checks do not take place
+!	    when the succeeding bucket is scanned.
+! 455	-   Change progress reporting in SCNBKT to use
+!	    RMSM2 formats and routine.  This way, all
+!	    key datatypes may be reported.
+!
+!  Version 3
+! 366  -    Apply old Davenport fix to SIDRADJ
+!           9/15/86 asp
+!
+!--
+
+! REQUIRE FILES:
+!
+
+REQUIRE 'rmslus';
+
+LIBRARY 'rmslib';
+
+LIBRARY 'utlext';
+
+!<BLF/MACRO>
+! MACROS:
+!
+! U$*** - INTERFACE TO $UTLINT (EXTERNAL ACCESS TO RMS ROUTINES)
+!
+! U$BOTH - CALL $UTLINT & FALL THRU
+! U$IFF - CALL $UTLINT IN RMS & TEST FOR FAILURE
+! U$IFS - CALL $UTLINT IN RMS & TEST FOR SUCCESS
+! U$SUC - CALL $UTLINT & ABORT IF FAILURE
+!
+!	THESE MACROS ACCEPT A $UTLINT FUNCTION CODE MINUS THE U$
+!	THE REMAINING ARGUMENTS ARE FUNCTION-DEPENDENT
+!	THE MACROS ASSUME THAT THERE IS A STRUCT CALLED "ARGBLK"
+!	U$SUC USES THE ERROR LABEL "INTERR"
+!
+
+MACRO
+    u$both (funct) =
+	bld_arg_lst (argblk, %NAME (u$, funct), %REMAINING);
+	$utlint (argblk, bugerr)		!NOTE NO ERR LABEL
+    %;
+
+!<BLF/NOMACRO>
+
+MACRO
+    u$iff (funct) =
+	u$both (funct, %REMAINING);
+	IF .argblk EQL 0			!FAIL TEST
+%;
+
+MACRO
+    u$ifs (funct) =
+	u$both (funct, %REMAINING);
+	IF .argblk NEQ 0			!SUCC TEST
+%;
+
+!<BLF/MACRO>
+
+MACRO
+    u$suc (funct) =
+	BEGIN
+	bld_arg_lst (argblk, %NAME (u$, funct), %REMAINING);
+	$utlint (argblk, interr);
+	END
+    %;
+
+MACRO 						!			!A423
+!									!A423
+!   $$COMMA yields a comma if any arguments are passed			!A423
+!   to it.  It is used in macros which call routines			!A423
+!   with a variable number of parameters; when a			!A423
+!   routine is called as "SUMRTN (A, B, %REMAINING)",			!A423
+!   if %REMAINING is null, the comma after "B" will			!A423
+!   evoke a "Null expression appears..." error.  Using			!A423
+!   "SUMRTN (A, B $$COMMA[%REMAINING] %REMAINING)" is			!A423
+!   cumbersome, but avoids this error.					!A423
+!									!A423
+    $$comma [] =
+	, %;
+
+!
+! ERRUX - EXPLANATION LINE OF ERR FOR UNEXP RMS ERROR
+!
+
+MACRO
+    errux =
+	verinfo (utlurf, 			! .
+	    zown, 				! .
+	    rmevec [.$field (sts, .rab) - er$bas], 	! .
+	    .$field (stv, .rab))		! .
+    %;
+
+! FIXING - TEST IF V$FIX APPLIES
+! UNCING - TEST IF UNCLUTTER APPLIES
+!
+
+MACRO
+    fixing =
+	(.v$fix NEQ 0) %;
+
+MACRO
+    uncing =
+	(.sc$case EQL sc_uncl) %;
+
+! GB_VERIF - GET A BKT & OUTPUT APPROP MESSAGES IF NECES
+!
+
+MACRO
+    gb_verif (page$, size$, lock$, bd$) =
+	BEGIN
+
+	LOCAL
+	    R1;
+
+	R1 = bd$get (page$, size$, lock$, bd$, bbm_none);
+
+	IF .R1 LSS 0 THEN %NAME ('TRAP.U') ();	! Fake an UNWIND
+
+	!+
+	!   See if the bucket is clobbered (the test is
+	!   a kludge) and tell the user about it if so.
+	!-
+
+	IF .R1 GTR 1				! Clobbered?
+	THEN
+	    verrarb (utlpnv, 0, page$, .R1, .kdb [kdbref]);	! Tell user
+
+	END
+    %;
+
+!
+! MODBKT - PERFORM ACTION AND SET BKT UPD FLAG
+!
+
+MACRO
+    modbkt (action, bd) =
+	BEGIN
+	action;
+	setupd (bd);				!INDIC MUST WRITE
+	END
+    %;
+
+!
+! VERR - OUTPUTS "USUAL" MSG DESCRIBING PROBLEM DETECTED DIRECTLY BY UTLVFY
+!
+
+MACRO
+    verr (text$) =
+	verrarb (utlvem, 0, UPLIT (%ASCIZ text$), .ent_rfa) %;
+
+! VERRFIX - OUTPUTS "USUAL" MSG FOR FIXABLE PROBLEM
+!
+
+MACRO
+    verrfix (text$) =
+	verrarb (utlvef, 1, UPLIT (%ASCIZ text$), .ent_rfa, .fixsfx) %;
+
+! VERRC - OUTPUTS "USUAL" MSG FOR PROBLEM DETECTED IN FILE BY CALL TO RMS
+!
+
+MACRO
+    verrc (text$) =
+	BEGIN
+	verrarb (utlvem, 0, UPLIT (%ASCIZ text$), .ent_rfa);
+	errux
+	END
+    %;
+
+!<BLF/NOMACRO>
+!
+! VERRARB - OUTPUTS ARBITRARY VERIFY ERR MSG TO REPORT FILE
+!
+
+MACRO
+    verrarb (fmt, fixable) =
+	BEGIN
+
+	EXTERNAL
+	    %NAME (fmt);
+
+	%IF NOT fixable
+	%THEN
+	    currerr = .currerr + 1;		!BUMP ERRS DETECTED FOR CURR BKT
+
+	    IF fixing OR uncing			!TERMINATE UPDATES FOR SAFETY
+	    THEN
+		BEGIN				!YES
+		verinfo (utlcrs);		!CHANGING TO RETR MODE
+		sc$case = sc_ver;		!UNCL OFF
+		v$fix = 0;			!FIX OFF
+		fixsfx = UPLIT (%ASCIZ' [Fixable]');
+		END;
+
+	%FI
+
+	!+
+	!   IF statement is a kludge to insure that
+	!   an ADJSP immediately follows the
+	!   PUSHJ 17,TX$TOUT instruction.
+	!-
+
+	IF tx$rpt NEQ 0				!
+	THEN
+	    tx$rpt (%REMAINING $$comma[%REMAINING] %NAME (fmt) );
+
+	v$err = v$err + 1;			!FOR SUMMARY MSG
+	END
+    %;
+
+!
+! VERINFO - OUTPUTS INFO MSG TO REPORT FILE
+!
+
+MACRO
+    verinfo (fmt) =
+	BEGIN
+
+	EXTERNAL
+	    %NAME (fmt);
+
+	!+
+	!   IF statement is a kludge to insure that
+	!   an ADJSP immediately follows the
+	!   PUSHJ 17,TX$TOUT instruction.
+	!-
+
+	IF tx$rpt NEQ 0				!
+	THEN
+	    tx$rpt (%REMAINING $$comma[%REMAINING] %NAME (fmt) );
+
+	END
+    %;
+
+!
+! EQUATED SYMBOLS:
+!
+
+LITERAL
+    flgdup = xb$dup,				! KLUDGE FOR "DUPLICATES" MACRO
+    rfmfix = fb$fix,				! DITTO "SIZEOFDATARECRD"
+    sidhsz = sidrhdrsize;			! SHORTHAND
+
+BIND
+    stplen = stript + 1;			!2ND WD OF STRING PTR
+
+OWN 						!STATIC VARIABLES FOR MODULE
+    argblk : BLOCK [5],				!SPACE FOR ARGLISTS OF $UTLINT RMS ENTRY
+    bdcurr : BLOCK [bdsize],			!BKT DESC, FOR CURR P OF SCAN
+    bdlink : BLOCK [bdsize],			!BKT DESC, FOR P LINKED TO CURR P
+    bkt : REF BLOCK,				!POINTER TO CURR BKT
+    cid,					!ID OF CURR ENTRY IN BKT
+    cpage,					!FILE PAGE AT WHICH CURR BKT LOCATED
+    currerr,					!# OF NON-FIXABLE PROBS FOR CURR BKT
+    dupstill,					!IF ON, KEYVAL SEEN IN EARLIER BKT STILL HIGHEST SEEN SO FAR
+    end_rfa,					!PHYS ADDR OF RFA TERM SCAN
+    ent_hikey,					!ENTPTR FOR ENTRY WITH HI KEY IN BKT
+    entptr : REF BLOCK,				!PTR TO CURR ENTRY IN BKT
+    ent_rfa,					!PHYS ADDR OF CURR REC
+    ent_rrv,					!RRV ADDR (IE. USER RFA ADDR) OF ENTRY
+    fixsfx,					!PTR TO ASCIZ STRING INDICATING FIX INFO
+    hsz_prim,					!# OF WDS IN HDR OF UDR (3=V, 2=F)
+    kref,					!KEY OF REFERENCE FOR SCAN
+    oopage,					!P# OF OUT-OF-ORD KEY (TO RECOG BKT LP)
+    ppage,					!FILE PAGE AT WHICH PREV BKT LOCATED
+    pplev1,					!LEVEL 1 ENT OF PATH ON PREV KEY ACC
+    progress,					!IN EFFECT SCANCNT MOD V$PREQ
+    pt1 : REF BLOCK,				!TEMP PTR
+    rdp : BLOCK [rdsize],			!REC DESC PKT CONTAINS KVAL PTR/LEN
+    rdp_rfa : BLOCK [rdsize],			!RECDESC FOR FBYRFA/RRV
+    rdp_key : BLOCK [rdsize],			!FOR CKEYKU CALL (SIDR,UDR)
+    scancnt,					!CNT OF RECS SEEN
+    sidr_occ,					!ON IF SIDR HAS AT LEAST 1 NON-NULL RFA
+    zown : INITIAL (0);				!0 VALUE = NULL STRING
+
+%SBTTL 'VR$CLEAN - insure cleanliness(?)'
+
+GLOBAL ROUTINE vr$clean : NOVALUE =
+    BEGIN
+    bd$put (bdcurr, 0);				! Insure things clean
+    bd$put (bdlink, 0);
+    RETURN;
+    END;
+
+%SBTTL 'VR$SCAN - initiate data scan'
+
+GLOBAL ROUTINE vr$scan (rfa_low, rfa_hi) : NOVALUE =
+! VR$SCAN - INIT SCAN OF DATA BKTS
+! INPUTS:
+!	RFA_LOW = THE PHYS ADDR OF ENTRY TO START SCAN
+!	RFA_HI = PHYS ADDR OF ENTRY THAT TERMINATES SCAN (0 FOR EOF)
+!	(SEE V$ACC, V$FIX, V$PREQ, & RAB IN EXTERNALS TOO)
+! NOTES:
+!	SET CONSTANT USER AND DATA STRUCT INFO (EG. KEY-OF-REF).
+!	LOCATE BKT OF LOWER LIMIT OF SCAN & GET PTR TO ITS BKT.
+!	SET KDB & USE IT TO SET KEY'S PARAMETERS.
+!	ESTABLISH RFA OF UPPER LIMIT OF SCAN.
+!	SET KEY PARAMATERS NEEDED IN SCAN.
+!	CALL APPROP SCANNING ROUTINE
+    BEGIN
+
+    IF fixing					!SET FIX MSG
+    THEN
+	fixsfx = UPLIT (%ASCIZ' [Fixing]')
+	ELSE
+	fixsfx = UPLIT (%ASCIZ' [Fixable]');
+
+    end_rfa = .rfa_hi;				!MAKE IT GLOBALLY AVAIL
+    kref = .$field (krf, .rab);			!MAKE IT EASY TO USE KEY OF REF
+    $field (rac, .rab) = rb$key;		!WILL DO KEY ACCESSES
+    pt1 = .fst [fstkdb];			!GET PRIM KEY KDB
+    hsz_prim = .pt1 [kdbhsz];			!NEEDED BY ACCUDR
+    cpage = bucketofrfa (.rfa_low);		!GET PAGE $FIND WENT TO
+    gb_verif (.cpage, .kdb [kdbdbkz], 0, bdcurr);	!GET BKT ADDR OR BARF
+    bkt = .bdcurr [bkdbktadr];			!PRESERVE IT
+    bd$put (bdlink, 0);				!INSURE CLEAN
+    rdp_rfa [rdrecptr] = 0;			!START AT BEGIN OF BKT
+    rdp_rfa [rdrfa] = .rfa_low;			! AND LOOK FOR THIS
+    u$both (fbyrfa, rdp_rfa, bdlink);		!GET LOC OF THIS ENTRY
+
+    IF .argblk EQL 0
+    THEN
+	BEGIN
+	txtout (utlsnf);			!STARTING REC NOT FOUND
+	entptr = .bkt + bhhdrsize;		!START AT TOP OF PAGE
+	END
+    ELSE
+	entptr = .rdp_rfa [rdrecptr];		!SET OFFSET
+
+    rdp [rdusersize] = .ksizb;			!FOR MOVEKEY & CKEYKU
+    rdp [rduserptr] = buf$k1;			!PT TO KEYVAL TOO
+    rdp_key [rdusersize] = .ksizb;		!SET KEY LEN
+
+    IF .sc$case EQL sc_space
+    THEN
+	scansp ()				!DO SPACE SCAN
+    ELSE
+	scanver ();				!DO VERIF SCAN
+
+    RETURN;
+    END;
+
+%SBTTL 'SCANSP - loop for SPACE scan'
+
+GLOBAL ROUTINE scansp : NOVALUE =
+! SCANSP - LOOP FOR SPACE SCAN
+! NOTES:
+!	TABULATE TOTAL SPACE AVAILABLE & SPACE USED, REPORT AS PERCENTAGE
+    BEGIN
+
+    LOCAL
+	cspace;
+
+    LOCAL
+	freept;
+
+    LOCAL
+	sizrec;
+
+    LOCAL
+	tspace;
+
+    LOCAL
+	uspace;
+
+    LOCAL
+	t1;					!TEMP FOR SHORT-TERM USE
+
+    tspace = 0;					!NO SPACE TABUL YET
+    cspace = 0;
+    uspace = 0; repeat
+
+	BEGIN					!EXIT ONLY ON ERR OR EOF
+	tspace = .tspace + (.kdb [kdbdbkz]*pagesize) - bhhdrsize;
+	uspace = .uspace + .bkt [bhnextbyte] - bhhdrsize;	!INCREM TOT & USED SPACE SEEN
+
+	IF .kref EQL 0				!IF PRIM KEY
+	THEN
+	    BEGIN				!SCAN FOR CLUTTER TOO
+	    freept = .bkt + .bkt [bhnextbyte];	!SCAN TO END OF DATA
+
+	    WHILE .entptr LSS .freept		!SCAN TO 1ST FREE WD
+	    DO
+		BEGIN
+
+		IF rrvflag (entptr) NEQ 0
+		THEN
+		    BEGIN			!REPRES CHUNK OF CLUT
+		    cspace = .cspace + .freept - .entptr;
+		    EXITLOOP;			!RRV'S AT END OF BKT
+		    END;
+
+		sizrec = sizeofdatarecrd (entptr);	!GET # OF WDS IN CURR ENT
+
+		IF deleteflag (entptr) NEQ 0 THEN cspace = .cspace + .sizrec;	!TACK ON SIZE OF DEL REC
+
+		entptr = .entptr + .sizrec;	!HOP TO NEXT ENTRY
+		END;				!END ITER OF MAIN LOOP
+
+	    END;				!END CLUTTER CHK
+
+	t1 = chkflag (bkt [bhflags], bhflgend);	!PRESERVE END STATUS
+	cpage = .bkt [bhnextbkt];		!GET P# OF NEXT BKT FOR GETBKT
+	bd$put (bdcurr, 0);			!RELEASE BKT
+
+	IF .t1 NEQ 0
+	THEN
+	    BEGIN				!REACHED END OF DATA BKTS
+	    scancnt = (.uspace*100)/.tspace;	!COMPUTE PERCENTAGE
+	    verinfo (utlssc, .kref, .scancnt);	!REPORT COMM RESULTS OF SCAN
+
+	    IF .kref EQL 0			!DO MORE FOR PRIM KEY
+	    THEN
+		BEGIN
+		scancnt = (.cspace*100)/.tspace;
+		verinfo (utlbcl, .scancnt);
+		END;
+
+	    $flush (.rab);			!MAKE RMS FILE UP TO DATE
+	    RETURN;
+	    END;
+
+	gb_verif (.cpage, .kdb [kdbdbkz], 0, bdcurr);	!GET PTR TO NEXT BKT
+	bkt = .bdcurr [bkdbktadr];		!PRESERVE IT
+	entptr = .bkt + bhhdrsize;		!PT TO 1ST ENTRY
+	END;					!LOOP
+
+    RETURN;					!INACCESSIBLE (BLISS STUPID)
+    END;					!END ROUTINE
+
+%SBTTL 'SCANVER - top-level VERIFY loop'
+
+GLOBAL ROUTINE scanver : NOVALUE =
+! SCANVER - TOP-LEVEL LOOP FOR VERIFY SCAN
+! NOTES:
+!	DOES BKT I/O & DETECTS EOF
+!	CALLS SCANBKT TO DO ALL RECORD-LEVEL WORK
+    BEGIN
+
+    LOCAL
+	t1;					!TEMP FOR SHORT-TERM USE
+
+    ent_rfa = -1;				!IN CASE 1ST DATA BKT EMPTY...
+    						!PREVENTS END_RFA=EOF=0 MATCHING
+    dupstill = 1;				!INDIC 1ST KEY
+    oopage = 0;					!NO PAGE SCANNED YET
+    pplev1 = 0;					!INDIC NO PREV BKT YET
+    progress = 0;				!INIT STATE OF SCAN
+    scancnt = 0;				!INIT CNT OF RECS SCANNED
+    repeat
+
+	BEGIN					!EXIT ONLY ON ERR OR EOF
+	cid = 0;				!INIT CURR ID
+	currerr = 0;				!INDIC NO ERRS FOR CURR BKT YET
+
+	IF .bkt [bhbtype] NEQ btypedata THEN verr ('Bucket type not DATA');	!ASSUME TYPCOD WRONG
+
+	IF .oopage EQL .cpage			!BKTS IN LOOP?
+	THEN
+	    verinfo (utlask, .kref);		!YES, TELL USER
+
+	IF .oopage EQL .cpage			!SEP TEST TO OUTWIT BLISS
+	THEN
+	    RETURN;				!... AND ABORT SCAN
+
+	scanbkt ();				!PROCESS ENTRIES IN BKT
+	t1 = chkflag (bkt [bhflags], bhflgend);	!PRESERVE END STATUS
+	ppage = .cpage;				!SAVE P# OF PREV BKT
+	cpage = .bkt [bhnextbkt];		!GET P# OF NEXT BKT FOR GETBKT
+	bd$put (bdcurr, 0);			!RELEASE BKT
+
+	IF .end_rfa EQL -1 THEN RETURN;		!FIXING A SINGLE REC
+
+	IF .t1 NEQ 0 OR .ent_rfa EQL .end_rfa
+	THEN
+	    BEGIN				!REACHED END OF DATA BKTS
+	    verinfo (utlvcm, .kref, .scancnt);	!REPORT RESULT OF SCAN
+	    $flush (.rab);			!MAKE RMS FILE UP TO DATE
+	    RETURN;
+	    END;
+
+	gb_verif (.cpage, .kdb [kdbdbkz], 0, bdcurr);	!GET PTR TO NEXT BKT
+	bkt = .bdcurr [bkdbktadr];		!PRESERVE IT
+	entptr = .bkt + bhhdrsize;		!PT TO 1ST ENTRY
+	END;					!LOOP
+
+    RETURN;					!INACCESSIBLE (BLISS STUPID)
+    END;					!END ROUTINE
+
+%SBTTL 'SCANBKT - scan entries in a bucket'
+
+GLOBAL ROUTINE scanbkt : NOVALUE =
+!
+! SCANBKT - SCANS THE ENTRIES IN A BKT
+! INPUTS
+!	BKT = PTR TO CURRENT PAGE
+!	ENTPTR = PTR TO 1ST ENTRY TO PROC IN CURR BKT
+! NOTES:
+!	VERIFIES KEYS ASCEND PROPERLY
+!	CHKS IF BKT'S RECORDS CAN BE FOUND BY KEY ACCESS
+!	VERIFIES INTER-PAGE LINKS VS. KEY-GREATER ACCESS
+!	DOES RRV BACKCHECK (CORRECTING PROB IF V$FIX)
+!	DOES UDR/SIDR COMPAT CHKS IF APPLIC (SEE ACCUDR)
+    BEGIN
+
+    LABEL
+	iter,
+	current,
+	idxseq;
+
+    LOCAL
+	currdup,				! Number of undeleted	!A047
+						!   records with current
+						!   key value
+	cval;					! Key comparison case variable
+
+    LITERAL
+	!
+	!   CVAL is set to one of these values based on the
+	!   comparison of the record key currently processed
+	!   with the key of the previous record.
+	!
+	cval$k_higher = 1,			! New key higher than old
+	cval$k_ok_dup = 2,			! New key is legal duplicate
+	cval$k_lower = 3,			! New key is lower than old
+	cval$k_err_dup = 4;			! New key is illegal duplicate
+
+    !+
+    !   Scan bucket from entry position (at initial value of
+    !   ENTPTR) until we reach the end of the data in the bucket.
+    !
+    !   Note: the label ITER is used to terminate processing in
+    !   a particular iteration of the loop WITHOUT leaving the
+    !   loop construct (by the "LEAVE iter" expression in the
+    !   loop body).  If an EXITLOOP had been used, the processing
+    !   would resume after the loop body; with the LEAVE, processing
+    !   resumes at the top of the loop (at ITER).
+    !-
+
+    WHILE .entptr LSS .bkt + .bkt [bhnextbyte] DO
+iter :
+	BEGIN
+
+	!+
+	!   If we have 3 or more non-fixable errors in this bucket,
+	!   then abort this bucket-scan and change PPLEV1 to show
+	!   no previous bucket.
+	!-
+
+	IF .currerr GEQ 3			!TREAT PAGE AS GARBAGE?
+	THEN
+	    BEGIN				!YES
+	    verinfo (utlasb);			!ABORT SCAN
+	    pplev1 = 0;				!REINIT NEXT/DOWN PTR CONSIS CHK
+	    RETURN;
+	    END;
+
+current :
+	BEGIN
+
+	!+
+	!   Report progress count: reset the progress counter,
+	!   checkpoint the file, and type a message (with current
+	!   key string) on the report device.
+	!-
+
+	IF .progress EQL .v$preq		!TIME TO REPORT?
+	THEN
+	    BEGIN				!YES
+	    LOCAL
+		strarg : VECTOR [3];		!ARGUMENTS FOR OUTPUT	!A455
+	    progress = 0;			!RESET IT
+	    $flush (.rab);			!MAKE RMS FILE UP TO DATE
+	    stript<rh> = buf$k1;		!PT TO CURR KEY STRING
+	    strarg [0] = .stript;		! Pointer for RMSM2	!A455
+	    strarg [1] = .ksizb;		! Length in bytes	!A455
+	    strarg [2] = .ktype;		! Datatype		!A455
+	    verinfo (utlvpr, strarg);		! Type message		!A455
+	    rp$put ();				!EMPTY RPT BUFFER
+	    $flush (.outrab);			!FORCE RPT DATA TO DSK TOO
+	    END;
+
+	!+
+	!   If we are verifying a range of keys, see if
+	!   we have reached the high end of the range.
+	!-
+
+	cid = .entptr [drrecordid];		!SET CURR ID
+	ent_rfa = makerfa (.cpage, .cid);	!SET ITS RFA TOO
+
+	IF .end_rfa EQL .ent_rfa		!HIT 1ST OUT OF BNDS KEY?
+	THEN
+	    RETURN;				!YES
+
+	!+
+	!   Exit the loop when we hit the RRVs.
+	!-
+
+	IF rrvflag (entptr) NEQ 0 THEN EXITLOOP;	!RRV'S AT END OF BKT
+
+	!+
+	!   If the current entry is deleted and we are
+	!   fixing up the file, expunge the entry from
+	!   the bucket and go back and scan the next entry.
+	!
+	!   Note: see comment above on "LEAVE iter".
+	!-
+
+	IF deleteflag (entptr) NEQ 0 AND fixing
+	THEN
+	    BEGIN				!DELETED & FIXING
+	    delent (bdcurr, .entptr);		!ZAP IT
+	    LEAVE iter;				!NEXT REC NOW HAS CURR ENTPTR
+	    END;
+
+	!+
+	!   If we are scanning an alternate key, then
+	!   check that we can access the UDR (ACCUDR also
+	!   checks that the alternate key matches the
+	!   key field in the UDR).  If we are in the
+	!   primary index, retrieve this entry's RRV address.
+	!-
+
+	IF .kref NEQ 0				!2NDARY KEY?
+	THEN
+	    accudr ()				!ACC USER DATA RECORD
+	ELSE
+	    ent_rrv = .entptr [drrrvaddress];	!WILL SET CKEY IF HI-ER KEY
+
+	!+
+	!   Compare the previous record's key with the key
+	!   of the record we are now processing.  Set CVAL
+	!   to indicate that the new key is greater than
+	!   the last, a legal duplicate, an illegal duplicate,
+	!   or (worst of all) lower than the previous key.
+	!   Processing will continue based on CVAL in the
+	!   next section of code.
+	!
+	!   Note: usage of BEGIN and END here is gratuitous,
+	!   to delineate the code whereunto this comment pertains.
+	!-
+
+	BEGIN
+	!
+	!   Set up the arguments for the $UTLINT call,
+	!   choosing the function based on whether
+	!   this is a primary or secondary key.
+	!
+	bld_arg_lst (argblk, 0, rdp, .entptr + .kdb [kdbhsz]);
+
+	IF .kref EQL 0				!IS IT PRIM KEY?
+	THEN
+	    argblk [rms_func] = u$ckeyku	!COMPARE KEY STRING TO UDR
+	ELSE
+	    argblk [rms_func] = u$ckeykk;	!COMP KS TO SIDR KEY
+
+	$utlint (argblk, bugerr);		!COMPARE KVCURR TO KEY OF REC
+
+	!+
+	!   Set CVAL to reflect the comparison results.
+	!-
+
+	IF .argblk NEQ 0			!TRUE IF RECORD HAS EQL OR HIGHER KEY
+	THEN
+
+	    IF lssflag (rdp) NEQ 0
+	    THEN
+		cval = cval$k_higher		!HIGHER ALW OK, PLUS CALL MOVEKEY
+	    ELSE
+
+		IF duplicates			!EQL KEYS, DUPS OK?
+		THEN
+		    cval = cval$k_ok_dup	!OK, BUT NO MOVEKEY
+		ELSE
+		    cval = cval$k_err_dup	!DUPS NOT OK, ERR
+	ELSE
+
+	    cval = cval$k_lower;		!REC LOWER NEVER OK
+
+	!+
+	!   If we are still processing a record in this bucket
+	!   which is a duplicate of a record in a previous bucket
+	!   (i.e., this is a continuation bucket) then mark it
+	!   as a "higher" record for the sake of argument.
+	!-
+
+	IF .dupstill EQL 1			!THEN 1ST TIME THRU
+	THEN
+	    cval = cval$k_higher;		!TREAT 1ST KEY AS "HIGHER"
+
+	END;					! End of comparison code
+
+	!+
+	!   We have determined what relation this record (or,
+	!   better, this key) has to the previous record.
+	!   Now, process it accordingly, flagging errors
+	!   where necessary.
+	!-
+
+	CASE .cval FROM cval$k_higher TO cval$k_err_dup OF
+	    SET
+
+	    [cval$k_higher] :
+
+		!+
+		!   New key is higher than old, so store it
+		!   away for future comparisons, among other
+		!   things.
+		!-
+
+		BEGIN				!NEW HI KEY
+
+		IF .kref EQL 0			!COPY KEYVAL, PR/SEC DEP
+		THEN
+		    u$suc (movekey, .entptr + .kdb [kdbhsz], buf$k1)	!COPY KEY VAL FOR NEXT ITER
+		ELSE
+		    movewords (.entptr + .kdb [kdbhsz], buf$k1, .ksizw);	!JUST BLT THE KEY
+
+		ent_hikey = .entptr;		!SAVE ADDR OF ENTRY WITH HI KEY
+		currdup = 0;			![%47] CLEAR CNT OF UNDEL DUPS
+		dupstill = 0;			!CLEAR FLAG
+		END;
+
+	    [cval$k_ok_dup] :
+
+		!+
+		!   Key is a valid duplicate, don't do anything.
+		!-
+
+		0;				!NO-OP FOR EQUAL KEYS
+
+	    [cval$k_lower] :
+
+		!+
+		!   Key is lower than previous record, so use it
+		!   as the key for future comparisons (to minimize
+		!   error messages in case the previous key was
+		!   illegitimately high, rather than this key being
+		!   unduly low) and give the user an error message.
+		!-
+
+		BEGIN
+		currdup = 0;			![%47] CLEAR CNT OF UNDEL DUPS
+
+		IF .entptr EQL .bkt + bhhdrsize	!1ST ENT ON PAGE?
+		THEN
+		    oopage = .cpage;		!THEN SAVE FOR LOOP DETECTION
+
+		verr ('Key value out of order');
+
+		IF .kref EQL 0			!COPY KEYVAL, PR/SEC DEP
+		THEN
+		    u$suc (movekey, .entptr + .kdb [kdbhsz], buf$k1)	!COPY KEY VAL FOR NEXT ITER
+		ELSE
+		    movewords (.entptr + .kdb [kdbhsz], buf$k1, .ksizw);	!JUST BLT THE KEY
+
+		END;
+
+	    [cval$k_err_dup] :
+
+		!+
+		!   Key is invalid duplicate, so give an error unless
+		!   the record is deleted.  Notice that the use of
+		!   CURRDUP prevents output of multiple error messages
+		!   for a chain of duplicate records with the same key.
+		!-
+
+		BEGIN
+
+		IF .currdup NEQ 0 AND deleteflag (entptr) EQL 0	![%47] DONT CONSID DEL RECS
+		THEN
+		    verr ('Duplicate key encountered');
+
+		END;
+	    TES;
+
+	!+
+	!   If we have a deleted record, then we can skip over
+	!   the key- and RFA-access checks and move on.
+	!-
+
+	IF deleteflag (entptr) NEQ 0		! Deleted record?
+	THEN
+	    LEAVE current;			! Skip access checks
+
+	currdup = .currdup + 1;			![%47] INCR CNT OF UNDEL DUPS
+
+	IF .v$acc EQL true THEN acckey ();	!ACC UDR BY 2NDARY KEYS
+
+	IF .kref EQL 0 THEN accrrv ();		!DO RRV BACK CHECK FOR UDR
+
+						!IF UNCLUT, DEL RRV IF 1
+	END;					!END "CURRENT" BLK
+
+	IF .end_rfa EQL -1 THEN RETURN;		!FIXING A SINGLE REC
+
+	entptr = .entptr + sizeofdatarecrd (entptr);	!HOP TO NEXT ENTRY
+	END;					!END ITER OF MAIN LOOP
+
+    !+
+    !   We have come through much suffering to the end of the
+    !   bucket.  If we have scanned more than one key, and have
+    !   not scanned a whole bucket of duplicate keys, then, we
+    !   must perform several checks on this bucket as a whole.
+    !-
+
+    IF .dupstill EQL 0				!1ST KEY OR SAME HI KEY AS LAST BKT?
+    THEN
+	BEGIN					!NO
+	!
+	!   Write out the bucket and then search for the
+	!   highest key in the bucket (which we stored away).
+	!
+	bd$put (bdlink, 0);			!INSURE CLEAN SLATE
+	rdp [rdrecptr] = 0;			!INSURE SEARCH NOT "RESUMED"
+	u$both (fnddata, rdp, bdlink);		!FIND HI KEY REC (EVEN IF DEL)
+
+	!+
+	!   If the search is unsuccessful, give an error message.
+	!   Otherwise, keep checking.
+	!-
+
+	IF .argblk EQL 0
+	THEN
+	    verrc ('Key access aborted')	!OOPS, NOTHING FND
+	ELSE
+
+	!+
+	!   We found a record; if it is not an exact match of
+	!   our high entry, then we have another error.
+	!-
+
+	    IF chkflag (rdp [rdstatus], 	! Check for exact key match
+		    (rdflglss OR rdflgpst)) NEQ 0 OR 	! ...
+		.rdp [rdrecptr] NEQ .ent_hikey	! and exactly same record.
+	    THEN
+		verr ('Key access failed');	! Not a match - print message
+
+	!+
+	!   If there is a previous bucket, then do
+	!   some consistency checks against it.
+	!
+	!   Note: a previous bucket is indicated by
+	!   non-zero PPLEV1.
+	!-
+
+	IF .pplev1 NEQ 0			!1ST TIME THRU OR AFT BKT ABORT?
+	THEN
+idxseq :
+	    BEGIN				!NO, SEE IF NOW AT NEXT IDX ENT
+
+	    !+
+	    !   If the same index entry points to the
+	    !   previous bucket and to this bucket,
+	    !   then we need not continue with the
+	    !   consistency checks.
+	    !
+	    !   Note: if this is the case, it means we
+	    !   have an inefficient index, which we may
+	    !   want to think about in a future extension
+	    !   to UNCLUTTER.
+	    !-
+
+	    IF .path [1, wrd] EQL .pplev1	! Same index entry
+	    THEN
+		LEAVE idxseq;			! Stop checking
+
+	    !+
+	    !   Tweak PPLEV1 to point at what should be the
+	    !   index entry pointing at the current bucket
+	    !   (i.e., add the length of an index record
+	    !   to it).  If PPLEV1 then points at the
+	    !   hoped-for entry (check by looking at PATH),
+	    !   further consistency checks are unnecessary.
+	    !-
+
+	    BEGIN
+	    !
+	    !	Update PPLEV1 to point at current index record.
+	    !
+	    pplev1<pathoffset> = .pplev1<pathoffset> + .ksizw + 1;
+
+	    IF .path [1, wrd] EQL .pplev1 AND 	! Same index entry and
+		.cpage EQL .path [0, pathbkt]	!   same data bucket?
+	    THEN
+		LEAVE idxseq;			! Yes - all is OK
+
+	    END;
+
+	    !+
+	    !   If all has gone well, we are here because the
+	    !   previous index entry and the current one are in
+	    !   different index buckets.  If such is the case,
+	    !   get the previous bucket and do some consistency
+	    !   checks between the buckets.
+	    !-
+
+	    gb_verif (.pplev1<pathbkt>, .kdb [kdbibkz], 0, bdlink);	!GET IDX BKT TO CHK LAST ENTRY
+	    pt1 = .bdlink [bkdbktadr];		!MAKE PTR TO IDX BKT
+
+	    !+
+	    !   At this point, PPLEV1 contains the path information
+	    !   pointing to the first free space in the previous
+	    !   index bucket (i.e., just past the last index record).
+	    !   PT1 points to the header of that index bucket.
+	    !-
+
+	    IF
+		BEGIN
+		!
+		!   Is the previous index record
+		!   not last in its bucket?
+		!
+		.pplev1<pathoffset> NEQ .pt1 [bhnextbyte] OR 	!
+		!
+		!   Is the current index record
+		!   not in the succeeding bucket?
+		!
+		.path [1, pathbkt] NEQ .pt1 [bhnextbkt] OR 	!
+		!
+		!   Is the current index record
+		!   not first in its bucket?
+		!
+		.path [1, pathoffset] NEQ bhhdrsize OR 	!
+		!
+		!   Is the current data page incorrect?
+		!
+		.cpage NEQ .path [0, pathbkt]	!
+		END
+	    THEN
+	    !
+	    !   If any of the above are true, then
+	    !   we have a bad link in the file
+	    !   somewhere, and the user should know.
+	    !
+		verrarb (utlbnc, 0, .ppage, .cpage);	!BKT NOT IN DATA BKT CHAIN
+
+	    END;
+
+	pplev1 = .path [1, wrd];		!SAV JUST FOUND INFO
+	dupstill = true;			!RESET "NO GTR KEY YET"
+	END;					!END IF NOT .DUPSTILL
+
+    !+									!A454
+    !   If the data bucket we just scanned has no entries
+    !	(as in the case of all records deleted and expunged),
+    !   set PPLEV1 to 0, to indicate that there are
+    !   to be no "previous bucket" consistency checks
+    !   when the next bucket is verified.
+    !-
+
+    IF .bkt [bhnextbyte] EQL bhhdrsize		! Header only?		!A454
+    THEN 					!			!A454
+	pplev1 = 0;				! No previous bucket	!A454
+
+    RETURN;
+    END;					!END SCANBKT
+
+%SBTTL 'ACCKEY - access UDR by alternate keys'
+
+GLOBAL ROUTINE acckey : NOVALUE =
+!
+! ACCKEY - ACCESSES UDR BY THE SPECIFIED 2NDARY KEYS
+! INPUTS:
+!	BKT, ENTPTR
+! NOTES:
+!	ACCKEY CALLED ONLY IF KREF IS 0.
+!	LOOPS THRU THE KDB'S FOR THE FILE, DOES A KEY ACCESS FOR EACH KEY
+!	AFTER MOVEKEY-ING IT TO A BUFFER.
+!	HOWEVER THE KEY ACCESS IS OMITTED IF THE RECORD ISNT LONG ENOUGH.
+!	IF CANT FIND THE REC BY KEY,
+!	THEN PUTSIDR IS CALLED IF V$FIX APPLIES
+!	ELSE THE RRV IS ELIMINATED IF UNCLUTTERING.
+    BEGIN
+
+    LABEL
+	iter;
+
+    LOCAL
+	sts;					!TEMP FOR RMS STATUS
+
+    rdp_key [rduserptr] = buf$k2;		!MAKE KEY ADDR PASSABLE
+    $field (kbf, .rab) = buf$k2;		!USER-LEVEL TOO
+    $field (rop, .rab) = rb$rah OR rb$nrp;	!DO EXACT MATCH (READAHEAD TOO)
+    !NRP FOR PHYS ADDR OF SIDR
+
+    WHILE true DO
+iter :
+	BEGIN
+	kdb = .kdb [kdbnxt];			!GET NEXT 2NDARY KEY
+
+	IF .kdb EQL 0 THEN EXITLOOP;		!PAST LAST KEY
+
+	IF .entptr [drrecsize] LSS .kdb [kdbminrsz] THEN LEAVE iter;	!REC TOO SHORT TO ACC BY CUR KEY
+
+	u$suc (getkdb, .kdb [kdbref]);		!RESET CURR KDB IN RMS
+	u$suc (movekey, .entptr + .hsz_prim, buf$k2);	!COPY KEY VAL FOR THIS KEY
+	$field (krf, .rab) = .kdb [kdbref];	!SET KRF OF CUR KEY
+	rdp_key [rdusersize] = .kdb [kdbksz];	!MAKE KEY SIZE PASSABLE
+	$field (ksz, .rab) = .kdb [kdbksz];	!RESET AT USER-LEVEL TOO
+	$find (.rab);				!DO KEY ACCESS
+	sts = .$field (sts, .rab);		!GET STS FLD
+
+	IF .$field (sts, .rab) EQL su$suc
+	THEN
+
+	    IF sidrscan ()			!IS THIS PARTIC REC IN SIDR ARR
+	    THEN
+		BEGIN				!YES
+
+		IF uncing			!ELIM RRV'S?
+		THEN
+		    sidradj ();			!RESET SIDR PTR TO ENT_RFA
+
+		LEAVE iter;			!DONE WITH THIS ENTRY
+		END;
+
+	IF .sts NEQ er$rnf			!FISHY FAILURE?
+	    AND .sts NEQ su$suc			!SIDRSCAN MAY HAVE FAILED
+	THEN
+	    BEGIN				!YES
+	    verrarb (utlakf, 0, .kdb [kdbref], .ent_rfa, zown);	!ACC BY KEY N FAILED FOR X/Y
+	    errux				!INEXPLIC ERR, TELL USER
+	    END
+	ELSE
+	    BEGIN				!ONE OR THE OTHER FAILED
+	    verrarb (utlakf, 1, .kdb [kdbref], .ent_rfa, .fixsfx);	!ACC BY KEY N FAILED FOR X/Y
+
+	    IF fixing THEN sidrput ();		!PUT OUT NEEDED SIDR ENTRY
+
+	    END;
+
+	END;					!END KDB LOOP
+
+    m$kdb (0);					!RESET PRIM KEY
+    rdp_key [rdusersize] = .ksizb;		!SET KEY LEN
+    RETURN;
+    END;
+
+%SBTTL 'ACCRRV - verify RRV record'
+
+GLOBAL ROUTINE accrrv : NOVALUE =
+!
+! ACCRRV - VERIFIES THAT REC'S RRV (IF ONE) PTS AT IT.
+! INPUTS:
+!	CURRENT ENTRY AS SET BY SCANBKT
+! NOTES:
+!	IF UNCLUTTER MODE APPLIES, THE CHECK IS N/A BECAUSE
+!	THE RRV IS SIMPLY DELETED, AND THE UDR PTED AT ITSELF.
+!	IF FIX AND NOT UNCLUT, A BAD PTR IN AN RRV IS SIMPLY RESET
+    BEGIN
+    progress = .progress + 1;			!BUMP CNT OF RECS PROCESSED
+    scancnt = .scancnt + 1;			!BUMP CNT OF RECS PROCESSED
+
+    IF .ent_rrv EQL .ent_rfa THEN RETURN;	!IF REC NEVER MOVED, NO BACK CHK TO MAKE
+
+    rdp_rfa [rdrecptr] = 0;			!CLEAR STARTING POS
+    rdp_rfa [rdrfa] = .ent_rrv;			!PREP TO PASS IT
+    bd$put (bdlink, 0);				!INSURE CLEAN
+    u$both (fbyrfa, rdp_rfa, bdlink);		!GET RRV OF THIS UDR
+
+    IF .argblk NEQ 0 AND NOT uncing		!AND CHK IF NOT SUBSUMED
+    THEN
+	BEGIN					!RRV FOUND
+	pt1 = .rdp_rfa [rdrecptr];		!GET PTR TO RRV
+
+	IF rrvflag (pt1) EQL 0			!PTS BACK AT UDR?
+	THEN
+	    BEGIN				!YES, OOPS
+	    verr ('Data record identified by back pointer');
+	    RETURN;
+	    END;
+
+	IF .pt1 [drrrvaddress] NEQ .ent_rfa
+	THEN
+	    BEGIN				!RRV/UDR OUT OF SYNC
+	    verrfix ('POINTER entry does not point at data record');
+
+	    IF fixing				!
+	    THEN
+		BEGIN
+!	    modbkt (pt1 [drrrvaddress] = .ent_rfa, bdlink);
+		pt1 [drrrvaddress] = .ent_rfa;	! Point RRV at right place
+		setupd (bdlink);
+		END;
+
+	    END;
+
+	END
+    ELSE
+	BEGIN					!BAD RRV OR ZAPPING ALL RRV'S
+
+	IF uncing OR fixing			!EITHER TYPE OF MODS ALLOWED?
+	THEN
+	    BEGIN
+!	modbkt (entptr [drrrvaddress] = .ent_rfa, bdcurr);
+	    entptr [drrrvaddress] = .ent_rfa;	! Yes -- point back at self
+	    setupd (bdcurr);
+	    END;
+
+	IF NOT uncing
+	THEN
+	    BEGIN				!BAD RRV
+	    verrfix ('POINTER entry not found');
+	    ent_rrv = .ent_rfa;			!INDIC RRV NO GOOD
+
+	    IF .v$acc EQL true THEN acckey ();	!RE-ACC TO DEAL WITH BAD RRV
+
+	    END
+	ELSE
+
+	    IF .argblk NEQ 0			!
+	    THEN
+		delent (bdlink, 		!
+		    .rdp_rfa [rdrecptr]);	!ZAP THE RRV IF IT WAS FND
+
+	END;					!END OF "IF NO RRV"
+
+    RETURN;
+    END;
+
+%SBTTL 'ACCUDR - compare SIDR key w/ UDR key'
+
+GLOBAL ROUTINE accudr : NOVALUE =
+!
+! ACCUDR - COMPARES SIDR KEY VALUE TO ASSOC PRIM DATA KEY VALUE
+! NOTES:
+!	SCANS ALL DUPS IN A PARTIC SIDR.
+!	FOR EACH, IT MUST GET THE PRIMARY DATA BKT,
+!	DO THE COMPARE AND REACT TO AN INEQUALITY.
+!		IF NOFIX, IT JUST PRINTS AN ERR MSG.
+!		IF V$FIX, IT 0'S THE BAD PTR
+    BEGIN
+
+    LOCAL
+	i;					!LOOP CTR
+
+    LABEL
+	iter,
+	exist;
+
+    sidr_occ = 0;				!PRESUME EMPTY ENTRY
+    scancnt = .scancnt + 1;			!BUMP CNT OF SIDRS PROCESSED
+    progress = .progress + 1;			!BUMP CNT OF SIDRS PROCESSED
+
+    INCR i FROM sidhsz + .ksizw TO .entptr [sidrrecsize] + sidhsz - 1 DO
+iter :
+	BEGIN					!EXA EACH RFA IN SIDR VECTOR
+	rdp_rfa [rdrfa] = .entptr [.i, wrd];	!SET ARG FOR FBYRRV
+	rdp_rfa [rdrecptr] = 0;			!CLEAR OUTPUT ARG
+
+	IF .entptr [.i, wrd] EQL 0 THEN LEAVE iter;	!NO ENTRY IN THIS SLOT
+
+exist :
+	BEGIN					!EXISTING ENTRY
+	sidr_occ = 1;				!INDIC SIDR NOT EMPTY
+	rdp_key [rduserptr] = 0;		! Kludgey distinction
+	! between bad key/record
+	bd$put (bdlink, 0);			! Insure clean
+	u$both (fbyrrv, rdp_rfa, bdlink);	! Get pointer to UDR
+
+	IF .argblk EQL 0 THEN LEAVE exist;	!NO MATCHING UDR
+
+	pt1 = .rdp_rfa [rdrecptr];		!MATER PTR TO UDR
+
+	IF deleteflag (pt1) NEQ 0 THEN LEAVE exist;	!UDR DELETED
+
+	rdp_key [rduserptr] = .entptr + sidhsz;	!SET PTR TO DATA
+	u$both (ckeyku, rdp_key, .pt1 + .hsz_prim);
+
+	IF .argblk EQL 0 OR 			! .
+	    lssflag (rdp_key) NEQ 0		! Compare KVCURR to key of rec
+	THEN
+	    LEAVE exist;			!KEY VALUES DONT MATCH
+
+	IF .sidr_occ GEQ 0			!SEEN A VALID ENTRY YET?
+	THEN
+	    sidr_occ = -1			!NO, INDIC NON-EMPTY & VALID
+	ELSE
+
+	    IF noduplicates THEN verr ('Duplicate key encountered');
+
+	LEAVE iter;				!ALL OK, DONE THIS ENTRY
+	END;					!EXIST
+	!BEGIN "NO LONGER EXIST"
+	verrarb (utlnmr, 1, .i + 1 - sidhsz - .ksizw, .rdp_rfa [rdrfa], .ent_rfa, .fixsfx);
+	!NO MAT UDR FOR SIDR ELEM N
+
+	IF fixing				!
+	THEN
+	    BEGIN
+!	    modbkt (entptr [.i, wrd] = 0, bdcurr);
+	    entptr [.i, wrd] = 0;		! Assume UDR deleted or
+	    ! key update
+	    setupd (bdcurr);
+	    END;
+
+	IF .rdp_key [rduserptr] NEQ 0		!REACH HERE CAUSE KEYS NOT MAT?
+	THEN
+	    verrarb (utlakm, 1, .kref, .rdp_rfa [rdrfa]);	!YES, INDIC 2ND ERR LIKELY
+
+	!END "NO LONGER EXIST"
+	END;					!END ITER
+
+!	IF .SIDR_OCC EQL 0 AND UNCING		!EMPTY AND UNCLUTTERING?
+!	THEN DELENT (BDCURR, .ENTPTR);		!YES, ELIM THE EMPTY SIDR
+
+    IF .sidr_occ EQL 0				!EMPTY RFA LIST?
+    THEN
+	verinfo (utlerl, .ent_rfa);		!YES, TELL USER
+
+    RETURN;
+    END;
+
+%SBTTL 'DELENT - expunge bucket entry'
+
+GLOBAL ROUTINE delent (bkdesc, recptr) : NOVALUE =
+! DELENT - EXPUNGES ANY TYPE OF ENTRY FROM A BKT
+! INPUTS:
+!	BKDESC OF THE BKT THAT CONTAINS THE ENTRY
+!	RECPTR = ADDR IN BUFFER OF THE ENTRY TO BE EXPUNGED
+! NOTES:
+!	IF ENTRY IS UDR, THEN ITS RRV IS ALSO EXPUNGED, IF ONE
+    BEGIN
+
+    MAP
+	bkdesc : REF BLOCK;
+
+    MAP
+	recptr : REF BLOCK;
+
+    bk$dent (.cpage, 				!
+	.bkdesc [bkdbktadr], .recptr);		! Common routine does the work
+    setupd (bkdesc);				!INDIC BKT UPD
+    RETURN;
+    END;
+
+%SBTTL 'SIDRADJ - reset SIDR RFA on UNCLUTTER'
+
+GLOBAL ROUTINE sidradj : NOVALUE =
+! SIDRADJ - RESET RFA IN SIDR TO POINT AT ACTU REC IF NECES
+! NOTES:
+!	ADJUSTMENT APPLIES ONLY IF UNCLUTTERING.
+!	RDP_KEY AND BDLINK ARE SETUP IN SIDRSCAN.
+    BEGIN
+
+    IF .ent_rrv EQL .ent_rfa			!BACK PTR = ACTU ADDR?
+    THEN
+	RETURN;					!YES, SO NO UN-INDIRECTING TO DO
+
+    pt1 = .rdp_key [rdrecptr];			!GET ADDR OF SIDR PTING AT CURR REC
+    pt1 [(.rdp_key[rdsidrelement]+sidrhdrsize+.kdb[kdbkszw]),
+          wrd] = .ent_rfa;     ! [366] get past key
+    setupd (bdlink);				!SET FLAG SAYING BKT MODIFIED
+    RETURN;
+    END;					!END SIDRADJ
+
+%SBTTL 'SIDRPUT - create missing SIDR entry'
+
+GLOBAL ROUTINE sidrput : NOVALUE =
+! SIDRPUT - CREATE SIDR ENTRY FOR UDR THAT LACKED ONE
+    BEGIN
+
+    IF uncing
+    THEN
+	rdp_rfa [rdrrv] = .ent_rfa		!MAP TO REC ITSELF
+    ELSE
+	rdp_rfa [rdrrv] = .ent_rrv;		!USE RRV, IF ONE
+
+    $field (rbf, .rab) = .entptr + .hsz_prim;	!PUTSIDR USES UDR TO LOC KEY VALUE
+    u$both (putsidr, rdp_rfa);			!INSERT KEY IN SIDR
+
+    IF .argblk EQL 0 THEN verr ('Could not insert key into secondary index');
+
+    RETURN;
+    END;
+
+%SBTTL 'SIDRSCAN - check that RFA is in SIDR'
+
+GLOBAL ROUTINE sidrscan =
+! SIDRSCAN - INSURE THAT RFA AS WELL AS KEY WAS IN THE SIDR
+! RETURNS:
+!	TRUE IF RECORD IS IN SIDR ARRAY, SETTING UP RDP_KEY AND BDLINK (USUALLY)
+!	FALSE OTHERWISE
+! NOTES:
+!	IF DUPLICATES NOT ALLOWED, THE $FIND DATA IS ADEQUATE.
+!	OTHERWISE HAVE TO USE RMS ROUTINES TO ACTU SCAN SIDRS.
+!	HOWEVER IF UNCLUT, THEN RMS ROUTINES ALWAYS CALLED SO THAT RD&BD SETUP.
+!	THUS ONLY TIME THEY ARE NOT SETUP IS NO UNC & $FIND ADEQ.
+    BEGIN
+
+    IF NOT uncing
+    THEN
+	BEGIN					!THEN TRY TO DO QUICK CHK
+
+	IF .$field (rfa, .rab) EQL .ent_rrv THEN RETURN true;	!IT WAS 1ST OR NO DUPS
+
+	IF noduplicates THEN RETURN false;	!NO DUPS, SO SCAN CANT SUCC
+
+	END;
+
+    rdp_key [rdrecptr] = 0;			!CLEAR STARTING POS
+    rdp_key [rdrfa] = .rst [rstnrp];		!PASS RFA OF THE FND SIDR
+    !START DUP SRCH WITH THIS REC
+    bd$put (bdlink, 0);				!INSURE CLEAN
+    u$suc (fbyrfa, rdp_key, bdlink);		!PHYS LOCATE SIDR FROM ITS RFA
+    rdp_key [rdflags] = rdflgretex;		!RET ON MATCH, DONT CORRECT IT
+    rdp_key [rdrrv] = .ent_rrv;			!COMPARE AGAINST THIS
+    u$both (chkdup, rdp_key, bdlink);		!SCAN FOR RFA MATCH
+
+    IF .argblk EQL 0
+    THEN
+	RETURN true				!FAILURE=MATCH
+    ELSE
+	RETURN false;				!SUCC=SCANNED ENTIRE SIDR
+
+    END;
+
+END
+
+ELUDOM
+  

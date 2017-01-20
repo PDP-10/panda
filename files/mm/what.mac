@@ -1,0 +1,507 @@
+	TITLE WHAT - What was that last TTY message?
+	SUBTTL Kirk Lougheed/KSL/FMF/MDP/DE/MRC/WHP4
+
+	SEARCH MONSYM,MACSYM
+	.REQUIRE SYS:MACREL
+	.TEXT "WHAT/SAVE"	;Save as WHAT.EXE
+	ASUPPRESS
+
+	COMMENT	\
+
+WHAT is invoked from the EXEC to type out the last N messages in the
+user's SENDS.TXT file, optionally specifying messages from a specific
+person.  The default value of N is one.  Examples of use:
+
+    @WHAT			!Type out last message
+    @WHAT 3			!Type out last three messages
+    @WHAT -3			!Type out third last message
+    @WHAT *			!Type out all messages
+    @WHAT F.FMF			!Type out last message from user F.FMF
+    @WHAT F.FMF 3		!Type out last three messages from F.FMF 
+    @WHAT 3 F.FMF		!Same as above
+    @WHAT F.FMF -3		!Type out third last message from F.FMF
+    @WHAT -3 F.FMF		!Same as above
+    @WHAT F.FMF *		!Type out all messages from F.FMF
+    @WHAT * F.FMF		!Same as above
+
+Original program by Kirk Lougheed with extensive improvements by
+Frank Fujimoto and Mike Peeler.
+
+	\
+
+SUBTTL Definitions
+
+A=:1				;Scratch ACs
+B=:2
+C=:3
+D=:4
+E=:5
+PT=:6				;Byte pointer
+LP=:7				;Counter for number of bytes seen
+CT=:10				;Counter for number of messages seen
+FP=:15				;Frame pointer for TRVARs
+CX=:16				;Scratch for MACREL
+P=:17				;Pointer to control stack
+
+	SNDPAG==10		;Read file to this page
+SNDADR==SNDPAG*1000
+
+PDLEN==10			;Length of pushdown stack
+BUFLEN==10			;Length of directory string buffer
+NAMLEN==10			;Length of user name
+CMDBSZ==100			;Length of command buffer
+ATMBSZ==100			;Length of atom buffer
+
+PDLIST:	BLOCK PDLEN		;Pushdown list
+BUFFER:	BLOCK BUFLEN		;Directory string buffer
+CMDBUF:	BLOCK CMDBSZ		;Command buffer
+ATMBUF:	BLOCK ATMBSZ		;Atom buffer
+GTJBLK:	BLOCK .GJATR+1		;Block for GTJFN for COMND
+USERNM:	BLOCK NAMLEN		;Buffer for user name
+SNDJFN:	BLOCK 1			;JFN of SENDS.TXT
+BYTCNT:	BLOCK 1			;File byte count
+NUMSND:	BLOCK 1			;Number of sends to type out
+PMPCNT:	BLOCK 1			;AC3 for map and unmap
+SAVPDL:	BLOCK 1			;Save ac p for reparse
+HOST:	BLOCK 2			;Temporary storage for host location
+
+USRBRK:	USRB0.			;Break mask for user name
+	USRB1.
+	USRB2.
+	USRB3.
+
+
+
+
+HSTBRK:	BRMSK. (USRB0.,USRB1.,USRB2.,USRB3.,,<<*>,<$>,<_>>)
+;CMDBLK - command state block
+
+CMDBLK:	0,,CMRPRS		;.CMFLG - flags
+	.PRIIN,,.NULIO 		;.CMIOJ - input/output JFNs
+	-1,,[ASCIZ//]		;.CMRTY - prompt
+	-1,,CMDBUF		;.CMBFP - start of text buffer
+	-1,,CMDBUF		;.CMPTR - next input to be parsed
+	CMDBSZ*5-1		;.CMCNT - count of space left in buffer
+	0			;.CMINC - chars left in buffer
+	-1,,ATMBUF		;.CMABP - pointer to atom buffer
+	ATMBSZ*5-1		;.CMABC - size of atom buffer
+	GTJBLK			;.CMGJB - address of GTJFN block
+
+SUBTTL Macros
+
+;DLDB - decrement and load byte pointer
+
+DEFINE DLDB (AC,PTR) <
+	MOVNI AC,1		;;Decrement byte pointer by one
+	ADJBP AC,PTR
+	MOVEM AC,PTR		;;Update pointer
+	LDB AC,PTR		;;Get the byte
+>
+
+
+;EMSG - print an error message and shut us down
+
+DEFINE EMSG (STRING) <
+	HRROI A,[ASCIZ\STRING\]	;;Prepare the message
+	ESOUT%			;;Do everything needed
+	JRST STOP		;;Now quit
+>
+
+SUBTTL Main loop
+
+START:	RESET%			;Initialize the world
+	MOVE P,[IOWD PDLEN,PDLIST] ;Set up the control stack
+	SETZM USERNM		;No user yet
+	MOVEI A,1
+	MOVEM A,NUMSND		;Initial number of messages to type
+	CALL FILE		;Go look for the sends.txt file
+	CALL GETJCL		;Get any arguments from rscan buffer
+	CALL PRINT		;Print the sends
+	SETO A,			;Mapping from null
+	MOVE B,[.FHSLF,,SNDPAG] ;To where we mapped SENDS.TXT
+	MOVE C,PMPCNT		;Number of pages to unmap
+	TXO C,PM%CNT		;Multiple page unmap
+	PMAP%			;Unmap the file
+	MOVE A,SNDJFN		;Get JFN on sends file
+	CLOSF%			;Close the file
+	 NOP			;Ignore an error here
+	JRST STOP
+
+SUBTTL PRINT - Print messages
+
+PRINT:	MOVE A,[POINT 7,SNDADR] ;A is pointer into file
+	MOVE PT,BYTCNT		;Get how many bytes in file
+	ADJBP PT,A		;Point to end of file, pointer now in pt
+	CALL CKCRLF		;See how many crlf's at end of file
+	SKIPE B,NUMSND		;0 meaning all?
+	IFSKP.
+	  SKIPN USERNM		;Want a user?
+	  IFSKP.
+	    MOVE PT,[POINT 7,SNDADR] ;Yes, point to start of file
+	    JRST PRTU4		;Location to print all from a certain user
+	  ENDIF.
+	  MOVEI B,3		;Skipping over delimiter and first CRLF
+	  ADJBP B,A		;Copy to appropriate register
+	  MOVE CT,BYTCNT	;With entire byte count of file
+	  SUBI CT,2		;Except those chars we just forgot
+	ELSE.
+	  MOVE LP,BYTCNT	;Less than whole file, calculate how much
+	  MOVE CT,NUMSND
+	  SKIPG CT		;Is it positive?
+	   MOVNS CT		;No, make it so
+	  SKIPE USERNM		;If it's a non-zero user number
+	   JRST PRTUSR		;Print with user name in mind
+	  SKIPG NUMSND		;Want only one send?
+	   JRST ONESND		;Yes, go do it
+	  DO.
+	    DLDB B,PT		;Decrement the byte pointer
+	    CAIN B,.CHESC	;Delimiter?
+	     SOJE CT,ENDLP.	;Yes, decrement number of messages
+	    SOJG LP,TOP.	;Keep looping
+	    IBP PT		;On the other hand, print whole file, slurp esc
+	  ENDDO.
+	  MOVEI B,2		;Skipping over initial CRLF
+	  ADJBP B,PT		;Get pointer to start of messages to print
+	  MOVE CT,BYTCNT	;Get byte count of file
+	  SUBI CT,(LP)		;Get number chars to print
+	ENDIF.
+
+	;; Here with CT/number of bytes to type, B/pointer to file
+	;; Print sends until end of file
+	DO.
+	  HRROI A,CMDBUF	;Into a long buffer
+	  MOVE C,CT		;With count
+	  CAILE C,CMDBSZ*5-1	;Will it fit?
+	   MOVEI C,CMDBSZ*5-1	;No, get what will
+	  SUBI CT,(C)		;Account for it in main count
+	  MOVEI D,.CHESC	;Ending on terminator
+	  SOUT%			;Copy some SENDS.TXT
+	  ADDI CT,(C)		;Add back in chars we didn't get
+	  JUMPE CT,OUTBUF	;If no more chars, done
+	  LDB C,A		;Get what we finished with
+	  CAIN C,.CHESC		;Escape?
+	  IFSKP.
+	    CALL OUTBUF		;Print out the buffer we got
+	    LOOP.		;Back for more
+	  ENDIF.
+	  SETZ C,		;Get a null
+	  DPB C,A		;Drop it in over the escape
+	  CALL OUTBUF		;Print out the buffer we got
+	  TMSG <------->	;Type divider
+	  LOOP.			;Back for more
+	ENDDO.
+
+OUTBUF:	HRROI A,CMDBUF		;Point to command buffer
+	PSOUT%			;Type it out
+	RET			;That's all
+
+; CKCRLF - check for a newline at the end of SENDS.TXT
+
+CKCRLF:	MOVE B,PT		;Start at end of file
+	LDB C,B			;Get last char
+	CAIN C,.CHCRT		;If not CR
+	IFSKP.
+	  CAIE C,.CHLFD		;If a linefeed
+	  IFSKP.
+	    DLDB C,B		;Get second-to-last
+	    CAIN C,.CHCRT	;If carriage return
+	     RET		;Have newline, done
+	  ENDIF.
+	  MOVEI C,.CHCRT	;Get carriage return
+	  IDPB C,PT		;Drop it in
+	  AOS BYTCNT		;One more byte
+	ENDIF.
+	MOVEI C,.CHLFD		;Now a linefeed
+	IDPB C,PT		;Finish string
+	AOS BYTCNT		;One more byte
+	RET
+
+; PRTUSR - print given the user name
+; Takes	PT/ pointer to end of SENDS.TXT
+;	LP/ number of bytes in SENDS.TXT
+; 	CT/ number of sends to print
+
+PRTUSR:	DLDB B,PT
+	CAIE B,.CHESC		;Delimiter?
+	IFSKP.
+	  MOVEI B,2		;Skip over delimiter, CRLF
+	  ADJBP B,PT		;Increment the pointer
+	  MOVE A,[POINT 7,USERNM] ;Get a pointer to the username
+	  CALL MATCH		;Do we have a match?
+	   CAIA			;Nope, sorry
+	    SOJE CT,PRTU1	;Jump straight to display
+	ENDIF.
+	SOJGE LP,PRTUSR		;Let's go for some more
+	IBP PT			;if get here, need to advance pointer extra
+
+; Here we are either at beginning of the file or at the beginning of the nth
+; most recent send from a given user
+
+PRTU4:	IBP PT			;Increment pointer
+PRTU1:	IBP PT			;Point beyond initial delimiter
+	SETO E,			;Nothing typed out yet
+PRTU2:	LDB B,PT		;Get the next byte
+	JUMPE B,R		;Null byte means we're done
+	IBP PT			;Increment it to flush CRLF
+	MOVE B,PT		;Get pointer to the user name
+	MOVE A,[POINT 7,USERNM]	;Get pointer to string we wanna match
+	CALL MATCH		;Try it
+	 JRST PRTU3		;We lose, oh well
+	MOVE A,PT		;Get current pointer
+	LDB B,PT		;Get the first character again
+	SETZ C,			;No chars yet
+	DO.
+	  SOS C			;Decrement once for count
+	  CAIN B,.CHESC		;Delimiter?
+	  IFSKP.
+	    ILDB B,PT		;No, get the next byte
+	    JUMPN B,TOP.	;Loop again if not null
+	    CALL DASH		;Make sure we have dashes
+	    PSOUT%		;That's all, type it out
+	    RET
+	  ENDIF.
+	ENDDO.
+	IBP PT			;Delimiter, point past it
+	CALL DASH		;Make sure we have dashes
+	MOVE B,A		;Get pointer to beginning
+	MOVEI A,.PRIOU		;To the terminal
+	SOUT%			;Output it
+	SKIPL NUMSND		;Want only one send?
+	 JRST PRTU2		;No, get next send
+	RET
+
+PRTU3:	ILDB B,PT		;Get the next byte
+	CAIE B,.CHESC		;Is it a delimiter?
+	IFSKP.
+	  IBP PT		;Yes, point past it
+	  JRST PRTU2		;Go on to the next
+	ENDIF.
+	JUMPN B,PRTU3		;Go get more if not null
+	RET
+
+
+; DASH - Make sure a dashed line separates two sends
+
+DASH:	AOJE E,R		;Count sends.  If this is first, nothing more
+	SAVEAC <A>		;Don't mung caller's registers
+	TMSG <-----
+>				;Else make dashed line
+	RET
+
+; MATCH - match strings pointed to in A with B
+; valid if all chars match (case independent) and the string in B ends with ","
+; returns +1 if no match, +2 if match
+
+MATCH:	ILDB C,A		;Get char from A
+	IFE. C			;If null, almost done
+	  ILDB C,B		;Get char from SENDS.TXT
+	  CAIE C,","		;Is it a comma?
+	   CAIN C," "		;Or space?
+	    RETSKP		;Yes, win
+	  RET
+	ENDIF.
+	CALL UPCASE		;Make it uppercase
+	MOVEM C,D		;Save it away
+	ILDB C,B		;Get char from SENDS.TXT
+	CALL UPCASE		;Uppercaseify it, too
+	CAME C,D		;Do the two match?
+	 RET			;No, fail
+	JRST MATCH		;Yes, back for the next
+
+
+; UPCASE - uppercasify character in C
+
+UPCASE:	CAIL C,"a"		;.LT. "a"?
+	 CAILE C,"z"		;Or .GT. "z"?
+	  SKIPA			;No, don't bother
+	   SUBI C,"a"-"A"	;Make it upper case
+	RET
+
+; ONESND - display only one send
+; Takes	PT/ pointer to end of SENDS.TXT
+;	LP/ number of bytes in SENDS.TXT
+; 	CT/ number of sends to print
+
+ONESND:	DLDB B,PT		;Decrement the byte pointer
+	CAIN B,.CHESC		;Is it a delimiter?
+	 SOJE CT,ONEEX		;Yes, decrement number of messages
+	SOJN LP,ONESND		;Keep looping
+ONEEX:	MOVEI A,2		;Skipping over delimiter, CRLF
+	ADJBP A,PT		;Get pointer to start of message text
+	MOVEM A,PT		;Save in pointer too
+	SETZ C,			;Clear counter (not -1 so we don't type delim)
+	DO.
+	  ILDB B,PT		;Get a char
+	  JUMPE B,ENDLP.	;If null, done
+	  CAIE B,.CHESC		;Else if not a delimiter
+	   SOJA C,TOP.		;then go back for the next
+	ENDDO.
+	MOVE B,A		;Get old pointer
+	MOVEI A,.PRIOU		;To terminal
+	SOUT%			;Output it
+	RET
+
+SUBTTL FILE - Find and read in the SENDS.TXT file 
+
+FILE:	SETO A,			;A/ -1 = this job
+	HRROI B,D		;B/-1,,4 = one word, put it in ac 4
+	MOVEI C,.JILNO		;want job's logged in directory number
+	GETJI%			;go look it up
+	 ERCAL FATAL		;can't recover from this
+	MOVE B,D		;get lidno
+	HRROI A,BUFFER		;A/ pointer to directory name buffer
+	DIRST%			;Write our directory string
+	 ERCAL FATAL
+	HRROI B,[ASCIZ/SENDS.TXT/] ;B/ we are looking for this file
+	SETZ C,			;C/ end on a null
+	SOUT%			;Add the file spec
+	IDPB C,A		;Ensure a null at the end
+	MOVX A,GJ%SHT!GJ%OLD	;A/short form, old file
+	HRROI B,BUFFER		;B/file spec
+	GTJFN%			;Get a handle on the file
+	 ERJMP STOP		;Not found, quit quietly
+	HRRZM A,SNDJFN		;Save JFN
+	MOVX B,FLD(7,OF%BSZ)!OF%RD ;Text, read access
+	OPENF%			;Open the file
+	 ERCAL FATAL
+	SIZEF%			;Get byte count in B
+	 ERCAL FATAL
+	JUMPE B,STOP		;Empty file, so quit
+	MOVEM B,BYTCNT		;Save byte count
+	MOVEM C,PMPCNT		;Save page count
+	HRLZ A,SNDJFN		;From first page of file
+	MOVE B,[.FHSLF,,SNDPAG] ;To our address space
+	TXO C,PM%CNT!PM%RD!PM%CPY ;Multiple page pmap and copy on write
+	PMAP%			;Map file in
+	RET
+
+SUBTTL GETJCL - Read any JCL from the RSCAN buffer
+
+GETJCL:	CALL DOJCL		;Process JCL
+	SETZ A,			;Get a null
+	IDPB A,PT		;Deposit it on end of user string
+	HRROI A,[ASCIZ//]	;Get null string
+	RSCAN%			;Flush RSCAN buffer with it
+	RET
+
+DOJCL:	MOVEI A,.RSINI		;A/ function is initialize RSCAN buffer
+	RSCAN%			;Do so
+	 ERJMP R
+	JUMPE A,R		;Do nothing if nothing to do it with
+	DO.
+	  PBIN%			;Get a character
+	  CAIE A,.CHLFD		;End of line?
+	   CAIN A,.CHCRT	;Or a carriage return?
+	    RET
+	  CAIE A,.CHSPC		;Is it a space?
+	   LOOP.		;No, back until we have one
+	ENDDO.
+	MOVEI A,CMDBLK		;Command state block
+	MOVEI B,[FLDDB. .CMINI]	;Initialize it
+	CALL .COMND
+	 NOP			;Can't fail
+	MOVEM P,SAVPDL		;Save stack pointer
+CMRPRS:	MOVE P,SAVPDL		;Get it back on reparse (reparse?  with JCL??)
+	CALL GETNUM		;Get number of sends (must be before GETUSR)
+	IFSKP.
+	  CALL GETUSR		;Got it, now get who to look for
+	   NOP			;Don't care if not given
+	ELSE.
+	  CALL GETUSR		;No number, try for user
+	  IFSKP.
+	    CALL GETNUM		;Got that, now try for number again
+	     NOP		;Don't care if not given
+	  ENDIF.
+	ENDIF.
+	MOVEI B,[FLDDB. .CMCFM]	;Confirm it
+	CALL .COMND
+	 IFSKP. <RET>
+	EMSG <Not confirmed>
+
+.COMND:	MOVEI A,CMDBLK		;Get pointer to command block
+	COMND%			;Parse
+	TXNE A,CM%NOP		;If not parsed
+	 RET			;Then return +1
+	RETSKP			;Else +2
+
+; GETUSR - Parse a user name (and host if given)
+
+GETUSR:	SETZM USERNM		;No user parsed yet
+	MOVEI B,[FLDBK. .CMUSR,,,,,USRBRK,[
+		 FLDBK. .CMFLD,CM%SDH,,,,USRBRK]]
+	CALL .COMND		;Parse user or remote user name
+	 RET			;Not parsed, give up
+	MOVE PT,[POINT 7,USERNM]
+	MOVE B,[POINT 7,ATMBUF]
+	CALL CPYPT		;Copy atom buffer into pointer
+	MOVX B,CM%XIF		;Turn off meaning of @
+	IORM B,.CMFLG+CMDBLK
+	MOVEI B,[FLDDB. .CMTOK,,<-1,,[ASCIZ/@/]>,,,[
+		 FLDDB. .CMTOK,CM%SDH,<-1,,[ASCIZ/@/]>]]
+	CALL .COMND		;Parse atsign
+	IFSKP.			;If we had one...
+	  MOVE B,[POINT 7,[ASCIZ/@/]] ;stuff in one of these
+	  CALL CPYPT		
+	  MOVEI B,[FLDBK. .CMFLD,CM%SDH,,<host name>,,HSTBRK]
+	  CALL .COMND
+	   IFNSK. <EMSG <Illegal host name>>
+	  MOVE B,[POINT 7,ATMBUF]
+	  CALL CPYPT		;Add in host name too
+	ENDIF.
+	MOVX B,CM%XIF		;Turn @ back on
+	ANDCAM B,.CMFLG+CMDBLK
+	SETZ B,			;Get a null
+	IDPB B,PT		;Drop it in
+	RETSKP
+
+
+; Copy a string into pointer pointed to by PT
+
+CPYPT:	DO.
+	  ILDB C,B		;Get next char
+	  JUMPE C,R		;Finish on null
+	  IDPB C,PT		;Drop it in
+	  LOOP.
+	ENDDO.
+
+
+; GETNUM - Parse number of messages to use
+
+GETNUM:	MOVEI B,[FLDDB. .CMNUM,,^D10,,,[
+		 FLDDB. .CMTOK,,<-1,,[ASCIZ/*/]>]]
+	CALL .COMND		;Parse number or star
+	 RET			;Neither, give up
+	LOAD C,CM%FNC,(C)	;Get which we parsed
+	CAIE C,.CMTOK		;Star?
+	IFSKP.
+	  SETZM NUMSND		;Yes, remember so (0 means all)
+	ELSE.
+	  CAME B,[-1]		;If number is minus one
+	   SKIPN B		;Or zero
+	    MOVEI B,1		;Then want only 1 msg
+	  MOVEM B,NUMSND	;Say this is how many sends we want
+	ENDIF.
+	RETSKP
+
+SUBTTL Error handling
+
+; ERROR - here to print out the last jsys error
+
+ERROR:	HRROI A,[ASCIZ//]	;Just print a question mark
+	ESOUT%			;Clear input buffer, type question mark
+	MOVEI A,.PRIOU		;A/ output to the TTY
+	HRLOI B,.FHSLF		;B/ most recent error, this fork
+	SETZ C,			;C/ no limit
+	ERSTR%			;Print the error
+	 NOP			;Ignore an error here
+	 NOP
+	RET
+
+; FATAL - shutdown because of error
+; STOP - quiet shutdown
+
+FATAL:	CALL ERROR		;Print last JSYS error
+STOP:	HALTF%			;Shut us down
+	EMSG <Cannot continue>	;In case we're continued....
+
+	END START

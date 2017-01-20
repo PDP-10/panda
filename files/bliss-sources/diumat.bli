@@ -1,0 +1,424 @@
+%TITLE 'Make a Single Move Matching Transform from Two (Source) Transforms'
+MODULE DIUMAT(
+       IDENT='253'
+       %BLISS32 (,
+                 ADDRESSING_MODE(EXTERNAL=GENERAL,NONEXTERNAL=LONG_RELATIVE)
+                 )
+       %BLISS36 (,
+                 ENTRY (chkdms, chkfqn, chkmat, mattra)
+                )
+                       ) = 
+BEGIN
+!++
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+! FACILITY:	DIU    Data Interchange Utility  V01-000
+!
+! ABSTRACT:	Routines to generate a single default move_matching
+!		or move_others_matching transform structure, given
+!		two (source) transforms.
+!
+! AUTHOR:	Sandy Clemens, Creation Date:  25-Oct-84
+!
+! EDIT HISTORY:
+!
+!  253  Change libraries to new names.
+!       Gregory A. Scott 1-Jul-86
+!
+!  236  Change library of DIXLIB to DIUDIX.
+!       Sandy Clemens  19-Jun-86
+!
+!       3	Clean up copyright notices.  Change LIBRARY 'DIUMSG'
+!		to 'DIU'.  Clean up condition handling.
+!		Sandy Clemens	14-Jun-85
+!--
+!********************************************************************
+!           L I B R A R Y   A N D   R E Q U I R E    F I L E S
+!********************************************************************
+%IF %BLISS (BLISS32)
+%THEN
+     LIBRARY 'SYS$LIBRARY:XPORT';       ! XPORT definitions
+     UNDECLARE %QUOTE $STRING;
+     LIBRARY 'SYS$LIBRARY:STARLET';     ! VMS System Services
+     LIBRARY 'DIU$SOURCE_LIB:DIUVMS';	! DIU VMS Specifics
+     LIBRARY 'DIU$SOURCE_LIB:DIUMSG';	! DIU MESSAGE Literals
+%FI
+
+%IF %BLISS (BLISS36)
+%THEN
+     LIBRARY 'BLI:XPORT';               ! XPORT definitions
+     LIBRARY 'FAOPUT';                  ! Defines $FAO_PUT macro
+     LIBRARY 'FAO';
+     LIBRARY 'DIU';
+%FI
+
+UNDECLARE %QUOTE $DESCRIPTOR;
+LIBRARY 'DIUCRX';                       ! CRX data structures
+UNDECLARE %QUOTE $DESCRIPTOR;
+LIBRARY 'DIUTLB';			! DIU Transform structure
+UNDECLARE %QUOTE $DESCRIPTOR;
+UNDECLARE %QUOTE STS$K_SEVERE, %QUOTE STS$K_ERROR, %QUOTE STS$K_WARNING,
+          %QUOTE STS$K_SUCCESS, %QUOTE SS$_NORMAL, %QUOTE STS$K_INFO;
+LIBRARY 'DIUDIX';			! DIX/DIL specific things
+LIBRARY 'DIUMLB';			! DIU Mapping routines library
+
+!******************************************************************
+!                     L I T E R A L S
+!******************************************************************
+
+LITERAL
+       no_match = 1,
+       yes_match = 2;
+
+!******************************************************************
+!                     C H E C K _ D I M S
+!******************************************************************
+GLOBAL ROUTINE CHECK_DIMS (src_dims, dst_dims) =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTOIN
+!
+!	This routine checks two entire dims lists to see if they
+!	can be moved using Move-Matching.
+!
+! FORMAL PARAMETERS
+!
+!	src_dims	The root address of the source dims list.
+!
+!	dst_dims	The root address of the destination dims list.
+!
+! IMPLICIT PARAMETERS
+!
+!	None.
+!
+! ROUTINE VALUE
+!
+!	Match_flg, set to 1 if the dims don't match, otherwise,
+!	set to zero.
+!++
+
+LOCAL sdims : REF dims,
+      ddims : REF dims,
+      count,
+      src_dimension : REF crx_dimension,
+      dst_dimension : REF crx_dimension,
+      match_flg : INITIAL (yes_match),
+      done : INITIAL (0),
+      status : INITIAL (0);
+
+sdims = .src_dims;
+ddims = .dst_dims;
+
+DO BEGIN
+   !++
+   ! If both dims passed are set to 0, then we are done so EXITLOOP.
+   ! If one dims EQL 0 and the other NEQ 0 then set match_flg to
+   ! no_match & EXITLOOP.  If both dims are NEQ 0 then see if their
+   ! respective dimensions_cnts are equal.  If not, then set match_flg
+   ! to no_match & EXITLOOP.
+   !--
+
+   IF (.sdims EQL 0 AND .ddims EQL 0)
+   THEN EXITLOOP                        ! these match & we're finished
+   ELSE
+        IF (.sdims EQL 0 AND .ddims NEQ 0) OR
+           (.sdims NEQ 0 AND .ddims EQL 0)
+        THEN (match_flg = no_match; EXITLOOP)   ! these don't match
+        ELSE
+            ! if both dims address are non-zero, then make sure the
+            ! addresses really point at dims nodes...
+            IF (.sdims [dims$b_id] NEQ DIU$K_DIMSNODE) OR
+              (.ddims [dims$b_id] NEQ DIU$K_DIMSNODE)
+            THEN
+                SIGNAL (DIU$_BUG)
+            ELSE
+                ! if the 2 dims nodes have different dimension counts,
+                ! then the structures don't "match" (can't be moved by
+                ! move matching)...
+                IF .sdims [dims$b_dimensions_cnt] NEQ
+                    .ddims [dims$b_dimensions_cnt]
+                THEN (match_flg = no_match; EXITLOOP);
+
+   !++
+   ! If not DONE, then examine the list of crx dimension nodes and see
+   ! if the upper & lower bounds are set correctly for a move-matching
+   ! situation, that is, the source bounds are within the destination
+   ! bounds!
+   !--
+
+   src_dimension = .sdims [dims$a_list];        ! get addressibility via REFs
+   dst_dimension = .ddims [dims$a_list];
+   count = 0;					! Initialize count of dimensions
+
+   WHILE NOT .done DO
+         BEGIN
+
+         ! check crx dimension node ids
+         IF (.src_dimension [CRD$B_ID] NEQ CRX$K_DIMENSION) OR
+            (.dst_dimension [CRD$B_ID] NEQ CRX$K_DIMENSION)
+         THEN
+             SIGNAL (DIU$_BUG);
+
+         IF (.src_dimension [crd$l_lower_bound] LSS     ! check bounds
+             .dst_dimension [crd$l_lower_bound])
+           OR
+            (.src_dimension [crd$l_upper_bound] GTR
+             .dst_dimension [crd$l_upper_bound])
+         THEN BEGIN
+              match_flg = no_match;     ! these don't match
+              done = 1;
+              END
+         ELSE BEGIN                     ! get next crx dimension nodes
+              src_dimension = .src_dimension [crd$a_next];
+              dst_dimension = .dst_dimension [crd$a_next];
+              END;
+
+         !++
+         ! Keep a count of the number of CRX dimension nodes we have
+         ! processed.  We know that the dimension count is the same
+         ! for the source and destination because we checked above!
+         !--
+         count = .count + 1;
+         IF .count EQL .sdims [dims$b_dimensions_cnt]
+         THEN done = 1;
+         END;
+
+   sdims = .sdims [dims$a_next];        ! process next DIMS nodes
+   ddims = .ddims [dims$a_next];
+   IF (.sdims NEQ 0) OR (.ddims NEQ 0)  ! if we aren't really done
+     AND (.match_flg EQL yes_match)
+   THEN done = 0;                       ! then note it!
+
+   END
+
+UNTIL .done;
+
+.match_flg                              ! return match_flg (set to yes_match
+                                        ! or no_match)...
+
+END;
+
+!******************************************************************
+!                     C H E C K _ F Q N S
+!******************************************************************
+GLOBAL ROUTINE CHECK_FQNS (src_fqn, dst_fqn) =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION
+!
+!	This routine checks two entire fqns to see if their
+!	names match.
+!
+! FORMAL PARAMETERS
+!
+!	src_fqn		The root address of the source fqn stringlist.
+!
+!	dst_fqn		The root address of the destination fqn stringlist.
+!
+! IMPLICIT PARAMETERS
+!
+!	None.
+!
+! ROUTINE VALUE
+!
+!	Match_flg, set to 1 if the names don't match, otherwise,
+!	set to zero.
+!++
+
+LOCAL	sfqn : REF crx_stringlist,
+	dfqn : REF crx_stringlist,
+	match_flg : INITIAL (yes_match),
+	done : INITIAL (0);
+
+sfqn = .src_fqn;
+dfqn = .dst_fqn;
+
+! This destination name has already been used, so it can't match now.
+IF .dfqn EQL 0 THEN RETURN no_match;
+
+DO BEGIN
+   ! if source & destination names are the same
+   IF $STR_EQL (STRING1 = (.sfqn [CRS$W_STRING_LENGTH],
+                           (.sfqn [CRS$A_STRING])),
+                STRING2 = (.dfqn [CRS$W_STRING_LENGTH], 
+                           (.dfqn [CRS$A_STRING])))
+      THEN BEGIN
+           ! if either field has sub-fields and the other doesn't then
+           ! this is not a match...
+	   sfqn = .sfqn [CRS$A_NEXT];
+	   dfqn = .dfqn [CRS$A_NEXT];
+	   IF (.sfqn EQL 0 AND .dfqn NEQ 0) OR (.sfqn NEQ 0 AND .dfqn EQL 0)
+	      THEN                      ! this is not a match; stop processing
+                  (match_flg = no_match; done = 1)
+	      ELSE                      ! if both names complete, we're done
+                  (IF .sfqn EQL 0 AND .dfqn EQL 0
+		   THEN done = 1)
+	   END
+      ELSE BEGIN                        ! if the names aren't equal
+	   match_flg = no_match;        ! then this is not a match
+	   done = 1                     ! and we can stop processing
+	   END
+   END
+UNTIL .done;
+
+.match_flg			! return match_flg (if set to 1, no match
+				! was found, else match was found
+END;
+
+!******************************************************************
+!                    C H E C K _ M A T C H
+!******************************************************************
+GLOBAL ROUTINE CHECK_MATCH (src_fqn, dst_fqn, src_dims, dst_dims) =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION
+!
+!	This routine checks DIMS lists and FQN stringlist for two
+!       fields to see if they can be moved using move-matching or
+!       move-others-matching.
+!
+! FORMAL PARAMETERS
+!
+!	src_fqn		The root address of the source fqn stringlist.
+!
+!	dst_fqn		The root address of the destination fqn stringlist.
+!
+!	src_dims	The root address of the source dims list.
+!
+!	dst_dims	The root address of the destination dims list.
+!
+! IMPLICIT PARAMETERS
+!
+!	None.
+!
+! ROUTINE VALUE
+!
+!	Match_flg, set to 1 if the dims don't match, otherwise,
+!	set to zero.
+!++
+
+LOCAL match_flg : INITIAL (yes_match);
+
+match_flg = check_fqns (.src_fqn, .dst_fqn);
+IF .match_flg EQL yes_match
+THEN match_flg = check_dims (.src_dims, .dst_dims);
+
+.match_flg                              ! return match_flg, which is set to
+                                        ! either "yes_match" or "no_match"
+END;
+
+!******************************************************************
+!                 D I U $ M A T C H _ T R A N S
+!******************************************************************
+GLOBAL ROUTINE DIU$MATCH_TRANS (src_trans, dst_trans) =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION
+!
+!	This routine will traverse the transform lists and search for
+!	matching names.  When matching names are found, the dst_trans
+!	information will be copied into the destination fields in the
+!	src_trans structure, provided that the dimension information
+!       (found in the dims structure attached to the transforms) is
+!       valid for a move-matching or move-others-matching situation.
+!
+! FORMAL PARAMETERS
+!
+!	src_trans	The root address of the source (final) transform
+!			structure.
+!
+!	dst_trans	The root address of the destination transform
+!			structure.
+!
+! IMPLICIT PARAMETERS
+!
+!	None
+!
+! ROUTINE VALUE
+!
+!	DIU$_NORMAL     Normal successful completion
+!
+!++
+
+LOCAL	strans : REF transform_str,
+	dtrans : REF transform_str,
+	match : INITIAL (0),
+        status : INITIAL (0);
+
+strans = .src_trans;
+
+IF .strans [tra_id] NEQ DIU$K_TRANSFORM
+   THEN SIGNAL (DIU$_BUG);
+
+DO BEGIN
+
+   dtrans = .dst_trans;
+
+   IF .dtrans [tra_id] NEQ DIU$K_TRANSFORM
+	THEN SIGNAL (DIU$_BUG);
+
+   DO BEGIN
+      match = check_match (.strans [tra_src_nam], .dtrans [tra_src_nam],
+                           .strans [tra_src_dims], .dtrans [tra_src_dims]);
+      IF .match EQL yes_match
+         THEN BEGIN
+              !++
+	      ! The transforms fully qualified names match, so
+	      ! copy the dtrans fields into the dst fields of
+	      ! the strans structure...  If a copy is done, zero
+              ! out the DIMS and FQN structure addresses in the
+              ! dtrans field so that when we delete the dest trans
+              ! structure later we don't also lose these structures!
+              ! If a move is done, set the destination member field
+              ! CRM$V_FACILITY_USE_2 to TRUE so that later we'll 
+              ! be able to read through the dst record descr. tree
+              ! and know that something was moved into this field!
+              !--
+              LOCAL dst_member : REF crx_member;
+              dst_member = .dtrans [tra_src_addr];
+              dst_member [CRM$V_FACILITY_USE_2] = TRUE;
+	      strans [tra_dst_addr] = .dtrans [tra_src_addr];
+	      strans [tra_dst_nam] = .dtrans [tra_src_nam];
+              dtrans [tra_src_nam] = 0;
+	      strans [tra_dst$v_length] = .dtrans [tra_src$v_length];
+	      strans [tra_dst$v_scale] = .dtrans [tra_src$v_scale];
+	      strans [tra_dst$v_type] = .dtrans [tra_src$v_type];
+	      strans [tra_dst$v_sys_orig] = .dtrans [tra_src$v_sys_orig];
+              strans [tra_dst_dims] = .dtrans [tra_src_dims];
+              dtrans [tra_src_dims] = 0;
+	      dtrans = 0;               ! set to zero to show we have a match
+	      END
+	 ELSE
+	      dtrans = .dtrans [tra_next]
+      END
+   UNTIL .dtrans EQL 0;		! Until no more dst_trans nodes to be
+				! processed, or we found a match...
+
+   strans = .strans [tra_next]
+
+   END
+
+UNTIL .strans EQL 0;                    ! Until there are no more src transform
+                                        ! nodes to be processed...
+
+DIU$_NORMAL                             ! Return normal status
+
+END;
+
+END
+ELUDOM

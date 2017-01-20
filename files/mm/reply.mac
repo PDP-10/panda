@@ -1,0 +1,599 @@
+	TITLE REPLY - Reply to last terminal message
+	SUBTTL Frank M. Fujimoto
+
+	SEARCH MONSYM,MACSYM
+	.REQUIRE SYS:MACREL
+	.TEXT "REPLY/SAVE"	;Save as REPLY.EXE
+	ASUPPRESS
+
+	VMAJOR==6
+	VMINOR==1
+	VEDIT==^D12
+	VWHO==4
+
+	COMMENT \
+
+REPLY is a program designed for use with the Stanford Tops-20 SEND
+protocol.  It looks at the user's SENDS.TXT in the login directory,
+and from that determines the last sender of a terminal message.
+From that information it will set up JCL and run SEND.
+
+If the last message was from a local sender, REPLY will attempt to
+send to the terminal number of the sender.  If that terminal is no
+longer in use by the same user, REPLY will send to the username.
+
+	\
+
+SUBTTL Definitions
+
+A=:1				;Scratch ACs
+B=:2
+C=:3
+D=:4
+PT=:5				;Byte pointer
+LP=:6				;Loop for finding last sender
+DBYTE=:14			;To do 'dldb'
+FP=:15				;Frame pointer for TRVAR
+CX=:16				;Scratch for MACREL
+P=:17				;Stack pointer
+
+	SNDPAG==10		;Map SENDS.TXT to this page
+SNDADR==SNDPAG*1000
+
+	PDLEN==100		;Length of push down stack
+	BUFLEN==50		;Length of directory string buffer
+	JCLLEN==300		;Most that can be put in JCL
+	TRASHL==100		;Length of trash buffer
+	INBUFL==240		;Length of input buffer
+	OVRBFL==10		;Modest overflow buffer
+
+
+
+SUBTTL Impure storage
+
+PDL:	BLOCK PDLEN		;Push down stack
+BUFFER:	BLOCK BUFLEN		;To hold directory string
+RECPT:	BLOCK BUFLEN		;Recipient string (TTY number usually)
+RSITE:	BLOCK BUFLEN		;And the site it should go back to
+RNAME:	BLOCK BUFLEN		;Pretty name or zero for net sends
+SNDJCL:	BLOCK JCLLEN		;To be sent to SEND.EXE
+TRASH:	BLOCK TRASHL		;To hold trash
+INBUF:	BLOCK INBUFL		;Input buffer length
+OVRBUF:	BLOCK OVRBFL		;Overflow buffer
+GTJBLK:	BLOCK .JIMAX		;For GETJI
+JCLPTR:	BLOCK 1			;Point to JCL for SEND.EXE
+JFN:	BLOCK 1			;Hold JFN for SENDS.TXT
+BYTCNT:	BLOCK 1			;Number of bytes in file
+PAGCNT:	BLOCK 1			;Number of pages in file
+WHOSND:	BLOCK 1			;Who sent to us?
+SNGLLN:	BLOCK 1			;Non-zero if text of reply on command line
+
+; Command parsing stuff
+
+DEFINE PROMPT (AC,LOC) <
+    IFB <LOC>,<
+	HRROI CX,AC
+	MOVEM CX,CMDBLK+.CMRTY
+    >
+    IFNB <LOC>,<
+	HRROI AC,LOC
+	MOVEM AC,CMDBLK+.CMRTY
+    >
+>
+
+PRMBUF:	BLOCK BUFLEN		;Buffer for prompts
+CMDBUF:	BLOCK BUFLEN		;Buffer for command input
+ATMBUF:	BLOCK BUFLEN		;Atom buffer
+
+CMDBLK:	REPARS			;Command state block
+	.PRIIN,,.PRIOU		;To and from terminal
+	0			;Prompt, filled in later
+	-1,,CMDBUF		;Start of text buffer
+	-1,,CMDBUF		;Next input to be parsed
+	BUFLEN*5-1		;Space left in buffer
+	0			;Unparsed chars in buffer
+	-1,,ATMBUF		;Start of atom buffer
+	BUFLEN*5-1		;Space in atom buffer
+	0			;GTJFN argument pointer
+
+SUBTTL Macros
+
+DEFINE EMSG (STRING) <		;;Like TMSG but does an ESOUT% instead
+	HRROI A,[ASCIZ\String\]
+	ESOUT%
+>
+
+DEFINE UPCASE (AC) <		;;Uppercase a letter
+	CAIL AC,"a"
+	 CAILE AC,"z"
+	  CAIA
+	   SUBI AC,"a"-"A"
+>
+
+DEFINE MATCH (AC,STRING) <	;;See if what AC points to matches string
+				;;Will leave updated pointer to AC in A
+				;;Returns +1 if no match, +2 if match
+	CALL [	SAVEAC <B,C,D>
+		MOVE A,AC	;;Get the ac here
+		MOVE B,[POINT 7,[ASCIZ\STRING\]]
+		JRST DOMATC ]	;;Go call handler routine
+>
+	      
+DOMATC:	ILDB C,B		;Get a byte from the literal
+	UPCASE C		;Make sure it's upper case
+	JUMPE C,RSKP		;If it's a null, then we win, return +2
+	ILDB D,A		;Get a byte from SENDS.TXT
+	UPCASE D		;Make sure it's upper case
+	CAMN C,D		;Do the two match?
+	 JRST DOMATC		;Yes, get next pair of characters otherwise
+	RET			;No match, return +1
+
+SUBTTL Main program
+
+EVEC:	JRST START
+	JRST START
+	BYTE (3)VWHO (9)VMAJOR (6)VMINOR (18)VEDIT
+EVECL==.-EVEC
+
+START:	RESET%			;Initialize things
+	MOVE P,[IOWD PDLEN,PDL]	;Set up stack pointer
+	CALL GETJCL		;Get arguments from command line
+	CALL FILE		;Open up SENDS.TXT
+	CALL GETSND		;Get pointer to start of last send
+	CALL GETINF		;Find out who to send it to, tell user
+	CALL CHKLOG		;Check if user is still there
+	CALL PUTJCL		;Put JCL so sender program can see it
+	CALL UNMAP		;Get rid of map to SENDS.TXT
+
+	MOVX A,GJ%SHT!GJ%OLD	;Short form, old file
+	HRROI B,[ASCIZ\SYS:SEND.EXE\]
+	GTJFN%			;For SEND.EXE
+	 ERCAL ERROR
+	HRLI A,.FHSLF		;For this process
+	MOVE D,A		;Save it
+	SETO A,			;Unmapping
+	MOVX B,<.FHSLF,,0>	;From the top
+	MOVX C,PM%CNT!777	;To the bottom
+	DMOVE 5,[  PMAP%	; 5  Unmap
+		   MOVE A,D ]	; 6  Get back GET% argument
+	DMOVE 7,[  GET%		; 7  Map file into ourself
+		   MOVEI A,.FHSLF ] ; This process
+	DMOVE 11,[ SETZ B,	; 11 Main entry point
+		   SFRKV% ]	; 12 Start ourself
+	JRST 5			;Do it in ACs
+
+SUBTTL GETJCL - Process input line
+
+GETJCL:	MOVEI A,.RSINI		;Initialize RSCAN buffer
+	RSCAN%			;Do it
+	 ERCAL ERROR
+	JUMPE A,JCLSND		;None, this is a multi-line reply
+
+	;; Found out how many chars, see if they fit and read all that will
+	MOVNM A,C		;Save this in the register SIN% wants it in
+	SUBI A,INBUFL*5-1	;Sub maximum chars we can have + 1
+	SKIPLE D,A		;Put extras in a safe place.  Do they fit?
+	 MOVNI C,INBUFL*5-2	;No, only fill up buffer
+	MOVEI A,.PRIIN		;Want to get from tty input
+	HRROI B,INBUF		;-1,,input buffer
+	SIN%			;Input the characters
+
+	;; Now handle overflow if we had it
+	IFGE. D			;If chars left is negative, it's a safe size
+	  MOVEI C,.CHLFD	;Get a linefeed
+	  IDPB C,B		;Terminate input buffer
+	  MOVEI C,.CHNUL	;And a null
+	  IDPB C,B		;To tie it off
+	  TMSG <%Message too long, truncating "> ;Start error message
+	  DO.
+	    PBIN%		;Read a char
+	    PBOUT%		;And send it out
+	    SOJGE D,TOP.	;Until done
+	  ENDDO.
+	  TMSG <"
+    >				;End truncating message
+	ENDIF.
+
+	;; JCL all read, now parse it a little
+	MOVE B,[POINT 7,INBUF]	;Point to what was typed in
+	DO.
+	  ILDB A,B		;Get a byte
+	  CAIE A,.CHCRT		;Carriage return?
+	   CAIN A,.CHLFD	;or linefeed?
+	    JRST JCLSND		;One or the other
+	  CAIE A," "		;If a space, then use 'to'
+	   LOOP.		;If neither, get more junk
+	ENDDO.
+	MOVEM B,JCLPTR		;Save pointer for later
+	SETOM SNGLLN		;This is a single line, so remember that
+	RET
+
+; Here when we are doing a multi-line send
+JCLSND:	SETZM SNGLLN		;Remember not doing it
+	HRROI A,[ASCIZ/
+/]	;Point to a bare linefeed
+	MOVEM A,JCLPTR		;Save as new JCL
+	RET
+
+SUBTTL FILE - Open up SENDS.TXT to get last send
+
+FILE:	HRROI B,[ASCIZ/SENDS.TXT.0/] ;Want SENDS.TXT
+	CALL FILNAM		;Make file name
+	MOVX A,GJ%SHT!GJ%OLD	;Short form, old file
+	GTJFN%			;Get a handle
+	IFJER.
+	  EMSG <No last send>
+	  JRST STOP
+	ENDIF.
+	HRRZM A,JFN		;Save the jfn
+	MOVE B,[FLD(7,OF%BSZ)!OF%RD] ;Text, reading
+	OPENF%			;Open it
+	 ERCAL ERROR
+	SIZEF%			;Find out how big it is
+	 ERCAL ERROR
+	IFE. B
+	  EMSG <No last send>
+	  JRST STOP
+	ENDIF.
+	MOVEM B,BYTCNT		;Save byte count
+	HRLZ A,JFN		;From file, first page
+	MOVE B,[.FHSLF,,SNDPAG]	;Where to map it
+	MOVEM C,PAGCNT		;Store for unmapping
+	HRLI C,(PM%CNT!PM%RD)	;Multiple page PMAP, read access
+	PMAP%			;Map file in
+	RET
+
+; Here to construct file name in home directory
+FILNAM:	PUSH P,B		;Save main filename part
+	SETO A,			;this job
+	HRROI B,D		;one word, to D
+	MOVEI C,.JILNO		;get job's logged in directory number
+	GETJI%			;go look it up
+	 ERCAL ERROR		;fatal error, can't recover
+	MOVE B,D		;get dir no to B
+	HRROI A,BUFFER		;Pointer to directory name buffer
+	DIRST%			;Make a directory string
+	 ERCAL ERROR
+	POP P,B			;Get filename part back
+	SETZ C,			;End on null
+	SOUT%			;Append filespec
+	IDPB C,A		;Make sure null at end
+	HRROI B,BUFFER		;File spec
+	RET			;Return with it
+
+
+SUBTTL GETSND - Make pointer to start of send in PT
+
+GETSND:	MOVE A,[POINT 7,SNDADR]	;Pointer to file
+	MOVE PT,BYTCNT		;Get how many bytes in file
+	ADJBP PT,A		;Point to end of file, pointer now in PT
+	SOS LP,BYTCNT		;Get number of bytes - 1 into LP
+	DO.
+	  SETO DBYTE,		;decrement byte pointer
+	  ADJBP DBYTE,PT
+	  MOVE PT,DBYTE		;Get updated pointer into 'pointr'
+	  LDB B,PT		;Get the byte
+	  SOS LP		;Subtract one from count of chars seen
+	  CAIN B,.CHESC		;Escape (delimiter of sends in file)?
+	  IFSKP.
+	    JUMPG LP,TOP.	;No, but still more chars, go ahead and loop
+	    JRST BADFIL		;Else complain
+	  ENDIF.
+	  ILDB A,DBYTE		;Next char
+	  CAIE A,.CHCRT		;Carriage return?
+	   LOOP.
+	  ILDB A,DBYTE		;Finally, need
+	  CAIE A,.CHLFD		;A linefeed
+	   LOOP.
+	ENDDO.
+	MOVE PT,DBYTE		;Save this as our real pointer, then
+	RET			;All done
+
+SUBTTL GETINF - Decide who to reply to 
+
+GETINF:	SETZM RECPT		;No real recipient as yet
+	SETZM RNAME		;Or pretty name
+	SETZM RSITE		;Or site name
+	MOVE A,[POINT 7,RNAME]	;Pointer to pretty name
+	MOVE B,PT		;And start of message
+	DO.
+	  CALL CPYDLM		;Copy until delimiter
+	  MOVEM A,PT		;Save pointer for later
+	  CAIN C,","		;Comma?
+	   JRST GCOMMA		;Yes, go process
+	  CAIE C,"@"		;At-sign?
+	  IFSKP.
+	    MOVE A,B		;Yes, get pointer in different place
+	    EXIT.
+	  ENDIF.
+	  CAIE C," "		;Space?
+	   JRST BADFIL		;Confusing file format, give up
+	  MATCH B,<at >		;Start of host?
+	  IFNSK.
+	    MOVE A,PT		;No, get pointer back
+	    IDPB C,A		;Drop space in
+	    LOOP.
+	  ENDIF.
+	ENDDO.
+	SETZ C,			;Get a null
+	IDPB C,PT		;And drop it in to RNAME
+	PUSH P,A		;Save pointer to site name
+	HRROI A,RECPT		;Get recipient pointer
+	HRROI B,RNAME		;And name we have
+	SOUT%			;Copy across
+	SETZM RNAME		;Forget we had a pretty name
+SSITE:	POP P,B			;Get site name pointer back
+	MOVE A,[POINT 7,RSITE]	;And where it belongs
+	CALL CPYDLM		;Copy until delimiter (don't care which)
+	SETZ C,			;Get a null
+	IDPB C,A		;Drop it in
+	RET
+
+GCOMMA:	MATCH B,< tty>		;Terminal number coming up next?
+	IFNSK.
+	  SETZ C,		;Nope, that must be all
+	  IDPB C,PT		;Drop in a null
+	  RET
+	ENDIF.
+	MOVE B,A		;Get source in its proper place
+	MOVE A,[POINT 7,RECPT]	;Get place to put tty number
+	DO.
+	  ILDB C,B		;Get next byte
+	  CAIL C,"0"		;Is it too small
+	   CAILE C,"7"		;Or too large to be an octal digit?
+	    EXIT.		;Yes, done
+	  IDPB C,A		;Else drop it in
+	  LOOP.
+	ENDDO.
+	SETZ D,			;Get a null
+	IDPB D,A		;And finish it off
+	CAIN C,","		;Comma?
+	 RET
+	CAIE C,"@"		;Is it an at-sign?
+	IFSKP.
+	  PUSH P,B		;Yes, save pointer
+	  JRST SSITE
+	ENDIF.
+	CAIE C," "		;Is it a space?
+	 RET			;No, must be finished
+	MATCH B,<at >		;Site name following?
+	 RET			;No, all done
+	PUSH P,A		;Save pointer to site name
+	JRST SSITE		;And go copy site name
+
+; CPYDLM - Copy from B to A until a delimiter (returned in C, not added to A)
+
+CPYDLM:	ILDB C,B		;Get next char
+	JUMPE C,R		;Stop for null
+	CAIE C," "		;Space
+	 CAIN C,","		;or comma?
+	  RET
+	CAIE C,.CHCRT		;Carriage return
+	 CAIN C,.CHLFD		;or linefeed?
+	  RET
+	CAIE C,.CHTAB		;Tab
+	 CAIN C,"@"		;or at-sign?
+	  RET
+	IDPB C,A		;None of the above, drop char in
+	JRST CPYDLM		;Loop back for the next
+
+SUBTTL CHKLOG - Make sure user is still logged in to given TTY
+
+CHKLOG:	SKIPE RSITE		;Net send?
+	 RET			;Yes, no way to check it
+	STKVAR <USRNUM>
+	SETZM USRNUM		;No user num as yet
+	MATCH <[POINT 7,RNAME]>,<not logged in>
+	IFNSK.
+	  MOVX A,RC%EMO		;Require exact match
+	  HRROI B,RNAME		;Get pretty name
+	  SETZ C,		;No stepping
+	  RCUSR%		;Read user name
+	  TXNE A,RC%NOM		;Was it matched?
+	   RET
+	  MOVEM C,USRNUM	;Save user number
+	ENDIF.
+	HRROI A,RECPT		;Get pointer to recipient terminal number
+	MOVEI C,^D8		;Radix octal
+	NIN%			;Read in the number
+	 ERCAL ERROR
+	MOVEI A,.TTDES(B)	;Turn into terminal designator
+	HRROI B,D		;One word, into D
+	MOVEI C,.JIUNO		;Read in user number
+	GETJI%			;Find out who there
+	 ERCAL ERROR
+	CAME D,USRNUM		;Was it the user number we expected?
+	IFSKP.
+	  JUMPN D,R		;and real user
+	  JUMPGE B,R		;or someone there?
+	  EMSG <TTY>		;No, start message
+	  HRROI A,RECPT		;Get terminal number
+	  PSOUT%		;Type it
+	  TMSG < is no longer active.>
+	  JRST STOP
+	ENDIF.
+	SKIPN USRNUM		;Did we have a user number?
+	 JRST NOWUSR		;No, but there's someone there now!
+	HRROI A,RNAME		;Get pretty name (all we have left now)
+	PSOUT%
+	TMSG < is no longer at TTY>
+	HRROI A,RECPT		;Get no-good terminal
+	PSOUT%			;Add that too
+	TMSG <
+>
+	PROMPT [ASCIZ/Sending to username instead [Confirm] /]
+	CALL CONFRM		;Ask user to say yes
+	 JRST ABTSND
+	SETZM RECPT		;No terminal number any more
+	RET
+
+NOWUSR:	TMSG <TTY>
+	HRROI A,RECPT		;With given tty number
+	PSOUT%			;Added to the string
+	TMSG < now in use by >
+	MOVEI A,.PRIOU		;To terminal
+	MOVE B,D		;With user number we got back
+	DIRST%			;Translate user number to string
+	 ERCAL ERROR
+	TMSG <
+>
+	PROMPT [ASCIZ/Sending there anyway [Confirm] /]
+	CALL CONFRM		;Make sure we want to send there
+	 JRST ABTSND
+	HRROI A,RNAME		;Get pointer to pretty name
+	MOVE B,D		;And user there again
+	DIRST%			;Translate again
+	 ERCAL ERROR
+	RET
+
+ABTSND:	EMSG <Not confirmed, send aborted>
+	JRST STOP
+
+; CONFRM - Ask for carriage-return confirmation
+; returns +1/not confirmed, +2/confirmed
+
+; If any COMND% parsing is ever needed elsewhere this should be made
+; into a real parser that handles stack saving and the rest.
+
+CONFRM:	SAVEAC <A,B,C>		;Save some registers
+	MOVEI A,CMDBLK		;Get CSB
+	MOVEI B,[FLDDB. .CMINI]	;Initialization
+	COMND%			;Parse it
+	 ERJMP R		;Lost????????
+REPARS:	MOVEI B,[FLDDB. .CMCFM]	;Confirmation
+	COMND%			;Parse that too
+	 ERJMP R		;Lost????
+	TXNE A,CM%NOP		;Not parsed?
+	 RET			;Fail
+	RETSKP			;Success
+
+SUBTTL PUTJCL - Put JCL so send can see it
+
+PUTJCL:	HRROI A,SNDJCL		;Destination send JCL
+	HRROI B,[ASCIZ\SEND \]	;Add program name
+	SETZ C,			;Ending on null
+	SOUT%			;Do it
+	SETZ C,			;All SOUTs end on nulls
+	SKIPE RECPT		;Are we trying for a username?
+	IFSKP.
+	  HRROI B,RNAME		;Yes, get it back
+	  SOUT%			;Send it off
+	ELSE.
+	  HRROI B,RECPT		;Get recipient
+	  SOUT%			;Add to JCL
+	  SKIPN RSITE		;Is there a site to send this to?
+	  IFSKP.
+	    MOVEI B,"@"		;Get an at-sign
+	    IDPB B,A		;Drop it in
+	    HRROI B,RSITE	;Now get pointer to site name
+	    SOUT%		;Add it to JCL
+	  ENDIF.
+	ENDIF.
+	MOVEI B," "		;Space for luck
+	IDPB B,A		;Drop it in
+	MOVE B,JCLPTR		;And pointer to rest of JCL
+	SOUT%			;Finish off JCL
+
+	;; Now that we've made JCL, make string saying who sending to.
+	PROMPT A,PRMBUF		;Start making prompt or response
+	FMSG <Replying to >	;Begin message
+	SKIPE RECPT		;Are we trying for a username?
+	IFSKP.
+	  HRROI B,RNAME		;Yes, get it back
+	  SOUT%			;Send it off
+	ELSE.
+	  SKIPN RNAME		;If we have a pretty name
+	  IFSKP.
+	    HRROI B,RNAME	;Get pretty name
+	    SOUT%		;Add it
+	    FMSG <, TTY>	;But that's not the real recipient
+	  ENDIF.
+	  HRROI B,RECPT		;Get recipient
+	  SOUT%			;Add to line
+	  SKIPN RSITE		;Is there a site to send this to?
+	  IFSKP.
+	    FMSG <@>
+	    HRROI B,RSITE	;Now get pointer to site name
+	    SOUT%		;Add it to JCL
+	  ENDIF.
+	ENDIF.
+
+	;; Either print string, or use as prompt for one-liner confirmation.
+	SKIPN SNGLLN		;All-on-one-line form of REPLY?
+	IFSKP.			;Yes
+	  FMSG < [Confirm] >	;Finish prompt
+	  CALL CONFRM		;Make sure user REPLYing to the right person
+	   JRST ABTSND		;Not confirmed, give up
+	ELSE.
+	  TMSG < >		;Start with a space
+	  MOVE A,CMDBLK+.CMRTY	;Now point to string
+	  PSOUT%		;Send that too
+	  TMSG <
+>				;Finish "Replying to ..." message
+	ENDIF.
+
+	;; All confirmed, safe to set RSCAN buffer
+	HRROI A,SNDJCL		;Get jcl for SEND.EXE
+	RSCAN%			;Put it in RSCAN buffer
+	 ERCAL ERROR
+	RET
+
+SUBTTL UNMAP - Cleans up SENDS.TXT
+
+UNMAP:	SETO A,			;-1
+	MOVE B,[.FHSLF,,SNDPAG]	;Where to unmap from
+	MOVX C,PM%CNT		;Multiple page unmap
+	HRR C,PAGCNT		;Number of pages to unmap
+	PMAP%			;Unmap the file
+	MOVE A,JFN		;Get the JFN back
+	CLOSF%			;Close the file
+	 ERCAL ERROR
+	RET
+
+SUBTTL Error handler
+
+ERROR:	EMSG <Error at >	;Start error message
+	MOVEI A,.PRIOU		;To terminal
+	MOVE B,(P)		;Get location after ERCAL
+	SUBI B,2		;Point back to losing JSYS
+	MOVEI C,^D8		;Octal
+	NOUT%			;Output location
+	 NOP
+	TMSG < - >
+	MOVEI A,.PRIOU		;To terminal again
+	HRLOI B,.FHSLF		;With last error on our own fork
+	SETZ C,			;No limit on how many chars to type
+	ERSTR%			;print error string
+	 NOP			;Undefined error number
+	 NOP			;Other error
+
+STOP:	SKIPN SNGLLN		;Single line?
+	IFSKP.			;Yes, want to write SENDS.FAILED
+	  SETZM SNGLLN		;But don't try again if we lose
+	  HRROI B,[ASCIZ/SENDS.FAILED.-1;P770202;T/]	;Want this file
+	  CALL FILNAM		;Go make it
+	  MOVX A,GJ%SHT!GJ%FOU	;Short GTJFN, for output
+	  GTJFN%		;Get the JFN
+	   ERCAL ERROR
+	  MOVX B,FLD(7,OF%BSZ)!OF%WR ;Writing, byte size 7
+	  OPENF%		;Open it up
+	   ERCAL ERROR
+	  MOVE B,JCLPTR		;Get pointer to the one line message
+	  SETZ C,		;Ending on null
+	  SOUT%			;Send it off to the file
+	   ERCAL ERROR
+	  CLOSF%		;Close it up
+	   ERCAL ERROR
+	  TMSG <
+%Failing message written to SENDS.FAILED
+>
+	ENDIF.
+
+	HALTF%			;Stop
+	EMSG <Can't continue>
+	JRST STOP
+
+BADFIL:	EMSG <Bad format for SENDS.TXT>
+	JRST STOP
+
+	END <EVECL,,EVEC>

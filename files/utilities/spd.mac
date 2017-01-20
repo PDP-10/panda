@@ -1,0 +1,824 @@
+;<UTILITIES>SPD.MAC.16,  1-Mar-83 17:35:13, Edit by MRC
+; Set TOPNUM to be CTY
+
+	Title SPD
+Comment \
+
+ 	Program to set and list port speeds
+
+	Version 2.3
+	TOPS-20 monitor, version 4.0
+	MACRO-10, version 53A
+	Edits 1-5
+
+	TOPS-20 MONITOR VERSION 5	7-SEPT-82
+	Edits 6 and above
+
+	Modifications:
+
+------------------------------------------------------------------------------
+
+  1	JVS	19-Dec-80
+	-----------------
+
+	Added help file lookup ability
+
+------------------------------------------------------------------------------
+
+  2	JVS	19-Dec-80
+	-----------------
+	Added DEC type version numbering
+
+------------------------------------------------------------------------------
+
+  3	JVS	30-Mar-81
+	-----------------
+	Revised stack use so bad command did not garbage stack.
+
+------------------------------------------------------------------------------
+
+  4	CAF	3-Feb-82
+	----------------
+	Added FIX command to repair "hung-up" local lines by setting
+	speed to 0 baud and then back to original speed.
+
+------------------------------------------------------------------------------
+
+  5	WTD	13-Apr-82
+	-----------------
+	Bumped up the number of terminals to 120 octal lines
+
+------------------------------------------------------------------------------
+
+ 6	WTD	7-Sep-82
+	----------------
+	WTD	9-Sep-82
+	Added LF and CR to Break mask
+
+-------------------------------------------------------------------------------
+
+ 7	WTD	7-Sep-82
+	----------------
+	if a terminal is not available continue to print rest of
+	range and not die.
+
+-------------------------------------------------------------------------------
+\
+
+
+	Search MONSYM, MACSYM
+
+
+; **********************************************************************
+; **********************************************************************
+; ********							********
+; ********	Symbol definitions  				********
+; ********							********
+; **********************************************************************
+; **********************************************************************
+
+; Accumulator definitions
+
+	A==1			; JSYS accumulators's
+	B==2
+	C==3
+	D==4
+	E==5
+	F==6
+
+	SpdFlg==10		; Storage for REMOTE and AUTO flag word
+	Speed==11		; Storage for output terminal speed
+	ScnFlg==15		; 0 if we're not rescanning
+	P==17			; PC Stack pointer
+
+; Misc. symbols
+
+	Versn==2B29		; Version number
+	Revisn==3		; Revision number
+	TopNum==400105		; [5] Designator for highest terminal on system
+	StkSiz==64		; Size of stack
+	BufSiz==100		; Word size of COMND text buffer
+	AtmSiz==40		; Word size of COMND atom buffer
+	CR==15			; ASCII code for carriage return
+
+
+; **********************************************************************
+; **********************************************************************
+; ********							********
+; ********	Macro Definitions				********
+; ********							********
+; **********************************************************************
+; **********************************************************************
+
+; ********** Entry ***********
+; Macro to build an entry for a TBLUK command table
+
+	Define Entry(Address, String, Flags)	<
+
+	IFN Flags, < Ent==[ CM%FW!Flags
+			    ASCIZ String ] >
+	IFE Flags, < Ent==[ ASCIZ String ] >
+	XWD Ent, Address	
+>
+
+; ********** CmdErr **********
+; Macro to dispatch to error writing routine if COMND
+; has generated an error
+
+	Define CmdErr	<
+	  ErJmp CWarn1
+	TLNE A, (CM%NOP)
+	  JRST	Cwarn2
+>
+
+
+; **********************************************************************
+; **********************************************************************
+; ********							********
+; ********	Impure data storage				********
+; ********							********
+; **********************************************************************
+; **********************************************************************
+
+PDLst:	Block StkSiz		; Stack storage
+IOLst:	Block StkSiz		; Input JFN stack storage
+TmpFil:	Block 1			; Temporary JFN storage for CmdFil routine
+Prompt:	ASCIZ /SPD>/		; COMND C-R prompt 
+CmdBuf:	Block BufSiz		; COMND text buffer
+Atom:	Block AtmSiz		; COMND atom buffer
+JFNBlk:	Block 16		; GTJFN arguement block
+StrtNm:	Block 1			; Storage for starting terminal number
+StopNm:	Block 1			; Storage for ending terminal number
+IOStk:	Block 1			; Storage for IO Stack Pointer
+StkIni:	IOWD StkSiz, PDLst	; Initial value for stack pointer
+Null:	Block 1			; Flag for null entry on FIX for lines
+Delay:	Block 1			; [4] amount of delay when fixing lines (exec5)
+
+; ********** Entry vector **********
+
+EntVec:	JRST	Start
+	JRST	CmdIni
+	Versn,,Revisn
+
+; ******* COMND state block *******
+
+State:	Parse			; Reparse dispatch address
+	.PRIIN,,.PRIOU		; Input and output JFN's for COMND
+	Point 7, Prompt		; Byte pointer to prompt text
+	Point 7, CmdBuf		; Byte pointer to text buffer
+	Point 7, CmdBuf		; Byte pointer to next field to parse
+	BufSiz*5		; Count of space left in text buffer
+	0			; Count of unparsed characters
+	Point 7, Atom		; Byte pointer to Atom buffer
+	AtmSiz*5		; Byte size of the Atom buffer
+	JFNBlk			; Address of GTJFN arguement block
+
+; ******* First parse level keyword table *******
+
+Pos0=.
+
+KeyTab:	KeyNum,,KeyNum
+	Entry Finish, </EXIT/>
+	Entry Fixup,  </FIX/>
+	Entry Help,   </HELP/>
+	Entry GetSpd, </LIST/>
+	Entry Finish, </QUIT/>
+	Entry SetSpd, </SET/>
+	Entry CmdFil, </TAKE/>
+
+KeyNum=. - Pos0 - 1
+
+; ******* Keyword table to parse TOPS-20 entry command **********
+
+Pos0=.
+
+ScnTab:	ScnNum,,ScnNum
+	Entry 0,	</RUN/>
+	Entry 1,	</START/>
+
+ScnNum= . - Pos0 - 1
+
+; ********** Set function keyword table **********
+
+Pos0=.
+
+SetTab:	SetNum,,SetNum
+	Entry <(MO%RMTZ)>, </REMOTE/>
+	Entry 0,	   </SPEED/>
+
+SetNum= . - Pos0 - 1
+
+; ********** Terminal speed keyword table **********
+
+	Radix 10
+Pos0=.
+
+SpdTab:	SpdNum,,SpdNum		; Number of elements in table
+	Entry 0,	</0/>	; List of allowable baud rates
+	Entry 110,	</110/>
+	Entry 1200,	</1200/>
+	Entry 134,	</134/>
+	Entry 150,	</150/>
+	Entry 1800,	</1800/>
+	Entry 200,	</200/>
+	Entry 2400,	</2400/>
+	Entry 300,	</300/>
+	Entry 4800,	</4800/>
+	Entry 50,	</50/>
+	Entry 600,	</600/>
+	Entry 75,	</75/>
+	Entry 9600,	</9600/>
+
+SpdNum= . - Pos0 - 1
+	Radix 8
+
+; ******* COMND function descriptor blocks *******
+
+IniFun:	.CMINI_^D27		; Initialize
+
+KeyFun:	.CMKEY_^D27		; Parse a first level keyword 
+	KeyTab			; Keyword table address
+
+CFMFun:	.CMCFM_^D27		; Get user confirmation
+
+FilFun:	.CMFIL_^D27		; Parse a general file specification
+
+ScnFun:				; Funtion to parse RUN from the rescan buffer
+	<.CMKEY>_^D27!FilFun	; Parse a keyword, then parse a file spec
+	ScnTab			; Keyword table
+
+RanFun:				; Parse port number range string
+	<.CMTXT>_^D27!<CM%HPP>!<CM%SDH>!<CM%BRK>
+				; Text parse, use help message and break mask
+	0
+	Point 7, [ASCIZ /
+Single octal port number or port number range in the format:  1-5/]
+	0
+	RanBrk			; Break mask
+
+SetFun:				; Parse a Set funtion keyword
+	<.CMKEY>_^D27		; Parse a keyword
+	SetTab			; Address of keyword table
+
+InSpdFun:			; Parse input speed spec
+	<.CMKEY>_^D27!<CM%HPP>!<AutFun>
+				; Parse a terminal speed keyword
+				;     Use defined help message plus default
+				;     If no speed entered check for auto.
+	SpdTab			; Address of speed keyword table
+	Point 7, [ASCIZ/ Input speed, /]  ; Help message
+
+OutSpdFun:			; Parse output speed spec
+	<.CMKEY>_^D27!<CM%HPP>!<CFMFun>
+				; Parse a terminal speed keyword or a confirm.
+				;     Use defined help message plus default
+	SpdTab			; Address of speed keyword table
+	Point 7, [ASCIZ/ Output speed, /]  ; Help message
+
+AutFun:				; Parse the AUTO keyword
+	<.CMTOK>_^D27		; Parse a token
+	Point 7, [ASCIZ /AUTO/]	; Token to parse
+
+
+; ********** Port number range break mask **********
+
+RanBrk:	1B9!1B10!1B13		; Break on tab,[6] LF,CR 
+	1B0			; Break on space
+	0
+	0
+
+
+; **********************************************************************
+; **********************************************************************
+; ********							********
+; ********	Subroutine ScnParse				********
+; ********							********
+; **********************************************************************
+; **********************************************************************
+;
+;  Routine to parse the rescan buffer
+;  Removes garbage like program name and 'RUN' or 'START'
+;
+;  No arguments neccessary
+;  Destroys A, B, C
+;  Returns:
+;	+1	If there is info in the rescan buffer
+;	+2	If there is no info to parse in the buffer
+
+ScnParse:
+
+; ********** Initialize the rescan buffer **********
+
+	MoveI	A, .RSINI	; Set up rescan buffer
+	RSCAN
+	  ErJmp Fatal		; If error, die
+	SkipN A			; If there is nothing in the rescan buffer
+	  JRST	Ret.2		;    Return at +2
+
+; ********** Set up COMND state defaults to parse rescan **********
+
+	MoveI	A, .NULIO
+	HRRM A, State + .CMIOJ	; COMND outputs to nowhere
+
+; ********** Parse the garbage out of the buffer **********
+
+	MoveI	A, State	; Move address of COMND state block into A
+	MoveI	B, IniFun	; Move address of function block into B
+	COMND			; Initialize command line
+	  ErJmp Fatal		; If error, die
+
+Scn1:	MoveI	B, ScnFun	; Move address of function block into B
+	COMND			; Parse 'run' or 'sys:spd.exe' 
+	  ErJmp Fatal		; If error, die
+	HRRZM C, C		; Zero the left half of C
+	CAIN	C, ScnFun	; If we parsed RUN or START
+	  JRST	Ret.2		;    Then forget rescan and return at +2
+
+	Move	A, B		; Move the JFN that COMND got into A
+	RLJFN			; Release the JFN
+	  ErJmp Fatal		; If error, die
+
+	Move	E, State+6	; Get number of characters left to parse
+	CAIG E, 1		; If we're out of rescan
+	  JRST	Ret.2		;     Then return at +2
+	MoveI	ScnFlg, 1	; Say we're rescanning
+	SkipA			; Skip the Ret.2 instruction
+
+; ********** Restore and return **********
+
+Ret.2:	AOS (P)			; Add one to the PC stored on the PC stack
+				;    so we return at +2
+
+	SetZM JFNBlk + .GJDIR	; Reset GTJFN defaults
+	SetZM JFNBlk + .GJNAM
+	SetZM JFNBlk + .GJEXT
+	MoveI	A, .PRIOU
+	HRRM A, State + .CMIOJ	; Reset COMND output to the controling terminal
+	Ret
+
+
+; **********************************************************************
+; **********************************************************************
+; ********							********
+; ********	Subroutine Confrm				********
+; ********							********
+; **********************************************************************
+; **********************************************************************
+;
+;  Subroutine to confirm a COMND command
+;
+;  Arguments:
+;	A	Command state block address
+;
+;  Destroys B
+;  Returns +1 always
+;
+
+Confrm:	MoveI	B, CFMFun	; Move address of confirmation function block
+				;   into B
+	COMND			; Get confirmation
+	  CmdErr		; Check for COMND errors
+	Ret
+
+; **********************************************************************
+; **********************************************************************
+; ********							********
+; ********	Subroutine SpdOut				********
+; ********							********
+; **********************************************************************
+; **********************************************************************
+;
+;  Routine to output a single line speed 
+;  Outputs the number in B right justified in 10 columns, radix 10
+;
+;  Arguements:
+;	A	Output JFN
+;	B	Number to be output
+;
+;  Destroys C
+;  Returns +1 always
+
+SpdOut:	Move	C, [9B17!<NO%LFL>!^D10]
+				; Number output format
+				;    14 character field width, right justified,
+				;    radix 10
+	NOUT			; Output the terminal speed
+	  ErJmp CWarn2		; If error, warn user and get another command
+	Ret
+
+; **********************************************************************
+; **********************************************************************
+; ********							********
+; ********	Subroutine GetRange				********
+; ********							********
+; **********************************************************************
+; **********************************************************************
+;
+;  Subroutine to parse a terminal range in the format:
+;	<starting number>-<ending number> (i.e. 1-5)
+;
+;  Arguements:
+;	A	COMND state block address
+;
+;  Destroys B, C, and E
+;  Returns +1 always
+;
+
+GetRange:
+	MoveI	B, RanFun	; Move funtion address block into B
+	COMND			; Parse port number range string
+	  CmdErr		; Check for errors
+
+	Setzm	Null		; Assume not a null 
+	Move	E, [Point 7, Atom]	; Point to start of atom buffer
+	ILDB	B, E			; Get first byte of the atom into E
+	SkipN 	B			; If its a null
+	  JRST	[MoveI	E, 400001	;   Then
+		MoveM	E, StrtNm	;     the starting number is 1 + 400000
+		MoveI	E, TopNum
+		MoveM	E, StopNm	;     and the ending number is TopNum
+		SetOM	Null		;     set the Null flag true for FIX
+		Ret]			;     return
+
+	Move	A, [Point 7, Atom]	; Point to start of atom buffer
+	MoveI	C, 8			; Move radix into C
+	NIN				; Get the input number
+	  ErJmp CWarn1			; If error, warn user
+	AddI 	B, 400000		; Add 400000 to B to get standard 
+					;    terminal device designator
+	MoveM	B, StrtNm		; Store the starting number
+
+	LDB 	B, A			; Load next byte in input string into B
+	CAIE	B, "-"			; If its not a "-"
+	  JRST	[Move	B, StrtNm	;    Then make starting terminal the 
+		MoveM	B, StopNm	;    ending terminal
+		Ret]			;    Return
+
+	NIN			; Get ending port number
+	  ErJmp CWarn1		; If error, warn user and get another command
+	AddI B, 400000		; Add 400000 to B to get standard terminal
+				;    device designator
+	MoveM	B, StopNm	; Store ending terminal designator
+	Ret
+
+; **********************************************************************
+; **********************************************************************
+; ********							********
+; ********	Start Mainline program				********
+; ********							********
+; **********************************************************************
+; **********************************************************************
+
+; ********** Initialize **********
+
+Start:	Reset
+	Move	P, StkIni		; Set up stack pointer
+	Move	A, [IOWD StkSiz, IOLst]	; Set up stack pointer for
+	MoveM	A, IOStk		;   IO stack
+	Movei	A, ^D10		; [4] Default to 1 sec delay when "fixing"
+	MoveM	A, Delay	; [4]
+	SetZ	ScnFlg,		; We aren't rescanning yet
+	Call ScnParse		; If there is anything in the rescan buffer to
+	  JRST	Parse		;   parse, parse it
+
+
+; ********** Start command parsing **********
+
+CmdIni:	SkipE 	ScnFlg		; If we're rescanning
+	  JRST	Die		;    Then we're done
+
+	MoveI	A, State	; Move address of COMND state block into A
+	MoveI	B, IniFun	; Move address of init function block into B
+	COMND			; Initialize command parsing
+	  ErJmp Fatal		; If error, die
+
+Parse:	MoveI	A, State	; Move address of COMND state block into A
+	MoveI	B, KeyFun	; Move address of keyword function block into B
+	COMND			; Parse a first level keyword
+	  CmdErr		; Check for COMND errors
+	HRRZ 	D, @B		; Move dispatch address into D
+	JRST	(D)		; Jump to dispatch address
+
+; ********** Command file opening routine **********
+
+CmdFil:	HRLZI 	C, (GJ%OLD)			; GTJFN flags:
+	MoveM	C, JFNBlk + .GJGEN 		;     File must exist
+	Move	C, [Point 7, [ASCIZ/SPD/]]	; Set default extention to 
+	MoveM	C, JFNBlk + .GJEXT		;     be the program name
+
+	MoveI	B, FilFun	; Move address of file name function into B
+	COMND			; Get the filename
+	  CmdErr		; Check for COMND errors
+	HRRZM 	B, TmpFil	; Store JFN in TmpFil
+	Call Confrm		;   Then confirm the command
+
+	Move	A, TmpFil	; Move the JFN into A
+	Move	B, [OF%RD!7B5]	; OpenF Functions:
+				;    Read access
+				;    7 bit bytes
+	OpenF			; Attempt to open the file
+	  ErJmp Warn		; If error warn user
+
+	Move	B, IOStk	; Get the IO stack pointer
+	Push 	B, State+.CMIOJ	; Push input stream onto the stack
+	MoveM	B, IOStk	; Put back the IO stack pointer
+	HRL	A, A		; Move input JFN into left half of A
+	HRRI 	A, .NULIO	; Since we're in a file, output to nowhere
+	MoveM	A, State+.CMIOJ	; Move the new I/O JFN's to COMND state block
+	SetZM	JFNBlk + .GJGEN	; Reset GTJFN block
+	SetZM	JFNBlk + .GJEXT
+	SetZM	ScnFlg		; Zero the rescan flag
+	JRST	CmdIni		; Go get another command
+
+
+; ********** Help routine **********
+;  Types out the HLP:SPD.HLP file
+;
+
+Help:	Call Confrm		; Confirm the command
+
+	Move	A, [GJ%SHT!GJ%OLD]	; GTJFN flags:
+				;    Short call, file must exist
+	HRROI	B, [ASCIZ /HLP:SPD.HLP/]	; Point to file name
+	GTJFN			; Get the help file JFN
+	  ErJmp Warn		; If error, warn user
+	Move	C, A		; Store the JFN in C
+
+	Move	B, [7B5!OF%RD]	; OPENF modes:
+				;    7 bit bytes and read access
+	OPENF			; Open the file
+	  ErJmp Warn		; If error, warn user
+
+Help1:	Move	A, C		; Move input JFN into A
+	BIN			; Get a byte
+	  ErJmp Help2		; If error, then we're done
+	Move	A, B		; Move the byte into A
+	PBOUT			; Dump the byte to the screen
+	JRST	Help1		; Get another byte
+
+Help2:	Move	A, C		; Move the input JFN into A
+	CLOSF			; Close the file
+	  ErJmp Warn		; If error, warn user
+	JRST	CmdIni		; Go get another command
+
+; ********** Speed setting routine *********
+
+SetSpd:	SetZ	E,		; Set no next function for RanFun function
+	HRRM	E, RanFun	;     block
+	Call GetRange		; Get terminal number range
+
+	MoveI	A, State	; Move address of COMND state block into A
+	MoveI	B, SetFun	; Move address of function block into B
+	COMND			; Parse Set keyword
+	  CmdErr		; Check for errors
+	HRLZ	SpdFlg, (B)	; Move flags into SpdFlg
+
+	MoveI	B, InSpdFun	; Move address of function block into B
+	COMND			; Parse input speed
+	  CmdErr		; Check for errors
+	HRRZ 	Speed, (B)	; Store input speed
+	HRRZM	C, C		; Zero the left half of C
+	CAIN	C, AutFun		; If we parsed AUTO instead of a speed
+	  JRST	[TLO	SpdFlg, (MO%AUT); Set the AUTO flag
+		JRST	Set1]		; And go to the set routine
+
+	MoveI	B, OutSpdFun		; Move address of function block into B
+	COMND				; Parse output speed or confirmation
+	  CmdErr			; Check for errors
+	HRRZM	C, C			; Zero the left half of C
+	CAIN	C, CFMFun		; If we parsed a confirmation 
+	  JRST	[HRL	Speed, Speed	;    Then input speed is same as output
+		JRST	Set2]		;    and jump to the speed set routine
+	HRL	Speed, (B)		; Store the output speed
+
+Set1:	Call Confrm		; Confirm the command
+Set2:	Move	A, StrtNm	; Move the starting terminal number into A
+Set:	MoveI	B, .MOSPD	; Move speed set function code into RH of B
+	HLL	B, SpdFlg	; Move flags into LH of B
+	Move	C, Speed	; Move speed to set into C
+	MTOPR			; Set the speed
+	  ErCal Warn		; If error, warn user
+	CAMGE A, StopNm		; If we're not done
+	  AOJA A, Set		;    Increment A and set another speed
+	JRST	CmdIni		; Go get another command
+
+; ********** Fix Lines in Case "Hung" by System **********
+
+Fixup:	SetZ	E,		; Set no default for RanFun
+	HRRM	E, RanFun	;     function block
+	Call GetRange		; Get the line number range
+	SkipE	Null		; Something must have been typed, no nulls
+	  Jrst	Cwarn3		;   allowed here.
+	MoveI	A, State	; Move address of COMND state block into A
+	Call Confrm		; Confirm the command
+	
+	Hrroi	A, [Asciz /   Fixing.../]
+	PSOUT
+	Move	E, StrtNm	; Move starting terminal designator into E
+
+Fix1:	Move	A, E		; Move terminal designator into A
+	MoveI	B, .MORSP	; Set funtion for MTOPR
+	MTOPR			; Get the terminal speed
+	  ErCal Warn		; If error, warn user and continue
+	MoveM	B, SpdFlg	; Save terminal flags
+	MoveM	C, Speed	; Save terminal speed
+	
+	Move	A, E		; Get terminal designator again
+	MoveI	B, .MOSPD	; Move speed set function code into RH of B
+	HLL	B, SpdFlg	; Move flags into LH of B
+	Movei	C, 0		; C = speed (0 baud for the line speed)
+	MTOPR			; Set the speed
+	  ErCal Warn		; If error, warn user
+
+	movei	A, ^D100	; Set up for delays in increments of .1 sec
+	Imul	A, Delay	; Multiply times desired delay
+	DISMS			; Now wait...  (seems needed for Ver 5 Monitor)
+	Move	A, E		; Get terminal designator again
+	MoveI	B, .MOSPD	; Move speed set function code into RH of B
+	HLL	B, SpdFlg	; Move flags into LH of B
+	Move	C, Speed	; C = speed (restore original speed again)
+	MTOPR			; Set the speed
+	  ErCal Warn		; If error, warn user
+
+	MoveI	A, .PRIOU	; Set output to terminal
+	Move	B, E		; Move terminal number into B
+	Subi	B, 400000	; Turn designator into number for printing
+	Move	C, [7B17!<NO%LFL>!8]
+				; Number output format
+				;   7 character field, right justified,
+				;   radix 8
+	NOUT			; Output the terminal number
+	  ErJmp CWarn2		; If error, warn user and get another command
+
+	CAMGE 	E, StopNm	; If we're not done
+	  AOJA	E, Fix1		;    Increment A and set another speed
+	HRROI	A, [ASCIZ /
+/]				; Move to next line
+	PSOUT
+	JRST	CmdIni		; Go get another command
+	
+
+; ********** List current terminal speeds **********
+
+GetSpd:	MoveI	E, CFMFun	; Move confirmation function code into RanFun
+	HRRM	E, RanFun	;     function block
+	Call GetRange		; Get the line number range
+	MoveI	A, State	; Move address of COMND state block into A
+	Call Confrm		; Confirm the command
+	HRROI	A, [ASCIZ /
+               Speeds
+ Terminal  Input    Output   Line type
+/]
+	PSOUT			; Output heading
+	  ErJmp CWarn1		; If error, warn user and get another command
+	Move	E, StrtNm	; Move starting terminal designator into E
+	Move	D, E		; Move starting terminal designator into D
+	SubI D, 400000		; Turn designator into number
+
+Get:	MoveI	A, .PRIOU	; Set output to terminal
+	Move	B, D		; Move terminal number into B
+	Move	C, [7B17!<NO%LFL>!8]
+				; Number output format
+				;   7 character field, right justified,
+				;   radix 8
+	NOUT			; Output the terminal number
+	  ErJmp CWarn2		; If error, warn user and get another command
+
+	Move	A, E		; Move terminal designator into A
+	MoveI	B, .MORSP	; Set funtion for MTOPR
+	MTOPR			; Get the terminal speed
+	 Erjmp [MoveI A,.FHSLF	;[7] this process
+		GETER		;[7] get error number
+		HrrZ A,B	;[7] move right of B to Right of A
+		CaiE A,DESX2	;[7] terminal not avail to job?
+		Call Warn	;[7] nope, bad error
+		HrrOI A,[Asciz/  Terminal not available/]
+		PSOUT		;[7] print message
+		Jrst OutCr ]	;[7] continue
+	MoveM	B, SpdFlg	; Save terminal flags
+	MoveM	C, Speed	; Save terminal speed
+
+	MoveI	A,.PRIOU	;[7] output to terminal
+	HLRZ	B, Speed	; Move input speed into B
+	Call SpdOut		; Output the speed
+	HRRZ	B, Speed	; Move output speed into B
+	Call SpdOut		; Output the speed
+
+	Move	B, SpdFlg	; Move flag word into B
+	TLNE	B, (MO%RMT)	; If its a remote terminal
+	  Call [		;    Then say so
+		HRROI	A, [ASCIZ/    Remote /]
+		PSOUT
+		  ErJmp CWarn2
+		TLNE	B, (MO%AUT)	 		 ; If its autobaud
+		  JRST	[HRROI	A, [ASCIZ /Auto/]	 ;   say so
+			PSOUT
+			  ErJmp CWarn2
+			Ret ]
+		Ret ]
+
+OutCr:	HRROI	A, [ASCIZ /
+/]
+	PSOUT			; Output CR 
+	  ErJmp CWarn1		; If error, warn user and get another command
+	CAML	E, StopNm	; If we're not done
+	  JRST	CmdIni		;    Go get another command
+	AOJ	D,		; Increment D
+	AOJA	E, Get		; Increment E and get another speed
+
+; ********** Cleanup and stop **********
+
+Finish:	Call Confrm		; Confirm the command
+	HRREI	A, -1		; Close all open files
+	ClosF
+	  ErJmp Fatal		; If error, die
+
+	HRROI	A, [ASCIZ /
+[SPD done]
+/]
+	PSOUT			; Send finishing message
+	HaltF			; Stop
+	JRST	CmdIni		; Restart at CmdIni
+
+
+; **********************************************************************
+; **********************************************************************
+; ********							********
+; ********	Error routines					********
+; ********							********
+; **********************************************************************
+; **********************************************************************
+
+; ********** COMND JSYS error **********
+
+CWarn1:	MoveI	A, .FHSLF		; Current process
+	GetEr				; Get most recent error
+	HRRZM	B, B			; Zero left half of B
+	CAIN	B, IOX4			; If EOF error,
+
+	  JRST	[HLRZ 	A, State+.CMIOJ	; Get the input file JFN
+		CLOSF			; Close the file
+		  ErJmp Fatal		; If error, die
+		Move	A, IOStk	; Get the IO stack pointer
+		Pop	A, State+.CMIOJ	; Pop the old COMND I/O desg.
+		MoveM	A, IOStk	; Store the pointer
+		Move	P, StkIni	; Get original stack pointer
+		JRST	CmdIni ]	; Go get a new command
+
+	JRST	Warn		; If any other error, warn user
+
+; ********** Write out error message for COMND internal error **********
+
+CWarn2:	HRROI	A, [ASCIZ /% /]
+	PSOUT			; Write warn prompt
+	MoveI	A, .PRIOU	; Send error message to the screen
+	HRLI B, .FHSlf		; Current process, use error code from COMND
+	SetZ C,			; No limit for message
+	ERSTR			; Write error message
+	  JFCL			; Ignore errors
+	  JFCL
+	HRROI	A, [ASCIZ /
+/]
+	PSOUT			; Move to a new line
+	Move	P, StkIni	; Get original stack pointer
+	JRST	CmdIni		; Go get another command
+
+; ********** Warning for null entry for lines on FIX **********
+
+CWarn3:	HRROI	A, [ASCIZ /% Line Number or Range must be entered
+/]
+	PSOUT			; Move to a new line
+	Move	P, StkIni	; Get original stack pointer
+	JRST	CmdIni		; Go get another command
+
+
+
+; ********** Write JSYS error messages to the screen **********
+
+Warn:	HRROI	A, [ASCIZ/% /]	; Warn char
+	Call Err		; Output error message
+	Move	P, StkIni	; Get original stack pointer
+	JRST	CmdIni		; Get another command
+
+Fatal:	HRROI	A, [ASCIZ/? /]	; Fatal char
+	Call Err		; Output error message
+Die:	HaltF			; Stop
+	JRST	.-1		; Don't allow continue
+
+Err:	PSOUT			; Dump out error type char
+	MoveI	A, .PRIOU	; Output to terminal
+	Move	B, [.FHSlf,,-1]	; Current process, last error
+	SetZ 	C,		; No limit
+	ERSTR			; Dump the message
+	  JFCL			; Ignore errors
+	  JFCL
+	HRROI	A, [ASCIZ/
+/]
+	PSOUT			; Dump out CR-LF
+	Ret			; Return
+
+; ************ End of program ****************************************
+
+	LIT			; assemble literals here
+
+	End <3,,EntVec>

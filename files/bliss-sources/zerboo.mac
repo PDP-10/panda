@@ -1,0 +1,327 @@
+TITLE ZERBOO -- DYNBOO extensions for calling from section zero
+
+;
+;	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1984, 1986.
+;	ALL RIGHTS RESERVED.
+;
+;	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+;	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+;	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+;	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+;	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+;	SOFTWARE IS HEREBY TRANSFERRED.
+;
+;	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+;	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+;	EQUIPMENT CORPORATION.
+;
+;	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+;	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+;
+
+SEARCH DDBSYM, MONSYM, MACSYM
+SEARCH DYNSYM
+
+SALL
+SUBTTL Edit History
+
+; Version 1.0
+
+;.EDIT 1	Put in section-zero call support
+;		DDB,4-APR-84,SPR:NONE
+
+;.EDIT 2	Put in recursive call from section zero
+;		DDB,9-APR-84,SPR:NONE
+
+;.EDIT 6	DY$ZMD shouldn't trash T1
+;		DDB,17-MAY-84,SPR:NONE
+
+; Version 1.1
+
+;.EDIT 50	Formally go to version 1.1, update copyright, insert V1.1
+;			development changes (formally V2)
+;		DDB,15-Jan-85,SPR:NONE
+;.EDIT 51	Add GLOBbing in build procedure, make DY$CBK work from JCK.
+;		DDB,30-Apr-85,SPR:NONE
+;.EDIT 52	Fix handling of stack pointer in DY$ZMD/DY$ZMU (routines with
+;			stack args removed in the routine confused it)
+;		DDB-3-MAY-85,SPR:NONE
+;.EDIT 53	Add some automatic initialization for programs calling from 0.
+;		DDB,6-May-85,SPR:NONE
+
+; When attempting to call a dynamic library from section zero, two things
+; must be done:
+;   1.  Section zero must be mapped to a nonzero section, and PC moved
+;	into the new section.
+;   2.	The stack pointer must be made global.
+; These things must be done without destroying the users data in ACs or
+; on the stack, so that the interface to the subroutine is not restricted.
+
+; The sequence selected to perform this is as follows:
+; The libZER file will look like a libJCK file (q.v.) except that the
+; code sequence at each entry name will be as follows:
+;
+;RT1:	;Stack level on entry will be called "SP0"
+;	CALL DY$ZMU		;Map up to non-zero section and change stack
+;				;It also stores the user return into .ZYURA
+;				;and removes that word from the stack
+;				;Stack returned at SP0-1
+;	CALL @TV+n		;Now go to the proper routine as per libJCK
+;				;Stack level now SP0-1
+;	CALL DY$ZMD		;Map back down
+;				;Stack level SP0
+;	RET DY.ZMV		;Return to user location
+;				;(The Y field is info used in DY$CBK
+;				;and probably elsewhere to find things
+;				;in ZERBOO from a library)
+;
+; The section that section 0 is mapped into (if necessary) is specified
+; by DY.ZMS.  The content of this location is initially 1.  Note that this
+; should be the first non-zero section allocated, since this happens on the
+; first call to the RTL.
+DY.ZMS:: 1
+
+; When section zero is actually mapped somewhere, the somewhere is recorded
+; here.
+DY.SEC:: 0			;Section 0 mapped to this section number
+
+; Pointer to special stack for recursive calls from section zero
+DY.ZBL:: IFIW DY.BLK-1
+
+; Stack of ZY blocks
+DY.BLK:: BLOCK 10*.ZYLEN
+
+; Vector of addresses in ZERBOO, for use from libraries (it's found by
+; looking at the Y field of the RET instruction after the DY$ZMD call)
+DEFINE ZVENT (OFFSET,CONTENTS) <
+    IFN .-DY.ZMV-OFFSET, <PRINTX ZV entry OFFSET out of order
+>
+    EXP CONTENTS
+>
+DY.ZMV:: ZVENT (.ZVCNT,.ZVLEN)	;Counted vector
+	ZVENT (.ZVBKR, <IFIW DY$BKR>)
+	ZVENT (.ZVZBL, <IFIW DY.ZBL>)
+	ZVENT (.ZVSEC, <IFIW DY.SEC>)
+	ZVENT (.ZVCS0, <IFIW DY$CS0>)
+
+SUBTTL DY$ZMU -- Map up to non-zero section, change stack
+
+; This routine is called from the per-routine code in a libZER interface file.
+
+; Arguments:
+;	DY.ZBL/	Address of last-used ZY block
+
+; Stack setup:
+;	SP0/	User call retadr
+;	(P)/	retadr
+
+DY$ZMU::
+
+	ADJSP P, 6		;Stack at SP0+7
+	DMOVEM T0, -5(P)
+	DMOVEM T2, -3(P)
+	DMOVEM T4, -1(P)
+	MOVX T5, .ZYLEN
+	ADDB T5, DY.ZBL		;Push onto ZY stack
+	SETZB T0, .ZYRTZ(T5)	;Assume we're in a non-zero section
+	SETZ T3,		;[51] Assume we won't do SMAP%
+	XHLLI T0, 1000		;Find out
+	JUMPN T0, ZMUNOZ	;Jump if assumption was true
+
+; We are in section zero.  Remember this, choose a section, and map up.
+	SETOM .ZYRTZ(T5)
+	SKIPE DY.SEC		;Skip if no section allocated
+	  JRST ZMUGOS
+
+; Map section via indirect pointer to section 0
+	MOVX T1, <.FHSLF,,0>
+	MOVE T2, DY.ZMS		;Section we've been asked to map to
+	MOVEM T2, DY.SEC	;Record section we mapped to
+	HRLI T2, .FHSLF
+	MOVX T3, <SM%IND!SM%RD!SM%WR!SM%EX!1> ;All access, indirect
+	SMAP%
+	  ERCAL DY$FJE##	;This is provided in DY$BOO
+	SETO T3,		;[51] Flag that we did SMAP%
+
+; Move PC into the new section
+ZMUGOS:	SETZ T1,
+	HRL T2, DY.SEC
+	HRRI T2, ZMUNOZ		;Address to jump to
+	XJRSTF T1
+
+; We're in a non-zero section.  Worry about the stack now.
+ZMUNOZ:	MOVE T1, P		;Copy of P (at SP0+7)
+; [52]	ADJSP T1, -3		;Adjust to SP0+4 for DY$ZMD
+	MOVEM T1, .ZYSP(T5)	;[52] Save LH/RH relationship of SP
+	SKIPG T1		;Skip if already global
+	  XHLLI P, 1000		;Make global current section if necessary
+
+; Modify retadr to return into non-zero section
+	XHLLI T1, 1000		;Get current section number
+	HLLM T1, -6(P)		;Put over flags in saved PC word
+
+; Put away the user retadr
+	MOVE T1, -7(P)		;Get user retadr
+	MOVEM T1, .ZYURA(T5)	;Store for use after call
+
+; [51]
+; If we were actually called from zero,
+; make sure RTL is initialized, then store dy.sec (this section) into
+; dy.zmp (galactic from rtl) so dy$cbk can tell what section represents
+; a call from section zero.
+	JUMPE T3, ZMURST	;[51] Jump if we didn't do SMAP%
+
+
+; [53]
+; On first call from zero, do special initializations.  This must happen
+; before anything that could cause an nxp from a non-zero section (such
+; as master-initializing the RTL, which will happen when the call in the
+; next chunk is executed).
+; 
+; First special initialization: if interrupt tables exist in section zero,
+; turn off .ICNXP (page create) and .ICIRD (illegal read) interrupts.
+	ADJSP P, 3		;[53] Allocate return value block
+	MOVX T1, .FHSLF		;[53]
+	XMOVEI T2, -2(P)	;[53]
+	MOVX T3, 3		;[53] Block length
+	MOVEM T3, -2(P)		;[53]
+	XRIR%			;[53]
+	  ERJMP ZMUDIC		;[53]
+	HLRZ T1, -1(P)		;[53] Get section of level table
+	JUMPN T1, ZMUFIN	;[53] Not in zero, don't disable
+ZMUDIC:	MOVX T1, .FHSLF		;[53]
+	MOVX T2, <1B<.ICNXP>!1B<.ICIRD>> ;[53]
+	DIC%			;[53]
+	  ERJMP .+1		;[53] Ignore errors
+ZMUFIN:	ADJSP P, -3		;[53] De-allocate return value block
+
+; [53] Second special initialization:
+; [53] Store ZMS into galactic variable
+	CALL @RL.CTV##+.RLNUL	;[51] CALL RL$NUL via vector
+				;[51] (we are mapped up and stack is global)
+	MOVE T1, DY.SEC		;[51] Get section zero was mapped to
+	MOVEM T1, @DY.ZMP##	;[51] Store where RTL can get it
+
+; Restore our saved registers 
+ZMURST:	DMOVE T2, -3(P)		;[51] Add label
+	DMOVE T0, -5(P)
+	MOVE T5, -6(P)		;Get retadr
+	MOVEM T5, -7(P)		;Store over user retadr
+	DMOVE T4, -1(P)		;Restore T4, T5
+	ADJSP P, -7		;Adjust to SP0
+	RET			;Stack at SP0-1
+SUBTTL DY$ZMD -- Return to section and stack mode where we started
+
+; Using the saved information in the ZY block pointed at by DY.ZBL
+
+; Arguments:
+;	DY.ZBL/	Address of ZY block for our use
+
+; Stack setup:
+;	P/	retadr		(SP0)
+
+; NOTE: Because this knows stack layout in detail, it must not be called
+; with a CALRET or equivalent!!
+
+DY$ZMD::
+
+	ADJSP P, 4		;Stack at SP0+4
+	DMOVEM T1, -3(P)	;Save T1, T2
+	DMOVEM T3, -1(P)	;Save T3, T4
+	XMOVEI T4, @DY.ZBL	;Get address of ZY block
+; [52]	MOVE P, .ZYSP(T4)	;Restore SP (particularly LH of local one,
+; [52]				;otherwise this should cause no change)
+
+	SKIPL .ZYSP(T4)		;[52] Skip if was local
+	  JRST ZMDSPG		;[52] Was global, leave alone
+	HLRE T1, .ZYSP(T4)	;[52] Get saved LH of SP as word quantity
+	HRRZ T2, .ZYSP(T4)	;[52] Get saved RH of SP
+	SUB T1, T2		;[52] Saved LH - saved RH
+	HRRZ T2, P		;[52] Current RH
+	ADD T1, T2		;[52] Saved LH + current RH - saved RH
+	HRL P, T1		;[52] becomes new RH
+
+ZMDSPG:				;[52] Stack pointer good
+
+; Return to section zero, if we came from there originally (in DY$ZMU).
+	SKIPN .ZYRTZ(T4)	;Skip if we are to Return To section Zero
+	  JRST ZMDSOK		;Already in right section
+
+	SETZB T1, T2		;Section to return to is zero, if anything
+	HRRI T2, ZMDSOK
+	HLLM T1, -4(P)		;Zero LH of return address (which contains
+				;section we mapped in to)
+	XJRSTF T1		;Return to our section zero
+
+; Now we are in the right section, and stack is ok.  Clean up.
+ZMDSOK:	DMOVE T1, -3(P)		;Restore T1, T2
+	MOVE T3, -4(P)		;[6] Get retadr
+	MOVEM T3, -3(P)		;[6]
+	MOVE T3, .ZYURA(T4)	;[6]
+	MOVEM T3, -4(P)		;[6]
+	MOVX T3, -.ZYLEN	;[6]
+	ADDM T3, DY.ZBL		;[6]
+	DMOVE T3, -1(P)		;[6] Restore T3, T4
+	ADJSP P, -3		;SP0+1
+	RET			;SP0
+SUBTTL DY$BKR -- Return from callback routine
+
+; When a routine in zero must be called from a non-zero section (such as
+; an error handling routine being called by a dynamic library), assistance
+; is needed on the call and the return.  This routine provides the assistance
+; on the return.
+
+; Arguments:
+;	DY.ZBL/	Address of one-word return address
+
+DY$BKR::
+
+	ADJSP P, 3		;Make work space
+	DMOVEM T1, -1(P)
+	XMOVEI T1, 0		;Are we in Zero?
+	JUMPN T1, BKRNOZ	;No
+
+; We are running in section zero.  Section zero is already mapped into some
+; non-zero section (or we wouldn't have reached a dynamic library, and thus
+; could never have ended up here during a callback); jump into that section.
+	; T1 is zero
+	HRL T2, DY.SEC
+	HRRI T2, BKRNOZ
+	HRL P, DY.SEC		;Global stack
+	XJRSTF T1		;Go up to our tame non-zero section
+
+; We are running in a non-zero section.
+BKRNOZ:	MOVE T1, @DY.ZBL	;Get our true return address
+	MOVEM T1, -2(P)		;Put it in first of three words reserved
+	DMOVE T1, -1(P)		;Restore two registers saved
+	ADJSP P, -2		;Return address now on top
+	SOS DY.ZBL		;Pop from other stack
+	RET			;Clean up and return to non-zero section
+
+SUBTTL DY$CS0 -- Call into section zero
+
+; This routine is called with a stack looking like this:
+;	0,,DY$BKR
+;	0,,address of routine we will call
+; P/-->	New stack pointer to install in DY$CS0
+;
+; There may be args in any register, or at any previous point on the stack.
+; Your mission, should you decide to accept it, is to get to the routine
+; specified in section zero (we're in ZMS on entry), with the stack pointer
+; that's on top of the stack (and unfortunately POP P, P has "indeterminate"
+; results according to the hardware reference manual; this seems to mean that
+; the value popped is thrown into the bit bucket on a KL with mocrocode 550),
+; and get to the routine without trashing any registers and with as little
+; delay as possible.  If you or any of your IFIW's are caught or killed, the
+; support group will disavow any knowledge of your actions.  Good luck, sucker.
+
+DY$CS0::
+
+	EXCH T1, 0(P)		;Get stack pointer we wish to install
+	MOVE P, T1		;Install it (stack points to same place,
+				;but is now local instead of ZMS-global)
+	POP P, T1		;Restore T1
+	RET			;Go to routine in section zero
+
+	END
+ 

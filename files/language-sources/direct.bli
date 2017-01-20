@@ -1,0 +1,1024 @@
+MODULE DIRECTORY (	!
+		IDENT = '5'
+                %BLISS36(,ENTRY(
+                                R$PARSE,       ! Parse filespec into components
+                                R$DIRECTORY,   ! Initiate directory search
+                                R$SEARCH,      ! Search (wildcard)
+                                DAP$SEARCH,    ! Search (wildcard) remote
+                                DAP$MERGE,     ! Merge remote filespecs
+                                R$NULL,        ! The Null routine--does nothing
+                                R$$MERGE,      ! Merge filespecs into Resultant
+                                R$RENAME,      ! Rename local or remote file(s)
+                                _SSCAN         ! ^V-handling string scanner
+                                ))
+		) =
+BEGIN
+!  COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1981, 1986.
+!  ALL RIGHTS RESERVED.
+!  
+!  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!  COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!  THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!  ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!  AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!  SOFTWARE IS HEREBY TRANSFERRED.
+!  
+!  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!  NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!  EQUIPMENT CORPORATION.
+!  
+!  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!  ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+
+!++
+! FACILITY:  DAP
+!
+! ABSTRACT:  Routines to transfer records or blocks of file data.
+!
+!
+! ENVIRONMENT:  RMS, BLISSNET, XPORT, Transportable code.
+!
+! AUTHOR:	Andrew Nourse, CREATION DATE:  3-Jan-82
+!
+! 05    - Make R$RENAME call DAP$NEXTFILE for additional files
+! 04    - Return after DAP$NEXTFILE if not DIRECTORY
+! 03    - Use original punctuation for generation number
+! 02    - Move system-dependant code to DIR20.  
+! 01	- The beginning
+!--
+!
+! INCLUDE FILES:
+!
+
+!LIBRARY 'BLI:XPORT';
+ LIBRARY 'RMS';
+ LIBRARY 'BLISSNET';
+ LIBRARY 'CONDIT';
+ LIBRARY 'DAP';
+%BLISS36(
+LIBRARY 'TWENTY';
+! LIBRARY 'BLI:TENDEF';
+! LIBRARY 'BLI:MONSYM';
+)
+!
+! TABLE OF CONTENTS:
+!
+
+FORWARD ROUTINE
+        R$PARSE,                        ! Parse filespec into component parts
+	R$DIRECTORY,                    ! Initiate directory search
+        R$SEARCH,                       ! Search (wildcard)
+        DAP$SEARCH,                     ! Search (wildcard) remote
+        DAP$MERGE,                      ! Merge remote filespecs
+        R$NULL,                         ! The Null routine... does nothing
+        R$$MERGE: NOVALUE,              ! Merge filespecs into Resultant
+	R$RENAME,                       ! Rename local or remote file(s)
+        _SSCAN,                         ! Special string scanner (handle ^V)
+        DIR$HANDLE;                     ! Condition handler
+
+!
+! Feature Tests:
+!
+
+COMPILETIME MULTIPLE_FILESPECS=1;       ! On to allow multiple filespecs in FAB
+
+!
+! MACROS:
+!
+
+
+MACRO SSCAN[]=$STR_SCAN(%REMAINING) %;             ! String Scan macro
+
+
+%IF %BLISS(BLISS36)
+%THEN
+%IF %SWITCHES(TOPS20)
+%THEN
+UNDECLARE %QUOTE SSCAN;
+KEYWORDMACRO
+    SSCAN( string, remainder,  stop, find, span, option, options,
+           substring, target, delimiter, success, failure = STR$FAILURE ) =
+
+	%EXPAND $xpo$required( string remainder, 'STRING= or REMAINDER=' )
+	%EXPAND $xpo$required( find span stop, 'FIND=, SPAN= or STOP=' )
+
+	%IF %EXPAND $xpo$conflict( string, remainder )
+	%THEN
+	    %WARN( 'STRING= and REMAINDER= are mutually exclusive' )
+	    %EXITMACRO
+	%FI
+
+        %IF %EXPAND $xpo$conflict( find, span, stop )
+	%THEN
+	    %WARN( 'FIND=, SPAN= and STOP= are mutually exclusive' )
+	    %EXITMACRO
+	%FI
+
+	%IF %EXPAND $xpo$conflict( option, options )
+	%THEN
+	    %WARN( 'OPTION= and OPTIONS= are mutually exclusive' )
+	    %EXITMACRO
+	%FI
+
+	%IF %EXPAND $xpo$conflict( substring, target )
+	%THEN
+	    %WARN( 'SUBSTRING= and TARGET= are mutually exclusive' )
+	    %EXITMACRO
+	%FI
+
+	%ASSIGN( $str$options, %EXPAND $str$opt_init )
+
+	%IF NOT %NULL( remainder )
+	%THEN
+	    %ASSIGN( $str$options, $str$options OR STR$M_REMAINDER )
+	%FI
+
+	%IF NOT %NULL( find )
+	%THEN
+	    %ASSIGN( $str$function, STR$K_FIND )
+	%ELSE %IF NOT %NULL( span )
+	%THEN
+	    %ASSIGN( $str$function, STR$K_SPAN )
+	%ELSE
+	    %ASSIGN( $str$function, STR$K_STOP )
+	%FI %FI
+
+	%IF NOT %NULL( target )
+	%THEN
+	    %ASSIGN( $str$options, $str$options OR STR$M_TARGET )
+	%FI
+
+	BEGIN
+	! %EXPAND $xpo$force( $xpo$ex_routine( _SSCAN ) )
+	%EXPAND $xpo$ex_failure( failure )
+
+	%IF NOT %NULL( delimiter )
+	%THEN
+	    LOCAL $str$status,
+		$str$delimiter;
+	%ELSE
+	    LITERAL $str$delimiter = 0;
+	%FI
+
+	$str$declare( LOCAL, $str$string, string remainder )
+	$str$declare( LOCAL, $str$pattern, find span stop )
+
+	$str$local_init( $str$string, string remainder )
+	$str$local_init( $str$pattern, find span stop )
+
+	%IF NOT %NULL( delimiter )
+	%THEN
+	    $str$status =
+	%FI
+
+	_SSCAN( %NUMBER( $str$options ) + %NUMBER( $str$function ),
+		$str$string,
+		$str$pattern,
+		$xpo$default( substring target, 0 ),
+		$str$delimiter,
+		$xpo$default( success, 0 ),
+		$xpo$default( failure, 0 ) )
+
+	%IF NOT %NULL( delimiter )
+	%THEN
+	    ;
+	    IF .$str$status
+	    THEN
+		delimiter = .$str$delimiter;
+	    .$str$status
+	%FI
+	END %;
+
+%FI
+%FI
+
+
+!
+! EQUATED SYMBOLS:
+!
+%BLISS36(
+LITERAL
+       FILE_NAME_LENGTH=40;
+)
+LITERAL
+       FILESPEC_FIELD_SIZE=40;     ! Length of filespec field in directory list
+!
+! OWN STORAGE:
+!
+
+OWN SPECSIZE: INITIAL(FILESPEC_FIELD_SIZE); ! Patchable
+OWN D_NULL: $STR_DESCRIPTOR(STRING=%CHAR(0));
+OWN D_SPACE: $STR_DESCRIPTOR(STRING=' ');
+
+!
+! EXTERNAL REFERENCES:
+!
+EXTERNAL ROUTINE
+                R$LIST,
+                R$$LIST,
+                DAP$OPENFILE,
+                DAP$GET_MESSAGE,
+                DAP$PUT_MESSAGE,
+                DAP$GET_ATTRIBUTES,
+                DAP$GET_STRING,
+                DAP$GET_STATUS,
+                DAP$PUT_STRING,
+                DAP$PUT_CONTROL,
+                DAP$GET_ACK,
+                DAP$ERROR_DAP_RMS,
+                DAP$HANDLE,             ! Condition handler
+                S$DTSTR,
+                S$JFN_STR,
+                RL$PARSE,
+                RL$MERGE,               ! Merge local filespecs
+                RL$DIRECTORY,           ! Initiate directory search local
+                RL$SEARCH,              ! Search (wildcard) local
+                RL$RENAME,              ! Rename local file(s)
+                RL$ERASE,               ! Delete local file(s)
+                XST$SCAN;
+
+EXTERNAL D_SKIP: $XPN_DESCRIPTOR();
+
+%IF MULTIPLE_FILESPECS
+%THEN EXTERNAL ROUTINE DAP$NEXTFILESPEC; %FI
+
+!
+! System Services
+!
+
+LINKAGE JSYS1S=JSYS(REGISTER=1;REGISTER=1): SKIP(1);
+LINKAGE JSYS2S=JSYS(REGISTER=1,REGISTER=2;REGISTER=1,REGISTER=2): SKIP(1);
+LINKAGE JSYS3E=JSYS(REGISTER=1,REGISTER=2,REGISTER=3): SKIP(-1);
+
+BIND ROUTINE GTFDB__=GTFDB_: JSYS3E;
+BIND ROUTINE GNJFN__=GNJFN_: JSYS1S;                                   
+BIND ROUTINE GTJFN__=GTJFN_: JSYS2S;
+BIND ROUTINE RLJFN__=RLJFN_: JSYS1S;
+BIND ROUTINE RNAMF__=RNAMF_: JSYS2S;
+
+GLOBAL ROUTINE R$PARSE (FAB,ERR)  =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Decompose a filespec & merge in related filespec
+!
+! FORMAL PARAMETERS:
+!
+!       FAB: A FAB as defined by RMS
+!       ERR: Address of error routine
+!
+! COMPLETION CODES:
+!
+!	RMS Codes
+!
+!--
+
+    BEGIN
+    MAP FAB: REF $FAB_DECL;
+    BIND ROUTINE $$ERRRTN=.ERR: RMS_ERCAL;
+    BIND NAM=.FAB[FAB$A_NAM]: $NAM_DECL;
+
+    IF FIND_SUBSTRING(.FAB[FAB$A_FNA],PP('::')) NEQ 0
+    THEN FAB[FAB$V_REMOTE]=1;            ! Remember
+
+    IF .FAB[FAB$V_REMOTE]
+    THEN
+        BEGIN
+        RL$MERGE(FAB[$],MERGE$M_DEFAULTS,.ERR); ! Get defaults first
+        DAP$MERGE(FAB[$],MERGE$M_EXPANDED+MERGE$M_POINT,.ERR) ! File is remote
+        END
+    ELSE RL$PARSE(FAB[$],.ERR)          ! Do local parse
+    END;			!End of R$PARSE
+
+GLOBAL ROUTINE R$DIRECTORY (FAB,ERR)  =	! Open a directory for listing
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Open a directory for listing
+!       Use RMS if file is local, DAP (via DAP$GET) if remote.
+!
+! FORMAL PARAMETERS:
+!
+!       FAB: A FAB as defined by RMS
+!       ERR: Address of error routine
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+    MAP FAB: REF $FAB_DECL;
+    BIND ROUTINE $$ERRRTN=.ERR: RMS_ERCAL;
+
+    IF FIND_SUBSTRING(.FAB[FAB$A_FNA],PP('::')) NEQ 0
+    THEN
+        BEGIN
+        FAB[FAB$V_REMOTE]=1;                           ! Remember
+        DAP$OPENFILE(FAB[$],DAP$K_DIRECTORY,0,.ERR)    ! File is remote.
+        END
+    ELSE
+        BEGIN
+        FAB[FAB$V_REMOTE]=0;
+        RL$DIRECTORY(FAB[$],.ERR)
+        END
+    END;			!End of R$DIRECTORY
+
+GLOBAL ROUTINE R$SEARCH (FAB,ERR) =	! Get next file 
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Get directory info for a file
+!       Use RMS if file is local, DAP (via DAP$DIR_GET) if remote.
+!
+! FORMAL PARAMETERS:
+!
+!       FAB: A FAB as defined by RMS -- Filled in by this routine
+!       ERR: Address of error routine
+!
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!--
+
+    BEGIN
+    MAP FAB: REF $FAB_DECL;
+    BIND ROUTINE $$ERRRTN=.ERR: RMS_ERCAL;
+   
+    IF .FAB[FAB$V_REMOTE]
+    THEN DAP$SEARCH(FAB[$],.ERR)
+    ELSE RL$SEARCH(FAB[$],.ERR)
+    END;			!End of R$SEARCH
+GLOBAL ROUTINE DAP$SEARCH (FAB,ERR)  =	! Get next file 
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Get directory info for a remote file
+!
+! FORMAL PARAMETERS:
+!
+!       FAB: A FAB as defined by RMS -- FNA contains wildcard spec
+!       ERR: Address of error routine
+!
+! COMPLETION CODES:
+!
+!	Standard RMS codes
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!--
+
+    BEGIN
+    MAP FAB: REF $FAB_DECL;
+    BIND ROUTINE $$ERRRTN=.ERR: RMS_ERCAL;
+    BIND NAM=.FAB[FAB$A_NAM]: $NAM_DECL;   ! Name block
+    LOCAL FABSAV: VOLATILE;
+    LOCAL ERRSAV: VOLATILE;
+
+    ENABLE DIR$HANDLE(FABSAV,ERRSAV);   ! Setup Condition handler
+    ERRSAV=.ERR;
+    FABSAV=.FAB;                   ! Handler will need this
+    
+    IF NAM EQL 0
+    THEN
+        BEGIN
+        FAB[FAB$H_STS]=RMS$_NAM;
+        $$ERROR(OPEN,FAB[$]);
+        .FAB[FAB$H_STS]
+        END
+    ELSE
+        BEGIN
+        BIND DIB=.FAB[FAB$A_DIB]: $DIB;
+        BIND IDD=.DIB[DIB$A_I_DD]: $DAP_DESCRIPTOR;
+        BIND ODD=.DIB[DIB$A_O_DD]: $DAP_DESCRIPTOR;
+
+        IF .DIB[DIB$V_ACCESS_ACTIVE] EQL 0
+        THEN
+            BEGIN
+            FAB[FAB$H_STS]=RMS$_NMF;
+            %IF MULTIPLE_FILESPECS
+                %THEN IF DAP$NEXTFILESPEC(FAB[$],.ERR) NEQ 0
+                      THEN
+                          BEGIN         ! [4] If not a DIRECTORY operation
+                          IF .DIB[DIB$B_OPERATION] NEQ DAP$K_DIRECTORY
+                          THEN RETURN .FAB[FAB$H_STS]   ![4] Done now
+                          END
+                      ELSE
+                          BEGIN
+                          $$ERROR(GET,FAB[$]);
+                          RETURN .FAB[FAB$H_STS];
+                          END
+                %ELSE
+                $$ERROR(GET,FAB[$]);
+                RETURN .FAB[FAB$H_STS];
+                %FI
+            END;
+
+
+            !
+            ! Receive info from other system
+            !
+            BEGIN                       ! If we had an error before
+            IF (.FAB[FAB$H_STS] NEQ RMS$_SUC)
+            THEN
+                BEGIN                   ! Send CONTINUE(SKIP)
+                DAP$PUT_STRING(ODD[$],D_SKIP);
+                DAP$PUT_MESSAGE(ODD[$]);
+                END;
+
+            FAB[FAB$H_STS]=RMS$_SUC;        ! Assume we will win
+            FAB[FAB$H_STV]=0;               ! for now
+            DAP$GET_ATTRIBUTES(IDD[$],FAB[$]);
+
+            IF .FAB[FAB$H_STS] EQL RMS$_FNF     ! If  file-not-found
+            THEN DIB[DIB$V_ACCESS_ACTIVE]=0;    ! then access not active
+
+            RETURN .FAB[FAB$H_STS]         ! return with it
+            END
+        END
+    END;			!End of DAP$SEARCH
+GLOBAL ROUTINE DAP$MERGE (FAB: REF $FAB_DECL, FLAGS: BITVECTOR, ERR) = 
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Merge the related file spec with the filespec
+!       to get the resultant file spec
+!
+! FORMAL PARAMETERS:
+!
+!	FAB: Address of FAB, which may have NAM block attached
+!       FLAGS: Merge flags to pass to R$$MERGE (defined in RMSUSR)
+!
+! COMPLETION CODES:
+!
+!	Standard RMS codes
+!
+!--
+BEGIN
+BIND NAM=.FAB[FAB$A_NAM]: $NAM_DECL;
+LOCAL DESC: $STR_DESCRIPTOR(CLASS=BOUNDED);     ! Filespec descriptor
+LOCAL D;                            ! Delimiter for $STR_SCAN
+LOCAL NEXT;                             ! Offset to next filespec
+
+FAB[FAB$H_STS]=RMS$_SUC;                ! Successful so far
+
+IF .FAB[FAB$V_FOP_OFP]
+THEN NEXT=0                             ! No multiple output filespecs
+ELSE NEXT=.NAM[NAM$H_WCC_NEXT];         ! Input multpile filespecs OK
+
+$STR_DESC_INIT(DESC=DESC, CLASS=BOUNDED,        ! Point to original filespec
+               STRING=ASCIZ_STR(CH$PLUS(.FAB[FAB$A_FNA], .NEXT)));
+
+IF $STR_SCAN(REMAINDER=DESC, SUBSTRING=DESC, FIND='::') ! Isolate node name
+THEN
+    BEGIN     ! Got node name, check for access info in it
+    LOCAL NDESC: $STR_DESCRIPTOR(CLASS=BOUNDED);    ! Node descriptor
+    LOCAL D;
+
+    $STR_DESC_INIT(DESC=NDESC, STRING=STR_PREFIX(DESC), CLASS=BOUNDED);
+
+    $STR_SCAN(REMAINDER=NDESC, SUBSTRING=NDESC,
+              DELIMITER=D, STOP='"');
+    $STR_COPY(STRING=$STR_CONCAT(STR_STRING_PLUS_PREFIX(NDESC),
+                                 %STRING('::',%CHAR(0))),
+              TARGET=(RMS$K_NODE_NAME_SIZE,CH$PTR(NAM[NAM$T_NODE])));
+
+    NAM[NAM$V_FNB_NODE]=1;              ! Filespec has a nodeid
+
+    IF .D EQL %C'"'
+    THEN                                ! Found access info, save it
+        BEGIN                           ! User name
+        NDESC[STR$H_LENGTH]=.NDESC[STR$H_LENGTH]+1; ! Skip initial quote
+        $STR_SCAN(REMAINDER=NDESC, SUBSTRING=NDESC, STOP=' "', DELIMITER=D);
+        $STR_COPY(STRING=$STR_CONCAT(NDESC,D_NULL),
+                  TARGET=(RMS$K_USERID_SIZE,CH$PTR(NAM[NAM$T_USERID])));
+
+        IF .D EQL %C' '
+        THEN
+            BEGIN                       ! Password
+            NDESC[STR$H_LENGTH]=.NDESC[STR$H_LENGTH]+1; ! Skip delimiter
+            $STR_SCAN(REMAINDER=NDESC, SUBSTRING=NDESC,
+                      STOP=' "', DELIMITER=D);
+            $STR_COPY(STRING=$STR_CONCAT(NDESC,D_NULL),
+                      TARGET=(RMS$K_PASSWORD_SIZE,
+                              CH$PTR(NAM[NAM$T_PASSWORD])));
+    
+            IF .D EQL %C' '
+            THEN
+                BEGIN                   ! Account
+                NDESC[STR$H_LENGTH]=.NDESC[STR$H_LENGTH]+1; ! Skip delimiter
+                $STR_SCAN(REMAINDER=NDESC, SUBSTRING=NDESC,
+                          STOP=' "', DELIMITER=D);
+                $STR_COPY(STRING=$STR_CONCAT(NDESC,D_NULL),
+                          TARGET=(RMS$K_ACCOUNT_SIZE,
+                                  CH$PTR(NAM[NAM$T_ACCOUNT])));
+
+                IF .D EQL %C' '
+                THEN
+                    BEGIN               ! Optional data
+                    NDESC[STR$H_LENGTH]=.NDESC[STR$H_LENGTH]+1; !Skip delimiter
+                    $STR_SCAN(REMAINDER=NDESC, SUBSTRING=NDESC,
+                              STOP='"');
+                    $STR_COPY(STRING=$STR_CONCAT(NDESC,D_NULL),
+                              TARGET=(RMS$K_OPTIONAL_DATA_SIZE,
+                                      CH$PTR(NAM[NAM$T_OPTIONAL_DATA])));
+                    END;
+                END;
+            END;
+        END;
+    END;
+
+
+IF SSCAN(REMAINDER=DESC, SUBSTRING=DESC, STOP=':') EQL STR$_NORMAL
+THEN                                      ! Device name found
+    BEGIN
+    DESC[STR$H_LENGTH]=.DESC[STR$H_LENGTH]+1; ! Include :
+    $STR_COPY(STRING=$STR_CONCAT(DESC,D_NULL),
+              TARGET=(RMS$K_DEVICE_NAME_SIZE,CH$PTR(NAM[NAM$T_DVI])));
+
+    IF SSCAN(STRING=DESC,STOP='?%*') EQL STR$_NORMAL ! Check for wildcards
+    THEN NAM[NAM$V_FNB_DEV]=1;
+    END
+ELSE DESC[STR$H_LENGTH]=0;              ! Else let the rest be scanned
+
+
+DO  BEGIN                               ! Loop thru filespec
+    SSCAN(REMAINDER=DESC, SUBSTRING=DESC,       ! Isolate file name 
+          DELIMITER=D, STOP=',+!.([<; ');
+    IF .DESC[STR$H_LENGTH] NEQ 0                    ! If any name here
+    THEN
+        BEGIN
+        $STR_COPY(STRING=$STR_CONCAT(DESC,D_NULL),            ! copy it
+                  TARGET=(RMS$K_FILE_NAME_SIZE, CH$PTR(NAM[NAM$T_NAM])));
+
+        IF SSCAN(STRING=DESC,STOP='?%*') EQL STR$_NORMAL 
+        THEN NAM[NAM$V_FNB_NAM]=1;                 ! Check for wildcards
+        END;
+
+    SELECT .D OF                            ! What's next
+        SET
+        [%C'.']:
+              BEGIN
+              DESC[STR$H_LENGTH]=.DESC[STR$H_LENGTH]+1; ! Skip the initial .
+              SSCAN(REMAINDER=DESC, SUBSTRING=DESC,
+                    STOP='.;,+!<([',DELIMITER=D);
+              $STR_COPY(STRING=$STR_CONCAT('.',DESC,D_NULL),    ! Extension
+                        TARGET=(RMS$K_EXTENSION_SIZE, CH$PTR(NAM[NAM$T_EXT])));
+
+              IF SSCAN(STRING=DESC,STOP='?%*') EQL STR$_NORMAL
+              THEN NAM[NAM$V_FNB_EXT]=1;        ! Check for wildcards
+              SELECT .D OF
+                  SET
+                  [%C'.',%C';']:        ! Version/Generation number
+                      BEGIN
+                      $STR_SCAN(REMAINDER=DESC, SUBSTRING=DESC, DELIMITER=.D,
+                                SPAN=';.0123456789-*');    ! Generation number
+                      $STR_COPY(STRING=$STR_CONCAT(DESC,D_NULL),
+                                TARGET=(RMS$K_VERSION_SIZE,
+                                        CH$PTR(NAM[NAM$T_VER])));
+
+                      IF $STR_SCAN(STRING=DESC,STOP='?%*') NEQ STR$_END_STRING
+                      THEN NAM[NAM$V_FNB_VER]=1;        ! Check for wildcards
+                      END;
+                  TES;
+              END;
+         [%C';']:        ! Version/Generation number
+              BEGIN
+              $STR_SCAN(REMAINDER=DESC, SUBSTRING=DESC, DELIMITER=.D,
+                        SPAN=';.0123456789-*');    ! Generation number
+              $STR_COPY(STRING=$STR_CONCAT(DESC,D_NULL),
+                        TARGET=(RMS$K_VERSION_SIZE,
+                                CH$PTR(NAM[NAM$T_VER])));
+
+              IF $STR_SCAN(STRING=DESC,STOP='?%*') NEQ STR$_END_STRING
+              THEN NAM[NAM$V_FNB_VER]=1;        ! Check for wildcards
+              END;
+        [%C'[', %C'<', %C'(']:          !Directory
+              BEGIN
+              SSCAN(REMAINDER=DESC, SUBSTRING=DESC, STOP=']>)',DELIMITER=D);
+              SELECT .D OF
+                  SET
+                  [%C']',%C'>',%C')']:  ! Count directory terminator if any
+                      DESC[STR$H_LENGTH]=.DESC[STR$H_LENGTH]+1;
+                  [OTHERWISE]:;
+                  TES;
+
+              $STR_COPY(STRING=$STR_CONCAT(DESC,D_NULL),
+                        TARGET=(RMS$K_DIRECTORY_NAME_SIZE,
+                                CH$PTR(NAM[NAM$T_DIR])));
+
+              IF SSCAN(STRING=DESC,STOP='?%*') EQL STR$_NORMAL
+              THEN NAM[NAM$V_FNB_DIR]=1;        ! Check for wildcards
+              END;
+        TES;
+
+        SELECT .D OF                    ! Check delimiter now
+        SET
+        [%C',', %C'+']: NAM[NAM$V_FNB_MULTIPLE]=1;    ! Flag multiple filespecs
+
+        [%C',', %C'+', %C'!', %C' ', 0]:
+              BEGIN
+              IF .FLAGS[MERGE$V_POINT]  ! Point to end of spec if requested
+              THEN NAM[NAM$H_WCC_NEXT]=
+                  .NAM[NAM$H_WCC_NEXT]+.DESC[STR$H_PFXLEN]+.DESC[STR$H_LENGTH];
+              EXITLOOP;
+              END;
+        TES;
+END WHILE 1;                            ! Loop until filespec is eaten
+
+IF .NAM[NAM$V_FNB_DEV] OR .NAM[NAM$V_FNB_DIR] OR .NAM[NAM$V_FNB_NAM]
+OR .NAM[NAM$V_FNB_EXT] OR .NAM[NAM$V_FNB_VER]
+THEN NAM[NAM$V_FNB_WILDCARD]=1;         ! Wildcard somewhere
+
+R$$MERGE(NAM,.FLAGS);                   ! Build expanded filespec
+
+.FAB[FAB$H_STS]                         ! Return status
+END;                                    ! End of DAP$MERGE
+
+GLOBAL ROUTINE R$NULL=
+!++
+! FUNCTIONAL DESCRIPTION:
+!       This routine does absolutely nothing
+BEGIN
+0
+END;
+GLOBAL ROUTINE R$$MERGE(P_NAM, FLAGS: BITVECTOR): NOVALUE=
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Merge the parts of the name in a name block into a complete filespec.
+!       This can be either an expanded or resultant filespec:
+!       If a resultant filespec is built, 
+!       wildcarded parts are taken from the related name block, if any.
+!
+! FORMAL PARAMETERS:
+!
+!	P_NAM: Address of name block
+!       FLAGS: Bitvector of merge flags (defined in RMSUSR)
+!          
+!
+! ROUTINE VALUE:
+!
+!	NONE
+!
+!--
+    BEGIN
+    LOCAL DESC: $STR_DESCRIPTOR(CLASS=BOUNDED);
+    BIND NAM=.P_NAM: $NAM_DECL;
+    LOCAL RNAM: REF $NAM_DECL;          ! Address of related name block
+
+    IF .FLAGS[MERGE$V_RLF]
+    THEN
+        BEGIN
+        RNAM=.NAM[NAM$A_RLF];           ! Merge with related filespec
+        IF .RNAM EQL 0 THEN RNAM=NAM;   ! If nothing to merge merge itself
+        END
+    ELSE
+        BEGIN
+        RNAM=NAM;                       ! Do not merge anything
+        END;
+
+    $STR_DESC_INIT(DESC=DESC, CLASS=DYNAMIC);
+
+    IF .NAM[NAM$V_FNB_NODE] NEQ 0
+    THEN $STR_COPY(STRING=ASCIZ_STR(CH$PTR(NAM[NAM$T_NODE])), TARGET=DESC);
+
+    IF CH$RCHAR(CH$PTR(NAM[NAM$T_USERID])) NEQ 0
+    THEN
+        BEGIN
+        DESC[STR$H_LENGTH]=.DESC[STR$H_LENGTH]-2;       ! Trim off ::
+        $STR_APPEND(STRING=$STR_CONCAT('"',
+                                       ASCIZ_STR(CH$PTR(NAM[NAM$T_USERID])),
+                                       D_SPACE,
+                                       ASCIZ_STR(CH$PTR(NAM[NAM$T_PASSWORD])),
+                                       D_SPACE,
+                                       ASCIZ_STR(CH$PTR(NAM[NAM$T_ACCOUNT])),
+                                       '"::'),
+                    TARGET=DESC);               ! Put in "user pass acct"::
+        END;
+
+    IF .NAM[NAM$V_FNB_DEV] NEQ 0        ! Wildcard device
+    THEN $STR_APPEND(STRING=ASCIZ_STR(CH$PTR(RNAM[NAM$T_DEV])), TARGET=DESC)
+    ELSE $STR_APPEND(STRING=ASCIZ_STR(CH$PTR(NAM[NAM$T_DEV])), TARGET=DESC);
+
+    IF .NAM[NAM$V_FNB_DIR] NEQ 0        ! Wildcard directory
+    THEN $STR_APPEND(STRING=ASCIZ_STR(CH$PTR(RNAM[NAM$T_DIR])), TARGET=DESC)
+    ELSE $STR_APPEND(STRING=ASCIZ_STR(CH$PTR(NAM[NAM$T_DIR])), TARGET=DESC);
+
+    IF .NAM[NAM$V_FNB_NAM] NEQ 0        ! Wildcard name
+    THEN $STR_APPEND(STRING=ASCIZ_STR(CH$PTR(RNAM[NAM$T_NAM])), TARGET=DESC)
+    ELSE $STR_APPEND(STRING=ASCIZ_STR(CH$PTR(NAM[NAM$T_NAM])), TARGET=DESC);
+
+    IF .NAM[NAM$V_FNB_EXT] NEQ 0        ! Wildcard extension
+    THEN $STR_APPEND(STRING=ASCIZ_STR(CH$PTR(RNAM[NAM$T_EXT])), TARGET=DESC)
+    ELSE $STR_APPEND(STRING=ASCIZ_STR(CH$PTR(NAM[NAM$T_EXT])), TARGET=DESC);
+
+    IF .NAM[NAM$V_FNB_VER] NEQ 0        ! Wildcard generation
+    THEN
+        BEGIN
+        ![3] Use original punctuation for generation/version number
+        LOCAL PTR, RPTR, R1PTR;
+        PTR=CH$PTR(NAM[NAM$T_VER]);
+        RPTR=R1PTR=CH$PTR(RNAM[NAM$T_VER]);
+
+        IF CH$RCHAR_A(R1PTR) NEQ 0 ! If related has a generation
+        THEN
+            BEGIN
+            IF CH$RCHAR(.PTR) NEQ 0 ! and our name block has too
+            THEN ! Use our form of generation number
+                BEGIN
+                $STR_APPEND(STRING=(1,.PTR), TARGET=DESC);
+                RPTR=.R1PTR;            ! Start resultant from 2nd char
+                END;
+
+            $STR_APPEND(STRING=ASCIZ_STR(.RPTR),TARGET=DESC);
+            END;
+        END
+    ELSE $STR_APPEND(STRING=ASCIZ_STR(CH$PTR(NAM[NAM$T_VER])), TARGET=DESC);
+
+    $STR_APPEND(STRING=D_NULL, TARGET=DESC);    ! Make ASCIZ
+
+    ! For now, expanded string gets copied to resultant also
+
+    IF .NAM[NAM$H_RSS] GEQ .DESC[STR$H_LENGTH]-1        ! If there is room
+    THEN
+        BEGIN
+        $STR_COPY(STRING=DESC,          ! Copy to resultant string always
+                  TARGET=(.NAM[NAM$H_RSS],.NAM[NAM$A_RSA]));
+        NAM[NAM$H_RSL]=.DESC[STR$H_LENGTH]-1; ! Length of resultant less null
+        END;
+
+    IF .FLAGS[MERGE$V_EXPANDED]                  ! Expanded string needed?
+    AND (.NAM[NAM$H_ESS] GEQ .DESC[STR$H_LENGTH]-1) ! And room for it
+    THEN
+        BEGIN
+        $STR_COPY(STRING=DESC,          ! Copy to expanded string
+                  TARGET=(.NAM[NAM$H_ESS],.NAM[NAM$A_ESA]));
+        NAM[NAM$H_ESL]=.DESC[STR$H_LENGTH]-1; ! Length of expanded less null
+        END;
+
+    $XPO_FREE_MEM(STRING=DESC);         ! Free temp storage
+    END;
+
+GLOBAL ROUTINE R$RENAME (SFAB,DFAB,ERR) =	! Rename a file
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Rename a file
+!       Use RMS if file is local, DAP (via DAP$CONNECT) if remote.
+!
+! FORMAL PARAMETERS:
+!
+!       SFAB: A FAB as defined by RMS
+!       DFAB: A FAB as defined by RMS
+!       ERR: Address of error routine
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+
+!--
+
+    BEGIN
+    MAP SFAB: REF $FAB_DECL;
+    MAP DFAB: REF $FAB_DECL;
+
+    BIND ROUTINE $$ERRRTN=.ERR: RMS_ERCAL;
+   
+    IF FIND_SUBSTRING(.SFAB[FAB$A_FNA],PP('::')) NEQ 0
+    THEN
+        BEGIN
+        %IF MULTIPLE_FILESPECS
+        %THEN
+        DO  BEGIN
+            SFAB[FAB$V_REMOTE]=1;                           ! Remember
+            DAP$OPENFILE(SFAB[$],DAP$K_RENAME,DFAB[$],.ERR) ! file is remote
+            END WHILE DAP$NEXTFILESPEC(SFAB[$],.ERR)    ![5] Go for more files
+        %ELSE
+        SFAB[FAB$V_REMOTE]=1;                           ! Remember
+        DAP$OPENFILE(SFAB[$],DAP$K_RENAME,DFAB[$],.ERR) ! file is remote
+        %FI
+        END
+    ELSE
+        BEGIN
+        RL$RENAME(SFAB[$],DFAB[$],.ERR)
+        END
+    END;			!End of R$RENAME
+
+
+GLOBAL ROUTINE _SSCAN(FUNCT,STRING,PATTERN,TARGET,DELIM,SUCC,FAIL)=
+!++
+! Functional Description:
+!
+!        Do $STR_SCAN actions, except that a STOP= string will
+!        ignore target characters preceded by ^V
+!
+! Formal Parameters: (Same as XST$SCAN)
+!
+!        FUNCT: Function code and option bits (as defined in XPORT.REQ)
+!        STRING: Descriptor from STRING= or REMAINDER=
+!        PATTERN: Descriptor from STOP=, FIND=, or SPAN=
+!        DELIM: Address of where to store delimiter (DELIMITER=)
+!        SUCC: Address of success action routine (SUCCESS=)
+!        FAIL: Address of failure action routine (FAILURE=)
+!
+! Completion Codes: (Same as XST$SCAN)
+!--
+    BEGIN
+    MAP FUNCT: BLOCK FIELD($STR$OPT_FIELDS);
+    MAP STRING: REF $STR_DESCRIPTOR(CLASS=BOUNDED);
+    MAP PATTERN: REF $STR_DESCRIPTOR(CLASS=BOUNDED);
+    MAP TARGET: REF $STR_DESCRIPTOR(CLASS=BOUNDED);
+                               
+    LOCAL TFUNCT: BLOCK[1] FIELD($STR$OPT_FIELDS);
+    LOCAL V;
+    LOCAL TSTRING: $STR_DESCRIPTOR(CLASS=BOUNDED);
+
+    IF .FUNCT[STR$V_REMAINDER]          
+    THEN $STR_DESC_INIT(DESC=TSTRING,CLASS=BOUNDED,    ! REMAINDER given
+                         STRING=STR_REMAINDER(STRING))
+    ELSE $STR_DESC_INIT(DESC=TSTRING,CLASS=BOUNDED,    ! STRING given
+                        STRING=(.STRING[STR$H_LENGTH],.STRING[STR$A_POINTER]));
+                                 
+    IF (.TARGET NEQ 0)                  ! Make target pointer point to start
+    AND .FUNCT[STR$V_REMAINDER]         ! if REMAINDER
+    THEN
+        BEGIN
+        TARGET[STR$A_POINTER]=.TSTRING[STR$A_POINTER];
+        TARGET[STR$H_PFXLEN]=.TARGET[STR$H_PFXLEN]+.TARGET[STR$H_LENGTH];
+        END;
+
+    TFUNCT=.FUNCT;
+    TFUNCT[STR$V_REMAINDER]=1;          ! Always use remainder with our desc
+
+    WHILE 1                             ! Loop until we find what we want
+    DO  BEGIN                           ! without ^V before it, or end string
+        V=XST$SCAN(.TFUNCT,TSTRING,.PATTERN,TSTRING,.DELIM,.SUCC,.FAIL);
+    
+        IF .V EQL STR$_END_STRING THEN EXITLOOP;
+
+        ! Now check for ^V
+        IF CH$RCHAR(CH$PLUS(.TSTRING[STR$A_POINTER],.TSTRING[STR$H_LENGTH]))
+           EQL $CHCNV
+        THEN TSTRING[STR$H_LENGTH]=.TSTRING[STR$H_LENGTH]+1  ! Skip quoted char
+        ELSE EXITLOOP;
+        END;
+
+    IF .TARGET NEQ 0                    ! If we have a target, compute length
+    THEN TARGET[STR$H_LENGTH]=.TSTRING[STR$H_LENGTH]+
+                     CH$DIFF(.TSTRING[STR$A_POINTER],.TARGET[STR$A_POINTER]);
+                                        ! Substring includes what was
+                                        ! skipped due to ^V
+                                        ! plus what we just found
+
+    .V                                  ! Returned value (value of $STR_SCAN)
+    END;
+
+GLOBAL ROUTINE DIR$HANDLE (SIGNAL_ARGS,MECH_ARGS,ENABLE_ARGS) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Condition handler for directory operations
+!
+! FORMAL PARAMETERS:
+!
+!	SIGNAL_ARGS: addr of vector of SIGNAL arguments,
+!       MECH_ARGS: not used,
+!       ENABLE_ARGS: args passed when this handler was established
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! COMPLETION CODES:
+!
+!	0: Resignal, 1: Continue
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+    MAP SIGNAL_ARGS: REF VECTOR,
+        MECH_ARGS: REF VECTOR,
+        ENABLE_ARGS: REF VECTOR;
+
+    BIND BLK=..ENABLE_ARGS[1]: $FAB_DECL;          ! RMS block
+    BIND ROUTINE $$ERRRTN=..ENABLE_ARGS[2]: RMS_ERCAL;       ! Error routine
+
+    LOCAL SEVERITY;
+
+    SEVERITY= .(SIGNAL_ARGS[1])<0,3>;
+
+    SELECT .SIGNAL_ARGS[1] OF
+           SET
+           [DAP$_FNF]:
+                         BEGIN
+                         END;
+           [SS$_UNWIND]:
+                         BEGIN
+                         RETURN STS$K_NORMAL;
+                         END;
+           [RMS$K_SUC_MIN TO RMS$K_SUC_MAX]: SEVERITY=SS$_NORMAL;
+
+           [RMS$K_ERR_MIN TO RMS$K_ERR_MAX]:
+                         SEVERITY=SS$_ERROR;
+           [RMS$K_ERR_MIN TO RMS$K_ERR_MAX, RMS$K_SUC_MIN TO RMS$K_SUC_MAX]:
+                         BEGIN
+                         BLK[FAB$H_STS]=.SIGNAL_ARGS[1];
+                         BLK[FAB$H_STV]=.SIGNAL_ARGS[2];
+                         END;
+
+           [DAP$K_FACILITY_CODE TO DAP$K_FACILITY_CODE+%O'7777777']:
+                         BEGIN
+                         BLK[FAB$H_STS]=DAP$ERROR_DAP_RMS(.SIGNAL_ARGS[1]);
+                         BLK[FAB$H_STV]=.(SIGNAL_ARGS[1])<DAPCODE>;
+                         END;
+
+           [XPN$$SELECT_XPN_ERRORS]:
+                         IF NOT .SEVERITY       ! If this is a connect error
+                         THEN                   ! then change to RMS code
+                             BEGIN
+                             BLK[FAB$H_STS]=RMS$_CON;
+                             BLK[FAB$H_STV]=.SIGNAL_ARGS[1]; ! XPN code
+                             END;
+
+           [XPN$_ABORTED, XPN$_DISCONN]:
+                         BEGIN
+                         SEVERITY=STS$K_ERROR;  ! Treat as error
+                         BLK[FAB$H_STS]=RMS$_NLB;
+                         END;       ! Network link broken (Abort or Disconnect)
+
+           [XPN$_NO_OPEN, XPN$_REJECTED]:
+                         BLK[FAB$H_STV]=.SIGNAL_ARGS[2];
+                         ! DECnet reason code will be STV for
+                         ! unspecified open error
+
+           [OTHERWISE]:
+                BEGIN
+                BLK[FAB$H_STS]=RMS$_BUG;        ! Should not occur
+                BLK[FAB$H_STV]=.SIGNAL_ARGS[1]; !
+                SEVERITY=SS$_FATAL;             !
+                END;
+           TES;
+
+
+    CASE .SEVERITY FROM 0 TO 7 OF
+         SET
+         [STS$K_WARNING, STS$K_ERROR]:  
+                BEGIN
+                $$ERROR(OPEN,BLK);              !? Should get operation too
+                RETURN STS$K_NORMAL;
+                END;
+         [STS$K_NORMAL, STS$K_INFO]: RETURN STS$K_NORMAL;
+         [STS$K_FATAL,INRANGE]: ;
+         TES;
+
+    SS$_RESIGNAL
+    END;			!End of DIR$HANDLE
+
+END				!End of module
+ELUDOM

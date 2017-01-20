@@ -1,0 +1,331 @@
+ %TITLE 'LINSERT - insert text'
+MODULE LINSERT (				! Insert text
+		IDENT = '3-005'			! File: LINSERT.BLI Edit: CJG3005
+		) =
+BEGIN
+!COPYRIGHT (c) DIGITAL EQUIPMENT CORPORATION 1981, 1988.  ALL RIGHTS RESERVED.
+!
+!THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED ONLY
+!IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH THE INCLUSION OF 
+!THE ABOVE COPYRIGHT NOTICE.  THIS SOFTWARE OR ANY OTHER COPIES THEREOF MAY 
+!NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY OTHER PERSON.  NO TITLE
+!TO AND OWNERSHIP OF THE SOFTWARE IS HEREBY TRANSFERRED.
+!
+!THE INFORMATION IN THIS SOFTWARE IS SUBJECT TO CHANGE WITHOUT NOTICE AND 
+!SHOULD NOT BE CONSTRUED AS A COMMITMENT BY DIGITAL EQUIPMENT CORPORATION.
+!
+!DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR RELIABILITY OF ITS 
+!SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+!
+!++
+! FACILITY:	EDT -- The DEC Standard Editor
+!
+! ABSTRACT:
+!
+!	This module executes the line mode INSERT command.
+!	It also provides support for the insert part of the
+!	REPLACE command.
+!
+! ENVIRONMENT:	Runs at any access mode - AST reentrant
+!
+! AUTHOR: Bob Kushlis, CREATION DATE: February 3, 1978
+!
+! MODIFIED BY:
+!
+! 1-001	- Original.  DJS 30-JAN-81.  This module was created by
+!	extracting routines INSERT and INS_COM from EXEC.BLI.
+! 1-002	- Regularize headers.  JBS 20-Mar-1981
+! 1-003	- Change INS_COM to EDT$$INS_CMD .  JBS 30-Mar-1981
+! 1-004	- Do prompting from a global.  JBS 23-Oct-1981
+! 1-005 - Add error check for too many lines.  SMB 5-Feb-1982
+! 1-006 - Reset command buffer after EOF. STS 23-Jun-1982
+! 1-007 - Add CRLF for EXT insert and replace commands.  SMB 07-Jul-1982
+! 1-008 - Change indentation for large line numbers.  SMB 14-Jul-1982
+! 1-009 - Use previous line size instead of current.  SMB 15-Jul-1982
+! 1-010 - Put code for edt$$rng_posfrst in line. STS 11-Oct-1982
+! 1-011 - Use new macro for comparing line numbers. STS 20-Oct-1982
+! 1-012	- Don't print CRLF unless we are coming from the terminal.  JBS 19-Jan-1983
+! 3-001 - Modify for the TOPS 20 parser. CJG 14-Mar-1983
+! 3-002 - Add updates from V3 sources.  GB 29-Apr-1983
+! 3-003 - Prompts do not have leading <CR><LF>, and <CR><LF> needed before
+!	  the call to EDT$$TY_CURLN. CJG 15-Jun-1983
+! 3-004 - Fix a problem with journalling multicommand lines, especially INSERT\...
+!	  CJG 10-Jan-1984
+! 3-005 - Modify ASSERT macro to include error code. CJG 30-Jan-1984
+!--
+
+
+%SBTTL 'Declarations'
+!
+! TABLE OF CONTENTS:
+!
+
+REQUIRE 'EDTSRC:TRAROUNAM';
+
+FORWARD ROUTINE
+    EDT$$INS_TXT : NOVALUE,			! Insert text
+    EDT$$INS_CMD : NOVALUE;			! Process the INSERT command
+
+!
+! INCLUDE FILES:
+!
+
+REQUIRE 'EDTSRC:EDTREQ';
+
+!
+! MACROS:
+!
+!	NONE
+!
+! EQUATED SYMBOLS:
+!
+!	NONE
+!
+! OWN STORAGE:
+!
+!	NONE
+!
+! EXTERNAL REFERENCES:
+!
+!	In the routines
+
+%SBTTL 'EDT$$INS_TXT  - insert text'
+
+GLOBAL ROUTINE EDT$$INS_TXT 			! Insert text for INSERT and REPLACE commands
+    : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine handles the insertion of text from an INSERT or REPLACE
+!	command.  If the current token from the parser is a '\', then the text
+!	to be inserted is the remainder of the command line.  Otherwise, loop
+!	reading a line and inserting it until an end of file is detected.
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	CMD_END
+!	CMD_LEN
+!	CMD_PTR
+!	INP_SRC
+!	NOS
+!	PA_CURTOK
+!	PA_CURTOKLEN
+!	PMT_INS
+!	PMT_INSN
+!
+! IMPLICIT OUTPUTS:
+!
+!	CMD_BUF
+!
+! ROUTINE VALUE:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+    EXTERNAL ROUTINE
+	EDT$$CMP_LNO,
+	EDT$$FMT_CRLF,
+	EDT$$TI_WRSTR,
+	EDT$$GET_LN,
+	EDT$$END_INS,
+	EDT$$INS_LN,
+	EDT$$START_INS,
+	EDT$$TI_BUFSTR,			! Save a journal record
+	EDT$$TI_FLUSHJOUFI,		! Write a journal record
+	EDT$$TY_CURLN;			! Type out the current line
+
+    EXTERNAL
+	WK_STARTNO : LN_BLOCK,
+	LNO0 : LNOVECTOR [14],
+	FMT_WRRUT,
+	EXT_MOD,
+	CMD_BUF,
+	CMD_END,
+	CMD_LEN,
+	CMD_PTR,
+	INP_SRC,
+	RCOV_MOD,			! Recovery mode (for journalling)
+	JOU_VALID,			! Validity of journal record
+	NOS,				! 1 = numbers, 0 = nonumbers
+	PA_MORE,			! More on current line indicator
+	PA_CURTOK,			! Pointer to remainder of input
+	PA_CURTOKLEN,			! Length of remainder
+	PMT_INS : VECTOR,		! Counted ASCII string for line-mode insert prompt
+	PMT_INSN : VECTOR;		! Counted ASCII string for line-mode insert nonumbers prompt
+
+    LOCAL
+	BIG_LINE_PMT : VECTOR [32],	! Prompt for lines larger than 10**5
+	STATUS,
+	EOF;
+
+!+
+! Set up the work-file system for insertion
+!-
+
+    EDT$$START_INS ();
+
+!+
+! Look for the immediate insertion signaled by a '\' following the command.
+! Don't insert the <CR><LF> at the end of the line.
+!-
+
+    IF (.PA_MORE NEQ 0) THEN
+	BEGIN
+	EDT$$TI_BUFSTR (CH$PTR (CMD_BUF,, BYTE_SIZE), .CMD_LEN + .PA_CURTOKLEN - 2);
+	JOU_VALID = 1;
+	IF ( NOT .RCOV_MOD) THEN EDT$$TI_FLUSHJOUFI (%C'T');
+	EDT$$INS_LN (.PA_CURTOK, .PA_CURTOKLEN - 2);
+	PA_MORE = 0;
+	END
+    ELSE
+
+!+
+! Insert mode loop.  Keep reading and inserting lines until EOF or until
+! the maximum number of lines has been reached for this buffer
+!-
+	BEGIN
+
+	IF (.EXT_MOD AND (.FMT_WRRUT EQL EDT$$TI_WRSTR) AND (.INP_SRC EQL INP_TERM))
+	THEN
+	    EDT$$FMT_CRLF ();
+
+!+
+! Set up the prompt for large lines just in case we need it later
+! (only want to do this once.  To do this we add 5 spaces after the
+! <CR><LF> in the prompt.
+!-
+
+	IF (.NOS EQL 1)
+	THEN
+	    BEGIN
+	    BIG_LINE_PMT [0] = .PMT_INS [0] + 5;
+	    CH$MOVE (.PMT_INS [0], CH$PTR (PMT_INS [1],, BYTE_SIZE),
+				   CH$PTR (BIG_LINE_PMT [1], 5, BYTE_SIZE));
+	    CH$FILL (%C' ', 5, CH$PTR (BIG_LINE_PMT [1],, BYTE_SIZE));
+	    END;
+
+	DO
+	    BEGIN
+
+	    LOCAL
+		PROMPT_ADDR : REF VECTOR;
+
+	    IF (EDT$$CMP_LNO (WK_STARTNO, LNO0 [10]) GEQ 0) AND (.NOS EQL 1)
+	    THEN
+		PROMPT_ADDR = BIG_LINE_PMT
+	    ELSE
+		PROMPT_ADDR = (CASE .NOS FROM 0 TO 1 OF
+		    SET
+		    [0] : PMT_INSN;
+		    [1] : PMT_INS;
+		    [OUTRANGE] :
+			BEGIN
+			ASSERT (15, 0);
+			0
+			END;
+		    TES);
+
+	    EOF = EDT$$GET_LN (0, PROMPT_ADDR [1], .PROMPT_ADDR [0]);
+
+	    IF (( NOT .EOF) OR (.CMD_LEN NEQ 0))
+	    THEN
+		STATUS = EDT$$INS_LN (CH$PTR (CMD_BUF,, BYTE_SIZE), .CMD_LEN)
+
+	    END
+	UNTIL ((.EOF) OR ( NOT .STATUS));
+
+	END;
+
+    IF .EOF
+    THEN
+	BEGIN
+	CMD_END = CH$PTR(CMD_BUF,, BYTE_SIZE);
+	CMD_PTR = CH$PTR(CMD_BUF,, BYTE_SIZE);
+	END;
+
+!+
+! Inform the work file system that the insert is complete, and print
+! the next line.
+!-
+    EDT$$END_INS ();
+
+    IF (.INP_SRC EQL INP_TERM)
+    THEN
+	BEGIN
+	EDT$$FMT_CRLF ();
+	EDT$$TY_CURLN ();
+	END;
+
+    END;
+
+%SBTTL 'EDT$$INS_CMD  - INSERT line-mode command'
+
+GLOBAL ROUTINE EDT$$INS_CMD 			! INSERT line-mode command
+    : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Command processing routine for the INSERT command.   Position to the
+!	specified range and, if it positioned successfully,  do the insert.
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	EXE_CURCMD
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+    EXTERNAL ROUTINE
+	EDT$$RNG_REPOS;
+
+    EXTERNAL
+	RNG_FRSTLN,
+	CUR_BUF : REF TBCB_BLOCK,
+	RNG_ORIGPOS : POS_BLOCK,
+	EXE_CURCMD : REF NODE_BLOCK;	! Pointer to the current command.
+
+ 	RNG_FRSTLN = 1;
+    EDT$$CPY_MEM (POS_SIZE, .CUR_BUF, RNG_ORIGPOS);
+
+    IF EDT$$RNG_REPOS (.EXE_CURCMD [RANGE1])
+    THEN
+	BEGIN
+	EDT$$INS_TXT ();
+	END;
+
+    END;
+
+
+END
+ELUDOM

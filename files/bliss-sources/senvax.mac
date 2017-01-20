@@ -1,0 +1,1224 @@
+;	COPYRIGHT (c) DIGITAL EQUIPMENT CORPORATION 1985, 1989.
+;	ALL RIGHTS RESERVED.
+;
+;	THIS SOFTWARE IS FURNISHED UNDER A  LICENSE AND MAY BE USED AND  COPIED
+;	ONLY IN  ACCORDANCE  WITH  THE  TERMS OF  SUCH  LICENSE  AND  WITH  THE
+;	INCLUSION OF THE ABOVE  COPYRIGHT NOTICE.  THIS  SOFTWARE OR ANY  OTHER
+;	COPIES THEREOF MAY NOT BE PROVIDED  OR OTHERWISE MADE AVAILABLE TO  ANY
+;	OTHER PERSON.  NO  TITLE TO  AND OWNERSHIP  OF THE  SOFTWARE IS  HEREBY
+;	TRANSFERRED.
+;
+;	THE INFORMATION IN THIS  SOFTWARE IS SUBJECT  TO CHANGE WITHOUT  NOTICE
+;	AND SHOULD  NOT  BE CONSTRUED  AS  A COMMITMENT  BY  DIGITAL  EQUIPMENT
+;	CORPORATION.
+;
+;	DIGITAL ASSUMES NO  RESPONSIBILITY FOR  THE USE OR  RELIABILITY OF  ITS
+;	SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+
+	TITLE SENVAX	KL TO VAX sender
+	TWOSEG
+	RELOC	400000
+
+	SEARCH	MACSYM,MSUNV
+
+	EXTERN	ER%PRC,MX$VAL,MXERRS,UF%CLO,UF%OPE,UF%REA,UF%WRI,UM%GET,UM%REL
+	EXTERN	UMP%GE,UMP%RE,UN%ABO,UN%ACC,UN%CLO,UN%OPE,UN%REA,UN%STA,UN%WRI
+	EXTERN	GETSUB,NMLDIE,ELOG
+
+	EXTERN	S2$ERR,NW$NFF,NW$NRF,NW$NWF,NW$UTC,UF$FOF,UF$FRF
+	
+;AC Definitions
+
+	T0==0			;Scratch registers
+	T1==1
+	T2==2
+	T3==3
+	T4==4
+	T5==5
+	FLGWRD==5		;Cr and lf flags for sending mail file
+	T6==6
+	T7==7
+	T10==10
+	WRKREQ==11		;Work request pointer
+	MSGBLK==12		;Message block pointer
+;Ac 13 and 15 reserved for BLISS
+	T14==14			;Another scratch register
+	VARPTR==16		;Points to variables and pointers buffer
+	P==17			;Stack
+
+;Information block offsets
+
+	CNNBLK==0		;Connect block address
+	TOLIST==1		;To: list buffer pointer
+	SNDSTR==2		;Sender string pointer
+	WRKBUF==3		;Working buffer address
+	TOHOLD==4		;Recipients fit into to: list buffer
+	FALSND==5		;All recipients o.k.ed by vax
+	MAIPTR==6		;Points to mail file spec
+	SCRAT1==7		;Scratch words
+	SCRAT2==10		
+	SCRAT3==11		
+	SCRAT4==12
+	NUMSUC==13		;Number of successful sends
+	SNDERR==14		;Sender string pointer (7 bit)
+	FILNB==15		;File number of mail file
+	DATLNK==16		;Senvax's data link
+	BUFPTR==17		;Pointer to replies from the vax
+	RCPT==20		;Number of recipients
+	FSRCPT==21		;Address of first recipient block in this pass
+	FSTPSS==22		;First pass flag
+	DSTNDE==23		;Destination node name
+	NUMVAR==25		;Information block size
+
+;Definitions
+
+	$DONE==2		;All recipients received mail
+	$DEFER==3		;A network problem occurred
+	$REJECT==5		;One or more recipients did not receive mail
+	CBKSIZ==^D64		;Connection block size
+	VAXOBJ==^D27		;Vax object type
+	SUCBIT==2000		;Success bit from vax reply
+	FAIBIT==1B31		;Failure bit from vax reply
+	CRFLG==1B34		;Carriage return was seen in mail file line
+	LFFLG==1B35		;Line feed was seen in mail file line
+	DELVER==1B0		;Addressee received mail
+	REJECT==1B1		;Addressee did not receive mail
+	MAXSND==^D100		;Maximum number of addressees allowed
+	.CR==15			;Carriage return
+	.LF==12			;Line feed
+	QUOTE==42		;Ascii quote value
+	IDMSK==77777777		;[321]mask for new id field
+	RCOFST==^D15		;Offset for reject code in the connect
+                                ;block
+
+;Severity codes
+
+	$WARN==0                ;[318]
+	$SEVERE==4              ;[318]
+
+;Facility codes
+
+	$ERR==0			;[318]standard mx error
+	$DCN==1			;[318]decnet reject code
+
+;Errors reported by vms mail-11
+
+	LOGLNK==125001,,760000	;Error creating logical link
+	.DCX11==13
+	SALL
+
+	RELOC	0		;Data area (lowseg)
+
+;[318]change the error blocks to the new format
+;The argument block passed to routine er%prc (adrerr:)
+ADRBLK:	EXP	6		;Size of the argument block
+	EXP	FLD(1,1B3)!FLD($ERR,37777B17)!FLD(1,1B18)!FLD(S2$ERR,37777B32)!FLD($SEVERE,7B35)
+	EXP	0		;Id
+	EXP	2		;[321]message data items
+	EXP	0		;[321]recipient pointer
+	EXP	0		;[321]error string
+	EXP	0		;No optional data
+
+	RELOC	400000		;Back to the hiseg
+;Save registers according to BLISS convention
+
+SENVAX::MOVE T5,P		;Save original stack to pick up arguments later
+	PUSH P,T0		;Save the registers preserved by bliss
+	PUSH P,T6
+	PUSH P,T7
+	PUSH P,T10
+	PUSH P,WRKREQ
+	PUSH P,MSGBLK
+	PUSH P,T14
+	PUSH P,VARPTR
+
+	MOVE WRKREQ,-2(T5)	;Work request address
+	MOVE MSGBLK,-1(T5)	;Message block address
+
+	PUSH P,13		;Save a bliss linkage register
+
+;Allocate buffer spaces
+
+	CALL GETBUF
+
+;Make the connection
+
+	SETZM RCPT(VARPTR)	;No recipients yet
+	SETZM FALSND(VARPTR)	;No rejected recipients yet
+	SETZM FSTPSS(VARPTR)	;Still on first pass
+MKECON:	CALL CONECT
+	 JRST RELBUF		;An error occurred
+
+;Send the sender's name to the vax
+
+	CALL SENSEN
+	 JRST ABTNOW		;A network error occurred, abort the link
+
+
+;Send the addressees to the vax
+
+	CALL ADRSEN
+	 JRST ABTRCP		;A network error occurred, abort the link
+
+;Send the to: list
+
+	CALL TOSEND
+	 JRST ABTRCP		;A network error occurred, abort the link
+
+;Send the subj: line
+
+	CALL SUBSEN
+	 JRST ABTRCP		;A network error occurred, abort the link
+
+;Open the mail file
+
+	CALL MAIOPN
+	 JRST ABTRCP		;A network error occurred, abort the link
+
+;Transfer the mail file and then close it
+
+	CALL MAISEN
+	 JRST ABTRCP		;A network error occurred, abort the link
+
+;Get success/failure messages for each recipient from the vax
+
+	CALL SFMSG
+	 JRST ABTRCP		;A network error occurred, abort the link
+
+;Close the link
+
+	SKIPN RCPT(VARPTR)	;Any more recipients?
+	IFSKP.
+	  CALL CSLINK		;Yes, 
+	  SETOM FSTPSS(VARPTR) 	;No longer the first pass
+	  JRST MKECON		;Begin a new session
+	ENDIF.
+
+	CALL CLOLIN		;No, terminate this session
+	MOVEI T1,$DONE		;Assume all recipients received mail
+	SKIPE FALSND(VARPTR)	;Did they really?
+	MOVEI T1,$REJECT	;No, so indicate so
+	MOVEM T1,5(WRKREQ)	;Store in the work request block
+
+;Release the buffers and return
+
+RELBUF:	CALL BUFREL		;Return the buffers
+	MOVE T1,5(WRKREQ)	;Pick up status for mx
+
+	POP P,13		;Restore regisiters for bliss	
+	POP P,VARPTR
+	POP P,T14
+	POP P,MSGBLK
+	POP P,WRKREQ
+	POP P,10
+	POP P,T7
+	POP P,T6
+	POP P,T0
+
+	RET			;And return to the calling routine
+
+;Common network error path
+ABTRCP:	CALL ZREJEC		;Zero out any rejected adressees
+ABTNOW:	CALL ABTLNK		;Abort the link
+	JRST RELBUF		;And finish up
+
+SUBTTL GETBUF	GET BUFFERS
+
+;Get space for list of addresses and pointers
+
+GETBUF:	PUSH P,[NUMVAR]		;Get space for the address list
+	CALL UM%GET		;Do it
+	ADJSP P,-1		;Reset the stack
+	JUMPLE T1,BUFERR	;An error occurred
+	MOVE VARPTR,T1		;Save the address of the list
+
+;Get space for the connect block
+
+	PUSH P,[CBKSIZ]		;Size of the connection block
+	CALL UM%GET		;Get the space
+	ADJSP P,-1		;Adjust the pointer
+	JUMPLE T1,BUFERR	;Error, halt
+	MOVEM T1,CNNBLK(VARPTR) ;Save the address for later
+
+
+;Allocate space for the to: list
+
+	PUSH P,[^D70]		;Buffer size
+	CALL UM%GET		;Get the space
+	ADJSP P,-1		;Adjust the pointer
+	JUMPLE T1,BUFERR	;An error occurred, halt
+	HRLI T1,(POINT 8)	;Make into a pointer
+	MOVEM T1,TOLIST(VARPTR) ;Save for later
+
+;Allocate space for the from string (8 bit byte pointer)
+
+	PUSH P,[^D70]		;Amount of space needed
+	CALL UM%GET		;Get the space
+	ADJSP P,-1		;Reset the stack
+	JUMPLE T1,BUFERR	;An error occurred
+	HRLI T1,(POINT 8)	;Make a pointer
+	MOVEM T1,SNDSTR(VARPTR)	;Save for later
+
+;Allocate space for the from string (7 bit byte pointer)
+
+	PUSH P,[^D70]		;Amount of space needed
+	CALL UM%GET		;Get the space
+	ADJSP P,-1		;Reset the stack
+	JUMPLE T1,BUFERR	;An error occurred
+	HRLI T1,(POINT 7)	;Make a pointer
+	MOVEM T1,SNDERR(VARPTR)	;Save for later
+
+;Allocate space for a working buffer
+
+	PUSH P,[^D100]		;The number of words to get
+	CALL UM%GET		;Get them
+	ADJSP P,-1		;Reset the stack
+	JUMPLE T1,BUFERR	;An error occurred, halt
+	MOVEM T1,WRKBUF(VARPTR)	;Save for later
+	HRLI T1,(POINT 8)	;Make into a pointer
+	MOVEM T1,BUFPTR(VARPTR)	;For vax replies
+	RET			;Return
+
+BUFERR:	PUSH P,[POINT 7,[ASCIZ /No memory at BUFERR:(SENVAX)/]]
+	PUSHJ P,NMLDIE		;No memory available, halt
+
+SUBTTL	CONECT	MAKE THE CONNECTION
+
+;Construct the connect block
+
+CONECT:	MOVE T7,CNNBLK(VARPTR)	;Get address of the data block
+	HRR T1,4(WRKREQ)	;Destination node address
+	HRLI T1,(POINT 8)	;Make into a pointer
+	MOVEM T1,0(T7)		;Node name pointer
+	IBP T1			;Skip two nulls
+	IBP T1
+	ILDB T2,T1		;Get length
+	MOVEM T2,1(T7)		;Node name length
+	MOVEI T2,DSTNDE(VARPTR)	;Address to store asciz node name
+	HRLI T2,(POINT 7)	;Make into a pointer
+NDECHR:	ILDB T3,T1		;Get next 8 bit byte node name chr
+	IDPB T3,T2		;Place in 7 bit byte buffer
+	CAIE T3,0		;Finished?
+	JRST NDECHR		;No, get the next character
+	MOVEI T1,VAXOBJ		;Object type
+	MOVEM T1,2(T7)		;Place in the connect block
+
+	SETZM 3(T7)		;The rest will be zeroed
+	HRLI T1,3(T7)		;Prepare for the blt
+	HRRI T1,4(T7)
+	BLT T1,CBKSIZ-1(T7)	;Zero the rest of the block
+
+;Open the connection
+
+	PUSH P,[2]		;Connect type 2, source
+	PUSH P,T7		;Link connect block address
+	PUSH P,[0]		;No response message
+	PUSH P,[0]		;Zero response message length
+	PUSH P,[0]		;No error code
+	CALL UN%OPEN		;Open and block for initiation
+	ADJSP P,-5		;Reset the stack
+	SKIPG T1		;Obtained the data link number?
+	JRST CONERR		;Return, a network error occurred
+	MOVEM T1,DATLNK(VARPTR)	;Save the data link number for later
+
+;Wait for the slave's confirmation/rejection
+REPEAT 0,<
+	PUSH P,DATLNK(VARPTR)	;Link identifier
+	PUSH P,[^D4]		;Number of bytes in the buffer
+	PUSH P,BUFPTR(VARPTR)	;Pointer to the buffer
+	CALL UN%REA		;Check for confirmation
+	ADJSP P,-3		;Adjust the stack
+	JUMPLE T1,CONERR	;Return, a network error occurred
+
+	HRRZ T2,BUFPTR(VARPTR)	;Address of the success/fail message
+	MOVE T2,0(T2)		;Pick up the status word
+	TLNE T2,SUCBIT		;Confirmation?
+>
+	RETSKP			;Yes return true
+
+SUBTTL SENSEN		SEND THE SENDER STRING
+
+;Sender's name in message block is in the form  name@node. translate this
+;to name 
+
+SENSEN:	SETZ T6,		;Number of characters in name so far
+	MOVE T2,SNDSTR(VARPTR)	;8 bit byte pointer to store name in
+        HRRZ T7,4(MSGBLK)       ;Get the sender's domain id
+SENSE0: HRR T4,1(MSGBLK)	;Pick up address of sender string
+	HRLI T4,(POINT 7)	;Make into a pointer
+	SETZ T3,		;No quotes found yet
+
+FINDNM:	ILDB T1,T4		;Get the first name character
+	CAIN T1," "		;A blank?
+	JRST FINDNM		;Yes, ignore leading blanks
+	CAIN T1,QUOTE		;First character a quote?
+	CALL SKPQTS		;Ignore the quoted string...
+	SKIPA
+FINDN2:	ILDB T1,T4		;Get the next character
+	CAIN T1,"@"		;End of the name found?
+	JRST CHKLOC		;Yes, check if mail originated on the 20
+	CAIN T1,0		;End of the name found?
+	JRST SNDNAM		;Yes, send off the name to the vax
+	CALL CHNUPC		;Change any l.c. to u.c.
+	IDPB T1,T2		;Store in temporary buffer
+	AOS T6			;Increment the character count
+	JRST FINDN2		;Get the next character
+
+;SKPQTS: Ignore the quoted string...
+
+;**;[303] ADD 1 LINE AT SKPQTS+2
+SKPQTS:	IDPB T1,T2		;Store the character in the temp buffer
+	ILDB T1,T4		;Get the next character
+	AOS T6			;[303] increment the character count
+	CAIE T1,QUOTE		;Is it a quote?
+	JRST SKPQTS		;No, keep looking
+	IDPB T1,T2		;Store the character in the temp buffer
+	RET			;All done, return
+
+;Send off the sender string to the vax
+
+CHKLOC: SKIPE T7                ;A local sender?
+        JRST NODCC              ;No.  We need NODE::
+MKEASZ:	SETZ T1,		;Add asciz termination character
+SNDNAM:	IDPB T1,T2		;Place in the buffer
+	PUSH P,DATLNK(VARPTR)	;Data link identifier
+	PUSH P,[1]		;End of message flag
+	PUSH P,T6		;Length of string
+	MOVE T2,SNDSTR(VARPTR)	;Pointer to string
+	PUSH P,T2		;Pass as an argument
+	CALL UN%WRI		;Send the string off to the vax
+	ADJSP P,-4		;Adjust the stack
+	JUMPLE T1,SENERR	;Network error
+	RETSKP			;Return success
+
+NODCC:  SETZ T6,                ;Reset the count, we'll do it again
+        MOVE T2,SNDSTR(VARPTR)  ;Reset the 8-bit sender pointer
+NODCC0: ILDB T1,T4              ;Get the first character of the nodename
+	skipn t1
+	jrst nodcc1
+        IDPB T1,T2              ;Write it to the 8-bit buffer
+        AOJA T6,NODCC0          ;No.  Count the character and loop.
+nodcc1:        MOVEI T1,":"            ;Get a colon
+        IDPB T1,T2              ;Write it
+        IDPB T1,T2              ;We need two
+        ADDI T6,2               ;Account for the ::
+        SETZ T7,                ;Make sure we don't do this again
+        JRST SENSE0             ;And go back and get the rest of the name again
+SUBTTL ADRSEN		SEND THE ADDRESSEES TO THE VAX
+
+;This routine returns with t2 containing the number of bytes in the to: list
+;returns with scrat2(varptr) pointing to end of the to: list
+;These are used by routine tosend
+;The maximum number of bytes accepted by the vax is 255, therefore, if the
+;To: list contains more than 255, we cannot send as is.
+;Initialize
+
+ADRSEN:	SKIPN T7,RCPT(VARPTR)	;First pass?
+	HLRZ T7,4(WRKREQ)	;No, get first recipient from work req
+	MOVEM T7,FSRCPT(VARPTR)	;Store as first recipient this pass
+	SKIPA 			;Skip the first time
+ADRSN1:	MOVE T7,FSRCPT(VARPTR)	;Get the first recipient
+	SETZM NUMSUC(VARPTR)	;No successful sends yet
+	SETZM TOHOLD(VARPTR)	;Room so far in the to: list buffer
+	MOVE T3,TOLIST(VARPTR)	;8 bit byte pointer to to: list buffer
+	SETZ T2,		;No characters yet in to: list buffer
+	MOVEM T3,SCRAT3(VARPTR)	;Save for later
+	MOVEM T2,SCRAT4(VARPTR)	;Save for later
+
+	MOVE T5,WRKBUF(VARPTR)	;Address of the working buffer
+	HRLI T5,(POINT 8)	;Make it into a pointer
+	MOVEM T5,SCRAT1(VARPTR)	;Save for later
+
+;Each addressee string is of the form @node1,@node2,...,@node3:username@node4.
+;The vax expects the form node1::node2::...node4::username.
+
+;Initialize, determine if the current addressee name is preceded by a node name
+
+NXTADR:	MOVE T6,1(T7)		;Get addressee's flag word
+	TXNE T6,REJECT		;Was mail previously rejected?
+	JRST GETNXT		;Yes, get the next addressee
+	HLR T6,0(T7)		;Address of addressee string
+	HRLI T6,(POINT 7)	;Make it into a pointer
+	MOVEM T6,SCRAT2(VARPTR)	;May need to reset pointer
+	MOVE T5,SCRAT1(VARPTR)	;8 bit byte pointer to working buffer
+	MOVE T0,SNDERR(VARPTR)	;7 bit byte pointer to user name
+	SETZ T10,		;No characters in working buffer yet
+	MOVE T3,SCRAT3(VARPTR)	;Point to current position in to: list
+	MOVE T2,SCRAT4(VARPTR)	;Current number of bytes in to: list
+
+	ILDB T1,T6		;Get the first addressee character
+	CAIN T1,"@"		;Node name?
+	IFSKP.
+	  MOVE T6,SCRAT2(VARPTR) ;No, reset to start of addressee 
+	  JRST FINALN		;Get the final node name
+	ENDIF.
+
+;Transfer this node name to the working buffer to be sent to the vax, and if
+;room, place in the to: list buffer
+
+NXNDCH:	ILDB T1,T6		;Get the next node name character
+	CAIN T1,","		;End of the node name?
+	JRST FINNDE		;Yes, append two colons
+	CAIN T1,":"		;Last node name?
+	JRST LSTNDE		;Yes, get the user name
+
+	CALL CHNUPC		;Change any lower case to upper case
+	IDPB T1,T5		;Place in the working buffer
+	AOS T10			;Increment working buffer byte count
+	CAIL T2,^D256		;Room in to: list buffer
+	JRST NXNDCH		;No, so get next node name character
+
+	IDPB T1,T3		;Place character in the to: list buffer
+	AOS T2			;Increment the to: list byte count
+	JRST NXNDCH		;Get the next node name character
+
+;A comma has been found in the addressee string. Append two colons to the node
+;name in the working buffer and the to: list buffer, if room, then get the next
+;node name
+
+FINNDE:	CALL ADDCOL		;Add two colons
+	IBP T6			;Get rid of the @
+	JRST NXNDCH		;Look for the next node
+
+;The last node before the user name has been found. Append two colons in
+;working buffer and the to: list buffer if space.
+
+LSTNDE:	CALL ADDCOL		;Add two colons
+
+;Add the node name following the user name
+
+	MOVEM T6,SCRAT2(VARPTR)	;Save pointer to user name
+FINALN:	MOVEI T4,"@"		;Assume name not surrounded by quotes
+	ILDB T1,T6		;Get first user name character
+	CAIN T1,QUOTE		;Is it a quote?
+	MOVEI T4,QUOTE		;Yes, set end of name character
+
+FINAL2:	ILDB T1,T6		;Get the next character
+	CAME T1,T4		;End of the user name?
+	JRST FINAL2		;No, get the next character
+	CAIN T4,QUOTE		;Is quote end of user name?
+	IBP T6			;Yes, strip off the following @
+
+FINAL3:	ILDB T1,T6		;Get the next node name character
+	CAIN T1,0		;The end of the node name?
+	JRST RESPTR		;Yes, copy over the user name
+	CALL CHNUPC		;Change any lower case to upper case
+	JUMPE T10,FINAL4	;If only 1 node name, do not include
+	IDPB T1,T5		;Place character in working buffer
+	AOS T10			;Increment working buffer byte count
+FINAL4:	CAIL T2,^D256		;Room in to: list buffer
+	JRST FINAL3		;No, so get next node name character
+
+	IDPB T1,T3		;Place character in the to: list buffer
+	AOS T2			;Increment the to: list byte count
+	JRST FINAL3		;Get the next node name character
+	
+RESPTR:	JUMPG T10,RESPT2	;Do not add colons to work buffer
+	MOVEI T1,":"		;Pick up a colon
+	CALL ADDCO2		;Add to to: buffer
+	SKIPA			;Don't do it again
+RESPT2:	CALL ADDCOL		;Add two colons
+	MOVE T6,SCRAT2(VARPTR)	;Point to user name
+	ILDB T1,T6		;Get the first user name character
+	CAIE T4,QUOTE		;Is name surrounded by quotes
+	JRST GETUS2		;Place in the buffer
+	MOVE T1,8(WRKREQ)	;Get the strip quotes flag
+	CAIN T1,2		;Strip them?
+	IFSKP.
+	  MOVEI T1,QUOTE	;No, reset T1
+	  JRST GETUS2		;Place in the buffer
+	ENDIF.
+	ILDB T1,T6		;Skip the quote
+	JRST GETUS2		;Place next character in the buffer
+
+;Move the users name over to the working buffer
+
+GETUSR:	ILDB T1,T6		;Get the next character
+	CAMN T1,T4		;End of the user name?
+	JRST LASTN1		;Yes, make the string asciz
+GETUS2:	CAIE T4,QUOTE		;Name surrounded by quotes?
+	CALL CHNUPC		;No, convert any l.c. to u.c.
+	IDPB T1,T5		;Place character in working buffer
+	IDPB T1,T0		;Place in 7 bit byte error message
+	AOS T10			;Increment the byte count
+	CAIL T2,^D255		;Room in the to: list?
+	JRST GETUSR		;No, get the next character
+	IDPB T1,T3		;Yes, place in the to: list
+	AOS T2			;Increment the to: list byte count
+	JRST GETUSR		;Get the next character
+
+;Make the addressee string asciz
+
+LASTN1:	CAIE T1,QUOTE		;Is termination character a quote?
+	JRST MAKASZ		;No, make string asciz now
+	MOVE T1,8(WRKREQ)	;Get the strip quotes flag
+	CAIN T1,2		;Strip it?
+	JRST MAKASZ		;Yes
+	MOVEI T1,QUOTE		;Reset T1
+	IDPB T1,T5		;Place the quote in the working buffer
+	IDPB T1,T0		;Place in the 7 bit byte error message
+	AOS T10			;Increment the byte count
+	CAIL T2,^D255		;Room in the to: list?
+	JRST MAKASZ		;No, so make working string asciz
+	IDPB T1,T3		;Place in the to: list
+	AOS T2			;Increment its byte count
+
+MAKASZ:	MOVEI T1,0		;Asciz string terminator
+	IDPB T1,T5		;Place in the temporary buffer
+	IDPB T1,T0		;Place in 7 bit byte error message
+
+;Send the current addressee name off to the vax
+
+SNDVAX:	PUSH P,T2		;Need later and destroyed by un%wri
+	PUSH P,T3		;Need later and destroyed by un%wri
+	PUSH P,DATLNK(VARPTR)	;Data link identifier
+	PUSH P,[1]		;End of message flag
+	PUSH P,T10		;Length of string
+	MOVE T5,SCRAT1(VARPTR)	;Point to the to: list
+	PUSH P,T5		;Pass as an argument
+	CALL UN%WRI		;Send the string off to the vax
+	ADJSP P,-4		;Adjust the stack
+	POP P,T3		;Restore t3
+	POP P,T2		;Restore t2
+	JUMPLE T1,SENERR	;Network error
+
+;Wait for the slave's confirmation/rejection
+
+	PUSH P,T2		;Destroyed by un%rea
+	PUSH P,T3		;Destroyed by un%rea
+	PUSH P,DATLNK(VARPTR)	;Data link number
+	PUSH P,[^D16]		;Number of bytes in the buffer
+	PUSH P,BUFPTR(VARPTR)	;Pointer to the buffer
+	CALL UN%REA		;Check for confirmation
+	ADJSP P,-3		;Adjust the stack
+	POP P,T3		;Restore t3
+	POP P,T2		;Restore t2
+	JUMPLE T1,REDERR	;Return, a network error occurred
+
+	HRRZ T1,BUFPTR(VARPTR)	;Address of the success/fail message
+	MOVE T1,0(T1)		;Pick up the status word
+	TLNN T1,SUCBIT		;Confirmation?
+	IFSKP.
+	  AOS NUMSUC(VARPTR) 	;Increment number of successful sends
+	  JRST NXTONE		;Set up for the next addressee
+	ENDIF.
+	TRZ T1,17		;Clear bits 32-35
+	CAMN T1,[LOGLNK]	;Is this an "Error creating log. link"?
+	JRST FWDERR		;Yes. Treat it as a network error
+	SETOM FALSND(VARPTR)	;No, vax rejected this addressee
+	MOVE T6,1(T7)		;Get the addressee flag word
+	TXO T6,REJECT		;Addressee rejected
+	MOVEM T6,1(T7)		;Store updated flag word
+
+;Get the error text message
+
+	HRRZ T1,BUFPTR(VARPTR)	;Address of the error message
+	MOVE T2,T1		;Save a copy for the blt
+	SETZM 0(T1)		;Zero the first word for the blt
+	HRLS T1			;Starting address in left 
+	AOS T1			;Destination address in right
+	BLT T1,^D99(T2)		;Zero the buffer
+	PUSH P,DATLNK(VARPTR)	;Data link number
+	PUSH P,[^D400]		;Number of bytes in the buffer
+	PUSH P,BUFPTR(VARPTR)	;Pointer to the buffer
+	CALL UN%REA		;Check for confirmation
+	ADJSP P,-3		;Adjust the stack
+	JUMPLE T1,REDERR	;Return, a network error occurred
+	MOVE T1,BUFPTR(VARPTR)	;Get 8 bit byte pointer for error 
+	HRRZ T2,SNDERR(VARPTR)	;Address of 7 bit byte error message
+	MOVE T3,T2		;Save for the blt
+	SETZM 0(T2)		;Zero out the first word
+	HRLS T2			;Put address in both halves
+	AOS T2			;Set up for the blt
+	BLT T2,^D69(T3)		;Zero out the entire error buffer
+	MOVE T2,SNDERR(VARPTR)	;Pointer to 7 bit byte error message
+	MOVE T4,T2		;Save for informing mx of the error
+GETREA:	ILDB T3,T1		;Get the next 8 bit byte
+	IDPB T3,T2		;Place in the asciz string
+	CAIE T3,0		;Finished?
+	JRST GETREA		;No, get the next byte
+	PUSH P,T4		;Yes, pass as an argument
+	CALL ADRERR		;Inform mx of the rejected addressee
+	ADJSP P,-1		;Reset the stack
+	CALL ABTLNK		;Abort the link
+	CALL CONECT		;Open the new link
+	IFNSK.
+	  ADJSP P,-1		;Network error, fake a ret
+	  JRST RELBUF		;Release the buffer space
+	ENDIF.
+	CALL SENSEN		;Send the stringer string to the vax
+	 RET			;A network error occurred
+	JRST ADRSN1		;Try again, ignore rejected recipients
+
+;Set up for the next addressee
+
+NXTONE:	CAIL T2,^D255		;Room in the to: list?
+	JRST GETNXT		;No, get the next addressee
+	MOVEM T3,SCRAT2(VARPTR)	;Save current end of to: list
+	MOVEI T1,","		;Pick up a comma
+	IDPB T1,T3		;Place in the to: list buffer
+	MOVEI T1," "		;Pick up a blank
+	IDPB T1,T3		;Place in the to: list buffer
+	AOS T2			;Increment the to: list byte count
+	AOS T2			;Again
+	MOVEM T3,SCRAT3(VARPTR)	;Save current position in the to: list
+	MOVEM T2,SCRAT4(VARPTR)	;Save current byte count in to: list
+
+GETNXT:	HRRZ T7,0(T7)		;Get the next addressee address
+	CAIN T7,0		;The last one?
+	IFSKP.
+	  MOVE T1,NUMSUC(VARPTR);Get number of successful recipients
+	  CAIGE T1,MAXSND	;Greater than the vax can handle?
+	  JRST NXTADR		;No, validate the next addressee
+	  MOVEM T7,RCPT(VARPTR) ;Yes, 1st addressee of the next pass
+	  JRST SNDEND		;Send eoa message for this pass
+	ENDIF.
+	SKIPLE NUMSUC(VARPTR)	;Any successful recipients?
+	IFSKP.
+	  MOVEI T1,$REJECT	;No, set the return code
+	  JRST RETSND		;And return false
+	ENDIF.
+	SETZM RCPT(VARPTR)	;First pass?
+	CAILE T2,^D255		;To: list buffer exhausted?
+SNDEND:	SETOM TOHOLD(VARPTR)	;Yes, so must use "distribution"
+	SUBI T2,2		;Correct the byte count
+
+;Send the end of addressees message
+
+	HRRZ T1,BUFPTR(VARPTR)	;Address of the message
+	SETZM 0(T1)		;All zeroes
+	HRLI T1,(POINT 8)	;Make it a pointer
+	PUSH P,T2		;Need contents for routine tosend
+	PUSH P,DATLNK(VARPTR)	;Data link number
+	PUSH P,[1]		;End of message flag
+	PUSH P,[1]		;Length of the message
+	PUSH P,T1		;Pointer to the message
+	CALL UN%WRI		;Send the message
+	ADJSP P,-4		;Adjust the stack
+	POP P,T2		;Restore the to: list byte count
+	JUMPLE T1,SENERR	;Network error occurred
+	RETSKP			;Return true, no network errors
+
+;Routine to add two colons
+
+ADDCOL:	MOVEI T1,":"		;Pick up a colon
+	IDPB T1,T5		;Place in the working buffer
+	IDPB T1,T5		;The vax wants two
+	AOS T10			;Increment the byte count
+	AOS T10			;Again
+
+ADDCO2:	CAIL T2,^D255		;Room in the to: list?
+	RET			;No, so get the next node
+	IDPB T1,T3		;Yes, place in the to: list buffer
+	IDPB T1,T3		;Again
+	AOS T2			;Increment the to: list byte count
+	AOS T2			;Again
+	RET				;Get the next node
+
+;Routine to convert lower case characters to upper case characters
+
+CHNUPC:	CAIL T1,"a"
+	CAILE T1,"z"
+	SKIPA 	
+	SUBI T1,40
+	RET
+
+SUBTTL TOSEND		SEND THE TO: LIST
+
+;Determine if the to: list buffer contains all the addressees
+;T2 and scrat2(varptr) values come from routine adrsen
+
+TOSEND:	SKIPE TOHOLD(VARPTR)	;To: list good as is?
+	JRST SENTO		;No, make one up
+	MOVE T1,SCRAT2(VARPTR)	;Pointer to end of to: list
+	MOVEI T3,0		;Get a 0
+	IDPB T3,T1		;Make it an asciz string
+	JRST SNDTOL		;Send it off to the vax
+
+;Make up a to: list
+
+SENTO:	HRLI T1,DISTRI		;Address of string to copy
+	HRR T1,TOLIST(VARPTR)	;Where to copy to
+	HRRZ T3,T1		;Starting address of where to copy
+	BLT T1,3(T3)		;Copy the to: string
+	MOVEI T2,^D13		;The number of bytes in the string
+
+;Send to the vax
+
+SNDTOL:	MOVE T1,TOLIST(VARPTR)	;8 bit byte pointer to to: list
+	PUSH P,DATLNK(VARPTR)	;Data link identifier
+	PUSH P,[1]		;End of message flag
+	PUSH P,T2		;Length of string
+	PUSH P,T1		;Pointer to string
+	CALL UN%WRI		;Send the string off to the vax
+	ADJSP P,-4		;Adjust the stack
+	JUMPLE T1,SENERR	;Network error
+	RETSKP			;Return true
+
+DISTRI:	BYTE(8)"D","i","s","t","r","i","b","u","t","i","o","n"
+	EXP 0
+
+SUBTTL SUBSEN		SEND THE SUBJ: LINE
+
+;Send the subject line
+
+SUBSEN:	HLRZ T1,4(MSGBLK)	;Get address of the subject line
+	JUMPN T1,SNDSUB		;Go send it, if it exists
+	HLR T1,0(MSGBLK)	;Get address of the file spec
+	HRLI T1,(POINT 7)	;Make it into a pointer
+	PUSH P,T1		;Pass as an argument
+	CALL GETSUB		;Get the subject line
+	ADJSP P,-1		;Reset the stack
+	JUMPE T1,BLKSUB		;There is none, send a blank
+	HRLM T1,4(MSGBLK)	;Save, may need another time
+SNDSUB:	HRLI T1,(POINT 7)	;Make into a pointer
+	MOVE T4,WRKBUF(VARPTR)	;Address of buffer to place 8 bit bytes
+	HRLI T4,(POINT 8)	;Make into a pointer
+	SETZ T2,		;Number of bytes in the subject
+NXTSUB:	ILDB T3,T1		;Get the next character
+	IDPB T3,T4		;Place in 8 bit byte buffer
+	JUMPE T3,NXTSU2		;Don't include the null in byte count
+	AOS T2			;Increment the byte count
+	JRST NXTSUB		;No, get the nex character
+NXTSU2:	MOVE T1,WRKBUF(VARPTR)	;Address of the 8 bit byte buffer
+	HRLI T1,(POINT 8)	;Make into a pointer
+	CALL SNDSJT		;Send off to the vax
+	JUMPLE T1,SENERR	;Network error occured if negative
+	JRST COMSUB		;Success, return
+
+BLKSUB:	MOVEI T1,WRKBUF(VARPTR)	;No subject line given, send a blank
+	HRLI T1,(POINT 8)	;Make it into a pointer
+	MOVE T2,T1		;Save for the call to sndsjt
+	MOVEI T3," "		;Pick up a blank
+	IDPB T3,T2		;Place in the buffer
+	SETZ T3,		;Get the asciz termination character
+	IDPB T3,T2		;Make it asciz for un%wri
+	MOVEI T2,1		;Length of message
+	CALL SNDSJT		;Send off to the vax
+	JUMPLE T1,SENERR	;Network error?
+COMSUB:	RETSKP			;No, return successfully
+
+SNDSJT:	PUSH P,DATLNK(VARPTR)	;Data link identifier
+	PUSH P,[1]		;End of message flag
+	PUSH P,T2		;Length of string
+	PUSH P,T1		;Pointer to string
+	CALL UN%WRI		;Send the string off to the vax
+	ADJSP P,-4		;Adjust the stack
+	RET			;Return true
+
+SUBTTL MAIOPN		OPEN THE MAIL FILE
+
+MAIOPN:	HLR T1,0(MSGBLK)	;Mail file spec  from message block
+	HRLI T1,(POINT 7)	;Make into a pointer
+	MOVEM T1,MAIPTR(VARPTR)	;Save for mail file transfer in maisen
+	PUSH P,T1		;Pass as an arugment
+	PUSH P,[1]		;Read access
+	PUSH P,[0]		;No error buffer
+	CALL UF%OPE		;Open the mail file
+	ADJSP P,-3		;Restore the stack
+	JUMPLE T1,OPNERR	;An error occurred
+	MOVEM T1,FILNB(VARPTR)	;Save the file number for later
+	RETSKP			;Return true
+
+SUBTTL MAISEN		TRANSFER THE MAIL FILE
+
+;Place a delimiter line between the header and mail file
+
+MAISEN:	SETOM T7		;Loop counter
+	MOVEI T1,TOPLIN		;Delimiter line
+	SKIPA
+MAISE2:	MOVEI T1,SNDLIN		;Send a blank line over
+	HRLI T1,(POINT 8)	;Make it into a pointer
+	MOVEI T2,^D11		;The length of the subject line
+
+	PUSH P,DATLNK(VARPTR)	;Data link identifier
+	PUSH P,[1]		;End of message flag
+	PUSH P,T2		;Length of string
+	PUSH P,T1		;Pointer to string
+	CALL UN%WRI		;Send the string off to the vax
+	ADJSP P,-4		;Adjust the stack
+	JUMPLE T1,OUTERR	;Network error
+	AOJE T7,MAISE2		;Send a blank line over
+	SETZ T7,		;No bytes in the output buffer
+	MOVE T6,SNDSTR(VARPTR)	;8 bit byte pointer to output buffer
+
+;Read in the next buffer from the mail file
+
+NXTBUF:	PUSH P,FILNB(VARPTR)	;File number of the mail file
+	MOVE T14,WRKBUF(VARPTR)	;Point to the start of the buffer
+	HRLI T14,(POINT 7)	;Make into a pointer
+	PUSH P,T14		;Pass as an argument
+	PUSH P,[^D255]		;Maximum number of bytes in buffer
+	PUSH P,[0]		;No error buffer
+	CALL UF%REA		;Read the next mail file buffer
+	ADJSP P,-4		;Reset the stack
+	SETZ FLGWRD,		;No cr or lf seen
+
+	JUMPL T1,REAERR		;An error occurred
+	JUMPE T1,EOFFND		;End of file
+	MOVE T10,T1		;The number of bytes in the buffer
+
+;Read the next character. when both a cr and lf has been found send the
+;Output buffer
+
+NXTCHR:	ILDB T1,T14		;Get  next character from input buffer
+	CAIE T1,.CR		;Is it a carriage return?
+	JRST CHKLF		;No, check if it is a line feed
+	TXO FLGWRD,CRFLG	;Lite the carriage return flag
+	TXNN FLGWRD,LFFLG	;Has a lf also been seen?
+	JRST DECCNT		;No,check for end of input buffer
+	CALL SENDIT		;Send the output buffer
+	RET			;Network error occurred
+	JRST DECCNT		;Check for end of input buffer
+
+CHKLF:	CAIE T1,.LF		;Is it a line feed?
+	JRST DEPBYT		;No, deposit in the output buffer
+	TXO FLGWRD,LFFLG	;Lite the line feed flage
+	TXNN FLGWRD,CRFLG	;Has a cr return also been seen?
+	JRST DECCNT		;No, check for end of input buffer
+	CALL SENDIT		;Send the output buffer
+	RET			;Network error occurred
+	JRST DECCNT		;Check for end of input buffer
+
+;Character is not a cr or lf, deposit in the output buffer. if no room, send
+;To the vax and reinialize the output buffer
+
+DEPBYT:	IDPB T1,T6		;Deposit character in output buffer
+	AOS T7			;Number of bytes in output buffer
+	CAIGE T7,^D255		;Any room left in the buffer?
+	JRST DECCNT		;Yes, just check for end input buffer
+	CALL SENBUF		;Send  output buffer, reinitialize it
+	RET			;Network error occurred
+
+;Decrement input buffer byte count and either get the next character or if
+;Empty, get the next buffer
+
+DECCNT:	SOSE T10		;Decrement input buffer byte count
+	JRST NXTCHR		;Not empty, get the next byte
+	JRST NXTBUF		;Empty, read in the next buffer
+
+;A cr and lf have both been found. send the output buffer to the vax
+;If the sequence cr,lf,cr,lf ...cr,lf has been found, replace each null
+;Line with a single blank character. finally reinitialize the output buffer
+
+SENDIT:	SETZ FLGWRD,		;Reset the cr and lf flag word
+	SKIPE T7		;Is the output buffer empty?
+	JRST SENBUF		;No, send it as is
+	MOVEI T1," "		;Get a blank
+	IDPB T1,T6		;And place in the output buffer
+	MOVEI T7,1		;Byte count of output buffer
+
+SENBUF:	PUSH P,DATLNK(VARPTR)	;Data link identifier
+	PUSH P,[1]		;End of message flag
+	PUSH P,T7		;Length of string
+	MOVE T6,SNDSTR(VARPTR)	;Pointer to output buffer
+	PUSH P,T6		;Pass as an argument
+	CALL UN%WRI		;Send the string off to the vax
+	ADJSP P,-4		;Adjust the stack
+	JUMPLE T1,OUTERR	;Network error occurred
+
+	SETZ T7,		;Reset output buffer byte count
+	RETSKP			;Return true
+
+;The mail file has been transfered, send an end of message to the vax
+
+EOFFND:	HRRZ T1,SNDSTR(VARPTR)	;Address of the message
+	SETZM 0(T1)		;The message is a zero byte
+	MOVE T1,SNDSTR(VARPTR)	;Pointer to the message
+	PUSH P,DATLNK(VARPTR)	;Data link identifier
+	PUSH P,[1]		;End of message flag
+	PUSH P,[1]		;Length of string
+	PUSH P,T1		;Pointer to the message
+	CALL UN%WRI		;Send the string off to the vax
+	ADJSP P,-4		;Adjust the stack
+	JUMPLE T1,OUTERR	;An error occurred
+	CALL MAICLO		;Close the mail file
+	RETSKP			;Return true
+
+OUTERR:	CALL SENERR		;Tell MX about the error
+	JRST COMRET		;Return false
+
+REAERR:	CALL FLRERR		;File read error
+
+COMRET:	PUSH P,T1		;Save the status
+	CALL MAICLO		;Close the mail file
+	POP P,T1		;Restore the status
+	RET			;Return false
+
+
+TOPLIN:	BYTE(8) " "," "," ","=","=","=","=","=","=","=","="
+SNDLIN: BYTE(8) " "," "," "," "," "," "," "," "," "," "," "
+
+SUBTTL SFMSG		PICK UP THE SUCCESS/FAIL MESSAGES FROM THE VAX
+
+;Initialize
+;NOTE WELL - The loop at SFLOOP assumes that the 3 arguments have been
+;pushed onto the stack.  Since the 3 arguments are constants, this is done
+;once prior to the start of the loop.  All paths out of the loop MUST
+;account for this prior to returning, or stack corruption results.  This is
+;ugly in the extreme...
+;The only paths out of this loop are through SFERR, and NEXTAD.  All roads
+;lead to one of these to locations.
+
+SFMSG:	MOVE T7,FSRCPT(VARPTR)	;Point to the first addressee
+	MOVN T14,NUMSUC(VARPTR)	;Negative number of recipients
+	HRRZ T5,BUFPTR(VARPTR)	;Message address
+	PUSH P,DATLNK(VARPTR)	;Data link number
+	PUSH P,[^D16]		;Number of bytes in the buffer
+	PUSH P,BUFPTR(VARPTR)	;Buffer pointer
+
+SFLOOP:	MOVE T6,1(T7)		;Get the addressee flag word
+	TXZN T6,REJECT		;Rejected previously by the vax?
+	IFSKP.
+	  MOVEM T6,1(T7)	;Yes, store the updated flag word
+	  HRRZ T7,0(T7)		;Get the next addressee
+	  JRST SFLOOP		;Check this one's flag word
+	ENDIF.
+	CALL UN%REA		;Get the next message
+
+;NOTE WELL - No adjustment to the stack.  This is intentional...
+
+	JUMPLE T1,SFERR		;Network error occurred
+	HRRZ T5,BUFPTR(VARPTR)	;Get the address of the message
+	MOVE T2,0(T5)		;Pick up the message
+	TLNN T2,SUCBIT		;Success message?
+	JRST ADRFAI		;No, inform MX
+	TXO T6,DELVER		;Set the mail delivered bit
+	MOVEM T6,1(T7)		;Store in addressee flag word
+	JRST NEXTAD		;Get the next addressee
+
+ADRFAI:	SETOM FALSND(VARPTR)	;Not all recipients received mail
+
+;Get the error text message
+
+	HRRZ T1,BUFPTR(VARPTR)	;Address of the error message
+	MOVE T2,T1		;Save a copy for the blt
+	SETZM 0(T1)		;Zero the first word for the blt
+	HRLS T1			;Starting address in left 
+	AOS T1			;Destination address in right
+	BLT T1,^D99(T2)		;Zero the buffer
+	PUSH P,DATLNK(VARPTR)	;Data link number
+	PUSH P,[^D400]		;Number of bytes in the buffer
+	PUSH P,BUFPTR(VARPTR)	;Pointer to the buffer
+	CALL UN%REA		;Check for confirmation
+	ADJSP P,-3		;Adjust the stack
+	JUMPLE T1,SFERR		;Return, a network error occurred
+	MOVE T1,BUFPTR(VARPTR)	;Get 8 bit byte pointer for error 
+	HRRZ T2,SNDERR(VARPTR)	;Address of 7 bit byte error message
+	MOVE T3,T2		;Save for the blt
+	SETZM 0(T2)		;Zero out the first word
+	HRLS T2			;Put address in both halves
+	AOS T2			;Set up for the blt
+	BLT T2,^D69(T3)		;Zero out the entire error buffer
+	MOVE T2,SNDERR(VARPTR)	;Pointer to 7 bit byte error message
+	MOVE T4,T2		;Save for informing mx of the error
+FNDREA:	ILDB T3,T1		;Get the next 8 bit byte
+	IDPB T3,T2		;Place in the asciz string
+	CAIE T3,0		;Finished?
+	JRST FNDREA		;No, get the next byte
+	PUSH P,T4		;Yes, pass as an argument
+	CALL ADRERR		;Inform mx of the addressee rejection
+	ADJSP P,-1		;Reset the stack
+
+NEXTAD:	HRRZ T7,0(T7)		;Get the next addressee
+	AOJL T14,SFLOOP		;Get the next message
+	ADJSP P,-3		;Reset the stack
+	MOVE T14,NUMSUC(VARPTR)	;Get the number of successfull sends
+	CAIL T14,MAXSND		;Is it the maximum?
+	RETSKP			;Yes, finish with this pass
+	SKIPN T7		;More addressess?
+	RETSKP			;No, finish with this pass
+
+	MOVEM T7,FSRCPT(VARPTR)	;Address of first addressee
+	CALL ZREJEC		;Zero any reject bits	
+	RETSKP			;Finished
+
+SFERR:	ADJSP P,-3		;This is truly awful...
+	CALL REDERR		;Tell MX about the error
+	CALL RSTPKT		;Reset error bits
+	RET			;Return an error
+
+SUBTTL CLOLIN		CLOSE THE CONNECTION
+
+CLOLIN:	PUSH P,DATLNK(VARPTR)	;Data link
+	PUSH P,[0]		;No optional data
+	PUSH P,[0]		;No optional data pointer
+	CALL UN%CLO		;Close the link
+	ADJSP P,-3		;Reset the stack
+	MOVEI T1,$DONE		;Everyone received mail
+	SKIPE FALSND(VARPTR)	;Really?
+	MOVEI T1,$REJECT	;No, indicate so
+	MOVEM T1,5(WRKREQ)	;Save in the work request block
+	RET
+
+ABTLNK:	PUSH P,DATLNK(VARPTR)	;Data link
+	PUSH P,[.DCX11]		;Undefined error
+	PUSH P,[0]		;No optional data
+	PUSH P,[0]		;No optional data pointer
+	CALL UN%ABO		;Abort the link
+	ADJSP P,-4		;Reset the stack
+	RET
+
+CSLINK:	PUSH P,DATLNK(VARPTR)	;Data link
+	PUSH P,[0]		;No optional data
+	PUSH P,[0]		;No optional data pointer
+	CALL UN%CLO		;Close the link
+	ADJSP P,-3		;Reset the stack
+	SKIPLE T1		;Error?
+	RET			;No, so return now
+
+	PUSH P,DATLNK(VARPTR)	;Data link
+	PUSH P,[.DCX11]		;Undefined error
+	PUSH P,[0]		;No optional data
+	PUSH P,[0]		;No optional data pointer
+	CALL UN%ABO		;Abort the link
+	ADJSP P,-4		;Reset the stack
+	RET
+
+;Close the mail file
+
+MAICLO:	PUSH P,FILNB(VARPTR)	;File number of the mail file
+	PUSH P,[0]		;Do not abort the file
+	PUSH P,[0]		;No error string
+	CALL UF%CLO		;Close and delete the mail file
+	ADJSP P,-3		;Reset the stack
+	RET
+
+;Reset the rejected bit of addressess upon an error
+
+ZREJEC:	SETZ T2,		;Zero the flag word
+	TXO T2,REJECT		;Light the reject bit
+	MOVE T1,FSRCPT(VARPTR)	;Pick up first addressee of this pass
+RESERR:	ANDCAM T2,1(T1)		;Zero out the rejected bit
+	HRRZ T1,0(T1)		;Get the next addressee
+	CAIE T1,0		;Last one?
+	JRST RESERR		;No
+	RET			;Yes
+
+
+SUBTTL		ERROR HANDLING ROUTINES
+
+FLRERR:	SKIPA T1,[UF$FRF]	;File read failed
+OPNERR:	MOVEI T1,UF$FOF		;File open failed
+FILER0:	MOVEI T2,MAIPTR(VARPTR)	;Get the file spec
+	HLL T2,[POINT 7]	;Make it a byte pointer
+	CALL TMXERR		;Tell MX all about it
+	MOVEI T1,$REJECT	;No users got the mail
+	MOVEM T1,5(WRKREQ)	;Place in the work request block
+	RET			;Return false
+
+CONERR:	SKIPA T1,[NW$UTC]	;Unable to connect
+FWDERR:	MOVEI T1,NW$NFF		;Forwarding failed
+	JRST SENER0		;Go tell MX
+
+REDERR:	SKIPA T1,[NW$NRF]	;Read error
+SENERR:	MOVEI T1,NW$NWF		;Write error
+SENER0:	MOVEI T2,DSTNDE(VARPTR)	;Address of the node name
+	HLL T2,[POINT 7] 	;Make it a byte pointer
+	CALL TMXERR		;Inform MX of the error
+	MOVEI T1,$DEFER		;Network error
+	SKIPE FSTPSS(VARPTR)	;First pass?
+	MOVEI T1,$REJECT	;No, so some addressees received mail
+RETSND:	MOVEM T1,5(WRKREQ)	;Store in the work request block
+	RET 			;Return false
+
+;This routine informs mx of any errors that occurred
+
+TMXERR:	PUSH P,T1		;Pass the error code
+	MOVE T1,3(MSGBLK)	;get the i.d.
+	AND T1,[IDMSK]		;get rid of the crud
+	PUSH P,T1		;Pass the id.
+	PUSH P,T2		;Pass the optional data
+	MOVE T1,CNNBLK(VARPTR)	;Get the connect block address
+	PUSH P,RCOFST(T1)	;Pass the reject code if present
+	CALL ELOG		;Log it
+	ADJSP P,-4		;Reset the stack pointer
+	RET
+
+;An addressee was rejected by the vax
+
+ADRERR:	MOVEI T1,ADRBLK		;Get address of the argument block
+	HLRZ T2,0(T7)		;[321]Get address of the recipient
+	HRLI T2,(POINT 7)	;[321]Make it a pointer
+	MOVEM T2,4(T1)		;[321]Store it in the arg block
+	MOVE T2,-1(P)		;Get the addressee pointer
+	MOVEM T2,5(T1)		;[321]place in the argument block
+	MOVE T2,3(MSGBLK)	;Get the i.d.
+	AND T2,[IDMSK]		;Get rid of the crud
+	MOVEM T2,2(T1)		;Place in the argument block
+	HRLS T1			;Start of what to put on the stack
+	HRRI T1,1(P)		;Where to put on the stack
+	BLT T1,7(P)		;[321]place on the stack
+	MOVEI T1,1(P)		;Address of the argument block
+	ADJSP P,7		;[321]update the stack pointer
+	PUSH P,T1		;Pass as an argument
+	CALL ER%PRC		;Inform mx of the user rejection
+	ADJSP P,-10		;[321]reset the stack pointer
+	RET
+
+SUBTTL BUFREL		RELEASE THE BUFFERS
+
+;Release space for the connect block
+
+BUFREL:	MOVE T1,CNNBLK(VARPTR)	;Address of the connection block
+	PUSH P,T1		;Pass as an argument
+	PUSH P,[CBKSIZ]		;Size of the connection block
+	CALL UM%REL		;Release the space
+	ADJSP P,-2		;Reset the stack
+
+;Release the space for the to: list
+
+	HRRZ T1,TOLIST(VARPTR)	;Address of the to: list buffer
+	PUSH P,T1		;Pass as an argument
+	PUSH P,[^D70]		;Size of the to: list buffer
+	CALL UM%REL		;Release the space
+	ADJSP P,-2		;Reset the stack
+
+;Release space for the from string (8 bit)
+
+	HRRZ T1,SNDSTR(VARPTR)	;Address of from string buffer
+	PUSH P,T1		;Pass as an argument
+	PUSH P,[^D70]		;Size of the from string buffer
+	CALL UM%REL		;Release the space
+	ADJSP P,-2		;Reset the stack
+
+;Release space for the from string (7 bit)
+
+	HRRZ T1,SNDERR(VARPTR)	;Address of from string buffer
+	PUSH P,T1		;Pass as an argument
+	PUSH P,[^D70]		;Size of the from string buffer
+	CALL UM%REL		;Release the space
+	ADJSP P,-2		;Reset the stack
+
+
+;Release space for the working buffer
+
+	HRRZ T1,WRKBUF(VARPTR)	;Address of the working buffer
+	PUSH P,T1		;Pass as an argument
+	PUSH P,[^D100]		;Size of the working buffer
+	CALL UM%REL		;Release the space
+	ADJSP P,-2		;Reset the stack
+
+;Release space for list of addresses and pointers
+
+	PUSH P,VARPTR		;Address of address list
+	PUSH P,[NUMVAR]		;Size of address list
+	CALL UM%REL		;Release the space
+	ADJSP P,-2		;Reset the stack
+
+	RET
+
+;A recipient was rejected, reset all delivered bits
+
+RSTPKT:	SETZ T1,0		;Zero the flag word
+	TXO T1,DELVER		;Lite the delivered bit
+RSTPK2:	ANDCAM T1,1(T7)		;Turn off the delivered bit
+	HRRZ T7,0(T7)		;Get the next recipient
+	CAIE T7,0		;Is this the last one?
+	JRST RSTPK2		;No, go turn off the delivered bit
+	RET			;Yes, go close the link
+
+RSKP:	AOS 0(P)
+R:	RET
+
+	END

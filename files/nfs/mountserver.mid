@@ -1,0 +1,292 @@
+	Title MountServer -- NFS Mount Server
+
+;Copyright (C) 1987, Mark K. Lottor.
+
+;Warning:  Access controls don't belong in this program.
+
+PPKT==0 ;don't print packets
+
+.DECSAV
+
+.INSRT MID:MACROS
+.INSRT MID:SYMBOLS
+.INSRT MID:SOUT
+
+.INSRT DSK:UDP.MID
+.INSRT DSK:XDR.MID
+.INSRT DSK:RPC.MID 
+
+Q1=5
+Q2=6
+Q3=7
+
+Define RetSkp
+	Jrst Popj1
+Termin
+
+PDLen==40
+PDL:	Block PDLen
+
+Prog==100005.
+Vers==1.
+OurPrt==4005
+
+LogFil:	Asciz "SYSTEM:NFS-MOUNT.LOG"
+LogJfn:	0
+
+RegArg:	4,,RegDat
+RegDat:	Block 4
+
+;Dispatch table, nx4 array, [program ? version ? procedure ? address]
+DspTab:	Prog ? Vers ? 0 ? D.NULL	;null procedure
+	Prog ? Vers ? 1 ? D.AMNT	;add a mount entry
+;nyi	Prog ? Vers ? 2 ? D.DMNT	;dump mount entries
+	Prog ? Vers ? 3 ? D.RMNT	;remove a mount entry
+;nyi	Prog ? Vers ? 4 ? D.RAME	;remove all mount entries
+;nyi	Prog ? Vers ? 5 ? D.DEXP	;dump export list
+	0				;end of table
+
+
+
+FooBuf:	Block 100
+DirNam:	Block 100
+T20Nam:	Block 100
+
+;the filehandle format (32 bytes)
+;words 0-1: handle type (4 bits)
+;		0 == reserved
+;		1 == directory
+;		2 == file
+;               3 == file with long name
+;	    handle id (24 bits)
+;           structure code (18 bits)
+;           directory number (18 bits)
+;words 2-7: file name string (24 bytes) (unless type 3)
+FH%TYP==740000,,000000
+FH.TRT==0
+FH.TDI==1
+FH.TFL==2
+FH.TLN==3
+FH%HND==037777,,777400
+FH%ST1==000000,,000360
+FH%ST2==777760,,000000
+FH%DIR==000017,,777760
+FH.TYP:	0
+FH.HND:	0
+FH.STR:	0
+FH.DIR:	0
+FH.NAM:	Block 10
+
+
+Start:	RESET%
+	Move	P,[PDL(-PDLen)]	;init stack
+
+	Movei 1,.FHSLF
+	RPCAP%
+	Txne 2,SC%WHL
+	 Txnn 2,SC%NWZ
+	  Jrst [TypeCR "[NFS] Need wheel and net-wizard privs."
+	        Jrst Die]
+	Seto 3,
+	EPCAP%
+
+ 	Movei 1,OurPrt
+	Call UDP"GetIQ		;get a udp queue
+	 Jrst [TypeCR "[MountServer] Can't get a UDP queue."
+	       Jrst Die]
+
+ 	Movei 1,OurPrt
+	Call RPC"Init		;init rpc
+	 Jrst [TypeCR "[MountServer] Can't init RPC library."
+	       Jrst Done]
+
+	Movei 2,RegDat
+	Movei 1,Prog
+	PutUns 1,2
+	Movei 1,Vers
+	PutUns 1,2
+	Movei 1,17.			;UDP
+	PutUns 1,2
+	Movei 1,OurPrt
+	PutUns 1,2
+
+ 	Move 1,RegArg
+	Call RPC"Reg		;register with portmapper
+	 Jrst [TypeCR "[MountServer] Can't register with portmapper."
+	       Jrst Done]
+
+	TypeCR "[MountServer] initialized."
+
+	Movei 1,Dsp
+	Movei 2,DspTab
+	Call RPC"DoRPC		;handle RPC requests forever
+	TypeCR "[MountServer] RPC death."
+	Jrst Done
+
+Dsp:	Call (1)
+	Ret
+
+
+;the null procedure
+D.NULL:
+	Ret
+
+
+;add a mount entry
+;takes directory name returns a file handle
+;directory name must be a tops-20 disk structure in unix format
+;example: to mount "PS:" mount "/ps"
+D.AMNT:	GetStr 1,RP		;get directory spec (count in 1, pntr in 2)
+	Movn 3,1
+	Move 1,[440700,,DirNam]
+	$SOUT			;save dir name
+	Setz 3,
+	Idpb 3,1
+	Call LogMnt
+
+;convert unix /dev into tops20 dev:
+	Move 1,[440700,,T20Nam]
+	Move 2,[440700,,DirNam]
+	Ildb 3,2
+	Caie 3,"/
+	 Jrst D.AMN1
+	Setz 4,			;count string length
+D.AMN2:	Ildb 3,2
+	Idpb 3,1
+	Addi 4,1
+	Jumpn 3,D.AMN2
+	Movei 3,":
+	Dpb 3,1
+	Hrroi 2,[asciz /<ROOT-DIRECTORY>/]
+	Setz 3,
+	$SOUT
+	Setz 3,
+	Idpb 3,1
+	Movx 1,RC%EMO
+	Hrroi 2,T20Nam
+	RCDIR%
+	 Erjmp D.AMN1
+	Txne 1,RC%NOM
+	 Jrst D.AMN1
+
+
+;send handle
+	Setz 1,
+	PutUns 1,SP		;reply status ok
+
+	Setz 2,
+	Movei 1,FH.TDI		;directory handle type
+	Dpb 1,[.BP FH%TYP,2]
+	Setz 1,			;zero for directories
+	Dpb 1,[.BP FH%HND,2]
+	Hlrz 1,3		;get structure code
+	Lsh 1,-14.
+	Dpb 1,[.BP FH%ST1,2]
+	PutXdr 2,SP		;word 0
+	Setz 2,
+	Hlrz 1,3
+	Trz 1,740000
+	Dpb 1,[.BP FH%ST2,2]
+	Hrrz 1,3
+	Dpb 1,[.BP FH%DIR,2]
+	PutXdr 2,SP		;word 1
+	Setz 1,
+	PutUns 1,SP
+	PutUns 1,SP
+	PutUns 1,SP
+	PutUns 1,SP
+	PutUns 1,SP
+	PutUns 1,SP
+	Ret	
+
+;return error
+D.AMN1:	Movei 1,2		;No Such Directory
+	PutUns 1,SP
+	Ret
+
+
+;remove a mount entry
+;takes directory handle returns nothing
+D.RMNT:	Ret			;this one's easy
+
+
+LogMnt:	Movx 1,GJ%SHT\GJ%OLD
+	Hrroi 2,LogFil
+	GTJFN%
+	 Erjmp [Movx 1,GJ%SHT\GJ%NEW\GJ%FOU
+		Hrroi 2,LogFil
+		GTJFN%
+		 Erjmp [TypeCR "[MountServer] Log file problems."
+			Ret]
+		Jrst .+1]
+	Movem 1,LogJfn
+	Move 2,[Field(7.,OF%BSZ)\OF%APP]
+	OPENF%
+	 Erjmp [TypeCR "[MountServer] Can't open log file."
+		Move 1,LogJfn
+		RLJFN%
+	 	 jfcl
+		Ret]
+	Move 1,[440700,,FooBuf]	;output buffer
+	Seto 2,
+	Setz 3,
+	ODTIM%
+	 Erjmp .+1
+	Movei 2,.CHSPC
+	BOUT%
+	Move 2,1
+	Movei 1,.GTHNS
+	Move 3,RPC"RcvBlk+U%SHST
+	GTHST%
+	 Erjmp [Move 1,2
+		Move 5,RPC"RcvBlk+U%SHST
+		Lsh 5,4
+		Move 4,[441000,,5]
+		Ildb 2,4
+		Call DNum
+		Movei 2,".
+		Idpb 2,1
+		Ildb 2,4
+		Call DNum
+		Movei 2,".
+		Idpb 2,1
+		Ildb 2,4
+		Call DNum
+		Movei 2,".
+		Idpb 2,1
+		Ildb 2,4
+		Call DNum
+		Move 2,1
+		Jrst .+1]
+	Move 1,2
+	Hrroi 2,[Asciz /: /]
+	Setz 3,
+	$SOUT
+	Hrroi 2,DirNam
+	$SOUT
+	Hrroi 2,[Asciz /.
+/]
+	$SOUT
+	Move 1,LogJfn
+	Hrroi 2,FooBuf
+	Setz 3,
+	SOUT%
+	CLOSF%
+	 Erjmp .+1
+	Ret
+
+DNum:	Movei 3,8.
+	NOUT%
+	 jfcl
+	Ret
+
+
+Done:	Call UDP"RlsIQ
+
+Die:	Haltf%
+	Jrst	Die
+
+Popj1:	Aos	(P)
+R:	Ret
+
+	End Start

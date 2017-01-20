@@ -1,0 +1,670 @@
+;Remote Procedure Call library
+
+;Copyright (C) 1987, Mark K. Lottor.
+
+;to use:
+;must .INSRT XDR, and .INSRT UDP
+
+IFNDEF RTXSW,[RTXSW==-1]	;non-zero to use retransmit cache
+
+;for RPC based servers:
+;DoRPC:
+; Loop forever handling RPC requests
+; takes in ac1/ address of dispatch routine
+;          ac2/ address of dispatch table
+; calls dispatch routine (ac1) with dispatch address in ac1
+; returns on error, otherwise doesn't.
+
+;for RPC clients:
+;RPC:
+; Sends an RPC call and returns the result.
+
+;global buffer pointers 
+RP=14				;receive buffer
+SP=15				;send buffer
+
+;dispatch table is in format:
+;  [program ? vers ? proc ? dispatch]
+;  and ends with a zero word
+D%PROG==0
+D%VERS==1
+D%PROC==2
+D%ADDR==3
+D%WID==4			;width of table
+
+R%HOST==0			;host
+R%PORT==1			;port (0 to call portmapper first)
+R%PROG==2			;program
+R%VERS==3			;version
+R%PROC==4			;procedure
+R%ARG==5			;length in words,,address of argument block
+R%RES==6			;length in words,,address of result block 
+				;R%RES is not used.  Use RP to get results.
+
+;errors returned in ac1
+E.TIME==0			;timeout waiting for RPC reply
+E.PROG==1			;program version mismatch (ac1 has: low,,high)
+E.ERR==2			;other error (ac1 has rpc error code)
+E.RPC==3			;rpc version mismatch (ac1 has: low,,high)
+E.AUTH==4			;authentication error (ac1 has auth reason)
+;  auth reasons
+A.BAD==1			;bad credentials
+A.REJC==2			;rejected cred, client must begin new session
+A.VER==3			;bad verifier
+A.REJV==4			;rejected verf (expired)
+A.WEAK==5			;rejected for security reasons
+
+
+TimCh==0			;timeout channel
+TimAdr:	0			;address to jump to on timeout
+
+CHNTAB:	Channel TimCh,1,TimeUp	;Timeout stuff
+	EndChannel
+
+LEVTAB:	PSIPC1
+	PSIPC2
+	PSIPC3
+
+PSIPC1:	0
+PSIPC2:	0
+PSIPC3:	0
+
+IntOn:	Movei 1,.FHSLF
+	Move 2,[LEVTAB,,CHNTAB]
+	SIR%
+	EIR%
+	Movx 2,ChnMsk
+	AIC%			;Turn on interrupt system
+	Ret
+
+Define TimOut (Tim,Adr)
+	Movei	1,Adr
+	Movem	1,TimAdr
+	Move	1,[.FHSLF,,.TIMEL]
+	Movei	2,Tim
+	Movei	3,TimCh		;channel 1
+	TIMER%
+	 Erjmp	[TypeCR "?Can't set a timer."
+		 Jrst Die]
+Termin
+
+Define TimClr
+	Move	1,[.FHSLF,,.TIMAL]
+	Setz	2,
+	TIMER%
+	 Erjmp	Die	
+Termin
+
+TimeUp:	Move	1,TimAdr
+	Txo	1,Bit(5)	;turn on user mode bit
+	Movem	1,PSIPC1	;return address
+	DEBRK%
+	 Erjmp	Die
+
+
+.BEGIN RPC
+
+Define RetSkp
+	Jrst Popj1
+Termin
+
+F==0
+;search flags
+F%PROG==1
+F%VERS==2
+F%PROC==4
+
+R.Dsp:	0			;dispatch routine
+R.DspT:	0			;dispatch table
+R.IDsp:	Jfcl			;in-between snd/get packet call dispatch
+
+Ver.Lo:	0
+Ver.Hi:	0
+R.Port:	0
+R.Prog:	0
+R.Vers:	0
+R.Proc:	0
+
+SavXID:	0
+RtxCnt:	0
+OurNum:	0
+OurNam:	Block 40
+SavP:	0
+RegBlk:	Block 10
+FPBlk:	Block 10
+FPArg:	Block 4
+
+R.Debug:  0
+
+A.Type:	0			;auth type
+A.UID:	0			;auth unix uid
+AuthSz==100
+R.Auth:	Block AuthSz+1		;opaque data
+
+RcvBlk:	Block 10
+SndBlk:	Block 10
+
+IFN RTXSW,[
+XID:	0
+Rx.Siz==10.
+Rx.XID:	Block Rx.Siz
+Rx.Buf:	Block Rx.Siz*1000	;1000=2048. bytes max packet size
+Rx.Blk:	Block Rx.Siz*10
+Rx.Ptr:	0
+Rx.Idx:	0
+RtxP:	0
+ST.RTX:	0			;count retransmissions
+]
+ST.RCV:	0			;count incoming packets
+
+
+;RPC definitions
+
+RPCVer==2
+
+;message type
+T%CALL==0
+T%REPLY==1
+
+;reply status
+T%ACCEPT==0
+T%DENY==1
+
+;accept status
+T%OK==0
+T%PROG==1
+T%VERS==2
+T%PROC==3
+T%ARGS==4
+
+;denied status
+T%RPC==0
+T%AUTH==1
+
+;authentication types
+T%A.NULL==0
+T%A.UNIX==1
+T%A.SHORT==2
+
+
+
+;initialize rpc client stuff
+;takes local udp port number in ac1
+;retskp on success
+Init:	Movem 1,R.Port
+	Call IntOn		;turn on interrupt system
+	Movei 1,.GTHNS
+	Hrroi 2,OurNam
+	Seto 3,			;us? (this ain't documented as working)
+	GTHST%
+	 Erjmp [TypeCR "?Can't get our own host info"
+		Ret]
+	Movem 3,OurNum
+	RetSkp
+
+
+;ask portmapper to set mapping for this rpc service
+;takes in ac1: length,,address of arg block
+; words of arg block are 1:program, 2:version, 3:protocol, 4:port
+;retskp on success
+Reg:	Movei 4,RegBlk
+	Move 2,OurNum
+	Movem 2,R%HOST(4)
+	Movei 2,111.	
+	Movem 2,R%PORT(4)
+	Movei 2,100000.		;portmapper
+	Movem 2,R%PROG(4)
+	Movei 2,2.
+	Movem 2,R%VERS(4)
+	Movei 2,1.		;set mapping
+	Movem 2,R%PROC(4)
+	Movem 1,R%ARG(4)	;args for set function
+
+	Movei 1,RegBlk
+	Call RPC		;do it
+	 Ret			;failed
+
+	GetUns 1,RP		;get result
+	Jumpe 1,[Ret]		;failed
+	RetSkp			;success
+
+
+;loop handling RPC requests forever
+;takes dispatch address in t1, table in t2.
+;Note: program structure here sucks.  need to fix it up a bit.
+DoRPC:	Movem 1,R.Dsp
+	Movem 2,R.DspT
+RPCLoop:
+	Movei 1,RcvBlk
+	Call UDP"GetPkt		;get a request
+	Aos ST.RCV		;count packets
+IFN RTXSW,[
+	Setzm RtxP
+]
+	Call DsSrch		;check parameters, get dispatch
+	  Jrst RPCLoop		;ignore the call
+ 	  Jrst RPERR		;error reply
+IFN RTXSW,[
+	  Jrst [Call RTx	;retransmission, fill packet
+	        Jrst RPNOHD]	;skip header
+]
+IFE RTXSW,[
+	  Jrst RPCLoop		;won't ever happen
+]
+	  Call @R.Dsp		;otherwise execute procedure (addr in ac1)
+RPERR:	Call AddHdr		;add return header
+RPNOHD:	Movei 1,SndBlk
+	Call UDP"SndPkt		;and send reply
+IFN RTXSW,[
+	Skipe RtxP		;don't re-cache retransmissions
+	 Jrst RPCLoop
+	Move 1,Rx.Ptr
+	Move 2,XID
+	Movem 2,Rx.XID(1)
+	Imuli 1,10
+	Addi 1,Rx.Blk
+	Movei 2,7(1)
+	Hrli 1,SndBlk
+	Blt 1,(2)
+	Move 1,Rx.Ptr
+	Imuli 1,1000
+	Addi 1,Rx.Buf
+	Movei 2,777(1)
+	Hrli 1,SndBuf
+	Blt 1,(2)
+	Aos 1,Rx.Ptr
+	Cail 1,Rx.Siz
+	 Setzm Rx.Ptr
+]
+	XCT R.IDsp		;call intermediate dispatch routine
+	Jrst RPCLoop
+
+
+;find mapping in R.DspT
+;returns +1 if call should be ignored
+;	 +2 if error in call
+;	 +3 if should do retransmission
+;	 +4 to call dispatch routine (with addr in ac1)
+DsSrch:	Move RP,RcvBlk+U%DATA
+	Movei SP,SndBuf+UDP"$DATA
+
+	GetUns 1,RP		;get XID
+IFN RTXSW,[
+	Movem 1,XID
+	Move 3,[-Rx.Siz,,0]
+SeXID:	Came 1,Rx.XID(3)	;seen this?
+	 Jrst NxtXid		;no, keep looking
+	Move 1,RcvBlk+U%SHST	;get source host
+	Hrrz 2,3
+	Movem 2,Rx.Idx
+	Imuli 2,10
+	Came 1,Rx.Blk+U%DHST(2)	;same host?
+	 Jrst NxtXid		;no, keep looking
+	Aos (P)
+	RetSkp			;yes, go for rtx return
+NxtXid:	Aobjn 3,SeXID		;no, keep looking
+]
+	PutUns 1,SP		;send back same XID
+
+	GetUns 1,RP		;get type
+	Movei 2,T%REPLY
+	PutUns 2,SP		;say it is a reply
+
+	Caie 1,T%CALL		;was request really a call?
+	 Ret			;go for ignore call return
+
+	GetUns 1,RP		;get rpc version number
+	Caie 1,2		;using version 2?
+	 Jrst NORPC
+
+	GetUns 1,RP		;get prog
+	Movem 1,R.Prog
+	GetUns 1,RP		;get vers
+	Movem 1,R.Vers
+	GetUns 1,RP		;get proc
+	Movem 1,R.Proc
+
+;read authentication stuff
+	Call R.Cred	
+	Call R.Verf
+
+	Skipe R.Debug
+	 Call PrtReq
+
+	Setz F,
+	Move 4,R.Dspt
+DoSrc1:	Skipn D%PROG(4)
+	 Jrst DoSrc2
+	Move 1,R.Prog
+	Came 1,D%PROG(4)	;found prog?
+	 Jrst DsSrcN
+	Tro F,F%PROG		;yes, flag it
+	Move 1,R.Vers
+	Camge 1,Ver.Lo
+	 Movem 1,Ver.Lo
+	Camle 1,Ver.Hi
+	 Movem 1,Ver.Hi
+	Came 1,D%VERS(4)	;right version?
+	 Jrst DsSrcN
+	Tro F,F%VERS		;yes, flag it
+	Move 1,R.Proc
+	Came 1,D%PROC(4)	;found proc?
+	 Jrst DsSrcN
+	Tro F,F%PROC		;yes, flag it
+	Jrst SUCCESS
+DsSrcN:	Addi 4,D%WID
+	Jrst DoSrc1
+
+DoSrc2:	Trnn F,F%PROG
+	 Jrst NOPROG
+	Trnn F,F%VERS
+	 Jrst NOVERS
+	Trnn F,F%PROC
+	 Jrst NOPROC
+	TypeCr "[RPC] Impossible error at DsSrcN."
+	Ret			;ignore call
+
+;read authentication bullshit
+R.Cred:	GetUns 1,RP		;get type of auth
+	Movem 1,A.Type
+	GetStr 1,RP		;read opaque data
+	Cail 1,AuthSz*4		;enough room?
+	 Movei 1,<AuthSz-1>*4	;no, truncate
+	Movei 3,R.Auth
+	PutStr 1,3		;save auth stuff
+	Movei 3,R.Auth
+	Move 1,A.Type
+	Cain 1,T%A.SHORT
+	 Jrst R.SHRT
+	Caie 1,T%A.UNIX
+	 Jrst NoCred
+	GetUns 1,3		;size
+	GetUns 1,3		;stamp
+	GetStr 1,3		;machine name
+	GetUns 1,3		;uid
+	Movem 1,A.UID
+	Ret
+R.Shrt:	GetUns 1,3		;size
+	Caie 1,8.
+	 Jrst NoCred
+	GetUns 1,3		;tag
+	Caie 1,767676
+	 Jrst NoCred
+	GetUns 1,3		;uid
+	Movem 1,A.UID
+	Ret
+NoCred:	Setom A.UID
+	Ret
+
+R.Verf:	GetUns 1,RP		;get type of auth
+	GetStr 1,RP		;read opaque data
+	Ret
+
+
+NORPC:	Movei 1,T%DENY
+	PutUns 1,SP
+	Movei 1,T%RPC
+	PutUns 1,SP
+	Movei 1,2		;lowest support version
+	PutUns 1,SP
+	Movei 1,2		;highest support version
+	PutUns 1,SP		
+	RetSkp
+
+NOPROC:	Call Accept
+	Movei 1,T%PROC
+	PutUns 1,SP
+	RetSkp
+
+NOVERS:	Call Accept
+	Movei 1,T%VERS
+	PutUns 1,SP
+	Move 1,Ver.Lo
+	PutUns 1,SP
+	Move 1,Ver.Hi
+	PutUns 1,SP
+	RetSkp
+
+NOPROG:	Call Accept
+	Movei 1,T%PROG
+	PutUns 1,SP
+	RetSkp
+
+SUCCESS:Push P,4		;save array index
+	Call Accept
+	Movei 1,T%OK
+	PutUns 1,SP
+	Pop P,4			;get back index
+	Move 1,D%ADDR(4)	;get dispatch address
+	Aos (P)
+	Aos (P)
+	RetSkp			;go for it
+
+Accept:	Movei 1,T%ACCEPT
+	PutUns 1,SP
+	Movei 1,T%A.SHORT
+	PutUns 1,SP
+	Movei 1,8.		;two words
+	PutUns 1,SP
+	Movei 1,767676		;tag
+	PutUns 1,SP
+	Move 1,A.UID		;uid
+	PutUns 1,SP
+	Ret
+
+
+IFN RTXSW,[
+;retx stuff
+RTx:	Aos ST.RTX		;yow!
+	Setom RtxP		;don't re-save this
+	Move 1,Rx.Idx
+	Imuli 1,10
+	Addi 1,Rx.Blk
+	Hrlz 1,1
+	Hrri 1,SndBlk
+	Blt 1,SndBlk+7
+	Move 1,Rx.Idx
+	Imuli 1,1000
+	Addi 1,Rx.Buf
+	Hrlz 1,1
+	Hrri 1,SndBuf
+	Blt 1,SndBuf+777
+	Ret
+]
+
+
+;setup reply destinations
+AddHdr:	
+	Move  1,RcvBlk+U%SHST
+	Movem 1,SndBlk+U%DHST
+
+	Move  1,RcvBlk+U%DHST
+	Movem 1,SndBlk+U%SHST
+
+	Move  1,RcvBlk+U%SPRT
+	Movem 1,SndBlk+U%DPRT
+
+	Move  1,RcvBlk+U%DPRT
+	Movem 1,SndBlk+U%SPRT
+
+	Move 1,SP
+	Subi 1,SndBuf+UDP"$DATA	;figure length of UDP data (in words)
+	Imuli 1,4		;convert to bytes
+	Movem 1,SndBlk+U%LEN
+
+	Ret
+
+;debugging routine.  print rpc request info
+PrtReq:	Type "[RPC] Call for program "
+	Move 2,R.Prog
+	Call DecOut
+	Type " version "
+	Move 2,R.Vers
+	Call DecOut
+	Type " procedure "
+	Move 2,R.Proc
+	Call DecOut
+	TypeCR "."
+	Ret
+
+DecOut:	Movei 1,.PRIOU
+	Movei 3,10.
+	NOUT%
+	 jfcl
+	Ret
+
+
+;RPC call routines
+;takes address of arg block in t1
+;returns updated arg block (R%PORT filled in if 0)
+;retskp on success, ret on failure (error code in ac1)
+;arg block:
+RPC:	Skipn R%PORT(1)
+	 Jrst [Push P,1
+	       Call FPort
+		Jrst [Pop P,1
+		      Ret]	;die
+	       Pop P,1
+	       Jrst .+1]
+	Movei SP,SndBuf+UDP"$DATA	
+	Movei 3,SndBlk
+	Move 2,OurNum
+	Movem 2,U%SHST(3)
+	Move 2,R%HOST(1)
+	Movem 2,U%DHST(3)
+	Move 2,R.Port
+	Movem 2,U%SPRT(3)
+	Move 2,R%PORT(1)
+	Movem 2,U%DPRT(3)
+
+;fill in RPC call header
+	Move 3,1
+	Movei 1,.HPELP
+	HPTIM%
+	 Erjmp Die
+	Tlz 1,740000		;make it 32 bits
+	Movem 1,SavXID
+	PutUns 1,SP		;XID
+	Movei 1,T%CALL
+	PutUns 1,SP
+	Movei 1,RPCVer
+	PutUns 1,SP		;RPC version
+	Move 1,R%PROG(3)
+	PutUns 1,SP
+	Move 1,R%VERS(3)
+	PutUns 1,SP
+	Move 1,R%PROC(3)
+	PutUns 1,SP
+
+	Movei 1,T%A.NULL	;credentials
+	PutUns 1,SP
+	Setz 1,
+	PutUns 1,SP
+
+	Movei 1,T%A.NULL	;verification
+	PutUns 1,SP
+	Setz 1,
+	PutUns 1,SP
+
+;add args
+	Hrlz 1,R%ARG(3)		;source
+	Hrr 1,SP		;destination
+	Hlrz 2,R%ARG(3)		;count
+	Add SP,2
+	Blt 1,-1(SP)		;zap
+
+	Move 1,SP
+	Subi 1,SndBuf+UDP"$DATA	;figure length of UDP data (in words)
+	Imuli 1,4		;convert to bytes
+	Movem 1,SndBlk+U%LEN
+
+;send a packet, wait n msec for reply, if none loop
+;retransmitting until n secs have passed
+
+;real cheap retransmitter.  try 30 times every 2 seconds.
+	Movei 1,30.		;30 tries
+	Movem 1,RtxCnt
+
+;send first packet
+	Movei 1,SndBlk
+	Call UDP"SndPkt		;send RPC call
+	TimOut(200.,TimTxo)
+	Movem P,SavP
+	Movei 1,RcvBlk
+	Call UDP"GetPkt		;get RPC reply
+	TimClr
+	Move P,SavP
+	Jrst ChkX
+
+ReTx:	Movei 1,SndBlk
+	Call UDP"SndPkt		;send RPC call
+WatPkt:	TimOut(2000.,TimTxo)
+	Movem P,SavP
+	Movei 1,RcvBlk
+	Call UDP"GetPkt		;get RPC reply
+	TimClr
+	Move P,SavP
+ChkX:	Movei 4,RcvBlk
+	Move RP,U%DATA(4)
+	GetUns 1,RP		;get XID
+	Came 1,SavXID		;reply for same call?
+	 Jrst WatPkt		;no, keep waiting
+
+	GetUns 1,RP		;get reply code
+	Caie 1,1
+	 Ret			;not a reply
+	GetUns 1,RP		;get accept/deny status
+	Jumpn 1,[Ret]		;not accepted
+
+	GetUns 1,RP		;get type of verf
+	GetStr 1,RP		;get verf data
+
+	GetUns 1,RP		;get success code
+	Jumpn 1,[Ret]		;not successful
+
+	RetSkp
+
+TimTxo:	TimClr
+	Move P,SavP
+	Sosle RtxCnt
+	 Jrst ReTx
+;;;;;error error...retx timeout
+;possibly have none and let user put timeout on rpc call
+;but this is hard because timer% doesn't allow selective deletion
+	Movei 1,E.Time
+	Ret
+
+;find port for specified service
+;arg block in ac1
+;ret of failure, retskp on success
+FPort:	Movei 4,FPBlk
+	Move 2,R%HOST(1)
+	Movem 2,R%HOST(4)
+	Movei 2,111.	
+	Movem 2,R%PORT(4)
+	Movei 2,100000.		;portmapper
+	Movem 2,R%PROG(4)
+	Movei 2,2.
+	Movem 2,R%VERS(4)
+	Movei 2,3.		;read a mapping
+	Movem 2,R%PROC(4)
+	Movei 3,FPArg
+	Movem 3,R%ARG(4)	;args for read function
+	Move 2,R%PROG(1)
+	PutUns 2,3
+	Move 2,R%VERS(1)
+	PutUns 2,3
+	Movei 2,6.		;UDP
+	PutUns 2,3
+	Setz 2,			;dummy
+	PutUns 2,3		
+
+	Movei 1,FPBlk
+	Call RPC
+	 Ret
+	GetUns 1,RP
+	Jumpe 1,[Ret]		;zero is no good
+	Movem 1,R%PORT(1)
+	RetSkp
+
+.END RPC

@@ -1,0 +1,1997 @@
+module NMUIPC (					! IPCF interface
+		ident = 'X00.09',
+		language (bliss36)
+		) =
+begin
+!	COPYRIGHT (c) DIGITAL EQUIPMENT CORPORATION 1985, 1989.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A  LICENSE AND MAY BE USED AND  COPIED
+!	ONLY IN  ACCORDANCE  WITH  THE  TERMS OF  SUCH  LICENSE  AND  WITH  THE
+!	INCLUSION OF THE ABOVE  COPYRIGHT NOTICE.  THIS  SOFTWARE OR ANY  OTHER
+!	COPIES THEREOF MAY NOT BE PROVIDED  OR OTHERWISE MADE AVAILABLE TO  ANY
+!	OTHER PERSON.  NO  TITLE TO  AND OWNERSHIP  OF THE  SOFTWARE IS  HEREBY
+!	TRANSFERRED.
+!
+!	THE INFORMATION IN THIS  SOFTWARE IS SUBJECT  TO CHANGE WITHOUT  NOTICE
+!	AND SHOULD  NOT  BE CONSTRUED  AS  A COMMITMENT  BY  DIGITAL  EQUIPMENT
+!	CORPORATION.
+!
+!	DIGITAL ASSUMES NO  RESPONSIBILITY FOR  THE USE OR  RELIABILITY OF  ITS
+!	SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+
+!++
+! Facility: LSG DECnet Network Management
+!
+! Abstract:
+!
+!       This set of routines provides a interface to the IPCF system
+!       on 36 bit machines.  Specifically it is tailored to provide
+!       an efficient interface to the GALAXY system.
+!
+! Environment: TOPS20 user mode
+!
+! Author: Steven M. Jenness, Creation date: 19 August 1980
+!
+!--
+
+!
+! Include files
+!
+
+library 'MXNLIB';			! All required definitions
+
+%if $TOPS20
+    %then
+	library 'MONSYM';		! Monitor symbols
+	library 'MXJLNK';		! JSYS linkage definitions
+    %fi
+
+!
+! Global routines
+!
+
+forward routine
+    NMU$IPCF_MANAGER;
+
+!
+! Local routines
+!
+
+forward routine
+    RECV_SIGNAL : IPCF_INTERRUPT_LINKAGE novalue, ! IPCF interrupt routine
+    RECEIVE_TASK : novalue,			! IPCF background receiving task
+    ALLOW_SEARCH,				! Allow list scanning routine
+    ALLOW_KILL,					! Allow list deletiong scanning routine
+    USER_NAME : novalue,			! $TEXT user name routine
+    %if $TOPS10 %then
+    USER_INITIALIZE_NAME : novalue,		! Sets up name string
+    SET_IPCF_INTERRUPT : novalue,		! Interrupt for packet receives
+    %fi
+    NMU$IPCF_SET_SYSPID,			! Sets up GETTABable pid
+    JOBNUM;					! Get current job number
+
+
+!+
+! Structure definitions
+!-
+
+!
+! Packet descriptor block (PDB).
+!
+
+field
+    PDB_BLOCK_FIELDS =
+	set
+	PD_FLAGS = [$IPCFL, 0, 36, 0],		! IPCF received flags
+	PD_SENDER = [$IPCFS, 0, 36, 0],		! PID of sender
+	PD_RECEIVER = [$IPCFR, 0, 36, 0],	! PID message received for
+	PD_LENGTH = [$IPCFP, 18, 18, 0],	! Length of message received
+	PD_MESSAGE = [$IPCFP, 0, 18, 0],	! Address of message
+	%if $TOPS20 %then
+	PD_LOGGED = [$IPCFD, 0, 18, 0],		! Sender's logged in directory number
+	%else
+	PD_LOGGED = [$IPCFU, 0, 36, 0],		! Sender's logged in ppn
+	%fi
+	PD_CAPABILITIES = [$IPCFC, 0, 36, 0]	! Sender's enabled capabilities
+	tes;
+
+literal
+    PDB_BLOCK_SIZE = $IPCFC + 1;
+
+macro
+    PDB_BLOCK = block [PDB_BLOCK_SIZE] field (PDB_BLOCK_FIELDS) %;
+
+!
+! Message descriptor block (MDB).
+!
+! 	This block contains the queueing information
+!	and the PDB (PDB Descriptor Block) for a
+!	message that has been received.
+!
+
+$field
+    MDB_BLOCK_FIELDS =
+	set
+	MD_QUEUE = [$sub_block (Q_ENTRY_SIZE)],	! Queueing information
+	MD_PDB = [$sub_block (PDB_BLOCK_SIZE)]	! PDB block
+	tes;
+
+literal
+    MDB_BLOCK_SIZE = $field_set_size,
+    MDB_BLOCK_ALLOCATION = $field_set_units;
+
+macro
+    MDB_BLOCK = block [MDB_BLOCK_SIZE] field (MDB_BLOCK_FIELDS) %;
+
+!
+! PID table entry format.
+!
+
+$field
+    PID_BLOCK_FIELDS =
+	set
+	PB_MSGS = [$sub_block (QQ_HEADER_SIZE)], ! Queue of received messages
+	PB_ALLOW = [$sub_block (Q_HEADER_SIZE)], ! List of allowable senders
+	PB_PID = [$integer],			! PID this entry is for
+	PB_RESTRICT = [$bit]			! Senders are restricted
+	tes;
+
+literal
+    PID_BLOCK_SIZE = $field_set_size,
+    PID_BLOCK_ALLOCATION = $field_set_units;
+
+macro
+    PID_BLOCK = block [PID_BLOCK_SIZE] field (PID_BLOCK_FIELDS) %;
+
+!
+! ALLOW queue entry format.
+!
+
+$field
+    ALLOW_BLOCK_FIELDS =
+	set
+	AB_Q_INFO = [$sub_block (Q_ENTRY_SIZE)],
+	AB_PID = [$integer]
+	tes;
+
+literal
+    ALLOW_BLOCK_SIZE = $field_set_size,
+    ALLOW_BLOCK_ALLOCATION = $field_set_units;
+
+macro
+    ALLOW_BLOCK = block [ALLOW_BLOCK_SIZE] field (ALLOW_BLOCK_FIELDS) %;
+
+!
+! Literals
+!
+
+literal
+    IPCF_MSG_QUOTA = 10;		! Max num of IPCF messages to
+					!  be queued by background task
+
+!
+! Own variables
+!
+
+own
+    PID_TABLE,
+    RECEIVE_EVENT : EVENT_BLOCK,
+    IPCF_CHANNEL,
+    PID_COUNT;
+
+!
+! External references
+!
+
+external routine
+    NMU$MEMORY_MANAGER,                 ! Memory manager routines
+    NMU$QUEUE_MANAGER,                  ! Queue management routines
+    NMU$TABLE_ROUTINES,                 ! Table data base management routines
+    NMU$PAGE_ALLOCATOR,                 ! Page allocation routines
+    NMU$SCHED_MANAGER,                  ! Scheduler
+    NMU$TEXT_MANAGER;                   ! Text processing facility
+
+!
+! Debugging definitions
+!
+
+external
+    %debug_data_base;
+!
+! Tops-10 only definitions to take the place of macros generated by
+! DECLARE_JSYS, and simplify some conditionals.
+!
+
+    %if $TOPS10 %then
+    builtin
+	UUO;
+
+    macro
+	$$MSEND (LENGTH, ADDRESS) =
+	begin
+	T1 = LENGTH ^ 18 + ADDRESS;
+	UUO (1, IPCFS$ (T1))
+	end %;
+
+    macro
+	$$MRECV (LENGTH, ADDRESS) =
+	begin
+	T1 = LENGTH ^ 18 + ADDRESS;
+	UUO (1, IPCFR$ (T1))
+	end %;
+
+	bind
+	    CFV = IP$CFV,
+	    CFZ = IP$CFZ;
+    %fi
+
+    %if $TOPS20 %then
+    bind
+	CFV = IP_CFV,
+	CFZ = IP_CFZ;
+    %fi
+%global_routine ('NMU$IPCF_INITIALIZE') : novalue =
+
+!++
+! Functional description:
+!
+!	This routine initializes the data bases required
+!	for IPCF processing.  It also starts the IPCF
+!	receive background task.
+!
+! Formal parameters: none
+!
+! Routine value: none
+! Side effects: none
+!
+!--
+
+    begin
+!
+! Clear the internal IPCF data base
+!
+    NMU$TABLE_CLEAR (PID_TABLE);
+
+!
+! Setup IPCF receive interrupt event and
+! create the receiver task.
+!
+    NMU$SCHED_EVENT (RECEIVE_EVENT, $true);
+    NMU$SCHED_CREATE (RECEIVE_TASK, 200, 0, ch$asciz ('IPCF-BACKGROUND'));
+
+!
+! Allocate an interrupt channel and
+! activate it.  All PIDs use this channel
+! for receiver interrupt service.
+!
+    IPCF_CHANNEL = ALLOCATE_INTERRUPT_CHANNEL (RECV_SIGNAL);
+    ACTIVATE_INTERRUPT (.IPCF_CHANNEL);
+
+    %if $TOPS10 %then
+    USER_INITIALIZE_NAME ();			! Get user name string
+    SET_IPCF_INTERRUPT (.IPCF_CHANNEL);		! Initialize specific interrupt
+    %fi
+
+    end;					! End of NMU$IPCF_INITIALIZE
+
+%global_routine ('NMU$IPCF_FIND_PID', PROCESS_NAME) =
+
+!++
+! Functional description:
+!
+!       This call returns the PID associated with the
+!       PROCESS_NAME string.  This is done by issuing
+!       a request for the PID to [SYSTEM]INFO.
+!
+! Formal parameters:
+!
+!	.PROCESS_NAME	Pointer to ASCIZ name to find the PID for.
+!
+! Routine value:
+!
+!      =0    no PID for PROCESS_NAME or failure during query.
+!     <>0    PID associated with PROCESS_NAME
+!
+! Side effects: none
+!
+!--
+
+    begin
+
+    literal
+	INF_BLK_SIZE = 10;
+
+    local
+	INF_BLK : vector [INF_BLK_SIZE], 	! [SYSTEM]INFO argument block
+	PID_ID,                                 ! Temporary PID
+	PTR,					! PTR for process name transfer
+	INF_PID,				! [SYSTEM]INFO PID
+	INFO_MSG : ref vector [INF_BLK_SIZE],	! Message returned from SYSINF
+	dummy;
+!
+! Get the PID of [SYSTEM]INFO.
+!
+    if 0 eql (INF_PID = NMU$IPCF_INFO ())
+    then return 0;
+
+!
+! Get a PID to use temporarily while talking to
+! [SYSTEM]INFO.
+!
+    if 0 eql (PID_ID = NMU$IPCF_CREATE (0, $true))
+    then return 0;
+
+!
+! Allow [SYSTEM]INFO to send to our temporary PID.
+!
+    if not NMU$IPCF_ALLOW (.PID_ID, .INF_PID)
+    then
+        begin
+        NMU$IPCF_DESTROY (.PID_ID);
+        return 0;
+        end;
+
+!
+! Make function block for [SYSTEM]INFO query about
+! the specified process name.
+!
+    INF_BLK [$IPCI0] = $IPCIW;
+    INF_BLK [$IPCI1] = 0;
+    PTR = ch$ptr (INF_BLK [$IPCI2]);
+    ch$movasciz (PTR, .PROCESS_NAME);
+    ch$wchar_a (0, PTR);
+
+!
+! Send the query to [SYSTEM]INFO.
+!
+    if not NMU$IPCF_TRANSMIT (.PID_ID, .INF_PID, INF_BLK, INF_BLK_SIZE)
+    then
+        begin
+        NMU$IPCF_DESTROY (.PID_ID);
+        return 0;
+        end;
+
+!
+! Get [SYSTEM]INFO's response to our query.
+!
+    if 0 eql (INFO_MSG = NMU$IPCF_RECEIVE (.PID_ID,dummy,dummy,dummy))
+    then
+        begin
+        NMU$IPCF_DESTROY (.PID_ID);
+        return 0;
+        end;
+
+!
+! Destroy our temporary PID.
+!
+    NMU$IPCF_DESTROY (.PID_ID);
+
+!
+! Check to see if [SYSTEM]INFO had a response for
+! us.  If so, return the PID given.  Otherwise
+! return the error value of zero (0).
+!
+    if .INFO_MSG eql 0
+    then
+	begin
+	%debug (IPCF_TRACE,
+		(TRACE_INFO ('No PID for %A', .PROCESS_NAME)));
+	0
+	end
+    else
+	begin
+	builtin
+               LSH;
+        local
+             PID;
+
+	PID = .INFO_MSG [$IPCI1];
+	NMU$PAGE_RELEASE (LSH (.INFO_MSG, -9));
+
+	%debug (IPCF_TRACE,
+		(TRACE_INFO ('PID for %A is %O,,%O',
+			 .PROCESS_NAME, .PID<18, 18>, .PID<0, 18>)));
+
+	.PID
+	end
+
+    end;					! End of NMU$IPCF_FIND_PID
+
+%global_routine ('NMU$IPCF_INFO') =
+
+!++
+! Functional description:
+!
+!       This call returns the PID of [SYSTEM]INFO.
+!
+! Formal parameters: none
+!
+! Routine value:
+!
+!    <>0    PID of [SYSTEM]INFO
+!     =0    Failure reading [SYSTEM]INFO PID
+!
+! Side effects: none
+!
+!--
+
+    %if $TOPS20 %then
+    begin
+
+    DECLARE_JSYS (MUTIL)
+
+    local
+	ARGBLK : vector [3],
+        PID;
+
+    ARGBLK [0] = $MUGTI;
+    ARGBLK [1] = 0;
+    ARGBLK [2] = 0;
+
+    if $$MUTIL (3, ARGBLK)
+    then
+        begin
+        PID = .ARGBLK [2];
+
+        %debug (IPCF_TRACE,
+                (TRACE_INFO ('PID for [SYSTEM]INFO is %O,,%O',
+                             .PID<18, 18>, .PID<0, 18>)));
+        end
+    else
+	begin
+        PID = 0;
+
+        %debug (IPCF_TRACE,
+                (begin
+                 TRACE_INFO ('MUTIL ($MUGTI) failed: %J', -1);
+                 TRACE_INFO_C ('PID for [SYSTEM]INFO is not available');
+                 end));
+	end;
+
+!
+! Return PID of [SYSTEM]INFO
+!
+    .PID
+
+    end;					! End of NMU$IPCF_INFO
+    %fi
+!
+! This routine finds the PID of [SYSTEM]INFO for a Tops-10 system
+!
+
+    %if $TOPS10 %then
+    begin
+
+    builtin
+	UUO;
+
+    register
+	T1;
+
+    T1 = _SIINF;
+
+    if UUO (1, GETTAB (T1))
+    then
+        begin
+        %debug (IPCF_TRACE,
+                (TRACE_INFO ('PID for [SYSTEM]INFO is %O,,%O',
+                             .T1<18, 18>, .T1<0, 18>)));
+        end
+    else
+	begin
+	T1 = 0;
+
+        %debug (IPCF_TRACE,
+                (begin
+                 TRACE_INFO ('GETTAB (%SIINF) failed', -1);
+                 TRACE_INFO_C ('PID for [SYSTEM]INFO is not available');
+                 end));
+	end;
+
+!
+! Return PID of [SYSTEM]INFO
+!
+    .T1
+
+    end;					! End of NMU$IPCF_INFO
+    %fi
+
+%global_routine ('NMU$IPCF_ORION') =
+
+!++
+! Functional description:
+!
+!       This routine returns the PID for the ORION process
+!       that this process is to talk to.
+!
+! Formal parameters: none
+!
+! Routine value:
+!
+!    <>0    If not LOCAL_GALAXY then the PID of the [SYSTEM]ORION.
+!           If LOCAL_GALAXY then the PID of the ORION local to
+!            the user the job is being run under (e.g. [DAVID]ORION).
+!     =0    ORION's PID is not available.
+!
+! Side effects: none
+!
+!--
+
+    begin
+
+    local
+	PID;
+
+    if LOCAL_GALAXY
+    then
+
+!
+! Find PID for local (private) GALAXY ORION.
+!
+	begin
+
+	literal
+	    USR_MAX = 39;
+
+	local
+	    USRNAM : block [ch$allocation (USR_MAX)];
+
+	$NMU$TEXT (%ref (ch$ptr (USRNAM)), USR_MAX, '[%@]ORION', USER_NAME);
+
+	PID = NMU$IPCF_FIND_PID (ch$ptr (USRNAM));
+
+        %debug (IPCF_TRACE,
+                (if .PID neq 0
+                 then TRACE_INFO ('PID for %A is %O,,%O',
+                                  ch$ptr (USRNAM),
+                                  .PID<18, 18>, .PID<0, 18>)
+                 else TRACE_INFO ('PID for %A is not available')));
+	end
+    else
+
+!
+! Find PID for [SYSTEM]ORION
+!
+	%if $TOPS20 %then
+	begin
+
+        DECLARE_JSYS (MUTIL)
+
+	local
+	    ARGBLK : vector [3];
+
+        ARGBLK [0] = $MURSP;
+	ARGBLK [1] = $SPOPR;
+
+	if $$MUTIL (3, ARGBLK)
+	then
+            begin
+            PID = .ARGBLK [2];
+
+            %debug (IPCF_TRACE,
+                    (TRACE_INFO ('PID for [SYSTEM]ORION is %O,,%O',
+                                 .PID<18, 18>, .PID<0, 18>)));
+            end
+        else
+	    begin
+	    PID = 0;
+
+            %debug (IPCF_TRACE,
+                    (begin
+                     TRACE_INFO ('MUTIL ($MURSP) failed: %J', -1);
+                     TRACE_INFO_C ('PID for [SYSTEM]ORION is not available');
+                     end));
+	    end;
+	end;
+	%fi
+!
+! This routine finds the PID for [SYSTEM]ORION for Tops-10
+!
+
+	%if $TOPS10 %then
+	begin
+
+	builtin
+	    UUO;
+
+	register
+	    T1;
+
+	T1 = _SIOPR;
+
+	if UUO (1, GETTAB (T1))
+	then
+	    begin
+	    %debug (IPCF_TRACE,
+		    (TRACE_INFO ('PID for [SYSTEM]ORION is %O,,%O',
+				 .T1<18, 18>, .T1<0, 18>)));
+	    end
+	else
+	    begin
+	    T1 = 0;
+
+	    %debug (IPCF_TRACE,
+		    (begin
+		     TRACE_INFO ('GETTAB (%SIOPR) failed', -1);
+		     TRACE_INFO_C ('PID for [SYSTEM]ORION is not available');
+		     end));
+	    end;
+
+	PID = .T1;
+	end;
+	%fi
+
+!
+! Return PID of ORION
+!
+    .PID
+
+    end;					! End of NMU$IPCF_ORION
+%global_routine ('NMU$IPCF_CREATE', PROCESS_NAME, RESTRICT) =
+
+!++
+! Functional description:
+!
+!       This routine creates a PID for the current process.  The
+!       name string in PROCESS_NAME is associated with the PID.
+!	If no process name is specified, one is created of the
+!	form: [user-id]JOBnn-PIDmm.
+!
+! Formal parameters:
+!
+!       .PROCESS_NAME	Pointer to the name for this PID
+!			(if zero (0) then no name is assigned).
+!	.RESTRICT	$TRUE	Restrict who can send to this PID.
+!			$FALSE	Any PID can send to this PID.
+!
+! Routine value:
+!
+!    <>0    NMU$IPCF ID assigned to the process
+!     =0    failure while getting PID for the process
+!
+! Side effects: none
+!
+!--
+
+    begin
+
+    %if $TOPS20 %then
+    DECLARE_JSYS (MSEND, MUTIL)
+    %fi %if $TOPS10 %then
+    builtin
+	UUO;
+
+    register
+	T1;
+    %fi
+
+    literal
+	INF_BLK_SIZE = 10;
+
+    local
+	PID,					! PID allocated
+	PID_NUMBER,				! Count of PID's in process
+        PID_ID,                                 ! Index into PID_TABLE
+	JOB_NUMBER,				! Current job number
+	PID_INFO : ref PID_BLOCK,		! PID_TABLE entry block
+	INF_BLK : vector [INF_BLK_SIZE],	! [SYSTEM]INFO function block
+	PDB : PDB_BLOCK;			! MSEND argument block
+
+!
+! Get PID count for this process and
+! the job number.
+!
+	PID_NUMBER = (PID_COUNT = .PID_COUNT + 1);
+	JOB_NUMBER = JOBNUM ();
+
+!
+! Copy the process' name into the [SYSTEM]INFO
+! function block.
+!
+    if .PROCESS_NAME eql 0 or LOCAL_GALAXY
+    then
+	begin
+	$NMU$TEXT (%ref (ch$ptr (INF_BLK [$IPCI2])),
+		   29,
+		   '[%@]J%D-P%D',
+		   USER_NAME, .JOB_NUMBER, .PID_NUMBER);
+	end
+    else
+	begin
+	local PTR;
+	PTR = ch$ptr (INF_BLK [$IPCI2]);
+	ch$movasciz (PTR, .PROCESS_NAME);
+	ch$wchar_a (0, PTR);
+	end;
+
+    %debug (IPCF_TRACE,
+	    (TRACE_INFO ('Creating PID for %A', ch$ptr (INF_BLK [$IPCI2]))));
+
+%if $TOPS10
+%then
+!   if LOCAL_GALAXY
+!   then
+!	begin
+%fi
+	!
+	! Setup rest of [SYSTEM]INFO function block.
+	!
+	    INF_BLK [$IPCI0] = $IPCII;		! Assign PID to name function
+	    INF_BLK [$IPCI1] = 0;		! No extra copies of response
+
+	    %if $TOPS20 %then
+	    PDB [PD_FLAGS] = IP_CPD;		! Create a PID
+	    %fi %if $TOPS10 %then
+	    PDB [PD_FLAGS] = 0;			! No special flags
+	    %fi
+	    PDB [PD_MESSAGE] = INF_BLK;		! Address of message
+	    PDB [PD_SENDER] = 0;		! No sender's PID (yet).
+	    PDB [PD_RECEIVER] = 0;		! Receiver is [SYSTEM]INFO.
+	    PDB [PD_LENGTH] = INF_BLK_SIZE;
+
+%if $TOPS10
+%then
+!	end
+!   else
+!	begin
+!
+!	    !
+!	    ! Create PID using [SYSTEM]IPCC
+!	    !
+!
+!	    T1 = _SIIPC;			! Get [SYSTEM]IPCC's PID
+!	    if UUO (1, GETTAB(T1))
+!	    then
+!		begin
+!		    %debug (IPCF_TRACE,
+!			    (TRACE_INFO ('PID for [SYSTEM]IPCC is %O,,%O',
+!					 .T1<18,18>, .T1<0,18>)));
+!		end
+!	    else
+!		begin
+!		    T1 = -1;
+!		    %debug (IPCF_TRACE,
+!			    (begin
+!			     TRACE_INFO ('GETTAB (%SIIPC) failed', -1);
+!			     TRACE_INFO_C ('PID for [SYSTEM]IPCC is not available');
+!			     end));
+!		end;
+!	    INF_BLK [$IPCI0] = $IPCSC;		! Create a PID
+!	    INF_BLK [$IPCI1] = 1^35 + .JOB_NUMBER;	! For my job
+!
+!	    PDB [PD_FLAGS] = IP$CFP;		! Privileged request
+!	    PDB [PD_MESSAGE] = INF_BLK;		! Address of message
+!	    PDB [PD_SENDER] = 0;		! No sender's PID (yet).
+!	    PDB [PD_RECEIVER] = .T1;		! Receiver is [SYSTEM]IPCC.
+!	    PDB [PD_LENGTH] = INF_BLK_SIZE;
+!	end;
+%Fi ! End %if $TOPS10
+%IF %SWITCHES(TOPS10) %THEN
+
+    pdb[pd_receiver] = nmu$ipcf_info();
+    pdb[pd_message] = inf_blk;
+    pdb[pd_sender] = 0;
+    pdb[pd_length] = inf_blk_size;
+%FI
+
+!
+! Send PID request to [SYSTEM]INFO
+!
+    if not $$MSEND (PDB_BLOCK_SIZE, PDB)
+    then
+        begin
+	%if $TOPS20 %then
+        %debug (IPCF_TRACE,
+                (TRACE_INFO ('MSEND failed: %J', -1)));
+	%fi
+
+	%if $TOPS10 %then
+        %debug (IPCF_TRACE,
+                (TRACE_INFO ('MSEND failed: %O', .T1)));
+	%fi
+        return 0;
+        end;
+
+    %if $TOPS10 %then
+    if	not $$MRECV (PDB_BLOCK_SIZE, PDB, ERRCOD)
+	or (IP$CFE and .PDB [PD_FLAGS]) neq 0
+	then
+	    begin
+	    TRACE_INFO ('PID creation failed: %O', POINTR(.T1, IP$CFE));
+	    return 0;
+	    end;
+!   if LOCAL_GALAXY
+!   then
+ 	PDB [PD_SENDER] = .INF_BLK [$IPCI1] ;
+!   else
+!	PDB [PD_SENDER] = .INF_BLK [$IPCI2];
+    %fi
+
+    PID = .PDB [PD_SENDER];             ! Set assigned PID
+
+!
+! Create the PID information block and
+! put it into the PID_TABLE.
+!
+    PID_INFO = NMU$MEMORY_GET (PID_BLOCK_ALLOCATION);
+    PID_INFO [PB_PID] = .PID;
+    PID_INFO [PB_RESTRICT] = $false;
+
+    NMU$QUEUE_RESET (PID_INFO [PB_ALLOW]);
+    NMU$QQUEUE_RESET (PID_INFO [PB_MSGS], IPCF_MSG_QUOTA);
+    PID_ID = (NMU$TABLE_INSERT (PID_TABLE, .PID_INFO));
+
+!
+! Enable interrupts to occur for the PID.
+!
+    %if $TOPS20 %then
+    begin
+        local
+             ARGBLK : vector [3];
+
+        ARGBLK [0] = $MUPIC;
+        ARGBLK [1] = .PID;
+	ARGBLK [2] = .IPCF_CHANNEL;
+	if not $$MUTIL (3, ARGBLK)
+        then TRACE_INFO ('MUTIL ($MUIPC) failed: %J', -1);
+    end;
+    %fi
+
+!
+! Get the response from [SYSTEM]INFO and throw it away.
+!
+    %if $TOPS20 %then
+    begin
+        builtin LSH;
+        local
+	     dummy,
+             MSG;
+
+        MSG = NMU$IPCF_RECEIVE (.PID_ID,dummy,dummy,dummy);
+        NMU$PAGE_RELEASE (LSH (.MSG, -9));
+    end;
+    %fi
+
+!
+! Set real receive restriction.
+!
+    PID_INFO [PB_RESTRICT] = .RESTRICT;
+
+    %debug (IPCF_TRACE,
+	    (TRACE_INFO ('PID %O,,%O assigned',
+				.PID<18, 18>, .PID<0, 18>)));
+
+!
+! Set large send and receive quotas
+!
+    %if $TOPS20 %then
+    begin
+         local
+              ARGBLK : vector [3];
+
+         ARGBLK [0] = $MUSSQ;
+         ARGBLK [1] = .PID;
+         ARGBLK [2] = %o'000000777024';
+
+         if not $$MUTIL (3, ARGBLK)
+         then TRACE_INFO ('MUTIL ($MUSSQ) failed: %J', -1);
+    end;
+    %fi
+
+!   %if $TOPS10
+!   %then
+!	INF_BLK [$IPCI0] = $IPCSQ;		! Set quotas
+!	INF_BLK [$IPCI1] = .JOB_NUMBER;		! For me
+!	INF_BLK [$IPCI2] = %o '000000777777';	! To large numbers
+!
+!	T1 = _SIIPC;				! Gettab for
+!	UUO (1, GETTAB (T1));			!  [SYSTEM]IPCC
+!
+!	PDB [PD_FLAGS] = IP$CFP;		! Say we are privileged
+!	PDB [PD_SENDER] = 0;			! Just us
+!	PDB [PD_RECEIVER] = .T1;		! PID of [SYSTEM]IPCC
+!	PDB [PD_LENGTH] = 3;			! Length of message
+!	PDB [PD_MESSAGE] = INF_BLK;		! Message address
+!
+!	if not $$MSEND (PDB_BLOCK_SIZE, PDB, ERRCOD)
+!	   or not $$MRECV (PDB_BLOCK_SIZE, PDB, ERRCOD)
+!	   or (IP$CFE and .PDB [PD_FLAGS]) neq 0
+!	then
+!	    TRACE_INFO ('Can''t set IPCF quotas %O', POINTR(.T1, IP$CFE));
+
+!	if not LOCAL_GALAXY
+!	then
+!	    NMU$IPCF_SET_SYSPID ($IPCNM, .PID);
+!   %fi
+
+!
+! Return assigned PID index
+!
+
+    .PID_ID
+
+    end;					! End of NMU$IPCF_CREATE
+
+%global_routine ('NMU$IPCF_DESTROY', PID_ID) =
+
+!++
+! Functional description:
+!
+!	This routine deletes the data base assigned to a
+!	particular PID.  It also notifies the monitor that
+!	the PID is no longer valid.
+!
+! Formal parameters:
+!
+!	.PID_ID    Index into PID_TABLE for PID to be deleted.
+!
+! Routine value:
+!
+!    $true    PID was destroyed
+!    $false   Failure during destruction attempt
+!
+! Side effects: none
+!
+!--
+
+    begin
+
+    %if $TOPS20 %then
+    DECLARE_JSYS (MUTIL)
+    %fi
+
+    %if $TOPS10 %then
+    register
+	T1;
+
+    local
+	INF_BLK : vector [10],		! [SYSTEM]INFO argument block
+	PDB : PDB_BLOCK,		! Argument block for IPCF functions
+	ERRCOD;
+    %fi
+
+    local
+	ARGBLK : vector [3],			! MUTIL argument block
+        PID_INFO : ref PID_BLOCK;
+
+!
+! Lookup PID info block
+!
+    if not NMU$TABLE_FETCH (PID_TABLE, .PID_ID, PID_INFO)
+    then
+        begin
+        %debug (IPCF_TRACE,
+                (TRACE_INFO ('Illegal NMU$IPCF ID')));
+        return $false;
+        end;
+
+!
+! Tell IPCF system that PID is to be destroyed
+!
+    %if $TOPS20 %then
+    ARGBLK [0] = $MUDES;
+    ARGBLK [1] = .PID_INFO [PB_PID];
+    $$MUTIL (3, ARGBLK);
+    %fi
+
+    %if $TOPS10 %then
+    INF_BLK [$IPCI0] = $IPCID;			! Drop this PID
+    INF_BLK [$IPCI1] = 0;			! No PID for copy
+    INF_BLK [$IPCI2] = .PID_INFO [PB_PID];	! PID to be destroyed
+
+    PDB [PD_FLAGS] = 0;				! No special flags
+    PDB [PD_SENDER] = 0;			! Me
+    PDB [PD_RECEIVER] = 0;			! [SYSTEM]INFO
+    PDB [PD_MESSAGE] = INF_BLK;			! Address of arg block
+    PDB [PD_LENGTH] = 3;			! ...
+
+    $$MSEND (PDB_BLOCK_SIZE, PDB);
+    $$MRECV (PDB_BLOCK_SIZE, PDB);
+    %fi
+
+    %debug (IPCF_TRACE,
+	    (begin
+             local
+                  PID;
+             PID = .PID_INFO [PB_PID];
+             TRACE_INFO ('PID %O,,%O destroyed', .PID<18, 18>, .PID<0, 18>);
+             end));
+
+!
+! Delete PID table entry for destroyed PID.
+!
+    NMU$TABLE_DELETE (PID_TABLE, .PID_ID);
+
+!*****
+!
+! Release any messages queued for reception ...
+!
+!*****
+
+    NMU$MEMORY_RELEASE (.PID_INFO, PID_BLOCK_ALLOCATION);
+
+    $true
+
+    end;					! End of NMU$IPCF_DESTROY
+
+%global_routine ('NMU$IPCF_ALLOW', DST_PID_ID, SRC_PID) =
+
+!++
+! Functional description:
+!
+!	This routine inserts a SRC_PID into the list of allowable
+!	PIDs that can send to this process' DST_PID.
+!
+! Formal parameters:
+!
+!	.DST_PID_ID	Index for this process' PID info block.
+!	.SRC_PID	PID of a possible valid sender.
+!
+! Routine value:
+!
+!    $true    Allowable PID set up
+!    $false   PID ID is invalid
+!
+! Side effects: none
+!
+!--
+
+    begin
+
+    local
+	PID_INFO : ref PID_BLOCK,
+	ALLOW_ENTRY : ref ALLOW_BLOCK;
+
+!
+! Lookup PID info block
+!
+    if not NMU$TABLE_FETCH (PID_TABLE, .DST_PID_ID, PID_INFO)
+    then
+        begin
+        %debug (IPCF_TRACE,
+                (TRACE_INFO ('Illegal NMU$IPCF ID')));
+        return $false;
+        end;
+
+    %debug (IPCF_TRACE,
+	    (begin
+             local
+                  DST_PID;
+
+             DST_PID = .PID_INFO [PB_PID];
+
+             TRACE_INFO ('Allowing PID %O,,%O to send to %O,,%O',
+			 .SRC_PID<18, 18>, .SRC_PID <0, 18>,
+			 .DST_PID<18, 18>, .DST_PID <0, 18>);
+             end));
+
+!
+! Allocate a "Allow" block to be linked into queue
+! of allow blocks for the destination PID.
+!
+    ALLOW_ENTRY = NMU$MEMORY_GET (ALLOW_BLOCK_ALLOCATION);
+    ALLOW_ENTRY [AB_PID] = .SRC_PID;
+    NMU$QUEUE_INSERT (PID_INFO [PB_ALLOW], .ALLOW_ENTRY);
+
+    $true
+    end;					! End of NMU$IPCF_ALLOW
+
+%global_routine ('NMU$IPCF_DISALLOW', DST_PID_ID, SRC_PID) =
+
+!++
+! Functional description:
+!
+!	This routine removes a SRC_PID from the list
+!	of PIDs that are allowed to send the this
+!	process' DST_PID
+!
+! Formal parameters:
+!
+!	.DST_PID_ID	Index to this process' PID info block.
+!	.SRC_PID	PID to disallow sending to us.
+!
+! Routine value:
+!
+!    $true    Allowable PID set up
+!    $false   PID ID is invalid
+!
+! Side effects: none
+!
+!--
+
+    begin
+
+    local
+	PID_INFO : ref PID_BLOCK,
+	ALLOW_ENTRY : ref ALLOW_BLOCK;
+
+!
+! Lookup PID info block
+!
+    if not NMU$TABLE_FETCH (PID_TABLE, .DST_PID_ID, PID_INFO)
+    then
+        begin
+        %debug (IPCF_TRACE,
+                (TRACE_INFO ('Illegal NMU$IPCF ID')));
+        return $false;
+        end;
+
+    %debug (IPCF_TRACE,
+	    (begin
+             local
+                  DST_PID;
+
+             DST_PID = .PID_INFO [PB_PID];
+             TRACE_INFO ('Disallowing PID %O,,%O to send to %O,,%O',
+			 .SRC_PID<18, 18>, .SRC_PID<0, 18>,
+			 .DST_PID<18, 18>, .DST_PID<0, 18>);
+             end));
+
+!
+! Delete any allow block that specifies the
+! source pid can send to the destination PID.
+!
+    NMU$QUEUE_SCAN (PID_INFO [PB_ALLOW], .SRC_PID, ALLOW_KILL);
+
+    $true
+
+    end;					! End of NMU$IPCF_DISALLOW
+
+%global_routine ('NMU$IPCF_TRANSMIT', SRC_ID, DST, MSG, LEN) =
+
+!++
+! Functional description:
+!
+!       This routine transmits an IPCF message to the specified
+!       destination PID.  If the length of the message is 512 (10)
+!       words in length, a page mode send is done.
+!
+!
+! Formal parameters:
+!
+!       .SRC_ID   Source PID (for this process)
+!       .DST      Destination PID
+!       .MSG      Address of message block
+!       .LEN      Number of words in message
+!
+! Routine value:
+!
+!    $true    Send completed successfully
+!    $false   Send failed
+!
+! Side effects:
+!
+!       If a page mode send is done, the message block
+!       is not returned to the caller.  It is removed from
+!       the process' page map.
+!
+!--
+
+    begin
+
+    %if $TOPS20 %then
+    DECLARE_JSYS (MSEND)
+    %fi %if $TOPS10 %then
+    register
+	T1;
+    %fi
+
+    local
+	PDB : PDB_BLOCK,
+	DUMP_PAGE,
+        PID_INFO : ref PID_BLOCK,
+        SRC;
+
+    builtin
+	LSH;
+
+!
+! Lookup PID info block
+!
+    if not NMU$TABLE_FETCH (PID_TABLE, .SRC_ID, PID_INFO)
+    then
+        begin
+        %debug (IPCF_TRACE,
+                (TRACE_INFO ('Illegal NMU$IPCF ID')));
+        return $false;
+        end;
+
+!
+! Set source PID for sending
+!
+    SRC = .PID_INFO [PB_PID];
+
+!
+! Display tracing information about from and to whom the
+! current packet is being sent.
+!
+    %debug (IPCF_TRACE,
+	    (begin
+	     TRACE_INFO ('Sending packet from %O,,%O to %O,,%O',
+			 .SRC<18, 18>, .SRC<0, 18>, .DST<18, 18>, .DST<0, 18>);
+	     TRACE_INFO (' message at %O, length %D', .MSG, .LEN);
+	     end));
+!
+! Initially assume that a non-page mode send
+! is being done.
+!
+    DUMP_PAGE = $false;
+
+!
+! Check for a page mode send
+!
+    if .LEN eql 512
+    then
+	begin
+!
+! On page mode,
+!    indicate page mode send
+!    set page number to send
+!    set flag to dump page (release it) on successful send
+!
+	PDB [PD_FLAGS] = CFV;
+	PDB [PD_MESSAGE] = LSH (.MSG, -9);
+	DUMP_PAGE = $true;
+	end
+    else
+	begin
+!
+! On non-page mode,
+!    indicate packet mode send
+!    set address to send
+!
+	PDB [PD_FLAGS] = 0;
+	PDB [PD_MESSAGE] = .MSG;
+	end;
+
+!
+! Set the source and destination PIDs
+! Set the size (in words) of the message to send.
+!
+    PDB [PD_SENDER] = .SRC;
+    PDB [PD_RECEIVER] = .DST;
+    PDB [PD_LENGTH] = .LEN;
+
+!
+! Attempt to do the send
+!
+    if not $$MSEND (PDB_BLOCK_SIZE, PDB)
+    then
+        begin
+	%if $TOPS20 %then
+        %debug (IPCF_TRACE,
+                (TRACE_INFO ('MSEND failed: %J', -1)));
+	%fi %if $TOPS10 %then
+        %debug (IPCF_TRACE,
+                (TRACE_INFO ('IPCFS. failed: %O', .T1)));
+	%fi
+        return $false;
+        end;
+
+!
+! If a page mode send was done, release the page
+!
+    if .DUMP_PAGE then
+    begin
+	%if $TOPS10 %then
+	! The following is a CROCK only for Tops-10. It recreates the page
+	!  that was destroyed by an IPCFS. so that the page allocator can
+	!  can deallocate the page without getting an ?Ill mem ref.
+	local
+	    ARGLST : vector [2];
+
+	ARGLST [0] = 1;
+	ARGLST [1] = LSH (.MSG, -9);
+
+	T1 = $PAGCD ^ 18 + ARGLST;
+
+	UUO (1, PAGE$(T1));
+	%fi
+
+        NMU$PAGE_RELEASE (LSH (.MSG, -9));
+    end;
+
+!
+! Indicate everything worked ok
+!
+    $true
+
+    end;					! End of NMU$IPCF_TRANSMIT
+
+%global_routine ('NMU$IPCF_RECEIVE', DST_PID_ID,sender_pid_,user_id_,caps_) =
+
+!++
+! Functional description:
+!
+!       This routine receives an IPCF message incoming for
+!       the specified PID.  It blocks until a message is
+!       received.
+!
+! Formal parameters:
+!
+!       .DST_PID_ID    Index to PID info block in PID table.
+!
+! Routine value:
+!
+!       Address of message page.
+!
+! Side effects: none
+!
+!       The message block is always a page,
+!       whether a page mode receive was done or not.
+!
+!--
+
+    begin
+    bind
+	sender_pid = .sender_pid_,
+	user_id = .user_id_,
+	caps = .caps_;
+
+    local
+	PID_INFO : ref PID_BLOCK,
+        DST_PID,
+	MSG_MDB : ref MDB_BLOCK,
+	PDB : ref PDB_BLOCK,
+	MSG_ADDRESS,
+	MSG_FOUND;
+
+    sender_pid = user_id = caps = 0;
+!
+! Lookup PID info block
+!
+    if not NMU$TABLE_FETCH (PID_TABLE, .DST_PID_ID, PID_INFO)
+    then
+        begin
+        %debug (IPCF_TRACE,
+                (TRACE_INFO ('Illegal NMU$IPCF ID')));
+        return $false;
+        end;
+
+    DST_PID = .PID_INFO [PB_PID];
+
+!
+! Indicate that so far no message has been found
+! for the specified pid.
+!
+    MSG_FOUND = $false;
+
+!
+! Until a message has been found
+!
+    while not .MSG_FOUND do
+	begin
+
+!
+! Get the next message descriptor from the queue of
+! messages for this pid.
+!
+	MSG_MDB = NMU$QQUEUE_REMOVE (PID_INFO [PB_MSGS]);
+
+!
+! Set the address of the message's PDB (packet descriptor)
+!
+	PDB = MSG_MDB [MD_PDB];
+
+!
+! Check to see if the message was a packet or page mode
+! receive.  Set the message's address appropriately.
+!
+	if (.PDB [PD_FLAGS] and CFV) eql 0
+	then
+	    MSG_ADDRESS = .PDB [PD_MESSAGE]
+	else
+	    begin
+	    builtin LSH;
+	    MSG_ADDRESS = LSH (.PDB [PD_MESSAGE], 9);
+	    end;
+
+!
+! Display tracing information telling where the packet came
+! from and who it is for.
+!
+	%debug (IPCF_TRACE,
+		(begin
+		 local SRC_PID;
+		 SRC_PID = .PDB [PD_SENDER];
+		 TRACE_INFO ('Received packet for %O,,%O, from %O,,%O',
+				.DST_PID<18, 18>, .DST_PID<0, 18>,
+				.SRC_PID<18, 18>, .SRC_PID<0, 18>);
+		 end));
+
+!
+! Check to see if the receiving PID has receive restrictions
+! on it.  If not .. just receive the message.  If there are
+! restrictions check to see if the sending PID is allowed.
+! If it isn't .. delete the message
+!
+	if not .PID_INFO [PB_RESTRICT]
+	then
+	    MSG_FOUND = $true
+	else
+	    if not (MSG_FOUND = NMU$QUEUE_SCAN (PID_INFO [PB_ALLOW],
+                                                .PDB [PD_SENDER],
+                                                ALLOW_SEARCH))
+	    then
+		begin
+		builtin LSH;
+		NMU$PAGE_RELEASE (LSH (.MSG_ADDRESS, -9));
+		%debug (IPCF_TRACE,
+			(TRACE_INFO ('Packet disallowed - deleted')));
+		end;
+!
+! Set the Sender_pid, User_id, and Capabilities of Sender
+!
+
+![308] DON'T RETURN INFO'S PID
+        IF (.pdb[pd_flags] AND ip_cfc) LEQ 1    ![308]
+        THEN                                    ![308]
+            sender_pid = .pdb[pd_sender];
+
+	user_id = .pdb[pd_logged];
+	caps = .pdb[pd_capabilities];
+!
+! Release the message descriptor block
+!
+	NMU$MEMORY_RELEASE (.MSG_MDB, MDB_BLOCK_ALLOCATION);
+	end;
+
+!
+! Display where the message is in core and return
+! its address
+!
+    %debug (IPCF_TRACE,
+	    (TRACE_INFO ('Packet at %O', .MSG_ADDRESS)));
+
+    .MSG_ADDRESS
+    end;					! End of NMU$IPCF_RECEIVE
+
+%global_routine ('NMU$IPCF_MAP_ID', PID_ID) =
+
+!++
+! Functional description:
+!
+!        This routine maps a NMU$IPCF id into a IPCF system PID.
+!
+! Formal parameters:
+!
+!    .PID_ID    NMU$IPCF ID returned from NMU$IPCF_CREATE
+!
+! Routine value:
+!
+!    <>0    PID associated with PID_ID
+!     =0    Invalid PID_ID
+!
+! Side effects: none
+!
+!--
+
+    begin
+
+    local
+         PID_INFO : ref PID_BLOCK;
+
+!
+! Lookup PID info block
+!
+    if not NMU$TABLE_FETCH (PID_TABLE, .PID_ID, PID_INFO)
+    then
+        begin
+        %debug (IPCF_TRACE,
+                (TRACE_INFO ('Illegal NMU$IPCF ID')));
+        return 0;
+        end;
+
+!
+! Return PID from info block
+!
+    .PID_INFO [PB_PID]
+
+    end;					! End of NMU$IPCF_MAP_ID
+
+%routine ('NMU$IPCF_SET_SYSPID', SPIDX, PID) =
+
+!++
+!
+! Functional description:
+!
+!	This routine is called in order to put us into the GETTABable PID
+!	table.  It takes no arguments.
+!
+! Formal parameters:
+!
+!	SPIDX			System PID index
+!	PID			PID of process
+!
+! Routine value:
+!
+!	$true			The syspid was assigned
+!	$false			The syspid could not be assigned to this job
+!
+!--
+
+begin
+
+%if $TOPS10
+%then
+    local
+	ARGLST : PDB_BLOCK,		! IPCF argument list
+	MESSAGE : vector [3];		! Message for [SYSTEM]IPCC
+
+    builtin
+	UUO;
+
+    register
+	T1;
+
+    T1 = _SIIPC;		! GETTAB the
+    if not UUO (1, GETTAB (T1)) !  pid of [SYSTEM]IPCC
+       then return $false;
+
+    ARGLST [PD_FLAGS] = IP$CFP;	! Priveleged packet
+    ARGLST [PD_SENDER] = .PID;	! Sender is me
+    ARGLST [PD_RECEIVER] = .T1;	! Receiver is [SYSTEM]IPCC
+    ARGLST [PD_LENGTH] = 3;	! Length
+    ARGLST [PD_MESSAGE] = MESSAGE; ! Pointer to message block
+
+    MESSAGE [$IPCS0] = $IPCWP;	! Write the pid table
+    MESSAGE [$IPCS1] = .SPIDX;	! System PID table offset
+    MESSAGE [$IPCS2] = .PID;	! PID to set up
+
+    T1 = 4 ^ 18 + ARGLST;	! AC for IPCFS.
+    if not UUO (1, IPCFS$ (T1)) ! Set the SYSPID
+       then return $false;
+
+    if not UUO (1, IPCFR$ (T1))	! Get the response
+       then return $false;
+
+    if (.ARGLST[PD_FLAGS] and IP$CFE) neq 0 ! Any errors?
+       then return $false;	! Yes, die
+%fi ! end %if $TOPS10
+
+    $true
+end;
+%routine ('RECV_SIGNAL') IPCF_INTERRUPT_ROUTINE novalue =
+
+!++
+! Functional description:
+!
+!	This routine is called whenever a IPCF message interrupt occurs.
+!
+! Formal parameters: none
+!
+! Routine value: none
+! Side effects:
+!
+!	The message received event is signalled.  This causes the
+!	RECEIVE_TASK to be scheduled (sometime).
+!
+!--
+
+    begin
+    NMU$SCHED_FLAG (RECEIVE_EVENT);
+    PROCESS_WAKE;
+    end;			! End of RECV_SIGNAL
+
+%routine ('RECEIVE_TASK') : novalue =
+
+!++
+! Functional description:
+!
+!       This is the IPCF receive background task.  It waits until
+!       a IPCF event occurs.  Then it attempts to receive any
+!       IPCF message that is waiting.  Received IPCF messages are
+!       queued to the appropriate PID on the PID_TABLE (if it exists).
+!
+! Formal parameters: none
+!
+! Routine value: none
+! Side effects:
+!
+!       The PID_TABLE entry for some PID may be modified to
+!       reflect the reception of a message.  Also if a task
+!       is waiting for a message on a specific PID, and the
+!       message is for the PID, the task is made schedulable.
+!
+!--
+
+    begin
+
+    %if $TOPS20 %then
+    DECLARE_JSYS (MUTIL, MRECV)
+    %fi
+
+    %if $TOPS10 %then register T1; %fi
+
+    local
+	MDB : ref MDB_BLOCK,                  ! Message descriptor block
+	PDB : ref PDB_BLOCK,                  ! Packet descriptor block
+	ARGBLK : vector [PDB_BLOCK_SIZE + 2], ! MUTIL argument block
+	PID_INFO : ref PID_BLOCK,             ! PID information block
+	MSG,                                  ! Message page address
+        PID_ID,                               ! PID ID for searching
+        MAX_PID_ID;                           ! Maximum ID in PID_TABLE
+
+    bind
+	NEW_PDB = ARGBLK [1] : PDB_BLOCK;
+
+    builtin
+	LSH;
+
+!
+! Loop forever receiving messages
+!
+    while $true
+    do
+
+!
+! Loop while a message is waiting
+!
+      begin
+
+      while
+           begin
+	   %if $TOPS20 %then
+           ARGBLK [0] = $MUQRY;
+           ARGBLK [1] = -1;		! Receive for any PID of this process
+           $$MUTIL (PDB_BLOCK_SIZE + 2, ARGBLK)
+	   %fi
+
+	   %if $TOPS10 %then
+	   register
+		T1;
+
+	   T1 = (PDB_BLOCK_SIZE + 2) ^ 18 + ARGBLK + 1;
+	   UUO (1, IPCFQ$ (T1))
+	   %fi
+           end
+      do
+        begin
+!
+! Get a message descriptor (MDB) block
+! Set the address of the packet (PDB) desciptor block
+!
+        MDB = NMU$MEMORY_GET (MDB_BLOCK_ALLOCATION);
+        PDB = MDB [MD_PDB];
+
+!
+! Check if a message is associated with the IPCF packet.
+! If it is, get a page to receive it into.
+!
+        if (.NEW_PDB [PD_FLAGS] and CFZ) neq 0
+        then MSG = 0
+        else MSG = NMU$PAGE_GET ();
+
+!
+! Set reception flags and receive buffer address
+!
+        if (.NEW_PDB [PD_FLAGS] and CFV) neq 0
+        then
+            begin
+	    %if $TOPS10 %then
+	    ! The following crock is related to the crock you probably
+	    !  saw a few pages back. This one ensures that the page
+	    !  that an IPCFR. is going to use, does not exist.
+	    local
+		ARGLST : vector [2];
+	    ARGLST [0] = 1;
+	    ARGLST [1] = PA$GAF + .MSG;
+	    T1 = $PAGCD ^ 18 + ARGLST;
+	    UUO (1, PAGE$(T1));
+	    %fi
+            PDB [PD_FLAGS] = CFV;	        ! Receive in page mode
+            PDB [PD_MESSAGE] = .MSG;	        ! Page to receive message
+            end
+        else
+            begin
+            PDB [PD_FLAGS] = 0;		        ! Packet mode receive
+            PDB [PD_MESSAGE] = LSH (.MSG, 9);	! Address of receive message
+            end;
+
+!
+! Receive for any pid into the 512 word buffer
+!
+        PDB [PD_RECEIVER] = -1;
+        PDB [PD_LENGTH] = 512;
+
+!
+! Do the receive, display errors, and release
+! the memory space allocated on failures
+!
+        if not $$MRECV (PDB_BLOCK_SIZE, .PDB)
+        then
+            begin
+            %debug (IPCF_TRACE,
+                    (TRACE_INFO ('MRECV failed: %J', -1)));
+
+            NMU$PAGE_RELEASE (.MSG);
+            NMU$MEMORY_RELEASE (.MDB, MDB_BLOCK_ALLOCATION);
+            end
+        else
+            begin
+
+!
+! On successful read, find the PID in the PID_TABLE
+! that the message was received for.   Put the message
+! onto the queue for the PID.
+!
+            PID_ID = 0;
+
+            if (MAX_PID_ID = NMU$TABLE_MAX (PID_TABLE)) eql  0
+            then PID_INFO = 0
+            else
+                while (PID_ID = .PID_ID + 1) leq .MAX_PID_ID
+                do
+                  if not NMU$TABLE_FETCH (PID_TABLE, .PID_ID, PID_INFO)
+                  then PID_INFO = 0
+                  else
+                      if .PID_INFO [PB_PID] eql .PDB [PD_RECEIVER]
+                      then exitloop;
+
+            if .PID_INFO eql 0
+            then
+                begin
+                %debug (IPCF_TRACE,
+                        (TRACE_INFO ('Message received for unknown PID')));
+                NMU$PAGE_RELEASE (.MSG);
+                NMU$MEMORY_RELEASE (.MDB, MDB_BLOCK_ALLOCATION);
+                end
+            else
+                NMU$QQUEUE_INSERT (PID_INFO [PB_MSGS], .MDB);
+
+            end;
+        end;
+
+!
+! Wait until an IPCF message comes in
+!
+      NMU$SCHED_WAIT(RECEIVE_EVENT,0);		! Wait for next IPCF interrupt
+      end;					! no timeout needed
+
+    end;					! End of RECEIVE_TASK
+%routine ('ALLOW_SEARCH', ALLOW_ENTRY : ref ALLOW_BLOCK, PID) =
+
+!++
+! Functional description:
+!
+!       This routine is the scanning routine used by NMU$IPCF when
+!       calling NMU$QUEUE_SCAN to search the allowable pid queue
+!       to see if a PID is a valid sender.
+!
+! Formal parameters:
+!
+!       .ALLOW_ENTRY  Address of current allowable PID entry.
+!       .PID          PID that is being searched for.
+!
+! Routine value:
+!
+!       $FALSE (0) if no match.
+!       $TRUE if a match is found.
+!
+! Side effects: none
+!
+!--
+
+    begin
+
+    if .ALLOW_ENTRY [AB_PID] eql .PID
+    then $true
+    else $false
+
+    end;					! End of ALLOW_SEARCH
+%routine ('ALLOW_KILL', ALLOW_ENTRY : ref ALLOW_BLOCK, PID) =
+
+!++
+! Functional description:
+!
+!	This routine is called by NMU$QUEUE_SCAN when doing
+!	a scan of a "allowable" PID list.  If the specified
+!	PID is found, it is deleted from the list.
+!
+! Formal parameters:
+!
+!	.ALLOW_ENTRY	Address of current allow block.
+!	.PID		PID being looked for.
+!
+! Routine value:
+!
+!	$true	if entry has been found and deleted
+!	$false	if entry does not match
+!
+! Side effects: none
+!
+!--
+
+    begin
+
+    if ALLOW_ENTRY [AB_PID] eql .PID
+    then
+	begin
+	NMU$QUEUE_EXTRACT (0, .ALLOW_ENTRY);
+	NMU$MEMORY_RELEASE (.ALLOW_ENTRY, ALLOW_BLOCK_ALLOCATION);
+	$true
+	end
+    else
+	$false
+
+    end;					! End of ALLOW_KILL
+%if $TOPS10 %then
+%routine ('USER_INITIALIZE_NAME') : novalue =
+
+!++
+! Functional description:
+!
+!	This routine puts the current job's user name
+!	into a special holding area.
+!
+! Formal parameters:
+!
+!	None
+! Routine value: none
+! Side effects: USER_STRING_NAME is set up
+!
+!--
+
+    begin
+
+	builtin
+	    UUO;
+
+	register
+	    T1;
+
+	global
+	    USER_STRING_NAME : vector [ch$allocation (13)];
+
+	local
+	    PTR;
+
+	UUO (0, GETPPN(T1));
+
+	PTR = ch$ptr (USER_STRING_NAME);
+	$NMU$TEXT (PTR,
+		   40,
+		   '%O,%O',
+		   .T1 <18,18,0>,
+		   .T1 <0,18,0>)
+    end;
+%fi
+%global_routine ('USER_NAME', TSB : ref TEXT_STATE_BLOCK) : novalue =
+
+!++
+! Functional description:
+!
+!	This routine outputs the current job's user name
+!	into the text output buffer.
+!
+! Formal parameters:
+!
+!	.TSB	Text state block address
+!
+! Routine value: none
+! Side effects: none
+!
+!--
+
+    begin
+
+  %if $TOPS20 %then
+    DECLARE_JSYS (GJINF, DIRST)
+  %fi
+
+    bind routine
+	CHAR_OUT = .TSB [OUTPUT_ROUTINE];
+
+    %if $TOPS20 %then
+    local
+        USER_NUMBER,
+	PTR,
+	CHAR,
+	NAME_BUFFER : vector [ch$allocation (40)];
+
+    PTR = ch$ptr (NAME_BUFFER);
+
+    $$GJINF (;USER_NUMBER);
+    $$DIRST (.PTR, .USER_NUMBER);
+    %fi
+
+    %if $TOPS10 %then
+    local
+	CHAR,
+	PTR;
+
+    external
+	USER_STRING_NAME : vector [ch$allocation (13)];
+
+    PTR = ch$ptr (USER_STRING_NAME);
+    %fi
+
+    while (CHAR = ch$rchar_a (PTR)) neq 0
+    do CHAR_OUT (.TSB, .CHAR);
+
+    end;					! End of USER_NAME
+%routine ('JOBNUM') =
+
+!++
+! Functional description:
+!
+!	This routine returns the current job's job number.
+!
+! Formal parameters: none
+!
+! Routine value:
+!
+!	Job number.
+!
+! Side effects: none
+!
+!--
+
+    begin
+
+    %if $TOPS20 %then
+    DECLARE_JSYS (GJINF)
+
+    local
+         JOB_NUMBER;
+
+    $$GJINF (;,,JOB_NUMBER);
+
+    .JOB_NUMBER
+    %fi
+
+    %if $TOPS10 %then
+    register
+	T1;
+
+    UUO (0, PJOB (T1));
+    .T1
+    %fi
+
+    end;			! End of JOBNUM
+%if $TOPS10 %then
+%routine ('SET_IPCF_INTERRUPT', CHANNEL) : novalue =
+
+!++
+! Functional description:
+!
+!	This routine enables trapping for IPCF packet receives.
+!
+! Formal parameters:
+!
+!	CHANNEL		The channel number for this type of interrupt
+!
+! Routine value:
+!
+!	None.
+!
+! Side effects:
+!
+!	The job will now be interrupted when a packet is put into the IPCF
+!	 receive queue.
+!
+!--
+
+    begin
+
+    register
+	T1;
+
+    local
+	ARGBLK : vector [3];
+
+    ARGBLK [0] = $PCIPC;
+    ARGBLK [1] = (.CHANNEL * 4) ^ 18;
+    ARGBLK [2] = 0;
+
+    T1 = PS$FAC + ARGBLK;
+
+    UUO (1, PISYS$ (T1));
+
+    end;					! End of SET_IPCF_INTERRUPT
+    %fi
+
+end						! End of module NMU$IPCF
+
+eludom

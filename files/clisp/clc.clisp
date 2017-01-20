@@ -1,0 +1,3492 @@
+;;; -*-Lisp-*- 
+
+;;;**********************************************************************
+;;; Originally this was the Common Lisp Compiler for Spice Lisp
+;;; at CMU.  It has been radically modified for use with Tops-20
+;;; Common Lisp.  Copyright (c) Charles Hedrick, q.v.
+;;;**********************************************************************
+
+;;; Tops-20 Common Lisp Compiler by JoSH.
+;;; Based on Tops-20 mods by Dave Steiner to the Spice Lisp compiler
+;;; by Scott Fahlman, Dave Dill, Skef Wholey, et al.
+
+;;; See also the file TRANS.CLISP (general transforms)
+
+(in-package "COMPILER")
+(shadow '(lisp::optimize))	;[Victor] Not a function in CLtL
+
+;;; *******************************************************************
+
+;;; Version number goes here:
+(defvar compiler-version "P.U.V.1(2)")
+
+;;; Overview
+;;; The top-level functions, compile, compile-file, etc, are essentially
+;;; the same as in the original.  The major data structures (*?env*)
+;;; are slightly different, especially Benv.  Lambda binding has been
+;;; modified to take account of the argument passing protocols of 
+;;; Tops-20 Clisp.
+
+;;; The functions in the main compiling loop recieve as arguments
+;;; the form to compile and the place to put the result.  This is always
+;;; denoted by the (local) variable "where".  It may indicate no value
+;;; (nil) or a register or a stack location or a special.  It may also
+;;; indicate a predicate, compiled to skip or not skip instead of producing
+;;; an explicit result.
+
+;;; Type determination (from the Spice) and the register model/copy optimize
+;;; algorithms have been completely removed.
+
+
+;;;; Global Switches
+
+;;; These control the actions of the compiler.  They may be set by the user,
+;;; but more commonly are manipulated via declarations.
+
+(defvar *lap-pretty-print* t	;[Victor]
+  "If NIL, prints the lap code on one line with just one space between the
+  instructions.  Otherwise (the default), it formats the code prettily.
+  Setting it to NIL saves disk, though.")
+
+(defvar *eval-when-load* t
+  "If non-null, sys that any forms encountered by the compiler are to appear
+  in the output file, compiled if possible, for execution at load time.
+  Initially T, modified by EVAL-WHEN forms.")
+
+(defvar *eval-when-compile* nil
+  "If non-null, says that any forms encountered by the compiler are to be
+  executed in the compiler's Lisp environment.  Initially NIL, modified by
+  EVAL-WHEN forms.")
+
+(defvar compile-forms-list '(prog do do* let let* flet labels)
+  "compile random forms beginning with these atoms")
+
+(defvar *nthcdr-open-code-limit* 10
+  "Maximum size NTHCDR or NTH to open-code as CAR and CDR forms.")
+
+(defvar *verbose* t
+  "If nil, only true error messages and warnings go to the error stream.
+  If non-null, prints a message as each function is compiled.")
+
+(defvar *compile-to-lisp* nil
+  "If non-null, stuff compiled definitions into the compiler's own Lisp
+  environment.")
+
+(defvar *check-keywords-at-runtime* t
+  "If non-null, compiled code with &key arguments will check at runtime
+  for unknown keywords.  This facility is normally left on.")
+
+(defvar *all-numbers-are-fixnums* t
+  "If non-null, the user guarantees that all arithmetic can be
+  assumed fixnum.  Produces faster code, but may be dangerous.")
+
+(defvar *clc-input-stream* nil)
+(defvar *clc-fasl-stream* nil)
+(defvar *clc-lap-stream* nil)
+(defvar *clc-err-stream* nil)
+
+(defvar *compiler-is-reading* nil
+  "This is true only if we are actually doing a read from
+  *clc-input-stream*.  #, (in the reader) looks at this.")
+
+(defvar *sharp-comma-seen* nil
+  "T if we have seen a sharp comma while *compiler-is-reading* is T.  Reset
+  before a new form is read in.")
+
+
+;;;; Implementation-Dependent "Constants"
+
+;;; These may be overwritten during compiler builds, but should never change
+;;; in mid-stream.
+
+(defconstant host-machine 'decsystem-20
+  "The type of machine on which the compiler is running.")
+
+(defconstant host-system 'tops-20
+  "The operating system on which the compiler is running.")
+
+(defconstant target-machine 'decsystem-20
+  "The type of machine that the code is being compiled for.")
+
+(defconstant target-system 'tops-20
+  "The operating system that the code is being compiled for.")
+
+;;; TYPE-NAMES is a constant list of the legal type names, for use in
+;;; declaration processing.
+
+(defconstant type-names
+  '(array atom bignum bit bit-vector character common compiled-function
+    complex cons double-float fixnum float function hash-table integer
+    keyword list long-float nil null number package pathname random-state
+    ratio rational readtable sequence short-float simple-array
+    simple-bit-vector simple-string simple-vector single-float
+    standard-char stream string string-char symbol t vector))
+
+
+;;;; Assorted Special Variables
+
+;;; All of the following are given plausible top-level values so that parts
+;;; of the compiler can be tested without a lot of setup.
+
+(defvar functions-with-errors nil
+  "A list of all functions that did not compile properly due to errors in
+  the code.")
+
+(defvar error-count 0
+  "The number of errors generated during this compilation.")
+
+(defvar warning-count 0
+  "The number of warnings generated during this compilation.")
+
+(defvar unknown-functions nil
+  "List of functions called but not yet seen and not built-in.  The user
+  is informed of any function still on this list at the end of a file
+  compilation.")
+
+(defvar unknown-free-vars nil
+  "A list of all variables referenced free in the compilation, but not
+  bound or declared special anywhere.  These are assumed to be special
+  variables, but are listed in a warning message at the end of the
+  compilation.")
+
+(defvar input-namestring nil			; [Victor]
+  "Truename of file being compiled, as a string.")
+
+(defvar function-name nil
+  "Holds a symbol that names the function currently being compiled,
+  or nil if between functions.")
+
+(defvar function-type 'expr
+  "The type of function being compiled: Expr, Macro, Closure, or One-Shot.")
+
+(defvar function-arglist ()
+  "The arglist of the function being compiled.")
+
+(defvar lap-code nil
+  "A list of the Lap code being generated for the current function.  The
+  first entry on this list is the marker (CODE-START), which gives us a
+  cons cell which can be destructively modified.  Lap-code is kept in
+  reversed form while being built, then is nreversed for optimization.")
+
+(defvar *contour-pointer* nil)
+
+(defvar *qref* 0
+  "0 or negative, tells how far off the nominal alloc level Q really is.")
+
+(defvar constants-list nil
+  "A list of all the constants and specials needed by the function being
+  defined.  Built during pass 2.  Kept in reversed form.")
+
+(defvar nconstants 0
+  "The number of entries currently on CONSTANTS-LIST.")
+
+(defvar *encloses* nil
+  "This func contains a closure, and thus must generate closure vectors.")
+
+(defvar *cvh* nil
+  "Stack location containing the closure vector for this contour.")
+
+(defvar *reach* 0
+  "Indicates how deep we are nested in FUNCTION forms.  A top-level defun
+  starts at 0.")
+
+(defvar *grasp* 0
+  "Indicates how far back up the chain of nested functions a closure
+   has referenced closed variables.")
+
+;;; A function's *reach* should exceed its *grasp*, or what's a closure for?
+
+(defvar *hand* 0
+  "Like *reach*, but indicates the lexical countour level.")
+
+;;; There may be several *hand*'s in a *reach*.  The difference is that 
+;;; only cross-*reach* references necessitate closure generation, but once
+;;; that happens, there must be a separate closure vector for each *hand*.
+
+(defvar max-args 0
+  "The maximum number of args for the current function, excluding any &rest
+  or &key args.")
+
+(defvar min-args 0
+  "The minimum number of args for the current function.")
+
+(defvar vars-griped-about nil
+  "When we gripe about an unknown var being assumed special, put it on this
+  list so that we don't gripe again while compiling the same function.")
+
+(defvar entry-points nil
+  "A list of tags, that tells where to 
+  enter the code for various numbers of optional arguments.  Built in
+  reversed order, nreversed before being written out.")
+
+(defvar *restp* nil
+  "T if there is an &rest var in this lambda list.")
+
+(defvar ff-code nil
+  "A list of instructions that must be executed at certain entry points to a
+  function.  Used by CG-Lambda-List and related functions.")
+
+(defvar vars-upstream nil
+  "An a-list of variables appearing in the arglist so far, paired with the
+  names of the locations they showed up in (ie register names, etc).
+  Used to compile 'easy' forms which use the values direct.")
+
+(defvar skip-tag nil
+  "A tag used to skip around frame-completion code in the the lambda-list
+  processing machinery.")
+
+(defvar old-venv nil
+  "Records *VENV* as it was upon entry to a binding contour.")
+
+(defvar old-fenv nil					;[Victor]
+  "Records *FENV* as it was upon entry to a binding contour.")
+
+(defvar *notinlines* nil
+  "list of functions declared notinline")
+
+(defvar ignores nil
+  "List of lexical vars to be ignored by this function.  Ignored vars do
+  not complain if nobody references them.")
+
+(defvar new-specials nil
+  "Rebound in each binding contour to record which vars are locally declared
+  special.")
+
+(defvar new-type-decls nil
+  "Rebound in each binding contour to record local type declarations until
+  they find their way into the *VENV* entry.")
+
+(defvar *internal-functions* nil
+  "When COMPILE is called for value, this var is used to accumulate
+   the defns of the generated subfunctions.")
+
+(defvar *nargs-on-stack* 0
+  "Number of args passed to the function that were put on the stack.  Ie,
+  the number of total args minus 5.")
+
+(defvar *temps* nil
+  "A list of the gensyms that name the stack locations used by the function")
+
+(defvar *free-temps* nil
+  "A tail of *temps*, representing those locations available at this point")
+
+(defvar *xstemps* nil
+  "a list of temps to be spliced into *temps* when all function
+   args have been processed.  It is used to denote the locations that
+   args passed in the regs (and supplied-p args) will be put into.")
+
+
+;;;; Major Compiler Data Structures
+
+;;; Environment for Variable Bindings.
+
+;;; A variable value can live in one of four places:
+
+;;; SPECIAL values live in the value cell of the symbol, as they have from
+;;; time immemorial.  Special bindings, setqs, and references are compiled
+;;; in pass 1.  The only tricky bits are that you have to keep track of how
+;;; many specials have been bound, so that when you exit a binding contour
+;;; you can peel back the stack to where it belongs.  This is done by "dead
+;;; reckoning" except for PROGV and THROW/CATCH.  
+
+;;; Lexical values may be LOCAL if they are bound in the current function
+;;; and if nobody references them from a closure.  These live on the stack.
+;;; But if someone references a local from down in a closure, the binding
+;;; function has to cons up a vector, assign the variable a slot in that
+;;; vector, and refer to it there.  Since you can't tell which case you are
+;;; in until after the whole binding-form (including embedded closures) has
+;;; been scanned, we put a pseudo op on the the LAP-CODE list in pass 1 and
+;;; resolve it into the proper reference type in pass 2.
+
+;;; Finally, if we are compiling a closure and a reference is to a variable
+;;; bound not in the current function but in a lexically surrounding
+;;; function, we must pick the right value out of the lexical environment
+;;; structure.  This is a set of vectors, one for each lexically enclosing
+;;; Function, which are chained and passed as a psuedo-argument with
+;;; the function call.  Each vector has an associated psuedo-variable
+;;; on the stack pointing to it.  Thus the reference looks like
+;;; move o6,psuedo ... ref varoffset(o6).
+
+;;; During compilation we keep track of the visible variable-binding
+;;; environemnt using the *VENV* list.  THis is an A-list of 
+;;; (variable-name . structure) pairs, where the structure is a defstruct
+;;; giving necessary information an incarantion of a variable.  The first
+;;; occurrence of a variable on *VENV* is the visible one -- all others are
+;;; shadowed.  If it is not on *VENV* it might have been proclaimed globally
+;;; special.  Else, assume it is special, but complain.
+
+;;; For each variable incarnation we need to keep track of the following:
+;;;
+;;; SPECIALP	   T if the var is special, NIL if it is lexical.
+;;; REACH          The *reach* at which the var is bound (q.v.).
+;;; USEDP          T if a lexical var has been referenced, NIL otherwise.
+;;; DECLARED-TYPE  Records TYPE declaration for this variable, or NIL if none.
+;;; HOME           The "name" of the stack location the var lives in.
+;;;		   If closed-over, the "name" is still used.
+;;; CVH		   *CVH* of wherever the var is bound (q.v.).
+;;; CVX            If closed over, index in the closure vector.
+
+
+(defvar *venv* nil)
+
+(defstruct (venv (:constructor make-venv (specialp home)))
+           specialp
+	   (reach *reach*)
+	   (usedp nil)
+	   (declared-type nil)
+	   home
+	   (cvh *cvh*)
+	   (cvx nil))
+
+;;; This is used for passing the lexical environment object into a closure
+;;; when that closure is called.
+
+(defvar *cenv* nil
+  "Closure environment:  an alist of (*cvh* . next-cvx).")
+;;; there is one entry per lexical contour.  the cdr of each entry
+;;; is nil until a closure is discovered somewhere inside that contour
+
+;;;; Environment for Function Names.
+
+;;; *FENV* is an alist used by FLET, LABELS, and MACROLET to create a lexical
+;;; binding environment for functions and macros.
+
+;;; For FLET and LABELS we make up an internal name for each of the functions,
+;;; compile it separately, get a closure and put it in FENV-HOME.
+;;; The FENV entry is of format (external-name . fenv).
+;;; Transform replaces any use of
+;;; the external name with a funcall to the internal name.
+;;; For a MACROLET we get the lambda expression for the expander and
+;;; the FENV-HOME entry is that lambda. FENV-MACROP is set to T, too.
+
+;;; MACROP	   T if the fun is a MACROLET thing
+;;; REACH          The *reach* at which the fun is bound (q.v.).
+;;; USEDP          T if a lexical fun has been referenced, NIL otherwise.
+;;; HOME           The "name" of the stack location the fun lives in.
+;;;		   If closed-over, the "name" is still used.
+;;; CVH		   *CVH* of wherever the fun is bound (q.v.).
+;;; CVX            If closed over, index in the closure vector.
+
+(defstruct (fenv (:constructor make-fenv (macrop home)))
+           macrop
+	   (reach *reach*)
+	   (usedp nil)
+	   home
+	   (cvh *cvh*)
+	   (cvx nil))
+
+(defvar *fenv* nil)
+
+
+;;; ENVIRONMENT FOR BLOCK/RETURN, TAGBODY/GO.
+
+;;; Block/Return is a tricky business.  The CMU compiler turned most 
+;;; returns (and goto's) into throw/catches.  The internal structures
+;;; in our implementation allows us to use direct jumps more often;
+;;; although in some cases auxilliary code is necessary to clear junk
+;;; off the stacks.
+
+;;; *BENV* serves a dual role as the a-list of visible block names, with
+;;; their associated information structures, and also a model of what's on
+;;; the call stack.  In addition to block entries there are tagbody entries,
+;;; since some tagbodies also turn into catch frames.  In general, there is 
+;;; an annotation for each form of enclosing form that affects non-local
+;;; transfers.
+
+;;; Returns or goto's through (ie, from inside to outside) unwind-protects,
+;;; progv's, and closures, are compiled as throws.  Each of these constructs
+;;; causes a great gulf to be fixed on *benv* to prevent random crossings.
+
+;;; An entry on *BENV* is one of:
+;;;	(block name . structure)	-- one for each enclosing BLOCK
+;;;	(tagbody taglist . structure)	-- one for each enclosing TAGBODY
+;;;	(specbind . #-of-vars)		-- one for each enclosing LET, etc
+;;;	(catch)				-- one for each enclosing CATCH
+;;;	(gulf)		      -- for unwind-protect, progv, and closures
+;;;	(gt5 . #-of-stack-locs)	-- If we are inside that part of
+;;;   a function call where more than five args are being compiled,
+;;;   pdl Q may be beyond its normal position and need to be fixed.
+;;; (Note that PROG uses BLOCK, TAGBODY, and LET.)
+
+;;; The block structure holds the following information:
+
+;;; END-TAG            If you just jump out of the block, this is the tag
+;;;                    to jump to.
+;;; WHERE	       The location the result of the block goes to.
+;;; CATCH-TAG          If someone does have to throw, make up a tag and
+;;;                    stick it in here.  Else, this is NIL.
+;;; FIXUPS             Contains pointers to every nonlocal transfer inside
+;;;		       this form to somewhere outside.  They will get
+;;;		       appropriate unwinding code when we figure out
+;;;		       what it is.
+
+(defvar *benv* nil)
+
+(eval-when (compile load eval)
+  (defun print-benv (foo stream bar)
+    (declare (ignore foo bar))
+    (princ "<Block>" stream)))
+
+(defstruct
+  (benv
+   (:constructor make-benv (end-tag where))
+   (:print-function print-benv))
+  end-tag
+  where
+  (catch-tag nil)
+  (fixups nil))
+
+;;; The tagbody problem is similar -- in most cases a jump is sufficient.
+;;; In the more complex cases, the GO compiles into a throw of some
+;;; integer index to a catch header set up at entry to the tagbody.  If the
+;;; throw occurs, the index is used to dispatch to the right go-tag.
+
+;;; The TENV structure contains the following information:
+;;;
+;;; CATCH-TAG       A catch tag created if anyone needs to do a THROW-type GO.
+;;; TAGS            An alist of (name . TAG-structure).
+;;; FIXUPS          Same as for BENV.
+
+(eval-when (compile load eval)
+  (defun print-tenv (foo stream bar)
+    (declare (ignore foo bar))
+    (princ "<Tagbody>" stream)))
+
+(defstruct (tenv (:constructor make-tenv ())
+		 (:print-function print-tenv))
+  (catch-tag nil)
+  (tags nil)
+  (fixups nil))
+
+;;; The TAG structure contains the following information:
+;;;
+;;; LABEL           The unique branch tag to which we want to jump.
+;;; INDEX           A small integer used to characterize the tag if
+;;;                 anyone needs to do a go the hard way.  Else NIL.
+;;; USEDP           NIL if there is no go to this tag.
+
+(defstruct (tag (:constructor make-tag (label index)))
+  label
+  index
+  (usedp nil))
+
+
+;;;; Error Reporting.
+
+;;; CLC-MUMBLE is just a format print to the error stream.
+
+(defun clc-mumble (string &rest args)
+  (let ((stream (or *clc-err-stream* *standard-output*)))
+    (apply #'format stream string args)))
+
+
+;;; A COMMENT is something the user might like to know, but that will
+;;; probably not affect the correctness of his code.
+
+(defun clc-comment (string &rest args)
+  (let ((stream (or *clc-err-stream* *standard-output*)))
+    (cond (function-name
+	   (format stream "~%Comment in ~S: " function-name))
+	  (t (format stream "~%Comment between functions: ")))
+    (terpri stream)
+    (princ "  " stream)
+    (apply #'format stream string args)))
+
+
+;;; A WARNING is something suspicious in the user's code that probably
+;;; signals some form of lossage, but that may be ignored if the user
+;;; knows what he is doing.
+
+(defun clc-warning (string &rest args)
+  (let ((stream (or *clc-err-stream* *standard-output*)))
+    (incf warning-count)
+    (cond (function-name
+	   (format stream "~%Warning in ~S: " function-name))
+	  (t (format stream "~%Warning between functions: ")))
+    (terpri stream)
+    (princ "  " stream)
+    (apply #'format stream string args)))
+
+
+;;; An ERROR is a problem in the user's code that will definitely cause some
+;;; lossage.  The compiler attempts to go on with the compilation so that
+;;; as many errors as possible can be caught per compilation.
+
+(defun clc-error (string &rest args)
+  (let ((stream (or *clc-err-stream* *standard-output*)))
+    (incf error-count)
+    (cond (function-name
+	   (pushnew function-name functions-with-errors)
+	   (format stream "~%Error in ~S: " function-name))
+	  (t (format stream "~%Error between functions: ")))
+    (terpri stream)
+    (princ "  " stream)
+    (apply #'format stream string args)))
+
+;;;; Gensym Stuff.
+
+;;; Gensym-type functions for use in the compiler.  All run off a single
+;;; global counter.
+
+;;; NEW-LABEL creates a new GO-TAG, unique to this incarnation of
+;;; the compiler.
+
+(defvar clc-counter 0
+  "Counter for the compiler's internal Gensyms.")
+
+(defvar *label-counter* 0
+  "Counter for labels-- rebound over each lambda lor low compact label sets")
+
+(eval-when (eval)
+(defmacro new-label ()
+  '(incf *label-counter*)))
+
+;;; NEW-INTERNAL-VARIABLE returns a new variable name, unique to this
+;;; top-level form.  We maintain a free list of these things.
+
+(defvar *free-internal-variables* nil)
+(defvar *currently-free-internal-variables* nil)
+
+(eval-when (eval)
+(defmacro new-internal-variable ()
+  '(if *currently-free-internal-variables*
+       (pop *currently-free-internal-variables*)
+       (really-new-internal-variable))))
+
+(defun really-new-internal-variable ()
+  (setq clc-counter (1+ clc-counter))
+  (let ((symbol
+	 (make-symbol (concatenate 'simple-string
+				   "INTERNAL-VARIABLE-"
+				   (princ-to-string clc-counter)))))
+    (push symbol *free-internal-variables*)
+    symbol))
+
+(defvar arg-alloc-offset 0
+  "Number of args locations needed on stack for missing optional and
+  rest args.")
+
+(eval-when (eval)
+(defmacro grab-a-temp ()
+  `(progn (enough-temps 1) (prog1 (car *free-temps*)
+				  (setq *free-temps* (cdr *free-temps*))))))
+
+(defun new-var-temp (flag)
+  (let ((temp (gensym "TEMP")))
+    (if flag (setq *xstemps* (nconc *xstemps* (list temp)))
+	(push temp *xstemps*))
+    temp))
+
+;;; *free-temps* is always one longer than we need, so we can run up
+;;; to the end and not fall off.
+
+(defun enough-temps (n)
+  (do () ((> (length *free-temps*) n))
+    (nconc *free-temps* (list (gensym "TEMP")))))
+
+;;; determine if a location name denotes a register
+;;; (nil is a register)
+(eval-when (eval)
+(defmacro regp (x) `(memq ,x '(o1 o2 o3 o4 o5 o6 nil))))
+
+(eval-when (eval)
+(defmacro stakp (x) `(memq ,x *temps*)))
+
+;;; BREAKOFF-NAME creates a name for an internal broken-off lambda.
+
+(defun breakoff-name ()
+  (let (name)
+    (setq clc-counter (1+ clc-counter))
+    (setq name (intern (concatenate 'simple-string
+				    (symbol-name function-name)
+				    "-INTERNAL-"
+				    (princ-to-string clc-counter))))
+    name))
+
+
+;;;; Random Stuff.
+
+;;; INST-OUT macro pushes a new instruction onto LAP-CODE.
+
+(eval-when (eval)
+(defmacro inst-out (i) `(setq lap-code (cons (copy-list ,i) lap-code))))
+
+;;; FF-OUT is for the finish-frame code sequence diddled by 
+;;; cg-lambda-list et al.
+(eval-when (eval)
+(defmacro ff-out (i)
+  `(progn (setq ff-code (cons (copy-list ,i) ff-code))
+	  (if ff-flag (inst-out ,i)))))
+
+;;; INST-OUT-SPLICE sticks the given sequence in before the given point
+;;; in the lap code list.  The lap code is stored in reverse order;
+;;; the code sequence given the function is of course in normal order.
+
+(defun inst-out-splice (spot code)
+  (rplacd spot (revappend code (cdr spot))))
+
+;;; INST-OUT-STOMP replaces the given instruction with the sequence.
+
+(defun inst-out-stomp (spot code)
+  (let ((x (revappend code (cdr spot))))
+    (rplacd (rplaca spot (car x)) (cdr x))))
+
+;;; MODIFY-PATHNAME-TYPE creates a pathname just like its argument, but
+;;; substituting the specified type.
+
+(defun modify-pathname-type (pathname type)
+  (make-pathname :host (pathname-host pathname)
+		 :device (pathname-device pathname)
+		 :directory (pathname-directory pathname)
+		 :name (pathname-name pathname)
+		 :type type
+		 :version :newest))
+
+
+;;; MAKE-CONST gets a constant expression C and finds a slot for it in the
+;;; constants area.  The constant's index is returned.  Normally this adds
+;;; the new constant to CONSTANTS-LIST and ticks the count, but if an EQUAL
+;;; constant already exists, it uses that.
+
+(defun make-const (c)
+   (do ((cl constants-list (cdr cl))
+	(i (1- nconstants) (1- i)))
+       ((null cl)
+	(push c constants-list)
+	(setq nconstants (1+ nconstants))
+	(1- nconstants))
+       (if (equal c (car cl)) (return i))))
+
+(eval-when (eval)
+(defmacro conref (con)
+  `(and ,con `(constant ,(make-const ,con)))))
+
+;;; TEST-VARNAME is passed an atom alleged to be a variable name.  It 
+;;; tests for a number of illegal conditions and issues error or warning
+;;; messages if these are seen.  Returns NIL if there is no way to proceed,
+;;; else returns T.
+
+(defun test-varname (var)
+  (cond ((not (symbolp var))
+	 (clc-error "~S -- variable name must be a symbol." var) nil)
+	((or (get var 'lisp::constant-in-compiler)
+	     (get var 'lisp::%constant)
+	     (memq var '(t nil)))
+	 (clc-error "~S is a constant -- cannot bind or set it." var) nil)
+	(t t)))
+
+
+;;; Check whether X is a constant or some other "trivial" expression.
+;;; "Trivial" means no side-effects and cheaper to recompute than to save.
+;;; Used in macros and transforms where one arg is going to be used in
+;;; two places: if arg expression is trivial, it is OK to compute it twice.
+;;; If not, must compute it only once and save the result for multiple uses.
+;;; Use only in contexts that do not themselves clobber X.
+
+(defun trivialp (x)
+  (or (symbolp x)
+      (constantp x)
+      (and (listp x)
+	   (eq (car x) 'the)
+	   (trivialp (caddr x)))))
+
+
+;;; DEF-CG creates a macro-like code-generator for the specified form.
+;;; There is only one CG form per function or special form.
+
+(eval-when (eval)
+(defmacro def-cg (fn name arglist &body body)
+  (let ((lisp::%arg-count 0)
+	(lisp::%min-args 0)
+	(lisp::%restp nil)
+	(lisp::%let-list nil)
+	(lisp::%keyword-tests nil))
+    (declare (special lisp::%arg-count lisp::%min-args lisp::%restp
+		      lisp::%let-list lisp::%keyword-tests))
+    ;; Analyze the defmacro argument list.
+    (lisp::analyze1 arglist '(cdr **form**) fn '**form**)
+    ;; Now build the body of the CG form.
+    (setq body `(let* ,(nreverse lisp::%let-list) ,@body))
+    `(progn
+      (defun ,name (**form** where) 
+	,@(if (null arglist) '((declare (ignore **form**))) nil)
+	,body)
+      (%put ',fn 'cg ',name)))))
+
+
+;;;; Bookkeeping.
+
+;;; ASSUME-EXPR is used when we encounter a function not yet declared or
+;;; defined.  We record the lowest and highest numbers of args that the
+;;; function has been called with, so that when we finally see the function 
+;;; we can at least warn that someone has lost.
+;;; The ASSUMED-EXPR property holds ( <min args seen> . <max args seen> )
+;;; If the function has a definition already, assume it is legal.
+;;; The package system should keep random user fns from crossing lisp
+;;; or compiler fns already defined.
+
+(defun assume-expr (name arg-count)
+  (unless (fboundp name)
+    (pushnew name unknown-functions)
+    (let ((counts (get name 'assumed-expr)))
+      (cond (counts 
+	     (if (< arg-count (car counts))
+		 (rplaca counts arg-count))
+	     (if (> arg-count (cdr counts))
+		 (rplacd counts arg-count)))
+	    (t (setf (get name 'assumed-expr)
+		     (cons arg-count arg-count)))))))
+
+;;; NOTE-TYPE is used to record the type of a function (Expr or
+;;; Macro) under the Declared-Function-Type property.
+
+(defun note-type (fn type)
+  (let ((old-type (get fn 'declared-function-type)))
+    (if (and old-type (not (eq type old-type)))
+	(clc-warning "Type of ~S being changed from ~S to ~S."
+		     fn old-type type))
+    (if (and (not (eq type 'expr)) (get fn 'assumed-expr))
+	(clc-warning "~S earlier assumed to be a normal function." fn))
+    (setf (get fn 'declared-function-type) type)))
+
+
+;;;; Parsing Routines
+
+;;; These parse certain complicated forms into more digestible chunks.
+
+;;; PARSE-BODY1 takes the body of a defun-like form (everything after the
+;;; varlist) and takes it apart.  Returns a list of three elements: all the
+;;; declarations, in order, then the documentation string, if any, then
+;;; the rest of the body.  Macros that may be declarations are expanded
+;;; and looked at, but are returned unexpanded.
+
+;;; This is not quite the same as the PARSE-BODY that lives in EVAL.
+
+(defun parse-body1 (body)
+  (do ((b body (cdr b))
+       (decls nil)
+       (doc nil)
+       (temp nil))
+      ((null b) (list (nreverse decls) doc nil))
+    (cond ((and (stringp (car b)) (cdr b) (null doc))
+	   (setq doc (car b)))
+	  ((not (listp (setq temp (transform (car b)))))
+	   (return (list (nreverse decls) doc b)))
+	  ((eq (car temp) 'declare)
+	   (dolist (x (cdr temp)) (push x decls)))
+	  (t (return (list (nreverse decls) doc b))))))
+
+
+;;; Parse-Body2 is the same as Parse-Body1, but works in contexts where no
+;;; doc string is allowed.  Returns a list of two elements: all the
+;;; declarations, in order, then the rest of the body.  Macros that may be
+;;; declarations are expanded and looked at, but are returned unexpanded.
+
+(defun parse-body2 (body)
+  (do ((b body (cdr b))
+       (decls nil)
+       (temp nil))
+      ((null b) (list (nreverse decls) nil))
+    (cond ((not (listp (setq temp (transform (car b)))))
+	   (return (list (nreverse decls) b)))
+	  ((eq (car temp) 'declare)
+	   (dolist (x (cdr temp)) (push x decls)))
+	  (t (return (list (nreverse decls) b))))))
+
+
+;;;; Top-Level Stuff
+
+;;; Compile-File is the major entry point for the compiler.
+
+;;; If any of :OUTPUT-FILE, :ERROR-FILE, or :LAP-FILE
+;;; are specified and non-null, use the name supplied.  A value of
+;;; T means construct a name by adding the proper type to the input
+;;; file's truename.  A value of NIL means don't generate that kind
+;;; of output.  :LAP-FILE and :ERROR-FILE default to T, the others
+;;; to NIL.
+
+(defun compile-file (&optional input-pathname 
+			  &key (output-file nil)
+			       (error-file t)
+			       (lap-file t)
+			       (errors-to-terminal t))
+  "Compiles the file identified by the Input-Pathname, producing a
+  corresponding .CFL or .LAP file.  Other options available via keywords."
+  (let ((wtime (get-internal-real-time))
+	(rtime (get-internal-run-time))
+	(unknown-functions nil)
+	(unknown-free-vars nil)
+	(functions-with-errors nil)
+	(error-count 0)
+	(warning-count 0)
+	(input-namestring nil)
+	(original-input-pathname nil)
+	(error-file-stream nil)
+	(*clc-input-stream* nil)
+	(*clc-fasl-stream* nil)
+	(*clc-err-stream* nil)
+	(*clc-lap-stream* nil)
+	(*package* *package*)
+	(*all-numbers-are-fixnums* nil)
+	(lisp::*in-the-compiler* t))
+    (declare (special lisp::*in-the-compiler*))
+    (unwind-protect
+     (progn
+      (unless input-pathname
+	(format t "~%File to compile, as a string:  ")
+	(setq input-pathname (read)))
+      ;; Make sure the specified input file exists.
+      (tagbody
+       LOOP
+	(setq original-input-pathname input-pathname)
+	(setq input-pathname (pathname input-pathname))
+	(unless (pathname-type input-pathname)
+		(setq input-pathname
+		      (modify-pathname-type input-pathname "CLISP")))
+	(unless (setq input-pathname (truename input-pathname))
+		(cerror "Prompt for new file name."
+			"Input file does not exist: ~S"
+			(namestring original-input-pathname))
+		(format t "~%Corrected file name, as a string:  ")
+		(setq input-pathname (read))
+		(go loop)))
+      ;; Note the truename of the input file.
+      (setq input-namestring (namestring input-pathname))
+      ;; Open the input stream.
+      (setq *clc-input-stream* (open input-pathname :direction :input))
+      ;; Set up the output stream.
+      (cond ((null output-file))
+	    (t (setq *clc-fasl-stream*
+		     (open (if (eq output-file t)
+			       (modify-pathname-type input-pathname "CFL")
+			       output-file)
+			   :direction :output
+			   :element-type '(unsigned-byte 8)))
+	       (init-fasl-file)))
+      ;; Set up the lap stream.
+      (cond ((null lap-file))
+	    (t (setq *clc-lap-stream*
+		     (open (if (eq lap-file t)
+			       (modify-pathname-type input-pathname "LAP")
+			       lap-file)
+			   :direction :output))
+	       (print-file-header *clc-lap-stream* input-namestring)))
+      ;; Set up the error stream.
+      (cond ((null error-file))
+	    (t (setq error-file-stream
+		     (open (if (eq error-file t)
+			       (modify-pathname-type input-pathname "ERR")
+			       error-file)
+			   :direction :output))
+	       (print-file-header error-file-stream input-namestring)
+	       (setq *clc-err-stream*
+		     (if errors-to-terminal
+			 (make-broadcast-stream *standard-output*
+						error-file-stream)
+			 error-file-stream))))
+      ;; All set up.  Let the festivities begin.	    
+      (clc-mumble "~%Compiling ~S.~%" input-namestring)
+      (readloop)
+      ;; Boy, that was quick.  All over but the shouting.
+      (clc-mumble "~2%Finished ~S.~%Wall time ~D ms; Run time ~D ms."
+		  input-namestring (- (get-internal-real-time) wtime)
+		                   (- (get-internal-run-time) rtime))
+      (unless (zerop (+ error-count warning-count))
+	      (clc-mumble "~%~S Errors, ~S Warnings."
+			  error-count warning-count))
+      (when functions-with-errors
+	(clc-mumble "~%Errors in functions:~%~S"
+		    (nreverse functions-with-errors)))
+      (when unknown-functions
+	(clc-mumble
+	 "~&(Assumed) functions, called but not declared or defined: ~%~S"
+	 (nreverse unknown-functions)))
+      (when unknown-free-vars
+	(clc-mumble
+	 "~&(Assumed) special variables, used free but not declared: ~%~S"
+	 (nreverse unknown-free-vars)))
+      (terpri)
+      nil)
+     ;; Close files.  Unwind-protect makes sure that these get closed even
+     ;; if compilation is aborted.
+     (when (streamp *clc-input-stream*) (close *clc-input-stream*))
+     (when (streamp *clc-fasl-stream*) (close *clc-fasl-stream*))
+     (when (streamp error-file-stream) (close error-file-stream))
+     (when (streamp *clc-lap-stream*) (close *clc-lap-stream*)))))
+
+;;; PRINT-FILE-HEADER prints assorted information at the start of an
+;;; ascii output file.
+
+(defun print-file-header (stream input-namestring)
+  (format stream "~%;;; CLC v~A compiling ~A~%"
+	  compiler-version input-namestring))
+
+
+;;; READLOOP reads objects from the input file one by one and passes each
+;;; to process-form for analysis and possible compilation.
+
+(defvar eof-value '(nil)
+  "A unique consed object that can be recognized as the end-of-file signal.")
+
+(defun readloop ()
+  (do ((form)
+       (*sharp-comma-seen*))
+      (nil)
+    (setq *sharp-comma-seen* nil)
+    (setq form (let ((*compiler-is-reading* t))
+		 (read *clc-input-stream* nil eof-value)))
+    (if (eq form eof-value) (return nil))
+    (let ((*currently-free-internal-variables* *free-internal-variables*)
+	  (*internal-functions* nil))
+      (process-form form))))
+
+
+;;; COMPILE is the entry point for compiling a single function with a
+;;; running Lisp.
+
+(defun compile (name &optional definition)
+  "Compiles the function whose name is Name.  If Definition is supplied,
+  it should be a lambda expression that is compiled and then placed in the
+  function cell of Name.  If Name is Nil, the compiled code object is
+  returned."
+  (let* ((old-definition (or definition (symbol-function name)))
+	 (function old-definition)
+	 (function-type 'expr)
+	 (function-name (or name (gensym)))
+	 (*compile-to-lisp* t)
+	 (*currently-free-internal-variables* *free-internal-variables*))
+    (when (and (consp function) (eq (car function) 'macro))
+	  (setq function-type 'macro)
+	  (setq function (cdr function)))
+    (unless (and (consp function) (eq (car function) 'lambda))
+	    (error "~S is not a compilable function." function-name))
+    (let* ((unknown-functions nil)
+	   (unknown-free-vars nil)
+	   (functions-with-errors nil)
+	   (error-count 0)
+	   (warning-count 0)
+	   (*clc-input-stream* nil)
+	   (*clc-fasl-stream* nil)
+	   (*clc-lap-stream* nil)
+	   (*clc-err-stream* *standard-output*)
+	   (*internal-functions* nil)
+	   (*venv* nil)
+	   (*fenv* nil)
+	   (*benv* nil)
+	   (lisp::*in-the-compiler* t))
+      (declare (special lisp::*in-the-compiler*))
+      (compile-one-lambda function)
+      (if (= error-count 0)
+	  (if name
+	      (prog1 name   ;return name
+	       (unless definition
+		(setf (get name 'previous-definition)
+		      old-definition)))
+	      (symbol-function function-name))
+	  (if *verbose*
+	      (format *clc-err-stream*
+		      "~%Horrible errors, compile aborted."))))))
+
+(defun uncompile (name)
+  "Restores the previous interpreted definition of the function
+  named by NAME, if it can find one."
+  (when (and (compiledp name)
+	     (get name 'previous-definition))
+      (setf (symbol-function name) (get name 'previous-definition))
+      (remprop name 'previous-definition)
+      name))
+
+(defun internal-compiledp (func)
+  (cond ((compiled-function-p func) t)
+	((consp func)
+	  (cond ((eq (car func) 'MACRO)
+		 (compiled-function-p (cdr func)))
+		((eq (car func) '%COMPILED-CLOSURE%) t)))
+	(t nil)))
+
+(defun compiledp (x)
+  "Predicate that is true if the argument is a compiled-function or if
+   it names one."
+  (or (internal-compiledp x)
+      (and (symbolp x)
+	   (fboundp x)
+	   (internal-compiledp (symbol-function x)))))
+
+
+;;;; Form Processing
+
+;;; PROCESS-FORM takes one Lisp object from the input file (or wherever),
+;;; transforms it (expanding any top-level macros or transforms), and then
+;;; does the appropriate top-level compiler-thing to it.
+
+(defun process-form (old-form)
+  (let ((form (transform old-form t)))
+    (unless (atom form)
+      (case (car form)
+	(defun (process-defun form))
+	(macro (process-macro form (caddr old-form)))
+	((defvar defparameter defconstant) (process-defsym form))
+	(progn (dolist (x (cdr form)) (process-form x)))
+	(proclaim (process-proclamation (cadr form)))
+	(eval-when (process-eval-when form))
+	(comment nil)
+	;; When seen at top level, these functions take effect in the
+	;; compiler's environment, as well as being dumped.
+	((make-package in-package shadow shadowing-import export
+		       unexport use-package unuse-package import)
+	 (eval form)
+	 (process-random form old-form))
+	(t (process-random form old-form))))))
+
+
+;;; Process-Eval-When  -- just bind the global eval-when switches to the
+;;; proper values and process the sub-forms.
+
+(defun process-eval-when (form)
+  (cond ((or (atom (cadr form))
+	     (eq 'quote (caadr form)))
+	 (clc-error "Ill-formed EVAL-WHEN.  Ignoring its contents.")
+	 nil)
+	(t (let ((*eval-when-compile* (memq 'compile (cadr form)))
+		 (*eval-when-load* (memq 'load (cadr form))))
+	     (dolist (x (cddr form))
+	       (process-form x))))))
+
+;;; Process-random handles random top-level forms.  
+
+(defun process-random (form &optional (old-form nil oldp))
+  (when *eval-when-compile* (eval (copy-tree (sclean form))))
+  (when *eval-when-load*
+    (cond ((or oldp (null (memq (car form) Compile-forms-list)))
+	   (if oldp (setq form old-form))
+	   (if *clc-lap-stream* (scprint form *clc-lap-stream*))
+	   (if *clc-fasl-stream* (fasl-dump-form form)))
+	  (t (let ((function-name '|Random Top-Level Form|)
+		   (function-type 'one-shot)
+		   (function `(lambda nil ,form)))
+	       (compile-one-lambda function))))))
+
+(defun process-defsym (form)
+  (proclaim `(special ,(cadr form)))
+  (when *eval-when-compile* (eval (copy-tree (sclean form))))
+  (when *eval-when-load*
+	(if *clc-lap-stream* (scprint form *clc-lap-stream*))
+	(if *clc-fasl-stream* (fasl-dump-form form))
+	(when (eq (car form) 'defconstant)
+	      (setf (get (car form) 'constant) t)
+	      (setf (get (car form) 'constval)
+		    (eval (caddr form))))))
+
+;;; Macros are always added to the compiler environment as a
+;;; lisp::macro-in-compiler property.  If *Eval-When-Compile* is on,
+;;; add it to the surrounding Lisp.  If *Eval-When-Load* is on,
+;;; compile the macro and dump it to the output file.
+
+(defun process-macro (form &optional (args nil args?))
+  (let ((function-arglist (if args? args (caddr form))))
+    (cond ((and (symbolp (cadr form))
+		(not (keywordp (cadr form))))
+	   (setf (get (cadr form) 'lisp::macro-in-compiler)
+		 (cons 'lambda (cddr form)))
+	   (when *eval-when-compile* (eval (copy-tree (sclean form))))
+	   (when *eval-when-load*
+	     (let* ((function (cons 'lambda (cddr form)))
+		    (function-type 'macro)
+		    (function-name (cadr form))
+		    (old-error-count error-count))
+	       (compile-one-lambda function)
+	       (when *verbose*
+		 (if (= error-count old-error-count)
+		     (progn
+		      (process-random
+		       `(%put ',function-name
+			      'lisp::%args-documentation
+			      ',function-arglist))
+		      (process-random
+		       `(%put ',function-name
+			      'lisp::%source-documentation
+			      (cons ',input-namestring
+				    (get ',function-name
+					 'lisp::%source-documentation))))
+		      (clc-mumble "~%~S compiled." function-name))
+		   (clc-mumble "~%~S did not compile successfully." 
+			       function-name))))))
+	  (t (clc-error "~S not a legal macro name." (cadr form))))))
+
+
+;;; If *Eval-When-Compile* is on, Process-Defun adds a definition to the
+;;; compiler.  If *Eval-When-Load* is true, the definition is compiled into
+;;; the output file.
+
+(defun process-defun (form)
+  (let ((function-name (cadr form))
+	(function-arglist (caddr form))) 
+    (cond ((and (symbolp function-name)
+		(not (keywordp function-name)))
+	   (when (get function-name 'inline-expansion)
+		 (%put function-name
+		       'inline-expansion
+		       (cons 'lambda (cddr form))))
+	   (when *eval-when-compile* (eval (copy-tree (sclean form))))
+	   (when *eval-when-load*
+		 (let ((function (cons 'lambda (cddr form)))
+		       (function-type 'expr)
+		       (old-error-count error-count))
+		   (compile-one-lambda function)
+		   (when *verbose*
+			 (if (= error-count old-error-count)
+			     (progn
+			      (process-random
+			       `(%put ',function-name
+				      'lisp::%args-documentation
+				      ',function-arglist))
+			      (process-random
+			       `(%put ',function-name
+				      'lisp::%source-documentation
+				      (cons ',input-namestring
+					    (get ',function-name
+						 'lisp::%source-documentation))))
+			      (clc-mumble "~%~S compiled." function-name))
+			     (clc-mumble "~%~S did not compile successfully." 
+					 function-name))))))
+	  (t (clc-error "~S not a legal function name." function-name)))))
+
+
+;;;; Declaration Deglutition
+
+;;; Process-proclamation is called by Process-Form at top level of compiler.
+
+(defun process-proclamation (form)
+  (setq form (eval form))
+  (cond ((not (consp form))
+	 (clc-warning "Illegal form in proclaim, ignoring it: ~S" form))
+	(t (case (car form)
+	     (special
+	      (dolist (x (cdr form))
+		(%put x 'lisp::globally-special-in-compiler t)
+		(process-random `(%put ',x 'lisp::globally-special t))))
+	     (fixnum (case (cadr form)
+		       ((t) (setq *all-numbers-are-fixnums* t))
+		       ((nil) (setq *all-numbers-are-fixnums* nil))))
+	     (ftype nil)
+	     (function nil)
+	     (inline nil)
+	     (notinline (dolist (x (cdr form))
+			  (push x *notinlines*)))
+	     (optimize)
+	     (declaration
+	      (dolist (x (cdr form))
+		(%put x 'recognized-declaration t)))
+	     (t (let ((x (car form)))
+		  (if (get x 'recognized-declaration)
+		      nil
+		      (clc-warning
+		       "~S unknown proclamation type." x))))))))
+
+;;; Binding-contour binds a bunch of specials and then processes a
+;;; list of declarations.  The pervasive declarations change the environment
+;;; by altering these specials.  Then the body is processed.
+
+;;; Normally no actual allocation occurs at the beginning of a contour,
+;;; although the usages of already-allocated stack space change here.
+;;; However, if a closure is involved, it may be necessary to create a 
+;;; new contour-level closure vector on the spot (for loops, etc).
+;;; In that case the (contour n) instruction gets replaced by the 
+;;; appropriate code.  Otherwise it is discarded.
+
+(eval-when (eval)
+(defmacro binding-contour (declarations &body body)
+  `(let* ((ignores '(ignore)) ; a temp. hack
+	  (*notinlines* *notinlines*)
+	  (*all-numbers-are-fixnums* *all-numbers-are-fixnums*)
+	  (new-type-decls nil)
+	  (new-specials nil)
+	  (*free-temps* *free-temps*)
+	  (*hand* (1+ *hand*))
+	  (old-cvh *cvh*)
+	  (*cvh* (grab-a-temp))
+	  (*cenv* (acons *cvh* nil *cenv*))
+	  (old-venv *venv*)
+	  (*venv* *venv*)
+	  (old-fenv *fenv*)				;[Victor] new
+	  (*fenv* *fenv*)				;[Victor] new
+	  (*benv* (cons (cons 'specbind 0) *benv*))
+	  *contour-pointer*)
+     (process-declarations ,declarations)
+     (setq *contour-pointer*
+	   (inst-out `(contour ,(car *cenv*) ,old-cvh ,*qref*)))
+     ,@body)))
+     
+;;; Process declarations at the start of a binding contour.
+
+(defun process-declarations (dlist)
+  (dolist (d dlist)
+    (if (not (consp d))
+	(clc-warning "Illegal form in Declare, ignoring it: ~S" d)
+	(case (car d)
+	  (special
+	   (dolist (x (cdr d))
+	     (test-varname x)
+	     (push x new-specials)
+	     (push (cons x (make-venv t (make-const x))) *venv*)
+	     (setq unknown-free-vars
+		   (delq x unknown-free-vars))))
+	  (fixnum (case (cadr d)
+		    ((t) (setq *all-numbers-are-fixnums* t))
+		    ((nil) (setq *all-numbers-are-fixnums* nil))))
+	  ((type ftype function inline) nil)
+	  (notinline (dolist (x (cdr d))
+		       (push x *notinlines*)))
+	  (ignore (dolist (x (cdr d))
+		    (test-varname x)
+		    (push x ignores)))
+	  (arglist (setq function-arglist (cadr d)))
+	  (optimize nil)
+	  (declaration
+	   (dolist (x (cdr d))
+	     (setf (get x 'recognized-declaration) t)))
+	  (t (let ((x (car d)))
+	       (cond ((memq x type-names)
+		      (dolist (y (cdr d))
+			(test-varname y)
+			(push (cons y x) new-type-decls)))
+		     ((get x 'recognized-declaration))
+		     (t (clc-warning
+			 "~S unknown declaration type." x)))))))))
+
+
+;;; Complain about any unreferenced locals.  Call only within a binding
+;;; contour.
+
+(defun check-used ()
+  (do ((x *venv* (cdr x)))
+      ((eq x old-venv))
+    (cond ((venv-usedp (cdar x)))
+	  ((venv-specialp (cdar x)))
+	  ((memq (caar x) ignores))
+	  (t (clc-warning "~S bound but not referenced in ~S."
+			  (caar x) function-name)))))
+
+;;;[Victor]
+(defun check-used-fns ()
+  ()
+;;; Do you want this, really?
+;  (do ((x *fenv* (cdr x)))
+;      ((eq x old-fenv))
+;    (cond ((fenv-usedp (cdar x)))
+;	  ((memq (caar x) ignores))
+;	  (t (clc-warning "~S defined but not used in ~S."
+;			  (caar x) function-name))))
+  )
+
+;;;; Compile-One-Lambda
+
+;;; Compile-One-Lambda compiles one lambda, does post-processing and
+;;; peephole optimization, then passes the code off to be assembled and
+;;; dumped, depending on what kind of output is to be produced. 
+
+;;; If there are embedded #'(lambda ...) calls, these result in recursive
+;;; calls to COMPILE-ONE-LAMBDA.
+
+(defun compile-one-lambda (form)
+  (let* ((lap-code (list '(code-start)))
+	 (entry-points nil)
+	 (constants-list nil)
+	 (nconstants 0)
+	 (*restp* nil)
+	 (*label-counter* 0)
+	 (*encloses* nil)
+	 (old-error-count error-count)
+	 (vars-griped-about nil)
+	 (arglist (cadr form))
+	 (*temps* (list (gensym "TEMP")))
+	 (*free-temps* *temps*)
+	 (*xstemps* nil)
+	 (max-args 0)
+	 (min-args 0)
+	 (*nargs-on-stack* 0)
+	 (body (parse-body1 (cddr form)))
+	 (decls (car body))
+	 (doc (cadr body)))
+    (setq body (caddr body))
+    (setq body `(block ,function-name ,@body))
+    (when doc
+      (process-random `(%put ',function-name 'lisp::%fun-documentation ',doc)))
+    (binding-contour decls
+      (cg-lambda-list arglist)
+      (inst-out `(top-contour ,(car *cenv*) ,old-cvh))
+      (cg-form body 'tail)
+      (unless (zerop (cdr (assq 'specbind *benv*)))
+	      (inst-out `(unbind ,(cdr (assq 'specbind *benv*)))))
+      (inst-out `(dealloc ,(length *temps*)))
+      (inst-out '(popj p))
+      (if (> *reach* *grasp*) (closure-vectors-go-home))
+      (if *encloses* (generate-closure-vectors))
+      (setq lap-code (nreverse lap-code))
+      (setf (get function-name 'pss1) (make-lap-function (copy-tree lap-code)))
+      (optimize)
+      (fix-qrefs)
+      (setq entry-points (nreverse entry-points))
+      (setq constants-list (nreverse constants-list))
+      (setq unknown-functions (delq function-name unknown-functions))
+      (check-used)
+      (if (eq function-type 'closure)
+	  (setq function-type 'expr))
+      (unless (eq function-type 'one-shot)
+	      (note-type function-name function-type))
+      (setq lap-code (make-lap-function lap-code))
+      (if *clc-lap-stream* (laprint lap-code *clc-lap-stream*))
+;; [don't] output fasl-file
+      (if *clc-fasl-stream* (make-fasl lap-code))
+      (if *compile-to-lisp* (eval lap-code)
+	  (push lap-code *internal-functions*)))))
+
+(defun make-lap-function (lap-code)
+  `(lap ,function-name ,function-type
+    (entry-points ,entry-points ,@(if *restp* '(rest)))
+    ,constants-list
+    . ,lap-code))
+
+;;; The following is an pretty outrageous printer for LAP code.
+
+(defun laprint (list stream)
+  (let ((*package* *clc-package*) (xpkg *package*))
+    (format stream "~2%#_(~S " (car list))
+    (let ((*package* xpkg)) (format stream "#0_~S " (cadr list)))
+    (format stream "~S" (caddr list))
+    (setq list (cdddr list))
+    (format stream "~%~7T~S" (car list))
+    (let ((*package* xpkg))
+      (format stream "~%~7T#0_")
+      (if *sharp-comma-seen*
+	  (prin1-sharp-dot (cadr list) stream)
+	  (format stream "~S" (cadr list))))
+    (format stream "~%~7T~S~%" (caddr list))
+    (if *lap-pretty-print*				;[Victor] Save disk?
+	(dolist (y (cdddr list))
+	  (if (eq (car y) 'label) (format stream "~&~S" y)
+	    (format stream "~13T~S~%" y)))
+      (dolist (y (cdddr list))
+	  (if (eq (car y) 'label) (format stream "~&~S" y)
+	    (format stream " ~S~%" y))))
+    (format stream ")~%")))
+
+
+
+;;;; Lambda Lists, Quaternions, and the Phlogiston Theory
+
+;;; CG-LAMBDA-LIST processes the extended-format arglist for a lambda.
+;;; This is called within the binding-contour call for a Lambda being compiled.
+;;; Code to do the actual binding is extruded into LAP-CODE, and the
+;;; corresponding data structures are built up, particularly *VENV*.
+;;; Tags for the various entry points are pushed on the ENTRY-POINTS list.
+
+;;; NB: The treatment of entry points here differs considerably from that
+;;; of the previous versions of this compiler.  Entry points are 
+;;; deposited for each arg.  The entry point is output before the arg
+;;; processing, and is the entry for which that arg is the first missing
+;;; arg.  Thus each required arg puts out a "too-few-args" entry point,
+;;; each optional arg puts out the e.p. that points to its default init
+;;; code.  At least seven entry points are output;  the last are
+;;; "too-many-args" is that is the case.
+;;; If more than 7 entry points are produced, it is expected that Lap
+;;; will fold the extra ones into a jump-table.  Someday the compiler
+;;; itself may do that.
+
+(defun cg-lambda-list (arglist)
+  (let ((ff-code nil)
+	(vars-upstream nil)
+	(skip-tag nil))
+    (do* ((a arglist (cdr a))
+	  (arg (car a) (car a))
+	  (b '(o1 o2 o3 o4 o5) (cdr b))
+	  (reg (car b) (or (car b) (grab-a-temp))))
+	((atom a) (finish-frame nil max-args))
+      (cond ((eq arg '&optional) (return (cg-optional (cdr a) reg)))
+	    ((eq arg '&rest) (return (cg-rest (cdr a) nil reg)))
+	    ((eq arg '&key)
+	     ;; Add an imaginary &rest arg before the &key.
+	     (return (cg-rest (cons (new-internal-variable) a) nil reg)))
+	    ((eq arg '&aux) (finish-frame nil max-args)
+			    (return (cg-bind-auxen (cdr a))))
+	    ((eq arg '&allow-other-keys)
+	     (clc-warning "Stray &allow-other-keys in lambda-list, ignoring."))
+	    ((cg-required-arg arg reg))))
+    ;; all args compiled, do some cleaning up
+    (cond ((null *xstemps*))
+	  ;; splice allocated vars into temps list
+	  ((eq *temps* *free-temps*)
+	   (setq *temps* (nconc *xstemps* *temps*)))
+	  (t (do ((x *temps* (cdr x)))
+		 ((eq *free-temps* (cdr x))
+		  (setf (cdr x) (nconc *xstemps* *free-temps*))))))
+    ;; there must be at least one "too-many-args" EP.
+    (unless *restp* (push '2-many entry-points))
+    ;; at least 7 entry points, please
+    (do () ((>= (length entry-points) 7)) (push '2-many entry-points))))
+
+;;; Finish-Frame completes the call frame.   Output the
+;;; ALLOC pseudo instruction which will get fixed *after* pass 2 when 
+;;; we know how many places are needed on the stack for temp vars.
+;;; Following this, a copy of the prefix code is deposited.  If a Skip-Tag 
+;;; is supplied, someone wants to jump over all this because the frame
+;;; was completed earlier along another branch.  
+
+(defun finish-frame (skip-tag nargs)
+  (unless *restp* (entry-out))
+  (inst-out `(alloc ,(max 0 (- nargs 5))))
+  (setq lap-code (append ff-code lap-code))
+  (if skip-tag (inst-out `(label ,skip-tag))))
+
+
+;;; CG-BIND-AUXEN binds a list of &AUX args as for a LET*.
+
+(defun cg-bind-auxen (aux-list)
+  (dolist (v aux-list)
+    (cond ((symbolp v) (cg-bind v nil))
+	  ((atom (cdr v)) (cg-bind (car v) nil))
+	  ((null (cddr v)) (cg-bind (car v) (cadr v)))
+	  (t (clc-error "Bad item after &AUX: ~S" v)))))
+
+
+;;; CG-REQUIRED-ARG processes a single symbol as a required argument.
+;;; If the arg is special, gernerate code to do the binding and put this
+;;; into the Ff-code list.  We must arrange for each of the entry
+;;; points to execute Ff-code once.  Often, we can delay depositing
+;;; this code until after all of the entry points have been passed, and
+;;; therefore just create one copy.  However, if we run into an optional
+;;; argument init that might look at a variable bound upstream or any
+;;; occurrence of a supplied-p variable, we deposit the prefix code
+;;; at once and complete the call frame by pushing NIL for all locals.
+;;; Once this has been done, we must deposit this same code at each entry
+;;; point farther on.
+
+(defun cg-required-arg (v given)
+  (push '2-few entry-points)
+  (cg-bind-arg v given)
+  (push (cons v given) vars-upstream)
+  (setq max-args (1+ max-args)
+	min-args (1+ min-args)))
+
+
+;;; CG-BIND-ARG sets up the *VENV* entry for an argument to be bound.
+;;; If the arg is special or if it is a lexical that becomes a closure,
+;;; we need to move the arg value from the stack to somewhere else.
+
+(defun cg-bind-arg (var given &optional home ff-flag &aux entry)
+  (if (and (not (regp given)) (symbolp given))
+      (setf (get given 'gt5arg) t))
+  (cond ((not (test-varname var)) nil)
+	((setq entry (specialp-here var))
+	 ;; var is special
+	 (incf (cdr (assq 'specbind *benv*)))
+	 (setq home (venv-home (cdr entry)))
+	 (ff-out `(spec-bind (special ,home)))
+	 (cond ((regp given) (ff-out `(movem ,given (special ,home))))
+	       (t (ff-out `(move o6 ,given 0))
+		  (ff-out `(movem o6 (special ,home))))))
+	;; var is lexical
+	(t (unless home
+		   (setq home (if (regp given) (new-var-temp t) given)))
+	   (setq entry (cons var (make-venv nil home)))
+	   (push entry *venv*)
+	   (if (regp given) (ff-out `(movem ,given ,home 0))
+	       (unless (equal given home)
+		       (ff-out `(move o6 ,given)) ;assume given is const
+		       (ff-out `(movem o6 ,home 0))))))))
+
+;;; is a var special?  return venv entry or nil
+;;; this is for use only when binding the var
+(defun specialp-here (var &aux entry)
+  (cond ((memq var new-specials)
+	 ;; The entry should already be on *VENV*.
+	 (setq entry (assq var *venv*)))
+	((or (get var 'lisp::globally-special)
+	     (get var 'lisp::globally-special-in-compiler))
+	 (setq entry (cons var (make-venv t (make-const var))))
+	 (push entry *venv*)
+	 entry)
+	(t nil)))
+
+;;; CG-BIND emits the code to bind a variable to a value.   Does lots of
+;;; bookkeeping in the environment.  Call this only within a binding
+;;; contour.  If HOME is supplied, use that as the home for the variable
+;;; if it is lexical.  Else, grab a new local slot.  Return the venv
+;;; entry that the value was bound to.
+;;; if val is a register, the value is found there. otherwise it is a 
+;;; lisp form: compile it.
+
+(defun cg-bind (var val &optional home)
+  (let (entry (homep home))
+    (cond ((not (test-varname var)) nil)
+	  ((setq entry (specialp-here var))
+	   (setq home (venv-home (cdr entry)))
+	   (incf (cdr (assq 'specbind *benv*)))
+	   (cond ((or (eq var val) (regp val)))
+		 (homep (inst-out `(move o1 ,val ,*qref*)))
+		 ((and (consp val) (eq 'popreg (car val))))
+		 (t (cg-form val 'o1)))
+	   (inst-out `(spec-bind (special ,home)))
+	   (cond ((eq var val))
+		 ((and (consp val) (eq 'popreg (car val)))
+		  (inst-out `(pop ,(cadr val) (special ,home))))
+		 (t (inst-out `(movem ,(if (regp val) val 'o1)
+				      (special ,home)))))
+	   entry)
+	  (t (setq entry (cons var (make-venv nil (or home (grab-a-temp)))))
+	     (cond ((regp val)
+		    (inst-out `(movem ,val ,(venv-home (cdr entry)) ,*qref*)))
+		   ((and (consp val) (eq 'popreg (car val)))
+		    (inst-out `(pop ,(cadr val)
+				    ,(venv-home (cdr entry)) ,*qref*)))
+		   (home)
+		   (t (cg-form val (venv-home (cdr entry)))))
+	     (push entry *venv*)
+	     entry))))
+
+;;; CG-OPTIONAL takes the portion of an arglist after the &OPTIONAL flag
+;;; and continues digesting it.
+
+(defun cg-optional (arglist given)
+  (do* ((a arglist (cdr a))
+	(arg (car a) (car a))
+	(b (memq given '(o1 o2 o3 o4 o5)) (cdr b))
+	(reg given (or (car b) (grab-a-temp))))
+       ((atom a) (finish-frame skip-tag max-args))
+    (cond ((eq arg '&rest)
+	   (return (cg-rest (cdr a) skip-tag reg)))
+	  ((eq arg '&key)
+	   (return (cg-rest (cons (new-internal-variable) a) nil reg)))
+	  ((eq arg '&aux)
+	   (finish-frame skip-tag max-args)
+	   (return (cg-bind-auxen (cdr a))))
+	  ((eq arg '&allow-other-keys)
+	   (clc-warning "Stray &allow-other-keys in lambda-list, ignoring."))
+	  ((eq arg '&optional)
+	   (clc-error "&Optional appears more than once.")
+	   (return nil))
+	  ((atom arg)
+	   (cg-optional-arg arg nil nil reg))
+	  ((atom (cdddr arg))
+	   (cg-optional-arg (car arg) (cadr arg) (caddr arg) reg))
+	  (t (clc-error "Illegal item in arglist: ~S" arg)))))
+
+
+;;; CG-OPTIONAL-ARG gets the three elements of an optional argument plus
+;;; a skip tag or NIL.  If there is a skip tag, it means that someone
+;;; upstream has already executed the prefix code and completed the
+;;; frame and wants to skip any repetition of that code.  If the init
+;;; for this optional might reference variables bound upstream or if
+;;; there is a supplied-p variable, we have to dump the prefix code
+;;; and finish the frame here.  Any function call in the init is
+;;; assumed to reference vars upstream.
+
+(defun cg-optional-arg (v init vp given)
+  (cond ((and (null skip-tag)
+	      (null vp)
+	      (easyp init (if (regp given) given 'push)))
+	 ;; Frame is not finished but it is safe to go on this way.
+	 (push (cons v given) vars-upstream)
+	 ;; Arrange to move it later if necessary.
+	 (cg-bind-arg v given)
+	 (incf max-args))
+	;; We must finish the frame for code entering here.
+	(t (finish-frame skip-tag max-args)
+	   ;; now environment is there, we can compile the default value
+	   (cg-form init given)
+	   ;; bind the arg thereunto both here and hereafter
+	   (cg-bind-arg v given nil t)
+	   (when vp (cg-bind-arg vp (conref t) (new-var-temp nil))
+		    (inst-out `(movem nil ,@(varref vp))))
+	   (inst-out `(jrst ,(setq skip-tag (new-label))))
+	   (incf max-args)))))
+
+;;; output an entry point.  There's no need to know what it was.
+(defun entry-out (&aux (tag (new-label)))
+  (push tag entry-points)
+  (inst-out `(label ,tag)))
+
+;;; CG-REST receives the part of the arglist after &REST and a skip-tag if
+;;; earlier arguments have deposited prefix code and completed the frame.
+
+(defun cg-rest (arglist skip-tag given)
+  (prog (v excess-tag entry-tag)
+    (cond ((atom arglist)
+	   (clc-error "Ill-formed &REST arg.")
+	   (return nil))
+	  ((memq (setq v (car arglist))
+		 '(&optional &rest &key &aux &allow-other-keywords))
+	   (clc-error "~S in illegal place in arglist." v)
+	   (return nil))
+	  ((not (test-varname v))
+	   (return nil)))
+    (setq *restp* t)
+    (setq excess-tag (new-label))
+    (entry-out)
+    (retnil given)
+    (inst-out `(jrst ,excess-tag))
+    (cond ((< max-args 6)
+	   (do ((n max-args (1+ n)))
+	       ((= n 5) (entry-out)
+			(inst-out `(movei w2 ,max-args))
+			(inst-out `(icall restx)))
+	       (entry-out)
+	       (inst-out `(movei w2 ,(1+ (- n max-args))))
+	       (inst-out `(icall ,(nth n '(rest1 rest2 rest3
+					   rest4 rest5))))
+	       (inst-out `(jrst ,excess-tag))))
+	  (t (entry-out)
+	     (inst-out `(movei w2 ,max-args))
+	     (inst-out `(icall restn))))
+    (inst-out `(label ,excess-tag))
+    (if skip-tag (fix-final-optional given))
+    (cg-bind-arg v given)
+    (finish-frame nil (1+ max-args))
+    (cond ((atom (cdr arglist)))
+	  ((eq (cadr arglist) '&key)
+	   (cg-keys (cddr arglist) v))
+	  ((eq (cadr arglist) '&aux)
+	   (cg-bind-auxen (cddr arglist)))
+	  (t (clc-error "Illicit substances after &REST arg.")))))
+
+;;; This is for the special case where there are optionals which
+;;; require emitting the ff-code before the rest var.  It is necessary
+;;; to default the rest var to nil in the optional processing, and 
+;;; put the skip-tag label in the ff-code (!) before the rest var
+;;; is bound.
+
+(defun fix-final-optional (spot &aux ff-flag)
+  (inst-out-splice (member `(jrst ,skip-tag) lap-code :test #'equal)
+		   (if (regp spot) `((move ,spot nil))
+		       `((movem nil ,spot 0))))
+  (ff-out `(label ,skip-tag)))
+
+;;; CG-KEYS deposits code to bind the keyword variables to the proper
+;;; arguments or default values.  Varlist is everything following &KEY
+;;; in the lambda-list.  Rest-var is the name of the &rest variable.
+;;; This always exists and has already been set up.  The frame has been
+;;; completed.
+
+(defun cg-keys (varlist rest-var)
+  (let ((check-keywords *check-keywords-at-runtime*)
+	key item)
+    (do ((vl varlist (cdr vl))
+	 (seen-keywords nil (cons key seen-keywords)))
+	((atom vl)
+	 (if check-keywords
+	     (cg-form `(lisp::keyword-test ,rest-var ',seen-keywords) nil)))
+      (setq item (car vl))
+      (cond ((eq item '&aux)
+	     (if check-keywords
+		 (cg-form `(lisp::keyword-test ,rest-var ',seen-keywords) nil))
+	     (return (cg-bind-auxen (cdr vl))))
+	    ((eq item '&allow-other-keys)
+	     (setq check-keywords nil))
+	    ((symbolp item)
+	     (setq key (lisp::make-keyword item))
+	     (cg-key item key nil nil rest-var))
+	    ((atom item)
+	     (clc-error "Non-symbol used as variable name."))
+	    ((symbolp (car item))
+	     (setq key (lisp::make-keyword (car item)))
+	     (cg-key (car item) key (cadr item) (caddr item) rest-var))
+	    ((and (consp (car item))
+		  (symbolp (caar item))
+		  (consp (cdar item))
+		  (symbolp (cadar item)))
+	     (setq key (caar item))
+	     (cg-key (cadar item) key (cadr item) (caddr item) rest-var))
+	    (t (clc-error "Ill-formed keyword item in lambda list."))))))
+
+;;; Emit the code to check for a keyword.  searches the &rest var for the
+;;; keyword, substitutes the default value if not found, sets the 
+;;; supplied-p variable appropriately if present.
+
+(defun cg-key (var key init varp rest-var)
+  (let ((tag (new-label)) (loop (new-label)))
+    (when varp (cg-bind varp t))
+    (cg-atomic rest-var 'o2)
+    (inst-out `(label ,loop))
+    (inst-out `(dmove o3 0 o2))
+    (inst-out `(dmove o1 0 o4))
+          ;; slightly more efficient code for simplest case
+    (cond ((and (null init) (null varp))
+	   (inst-out `(came o3 ,(conref key)))
+	   (inst-out `(jumpn o4 ,loop)))
+	  (t (inst-out `(camn o3 ,(conref key)))
+	     (inst-out `(jumpa ,tag))
+	     (inst-out `(jumpn o2 ,loop))
+	     (if varp (inst-out `(movem nil ,@(varref varp))))
+	     (cg-form init 'o1)
+	     (inst-out `(label ,tag))))
+    (cg-bind var 'o1)))
+
+;;; [Victor]
+;;; CG-BIND-FN emits the code to bind a function name to a closure.
+;;; Call this only within a binding contour.
+;;; Return the fenv entry that the function was bound to.
+
+(defun cg-bind-fn (fun home from)
+  (let (entry)
+    (setq entry (cons fun (make-fenv (if (listp home) t	;MacroP
+				       nil)
+				     (or home (grab-a-temp)))))
+    (push entry *fenv*)
+    (when from (set-bound-fn fun from))
+    entry))
+
+;;; SET-BOUND-FUN is used to set up FENV-HOME in a FENV entry.
+(defun set-bound-fn (fun from)
+  (let ((entry (assq fun *fenv*)))
+    (inst-out `(movem ,from ,(fenv-home (cdr entry)) ,*qref*))))
+;;; End [Victor]
+
+
+;;;; (I'm good but not) Easyp
+;;; See if we can compile a form without screwing up the registers
+
+(defun easyp (form where)
+  (let (fn temp)
+    (setq form (transform form))
+    (cond ((atom form)
+	   (entry-out)
+	   (easy-atomic form where)			t)
+	  ((eq (setq fn (car form)) 'quote)
+	   (entry-out)
+	   (cg-constant (cadr form) where)		t)
+	  ;; Is there a special code generator for this form?
+	  ((setq temp (get fn 'easy))
+	   (entry-out)
+	   (funcall temp form where)			t)
+	  (t						nil))))
+
+;;; EASY-ATOMIC produces code for atomic forms.  Only atoms to be evaluated
+;;; should get in here.  Go tags are picked off elsewhere. 
+
+(defun easy-atomic (form where)
+  (cond ((or (numberp form)
+	     (characterp form)
+	     (stringp form)
+	     (bit-vector-p form))
+	 (cg-constant form where))
+	((not (symbolp form))
+	 (clc-error "Illegal atomic form to eval: ~S" form)
+	 nil)
+	((null form) (cg-constant form where))
+	((eq form t) (cg-constant form where))
+	((keywordp form) (cg-constant form where))
+	(t (case where
+	     (predicate (inst-out `(skipn nil ,@(easyref form))))
+	     (inv-predicate (inst-out `(skipe nil ,@(easyref form))))
+	     ((o1 o2 o3 o4 o5 o6) (inst-out `(move ,where ,@(easyref form))))
+	     ((tail multiple) (inst-out `(move o1 ,@(easyref form)))
+			      (inst-out '(movei n 1)))
+	     (push (inst-out `(push q ,@(easyref form))))
+	     (t (inst-out `(move o6 ,@(easyref form)))
+		(inst-out `(movem o6 ,where
+				  ,@(if (stakp where) `(,*qref*)))))))))
+
+;;; return the appropriate object to reference a variable with,
+;;; either (SPECIAL n) or the stack location name
+
+(defun easyref (form)
+  (let (entry)
+    (cond ((setq entry (cdr (assq form vars-upstream)))
+	   (if (regp entry) `(,entry) `(,entry ,*qref*)))
+	  ((or (get form 'lisp::globally-special-in-compiler)
+	       (get form 'lisp::globally-special))
+	   `((special ,(make-const form))))
+	  (t (unless (memq form vars-griped-about)
+		     (clc-warning "~S not declared or bound, assuming special."
+				  form)
+		     (pushnew form unknown-free-vars)
+		     (push form vars-griped-about))
+	     `((special ,(make-const form)))))))
+
+
+;;;; Transform
+
+;;; Transform does assorted source-to-source transformations before we get
+;;; down to the real business of compiling a form.
+
+;;; Transform takes a form, checks for the proper length if this is known,
+;;; and applies any macros, inline expansions or lisp-to-lisp transforms
+;;; that have been defined for the form.  If anything gets changed, we run
+;;; the new form through again until quiescence is reached.  A single
+;;; function may have multiple transforms, and we are not done until all
+;;; have passed the form with no changes.
+
+;;; A transform that doesn't want to change the form should return %PASS%.
+;;; If called while processing a top-level form, decline to transform
+;;; certain special forms.
+
+(defun transform (form &optional at-top-level)
+  (prog (temp)
+    loop
+    (cond ((symbolp form)
+	   (return (transform-symbol form)))
+	  ((atom form) (return form))
+	  ((not (symbolp (car form)))
+	   (cond ((and (consp (car form)) (eq (caar form) 'lambda))
+		  ;; Turn car-position lambda form into equivalent let form.
+		  ;; Lambdas containing &key become Apply forms.
+		  (setq form
+			(if (memq '&key (cadar form))
+			    `(funcall (function ,(car form)) ,@(cdr form))
+			    `(let ,(lambda-to-let (cadar form) (cdr form))
+				   ,@(cddar form))))
+		  (go loop))
+		 ;; Some bogus thing in car of the form.
+		 (t (clc-error
+		     "Function must be a symbol or lambda form: ~S"
+		     (car form))
+		    (return nil))))
+	  ;; If at "top level", don't transform certain things.
+	  ((and at-top-level (memq (car form) '(defun macro eval-when
+				     defconstant defvar defparameter)))
+	   (return form))
+	  ;; [Victor] a local function?
+	  ((and *fenv* (setq temp (cdr (assq (car form) *fenv*))))
+	   (cond ((not (fenv-macrop temp))	;[Victor] make funcall
+		  (setq form `(funcall (function ,(car form)) ,@(cdr form)))
+		  (return form))
+		 (t (setq form (funcall (fenv-home temp) form))
+		    (go loop))))				
+	  ;; Macros seen by the compiler are recorded as 
+	  ;; LISP::MACRO-IN-COMPILER.
+	  ;; These get priority over any macros lying around in the Lisp.
+	  ((setq temp (get (car form) 'lisp::macro-in-compiler))
+	   (setq form (funcall temp form))
+	   (go loop))
+	  ;; Might be defined as a macro in this Lisp environment.
+	  ((setq temp (macro-function (car form)))
+	   (cond ((eql (car form) 'declare)
+		  ;; Declare hack since declare is a macro in our version.
+		  (return form))
+		 (t (setq form (funcall temp form))
+		    (go loop))))
+	  ;; Replace synonyms.
+	  ((setq temp (get (car form) 'synonym))
+	   (setq form (cons temp (cdr form)))
+	   (go loop))
+	  ;; Now run transforms, and repeat the loop if any of them fire.
+	  ((do ((trans (get (car form) 'clc-transforms) (cdr trans)))
+	       ((null trans) nil)
+	     (setq temp (funcall (car trans) form))
+	     (unless (eq temp '%pass%)
+		     (setq form temp)
+		     (return t)))
+	   ;; If the transform changed anything, go around again.
+	   (go loop))
+	  ;; No transforms or all of them passed.  Done.
+	  (t (return form)))))
+
+
+;;; Transform-symbol handles symbols for transform.  If the symbol is a
+;;; defconstant in the compiler or in the surrounding Lisp, and if the
+;;; value is simple enough, replace the form with the value.  Else just
+;;; return the form.
+
+(defun transform-symbol (form)
+  (cond ((get form 'lisp::constant-in-compiler)
+	  (let ((temp (get form 'lisp::constant-value)))
+	    (cond ((or (characterp temp)
+		       (numberp temp)
+		       (and (listp temp)
+			    (eq (car temp) 'quote)
+			    (symbolp (cadr temp))))
+		   temp)
+		  (t form))))
+	 ((get form 'lisp::%constant)
+	  (let ((temp (symbol-value form)))
+	    (cond ((or (numberp temp)
+		       (characterp temp))
+		   temp)
+		  ((symbolp temp)
+		   (list 'quote temp))
+		  (t form))))
+	 (t form)))
+
+
+;;;; Basic Code-Generation Loop.
+
+;;; CG-Form generates code for a single form, anything but a top-level
+;;; lambda.  The second arg, for this and all the specific form-compiling
+;;; functions, indicates where the value the form produces is to be placed.
+;;; possible values are:  NIL, don't bother to return a value;
+;;; PREDICATE, meaning do a skip if true, no skip if false; INV-PREDICATE,
+;;; do the reverse; PUSH, push the result on Q; TAIL; MULTIPLE; O1; ...
+;;; O6; gensyms indicating temps on the stack; and variable names in
+;;; the lists of locals or specials.
+
+;;; The form is first transformed, then code is
+;;; deposited on the Lap-code list.  In a few cases, such as references to
+;;; lexical variables, the exact code to be deposited cannot be determined
+;;; until the whole form has been processed.  In such cases, a pseudo-code
+;;; is placed on the Lap list.  A quick second pass resolves these codes
+;;; into real instruction sequences.
+
+(defun cg-form (form where)
+  (let* (fn temp)
+    (setq form (transform form))
+    (cond ((atom form) (cg-atomic form where))
+	  ((eq (setq fn (car form)) 'quote)
+	   (cg-constant (cadr form) where))
+	  ;; Is the function declared notinline?
+	  ((memq fn *notinlines*) (cg-expr-call form where))
+	  ;; Is there a special code generator for this form?
+	  ((setq temp (get fn 'cg))
+	   (funcall temp form where))
+	  ;; Known to be an expr?
+	  ((eq (setq temp (get fn 'declared-function-type)) 'expr)
+	   (cg-expr-call form where))
+	  ;; Else, assume that it is an expr.
+	  (t (assume-expr fn (length (cdr form)))
+	     (cg-expr-call form where)))))
+
+
+;;; CG-CONSTANT adds its arg to the constants list and generates code to
+;;; reference this constant.
+
+(defun cg-constant (form where)
+  (case where
+    ((nil) nil)
+    (predicate (if form (inst-out '(skipa))))
+    (inv-predicate (if (null form) (inst-out '(skipa))))
+    ((tail multiple) (inst-out `(move o1 ,(conref form)))
+		     (inst-out '(movei n 1)))
+    ((o1 o2 o3 o4 o5 o6) (inst-out `(move ,where ,(conref form))))
+    (push (inst-out `(push q ,(conref form))))
+    (t (inst-out `(move o5 ,(conref form)))
+       (inst-out `(movem o5 ,where ,@(if (stakp where) `(,*qref*)))))))
+
+;;; CG-ATOMIC produces code for atomic forms.  Only atoms to be evaluated
+;;; should get in here.  Go tags are picked off elsewhere. 
+
+(defun cg-atomic (form where)
+  (cond ((not where)
+	 (let ((entry (assq form *venv*)))
+	   (if entry (setf (venv-usedp (cdr entry)) t)))
+	 nil)
+	((null form) (retnil where))
+	((eq form t) (rett where))
+	((or (numberp form)
+	     (characterp form)
+	     (stringp form)
+	     (bit-vector-p form))
+	 (cg-constant form where))
+	((not (symbolp form))
+	 (clc-error "Illegal atomic form to eval: ~S" form)
+	 nil)
+	((keywordp form) (cg-constant form where))
+	(t (case where
+	     (predicate (inst-out `(skipn nil ,@(varref form))))
+	     (inv-predicate (inst-out `(skipe nil ,@(varref form))))
+	     ((tail multiple) (inst-out `(move o1 ,@(varref form)))
+			      (inst-out '(movei n 1)))
+	     ((o1 o2 o3 o4 o5 o6)
+	      (inst-out `(move ,where ,@(varref form))))
+	     (push (inst-out `(push q ,@(varref form))))
+	     (t (inst-out `(move o5 ,@(varref form)))
+		(inst-out `(movem o5 ,where
+				  ,@(if (stakp where) `(,*qref*))))))))))
+
+;;; [Victor]
+;;; CG-FUNREF is used to reference a closed function.
+;;; (All these cases probably don't even work, and may be bogus)
+(defun cg-funref (form where)
+  (case where
+    (predicate (inst-out `(skipn nil ,@(funref form))))
+    (inv-predicate (inst-out `(skipe nil ,@(funref form))))
+    ((tail multiple) (inst-out `(move o1 ,@(funref form)))
+		     (inst-out '(movei n 1)))
+    ((o1 o2 o3 o4 o5 o6)
+     (inst-out `(move ,where ,@(funref form))))
+    (push (inst-out `(push q ,@(funref form))))
+    (t (inst-out `(move o5 ,@(funref form)))
+       (inst-out `(movem o5 ,where
+			 ,@(if (stakp where) `(,*qref*)))))))
+;;; End [Victor]
+
+;;; used in various cg-foo fns:
+
+(defun rett (where)
+  (case where
+    ((nil) nil)
+    (predicate (inst-out '(skipa)))
+    (inv-predicate nil)   ; don't skip
+    ((tail multiple) (inst-out `(move o1 ,(conref t)))
+		      (inst-out '(movei n 1)))
+    ((o1 o2 o3 o4 o5 o6) (inst-out `(move ,where ,(conref t))))
+    (push (inst-out `(push q ,(conref t))))
+    (t (inst-out `(move o5 ,(conref t)))
+       (inst-out `(movem o5 ,where ,@(if (stakp where) `(,*qref*)))))))
+
+(defun retnil (where)
+  (case where
+    ((nil) nil)
+    (predicate nil)    ; don't skip
+    (inv-predicate (inst-out '(skipa)))
+    ((tail multiple) (inst-out `(move o1 nil))
+		      (inst-out '(movei n 1)))
+    ((o1 o2 o3 o4 o5 o6) (inst-out `(move ,where nil)))
+    (push (inst-out '(push q nil)))
+    (t (inst-out `(movem nil ,where ,@(if (stakp where) `(,*qref*)))))))
+
+(defun reto1 (where)
+  (case where
+    ((nil o1) nil)
+    (predicate (inst-out '(skipn nil o1)))
+    (inv-predicate (inst-out '(skipe nil o1)))
+    ((tail multiple) (inst-out '(movei n 1)))
+    ((o2 o3 o4 o5 o6) (inst-out `(move ,where o1)))
+    (push (inst-out '(push q o1)))
+    (t (inst-out `(movem o1 ,where ,@(if (stakp where) `(,*qref*)))))))
+
+;;; if we have multiple values in the registers with n set
+;;; acts like one val in o1 unless caller wants m.vals
+(defun retregs (where)
+  (case where
+    ((nil o1 tail multiple) nil)
+    (predicate (inst-out '(skipn nil o1)))
+    (inv-predicate (inst-out '(skipe nil o1)))
+    ((o2 o3 o4 o5 o6) (inst-out `(move ,where o1)))
+    (push (inst-out '(push q o1)))
+    (t (inst-out `(movem o1 ,where ,@(if (stakp where) `(,*qref*)))))))
+
+(defun retmem (form where)
+  (let ((ref (cond ((atom form) `(,form ,*qref*))
+		   ((numberp (car form)) form)
+		   (t `(,form)))))
+    (case where
+      ((nil) nil)
+      (predicate (inst-out `(skipn nil ,@ref)))
+      (inv-predicate (inst-out `(skipe nil ,@ref)))
+      ((tail multiple) (inst-out `(move o1 ,@ref))
+		       (inst-out '(movei n 1)))
+      ((o1 o2 o3 o4 o5 o6)
+       (inst-out `(move ,where ,@ref)))
+      (push (inst-out `(push q ,@ref)))
+      (t (inst-out `(move o5 ,@ref))
+	 (inst-out `(movem o5 ,where
+			   ,@(if (stakp where) `(,*qref*))))))))
+
+;;; return the appropriate object to reference a variable with,
+;;; either (SPECIAL n) or the stack location name
+;;; The value returned includes stack loc and register--normally
+;;; Q, which is indicated by the current value of *qref*, or,
+;;; in the case of a closure var, an offset and o6.
+;;; Varref itself emits the code in such cases to set o6 up with the
+;;; closure vector pointer, so beware how it is called!
+
+(defun varref (form)
+  (let (entry temp)
+    (cond ((setq entry (cdr (assq form *venv*)))
+	   (setf (venv-usedp entry) t)
+	   (cond ((venv-specialp entry)
+		  `((special ,(make-const form))))
+		 ;; this is a reference to a closed variable
+		 ((not (= (venv-reach entry) *reach*))
+		  (setq *grasp* (min *grasp* (venv-reach entry)))
+		  (unless (venv-cvx entry)
+			  (setq temp (assq (venv-cvh entry) *cenv*))
+			  (or (cdr temp) (rplacd temp 0))
+			  (setf (venv-cvx entry) (incf (cdr temp))))
+		  (inst-out `(move o6 ,(venv-cvh entry) ,*qref*))
+		  `(,(venv-cvx entry) o6))
+		 ;; This is a normal local variable.
+		 (t `(,(venv-home entry) ,*qref*))))
+	  ((or (get form 'lisp::globally-special-in-compiler)
+	       (get form 'lisp::globally-special))
+	   `((special ,(make-const form))))
+	  (t (unless (memq form vars-griped-about)
+		     (clc-warning "~S not declared or bound, assuming special."
+				  form)
+		     (pushnew form unknown-free-vars)
+		     (push form vars-griped-about))
+	     `((special ,(make-const form)))))))
+
+;;; [Victor]
+;;; return the appropriate object to reference a function with,
+;;; either (CONSTANT f) or the stack location name
+;;; The value returned includes stack loc and register--normally
+;;; Q, which is indicated by the current value of *qref*, or,
+;;; in the case of a closure fun, an offset and o6.
+;;; Funref itself emits the code in such cases to set o6 up with the
+;;; closure vector pointer, so beware how it is called!
+
+(defun funref (form)
+  (let (entry temp)
+    (cond ((setq entry (cdr (assq form *fenv*)))
+	   (setf (fenv-usedp entry) t)
+	   (cond ;; This is a macro. Can't use it as a function.
+	         ((fenv-macrop entry)
+		   (clc-error "~S locally defined to be a macro." form))
+		 ;; this is a reference to a closed function
+		 ((not (= (fenv-reach entry) *reach*))
+		  (setq *grasp* (min *grasp* (fenv-reach entry)))
+		  (unless (fenv-cvx entry)
+			  (setq temp (assq (fenv-cvh entry) *cenv*))
+			  (or (cdr temp) (rplacd temp 0))
+			  (setf (fenv-cvx entry) (incf (cdr temp))))
+		  (inst-out `(move o6 ,(fenv-cvh entry) ,*qref*))
+		  `(,(fenv-cvx entry) o6))
+		 ;; This is a normal local function.
+		 (t `(,(fenv-home entry) ,*qref*))))
+	  (t `(,(conref form))))))
+;;; End [Victor]
+
+;;; Generate code for a call to a random EXPR.  
+
+(defun cg-expr-call (form where)
+  (compile-args (cdr form))
+  (inst-out `(call ,(car form) ,(length (cdr form))))
+  (retregs where))
+
+;;; compile the code that leaves the args in the registers for a 
+;;; function call.
+
+(defun compile-args (args)
+  (let ((la (length args)) limits)
+    (cond ((null args) nil)
+	  ((> la 5) (compile-args-gt5 args))
+	  ((= la 1) (cg-form (car args) 'o1))
+	  (t (enough-temps la)
+	     (do ((*free-temps* *free-temps* (cdr *free-temps*))
+		  (args args (cdr args)))
+		 ((null (cdr args))
+		  (cg-form (car args) (nth la '(nil o1 o2 o3 o4 o5))))
+	       (cg-form (car args) (car *free-temps*))
+	       (push lap-code limits))
+	     (do ((x '(o1 o2 o3 o4 o5) (cdr x))
+		  (y *free-temps* (cdr y))
+		  (z (nreverse limits) (cdr z))
+		  (i 1 (1+ i)))
+		 ((= i la))
+	       (inst-out-load (car x) (car y) (car z)))))))
+
+(defun compile-args-gt5 (args)
+   (enough-temps 5)
+   (do ((*free-temps* *free-temps* (cdr *free-temps*))
+	(args args (cdr args))
+	(i 0 (1+ i))
+	(oft *free-temps*))
+       ((= i 5)
+	;; this do must be inside the other for the *free-temp* binding
+	(do ((args args (cdr args))
+	     (*qref* *qref* (1- *qref*)))
+	    ((null args)  ; and this for the *qref* binding
+	     (do ((x '(o1 o2 o3 o4 o5) (cdr x))
+		  (y oft (cdr y)))
+		 ((null x))
+	       (inst-out `(move ,(car x) ,(car y) ,*qref*))))
+	  (cg-form (car args) 'push)))
+     (cg-form (car args) (car *free-temps*))))
+
+;;; this is where we sneak in the optimizer.
+;;; NB: this code depends on the fact that
+;;; there is no instruction besides MOVEM that is used to change
+;;; temp stack locations.
+
+(defun inst-out-load (to from limit)
+  ;; sometimes a limit gets edited out on a prev optimization
+  (if (tailp limit lap-code)
+      (let* ((x (car limit)) (y (cadr limit))
+	     (source (caddr y)) flag)
+	 (cond ((and (eq (caddr x) from)
+		     (eq (cadr x) (cadr y))
+		     (eq (car x) 'movem)
+		     (eq (car y) 'move)
+		     (or (memq source *temps*)
+			(and (consp source) (eq (car source) 'constant))))
+		(setq flag t))
+	       ((and (eq (caddr x) from)
+		     (eq (cadr x) nil)
+		     (eq (car x) 'movem))
+		(setq flag t)
+		(setq source nil)))
+	 (if flag
+	     (do* ((ox nil x)
+		   (x lap-code (cdr x))
+		   (temp (car x) (car x)))
+		  ((eq x limit)
+	      (cond ((null source)
+		     (rplacd ox (cdr x))
+		     (inst-out `(move ,to nil)))
+		    (t (if ox (rplacd ox (cddr x)) (setq lap-code (cddr x)))
+		       (inst-out `(move ,to ,source ,@(and (symbolp source)
+							   (list *qref*)))))))
+		  (if (and (eq (car temp) 'movem)
+			   (or (eq (caddr temp) source)
+			       (eq (caddr temp) from)))
+		      (return (inst-out `(move ,to ,from ,*qref*)))))
+	     (inst-out `(move ,to ,from ,*qref*))))
+      (inst-out `(move ,to ,from ,*qref*))))
+
+
+
+(defun generate-closure-vectors (&aux junk temp (clovar (make-hash-table))
+				      (clofun (make-hash-table)))
+  (do ((x *venv* (cdr x)))
+      ((eq x old-venv))
+    (if (venv-cvx (cdar x)) (setf (gethash (venv-home (cdar x)) clovar)
+				  (cdar x))))
+  (do ((x *fenv* (cdr x)))		;[Victor] Check *fenv* too
+      ((eq x old-fenv))
+    (if (fenv-cvx (cdar x)) (setf (gethash (fenv-home (cdar x)) clofun)
+				  (cdar x))))
+  (do* ((lc lap-code (cdr lc))
+	(inst (car lc) (car lc))
+	(op (car inst) (car inst))
+	(reg (cadr inst) (cadr inst))
+	(addr (caddr inst) (caddr inst))
+	(qref (cadddr inst) (cadddr inst)))     
+       ((eq lc *contour-pointer*)
+	(if (and (eq op 'contour) (cdr reg) (null junk))
+	    (inst-out-stomp lc `((move w2 ,(conref (1+ (cdr reg))))
+				 (move o6 ,addr ,qref)
+				 (icall alloc-closure-vector)
+				 (movem w3 ,(car reg) ,qref)))))
+     (cond ((eq op 'top-contour)
+	    (setq junk `((move w2 ,(conref (1+ (cdr reg))))
+			 ,(if (> *reach* *grasp*)
+			      '(move o6 0 o6)
+			      '(move o6 nil))
+			 (icall alloc-closure-vector)
+			 (movem w3 ,(car reg) 0))))
+	   ((setq temp (gethash addr clovar))
+	    (inst-out-stomp lc `((move o6 ,(venv-cvh temp) ,qref)
+				 (,op ,reg ,(venv-cvx temp) o6))))
+	   ((setq temp (gethash addr clofun))	;[Victor] and for fenv too
+	    (inst-out-stomp lc `((move o6 ,(fenv-cvh temp) ,qref)
+				 (,op ,reg ,(fenv-cvx temp) o6)))))
+     (when (eq (caadr lc) 'alloc)
+	   (setq temp (cdr lc))
+	   (inst-out-splice lc (copy-tree junk))
+	   (setq lc temp))))
+
+(defun closure-vectors-go-home (&aux junk ctemps tlc)
+  (dolist (x (cdr *cenv*))
+    (push `(move o6 0 o6) junk)
+    (when (and (cdr x) (> (cdr x) 0)) (push `(movem o6 ,(car x) 0) junk)
+	                              (push (car x) ctemps)))
+  (do ((x junk (cdr x))) ((or (null x) (eq 'movem (caar x)))
+			  (setq junk x)))
+  (setq junk (nreverse junk))
+  (if *encloses* (setq junk (cdr junk)))
+  (do ((lc lap-code (cdr lc)))
+      ((null lc))
+    (when (eq (caadr lc) 'alloc)
+	  (setq tlc (cdr lc))
+	  (inst-out-splice lc (copy-tree junk))
+	  (setq lc tlc)))
+ (if ctemps (setq *temps* (nconc ctemps *temps*))))
+
+;;; Stack Reference Fixup.
+;;; This function passes over the code changing the gensyms used to 
+;;; reference a stack loc to an offset from q.  If q had been bumped to
+;;; put extra args to a fn being called, that will have been reflected by
+;;; making the "offreg" a number indicating how much q was bumped.
+;;; We also set the "alloc" and "dealloc" instructions to their proper
+;;; form.
+
+(defun fix-qrefs ()
+  (cond ((null *temps*) (do ((lc lap-code (cdr lc)))
+			    ((null lc))
+			  (if (memq (caadr lc) '(alloc dealloc))
+			      (rplacd lc (cddr lc)))))
+	(t (setq *temps* (nreverse *temps*))
+	   (let ((n (length *temps*)))
+	     (do* ((lc lap-code (cdr lc))
+		   (inst (car lc) (car lc))
+		   (opcode (car inst) (car inst))
+		   (reg (cadr inst) (cadr inst))
+		   (loc (caddr inst) (caddr inst))
+		   (offreg (cadddr inst) (cadddr inst)))
+		  ((null (cdr lc)))
+		  (cond ((eq opcode 'alloc)
+			 (setf (car lc) `(addi q ,(- n reg))))
+			((eq opcode 'dealloc)
+			 (setf (car lc) `(subi q ,n)))
+			((numberp offreg)
+			 (setf (caddr inst) (- offreg (position loc *temps*)))
+			 (setf (cadddr inst) 'q))
+			((and loc (symbolp loc) (stakp loc))
+			 (error "missing qref in ~S" inst))))))))
+
+
+
+;;; FUNCTION
+
+;;; This is where Lisp gets its delusions of being an applicative language.
+;;; FUNCTION acts like QUOTE unless its arg is a lambda expression.
+;;; In that case, it compiles the expression recursively under an assumed
+;;; name, and returns the name.  Most of the folderol below is because the 
+;;; generated function is likely to be a closure, ie to reference variables
+;;; bound in the lexically surrounding function.  Throw enough switches
+;;; so that things get allocated right.
+
+(def-cg function cg-function (arg)
+    (cg-function1 arg (breakoff-name) where 'closure))
+
+(defun cg-function1 (arg name where what &aux grasp)
+  (cond ((symbolp arg)
+	 (cg-funref arg where))		;[Victor] Neat hack
+	((and (consp arg)
+	      (consp (cdr arg))
+	      (eq (car arg) 'lambda))
+	 ;; Compile the lambda under an assumed name.  This sees the
+	 ;; surrounding lexical environment and leaves tracks if that
+	 ;; environment is actually used.
+	 (let* ((function-name name)
+		(function-type what)
+		(*reach* (1+ *reach*))
+		(*grasp* *reach*))
+	   (let ((*qref* 0))		;[Victor] 
+	     (compile-one-lambda arg))
+	   (setq grasp *grasp*)
+	   (if (> *reach* *grasp*)
+	       (deposit-generate-closure name where)
+	       (cg-constant name where)))
+	 (setq *grasp* (min grasp *grasp*)))
+	(t (clc-error "Ill-formed arg to FUNCTION: ~S" arg))))
+
+(defun deposit-generate-closure (name where)
+  (setq *encloses* t)
+  (dolist (x *cenv*) (or (cdr x) (rplacd x 0)))
+  (cg-constant name 'o1)
+  (inst-out `(move o2 ,*cvh* ,*qref*))
+  (inst-out `(icall clogen))
+  (reto1 where))
+
+;; FUNCALL
+(def-cg funcall cg-funcall (fn &rest args)
+  (let* ((*free-temps* *free-temps*)
+	 (tfn (grab-a-temp)))
+    (cg-form fn tfn)
+    (compile-args args)
+    (inst-out `(move o6 ,tfn ,*qref*))
+    (inst-out `(fcall ,(length args)))
+    (retregs where)))
+
+
+;;;; *** Here begin the code generators for particular special forms. ***
+
+;;; DEFUN inside a non-null lexical environment--
+;;; We do a hack for this to get the environment passed to the closure.
+;;; The problem is that the normal calling convention for functions
+;;; with global definitions is over-optimized and doesn't pass enough
+;;; info to reconstruct the lexical environment.  We thus compile two 
+;;; functions, a closure which is the real function, and a vestibule
+;;; function which calls the closure using funcall, thus allowing it to 
+;;; work properly.  The vestibule bears the global name from the defun.
+
+(def-cg defun cg-defun (name &rest body)
+  (let* ((closure (breakoff-name)) (vestibule (breakoff-name))
+         (*free-temps* *free-temps*) (keep (grab-a-temp)))
+    (cg-function1 `(lambda ,@body) closure `(special ,vestibule) 'closure)
+    (compile-transparent-function vestibule)
+    (cg-form `(%sp-set-definition ',name (symbol-function ',vestibule)) nil)
+    (cg-form `',name where)))
+
+(defun compile-transparent-function (function-name)
+  (let* ((function-type 'expr) (entry-points '(0 1 2 3 4 5 6))
+	 (*restp* nil) (constants-list nil)
+	 (lap-code `((code-start))))
+    (dolist (n entry-points)
+      (setq lap-code (nconc lap-code
+			    (copy-tree `((label ,n)
+					 (move o6 (special ,function-name))
+					 (fcall ,n)
+					 (popj p))))))
+    (setq lap-code (make-lap-function lap-code))
+    (if *clc-lap-stream* (laprint lap-code *clc-lap-stream*))
+;; [don't] output fasl-file
+    (if *clc-fasl-stream* (make-fasl lap-code))
+    (if *compile-to-lisp* (eval lap-code)
+	(push lap-code *internal-functions*))))
+
+;;;; SETQ & FRIENDS.
+
+;;; This code generator handles only the two-arg form of SETQ.  A transform
+;;; turns multi-pair SETQ into the single-pair form.
+
+(def-cg setq cg-setq (var val)
+  (test-varname var)
+  (cg-form val 'o1)
+  (inst-out `(movem o1 ,@(varref var)))
+  (reto1 where))
+
+(def-cg psetq cg-psetq (&rest pairs)
+  (let ((n (floor (length pairs) 2)))
+    (unless (= (* 2 n) (length pairs))
+	    (clc-error "Unmatched pairs in PSETQ"))
+    (cond ((= n 1) (test-varname (car pairs))
+		   (cg-form (cadr pairs) 'o1)
+		   (inst-out `(movem o1 ,@(varref (car pairs)))))
+	  (t (enough-temps n)
+	     (do ((*free-temps* *free-temps* (cdr *free-temps*))
+		  (pairs pairs (cddr pairs)))
+		 ((null pairs))
+	       (cg-form (cadr pairs) (car *free-temps*)))
+	     (do ((*free-temps* *free-temps* (cdr *free-temps*))
+		  (pairs pairs (cddr pairs)))
+		 ((null pairs))
+	       (inst-out `(move o1 ,(car *free-temps*) ,*qref*))
+	       (inst-out `(movem o1 ,@(varref (car pairs)))))))
+    (retnil where)))
+
+(def-cg multiple-value-setq cg-multiple-value-setq (varlist mv-form)
+  (cond ((atom varlist) (cg-form mv-form nil))
+	(t (mapc #'test-varname varlist)
+	   (cg-form mv-form 'multiple)
+	   (inst-out `(adjust-values ,(length varlist)))
+	   (do ((vl varlist (cdr vl))
+		(x '(o1 o2 o3 o4 o5) (cdr x)))
+	       ((null (and vl x)))
+	     (inst-out `(movem ,(car x) ,@(varref (car vl)))))
+	   (setup-mvp (length varlist))
+	   (do ((vl (reverse (nthcdr 5 varlist)) (cdr vl)))
+	       ((null vl))
+	     (inst-out `(pop w2 ,@(varref (car vl)))))))
+  (reto1 where))
+
+
+;;;; LET & FRIENDS.
+
+;;; LET* establishes a binding contour and then binds the variables to
+;;; the inits one by one.
+
+(def-cg let* cg-let* (varlist &rest forms)
+  (let* ((pb (parse-body2 forms))
+	 (decls (car pb))
+	 (body (cadr pb))
+	 (result nil)
+	 (owhere (when (or (memq where '(predicate inv-predicate))
+			   (and (consp where) (eq 'special (car where))))
+		       (prog1 where (setq where 'o1)))))
+    (binding-contour decls
+      (dolist (v varlist)
+	(cond ((symbolp v) (cg-bind v nil))
+	      ((atom (cdr v)) (cg-bind (car v) nil))
+	      ((null (cddr v)) (cg-bind (car v) (cadr v)))
+	      (t (clc-error "Bad item in Let* binding list: ~S" v))))
+      (cg-progn-body body where)
+      (check-used)
+      (unless (zerop (cdr (assq 'specbind *benv*)))
+	      (inst-out `(unbind ,(cdr (assq 'specbind *benv*)))))
+      (if owhere (reto1 owhere))
+      (if *encloses* (generate-closure-vectors)))))
+
+;;; LET is similar, but pushes all the values on the stack, then pops them
+;;; off and binds them.
+
+(def-cg let cg-let (varlist &rest forms)
+  (let* ((pb (parse-body2 forms))
+	 (decls (car pb))
+	 (body (cadr pb))
+	 (vars nil)
+	 (vals nil)
+	 (owhere (when (or (memq where '(predicate inv-predicate))
+			   (and (consp where) (eq 'special (car where))))
+		       (prog1 where (setq where 'o1)))))
+    (binding-contour decls
+      (dolist (v varlist)
+	(cond ((or (symbolp v) (and (atom (cdr v)) (setq v (car v))))
+	       (push (grab-a-temp) vals)
+	       (retnil (car vals))
+	       (push v vars))
+	      ((null (cddr v)) (push (grab-a-temp) vals)
+			       (cg-form (cadr v) (car vals))
+			       (push (car v) vars))
+	      (t (clc-error "Bad item in Let binding list: ~S" v))))
+      (setq vars (nreverse vars))
+      (setq vals (nreverse vals))
+      (do* ((v (car vars) (car vars))
+	    (vars (cdr vars) (cdr vars))
+	    (val (car vals) (car vals))
+	    (vals (cdr vals) (cdr vals)))
+	   ((null v))
+	   (cg-bind v val val))
+      (cg-progn-body body where)
+      (check-used)
+      (unless (zerop (cdr (assq 'specbind *benv*)))
+	      (inst-out `(unbind ,(cdr (assq 'specbind *benv*)))))
+      (if owhere (reto1 owhere))
+      (if *encloses* (generate-closure-vectors)))))
+
+;;; bind explicit vars to mv's
+
+(def-cg multiple-value-bind cg-multiple-value-bind
+        (varlist mv-form &body forms)
+  (cg-form mv-form 'multiple)
+  (inst-out `(adjust-values ,(length varlist)))
+  (let* ((pb (parse-body2 forms))
+	 (decls (car pb))
+	 (body (cadr pb))
+	 (owhere (when (or (memq where '(predicate inv-predicate))
+			   (and (consp where) (eq 'special (car where))))
+		       (prog1 where (setq where 'o1)))))
+    (binding-contour decls
+      (do ((i '(o1 o2 o3 o4 o5) (cdr i))
+	   (v varlist (cdr v)))
+	  ((or (null v) (null i)))
+	(cg-bind (car v) (car i)))
+      (setup-mvp (length varlist))
+      (do ((v (reverse (nthcdr 5 varlist)) (cdr v)))
+	  ((null v))
+	(cg-bind (car v) '(popreg w2)))
+      (cg-progn-body body where)
+      (check-used)
+      (unless (zerop (cdr (assq 'specbind *benv*)))
+	      (inst-out `(unbind ,(cdr (assq 'specbind *benv*)))))
+      (if owhere (reto1 owhere))
+      (if *encloses* (generate-closure-vectors)))))
+
+(defun setup-mvp (n)
+  (when (> n 5)
+    (inst-out '(move w2 mvp))
+    (inst-out `(addi w2 ,n))))    
+
+;;; COMPILER-LET binds its variables as specials during compilation.
+
+(def-cg compiler-let cg-compiler-let (varlist &rest body)
+  (let ((vars nil)
+	(varinits nil))
+    (dolist (v varlist)
+      (cond ((symbolp v)
+	     (push v vars)
+	     (push nil varinits))
+	    ((atom (cdr v))
+	     (push (car v) vars)
+	     (push nil varinits))
+	    ((null (cddr v))
+	     (push (car v) vars)
+	     (push (eval (cadr v)) varinits))
+	    (t (clc-error "Bad item in Let binding list: ~S" v)
+	     (push (car v) vars)
+	     (push nil varinits))))
+    ;; Now bind all vars before compiling body.
+    (progv (nreverse vars) (nreverse varinits)
+      (cg-progn-body body where))))
+
+
+;;;; FLET and friends.
+;;;[Victor says:]
+;;; End all hackery about local functions.  Do it just like local variables!
+
+(def-cg flet cg-flet (deflist &rest forms)
+  (let* ((pb (parse-body1 forms))
+	 (decls (first pb))
+	 ;;(docstr (second pb))
+	 (body (third pb)))
+    (binding-contour decls
+      (do ((defs deflist (cdr defs))
+	   (old-env *fenv*)
+	   (name (breakoff-name) (breakoff-name))
+	   (temp (grab-a-temp) (grab-a-temp)))
+	  ((atom defs)
+	   ;; Compile the functions.  THEN set up the new fenv and compile
+	   ;; the body.
+	   (cg-progn-body body where)
+	   (check-used-fns)
+	   (if *encloses* (generate-closure-vectors)))
+	(let ((*fenv* old-env))				;Compile in old env
+	  (cg-function1 `(lambda ,@(cdar defs))
+			name
+			'o1
+			'auxiliary))
+	(cg-bind-fn (caar defs) temp 'o1)))))
+
+(def-cg labels cg-labels (deflist &rest forms)
+  (let* ((pb (parse-body1 forms))
+	 (decls (first pb))
+	 ;;(docstr (second pb))
+	 (body (third pb))
+	 (names nil))
+    (binding-contour decls
+      ;;  Set up the new fenv.  THEN compile the functions and the body.
+      (dolist (def deflist)
+	(let ((temp (grab-a-temp)))
+	  (cg-bind-fn (car def) temp nil)
+	  (push (cons (car def) (breakoff-name)) names)))
+      (dolist (def deflist)
+	(cg-function1 `(lambda ,@(cdr def))
+		      (cdr (assq (car def) names))
+		      'o1
+		      'auxiliary)
+	(set-bound-fn (car def) 'o1))
+      (cg-progn-body body where)
+      (check-used-fns)
+      (if *encloses* (generate-closure-vectors)))))
+
+(def-cg macrolet cg-macrolet (deflist &rest forms)
+  (let* ((pb (parse-body1 forms))
+	 (decls (first pb))
+	 ;;(docstr (second pb))
+	 (body (third pb)))
+    (binding-contour decls
+      (do ((defs deflist (cdr defs))
+	   (old-env *fenv*))
+	  ((atom defs)
+	   (cg-progn-body body where)
+	   (check-used-fns)
+	   (if *encloses* (generate-closure-vectors)))
+	(cg-bind-fn (caar defs)
+		    (cons 'lambda
+			  (cddr (let ((*fenv* old-env))
+				  (macroexpand		;expand in old env
+				   `(defmacro ,@(car defs))))))
+		    nil)))))
+
+;;;; BLOCK and RETURN
+
+;;; See the explanation with the *BENV* structure definition.
+
+(def-cg block cg-block (name &rest forms)
+  (let* ((end-tag (new-label))
+	 (struct (make-benv end-tag where))
+	 (entry (list* 'block name struct))
+	 (*benv* (cons entry *benv*))
+	 (begin (inst-out '(continue)))
+	 (owhere (when (or (memq where '(predicate inv-predicate))
+			   (and (consp where) (eq 'special (car where))))
+		       (prog1 where (setq where 'o1)))))
+    ;; Compile all the sub-forms as a progn.
+    (cg-progn-body forms where)
+    ;; See if anybody had to turn this into a catch
+    (when (benv-catch-tag struct)
+	  ;; insert the catch code
+	  (inst-out-splice begin
+	     `((move o1 ,(conref (benv-catch-tag struct)))
+	       (icall ccatch)
+	       (jumpa ,end-tag)))
+	  (inst-out '(popj p))
+	  ;; put code at all trans-block jumps to handle it
+	  (dolist (x (benv-fixups struct))
+	    (inst-out-splice x '((subi p 3)
+			         (subi sp 4)
+				 (pop p w2)
+				 (icall unbind)
+				 (subi p 1)))))
+    (inst-out `(label ,end-tag))
+    (if owhere (reto1 where))))
+
+(def-cg return-from cg-return-from (name &optional (value nil))
+  (let (blocked home)
+    (do* ((b *benv* (cdr b)))
+	 ((null b) (clc-error "Return to unseen block name: ~S" name))
+       (case (caar b)
+	 (block (when (eq name (cadar b))
+		      (setq home (car b))
+		      (setq where (benv-where (cddr home)))
+		      (return nil)))
+	 (gulf (setq blocked t))
+	 (t nil)))
+    (if blocked (let ((tag (or (benv-catch-tag (cddr home))
+			       (setf (benv-catch-tag (cddr home))
+				     (setq tag (new-label))))))
+		  (comp-throw tag value))
+	;; if not blocked
+	(progn (cg-form value where)	; compile the return value
+          (do* ((b *benv* (cdr b))
+		(entry (car b) (car b))
+		(struct nil))
+	       ((eq entry home) (setq struct (cddr entry))
+		(push (inst-out '(continue)) (benv-fixups struct))
+		(cond ((memq where '(predicate inv-predicate))
+		       (inst-out `(jumpa ,(benv-end-tag struct)))
+		       (inst-out `(jrst1 ,(benv-end-tag struct))))
+		      (t (inst-out `(jrst ,(benv-end-tag struct))))))
+            ;; all the following may be thrown away.  Here's from where:
+	    (setq code-dump lap-code)
+	    ;; Look for the target Block entry on the *BENV* list.
+	    (case (car entry)
+	      (block (setq struct (cddr entry))
+		     (if (benv-catch-tag struct) (inst-out-delete-catch-blip)
+			 (push (inst-out '(continue)) (benv-fixups struct))))
+	      (tagbody (setq struct (cddr entry))
+		       (if (tenv-catch-tag struct) (inst-out-delete-catch-blip)
+			   (push (inst-out '(continue)) (tenv-fixups struct))))
+	      (specbind (unless (zerop (cdr entry))
+				(inst-out `(unbind ,(cdr entry)))))
+	      (gt5 (inst-out `(subi q ,(cdr entry))))
+	      (catch (inst-out-delete-catch-blip))
+	      (t (error "Compiler bug in RETURN[-FROM]"))))))))
+
+;;; award winner for smallest function with largest name
+(defun inst-out-delete-catch-blip ()
+  (inst-out '(subi p 3))
+  (inst-out '(subi sp 4))
+  (inst-out '(pop p w2))
+  (inst-out '(icall unbind))
+  (inst-out '(subi p 1)))
+
+;;;; TAGBODY and GO.
+
+;;; See the description with the *BENV* structure definition.
+
+(def-cg tagbody cg-tagbody (&rest forms)
+  (let* ((tags nil)
+	 (tagstructs nil)
+	 (struct (make-tenv))
+	 (entry nil)
+	 (*benv* *benv*)
+	 (begin (inst-out '(continue)))
+	 (tag1 (new-label))
+	 (tag2 (new-label))
+	 (tag3 (new-label)))
+    ;; Pre-scan to build structures for all tags in this body.
+    (do ((f forms (cdr f)) (i 0))
+	((atom f))
+      (when (or (symbolp (car f)) (integerp (car f)))
+	(if (memq (car f) tags)
+	    (clc-error "Tag ~s appears more than once in a tagbody." (car f))
+	    (progn
+	     (push (car f) tags)
+	     (push (cons (car f) (make-tag (new-label) (incf i)))
+		   tagstructs)))))
+    (setq entry (list* 'tagbody tags struct))
+    (setf (tenv-tags struct) tagstructs)
+    (setq *benv* (cons entry *benv*))
+    ;; Now compile the forms.  None are for value.
+    (do ((f forms (cdr f)))
+	((atom f))
+      (cond ((or (symbolp (car f)) (integerp (car f)))
+	     (inst-out `(label ,(tag-label (cdr (assq (car f) tagstructs))))))
+	    ((atom (car f))
+	     (clc-warning "Atom in tagbody not a legal tag: ~s" (car f)))
+	    (t (cg-form (car f) nil))))
+    ;; Complain about any unused tags.
+    (dolist (ts tagstructs)
+      (when (null (tag-usedp (cdr ts)))
+	    (clc-warning "~s unused tag in tagbody." (car ts))))
+    ;; See if anybody had to turn this into a catch
+    (when (tenv-catch-tag struct)
+	  ;; insert the catch code at beginning
+	  (inst-out-splice begin
+	     `((move o1 ,(conref (tenv-catch-tag struct)))
+	       (icall ccatch)
+	       (jumpa ,tag1)))
+	  ;; .. and jumptable at the end
+	  (inst-out-delete-catch-blip)	   ; falling thru rtns nil
+	  (inst-out `(jrst ,tag3))
+	  (inst-out `(label ,tag1))
+	  (inst-out '(hrrz w2 o1))
+	  (inst-out `(jrst ,tag2 w2))
+	  (inst-out `(label ,tag2))
+	  (dolist (x tagstructs)
+	    (inst-out `(jumpa ,(tag-label (cdr x)))))
+	  ;; put code at all trans-block jumps to handle the catch blip
+	  (dolist (x (benv-fixups struct))
+	    (inst-out-splice x '((subi p 3) (subi sp 4) 
+				 (pop p w2) (icall unbind) (subi p 1))))
+	  ;; final label, return nil if we ran off the end
+	  (inst-out `(label ,tag3)))
+    (retnil where)))
+
+(def-cg go cg-go (tag)
+  (do* ((b *benv* (cdr b))
+	(entry (car b) (car b))
+	(struct nil)
+	(tstruct nil)
+	(blocked nil)
+	(discard-useless-preface lap-code))
+       ((null b) (clc-error "Go to unseen tag: ~S" tag))
+    (case (car entry)
+      (block (setq struct (cddr entry))
+	     (if (benv-catch-tag struct) (inst-out-delete-catch-blip)
+		 (push (inst-out '(continue)) (benv-fixups struct))))
+      (tagbody (setq struct (cddr entry))
+       (if (setq tstruct (cdr (assq tag (tenv-tags struct))))
+	   (if blocked
+	       (let ((ctag (or (tenv-catch-tag struct)
+			       (setf (tenv-catch-tag struct)
+				     (setq ctag (new-label))))))
+		 (setf (tag-usedp tstruct) t)
+		 (setq lap-code discard-useless-preface)
+		 (comp-throw tag (tag-index tstruct)))
+	       ;; if not blocked
+	       (progn (setf (tag-usedp tstruct) t)
+		      (push (inst-out '(continue)) (tenv-fixups struct))
+		      (inst-out `(jrst ,(tag-label tstruct)))))
+	   ;; this tag not found at this level
+	   (if (tenv-catch-tag struct) (inst-out-delete-catch-blip)
+	       (push (inst-out '(continue)) (tenv-fixups struct))))
+       (if tstruct (return nil)))
+      (specbind (unless (zerop (cdr entry))
+			(inst-out `(unbind ,(cdr entry)))))
+      (gt5 (inst-out `(subi q ,(cdr entry))))
+      (catch (inst-out-delete-catch-blip))
+      (gulf (setq blocked t)))))
+
+
+;;;; CONTROL STRUCTURE
+
+(def-cg the cg-the (type value)
+  (declare (ignore type))
+  (cg-form value where))
+
+(def-cg progn cg-progn (&rest forms)
+  (cg-progn-body forms where))
+
+(defun cg-progn-body (forms where)
+  (if (atom forms)
+      (cg-form nil where)		; Empty body
+      (do ((f forms (cdr f)))           ; Normal progn
+	  ((atom (cdr f))
+	   (cg-form (car f) where))	; return value of last form
+	(cg-form (car f) nil))))
+
+(def-cg prog1 cg-prog1 (form1 &rest forms)
+  (if forms (let ((*free-temps* *free-temps*) (rv (car *free-temps*)))
+	      (enough-temps 2)
+	      (cg-form form1 rv)
+	      (setq *free-temps* (cdr *free-temps*))
+	      (dolist (f forms) (cg-form f nil))
+	      (retmem rv where))
+      (cg-form form1 where)))
+
+(def-cg prog2 cg-prog2 (form1 form2 &rest forms)
+  (cg-form form1 nil)
+  (if forms (let ((*free-temps* *free-temps*) (rv (car *free-temps*)))
+	      (enough-temps 2)
+	      (cg-form form2 rv)
+	      (setq *free-temps* (cdr *free-temps*))
+	      (dolist (f forms) (cg-form f nil))
+	      (retmem rv where))
+      (cg-form form2 where)))
+
+(def-cg multiple-value-prog1 cg-mvprog1 (form1 &rest forms)
+  (cg-form form1 'multiple)
+  (inst-out '(icall push-values))
+  (dolist (f forms) (cg-form f nil))
+  (inst-out '(icall pop-values))
+  (retregs where))
+
+;; take a mv form and return a list
+(def-cg multiple-value-list cg-multiple-value-list (form)
+  (cg-form form (and where 'multiple))
+  (if where (inst-out '(icall values-to-list)))
+  (reto1 where))
+
+;; values-list is called as a normal expr
+
+(def-cg multiple-value-call cg-multiple-value-call (fn &rest forms)
+  (let* ((*free-temps* *free-temps*)
+	 (fnsav (grab-a-temp)))
+    (cg-form fn fnsav)
+    (dolist (f forms)
+      (cg-form f 'multiple)
+      (inst-out '(icall push-values)))
+    (inst-out `(move o1 ,fnsav ,*qref*))
+    (inst-out `(movei n ,(length forms)))
+    (inst-out '(icall values-call))
+    (retregs where)))
+
+(def-cg values cg-values (&rest values)
+  (compile-args values)
+  (if (< (length values) 6)
+      (if (atom values)
+	  (inst-out `(setzb o1 n))
+          (inst-out `(movei n ,(length values))))
+      (inst-out `(call values ,(length values))))
+  (retregs where))
+
+(def-cg throw cg-throw (tag value)
+  (comp-throw tag value))
+
+(defun comp-throw (tag value)
+  (cg-form tag 'o1)
+  (inst-out '(icall cthrow))
+  (cg-form value 'multiple)
+  (inst-out '(popj p)))
+
+(def-cg catch cg-catch (tag &rest forms)
+  (let ((tag1 (new-label))
+	(*benv* (cons '(catch) *benv*)))
+    (cg-form tag 'o1)
+    (inst-out '(icall ccatch))
+    (inst-out `(jumpa ,tag1))
+    (cg-progn-body forms 'multiple)
+    (inst-out '(popj p))
+    (inst-out `(label ,tag1))
+    (retregs where)))
+
+(def-cg unwind-protect cg-unwind-protect (pform &rest forms)
+  (let ((cleanup-tag (new-label))
+	(exit-tag (new-label))
+	(*benv* (cons '(gulf) *benv*)))
+    ;; invocation 
+    (inst-out '(icall cunwind))
+    (inst-out `(jumpa ,cleanup-tag))
+    (inst-out `(jumpa ,exit-tag))
+    ;; compile protected form
+    (case where ((o1 o2 o3 o4 o5 multiple tail predicate inv-predicate)
+		 (cg-form pform 'multiple))
+	        (t (cg-form pform where)))
+    ;; return out of unwind-protect
+    (inst-out '(popj p))
+    ;; end of protected form
+    (inst-out `(label ,cleanup-tag))
+    ;; do cleanup forms
+    (cg-progn-body forms nil)
+    (inst-out '(popj p))
+    (inst-out `(label ,exit-tag))
+    (case where ((o1 o2 o3 o4 o5 multiple tail predicate inv-predicate)
+		 (retregs where)))))
+
+;;; Complain about misplaced declarations.
+
+(def-cg declare cg-declare (&rest args)
+  (declare (ignore args))
+  (clc-warning "Misplaced DECLARE form.  Ignoring it.")
+  nil)
+
+;;;; CONDITIONALS
+
+;;; BR-NULL compiles code to eval and test the predicate form, and to
+;;; branch to DEST if the result is NIL.
+
+(defun br-null (pred dest where)
+  (cg-form pred 'predicate)
+  (if (eq where 'inv-predicate) (inst-out `(jumpa1 ,dest))
+      (inst-out `(jumpa ,dest))))
+
+;;; BR-NOT-NULL compiles code to eval and test the predicate form, and to
+;;; branch to DEST if the result is not NIL.
+
+(defun br-not-null (pred dest where)
+  (case where
+    (predicate (cg-form pred 'inv-predicate)
+	       (inst-out `(jumpa1 ,dest)))
+    ((nil inv-predicate) (cg-form pred 'inv-predicate)
+			 (inst-out `(jumpa ,dest)))
+    ((tail multiple o1 o2 o3 o4 o5 o6)
+       (cg-form pred where)
+       (inst-out `(skipe nil ,(if (memq where '(tail multiple)) 'o1 where)
+			 ,@(if (stakp where) `(,*qref*))))
+       (inst-out `(jumpa ,dest)))
+;; push and memory locations.   Assumes that reto1 generates exactly
+;; 1 instruction.  The skipe and jumpa will be optimized to a jumpn
+    (t (cg-form pred 'o1)
+       (inst-out `(skipe nil o1))
+       (reto1 where)
+       (inst-out `(skipe nil o1))
+       (inst-out `(jumpa ,dest)))))
+
+(def-cg and cg-and (&rest forms)
+  (cond ((atom forms) (rett where))
+	(t (do ((f forms (cdr f))
+		(tag1 (new-label))
+		(tag2 (new-label)))
+	       ((atom (cdr f))
+		(case where ((predicate inv-predicate)
+			     (cg-form (car f) where)
+			     (inst-out `(label ,tag1)))
+		      (t (cg-form (car f) where)
+			 (inst-out `(jrst ,tag2))
+			 (inst-out `(label ,tag1))
+			 (retnil where)
+			 (inst-out `(label ,tag2)))))
+	     (br-null (car f) tag1 where)))))
+
+(def-cg or cg-or (&rest forms)
+  (cond ((atom forms) (retnil where))
+	((null (cdr forms)) (cg-form (car forms) where))
+	(t (do ((f forms (cdr f)) (tag (new-label)))
+	       ((atom (cdr f))
+		(cg-form (car f) where)
+		(inst-out `(label ,tag)))
+	     (br-not-null (car f) tag where)))))
+
+(def-cg if cg-if (pred then &optional (else nil))
+  (let ((tag1 (new-label))
+	(tag2 (new-label)))
+    (br-null pred tag1 'predicate)
+    (cg-form then where)
+    (if (memq where '(predicate inv-predicate))
+	(progn (inst-out `(jumpa ,tag2))
+	       (inst-out `(jrst1 ,tag2)))
+        (inst-out `(jrst ,tag2)))
+    (inst-out `(label ,tag1))
+    (cg-form else where)
+    (inst-out `(label ,tag2))))
+
+(def-cg not cg-not (arg)
+  (case where
+    ((nil) (cg-form arg nil))
+    (predicate (cg-form arg 'inv-predicate))
+    (inv-predicate (cg-form arg 'predicate))
+    (t (cg-form arg 'o1)
+       (inst-out '(tdcn o1 o1))
+       (inst-out `(move o1 ,(conref t)))
+       (reto1 where))))
+
+(def-cg cond cg-cond (&rest forms)
+  (let ((endtag (new-label))
+	(closed nil))
+    (do* ((clauses forms (cdr clauses))
+	  (clause (car clauses) (car clauses))
+	  (next-tag (new-label) (new-label)))
+	 ((atom clauses))
+      (cond ((atom clause)
+	     (clc-error "Atomic clause in Cond: ~S" clause))
+	    ;; Normal clause.
+	    ((cdr clause)
+	     (if (atom (cdr clauses))	; check for t as pred for last clause
+		 (if (eql (car clause) 't)
+		     (setq closed t)))
+	     (br-null (car clause) next-tag nil)
+	     (cg-progn-body (cdr clause) where)
+	     (if (memq where '(predicate inv-predicate))
+		 (progn (inst-out `(jumpa ,endtag))
+			(inst-out `(jrst1 ,endtag)))
+		 (inst-out `(jrst ,endtag)))
+	     (inst-out `(label ,next-tag)))
+	    ;; Singleton clause
+	    (t (br-not-null (car clause) endtag where))))
+    ;; In case we fell through, return NIL. unless last pred was "t"
+    (cond ((not closed) (retnil where)))
+    (inst-out `(label ,endtag))))
+
+
+
+;;;; BASIC FUNCTIONS
+
+;do cg's for eq, eql, 1-, 1+, +, -, <, >, etc.
+
+;;; CAR/CDR forms.
+
+(def-cg car cg-car (arg)
+  (when where
+	(cg-form arg 'o1)
+	(retmem '(0 o1) where)))
+
+(def-cg cdr cg-cdr (arg)
+  (when where
+	(cg-form arg 'o1)
+	(retmem '(1 o1) where)))
+
+(def-cg lisp::%sp-svref cg-svref (sv ref)
+  (when where
+	(cond ((numberp ref) (cg-form sv 'o1)
+			     (retmem `(,ref o1) where))
+	      (t (compile-args (list sv ref))
+		 (inst-out '(addi o1 0 o2))
+		 (retmem '(0 o1) where)))))
+
+(def-cg lisp::%sp-svset cg-svset (sv ref new)
+  (cond ((numberp ref) (compile-args (list sv new))
+		       (inst-out `(movem o2 ,ref o1))
+		       (retmem `(,ref o1) where))
+	(t (compile-args (list sv ref new))
+	   (inst-out '(addi o1 0 o2))
+	   (inst-out '(movem o3 0 o1))
+	   (retmem '(0 o1) where))))
+
+(def-cg eq cg-eq (a1 a2)
+  (cg-1inst-pred a1 a2 where 'came 'camn))
+
+(defun cg-1inst-pred (a1 a2 where op inv-op)
+  (if (null where) (progn (cg-form a1 nil) (cg-form a2 nil))
+      (progn (compile-args (list a1 a2))
+	     (let ((reg 'o2) (mem (list 'o1)))
+	       (when (eq (caar lap-code) 'move)
+		     (setq mem (cddar lap-code))
+		     (setq lap-code (cdr lap-code))
+		     (when (equal (car lap-code) '(move o2 o1))
+			   (setq reg o1)
+			   (setq lap-code (cdr lap-code))))
+	       (if (eq where 'inv-predicate) (setq op inv-op))
+	       (inst-out `(,op ,reg ,@mem))
+	       (returnpred where)))))
+
+;;; called from cg-1inst-pred and cg-&/-pred which both do their 
+;;; own predicate inversion and null where check
+(defun returnpred (where)
+  (case where
+    ((predicate inv-predicate) nil)
+    ((o1 o2 o3 o4 o5) (inst-out `(skipa ,where nil))
+		      (cg-form 't where))
+    (t (returnpred 'o1) (reto1 where))))
+
+
+(def-cg eql cg-eql (a1 a2)
+  (if *all-numbers-are-fixnums* (cg-1inst-pred a1 a2 where 'came 'camn)
+      (cg-expr-call `(eql ,a1 ,a2) where)))
+
+;;; all the following take arbitrary number of args...
+
+(def-cg = cg-= (a1 &rest a2)
+  (cond ((null a2) (cg-form a1 nil) (rett where))
+	((and *all-numbers-are-fixnums* (null (cddddr a2)))
+	 (cg-&/-pred a1 a2 where 'came 'camn))
+	(t (cg-expr-call `(= ,a1 ,@a2) where))))
+
+;;; /= is not a1 op a2 & a2 op a3 & etc, but quadratic... 
+;;;   only do simplest case in line
+(def-cg /= cg-/= (a1 &rest a2)
+  (cond ((null a2) (cg-form a1 nil) (rett where))
+	((and *all-numbers-are-fixnums* (null (cdr a2)))
+	 (cg-1inst-pred a1 (car a2) where 'camn 'came))
+	(t (cg-expr-call `(/= ,a1 ,@a2) where))))
+
+
+;;; for the following functions, it must be noted that the single-inst
+;;; mode assigns the register to arg 2 and the memory to arg 1
+
+(def-cg < cg-< (a1 &rest a2)
+  (cond ((null a2) (cg-form a1 nil) (rett where))
+	((and *all-numbers-are-fixnums* (null (cddddr a2)))
+	 (cg-&/-pred a1 a2 where 'camg 'camle))
+	(t (cg-expr-call `(< ,a1 ,@a2) where))))
+
+(def-cg > cg-> (a1 &rest a2)
+  (cond ((null a2) (cg-form a1 nil) (rett where))
+	((and *all-numbers-are-fixnums* (null (cddddr a2)))
+	 (cg-&/-pred a1 a2 where 'caml 'camge))
+	(t (cg-expr-call `(> ,a1 ,@a2) where))))
+
+(def-cg <= cg-<= (a1 &rest a2)
+  (cond ((null a2) (cg-form a1 nil) (rett where))
+	((and *all-numbers-are-fixnums* (null (cddddr a2)))
+	 (cg-&/-pred a1 a2 where 'camge 'caml))
+	(t (cg-expr-call `(<= ,a1 ,@a2) where))))
+
+(def-cg >= cg->= (a1 &rest a2)
+  (cond ((null a2) (cg-form a1 nil) (rett where))
+	((and *all-numbers-are-fixnums* (null (cddddr a2)))
+	 (cg-&/-pred a1 a2 where 'camle 'camg))
+	(t (cg-expr-call `(>= ,a1 ,@a2) where))))
+
+
+(defun cg-&/-pred (a1 a2 where op inv-op)
+  (cond ((null where) (progn (cg-form a1 nil) (cg-form a2 nil)))
+	(t (compile-args (list* a1 a2))
+	   (if (eq where 'inv-predicate) (rotatef op inv-op))
+	   (case (length a2)
+	     (1 (let ((reg 'o2) (mem (list 'o1)))
+		  (when (eq (caar lap-code) 'move)
+			(setq mem (cddar lap-code))
+			(setq lap-code (cdr lap-code))
+			(when (equal (car lap-code) '(move o2 o1))
+			      (setq reg o1)
+			      (setq lap-code (cdr lap-code))))
+		  (inst-out `(,op ,reg ,@mem))))
+	     (2 (inst-out `(,inv-op o2 o1))
+		(inst-out `(,op o3 o2)))
+	     (3 (inst-out `(,inv-op o2 o1))
+		(inst-out `(,op o3 o2))
+		(inst-out '(skipa))
+		(inst-out `(,op o4 o3)))
+	     (4 (let ((tag (new-label)))
+		   (inst-out `(,inv-op o2 o1))
+		   (inst-out `(,op o3 o2))
+		   (inst-out `(jumpa ,tag))
+		   (inst-out `(,inv-op o4 o3))
+		   (inst-out `(,op o5 o4))
+		   (inst-out `(label ,tag)))))
+	   (returnpred where))))
+
+;;; arith funs with values
+
+(def-cg + cg-+ (a1 a2)
+  (cond ((null where) (progn (cg-form a1 nil) (cg-form a2 nil)))
+	(*all-numbers-are-fixnums* 
+	 (compile-args (list a1 a2))
+	 (inst-out `(sub o1 ,(conref 0)))
+	 (inst-out '(add o1 o2))
+	 (reto1 where))
+	(t (cg-expr-call `(+ ,a1 ,a2) where))))
+
+(def-cg - cg-- (a1 a2)
+  (cond ((null where) (progn (cg-form a1 nil) (if a2 (cg-form a2 nil))))
+	(*all-numbers-are-fixnums* 
+	 (cond ((null a2) (cg-form a1 'o1)
+			  (inst-out `(sub o1 ,(conref 0)))
+			  (inst-out '(movn o1 o1)))
+	       (t (compile-args (list a1 a2))
+		  (inst-out '(sub o1 o2))))
+	 (inst-out `(add o1 ,(conref 0)))
+	 (reto1 where))
+	((null a2) (cg-expr-call `(- ,a1) where))
+	(t (cg-expr-call `(- ,a1 ,a2) where))))
+
+(def-cg 1+ cg-1+ (a1)
+  (cond ((null where) (cg-form a1 nil))
+	(*all-numbers-are-fixnums* 
+	 (cg-form a1 'o1)
+	 (inst-out '(addi o1 1))
+	 (reto1 where))
+	(t (cg-expr-call `(1+ ,a1) where))))
+
+(def-cg 1- cg-1- (a1)
+  (cond ((null where) (cg-form a1 nil))
+	(*all-numbers-are-fixnums* 
+	 (cg-form a1 'o1)
+	 (inst-out '(subi o1 1))
+	 (reto1 where))
+	(t (cg-expr-call `(1- ,a1) where))))
+
+
+
+;;;; WIERDNESS DEVICES
+
+(def-cg progv cg-progv (vars vals &rest forms)
+  (let ((owhere (when (or (memq where '(predicate inv-predicate))
+			   (and (consp where) (eq 'special (car where))))
+		      (prog1 where (setq where 'o1))))
+	(*benv* (cons '(gulf) *benv*)))
+    (compile-args (list vars vals))
+    (inst-out '(push p sp))
+    (inst-out `(icall bindv))
+    (cg-progn-body forms where)
+    (inst-out '(pop p w2))
+    (inst-out '(icall unbind))
+    (if owhere (reto1 owhere))))
+
+
+;;;; CONVERSION FOR INLINE LAMBDAS.
+
+;;; LAMBDA-TO-LET takes an arbitrary lambda-list and a list of argument
+;;; forms and returns a let-list that does the equivalent bindings.
+;;; Copes with &optional, &rest, and &aux.  Does not hack &key, as forms
+;;; containing &key cannot always be turned into simple Let forms.
+
+(defun lambda-to-let (lambda-list argument-list)
+  (do ((ll lambda-list (cdr ll))
+       (al argument-list (cdr al))
+       (let-list nil))
+      ((atom ll)
+       (cond ((null al) 
+	      (nreverse let-list))
+	     (t (clc-error "Too many args supplied to Lambda form.")
+		(nreverse let-list))))
+    (case (car ll)
+      (&optional (return (lambda-to-let-optional (cdr ll) al let-list)))
+      (&rest (return (lambda-to-let-rest (cdr ll) al let-list)))
+      (&aux (cond ((null al)
+		   (return (nconc (nreverse let-list) (cdr ll))))
+		  (t (clc-error "Too many args supplied to Lambda form.")
+		     (return (nreverse let-list)))))
+      ((&key &allow-other-keys)
+       (clc-error "Stray ~S in Lambda list." (car ll))
+       (return (nreverse let-list))))
+    (cond ((atom al)
+	   (clc-error "Too few args supplied to Lambda form.")
+	   (return (nreverse let-list)))
+	  (t (push (list (car ll) (car al)) let-list)))))
+
+
+(defun lambda-to-let-optional (lambda-list argument-list let-list)
+  (do ((ll lambda-list (cdr ll))
+       (al argument-list)
+       var)
+      ((atom ll)
+       (cond ((null al) 
+	      (nreverse let-list))
+	     (t (clc-error "Too many args supplied to Lambda form.")
+		(nreverse let-list))))
+    (setq var (car ll))
+    (case var
+      (&rest (return (lambda-to-let-rest (cdr ll) al let-list)))
+      (&aux (cond ((null al)
+		   (return (nconc (nreverse let-list) (cdr ll))))
+		  (t (clc-error "Too many args supplied to Lambda form.")
+		     (nreverse let-list))))
+      ((&optional &key &allow-other-keys)
+       (clc-error "Stray ~S in Lambda list." var)
+       (return (nreverse let-list)))
+      (t (cond ((atom al)
+		;; No more args, use default.
+		(cond ((atom var)
+		       (push (list var nil) let-list))
+		      (t (push (list (car var) (cadr var)) let-list)
+			 ;; Supplied-p var, if any, is nil.
+			 (if (consp (cddr var))
+			     (push (list (caddr var) nil) let-list)))))
+	       ;; We do have more args, so use them.
+	       (t (cond ((atom var)
+			 (push (list var (car al)) let-list))
+			(t (push (list (car var) (car al)) let-list)
+			   ;; Supplied-p var, if any, is T.
+			   (if (consp (cddr var))
+			       (push (list (caddr var) t) let-list))))
+		  (setq al (cdr al))))))))
+
+
+(defun lambda-to-let-rest (lambda-list argument-list let-list)
+  (cond ((not (symbolp (car lambda-list)))
+	 (clc-error "Ill formed &rest arg in Lambda list.")
+	 (nreverse let-list))
+	(t (push (if (atom argument-list)
+		     (list (car lambda-list) nil)
+		     (list (car lambda-list) (cons 'list argument-list)))
+		 let-list)
+	   (cond ((atom (cdr lambda-list))
+		  (nreverse let-list))
+		 ((eq (cadr lambda-list) '&aux)
+		  (nconc (nreverse let-list) (cddr lambda-list)))
+		 (t (clc-error "Ill-formed lambda list."))))))
+
+
+;;; This is the reader function for "#,".  This construction is equivalent
+;;; to "#." unless read in the compiler, when it is to be replaced by "#."
+;;; in the lap file instead of being evalled immediately.
+
+;;; It "is an error" to put a "#," in a place where processing other than 
+;;; copying to the output file is required.
+
+;;; #, works thus:  When #,foo is seen it is replaced by
+;;; (%hashco foo). 
+;;;  LAPRINT will look at the constants-list and print
+;;; out #.foo for any (%hashco foo).  If (%hashco foo)
+;;; is in a random form, it will be printed out as #.foo.
+;;; If eval-when is set such that the form is evaluated, an error occurs.
+
+(def-cg %hashco cg-%hashco (form)
+  (clc-error "#, form in inappropriate context"))
+
+(defmacro %hashco (form)
+  (clc-error "#, form in inappropriate context"))
+
+(defun lisp::sharp-comma (stream ignore ignore)
+  (declare (ignore ignore))
+  (let ((form (read stream nil nil t)))
+    (unless lisp::*read-suppress*
+      (if *compiler-is-reading*
+	  (progn (setq *sharp-comma-seen* t)
+		 `(%hashco ,form))
+	  (eval form)))))
+
+(set-dispatch-macro-character #\# #\, #'lisp::sharp-comma)
+
+;;; used to filter lossage
+
+(defun sclean (form)
+  (if *sharp-comma-seen* (subst-sharp-comma form) form))
+
+(defun scprint (form stream)
+  (if *sharp-comma-seen* (progn (terpri stream)
+				(prin1-sharp-dot form stream))
+      (print form stream)))
+
+;;; functions need to implement #,
+
+(defun subst-sharp-comma (form)
+  "Return the form with FOO evaluated when found in (%hashco FOO)."
+  (cond ((or (not (or (consp form) (arrayp form))) (stringp form)
+	     (bit-vector-p form))
+	 form)
+	((vectorp form) (subst-vector-sharp-comma form))
+	((arrayp form) (subst-array-sharp-comma form))
+	((and (consp form) (eq (car form) '%hashco))
+	 (eval (subst-sharp-comma (cadr form))))
+	(t (cons (subst-sharp-comma (car form))
+		 (subst-sharp-comma (cdr form))))))
+
+(defun subst-vector-sharp-comma (vector)
+  "Return a vector with FOO evaluated when found in (%hashco FOO)."
+  (do* ((index 0 (1+ index))
+	(len (length vector))
+	(new (make-array len)))
+       ((= index len)
+	new)
+    (setf (aref new index) (subst-sharp-comma (aref vector index)))))
+
+(defun subst-array-sharp-comma (array)
+  "Return an array with FOO evaluated when found in (%hashco FOO)."
+  (let* ((subs (array-dimensions array))
+	 (index (make-list (array-rank array) :initial-element 0))
+	 (new (make-array subs))
+	 done)
+    (loop
+      (when done (return new))
+      (setf (apply #'aref new index)
+	    (subst-sharp-comma (apply #'aref array index)))
+      (multiple-value-setq (index done) (perm index subs)))))
+
+(defun perm (new orig)
+  (cond ((= (length new) 1)
+	 ;; with dimensions of (2 2) only go up to (1 1)
+	 (if (= (car new) (1- (car orig)))
+	     (values (cons 0 nil) t)
+	     (values (cons (1+ (car new)) nil) nil)))
+	(t
+	 (multiple-value-bind (x done) (perm (cdr new) (cdr orig))
+	   (cond ((null done)
+		  (values (cons (car new) x) nil))
+		 ((= (car new) (1- (car orig)))
+		  (values (cons 0 x) t))
+		 (t
+		  (values (cons (1+ (car new)) x) nil)))))))
+
+(defun prin1-sharp-dot (form stream)
+  "Print the form on the given stream substituting all occurances of
+  (%hashco foo) with #.foo."
+  (cond ((or (not (or (consp form) (arrayp form))) (stringp form)
+	     (bit-vector-p form))
+	 (format stream "~S" form))
+	((vectorp form)
+	 (prin1-vector-sharp-dot form stream))
+	((arrayp form)
+	 (prin1-array-sharp-dot form stream))
+	((eql (car form) '%hashco)
+	 (format stream "#.")
+	 (prin1-sharp-dot (cadr form) stream))
+	(t
+	 (format stream "(")
+	 (do ((form form (cdr form))
+	      (currlength 0 (1+ currlength)))
+	     ((null form)
+	      (format stream ")"))
+	   (if (> currlength 0) (format stream " "))
+	   (prin1-sharp-dot (car form) stream)
+	   (cond ((not (or (consp (cdr form))
+			   (null (cdr form))))
+		  (format stream " . ")
+		  (prin1-sharp-dot (cdr form) stream)
+		  (format stream ")")
+		  (return ())))))))
+
+(defun prin1-vector-sharp-dot (vector stream)
+  (format stream "#(")
+  (do ((currlength 0 (1+ currlength))
+       (vlength (length (the vector vector))))
+      ;;Terminate at end, or when too much has been output
+      ((= currlength vlength)
+       (format stream ")"))
+    ;;Put a space before every element except the first
+    (if (> currlength 0) (format stream " "))
+    ;;Output an element of the vector
+    (prin1-sharp-dot (aref vector currlength) stream)))
+
+(defun prin1-array-sharp-dot (array stream)
+  (let ((rank (array-rank array)))
+    (prin1-array-guts array rank stream)))
+
+(defun prin1-array-guts (array rank stream)
+  (format stream "#~DA" rank)
+  (sub-prin1-array-guts (lisp::header-ref array lisp::%array-data-slot)
+			(array-dimensions array)
+			stream
+			(lisp::header-ref
+			 array lisp::%array-displacement-slot)))
+
+;; Helping function for above.
+(defun sub-prin1-array-guts (array dimensions stream index)
+  (cond ((null dimensions)
+	 (prin1-sharp-dot (lisp::%sp-svref array index) stream)
+	 (1+ index))
+	(T
+	 (format stream "(")
+	 (do ((index index)
+	      (times 0 (1+ times))
+	      (limit (pop dimensions)))
+	     ((= times limit)
+	      (format stream ")")
+	      index)
+	   (if (not (zerop times)) (format stream " "))
+	   (setq index
+		 (sub-prin1-array-guts array dimensions stream index))))))

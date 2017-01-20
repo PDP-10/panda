@@ -1,0 +1,167 @@
+	This is the new, improved, completely re-written, nearly
+pretty-much bug-free STDIO package, designed to conform to the
+description of the runtime I/O library as described in Harbison &
+Steele's "C: A Reference Manual".  In grey cases, 4.2BSD was used as a
+model for behavior.
+
+	See LIBC.DOC for descriptions of specific external functions
+where those functions may have unusual or non-standard behavior.
+
+Exceptions:
+
+	This STDIO was meant to go with the new UIO, one of whose
+features was newline-CRLF conversion.  For ftell() to work, messyness
+was needed, including a new UIO function bufpos().  This has been
+changed so that bufpos() is no longer needed, though the old code has
+been retained in comments for reference.
+
+
+The following (all prefixed with '_') are internal-only functions:
+
+int _filbuf(stream)	    				filbuf.c
+
+    _filbuf() is called when input is needed from a stream but no more
+buffered characters are available; it slurps a new bufferful of data
+and returns 0 if it succeeded.  For internal use only!
+
+
+
+_prime(stream)						fflush.c
+
+    _prime() primes a streams counters to prepare it for i/o.  for reading,
+this basically means zeroing the available-to-read count; for writing, it
+means setting the space-available-for-writing to the initial, max value.
+
+_readable(stream)					fgetc.c
+
+    _readable() says whether or not the given stream can be read from.
+this either means the stream is open for read, or is open for read/write
+and is currently in the read direction.  if a read/write stream is in
+the quiescent state (neither read nor write yet), then read mode is
+selected and the stream is _primed.
+
+_writeable(stream)					fputc.c
+
+    _writeable() is the analogue of _readable(), with the difference that
+it is permitted to write to a read/write stream that is currently in
+read mode IFF that stream is at EOF.
+
+_sioflags(stream, str, &loc)				freope.c
+	Internal.  Parses specification string, returns _SIOF flags.
+
+_setFILE(stream, fd, flags)				freope.c
+	Internal.  Sets up FILE block after fd and flags found.
+
+_makeFILE()						fopen.c
+	Internal.  Finds fresh FILE block.
+
+_freeFILE(stream)					fopen.c
+	Internal.  Frees up a FILE block.
+
+I/O stream states:
+
+There are basically 5 major states for a stream, represented by a FILE
+block:
+						   /-----sioflgs----\
+				siocheck	_READ	_WRITE	_UPDATE
+(1) Illegal	<not _SIOF_FILE or _SIOF_OPEN>	n.a.	n.a.	n.a.
+(2) Valid but not open		_SIOF_FILE	n.a.	n.a.	n.a.
+(3) Open, quiescent update	_SIOF_OPEN	0	0	1
+(4) Open for reading		_SIOF_OPEN	1	0	0/1
+(5) Open for writing		_SIOF_OPEN	0	1	0/1
+
+The first state should never happen; the second only exists while the
+internal STDIO routines are manipulating FILE blocks.  The quiescent
+state only happens for streams that can be either read or written because
+they were opened for update (with "+"); as soon as a read or write is
+attempted, the corresponding read or write state is entered.
+	It should be impossible to ever have both _SIOF_READ and _SIOF_WRITE
+on.
+	It is possible in this implementation to have a stream opened for
+a string rather than a file.  For this case, _SIOF_STR is set, and siofd
+is unused.  This is not supported for update streams yet; that is, the
+quiescent state does not handle strings.  Also, severe lossage will result
+if such a stream has the _SIOF_CONVERTED bit set.
+
+Components valid for all valid states:
+    int sioflgs;		/* Flags */
+    FILE *sionFILE;		/* pointer to next and... */
+    FILE *siopFILE;		/* ...previous FILE blocks in chain */
+
+Components valid for all OPEN states:
+	    int sioerr		If nonzero, error # for stream
+	    int siofd		FD for stream (-1 if using string, not file)
+	    long siofdoff	fd fileptr loc corresponding to start of buffer
+	    char *siopbuf	pointer to start of buffer (may be NULL)
+	    int siolbuf		size of buffer in bytes (0 if siopbuf == NULL)
+    Note:
+	The buffer pointed to by siopbuf may be user-allocated.  If siopbuf ==
+NULL then no buffer currently exists for the stream, and the various flags
+will determine what happens when I/O is done.  Either a buffer will be
+dynamically allocated, or I/O will take place unbuffered.  If I/O is
+unbuffered then siocnt is always kept <= 0, and no other components are
+used (with the exception of those needed for push-back on read streams).
+
+READ state:	siocheck == _SIOF_OPEN
+		sioflgs & (_SIOF_READ|_SIOF_WRITE) == _SIOF_READ
+	Active FILE components:
+	    int sioocnt		# valid bytes in buffer (from read())
+	    int sio2cnt		If in UNGETC state, saves original siocnt.
+	    char *sio2cp		"	  , saves original siocp.
+	    char siopbc[]		"	  , holds pushed-back char(s).
+	Changed by each getc:
+	    int siocnt		# chars left to read in buffer
+	    char *siocp		pointer to last char read from buffer
+    Note:
+	The components sio2cnt, sio2cp, and siopbc are used only when
+_SIOF_PBC is set.  In that substate, siocp and siocnt point into the
+siopbc mini-buffer of pushed-back chars; sio2cp and sio2cnt remember the
+original, real values of siocp and siocnt.
+
+WRITE state:	siocheck == _SIOF_OPEN
+		sioflgs & (_SIOF_READ|_SIOF_WRITE) == _SIOF_WRITE
+	Active FILE components:
+	    int sioocnt		Not used!
+	    int sio2cnt		Used as siolcnt (line-buffered siocnt).
+	    char *sio2cp	"
+	    char siopbc[]	"
+	Changed by each putc:
+	    int siocnt		# chars of room left in buffer
+	    char *siocp		pointer to last char deposited in buffer
+    Note:
+	If output is being line-buffered (_SIOF_LINEBUF) then siocnt is always
+kept <= 0 so as to force calls to fputc, and siolcnt is used for the actual
+count of # bytes room left in the buffer.
+
+QUIESCENT state: siocheck == _SIOF_OPEN
+		sioflgs & (_SIOF_READ|_SIOF_WRITE|_SIOF_UPDATE) == _SIOF_UPDATE
+	Active FILE components:
+	    int sioocnt		should be 0!
+	    int sio2cnt		if line-buffered, should be 0, else unused.
+	    char *sio2cp	Not used.
+	    char siopbc[]	"
+	    int siocnt		should be 0! (to force call to fgetc/fputc)
+	    char *siocp		not used.
+    Note:
+	In the quiescent state, the buffer contains nothing.  siofdoff
+indicates the position within the file at which to begin reading or writing.
+It isn't clear whether pushed-back chars should be allowed in this state;
+probably not.
+
+USYS system calls used by STDIO routines:
+
+	The STDIO code is intentionally based on a core of UN*X system calls 
+so that it can be ported fairly easily.  The following are the calls used:
+
+USYS call	Used by module
+close()		FCLOSE
+write()		FFLUSH
+lseek()		FFLUSH, FGETC, FILBUF, FREOPE, FSEEK
+read()		FGETC, FILBUF
+write()		FPUTC, FPUTS
+open()		FREOPE
+fcntl()		FREOPE
+getpid()	MKTEMP, TMPFIL, TMPNAM
+access()	MKTEMP, TMPNAM
+unlink()	REMOVE
+time()		TMPFIL, TMPNAM

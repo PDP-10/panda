@@ -1,0 +1,620 @@
+MODULE DIR20(
+             IDENT='3(631)',
+             ENTRY(
+                    RL$PARSE,               ! Parse a local filespec
+                    RL$MERGE,               ! Merge local filespecs
+                    RL$SEARCH,              ! Search (wildcard) local 
+                    RL$RENAME               ! Rename local file(s) 
+                  )
+             )=
+BEGIN
+!
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1984, 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+
+!++
+! FACILITY:  DAP
+!
+! ABSTRACT:  Routines to transfer records or blocks of file data.
+!
+!
+! ENVIRONMENT:  RMS-20, BLISSNET-20, XPORT-20, Non-Transportable code.
+!
+! AUTHOR:	Andrew Nourse, CREATION DATE:  14-Sep-82
+!
+! RMS edit numbers:
+! 631	- GJ%FOU on destination RNAMF JFN.
+! 625   - (GAS, 10-Jun-86) Dot bug caused low memory to be trashed after the 
+!         RNAMF in RL$RENAME
+! 566   - Remove redundant Rl$Directory routine
+! 562   - Handle errors better in wildcard case
+! 544   - $parse needs another UaPointer call
+! 542   - Set CHA bits first time thru $Search
+! 516   - Add UAddr calls for ext addr
+! 514   - Use MapCodes for all GTJFN errors
+! Module edit numbers:
+! 13    - RMS'ify and convert to vaxish name block
+! 12    - Don't trash JFN when no nam block is being merged in really
+! 11    - Check RLF bit, not presence of an RLF, in RL$MERGE
+! 10    - Make wildcard $RENAME work
+! 07    - Set NAM$V_FNB_WILDCARD if any wildcard bit set in RL$MERGE
+! 06    - First file on next filespec was not being processed correctly
+! 05    - Use RMS BSZ instead of FDB BSZ if it is an RMS file
+! 04    - Fix wildcard delete and rename
+! 03    - Put in ENTRY points
+! 02    - Supress device we get from JFN always if remote file
+! 01	- Separate system-dependant functions of DIRECT into this module
+!--
+!
+! INCLUDE FILES:
+!
+
+REQUIRE 'RMSREQ';
+REQUIRE 'RMSOSD';
+
+!
+! Table of Contents
+!
+
+FORWARD ROUTINE
+RL$PARSE,               ! Parse a local filespec
+RL$MERGE,               ! Merge local filespecs
+RL$SEARCH,              ! Search (wildcard) local 
+RL$RENAME;              ! Rename local file(s) 
+
+!
+! Feature Tests
+!
+
+COMPILETIME MULTIPLE_FILESPECS=1;
+
+!
+! Externals
+!
+
+EXTERNAL ROUTINE
+    S$JFN_STR,
+    MOVEAZ,
+    DAP$MERGE,
+    DAP$HANDLE,
+    GETJFN: NOVALUE,
+    R$NULL;
+%IF MULTIPLE_FILESPECS
+%THEN EXTERNAL ROUTINE RL$NEXTFILESPEC %FI;
+
+EXTERNAL
+    UserJfn;
+
+!
+! Built in
+!
+
+BUILTIN SCANN;
+
+GLOBAL ROUTINE Rl$Parse(P_Fab: REF $fab_decl, Err)=
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Decompose a local filespec & merge in related filespec
+!
+! FORMAL PARAMETERS:
+!
+!       FAB: A FAB as defined by RMS
+!       ERR: Address of error routine
+!
+! COMPLETION CODES:
+!
+!	Standard RMS completion codes
+!
+!--
+    BEGIN
+    BIND UFab=.P_Fab: $Fab_decl;
+
+    Rl$Merge( UFab, Merge$m_Expanded+Merge$m_Rlf+Merge$m_Point, .Err)
+    END;       ! RL$PARSE
+
+
+GLOBAL ROUTINE Rl$Merge (P_Fab: REF $Fab_Decl, Flags: BITVECTOR, Err) = 
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Merge the related file spec with the filespec
+!       to get the resultant file spec
+!
+! FORMAL PARAMETERS:
+!
+!	P_Fab: Address of FAB, which may have NAM block attached
+!       Flags: Merge bits, defined in RMSUSR
+!	Err:   Address of error routine
+!
+! COMPLETION CODES:
+!
+!	RMS codes
+!
+! SIDE EFFECTS:
+!
+!	GTJFN will have been done on the filespec
+!       The JFN will be in FAB[FAB$H_JFN]
+!
+!--
+    BEGIN
+    BIND Fab=.P_Fab: $Fab_decl;
+    BIND Nam=UAddr(.Fab[Fab$a_Nam]): $Nam_decl;
+    BIND Rnam=Uaddr(.Nam[Nam$a_Rlf]): $Nam_decl;
+    BIND ROUTINE $$Errrtn=.Err: Rms_Ercal;
+    LOCAL Desc: $Str_Descriptor(Class=Bounded);
+    LOCAL Result;
+    LOCAL Gjblk: VECTOR[$Gjatr-1];      ! GTJFN block
+    LOCAL Next;                             ! Offset to next filespec
+    LOCAL Wildjfn;                          ! Build indexable file handle here
+
+    IF .Fab[Fab$v_Ofp]
+    THEN Next=0                             ! No multiple output filespecs
+    ELSE Next=.Nam[Nam$h_Wcc_Next];         ! Input multpile filespecs OK
+
+    IF .Fab[Fab$v_Cif] THEN Flags[Merge$v_Cif]=1; ! Set Create-if if in FAB
+    IF .Fab[Fab$v_Ofp] THEN Flags[Merge$v_Create]=1; ! Set create if in FAB
+    IF Rnam EQL 0 THEN Flags[Merge$v_Rlf]=0;    ! Don't use related if none
+
+    Clearv(Gjblk);
+    Gjblk[$Gjsrc]=$Nulio+($Nulio^18);
+
+    IF .Nam[Nam$v_SynChk] THEN GjBlk[$GjGen]=GJ_Ofg
+    ELSE Gjblk[$Gjgen]=Gj_Ifg+Gj_Xtn
+                  + ( .Flags[Merge$v_Rlf] * GJ_Ofg )
+                  + ( (.Fab[Fab$v_Sup] EQL 0) * (GJ_New+$GJLeg ) )        !m577
+                  + ( .Flags[Merge$v_Create] * .Fab[Fab$v_Sup] * GJ_Fou );
+
+    IF (.UserJfn EQL 0)                                                  !m572
+    OR .Flags[Merge$v_Point]
+    THEN
+        BEGIN                 ! Get a JFN if we need one
+        LOCAL
+	     Begptr,
+             Endptr;
+
+        IF .Fab[Fab$v_Remote] THEN RETURN 0;    ! Never do this for remote file
+
+        ! Point to next filespec
+        Begptr=CH$PLUS(UAPointer(.Fab[Fab$a_Fna]),.Next);
+
+        IF Gtjfn(Gjblk,.Begptr; Result,Endptr)
+        THEN
+            BEGIN
+            IF .UserJfn EQL 0    ! If we need this JFN                  !m572
+            THEN
+                BEGIN
+                LOCAL Multiple;
+                Multiple=.Nam[Nam$v_Multiple];      ! Save this bit
+                UserJfn = Fab[Fab$h_Jfn]=.Result;     ! Save the JFN    !m572
+                Nam[Nam$g_Fnb]=.Result^-18; ! Save the flags
+                Nam[Nam$v_Multiple]=.Multiple;  ! Keep set if it was before
+                END
+            ELSE Rljfn(.Result<0,18>);   ! Don't need this JFN
+
+            IF .Flags[Merge$v_Point]       ! Incr offset to next if requested
+            THEN Nam[Nam$h_Wcc_Next]=
+                  .Nam[Nam$h_Wcc_Next]+CH$DIFF(.Endptr,.Begptr)-1;
+
+            SELECT SCANN(Endptr) OF     ! Check for multi-filespec delimiters
+                SET
+                [%C',', %C'+']: Nam[Nam$v_Multiple]=1; ! Multiple filespecs
+                TES;
+            END
+        ELSE
+            BEGIN
+            IF .UserJfn EQL 0    ! If we need the JFN                 !m572
+            THEN                        ! Do not complain if 
+                BEGIN                   ! just sizing filespec
+                                                            	      !m514 vv 
+                Fab[Fab$h_Stv]
+                 = UsrStv
+                 = .Result;
+
+                ! Use standard error code mapper (sets UsrSts & exits w/error)
+                MapCodes( .Result, Rms$_Cgj, OpnErrTab );             !M514 ^^
+
+                RETURN .UsrSts
+                END;
+            END;
+        END;
+
+    Nam[Nam$v_Wildcard]=                    ![7] If any wildcard, set this
+       (.Nam[Nam$g_Fnb] AND Nam$m_Wildcard_Bits) NEQ 0;
+
+    Wildjfn=.UserJfn;                   ! Start with JFN                !m572
+
+    IF .Flags[Merge$v_Expanded]                 ! For expanded filespec
+    OR .Flags[Merge$v_Defaults]                 ! or default setting
+    THEN Wildjfn=.Wildjfn+(.Nam[Nam$g_Fnb]^18); ! Make Indexable file handle
+
+
+    IF .Flags[Merge$v_Expanded]             ! Which spec are we writing?
+    THEN                                    ! Expanded
+        BEGIN
+        Nam[Nam$a_Dev] = .Nam[Nam$a_Esa];
+
+        $Str_Desc_Init( Desc=Desc, Class=Bounded,
+                        String=(.Nam[Nam$h_Ess], UAPointer(.Nam[Nam$a_Esa]) ))
+        END
+    ELSE                                    ! Resultant
+        BEGIN
+        Nam[Nam$a_Dev] = .Nam[Nam$a_Rsa];
+
+        $Str_Desc_Init( Desc=Desc, Class=Bounded,
+                        String=(.Nam[Nam$h_Rss], UAPointer(.Nam[Nam$a_Rsa]) ));
+        END;
+
+    !+
+    ! Copy each field from either the JFN or the related
+    ! filespec and find out how long it is
+    !-
+    IF .Nam[Nam$v_Wild_Dev] AND .Flags[Merge$v_Rlf]
+    THEN
+        BEGIN
+        $Str_Copy( String=(.Rnam[Nam$b_Dev], UAPointer(.Rnam[Nam$a_Dev])),
+                   Target=Desc );
+        Nam[Nam$b_Dev] = .Rnam[Nam$b_Dev];
+        END                   
+    ELSE
+        ! Device and generation are stuffed in by the system.
+        ! If this is a remote file, ignore device
+
+        Nam[Nam$b_Dev] = (IF .Fab[Fab$v_Remote] AND .Flags[Merge$v_Defaults]
+                          THEN 0
+                          ELSE
+                              S$Jfn_Str(.Wildjfn,
+                                        Desc,
+                                        Fld($JsAof,Js_Dev)+Js_Paf) );
+
+    Str_Exclude( Desc, .Nam[Nam$b_Dev] );   ! so next field is appended
+
+    Nam[Nam$a_Dir] = CH$PLUS( .Nam[Nam$a_Dev], .Nam[Nam$b_Dev] );
+    ! This ensures we return same kind of pointer user gave us.
+
+    IF .Nam[Nam$v_Wild_Dir] AND .Flags[Merge$v_Rlf]
+    THEN
+        BEGIN
+        $Str_Copy( String=(.Rnam[Nam$b_Dir], UAPointer(.Rnam[Nam$a_Dir])),
+                   Target=Desc );
+        Nam[Nam$b_Dir] = .Rnam[Nam$b_Dir];
+        END                   
+    ELSE
+        Nam[Nam$b_Dir]=S$Jfn_Str(.Wildjfn, Desc, Fld($JsAof,Js_Dir)+Js_Paf);
+
+    Str_Exclude( Desc, .Nam[Nam$b_Dir] );   ! so next field is appended
+
+    Nam[Nam$a_Name] = CH$PLUS( .Nam[Nam$a_Dir], .Nam[Nam$b_Dir] );
+    ! This ensures we return same kind of pointer user gave us.
+
+    IF .Nam[Nam$v_Wild_Name] AND .Flags[Merge$v_Rlf]
+    THEN
+        BEGIN
+        $Str_Copy( String=(.Rnam[Nam$b_Name], UAPointer(.Rnam[Nam$a_Name])),
+                   Target=Desc );
+        Nam[Nam$b_Name] = .Rnam[Nam$b_Name];
+        END                   
+    ELSE
+        Nam[Nam$b_Name]=S$Jfn_Str(.Wildjfn, Desc, Fld($JsAof,Js_Nam)+Js_Paf);
+
+    Str_Exclude( Desc, .Nam[Nam$b_Name] );   ! so next field is appended
+
+    Nam[Nam$a_Type] = CH$PLUS( .Nam[Nam$a_Name], .Nam[Nam$b_Name] );
+    ! This ensures we return same kind of pointer user gave us.
+
+    IF .Nam[Nam$v_Wild_Type] AND .Flags[Merge$v_Rlf]
+    THEN
+        BEGIN
+        $Str_Copy( String=(.Rnam[Nam$b_Type], UAPointer(.Rnam[Nam$a_Type])),
+                   Target=Desc );
+        Nam[Nam$b_Type] = .Rnam[Nam$b_Type];
+        END                   
+    ELSE
+        Nam[Nam$b_Type]=S$Jfn_Str(.Wildjfn, Desc, Fld($JsAof,Js_Typ)+Js_Paf);
+
+    Str_Exclude( Desc, .Nam[Nam$b_Type] );   ! so next field is appended
+
+
+    Nam[Nam$a_Ver] = CH$PLUS( .Nam[Nam$a_Type], .Nam[Nam$b_Type] );
+    ! This ensures we return same kind of pointer user gave us.
+
+    IF .Nam[Nam$v_Wild_Ver] AND .Flags[Merge$v_Rlf]
+    THEN
+        BEGIN
+        $Str_Copy( String=(.Rnam[Nam$b_Ver], UAPointer(.Rnam[Nam$a_Ver])),
+                   Target=Desc );
+        Nam[Nam$b_Ver] = .Rnam[Nam$b_Ver];
+        END                   
+    ELSE
+        ! Device and generation are stuffed in by the system.
+        ! If this is a remote file, ignore device
+
+        Nam[Nam$b_Ver] = (IF .Fab[Fab$v_Remote] AND .Flags[Merge$v_Defaults]
+                          THEN 0
+                          ELSE
+                              S$Jfn_Str(.Wildjfn,
+                                        Desc,
+                                        Fld($JsAof,Js_Gen)+Js_Paf) );
+
+    !
+    ! Return the total length of the filespec
+    !
+
+    If .Flags[Merge$v_Expanded]
+    THEN Nam[Nam$h_Esl]=.Desc[Str$h_PfxLen]+.Desc[Str$h_Length]-1     !m545
+    ELSE Nam[Nam$h_Rsl]=.Desc[Str$h_PfxLen]+.Desc[Str$h_Length]-1;    !m545
+
+    !
+    ! If we are filling in defaults for a remote filespec
+    ! Then we are done, do not try to get a JFN
+    !
+
+    IF .Flags[Merge$v_Defaults]         ! Getting defaults from JFN
+    AND .Fab[Fab$v_Remote]              ! but the file is remote
+    THEN
+        RETURN UsrSts=Rms$_Suc; ! WE ARE DONE
+
+
+
+    IF .Flags[Merge$v_Rlf]        ![11] If we merged something
+    THEN                          ! Then we need to get a new
+        BEGIN                     ! JFN
+        LOCAL Winflag;
+        LOCAL EsaPtr;
+
+        EsaPtr = UAPointer(.Nam[Nam$a_Esa]);    !a544
+        Rljfn(.Fab[Fab$h_Jfn]);
+        Gjblk[$Gjjfn]=.Fab[Fab$h_Jfn];  ! Get this JFN back
+
+        Gjblk[$Gjgen]=( Gj_Ifg * (.Flags[Merge$v_create] EQL 0) )
+                      + Gj_Xtn
+                      + ( (.Fab[Fab$v_Sup] EQL 0) * GJ_New )              !m575
+                      + ( .Flags[Merge$v_Create] * .Fab[Fab$v_Sup] * GJ_Fou );
+                      + FLD($Gjerr,Gj_Jfn);
+
+        IF ( Winflag = Gtjfn( Gjblk, .Esaptr ; Result ) ) EQL 0  !m544
+        THEN
+            BEGIN                       ! GTJFN failed
+            IF .Flags[Merge$v_Cif]      ! Try new file if CIF
+            THEN
+                BEGIN
+                Gjblk[$Gjgen]=Gj_New+Gj_Ofg+Gj_Ifg+Gj_Xtn+Fld($Gjerr,Gj_Jfn);
+
+                Winflag = Gtjfn( Gjblk, .Esaptr ; Result ); !M544
+                END;
+
+            IF .Winflag EQL 0         ! Still failed?
+            THEN
+                BEGIN
+                Fab[Fab$h_Jfn]=0;       ! Blew this JFN away
+                                                            	      !m514 vv 
+                Fab[Fab$h_Stv]
+                 = UsrStv
+                 = .Result;
+
+                ! Use standard error code mapper (sets UsrSts & exits w/error)
+                MapCodes( .Result, Rms$_Cgj, OpnErrTab );             !m514 ^^
+
+                RETURN .UsrSts
+                END;
+            END;
+        END;
+
+    UsrSts=Rms$_Suc             ! Win
+    END;                                ! RL$MERGE
+
+GLOBAL ROUTINE RL$Search (P_Fab, Err ) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Get directory info for a local file
+!
+! FORMAL PARAMETERS:
+!
+!       FAB: A FAB as defined by RMS -- FNA contains wildcard spec
+!       ERR: Address of error routine
+!
+! COMPLETION CODES:
+!
+!	Standard RMS status codes
+!--
+
+    BEGIN
+    BIND UFab=.P_Fab: $Fab_decl;
+    LOCAL Desc: $Str_Descriptor();
+    BIND UNam=UAddr(.Ufab[Fab$a_Nam]): $Nam_Decl;
+    BIND ROUTINE $$Errrtn=.Err: Rms_Ercal;
+    BIND UTyp=UAddr(.UFab[Fab$a_Typ]): $Typ_Decl;
+    LOCAL Class;
+
+    UsrSts = Rms$_Suc;
+
+    IF UTyp NEQ 0                    ! If we have a datatype block,
+    THEN Class=.UTyp[Typ$h_Class]    ! get the datatype class from it
+    ELSE Class=0;
+
+    IF UNam EQL 0 THEN (UsrSts=Rms$_Nam;           ! Must have a NAM block
+                        $$Error(Get,UFab));        ! or can't do this
+
+    ! Set up descriptor for resultant string
+    $Str_Desc_Init( Desc=Desc, String=(.UNam[Nam$h_Rss],.UNam[Nam$a_Rsa]) );
+
+    UNam[Nam$h_Rsl] = 0 ;               ! Clear resultant length     !m567
+
+    IF (.UNam[Nam$h_Wcc_Count] NEQ 0)     ! No GNJFN first time through
+    THEN
+        BEGIN                          ! 
+        LOCAL cha;
+
+        IF GNJFN((.UNam[Nam$g_Fnb]^18)+.UFab[Fab$h_Jfn];Cha)
+        THEN
+            UNam[Nam$z_Cha]=.Cha<lh>   ! Save change bits     !m535
+        ELSE
+            BEGIN
+            
+            UsrSts = Rms$_Nmf;         ! No more files
+
+            UFab[Fab$h_Jfn] = 0;        ! No more JFN 
+
+            %IF MULTIPLE_FILESPECS                 ! Scan another filespec:
+                 %THEN                              !  User can supply 
+                 IF RL$Nextfilespec( UFab, .Err) EQL 0  !  multiple filespecs,
+                 THEN RETURN .UsrSts;
+                 %FI                                ! 
+             END;                                   ! File1,file2,file3 
+
+
+
+         END
+     ELSE UNam[Nam$v_Cha_Dev]
+         =UNam[Nam$v_Cha_Dir]
+         =UNam[Nam$v_Cha_Nam]
+         =UNam[Nam$v_Cha_Ext]=1;   ! Set change bits first time thru     !m542
+
+!
+! Now get the information for the file
+!
+
+         BEGIN
+         UNam[Nam$h_Rsl]=S$Jfn_Str( .UFab[Fab$h_Jfn], Desc, 0); ! Get name
+
+
+         !? Fill in the file attributes
+
+
+         ! Get the length from the monitor
+             BEGIN
+             LOCAL FDBBUF: VECTOR[$FBLEN];
+             LOCAL BSZ;
+
+             GTFDB(.UFab[FAB$H_JFN],$FBLEN^18,FDBBUF);
+             UFab[FAB$G_ALQ]=.FDBBUF[$FBBYV] AND FB_PGC; ! # of pages
+
+             ! Get byte size
+             Bsz=.POINTR((Fdbbuf[$Fbbyv]),Fb_Bsz); 
+             IF (.Bsz NEQ 0)                            ! If nonzero
+             AND (.UFab[FAB$v_Rfm] EQL Fab$k_Stm)       ![5] and file is stream
+             OR (.UFab[FAB$v_BSZ] EQL 0)                ![5] or RMS has 0
+             THEN UFab[FAB$v_BSZ]=.Bsz                  ! use BSZ from FDB
+
+             %IF %DECLARED(Xabfhc)
+             %THEN                      
+                 BEGIN                  ! File Header Characteristics
+                 Xabfhc[Xab$g_Ebk]=.Fdbbuf[$Fbsiz]/((%BPUNIT/.Bsz)*512);
+                 Xabfhc[Xab$h_Ffb]=.Fdbbuf[$Fbsiz] MOD ((%BPUNIT/.Bsz)*512);
+                 END;
+             %FI;
+
+%( !? File is a directory
+             IF (.Fdbbuf[$Fbctl] AND Fb_Dir) NEQ 0   ! File is a directory?
+             THEN UFab[FAB$v_Org]=Fab$k_Directory;   ! Set file organization
+)%
+             IF .UTyp[Typ$h_Class] EQL Typ$k_Macy11  ! MACY11?
+             THEN                                   
+                 BEGIN
+                 LOCAL Size;
+                 Size=.Fdbbuf[$Fbsiz];      ! Size in bytes according to FDB
+                 IF .Bsz EQL 36 THEN Size=.Size*4;  ! Really 8-bit bytes
+                 IF .UFab[Fab$v_Rfm] EQL Fab$k_Fix
+                 THEN UFab[Fab$g_Mrn]=.Size/.UFab[Fab$h_Mrs];
+                 END;
+             END;
+         END;
+
+
+    UNam[Nam$h_Wcc_Count]=.UNam[Nam$h_Wcc_Count]+1; ! Incr wildcard count
+
+    IF .UsrSts EQL Rms$_Suc
+    THEN Rl$Merge( UFab, Merge$m_Rlf, .Err)   ! get resultant filespec, etc.
+    ELSE $$Error(Open,UFab);                  ! call error routine if error
+    .Usrsts                                   ! return status
+    END;			!End Of RL$SEARCH
+GLOBAL ROUTINE RL$Rename (Sfab,Dfab,Err) =	! Rename a file or files
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Rename a local file or files
+!
+! FORMAL PARAMETERS:
+!
+!       SFAB: A FAB as defined by RMS
+!       DFAB: A FAB as defined by RMS
+!       ERR: Address of error routine
+!
+! COMPLETION CODES:
+!
+!	RMS-20 codes
+!
+! SIDE EFFECTS:
+!
+!	The JFN (if any) may have changed
+!--
+
+    BEGIN
+    MAP Sfab: REF $Fab_decl;
+    MAP Dfab: REF $Fab_decl;
+    BIND Snam=Uaddr(.Sfab[Fab$a_Nam]): $Nam_decl;       ! Ext addr !m516
+    BIND Dnam=UAddr(.Dfab[Fab$a_Nam]): $Nam_decl;       ! Ext addr !m516
+    BIND ROUTINE $$Errrtn=.Err: Rms_Ercal;
+    LOCAL desc: $Str_Descriptor( CLASS=DYNAMIC, STRING=(0,0) );
+    LOCAL tempjfn;
+
+
+    S$Jfn_Str( .UserJfn<RH>, desc, 0 );     ! Get filespec string
+    GTJFN( GJ_SHT, .desc[STR$A_POINTER] ; tempjfn );
+
+    Fab = .Dfab;
+    GetJfn( GJ_Fou + Gj_Sht );          ! 631
+
+    Fab = .SFab;                        ! Set the old FAB as _THE_ FAB  !a575
+
+    IF .Fst[Fst$v_Remote]               ! Can't rename a local file to remote
+    THEN                                                                !a575
+        BEGIN
+        Fst[Fst$v_Remote] = 0;          ! Clear remote bit
+        UserError( Rms$_Rtn );
+        END;
+
+    IF NOT RNAMF(.tempjfn, .userjfn) THEN monerr();
+
+    Dfab[Fab$h_Jfn] = .UserJfn;
+
+    IF .Dfab[Fab$a_Nam] NEQ 0       ! Return resultant new name           !a527
+    THEN RL$Merge( .Dfab, 0 ,R$Null );                                    !m547
+
+    IF NOT .SFab[Fab$v_Drj]
+    THEN
+        BEGIN
+        RLJFN( .SFab[Fab$h_Jfn] );
+        SFab[Fab$h_Jfn] = 0;
+        END;
+
+
+    IF NOT .DFab[Fab$v_Drj]
+    THEN
+        BEGIN
+        RLJFN( .UserJfn );
+        DFab[Fab$h_Jfn] = 0;
+        END;
+
+    Usrret();
+    END;                                 !End of RL$RENAME
+END
+ELUDOM ! End of module

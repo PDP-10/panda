@@ -1,0 +1,62 @@
+/*
+**	SOPEN - string open
+**
+**	(c) Copyright Ken Harrenstien 1989
+**		for all changes after v.17, 30-May-1988
+**	(c) Copyright Ian Macky, SRI International 1986
+*/
+
+#include <stdioi.h>
+#include <stdlib.h>
+
+#if __STDC__
+#define CONST const
+#else
+#define CONST
+#endif
+
+FILE *sopen(s, flags, max_size)
+CONST char *s, *flags;
+size_t max_size;
+{
+    int c, local_flags = 0;
+    FILE *f;
+
+    switch (c = *flags++) {
+	case 'r':
+	    local_flags |= _SIOF_READ;
+	    break;
+	case 'w':
+	    local_flags |= _SIOF_WRITE;
+	    if (*flags && (*flags == '+')) {	/* "w+" means auto-exp str */
+		flags++;
+		local_flags |= _SIOF_GROWBUF;
+	    }
+	    break;
+	default:  return NULL;
+    }
+    if (*flags)			/* More stuff left, don't allow it. */
+	return NULL;
+
+    if (!(f = _makeFILE())) return NULL;	/* get a FILE descriptor */
+/*
+ *	if they want us to allocate the string space, then check
+ *	the size arg and do it
+ */
+    if (!s) {
+	if (max_size <= 0 || !(s = malloc(max_size))) {
+	    _freeFILE(f);
+	    return NULL;
+	} else f->siopbuf = (char *)s;
+    } else f->siopbuf = 0;
+/*
+ *	now stuff it!
+ */
+    f->siocp = (char *)s - 1;		/* one before, for pre-inc load */
+    f->siolbuf = f->siocnt = max_size;	/* length of buffer */
+    f->sioflgs |= local_flags | _SIOF_STR | _SIOF_BUF;
+    f->siofd = -1;			/* Ensure no FD there */
+    f->sioocnt = f->sioerr = 0;		/* Init other stuff */
+    f->siocheck = _SIOF_OPEN;		/* validate block */
+    return f;
+}

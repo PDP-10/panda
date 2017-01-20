@@ -1,0 +1,1800 @@
+MODULE DAP(			!DAP message processing routines
+	IDENT='60(13)  9-Feb-84'
+        %BLISS36(,
+                 ENTRY(
+                       D$GCFG, ! DAP$GET_CONFIG,     ! Get Config message
+                       D$GATT, ! DAP$GET_ATTRIBUTES, ! Get Attributes -> FAB
+                       D$PCFG, ! DAP$PUT_CONFIG,     ! Build CONFIG
+                       D$PATT, ! DAP$PUT_ATTRIBUTES, ! Build ATTRIBUTES <- FAB
+                       D$PACC, ! DAP$PUT_ACCESS,     ! Build ACCESS message
+                       D$PNAM, ! DAP$PUT_NAME,       ! Build a NAME message
+                       D$PCTL, ! DAP$PUT_CONTROL,    ! Build CONTROL message
+                       D$GSTS  ! DAP$GET_STATUS      ! Process a STATUS message
+                       ))
+	)=
+BEGIN
+
+!
+!  COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1981, 1986.
+!  ALL RIGHTS RESERVED.
+!  
+!  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!  COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!  THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!  ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!  AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!  SOFTWARE IS HEREBY TRANSFERRED.
+!  
+!  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!  NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!  EQUIPMENT CORPORATION.
+!  
+!  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!  ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+
+!++
+! FACILITY:	FTS-20
+!
+! ABSTRACT:	This is the System-independent part of the DAP protocol.
+!
+!
+! ENVIRONMENT:	TOPS-20, Transportable BLISS DecNet Interface
+!
+! AUTHOR:	Andrew Nourse, CREATION DATE: 21-Dec-81
+!
+! 13    - Make losing old FAL-20 blocks into pages
+! 12    - Handle ADT.  also put BDT and PDT in correct order
+! 11    - Put nodeid in resultant name generated from 3-part name
+! 10    - Send real byte size to 36-bit machines, no byte size to others
+!         and include node name in remote resultant filespec.
+! 07    - Set implied CRLF for ASCII FIXED
+! 06    - Workaround RSTS not sending STATUS for file-not-found on directory
+! 05    - Put in ENTRY points
+! 04    - Fix default for BLS in DAP$PUT_ATTRIBUTES
+!         and put in bitvectors for workarounds
+!       - Fix RENAME name type
+! 03    - Page mode
+! 02    - Make the FOP go out
+! 01	- The beginning
+!--
+
+
+!
+! Conditionals
+!
+
+COMPILETIME
+           FTPASSIVE=0;                 ! FAL can't use this package yet
+
+
+!
+! Libraries
+!
+
+LIBRARY 'DAP';
+LIBRARY 'BLISSNET';
+LIBRARY 'RMS';
+LIBRARY 'CONDIT';
+
+!
+! Table of Contents
+!
+FORWARD ROUTINE
+    DAP$GET_CONFIG,                         ! Get Config message
+    DAP$GET_ATTRIBUTES,                     ! Get Attributes
+    DAP$PUT_CONFIG: NOVALUE,                ! Build CONFIG
+    DAP$PUT_ATTRIBUTES: NOVALUE,            ! Build ATTRIBUTES from FAB
+    DAP$PUT_ACCESS: NOVALUE,                ! Build ACCESS message
+    DAP$PUT_NAME: NOVALUE,                  ! Build a NAME message
+    DAP$PUT_CONTROL: NOVALUE,               ! Build CONTROL message
+    DAP$GET_STATUS;                         ! Process a STATUS message
+
+
+!
+! Literals
+!
+
+%IF %BLISS(BLISS36)
+    %THEN 
+    %IF %SWITCHES(TOPS20)
+        %THEN
+        LITERAL
+               OUR_OSTYPE=DAP$K_TOPS20,
+               OUR_BLOCK_SIZE=512,
+               DEVICE_NAME_LENGTH=40,   ! Including punctuation
+               DIRECTORY_NAME_LENGTH=41,!
+               FILE_NAME_LENGTH=40;     !
+        %ELSE
+        %ERROR('Not implemented on TOPS-10')
+        %FI
+
+    LITERAL
+           OUR_FILESYS=DAP$K_RMS20;
+    %ELSE %ERROR('Not implemented for 16/32 bit architectures')
+    %FI;
+
+
+!
+! External references
+!
+EXTERNAL ROUTINE CHAZAC,
+                 S$STRDT,
+                 DAP$GET_HEADER,
+                 DAP$UNGET_HEADER,
+                 DAP$GET_BYTE,
+                 DAP$GET_2BYTE,
+                 DAP$GET_DATE,
+                 DAP$GET_VARIABLE_STRING,
+                 DAP$SIZE_BITVECTOR,
+                 DAP$GET_BITVECTOR,
+                 DAP$PUT_BITVECTOR,
+                 DAP$PUT_HEADER,
+                 DAP$PUT_2BYTE,
+                 DAP$PUT_BYTE,
+                 DAP$PUT_STRING,
+                 DAP$PUT_VARIABLE_COUNTED,
+                 DAP$UNGET_BYTE,
+                 DAP$EAT_MESSAGE;
+
+!
+! Macros
+!
+MACRO DAP_ERROR(DDESC,MAC,MIC)=SIGNAL(ERR_DS(MAC,MIC),DDESC) %;
+
+!
+! Canned Messages   (Global PLITS)
+!
+
+GLOBAL BIND	CFGMSG=UPLIT(CHAR8(
+				DAP$K_CONFIG,	!Message type CONFIG
+				0,              !Flags
+				DAP$K_BUFFER_SIZE,      ! Buffer
+                                DAP$K_BUFFER_SIZE/256,  !  length
+				OUR_OSTYPE,	!Operating system type
+				OUR_FILESYS,	!File system type
+				6,		!DAP version 6
+				0,		!ECO #  (DAP 6.0)
+				0,		!Customer version #
+				1,		!Release 1 of software
+				0,		!User software ver #
+				!SYSCAP fields follow
+                                %O'243',%O'340',%O'361',%O'360',%O'206',%O'55'
+						!Sequential organization
+                                                !Relative organization
+						!Sequential access
+
+                                                !DAP message blocking
+						!DAP message blocking over rsp
+                                                !Len256 field
+
+                                                !Directory list
+						!DTM attr. ext. msg
+						!PROT attr. ext. msg
+
+                                                !FOP spool
+                                                !FOP submit
+
+                                                !BITCNT
+                                                !RENAME
+                                                !Wildcard
+                                                !NAME message
+			)):BYTE8VECTOR;
+
+GLOBAL BIND CFGLEN=17;
+
+GLOBAL D_CFG: $XPN_DESCRIPTOR(BINARY_DATA=(CFGLEN,CFGMSG,BYTES));
+                                        ! Descriptor for config message
+GLOBAL D_SKIP: $XPN_DESCRIPTOR(BINARY_DATA=(3,UPLIT(CHAR8(DAP$K_CONTINUE,
+                                                          0,
+                                                          DAP$K_CON_SKP))));
+%IF %BLISS(BLISS36)
+%THEN
+GLOBAL D_CFGTAIL: $XPN_DESCRIPTOR(BINARY_DATA=(CFGLEN-4,CFGMSG+1,BYTES));
+                  ! Descriptor for part of config message after buffer size
+%ELSE
+GLOBAL D_CFGTAIL: $XPN_DESCRIPTOR(BINARY_DATA=(CFGLEN-4,CFGMSG[4],BYTES));
+                  ! Descriptor for part of config message after buffer size
+%FI
+
+GLOBAL BIND ACKMSG=PLIT(CHAR8(DAP$K_ACK,0));
+		!Acknowledge
+GLOBAL D_ACK: $XPN_DESCRIPTOR(BINARY_DATA=(2,CH$PTR(ACKMSG,0,8)));
+                                        ! Descriptor for Ack message
+%IF FTPASSIVE
+%THEN
+GLOBAL BIND ACCOMP_RESP=PLIT(CHAR8(DAP$K_ACCESS_COMPLETE,
+                                   DAP$K_ACCOMP_RESPONSE));
+GLOBAL BIND ACCOMP_RESP_LEN=3;
+GLOBAL D_ACM: $XPN_DESCRIPTOR(STRING=(ACRLEN,CH$PTR(ACRMSG,0,8)));
+%FI !FTPASSIVE
+
+OWN D_NULL: $STR_DESCRIPTOR(STRING=%CHAR(0));
+
+
+! Runtime conditionals for workarounds (to other systems' bugs)
+GLOBAL
+    T20BUG: BITVECTOR[16] INITIAL(-1),  ! Bit map for TOPS-20 workarounds
+    VMSBUG: BITVECTOR[16] INITIAL(-1),  !         for VMS
+    RSXBUG: BITVECTOR[16] INITIAL(-1),  !         for RSX
+    RSTBUG: BITVECTOR[16] INITIAL(-1),  !         for RSTS
+    RTBUG:  BITVECTOR[16] INITIAL(-1),  !         for RT11
+    IASBUG: BITVECTOR[16] INITIAL(-1),  !         for IAS
+    T10BUG: BITVECTOR[16] INITIAL(-1);  !         for TOPS-10
+
+
+
+GLOBAL ROUTINE DAP$GET_CONFIG(DD,C)=
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Process a CONFIG message and save the information contained therein
+!       into the configuration block
+!
+! FORMAL PARAMETERS:
+!
+!       DD:     A DAP message descriptor
+!       C:      A Configuration Block
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	Configuration block is set up
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	DAP Message type of message we got.
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+	BEGIN				
+	LOCAL MTYPE;			!DAP message type
+        MAP DD: REF $DAP_DESCRIPTOR,
+            C: REF $CONFIG;
+
+        IF (MTYPE=GET_HEADER(DD[$])) NEQ DAP$K_CONFIG
+	THEN RETURN .MTYPE;
+
+	C[CONFIG$H_BUFSIZ]=GET_2BYTE(DD[$]);	!Maximum DAP message size
+	C[CONFIG$B_OSTYPE]=GET_BYTE(DD[$]);	!What are we talking to
+	C[CONFIG$B_FILESYS]=GET_BYTE(DD[$]);	!File system type
+	C[CONFIG$B_VERSION]=GET_BYTE(DD[$]);	!DAP Version # of remote system
+	C[CONFIG$B_ECONUM]=GET_BYTE(DD[$]);	!DAP ECO #
+	C[CONFIG$B_USRNUM]=GET_BYTE(DD[$]);	!Customer version # for DAP
+	C[CONFIG$B_SOFTVER]=GET_BYTE(DD[$]);	!Version of cusp
+	C[CONFIG$B_USRSOFT]=GET_BYTE(DD[$]);	!User cusp version #
+	DAP$GET_BITVECTOR(DD[$],C[CONFIG$V_SYSCAP],12);	!SYSCAP bits
+					!Message was longer than it should be
+        .MTYPE                          !Return what we got
+	END;				!End of GETCFG
+
+GLOBAL ROUTINE DAP$GET_ATTRIBUTES(DD,FAB)=
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Process ATTRIBUTES, ATTRIBUTES extensions, NAME and ACCESS messages
+!	Returns on receipt of ACK or ACCESS (or NAME if DAP$K_RENAME)
+!
+! FORMAL PARAMETERS:
+!
+!	DD: A DAP message descriptor
+!       FAB: A (RMS) FAB
+!
+! ROUTINE VALUE:
+!
+!	DAP Operator code if successful, Signal error otherwise
+!
+! SIDE EFFECTS:
+!
+!       Message(s) will have been read.
+!
+!--
+BEGIN				!Expecting ATTRIBUTES, ACCESS, NAME, ACK,
+				!or any of the Attributes extensions
+MAP DD: REF $DAP_DESCRIPTOR,
+    FAB: REF $FAB_DECL;
+
+BIND DIB=.FAB[FAB$A_DIB]: $DIB;                 ! DAP information block
+BIND CONFIG=.DIB[DIB$A_CONFIG]: $CONFIG;        ! Configuration block
+
+LOCAL MTYPE: INITIAL(-1);               !DAP message type
+LOCAL OMTYPE;
+
+LOCAL NAMETYPES_SEEN: BITVECTOR[21] INITIAL(0); ! Types of Name messages seen
+
+WHILE 1 DO
+	BEGIN
+        OMTYPE=.MTYPE;
+        MTYPE=GET_HEADER(DD[$]);
+
+	SELECTONE .MTYPE OF SET
+
+	[DAP$K_ATTRIBUTES]:
+		BEGIN
+		LOCAL ATTMENU: BITVECTOR[42] INITIAL(0),
+                      DATATYPE: BITVECTOR[14] INITIAL(0),
+                      ORG: INITIAL(0),
+                      RFM: INITIAL(0),
+                      RAT: BITVECTOR[21] INITIAL(0),
+                      BLS: INITIAL(0),
+                      MRS: INITIAL(0),
+                      ALQ: INITIAL(0),
+                      BKS: INITIAL(0),
+                      FSZ: INITIAL(0),
+                      MRN: INITIAL(0),
+                      RUNSYS: VECTOR[CH$ALLOCATION(40)]
+                              INITIAL(REP CH$ALLOCATION(40) OF (0)),
+                      DEQ: INITIAL(0),
+                      FOP: BITVECTOR[42] INITIAL(0),
+                      BSZ: INITIAL(0),
+                      DEV: BITVECTOR[42] INITIAL(0),
+                      SDC: BITVECTOR[42] INITIAL(0),
+                      LRL: INITIAL(0),
+                      HBK: INITIAL(0),
+                      EBK: INITIAL(0),
+                      FFB: INITIAL(0),
+                      SBN: INITIAL(0);
+
+		DAP$GET_BITVECTOR(DD[$],ATTMENU,6);	!Attributes menu bits
+
+		IF .ATTMENU[DAP$V_ATTMENU_DAT]
+                THEN DAP$GET_BITVECTOR(DD[$],DATATYPE,2);
+
+		IF .ATTMENU[DAP$V_ATTMENU_ORG]    ! File Organization
+                THEN
+                    BEGIN
+                    ORG=GET_BYTE(DD[$]);
+                    FAB[FAB$Z_ORG]=$DAP_TRANSLATE_VALUE(.ORG,
+                                                        DAP$K_ORG_,FAB$K_ORG_,
+                                                        SEQ,REL,IDX,HSH);
+                    END;
+
+		IF .ATTMENU[DAP$V_ATTMENU_RFM]    ! Record Format
+                THEN
+                    BEGIN
+                    RFM=GET_BYTE(DD[$]);
+                    FAB[FAB$Z_RFM]=$DAP_TRANSLATE_VALUE(.RFM,
+                                                        DAP$K_RFM_,FAB$K_RFM_,
+                                                        UDF,FIX,VAR,
+                                                        VFC,STM,LSA);
+                    END;
+
+		IF .ATTMENU[DAP$V_ATTMENU_RAT]    ! Record Attributes
+                THEN
+                    BEGIN
+                    RAT=GET_BYTE(DD[$]);
+                    $DAP_MOVE_BITS(RAT,DAP$V_RAT_,FAB,FAB$V_RAT_,
+                                   FTN,CR,PRN,BLK,LSA);
+                    END;
+
+%BLISS36(
+                IF .RAT[DAP$V_RAT_LSA] THEN FAB[FAB$Z_RFM]=FAB$K_RFM_LSA;
+                                        ! Line-Sequenced Ascii
+                                        ! is a Record Format on the 10 & 20
+                                        ! and a Record Attribute elsewhere
+) !End %BLISS36
+
+
+		IF .ATTMENU[DAP$V_ATTMENU_BLS]
+                THEN BLS=GET_2BYTE(DD[$])    ! Physical Block Size
+                ELSE BLS=512;                ! default
+
+		IF .ATTMENU[DAP$V_ATTMENU_MRS]
+                THEN FAB[FAB$H_MRS]=GET_2BYTE(DD[$]);   ! Maximum Record Size
+
+		IF .ATTMENU[DAP$V_ATTMENU_ALQ]            ! Allocation Quantity
+		THEN
+                    BEGIN                             ! in blocks
+                    ALQ=GET_LONGWORD(DD[$]);          ! of (BLS) bytes
+
+                    ! Convert blocks to pages if old TOPS-20 non-RMS FAL
+                    !  New FAL has FILESYS of RMS-20                ![13]
+                    IF .FAB[FAB$V_REMOTE]
+                    AND (.CONFIG[CONFIG$B_FILESYS] EQL DAP$K_FILESYS_TOPS20)
+                    THEN ALQ=.ALQ/4;
+
+                    FAB[FAB$G_ALQ]=.ALQ;
+                    END;
+
+		IF .ATTMENU[DAP$V_ATTMENU_BKS]            ! Bucket Size
+		THEN FAB[FAB$Z_BKS]=GET_BYTE(DD[$]);
+
+		IF .ATTMENU[DAP$V_ATTMENU_FSZ]  ! Fixed Header Size
+		THEN	BEGIN                   ! (of VFC record)
+                        FSZ=GET_BYTE(DD[$])
+			END;
+
+		IF .ATTMENU[DAP$V_ATTMENU_MRN]  ! Maximum Record Number
+		THEN    FAB[FAB$G_MRN]=GET_LONGWORD(DD[$]);
+                                        
+		IF .ATTMENU[DAP$V_ATTMENU_RUN]  ! Runtime System
+                THEN DAP$GET_VARIABLE_STRING(DD[$],CH$PTR(RUNSYS),40);
+
+		IF .ATTMENU[DAP$V_ATTMENU_DEQ]  ! Default Extension Quantity
+		THEN DEQ=GET_2BYTE(DD[$]);
+
+		IF .ATTMENU[DAP$V_ATTMENU_FOP]            ! File Options
+                THEN
+                    BEGIN
+                    DAP$GET_BITVECTOR(DD[$],FOP,6);
+                    $DAP_MOVE_BITS(FOP,DAP$K_FOP_,FAB,FAB$V_FOP_,
+                                   RWO,RWC,POS,DLK,LCK,
+                                   CTG,SUP,NEF,TMP,MKD,DMO,
+                                   WCK,RCK,CIF,LKO,SQO,MXV,SPL,
+                                   SCF,DLT,CBT,WAT,DFW,TEF,DRJ);
+                    END;
+                                                 
+		IF .ATTMENU[DAP$V_ATTMENU_BSZ]
+                THEN
+                    BEGIN
+                    FAB[FAB$Z_BSZ]=BSZ=GET_BYTE(DD[$]);	!Byte size
+                    END;
+
+                IF .ATTMENU[DAP$V_ATTMENU_DEV]
+                THEN
+                    BEGIN
+                    DAP$GET_BITVECTOR(DD[$],DEV,6);	!Device characteristics
+                    $DAP_MOVE_BITS(DEV,DAP$V_DEV_,FAB,FAB$V_DEV_,
+                                   REC,CCL,TRM,MDI,SDI,SQD,NUL,
+                                   FOD,SHR,SPL,MNT,DMT,ALL,IDV,
+                                   ODV,SWL,AVL,ELG,MBX,RTM,RAD,
+                                   RCK,WCK,FOR,NET,GEN);
+                    END;
+
+		IF .ATTMENU[DAP$V_ATTMENU_SDC]
+                THEN
+                    BEGIN
+		    DAP$GET_BITVECTOR(DD[$],SDC,6);	
+                    $DAP_MOVE_BITS(SDC,DAP$V_DEV_,FAB,FAB$V_SHR_,
+                                   REC,CCL,TRM,MDI,SDI,SQD,NUL,
+                                   FOD,SHR,SPL,MNT,DMT,ALL,IDV,
+                                   ODV,SWL,AVL,ELG,MBX,RTM,RAD,
+                                   RCK,WCK,FOR,NET,GEN);
+                    END;		! spooling device characteristics
+
+		IF .ATTMENU[DAP$V_ATTMENU_LRL]
+                THEN
+                    BEGIN
+                    LRL=GET_2BYTE(DD[$]);
+                    END;
+
+		IF .ATTMENU[DAP$V_ATTMENU_HBK]
+                THEN
+                    BEGIN
+                    HBK=GET_LONGWORD(DD[$]);
+                    END;
+
+		IF .ATTMENU[DAP$V_ATTMENU_EBK]
+                THEN
+                    BEGIN
+                    EBK=GET_LONGWORD(DD[$]);
+                    END;
+
+		IF .ATTMENU[DAP$V_ATTMENU_FFB]
+                THEN
+                    BEGIN
+                    FFB=GET_2BYTE(DD[$]);
+                    END;
+
+		IF .ATTMENU[DAP$V_ATTMENU_SBN]
+                THEN
+                    BEGIN
+                    SBN=GET_LONGWORD(DD[$]);
+                    END;
+		END;                    ! End of Attributes Message
+
+	[DAP$K_DATE_TIME]:		!Date & time extension message
+		BEGIN
+		LOCAL DTMSTR: VECTOR[CH$ALLOCATION(18)];
+                LOCAL D_DTMSTR: $STR_DESCRIPTOR();
+		LOCAL DTMMENU: BITVECTOR[14];	!Menu for this message
+                LOCAL XABDAT: REF $XABDAT_DECL; ! Address of Date/Time XAB
+                LOCAL RVN;              ! Revision number
+
+		CLEARV (DTMMENU);
+                
+                $STR_DESC_INIT(DESC=D_DTMSTR, STRING=(18,CH$PTR(DTMSTR)));
+
+                ! Find the Date/Time XAB, if any
+                XABDAT=.FAB[FAB$A_XAB]; ! Head of XAB chain
+
+                WHILE .XABDAT[XABDAT$H_BID] NEQ XABDAT$K_BID
+                DO (IF (XABDAT=.XABDAT[XABDAT$A_NXT]) EQL 0 THEN EXITLOOP);
+
+                IF .XABDAT NEQ 0        ! If we found a Date/Time XAB
+                THEN
+                    BEGIN
+                    DAP$GET_BITVECTOR(DD[$],DTMMENU,2);
+
+                    IF .DTMMENU[DAP$V_DTM_CDT]  ! Creation date time
+                    THEN    BEGIN
+                            DAP$GET_DATE(DD[$],CH$PTR(DTMSTR));
+                            XABDAT[XABDAT$G_CDT]=S$STRDT(D_DTMSTR);
+                            END;
+
+                    IF .DTMMENU[DAP$V_DTM_RDT]  ! Read date time
+                    THEN    BEGIN
+                            DAP$GET_DATE(DD[$],CH$PTR(DTMSTR));
+                            XABDAT[XABDAT$G_RDT]=S$STRDT(D_DTMSTR); 
+                            END;
+
+                    IF .DTMMENU[DAP$V_DTM_EDT]  ! Scratch date time
+                    THEN    BEGIN   
+                            DAP$GET_DATE(DD[$],CH$PTR(DTMSTR));
+                            XABDAT[XABDAT$G_EDT]=S$STRDT(D_DTMSTR);
+                            END;
+                    IF .DTMMENU[DAP$V_DTM_RVN]  ! Revision number
+                    THEN RVN=DAP$GET_2BYTE(DD[$]);
+
+                    IF .DTMMENU[DAP$V_DTM_BDT]  ! Backup date time
+                    THEN    BEGIN   
+                            DAP$GET_DATE(DD[$],CH$PTR(DTMSTR));
+                            !When we put this in the RMS block we can save it
+                            !XABDAT[XABDAT$G_BDT]=S$STRDT(D_DTMSTR);
+                            END;
+
+                    IF .DTMMENU[DAP$V_DTM_PDT]  ! Internal date time
+                    THEN    BEGIN   
+                            DAP$GET_DATE(DD[$],CH$PTR(DTMSTR));
+                            !When we put this in the RMS block we can save it
+                            !XABDAT[XABDAT$G_PDT]=S$STRDT(D_DTMSTR);
+                            END;
+
+                    IF .DTMMENU[DAP$V_DTM_ADT]  ! Access date time	![12]
+                    THEN    BEGIN   
+                            DAP$GET_DATE(DD[$],CH$PTR(DTMSTR));
+                            !When we put this in the RMS block we can save it
+                            !XABDAT[XABDAT$G_ADT]=S$STRDT(D_DTMSTR);
+                            END;
+
+                    END
+                ELSE DAP$EAT_MESSAGE(DD[$]);           ! No place to put it
+		END;
+
+%(
+	[DAP$K_PROTECT]:		!Protection extension message
+		BEGIN
+		LOCAL PROT;
+		LOCAL PROMENU: BITVECTOR[14];	!Menu 
+		LOCAL OWNER: VECTOR[CH$ALLOCATION(40)]; 
+		CLEARV(PROMENU);
+		DAP$GET_BITVECTOR(DD[$],PROMENU,2);	!Get the menu
+
+		IF .PROMENU[PRO_OWNER]
+		THEN	DAP$GET_VARIABLE_STRING(DD[$],CH$PTR(OWNER),40);
+
+		IF .PROMENU[PRO_PROTSYS]
+		THEN
+                    BEGIN
+                    PROT=0;
+                    DAP$GET_BITVECTOR(DD[$],PROT,3);	!System protection
+        	    %IF %DECLARED(XABPRO$Z_SYS)
+		    %THEN XABPRO[XABPRO$Z_SYS]=PRO_DS(.PROT);
+                    %FI
+                    END;
+
+		IF .PROMENU[PRO_PROTOWN]
+		THEN
+                    BEGIN
+                    PROT=0;
+                    DAP$GET_BITVECTOR(DD[$],T,3);	!Owner protection
+		    XABPRO[XABPRO$Z_OWN]=PRO_DS(.T);
+                    END;
+
+		IF .PROMENU[PRO_PROTGRP]
+		THEN
+                    BEGIN
+                    PROT=0;
+                    DAP$GET_BITVECTOR(DD[$],T,3);	!Owner protection
+		    XABPRO[XABPRO$Z_GRP]=PRO_DS(.T);
+                    END;
+
+		IF .PROMENU[PRO_PROTWLD]
+		THEN
+                    BEGIN
+                    PROT=0;
+                    DAP$GET_BITVECTOR(DD[$],T,3);	!Owner protection
+		    XABPRO[XABPRO$Z_WLD]=PRO_DS(.T);
+                    END;
+		END;
+)%
+	[DAP$K_NAME]:
+		BEGIN
+                BIND NAM=.FAB[FAB$A_NAM]: $NAM_DECL;
+
+		LOCAL FILESPEC: VECTOR[CH$ALLOCATION(255)];	!Store filespec
+		LOCAL NAMETYPE: BITVECTOR[21];
+                LOCAL NDS,              ! Length of nodeid
+                      DVS,              ! Length of device
+                      DIS,              ! Length of directory
+                      NAS;              ! Length of name
+                LOCAL DELIM;
+
+                CLEARV(NAMETYPE);
+
+                IF NAM EQL 0 THEN SIGNAL(RMS$_NAM,0,FAB[$]);
+                ! Must have a NAM block
+
+		DAP$GET_BITVECTOR(DD[$],NAMETYPE,3);
+
+                IF (.NAMETYPE AND .NAMETYPES_SEEN) NEQ 0
+                THEN RETURN DAP$UNGET_HEADER(DD[$]);
+                ! If this is the second NAME message of this type for this call
+                ! then it must be for the next file and should not be
+                ! read until the next call (Directory List)
+
+                NAMETYPES_SEEN=.NAMETYPES_SEEN OR .NAMETYPE;
+
+                IF .NAMETYPE[DAP$K_NAMETYPE_STR]        ! Structure
+                THEN
+                    BEGIN
+                    DAP$GET_VARIABLE_STRING(DD[$],CH$PTR(NAM[NAM$T_DVI]),
+                                            DEVICE_NAME_LENGTH);
+                    NAM[NAM$V_CHA_STR]=1;
+                    NAM[NAM$V_FNB_WILDCARD]=1; ! Something is wildcarded
+                                               ! (not necessarily this)
+                                               ! (3-part name indicates this)
+                    END;
+
+                IF .NAMETYPE[DAP$K_NAMETYPE_DIR]        ! Directory
+                THEN
+                    BEGIN
+                    NAM[NAM$V_CHA_DIR]=1;
+                    DAP$GET_VARIABLE_STRING(DD[$],CH$PTR(NAM[NAM$T_DIR]),
+                                            DIRECTORY_NAME_LENGTH);
+                    NAM[NAM$V_FNB_WILDCARD]=1; ! Something is wildcarded
+                    END;
+
+                IF .NAMETYPE[DAP$K_NAMETYPE_NAM]        ! File name
+                THEN
+                    BEGIN
+                    LOCAL D_FILESPEC: $STR_DESCRIPTOR(CLASS=DYNAMIC);
+                    LOCAL BD_FILESPEC: $STR_DESCRIPTOR(CLASS=BOUNDED);
+                    
+                    $STR_DESC_INIT(DESC=D_FILESPEC, CLASS=DYNAMIC);
+                    $XPO_GET_MEM(DESC=D_FILESPEC, CHARACTERS=255);
+                                        
+                    NAS=DAP$GET_VARIABLE_STRING(DD[$],  ! Get file name in temp
+                                                .D_FILESPEC[STR$A_POINTER],
+                                                255);
+                    $STR_DESC_INIT(DESC=BD_FILESPEC, CLASS=BOUNDED,
+                                   STRING=(.NAS,.D_FILESPEC[STR$A_POINTER]));
+
+                    $STR_SCAN(REMAINDER=BD_FILESPEC, SUBSTRING=BD_FILESPEC,
+                              DELIMITER=DELIM,
+                              STOP='.;<');
+                    $STR_COPY(STRING=$STR_CONCAT(BD_FILESPEC,D_NULL),
+                              TARGET=(FILE_NAME_LENGTH,
+                                      CH$PTR(NAM[NAM$T_NAM])));
+
+                    IF .DELIM EQL %C'.'
+                    THEN
+                        BEGIN
+                        BD_FILESPEC[STR$H_LENGTH]=
+                         .BD_FILESPEC[STR$H_LENGTH]+1; ! skip delimiter
+                        $STR_SCAN(REMAINDER=BD_FILESPEC,
+                                  SUBSTRING=BD_FILESPEC,
+                                  DELIMITER=DELIM,
+                                  STOP='.;<');
+                        $STR_COPY(STRING=
+                                   $STR_CONCAT('.',BD_FILESPEC,D_NULL),
+                                  TARGET=(FILE_NAME_LENGTH,
+                                          CH$PTR(NAM[NAM$T_EXT])),
+                                  OPTION=TRUNCATE);
+                        END;
+                    IF (.DELIM EQL %C';') OR (.DELIM EQL %C'.')
+                    THEN                ! Version/Generation number
+                        BEGIN
+                        $STR_SCAN(REMAINDER=BD_FILESPEC,
+                                  SUBSTRING=BD_FILESPEC,
+                                  DELIMITER=.DELIM,
+                                  SPAN=';.0123456789-*');  ! Generation number
+
+                        ! Now Copy the generation number into the name block
+                        ! if it really is a generation number,
+                        ! i.e. .### or ;###.
+                        ! If we really got ;T or ;Afoo or ;P#####, ignore it.
+
+                        IF .BD_FILESPEC[STR$H_LENGTH] GTR 1
+                        THEN $STR_COPY(STRING=$STR_CONCAT(BD_FILESPEC,D_NULL),
+                                       TARGET=(RMS$K_VERSION_SIZE,
+                                               CH$PTR(NAM[NAM$T_VER])),
+                                       OPTION=TRUNCATE);
+                        END;
+
+                    DVS=ASCIZ_LEN(CH$PTR(NAM[NAM$T_DVI]));
+                    DIS=ASCIZ_LEN(CH$PTR(NAM[NAM$T_DIR]));
+                    NDS=ASCIZ_LEN(CH$PTR(NAM[NAM$T_NODE]));
+
+                        BEGIN           ! Build resultant string
+                        LOCAL D_RESULTANT: $STR_DESCRIPTOR(CLASS=BOUNDED);
+                        $STR_DESC_INIT(DESC=D_RESULTANT, CLASS=BOUNDED,
+                                       STRING=(.NAM[NAM$H_RSS],
+                                               .NAM[NAM$A_RSA]));
+
+                        IF (.NDS+.DVS+.DIS+.NAS) GTR .NAM[NAM$H_RSS]
+                        THEN SIGNAL(RMS$_NAM, 0, FAB[$]);       ![11] Won't fit
+
+                        ! Concatenate the Device, Directory, and filespec
+                        $STR_COPY(STRING=
+                                     $STR_CONCAT(
+                                         (.NDS,CH$PTR(NAM[NAM$T_NODE])), ![11]
+                                         (.DVS,CH$PTR(NAM[NAM$T_DVI])),
+                                         (.DIS,CH$PTR(NAM[NAM$T_DIR])),
+                                         (.NAS,.D_FILESPEC[STR$A_POINTER])),
+                                  TARGET=D_RESULTANT,
+                                  OPTION=TRUNCATE);
+
+                        $XPO_FREE_MEM(STRING=D_FILESPEC);
+
+                        NAM[NAM$H_RSL]=.D_RESULTANT[STR$H_LENGTH];
+                        END;
+                    END;
+
+                IF .NAMETYPE[DAP$K_NAMETYPE_FSP]        ! Resultant filespec
+                THEN
+                    BEGIN                           ! Store resultant filespec
+                    LOCAL ressize;                  ! Length of resultant
+                    IF (ressize=DAP$GET_BYTE(DD[$])) GTR 0    ! if non-null
+                    THEN
+                        BEGIN
+                        LOCAL nodedesc: $STR_DESCRIPTOR();
+                        $STR_DESC_INIT
+                             (DESC=nodedesc,
+                              STRING=ASCIZ_STR(CH$PTR(NAM[NAM$T_NODE])));
+
+                        IF .ressize+.nodedesc[STR$H_LENGTH] GEQ .NAM[NAM$H_RSS]
+                        THEN            ! Make sure it will fit
+                            SIGNAL(RMS$_NAM, 0, FAB[$]) ![11] Too big
+                        ELSE
+                            BEGIN
+                            LOCAL rptr,
+                                  rlen;
+                            $STR_COPY(STRING=NODEDESC,
+                                      TARGET=(.NODEDESC[STR$H_LENGTH],
+                                              .NAM[NAM$A_RSA]));
+
+                            rlen=.NAM[NAM$H_RSS]-.nodedesc[str$h_length];
+                            rptr=CH$PLUS(.NAM[NAM$A_RSA],
+                                         .nodedesc[str$h_length]);
+
+                            DAP$UNGET_BYTE(DD[$]);      ! string getter needs count
+                            NAM[NAM$H_RSL]=DAP$GET_VARIABLE_STRING
+                                               (DD[$],.rptr,.rlen)
+                                           +.nodedesc[STR$H_LENGTH];
+                            END;
+                        END;
+                    END;
+
+                %IF FTPASSIVE           ! FAL only
+                %THEN
+		IF .ACCFUNC EQL DAP$K_RENAME
+		THEN	BEGIN		!This is for a new name
+			ACCESS(FAB[$]);	        !Try to rename the file
+			RETURN DAP$K_NAME;      !end of setup sequence
+			END;
+                %ERROR('Passive Rename not implemented')
+                %FI
+
+
+		END;
+
+%IF FTPASSIVE %THEN
+	[DAP$K_ACCESS]:
+		BEGIN
+		LOCAL FILESPEC: VECTOR[CH$ALLOCATION(200)];
+		LOCAL	DISPLAY: BITVECTOR[28],	!DISPLAY field for attributes to return
+			PASSWORD: VECTOR[CH$ALLOCATION(41)],
+                        ACCFUNC,
+                        ACCOPT: BITVECTOR[28],
+                        FAC: BITVECTOR[28],
+                        SHR: BITVECTOR[28];
+
+
+		ACCFUNC=GET_BYTE(DD[$]);	!OPEN/CREATE/ERASE/RENAME
+
+		DAP$GET_BITVECTOR(DD[$],N[ACCOPT],5);	!Access options
+
+		DAP$GET_VARIABLE_STRING(DD[$],CH$PTR(FILESPEC),200);
+                                        !Store remote filespec in temp
+
+		IF .DD[DAP$H_LENGTH] GTR 0
+		THEN
+                    BEGIN
+                    DAP$GET_BITVECTOR(DD[$],FAC,3);	!File access options
+                    $DAP_MOVE_BITS(FAC,DAP$V_FAC_,FAB,FAB$V_FAC_,
+                                   PUT,GET,DEL,UPD,TRN,
+                                   BIO,BRO,APP);
+                    END;
+
+		IF .DD[DAP$H_LENGTH] GTR 0
+		THEN
+                    BEGIN
+                    DAP$GET_BITVECTOR(DD[$],SHR,3);	!Shared operations
+                    $DAP_MOVE_BITS(FAC,DAP$V_FAC_,FAB,FAB$V_SHR_,
+                                   PUT,GET,DEL,UPD,TRN,
+                                   BIO,BRO,APP);
+    
+
+		IF .DD[DAP$H_LENGTH] GTR 0
+		THEN DAP$GET_BITVECTOR(DD[$],DISPLAY,4);
+                !What attributes should we return?
+                ! IGNORE FOR NOW
+
+		IF .DD[DAP$H_LENGTH] GTR 0
+		THEN DAP$GET_VARIABLE_STRING(DD[$],CH$PTR(PASSWORD),40);
+                !Password for file access
+
+		!If this is a RENAME, then get a NAME message
+		!Otherwise, try to do the access
+		IF .WAIT_FOR_NAME EQL 0
+		THEN ACCESS(FAB[$]);		!Try to do it
+
+		IF (.N[ACCFUNC] EQL DAP$K_OPEN)
+                OR (.N[ACCFUNC] EQL DAP$K_CREATE)
+		THEN
+			BEGIN	!Return attributes of our file
+			D$PATT(DD[$],FAB[$]);	!Build attributes & send
+			DAP$PUT_MESSAGE(DD[$]);	!Force it out
+			END;
+		ACKNOWLEDGE;	!Otherwise just ACK
+			!The documentation is ambiguous here
+			!as to what response should occur for RENAME or DELETE
+		N[GOT_ACC]=1;		!Remember we got it
+		IF .WAIT_FOR_NAME EQL 0
+		THEN RETURN DAP$K_ACCESS;
+		END; !DAP_ACC
+%FI	!FTPASSIVE
+
+	[DAP$K_STATUS]:			! Some sort of error from other end
+		BEGIN
+                BIND C=D$GSTS(DD[$]);
+                SIGNAL(C);
+                RETURN C
+                END;
+
+        [DAP$K_ACCESS_COMPLETE]:        ! Rename & Delete would return ACM
+                BEGIN
+                BIND DIB=.FAB[FAB$A_DIB]: $DIB;
+                LOCAL CMPFUNC;
+                LOCAL FOP: BITVECTOR[42];
+
+                CMPFUNC=DAP$GET_BYTE(DD[$]);
+                IF .CMPFUNC NEQ DAP$K_ACCOMP_RESPONSE
+                THEN SIGNAL(RMS$_DPE,0,FAB[$]);
+
+                DIB[DIB$V_ACCESS_ACTIVE]=0;     ! Access is no longer active
+
+                !% FAL WORKAROUND
+                ! If all we get is an ACCESS COMPLETE (without any attrs first)
+                ! Then assume we cannot access the directory.
+                ! For some reason TOPS-10 & TOPS-20 FALs do not give a status
+                ! for this, but merely return immediate ACCESS COMPLETE!!!
+                ! RSTS does exactly the same thing on file-not-found
+
+                IF (.OMTYPE EQL -1)       ! First message of this call?
+                AND (.T20BUG[T20_BUG_NO_DIR_PRV] ! And workaround enabled
+                     OR .RSTBUG[RST_BUG_NO_DIR_FNF])
+                THEN
+                    BEGIN
+                    SELECT .CONFIG[CONFIG$B_OSTYPE] OF
+                       SET
+                       [DAP$K_TOPS20]: FAB[FAB$H_STS]=RMS$_PRV;
+                       [DAP$K_RSTS]:   FAB[FAB$H_STS]=RMS$_FNF;
+                       [DAP$K_TOPS20, DAP$K_RSTS]:
+                            SIGNAL(.FAB[FAB$H_STS],0,FAB[$]);
+                       TES;
+                    END;
+
+                DAP$GET_BITVECTOR(DD[$],FOP,6);
+                $DAP_MOVE_BITS(FOP,DAP$K_FOP_,FAB,FAB$V_FOP_,
+                               RWO,RWC,POS,DLK,LCK,
+                               CTG,SUP,NEF,TMP,MKD,DMO,
+                               WCK,RCK,CIF,LKO,SQO,MXV,SPL,
+                               SCF,DLT,CBT,WAT,DFW,TEF,
+                               DRJ);
+
+                IF .DD[DAP$H_BYTES_REMAINING] GTR 0
+                THEN
+                    BEGIN
+                    LOCAL CHECKSUM;
+                    CHECKSUM=DAP$GET_2BYTE(DD[$]);
+                    !? Can check checksum here when we implement that stuff
+                    END;
+
+                RETURN DAP$K_ACCESS_COMPLETE;
+                END;
+
+	[DAP$K_ACK]:
+                RETURN DAP$K_ACK;       ! Normal exit from this routine
+	[OTHERWISE]:
+		BEGIN
+		DAP_ERROR(DD[$],DAP$K_MAC_SYNC,.DD[DAP$B_OPERATOR]);
+                RETURN .DD[DAP$B_OPERATOR]
+		END;
+	TES;
+	END;	!WHILE 1
+.MTYPE                           ! Return message type if we ever get here
+END;  !End of DAP$GET_ATTRIBUTES (D$GATT) (process ATTRIBUTES)
+
+GLOBAL ROUTINE DAP$PUT_CONFIG(DD: REF $DAP_DESCRIPTOR, BUFSIZ): NOVALUE=
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Build a CONFIG message, using specified buffer size
+!
+! FORMAL PARAMETERS:
+!
+!       DD:     A DAP message descriptor
+!       BUFSIZ: Buffer size to send to other system
+!
+!--
+    BEGIN				
+    INIT_MESSAGE(DD[$]);                ! 
+    DD[DAP$B_OPERATOR]=DAP$K_CONFIG;    ! Build header
+    DAP$PUT_HEADER(DD[$]);              !
+    DAP$PUT_2BYTE(DD[$],.BUFSIZ);       ! Put buffersize
+    DAP$PUT_STRING(DD[$],D_CFGTAIL);    ! and rest of message
+    END;                                ! DAP$PUT_CONFIG
+GLOBAL ROUTINE DAP$PUT_ATTRIBUTES(DD,FAB): NOVALUE=
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Build attributes message from associated file block & send it.
+!
+! FORMAL PARAMETERS:
+!
+!       DD: Address of a DAP descriptor
+!       FAB: Address of RMS FAB
+!
+! IMPLICIT OUTPUTS:
+!
+!	An ATTRIBUTES message is put in the output buffer.
+!
+!--
+BEGIN
+MAP DD: REF $DAP_DESCRIPTOR,
+    FAB: REF $FAB_DECL;
+BIND TYP=.FAB[FAB$A_TYP]: $TYP_DECL;
+BIND DIB=.FAB[FAB$A_DIB]: $DIB;
+BIND CONFIG=.DIB[DIB$A_CONFIG]: $CONFIG;
+
+LOCAL
+	MLENGTH: INITIAL(0),		!Length of this message (data portion)
+	ATTMENU: BITVECTOR[42] INITIAL(0),      !Attributes menu field
+	DATATYPE: BITVECTOR[14] INITIAL(0),     !Data representation
+	ORG: INITIAL(0),			!File organization
+	RFM: INITIAL(0),			!Record format
+	RAT: BITVECTOR[21] INITIAL(0),		!Record attributes
+	BLS: INITIAL(512),     ![4] default=512	!Block size
+	MRS: INITIAL(0),			!Record size
+	ALQ: INITIAL(0),                        !File size
+	BKS: INITIAL(0),			!Bucket size
+	FSZ: INITIAL(0),			!Fixed portion size
+	MRN: BYTE8VECTOR[6] INITIAL(0),         !Max record number
+	RUNSYS: BYTE8VECTOR[41] INITIAL(0),     !Runtime system
+	DEQ: INITIAL(0),			!Default extension quantity
+	BSZ: INITIAL(0),			!Byte size
+	DEV: BITVECTOR[42] INITIAL(0),		!Device characteristics
+	SDC: BITVECTOR[42] INITIAL(0),		!Spooling dev characteristics
+	NOK: INITIAL(0),
+	NOA: INITIAL(0),
+	NOR: INITIAL(0),
+	CDT: BYTE8VECTOR[18] INITIAL(0),	!Create date
+	RDT: BYTE8VECTOR[18] INITIAL(0),	!Update date
+	EDT: BYTE8VECTOR[18] INITIAL(0),	!Scratch date
+	OWNER: BYTE8VECTOR[40] INITIAL(0),
+	PROTSYS: BITVECTOR[21] INITIAL(0),
+	PROTOWN: BITVECTOR[21] INITIAL(0),
+	PROTGRP: BITVECTOR[21] INITIAL(0),
+	PROTWLD: BITVECTOR[21] INITIAL(0),
+	FOP: BITVECTOR[42] INITIAL(0);
+
+
+BSZ=.FAB[FAB$Z_BSZ];	!Byte size
+
+! Set up DATATYPE
+IF (TYP NEQ 0)
+THEN CASE .TYP[TYP$H_CLASS] FROM 0 TO TYP$K_CLASS_MAX OF
+    SET
+    [0, TYP$K_CLASS_ASCII]:
+	BEGIN
+        DATATYPE[DAP$V_DATATYPE_ASCII]=1;
+	BLS=OUR_BLOCK_SIZE*(%BPVAL/.BSZ);     ! Block size in bytes
+
+        IF .FAB[FAB$Z_RFM] EQL FAB$K_RFM_VAR    ! If /ASCII/VARIABLE
+        OR .FAB[FAB$Z_RFM] EQL FAB$K_RFM_FIX    ! or /ASCII/FIXED
+        THEN RAT[DAP$V_RAT_CR]=1;               ! Assume implied CRLF 
+        END;
+    [TYP$K_CLASS_IMAGE]: DATATYPE[DAP$V_DATATYPE_IMAGE]=1;
+    [TYP$K_CLASS_MACY11]:
+        BEGIN
+        DATATYPE[DAP$V_DATATYPE_IMAGE]=1;       ! Looks like image on remote
+        !% RAT[DAP$V_RAT_MACY11]=1;
+        !  Nobody supports this bit
+        END;
+    [OUTRANGE]: SIGNAL(DAP$_AOR,0,TYP);
+    TES;
+
+
+!% BSZ of other than 8 is not supported on non-36-bit systems
+SELECT .CONFIG[CONFIG$B_OSTYPE] OF
+SET
+[DAP$K_TOPS20, DAP$K_TOPS10]: ;         ! OK
+[OTHERWISE]: BSZ=0;                     ! Don't send byte size
+TES;
+
+! Device is a file-structured disk
+DEV[DAP$V_DEV_MDI]=DEV[DAP$V_DEV_FOD]=DEV[DAP$V_DEV_SHR]
+=DEV[DAP$V_DEV_MNT]=DEV[DAP$V_DEV_IDV]=DEV[DAP$V_DEV_ODV]
+=DEV[DAP$V_DEV_AVL]=DEV[DAP$V_DEV_ELG]=DEV[DAP$V_DEV_RAD]=1;
+
+ALQ=.FAB[FAB$G_ALQ];                    ! Allocation quantity
+
+
+	!Turn on extension bits where needed & count # of bytes
+	BEGIN
+	LOCAL T;
+	T=DAP$SIZE_BITVECTOR(DATATYPE,2,0);
+	IF (.T GTR 0) THEN
+           BEGIN
+	   ATTMENU[DAP$V_ATTMENU_DAT]=1;	!Remember to send it
+	   MLENGTH=.MLENGTH+.T;	!Add approprioate # of bytes
+	   END;
+
+        ORG=$DAP_TRANSLATE_VALUE(.FAB[FAB$Z_ORG],
+                                 FAB$K_ORG_,DAP$K_ORG_,
+                                 SEQ,REL,IDX,DIR);
+
+	IF .ORG NEQ DAP$K_ORG_SEQ THEN
+           BEGIN
+	   ATTMENU[DAP$V_ATTMENU_ORG]=1;
+	   MLENGTH=.MLENGTH+1;
+	   END;
+
+        RFM=$DAP_TRANSLATE_VALUE(.FAB[FAB$Z_RFM],
+                                 FAB$K_RFM_,DAP$K_RFM_,
+                                 UDF,FIX,VAR,VFC,STM,LSA);
+
+	IF .RFM NEQ DAP$K_RFM_FIX THEN
+           BEGIN
+	   ATTMENU[DAP$V_ATTMENU_RFM]=1;
+	   MLENGTH=.MLENGTH+1;
+	   END;
+
+        $DAP_MOVE_BITS(FAB,FAB$V_RAT_,RAT,DAP$V_RAT_,
+                       FTN,CR,BLK,EFC,CBL,LSA);
+
+	T=DAP$SIZE_BITVECTOR(RAT,3,0);
+	IF .T GTR 0 THEN
+            BEGIN
+            ATTMENU[DAP$V_ATTMENU_RAT]=1;
+            MLENGTH=.MLENGTH+.T;
+            END;
+
+        !
+        ! BLS field
+        !
+
+	IF .BLS NEQ 512
+        THEN ATTMENU[DAP$V_ATTMENU_BLS]=1;
+
+        IF .RSXBUG[RSX_BUG_NOT_WANT_BLS]
+        THEN
+            BEGIN
+            IF (.CONFIG[CONFIG$B_FILESYS] EQL DAP$K_FILESYS_FCS11)
+            THEN ATTMENU[DAP$V_ATTMENU_BLS]=0;  ! Don't send BLS to this
+            END;
+
+        IF .ATTMENU[DAP$V_ATTMENU_BLS]  ! If we are sending BLS
+	THEN MLENGTH=.MLENGTH+2;        ! allow 2 bytes for it
+        
+        !
+        ! MRS field
+        !
+
+        MRS=.FAB[FAB$H_MRS];            ! Max record size
+
+	IF .MRS NEQ 0 THEN
+           BEGIN
+	   ATTMENU[DAP$V_ATTMENU_MRS]=1;
+	   MLENGTH=.MLENGTH+2;
+	   END;
+
+	IF .ALQ NEQ 0 THEN
+            BEGIN
+	    ATTMENU[DAP$V_ATTMENU_ALQ]=1;
+	    MLENGTH=.MLENGTH+5;
+	    END;
+
+	IF .BKS NEQ 0 THEN
+           BEGIN
+	   ATTMENU[DAP$V_ATTMENU_BKS]=1;
+	   MLENGTH=.MLENGTH+1;
+	   END;
+
+	IF .FSZ NEQ 0 THEN
+           BEGIN
+	   ATTMENU[DAP$V_ATTMENU_FSZ]=1;
+	   MLENGTH=.MLENGTH+1;
+	   END;
+
+	IF (T=.MRN[0]) NEQ 0 THEN
+            BEGIN
+	    ATTMENU[DAP$V_ATTMENU_MRN]=1;
+	    MLENGTH=.MLENGTH+.T;
+	    END;
+
+	IF (T=.RUNSYS[0]) NEQ 0 THEN
+            BEGIN
+	    ATTMENU[DAP$V_ATTMENU_RUN]=1;
+	    MLENGTH=.MLENGTH+.T;
+	    END;
+
+	IF .DEQ NEQ 0 THEN
+           BEGIN
+	   ATTMENU[DAP$V_ATTMENU_DEQ]=1;
+	   MLENGTH=.MLENGTH+2;
+	   END;
+
+        $DAP_MOVE_BITS(FAB,FAB$V_FOP_,FOP,DAP$V_FOP_,
+                       RWO,RWC,POS,DLK,LCK,
+                       CTG,SUP,NEF,TMP,MKD,DMO,
+                       WCK,RCK,CIF,LKO,SQO,MXV,SPL,
+                       SCF,DLT,CBT,WAT,%(DFW)% ,TEF,DRJ);  ! DFW not supported
+                                                           ! by most FALs
+
+	T=DAP$SIZE_BITVECTOR(FOP,6,0);
+	IF .T GTR 0 THEN
+           BEGIN
+	   ATTMENU[DAP$V_ATTMENU_FOP]=1;
+	   MLENGTH=.MLENGTH+.T;
+	   END;
+
+	IF (.BSZ NEQ 0) THEN      ! Send BSZ unless 0
+           BEGIN
+	   ATTMENU[DAP$V_ATTMENU_BSZ]=1;
+	   MLENGTH=.MLENGTH+1;
+	   END;
+
+	T=DAP$SIZE_BITVECTOR(DEV,6,0);
+	IF .T GTR 0 THEN
+           BEGIN
+	   ATTMENU[DAP$V_ATTMENU_DEV]=1;
+	   MLENGTH=.MLENGTH+.T;
+	   END;
+
+	T=DAP$SIZE_BITVECTOR(SDC,6,0);
+	IF .T GTR 0 THEN
+           BEGIN
+	   ATTMENU[DAP$V_ATTMENU_SDC]=1;
+	   MLENGTH=.MLENGTH+.T;
+	   END;
+
+	END;
+
+MLENGTH=.MLENGTH+$DAP_SIZE_BITVECTOR(ATTMENU,6);
+
+INIT_MESSAGE(DD[$]);
+DD[DAP$B_OPERATOR]=DAP$K_ATTRIBUTES;    ! This is attributes message
+DD[DAP$V_MFLAGS_LENGTH]=1;              ! We will send length field
+DD[DAP$H_LENGTH]=.MLENGTH;              ! Set up message length in header
+
+DAP$PUT_HEADER(DD[$]);                  ! Build the message header
+
+DAP$PUT_BITVECTOR(DD[$],ATTMENU,6);			!Menu field
+
+IF .ATTMENU[DAP$V_ATTMENU_DAT] THEN DAP$PUT_BITVECTOR(DD[$],DATATYPE,2);
+IF .ATTMENU[DAP$V_ATTMENU_ORG] THEN PUT_BYTE(DD[$],.ORG);
+IF .ATTMENU[DAP$V_ATTMENU_RFM] THEN PUT_BYTE(DD[$],.RFM);
+IF .ATTMENU[DAP$V_ATTMENU_RAT] THEN DAP$PUT_BITVECTOR(DD[$],RAT,3);
+IF .ATTMENU[DAP$V_ATTMENU_BLS] THEN PUT_2BYTE(DD[$],.BLS);
+IF .ATTMENU[DAP$V_ATTMENU_MRS] THEN PUT_2BYTE(DD[$],.MRS);
+IF .ATTMENU[DAP$V_ATTMENU_ALQ] THEN PUT_LONGWORD(DD[$],.ALQ);
+IF .ATTMENU[DAP$V_ATTMENU_BKS] THEN PUT_BYTE(DD[$],.BKS);
+IF .ATTMENU[DAP$V_ATTMENU_FSZ] THEN PUT_BYTE(DD[$],.FSZ);
+IF .ATTMENU[DAP$V_ATTMENU_MRN] THEN PUT_LONGWORD(DD[$],.MRN);
+IF .ATTMENU[DAP$V_ATTMENU_RUN]
+THEN DAP$PUT_VARIABLE_COUNTED(DD[$],CH$PTR(RUNSYS,0,8));
+IF .ATTMENU[DAP$V_ATTMENU_DEQ] THEN PUT_2BYTE(DD[$],.DEQ);
+IF .ATTMENU[DAP$V_ATTMENU_FOP] THEN DAP$PUT_BITVECTOR(DD[$],FOP,6);
+IF .ATTMENU[DAP$V_ATTMENU_BSZ] THEN PUT_BYTE(DD[$],.BSZ);
+IF .ATTMENU[DAP$V_ATTMENU_DEV] THEN DAP$PUT_BITVECTOR(DD[$],DEV,6);
+IF .ATTMENU[DAP$V_ATTMENU_SDC] THEN DAP$PUT_BITVECTOR(DD[$],SDC,6);
+
+!Now send the DATE & TIME message if needed
+
+%(
+IF .C[CONFIG$V_DTM]
+AND ((.CDT NEQ 0) OR (.RDT NEQ 0) OR (.EDT NEQ 0))
+ THEN	BEGIN
+	LOCAL DTMMENU: BITVECTOR[42];	!Menu for this message
+	CLEARV(DTMMENU);	!initially 0
+        INIT_MESSAGE(DD[$]);
+
+	DD[DAP$H_MLENGTH]=1;		!The menu field is always sent
+	IF .CDT NEQ 0 THEN
+            BEGIN
+            DTMMENU[DTM_CDT]=1;
+            DD[DAP$H_MLENGTH]=19;
+            END;
+
+	IF .RDT NEQ 0 THEN
+            BEGIN
+            DTMMENU[DTM_RDT]=1;
+            DD[DAP$H_MLENGTH]=.DD[DAP$H_MLENGTH]+18;
+            END;
+
+	IF .EDT NEQ 0 THEN
+            BEGIN
+            DTMMENU[DTM_EDT]=1;
+            DD[DAP$H_MLENGTH]=.DD[DAP$H_MLENGTH]+18;
+            END;
+
+	DD[DAP$V_MFLAGS_LENGTH]=1;      !Length field present
+        DAP$PUT_HEADER(DD[$]);
+
+	DAP$PUT_BITVECTOR(DD[$],DTMMENU,6);	!Send the menu
+
+	!Dates are always 18-character fields
+	IF .DTMMENU[DTM_CDT] THEN PUT_18BYTE(CDT);	!Creation date
+	IF .DTMMENU[DTM_RDT] THEN PUT_18BYTE(RDT);	!Access date
+	IF .DTMMENU[DTM_EDT] THEN PUT_18BYTE(EDT);	!Scratch date
+	END;	!of code to send DATE & TIME message
+
+!
+! Send PROTECTION message if needed
+!
+	BEGIN			!Send PROTECTION message if needed
+	LOCAL	PROMENU: BITVECTOR[42];
+
+	CLEARV	(PROMENU);
+	DD[DAP$H_MLENGTH]=
+                (1		!The menu is 1 byte long
+		 +(IF (.OWNER[0] NEQ 0)
+		   THEN	(PROMENU[PRO_OWNER]=1;.OWNER[0]+1)
+		   ELSE 0)
+		 +(LOCAL BC;	!Byte count for field
+		   BC=DAP$SIZE_BITVECTOR(PROTSYS,3,0);
+		   IF .BC GTR 0
+		   THEN (PROMENU[PRO_PROTSYS]=1;.BC)
+		   ELSE 0)
+		 +(LOCAL BC;	!Byte count for field
+		   BC=DAP$SIZE_BITVECTOR(PROTOWN,3,0);
+		   IF .BC GTR 0
+		   THEN (PROMENU[PRO_PROTOWN]=1;.BC)
+		   ELSE 0)
+		 +(LOCAL BC;	!Byte count for field
+		   BC=DAP$SIZE_BITVECTOR(PROTGRP,3,0);
+		   IF .BC GTR 0
+		   THEN (PROMENU[PRO_PROTGRP]=1;.BC)
+		   ELSE 0)
+		 +(LOCAL BC;	!Byte count for field
+		   BC=DAP$SIZE_BITVECTOR(PROTWLD,3,0);
+		   IF .BC GTR 0
+		   THEN (PROMENU[PRO_PROTWLD]=1;.BC)
+		   ELSE 0));
+
+	IF (.MLENGTH GTR 1) AND .CONFIG[CONFIG$V_PROTECTION]
+	 THEN	BEGIN	!We need to send it
+                INIT_MESAGE(DD[$]);
+		DD[DAP$B_OPERATOR]=DAP$K_PROTECTION;    !Message type
+		DD[DAP$V_MFLAGS_LENGTH]=1;              !Length field present
+                DAP$PUT_HEADER(DD[$]);
+
+		DAP$PUT_BITVECTOR(DD[$],PROMENU,6);     !Menu
+
+		IF .PROMENU[PRO_OWNER]                  ! OWNER field
+                THEN DAP$PUT_VARIABLE_COUNTED(DD[$],CH$PTR(OWNER,0,8));
+
+		IF .PROMENU[PRO_PROTSYS]
+                THEN DAP$PUT_BITVECTOR(DD[$],PROTSYS,3);	!SYSTEM
+
+		IF .PROMENU[PRO_PROTOWN]
+                THEN DAP$PUT_BITVECTOR(DD[$],PROTOWN,3);	!OWNER
+
+		IF .PROMENU[PRO_PROTGRP]
+                THEN DAP$PUT_BITVECTOR(DD[$],PROTGRP,3);	!GROUP
+
+		IF .PROMENU[PRO_PROTWLD]
+                THEN DAP$PUT_BITVECTOR(DD[$],PROTWLD,3);	!WORLD
+		END;
+	END;	!of code to send PROTECTION message
+)%
+
+END;	!DAP$PUT_ATTRIBUTES
+GLOBAL ROUTINE DAP$PUT_ACCESS (DD,FAB,ACCFUNC,ACCOPT,DISPLAY,NFAB): NOVALUE=
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	build ACCESS message & put in output buffer
+!
+! FORMAL PARAMETERS:
+!
+!	DD: Address of DAP descriptor
+!       FAB:  "      " RMS FAB
+!       ACCFUNC: Access Function to perform
+!       ACCOPT: Access option bits (DAP)
+!       DISPLAY: Display Bits (DAP)
+!       NFAB: FAB with New name for rename
+!
+! IMPLICIT OUTPUTS:
+!
+!	An ACCESS msg will be put in the output buffer
+!
+! ROUTINE VALUE:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+MAP DD: REF $DAP_DESCRIPTOR,
+    FAB: REF $FAB_DECL,
+    NFAB: REF $FAB_DECL,
+    ACCOPT: REF BITVECTOR,
+    DISPLAY: REF BITVECTOR;
+
+BIND NAM=.FAB[FAB$A_NAM]: $NAM_DECL;    ! Name block (if any)
+
+LOCAL
+      C,
+      NPTR,
+      TNPTR,
+      FAC: BITVECTOR[21],
+      SHR: BITVECTOR[21];
+
+LOCAL REMOTEFILE: VECTOR[256/(%BPVAL/8)];
+CLEARV(FAC,SHR);
+
+INIT_MESSAGE(DD[$]);
+DD[DAP$B_OPERATOR]=DAP$K_ACCESS;
+DD[DAP$V_MFLAGS_LENGTH]=1;              ! Length field present always
+
+!Make sure we request enough access to do what we want
+CASE .ACCFUNC FROM DAP$K_OPEN TO DAP$K_ACCFUNC_MAX OF SET
+[DAP$K_OPEN]:		FAB[FAB$V_FAC_GET]=1;	!Ask for GET access
+[DAP$K_CREATE,DAP$K_SUBMIT]:
+                        FAB[FAB$V_FAC_PUT]=1;	!Ask for PUT access
+[INRANGE]: ;                            ! Not needed
+[OUTRANGE]: SIGNAL(DAP$_AOR,DD[$]);
+TES;
+
+$DAP_MOVE_BITS(FAB,FAB$V_FAC_,FAC,DAP$V_FAC_,
+               GET,PUT,BIO,TRN,UPD,BRO);        ! Massage RMS FAC bits into DAP
+
+$DAP_MOVE_BITS(FAB,FAB$V_SHR_,SHR,DAP$V_FAC_,
+               GET,PUT,BIO,TRN,UPD,BRO);        ! Massage RMS SHR bits into DAP
+
+
+! If we have a resultant name string, use it.
+! If not, try expanded name string.
+! If we have neither of those, or no name block at all, use the original string
+
+IF NAM NEQ 0
+THEN
+    BEGIN
+    IF .NAM[NAM$H_RSL] NEQ 0
+    THEN NPTR=.NAM[NAM$A_RSA]
+    ELSE IF .NAM[NAM$H_ESL] NEQ 0
+         THEN NPTR=.NAM[NAM$A_ESA]
+         ELSE NPTR=.FAB[FAB$A_FNA]
+    END
+ELSE NPTR=.FAB[FAB$A_FNA];
+
+TNPTR=.NPTR;                            ! Copy pointer
+
+! Scan off nodeid if any
+INCR I FROM 0 TO 255
+DO IF ((C=CH$RCHAR_A(NPTR)) EQL %C':') AND ((C=CH$RCHAR_A(NPTR)) EQL %C':')
+   THEN EXITLOOP
+   ELSE IF .C EQL 0
+        THEN (NPTR=.TNPTR; EXITLOOP);               ! Look for ::
+
+!Find out how long the message will be (and build a few fields in the process)
+DD[DAP$H_LENGTH]=(1                     !Length so far=1 
+                  +$DAP_SIZE_BITVECTOR(.ACCOPT,5)  ! +# of bytes of ACCOPT
+                  +CHAZAC(.NPTR,CH$PTR(REMOTEFILE,0,8))+1
+                  !Add length of the file name +1 for count byte
+                  +$DAP_SIZE_BITVECTOR(FAC,3,
+                                       SHR,3,
+                                       .DISPLAY,4)
+                 );
+
+
+!Now build the message a field at a time
+DAP$PUT_HEADER(DD[$]);                        ! First, the message header
+
+PUT_BYTE(DD[$],.ACCFUNC);                     !Access function
+
+DAP$PUT_BITVECTOR(DD[$],.ACCOPT,5);           !Access options
+
+PUT_VARIABLE_COUNTED(DD[$],CH$PTR(REMOTEFILE,0,8)); !Remote file spec
+
+DAP$PUT_BITVECTOR(DD[$],FAC,3);         !FAC
+
+DAP$PUT_BITVECTOR(DD[$],SHR,3);         !SHR
+
+DAP$PUT_BITVECTOR(DD[$],.DISPLAY,4);    !DISPLAY
+
+IF .ACCFUNC EQL DAP$K_RENAME
+THEN
+    BEGIN                               ! [4] Pass address of bitvector
+    LOCAL NAMETYPE: BITVECTOR[24] PRESET([DAP$K_NAMETYPE_FSP]=1);
+    D$PNAM(DD[$],NFAB[$],NAMETYPE);  ! New name for rename
+    END;
+END;	!D$PACC
+
+GLOBAL ROUTINE D$PNAM(DD,FAB,NAME_TYPE): NOVALUE=
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Send a NAME message
+!
+! FORMAL PARAMETERS:
+!
+!	DD:		addr of DAP descriptor
+!       FAB:            addr of RMS FAB
+!       NAME_TYPE:      name type (DAP) address of bitvector
+!--
+MAP  DD: REF $DAP_DESCRIPTOR;
+MAP  FAB: REF $FAB_DECL;
+MAP NAME_TYPE: REF BITVECTOR;
+LOCAL NPTR;
+LOCAL TNPTR;
+LOCAL C;
+LOCAL
+	CFILESPEC: VECTOR[200/(%BPVAL/8)];	!Store ASCIC filespec here
+    
+NPTR=.FAB[FAB$A_FNA];                   ! Scan off nodeid
+TNPTR=.NPTR;
+
+! Scan off nodeid if any
+INCR I FROM 0 TO 255
+DO IF ((C=CH$RCHAR_A(NPTR)) EQL %C':') AND ((CH$RCHAR_A(NPTR)) EQL %C':')
+   THEN EXITLOOP
+   ELSE IF .C EQL 0
+   THEN (NPTR=.TNPTR; EXITLOOP);               ! Look for ::
+
+INIT_MESSAGE(DD[$]);
+
+DD[DAP$B_OPERATOR]=DAP$K_NAME;
+DD[DAP$V_MFLAGS_LENGTH]=1;	!LENGTH field present
+DD[DAP$H_LENGTH]=$DAP_SIZE_BITVECTOR(.NAME_TYPE,3)
+                  +CHAZAC(.NPTR,CH$PTR(CFILESPEC,0,8))+1;
+                  !Convert filespec to ASCIC, & compute length of message
+                  ! add 1 for count byte
+
+DAP$PUT_HEADER(DD[$]);
+
+DAP$PUT_BITVECTOR(DD[$],.NAME_TYPE,3);		       ! NAMETYPE field
+DAP$PUT_VARIABLE_COUNTED(DD[$],CH$PTR(CFILESPEC,0,8)); ! FILESPEC field
+
+END;
+
+GLOBAL ROUTINE D$PCTL(DD,RAB,CFUN,DISPLAY) :NOVALUE=
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Build CONTROL message
+!
+! FORMAL PARAMETERS:
+!
+!       DD:     Address of DAP descriptor
+!       RAB:    Address of RMS RAB
+!	CFUN:	Control message function code
+!       DISPLAY:Address of display bitvector
+!
+! IMPLICIT INPUTS:
+!
+!
+! IMPLICIT OUTPUTS:
+!
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+MAP DD: REF $DAP_DESCRIPTOR,            ! Descriptor for message
+    RAB: REF $RAB_DECL;                 ! RAB
+
+LOCAL
+	CTLMENU: BITVECTOR[7],
+	RAC,
+	KEY: BYTE8VECTOR[255],
+        KRF,
+        ROP: BITVECTOR[42],
+        ROP_SIZE,
+        HSH: BITVECTOR[35],
+        HSH_SIZE,
+        DISPLAY_SIZE;
+
+
+BIND FAB=.RAB[RAB$A_FAB]: $FAB_DECL;               ! Find our FAB
+
+CLEARV(CTLMENU,KEY,KRF,ROP,HSH);
+
+INIT_MESSAGE(DD[$]);
+DD[DAP$B_OPERATOR]=DAP$K_CONTROL;       ! This is a CONTROL message
+DD[DAP$V_MFLAGS_LENGTH]=1;              ! Always a length field
+
+CTLMENU[DAP$V_CTL_RAC]=1;               ! Always have to send a RAC
+
+RAC=$DAP_TRANSLATE_VALUE(.RAB[RAB$Z_RAC],
+                         RAB$K_RAC_,DAP$K_RAC_,
+                         SEQ,REL,IDX,TRA,BLK,BFT);
+
+SELECT .RAB[RAB$Z_RAC] OF 
+SET
+[RAB$K_RAC_BFT]:                        ! Block mode file transfer
+    BEGIN
+    LOCAL KEYVAL;
+
+    CTLMENU[DAP$V_CTL_KEY]=1;           ! We will send the KEY
+    KEYVAL=RMS_VBN_TO_DAP(.RAB[RAB$G_BKT]);
+    KEY[0]=%BPVAL/8;                    ! Key is converted bucket number
+    INCR I FROM 1 TO %BPVAL/8           ! 
+    DO (KEY[.I]=.KEYVAL; KEYVAL=.KEYVAL^-8);
+    END;
+[RAB$K_RAC_KEY]:                        ! Key access
+    BEGIN
+    CTLMENU[DAP$V_CTL_KEY]=1;           ! We will send the key
+
+    SELECT .FAB[FAB$Z_ORG] OF
+    SET
+    [FAB$K_ORG_REL]:                    ! Relative file
+        BEGIN                           ! Key is Record number
+        LOCAL KEYVAL;                   ! KBF is address of record number
+
+        KEYVAL=..RAB[RAB$A_KBF];
+        KEY[0]=%BPVAL/8;
+        INCR I FROM 1 TO %BPVAL/8
+        DO (KEY[.I]=.KEYVAL; KEYVAL=.KEYVAL^-8)
+        END;
+    [FAB$K_ORG_IDX]:                    ! Indexed file
+        BEGIN                           ! Key is a string
+        LOCAL KEYPTR;
+        KEY[0]=.RAB[RAB$Z_KSZ];         ! KSZ is length of string
+        KEYPTR=.RAB[RAB$A_KBF];         ! Character pointer to key
+        INCR I FROM 1 TO .KEY[0]        ! Copy the string
+        DO (KEY[.I]=CH$RCHAR_A(KEYPTR));!
+        END;
+    TES;
+    END;
+TES;
+    
+$DAP_MOVE_BITS(RAB,RAB$V_ROP_,ROP,DAP$V_ROP_,
+               EOF,FDL,UIF,HSH,LOA,ULK,TPT,
+               RAH,WBH,KGE,KGT,NLK,RLK,BIO,
+               LIM,NXR);                ! Translate the RMS ROP to a DAP one
+
+ROP_SIZE=DAP$SIZE_BITVECTOR(ROP,6,0);   ! Remember the size of this now
+IF .ROP_SIZE NEQ 0 THEN CTLMENU[DAP$V_CTL_ROP]=1; !Remember to send if needed
+
+!HSH is reserved as of DAP 6.0
+HSH_SIZE=0;
+
+DISPLAY_SIZE=DAP$SIZE_BITVECTOR(.DISPLAY,4,0); ! Remember the size of this now
+IF .DISPLAY_SIZE NEQ 0 THEN CTLMENU[DAP$V_CTL_DISPLAY]=1; ! send if needed
+
+
+DD[DAP$H_LENGTH]=(1                                     ! Length of CTLFUNC
+                  +DAP$SIZE_BITVECTOR(CTLMENU,4,0)      ! Length of menu
+                  +.CTLMENU[DAP$V_CTL_RAC]              ! Length of RAC
+                  +(IF .CTLMENU[DAP$V_CTL_KEY]
+                    THEN .KEY[0]+1 ELSE 0)              ! Length of KEY
+                  +(.CTLMENU[DAP$V_CTL_KRF])            ! Length of KRF = 1
+                  +.ROP_SIZE                            ! Length of ROP
+                  +.HSH_SIZE                            ! Length of HSH
+                  +.DISPLAY_SIZE                        ! Length of DISPLAY
+                 );
+
+DAP$PUT_HEADER(DD[$]);                      ! Send the header
+
+DAP$PUT_BYTE(DD[$],.CFUN);                  !Function code
+
+DAP$PUT_BITVECTOR(DD[$],CTLMENU,4);     !Send the menu
+
+IF .CTLMENU[DAP$V_CTL_RAC]                    !RAC field
+THEN	DAP$PUT_BYTE(DD[$],.RAC);             !
+
+IF .CTLMENU[DAP$V_CTL_KEY]                    !Key field
+THEN	PUT_VARIABLE_COUNTED(DD[$],CH$PTR(KEY,0,8));
+
+IF .CTLMENU[DAP$V_CTL_KRF]
+THEN    PUT_BYTE(DD[$],.KRF);                 ! KRF field
+
+IF .CTLMENU[DAP$V_CTL_ROP]
+THEN    DAP$PUT_BITVECTOR(DD[$],ROP,6);           ! ROP field
+
+IF .CTLMENU[DAP$V_CTL_HSH]
+THEN    DAP$PUT_BITVECTOR(DD[$],HSH,5);           ! HSH field
+
+IF .CTLMENU[DAP$V_CTL_DISPLAY]
+THEN    DAP$PUT_BITVECTOR(DD[$],.DISPLAY,4);       ! DISPLAY field
+
+END;	!D$PCTL
+GLOBAL ROUTINE D$GSTS(DD)=
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Routine to process a (usually unexpected) STATUS message
+!	Note that the message header must have already been eaten
+!	Signals error condition & returns code
+!
+! FORMAL PARAMETERS:
+!
+!	DD: Addr of DAP descriptor
+!
+! IMPLICIT INPUTS:
+!
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	System-dependent error code (but we SIGNAL first)
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+MAP	DD:	REF $DAP_DESCRIPTOR;
+LOCAL
+        CODE,
+	MACCODE,
+	MICCODE,
+	RFA: BYTE8VECTOR[9],
+	RECNUM: BYTE8VECTOR[9],
+	STV: BYTE8VECTOR[9];
+
+CLEARV(RFA,RECNUM,STV);
+CODE=GET_2BYTE(DD[$]);                  !Put both here for now
+MACCODE=.CODE AND DAP$M_MACCODE;         !Pick out MACCODE
+MICCODE=.CODE AND DAP$M_MICCODE;         !and MICCODE
+
+IF .DD[DAP$H_LENGTH] GTR 0 THEN RFA=GET_VBN(DD[$]);
+IF .DD[DAP$H_LENGTH] GTR 0 THEN RECNUM=GET_LONGWORD(DD[$]);
+IF .DD[DAP$H_LENGTH] GTR 0 THEN STV=GET_LONGWORD(DD[$]);
+
+ERR_DS(.MACCODE,.MICCODE)
+END; !DOSTS
+GLOBAL ROUTINE DAP$GET_ACK(DD)=
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Routine to expect and process an ACK message,
+!       or a STATUS message if we aren't lucky
+!
+! FORMAL PARAMETERS:
+!
+!	DD: Addr of DAP descriptor
+!
+! IMPLICIT INPUTS:
+!
+!	Input buffer & pipeline
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! COMPLETION CODES:
+!
+!       STS$K_NORMAL if we get an ACK,
+!       error code otherwise
+!
+! SIDE EFFECTS:
+!
+!	The accessed file, if any, will be closed or flushed
+!
+!--
+MAP DD: REF $DAP_DESCRIPTOR;
+
+SELECT GET_HEADER(DD[$])
+OF  SET
+    [DAP$K_ACK]:     STS$K_NORMAL;
+    [DAP$K_STATUS]:  D$GSTS(DD[$]);
+    [OTHERWISE]:     SIGNAL(DAP$_SYNC,DD[$]);
+    TES
+END;	!DAP$GET_ACK
+%IF FTPASSIVE
+%THEN
+GLOBAL ROUTINE DAP$GET_ACCESS_COMPLETE(DD)=
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Routine to process an ACCESS COMPLETE message
+!	Note that the message header has already been eaten
+!
+! FORMAL PARAMETERS:
+!
+!	DD: Addr of DAP descriptor
+!
+! IMPLICIT INPUTS:
+!
+!	Input buffer & pipeline
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	CMPFUNC: the ACCESS COMPLETE function code
+!
+! SIDE EFFECTS:
+!
+!	The accessed file, if any, will be closed or flushed
+!
+!--
+LOCAL	FOP: BITVECTOR;
+LOCAL CMPFUNC;
+
+CMPFUNC=GET_BYTE(DD[$]);	!Save ACCOMP function
+IF .DD[DAP$H_LENGTH] GTR 0
+THEN DAP$GET_BITVECTOR(DD[$],FOP,6);	!Get a FOP field if any
+CASE .CMPFUNC FROM 1 TO 4 OF SET
+[DAP$K_ACCOMP_COMMAND]:
+                BEGIN
+                SELECT .NB[NDB$ACCFUNC] OF
+                    SET
+		    [DAP$K_OPEN,DAP$K_CREATE]: CLOSE(FB);	!Close the file
+		    TES;
+
+                IF .FOP[FB$DLC] THEN DELETE(FB);        !Delete on close
+
+		DAP$PUT_STRING(DD[$],D_ACCOMP_RESP);
+                DAP$PUT_MESSAGE(DD[$]);
+
+		RETURN DAP$K_ACCOMP_COMMAND	!We won & we're done
+		END;
+[DAP$K_ACCOMP_RESPONSE]:
+                DAP_ERROR(DD[$],DAP$K_MAC_INVALID,DAP$K_ACCOMP_CMPFUNC);
+		!They're not supposed to send us this!!
+[DAP$K_ACCOMP_PURGE]:
+                BEGIN
+		IF (FB NEQ 0) THEN RESETF(FAB);
+		DAP$PUT_STRING(DD[$],D_ACCOMP_RESP);
+                DAP$PUT_MESSAGE(DD[$]);
+
+		SIGNAL(DAP$_LINK_ABORT,DD[$]); !Remote system aborted transfer
+		RETURN DAP$K_ACCOMP_PURGE	!They gave up on us
+		END;
+[DAP$K_ACCOMP_EOS]:
+                BEGIN
+		DAP_ERROR(DD[$],DAP$K_MAC_UNSUPPORTED,
+                          DAP$K_MIC_ACCOMP_CMPFUNC);
+		END;
+[OUTRANGE]:	BEGIN
+		DAP_ERROR(DD[$],DAP$K_MAC_INVALID,
+                          DAP$K_MIC_ACCOMP_CMPFUNC);
+		END;
+TES;
+END;	!DOACM
+%FI !FTPASSIVE
+END ELUDOM

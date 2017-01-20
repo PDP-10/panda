@@ -1,0 +1,485 @@
+%TITLE 'Data Interchange Utility Show Queue'
+
+MODULE DIUSHO(IDENT = '252',
+              LANGUAGE(BLISS36),
+              ENTRY(SHOQUE)             ! SHOW REQUEST
+              ) =
+BEGIN
+
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+! FACILITY:	DIU    Data Interchange Utility
+!
+! ENVIRONMENT:  TOPS-20 V6.1    XPORT      
+!		BLISS-36 V4     FAO-36
+!
+! ABSTRACT:     This module dumps a DIU request block to the file specified
+!               by the RAB's associated $FAB, or to the TTY if no RAB given.
+!
+! AUTHOR:  Rick Fricchione			CREATED: 30-Oct-1984
+
+! HISTORY:
+!
+!  252	Remove library of CONDIT.
+!	Sandy Clemens  1-Jul-86
+!
+!  215  Call IP_FIND from SHOQUE to simplify things.
+!       Gregory A. Scott 3-Jun-86
+!
+!  174  Remove library of TOPS20.
+!       Gregory A. Scott 20-May-86
+!
+!  164  Using RMS for terminal IO was  causing us problems: If we were  showing
+!       the queues when we  got an IPCF  interrupt, we would  bomb out with  "?
+!       Channel 0 interrupt at blah" because the chntab entry points to a PUSHJ
+!       P,INTHAN instruction,  but the  stack  is in  section  3 so  the  PUSHJ
+!       doesn't work.  Cure is to not use RMS for terminal IO when showing  the
+!       queues.
+!       Gregory A. Scott 16-May-86
+!
+!  161  Don't attempt to display information that is not returned to us because
+!       we are not prived or the owner of the request even if SHOW QUEUE/ALL.
+!       Gregory A. Scott 14-May-86
+!
+!  156  Remove reference to DIU$H_TRIES since it it not implemented.
+!       Gregory A. Scott 13-May-86
+!
+! 121   Bug in  SHO_FILES  caused it  to  move  way too  many  characters  when
+!       excluding the  access  string.  This  bug  was  covered up  by  bug  in
+!       DEF$ACCESS which gave an  extra null after  each filespec (which  broke
+!       LOG files among other things).
+!       Gregory A. Scott 19-Apr-86
+!
+! 117   Change "entry"  to  "request  number",  reformat  show  queue  display.
+!       Rename DIU$$SHO_FULL  to be  SHO_ALL and  DIU$SFILES to  be  SHO_FILES.
+!       Make fao fabs in own storage.
+!       Gregory A. Scott 17-Apr-86
+!
+! 114   Show the passwords always if /DEBUG switch is on in DIU$SFILES.
+!       Gregory A. Scott 8-Apr-86
+!
+! 104   Show the source and destination files on SHOW QUEUE/ALL.
+!       Adds routine DIU$SFILES, called only by DIU$$SHO_ALL.
+!       Gregory A. Scott 31-Mar-86
+!
+!    46  Remove /NOTIFY:FAILURE code.
+!        Sandy Clemens	4-Nov-85
+!
+!    40  Put the REQUIRE/LIBRARY of 'TOPS20' into a TOPS-20 only
+!        conditional.
+!        Sandy Clemens  7-Oct-85
+!
+!	RDF0001	V01-000		Rick Fricchione		1-Nov-1984
+!		Original version of DIU$SHO_
+!
+!--
+%SBTTL 'Libraries and Externals'
+
+! Libraries
+
+LIBRARY 'BLI:XPORT';                    ! XPORT of course
+LIBRARY 'FAO';                          ! FAO services
+LIBRARY 'DIU';                          ! DIU Data Structures
+
+! Externals
+
+EXTERNAL tty : $XPO_IOB();              ! IOB for the TTY
+
+EXTERNAL ROUTINE IP_FIND;               ! Find a chain of requests
+
+! Forward Routine
+
+FORWARD ROUTINE sho_files : NOVALUE,    ! Print filenames on terminal
+                sho_all : NOVALUE,      ! Print extened queue listing
+                shoque : NOVALUE;       ! Print queue listing
+
+%SBTTL 'FAO Output'
+
+! Define FAO output buffers
+
+LITERAL fao_buf_len = 160;              ! fao_buf size in bytes
+
+OWN fao_desc : $STR_DESCRIPTOR(CLASS=BOUNDED),
+    fao_buf :  VECTOR[CH$ALLOCATION(fao_buf_len)];
+
+! Macro to print a FAOized string to the terminal
+
+MACRO $put_fao (control) = 
+
+      BEGIN
+
+      LOCAL fao_ctl : $STR_DESCRIPTOR(STRING=%STRING(control,%CHAR(13,10)));
+
+      $STR_DESC_INIT(DESC=fao_desc,           ! Re-init the buffer
+                     CLASS=BOUNDED,
+                     STRING=(fao_buf_len,CH$PTR(fao_buf)));
+
+      $FAO(fao_ctl,0,fao_desc,%REMAINING);    ! Format string
+
+      $XPO_PUT(IOB=tty,                       ! Slurp to terminal
+               STRING=fao_desc);
+
+      END %;
+
+! Macro to put a string to the terminal without a trailing crlf
+
+MACRO $append_fao (control) = 
+
+      BEGIN
+
+      LOCAL fao_ctl : $STR_DESCRIPTOR(STRING=control);
+
+      $STR_DESC_INIT(DESC=fao_desc,           ! Re-init the buffer
+                     CLASS=BOUNDED,
+                     STRING=(fao_buf_len,CH$PTR(fao_buf)));
+
+      $FAO(fao_ctl,0,fao_desc,%REMAINING);    ! Format string
+
+      $XPO_PUT(IOB=tty,                       ! Slurp to terminal
+               STRING=fao_desc);
+
+      END %;
+%SBTTL 'Routine SHO_FILES'
+
+ROUTINE sho_files (p_buffer,p_length,p_descr,p_dlength,
+                   p_source_or_dest): NOVALUE = 
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       This routine shows the source or destination filenames that are
+!       listed in the given buffer.  Called only from SHO_ALL.
+!
+! FORMAL PARAMETERS:
+!
+!       p_buffer          Filespec buffer address
+!       p_length          Filespec buffer length in characters
+!       p_source_or_dest  'Source:' or 'Destination:'
+!       p_descr           Description filespec  buffer address
+!       p_dlength         Description filespec length in characters
+!
+!--
+BIND
+         buffer = .p_buffer,
+         length = p_length,
+         descr = .p_descr,
+         dlength = p_dlength,
+         source_or_dest = .p_source_or_dest;
+
+LOCAL
+         file_ptr, next_ptr, file_rem, file_len, prt_flg,
+         b_acc_ptr, e_acc_ptr, n_len, f_len,
+         temp_file: VECTOR[CH$ALLOCATION(DIU$K_NORMAL_FILE_SIZE)];
+
+! Init flag and pointer to the filespecs
+
+prt_flg = 0;                            ! We haven't printed anything yet
+file_ptr = CH$PTR(buffer);              ! Point to filespec buffer
+file_rem = .length;                     ! Remaining chars in buffer
+
+DO BEGIN
+    next_ptr = CH$FIND_CH(.file_rem,.file_ptr,$ETG); ! find start of a filespec
+    IF CH$FAIL(.next_ptr) THEN EXITLOOP;        ! Return if no more tags
+
+    file_len = CH$A_RCHAR(next_ptr);    ! Get length of this file spec
+    IF .file_len EQL 0 THEN EXITLOOP;   ! Return if finished
+
+    file_rem = .file_rem-(2+.file_len); ! Compute chars remaining
+    file_ptr = CH$PLUS(.next_ptr,1);    ! Skip over the count byte
+
+! Remove any access control stuff and  copy the filespec to temp_file.   First,
+! search for a quote followed by a double colon, which is the end of the access
+! control string.  If it was found look for the first quote which is the  start
+! of the access control string, and if its present, copy the node name  (before
+! the first quote) and the double colon and filename to the temp_file area.  If
+! there is no access control information, just copy the whole filespec over  to
+! temp_file.
+
+%IF %SWITCHES(DEBUG)                    ! IF debugging mode
+%THEN CH$COPY(.file_len,.file_ptr,      ! Print the whole thing always
+                  0,DIU$K_NORMAL_FILE_SIZE,CH$PTR(temp_file));
+%ELSE
+    e_acc_ptr = CH$FIND_SUB(.file_len,.file_ptr,3,CH$PTR(UPLIT('"::')));
+    IF NOT CH$FAIL(.e_acc_ptr) 
+    THEN BEGIN
+         b_acc_ptr = CH$FIND_CH(.file_len,.file_ptr,%C'"');
+         IF NOT CH$FAIL(.b_acc_ptr) 
+         THEN BEGIN
+              n_len = CH$DIFF(.b_acc_ptr,.file_ptr);    ! Get # chars in node
+              e_acc_ptr = CH$PLUS(.e_acc_ptr,1);        ! Get past the ending "
+              f_len = .file_len - CH$DIFF(.e_acc_ptr,.file_ptr); ! Chars in fs
+              CH$COPY(.n_len,.file_ptr,                 ! Move the node
+                      .f_len,.e_acc_ptr,                ! and the rest
+                      0,DIU$K_NORMAL_FILE_SIZE,CH$PTR(temp_file)); ! to display
+              END;
+         END 
+     ELSE CH$COPY(.file_len,.file_ptr,
+                  0,DIU$K_NORMAL_FILE_SIZE,CH$PTR(temp_file));
+%FI
+
+! The sanitized  file spec  is now  in  temp_file, ready  to print.   Output  a
+! description field if we are through here  for the first time followed by  the
+! filespec and a cr lf.  If coming here after the first time, just output  some
+! spaces to line up the filespec.
+
+    IF .prt_flg THEN
+                     $PUT_FAO('!_             !AZ',CH$PTR(temp_file))
+                ELSE BEGIN
+                     prt_flg = 1;       ! We have printed the prolog line
+                     $PUT_FAO('!_!AZ!AZ',
+                                 CH$PTR(source_or_dest),CH$PTR(temp_file));
+                     END;
+
+! Do until the entire buffer has been examined, signified by a 0 length byte.
+
+END WHILE .file_rem NEQ 0;
+
+!Output description file, if present.
+
+IF .dlength NEQ 0 THEN $PUT_FAO('!2(_)     Description: !AZ',CH$PTR(descr));
+
+END;                                    ! sho_files
+%SBTTL 'Routine SHO_ALL'
+
+ROUTINE sho_all (request: REF $DIU_BLOCK): NOVALUE  = 
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       This routine will display  items only seen when  /FULL is added to  the
+!       SHOW command.  This adds the finer level of detail to the request block
+!       display.  All available information we  can pry from the request  block
+!       is displayed if it is set.
+!
+!
+! FORMAL PARAMETERS:
+!
+!	request  	Address of a DIU request block which will 
+!			be displayed.
+!
+!
+!--
+
+IF .request[DIU$H_SOURCE_FILESPEC] NEQ 0        ! We were passed anything?
+THEN BEGIN                                      ! Yes, show it
+
+     ! Print the source and destination filespecs
+
+     SHO_FILES(request[DIU$T_SOURCE_FILESPEC],
+               .request[DIU$H_SOURCE_FILESPEC],
+               request[DIU$T_SOURCE_DESCRIPTION],
+               .request[DIU$H_SOURCE_DESCRIPTION],
+               UPLIT(%ASCIZ'Source:      '));
+
+     SHO_FILES(request[DIU$T_DESTINATION_FILESPEC],
+               .request[DIU$H_DESTINATION_FILESPEC],
+               request[DIU$T_DESTINATION_DESCRIPTION],
+               .request[DIU$H_DESTINATION_DESCRIPTION],
+               UPLIT(%ASCIZ'Destination: '));
+
+     ! Print transformation filespec
+
+     IF .request[DIU$H_TRANSFORM] NEQ 0
+     THEN $PUT_FAO('!_Transform:   !AZ',CH$PTR(request[DIU$T_TRANSFORM]));
+
+     ! Print the log file spec, None if none
+
+     IF .request[DIU$H_LOG_FILESPEC] EQL 0
+     THEN $PUT_FAO('!_Log File:    none')
+     ELSE $PUT_FAO('!_Log File:    !AD',.request[DIU$H_LOG_FILESPEC],
+                                    CH$PTR(request[DIU$T_LOG_FILESPEC]));
+
+     ! Print creation date-time of request
+
+     $PUT_FAO('!_Creation:    !20%D',.request[DIU$G_CREATION]);
+
+     ! Minimum starting time
+
+     IF .request[DIU$G_AFTER] NEQ 0
+     THEN $PUT_FAO('!_After:       !20%D',.request[DIU$G_AFTER]);
+
+     ! Deadline job must complete by
+
+     IF .request[DIU$G_DEADLINE] NEQ 0
+     THEN $PUT_FAO('!_Deadline:    !20%D',.request[DIU$G_DEADLINE]);
+
+     ! Notify code and priority
+
+     $PUT_FAO('!_Priority:    !SW     Notify: !AZ',
+              .request[DIU$B_PRIORITY],
+              (IF .request[DIU$V_NOTIFY_MAIL] 
+               THEN CH$PTR(UPLIT(%ASCIZ'Mail'))
+               ELSE IF .request[DIU$V_NOTIFY_TERMINAL]
+                    THEN CH$PTR(UPLIT(%ASCIZ'Terminal'))
+                    ELSE CH$PTR(UPLIT(%ASCIZ'None'))));
+
+     ! Any dependent requests?  If so display the information
+
+     IF .request[DIU$H_DEPENDENT_ID] NEQ 0 
+        OR .request[DIU$H_PREREQUISITE_ID] NEQ 0
+     THEN BEGIN
+          $APPEND_FAO('!_Sequence:    !AZ',
+                      (IF .request[DIU$V_SEQ_CONTINUE]
+                       THEN CH$PTR(UPLIT(%ASCIZ'Continue'))
+                       ELSE CH$PTR(UPLIT(%ASCIZ'Abort'))));
+          IF .request[DIU$H_DEPENDENT_ID] NEQ 0
+             THEN $APPEND_FAO(', Dependent: !SW',
+                              .request[DIU$H_DEPENDENT_ID]);
+          IF .request[DIU$H_PREREQUISITE_ID] NEQ 0
+          THEN $APPEND_FAO(', Prerequisite: !SW',
+                           .request[DIU$H_PREREQUISITE_ID]);
+          $PUT_FAO(' ');
+          END;
+
+     ! Show how many requeues have taken place - we never get tired.
+
+     IF .request[DIU$G_REQUEUE_COUNT] NEQ 0
+     THEN $PUT_FAO('!_Requeues:    !SL',
+                   .request[DIU$G_REQUEUE_COUNT]);
+
+     END;                               ! End of "if we were passed anything"
+
+! A blank line for neatness.
+
+$PUT_FAO(' ');
+
+END;                                    ! sho_all
+%SBTTL 'Routine SHOQUE'
+
+GLOBAL ROUTINE SHOQUE (p_req_block, verbosity) : NOVALUE = 
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       List the queue.  We send a FIND request to the DIU master job via IPCF,
+!       receive zero  or more  request blocks,  and list  them in  intelligible
+!       form.
+!
+! FORMAL PARAMETERS:
+!
+!       p_req_block: pointer to request block to match on
+!       verbosity: Level to list, TRUE if listing all
+!
+!--
+
+BIND req_block = .p_req_block : $DIU_BLOCK;
+
+LOCAL chain,
+      retcode,
+      job_status,
+      request  : REF $DIU_BLOCK;
+
+%IF %SWITCHES (TOPS10) 
+%THEN
+LOCAL user_number_desc : $STR_DESCRIPTOR(CLASS=BOUNDED),
+      user_number : VECTOR[CH$ALLOCATION(16)];
+%FI
+
+OWN function: VECTOR[8] INITIAL(UPLIT(%ASCIZ'COPY'),
+                                UPLIT(%ASCIZ'APPEND'),
+                                UPLIT(%ASCIZ'DELETE'),
+                                UPLIT(%ASCIZ'RENAME'),
+                                UPLIT(%ASCIZ'PRINT'),
+                                UPLIT(%ASCIZ'SUBMIT'),
+                                UPLIT(%ASCIZ'DIRECTORY'));
+
+! Get the chain of requests that match what the user asked for.
+
+IF NOT (retcode = ip_find (req_block, chain))
+THEN IF .retcode EQL DIU$_QUEUE_EMPTY
+     THEN BEGIN
+          $XPO_PUT (IOB = tty,
+                    STRING = %STRING('[The queue is empty]',%CHAR(13,10)));
+          RETURN;
+          END
+     ELSE BEGIN
+          SIGNAL(.retcode);
+          END;
+
+! We know that the queue isn't empty, so output the headers
+
+$PUT_FAO('!/!AZ!2(_)!%D!/Request Queue Display!/',diu$$system_banner,0);
+$PUT_FAO('Jobname Req #  Function  Status   Username');
+$PUT_FAO('------- ----- --------- --------- --------');
+
+! Processing loop starts here.  List each request in the chain.
+
+DO BEGIN
+
+   BIND request = .chain + %UPVAL : $DIU_BLOCK;
+
+
+   job_status = (IF .request[DIU$V_HOLDING] 
+                    THEN CH$PTR(UPLIT(%ASCIZ' holding'))
+                    ELSE IF .request[DIU$V_ACTIVE]
+                         THEN CH$PTR(UPLIT(%ASCIZ'executing'))
+                         ELSE IF .request[DIU$V_DELETED]
+                                 THEN CH$PTR(UPLIT(%ASCIZ' deleted'))
+                                 ELSE CH$PTR(UPLIT(%ASCIZ' pending')));
+
+
+%IF %SWITCHES (TOPS20) %THEN            ! TOPS-20 ONLY
+
+   $PUT_FAO(' !7AZ!4SW  !10AZ!10AZ!AD',
+            CH$PTR(request[DIU$T_JOBNAME]),
+            .request[DIU$H_REQUEST_ID],
+            CH$PTR(.function[.request[DIU$H_FUNCTION]-1]),
+            .job_status,
+            .request[DIU$H_USERNAME],
+            CH$PTR(request[DIU$T_USERNAME]));
+
+%ELSE                                   ! TOPS-10 ONLY
+
+! Create a string of the form "[10,33]" from the project programmer number
+
+   $STR_DESC_INIT(DESC = user_number_desc, STRING = (15, CH$PTR(user_number)));
+   $STR_COPY(TARGET = user_number_desc,
+	STRING = $STR_CONCAT(
+            '[',
+	    $STR_ASCII(.(request[DIU$G_USER_NUMBER])<lh>,BASE8,LEADING_BLANK),
+	    ',',
+	    $STR_ASCII(.(request[DIU$G_USER_NUMBER])<rh>,BASE8,LEADING_BLANK),
+	    ']'));
+
+   $PUT_FAO('!8AZ!4SW  !10AZ!10AZ!AD !AS',
+            CH$PTR(request[DIU$T_JOBNAME]),
+            .request[DIU$H_REQUEST_ID],
+            CH$PTR(.function[.request[DIU$H_FUNCTION]]),
+            .job_status,
+            .request[DIU$H_USERNAME],
+            CH$PTR(request[DIU$T_USERNAME],
+            user_number_desc));
+%FI                                     ! END TOPS-10 / TOPS-20 CONDITIONAL
+
+! If we are being verbose today, then spill our guts about this request.
+
+   IF .verbosity                        ! If SHOW QUEUE /ALL
+   THEN sho_all(request);               ! then display them
+
+! Continue until no more jobs in the chain
+
+   END UNTIL (chain = ..chain) EQL 0;
+
+! Print a blank line, close the show fab, and return normally
+
+IF NOT .verbosity THEN $PUT_FAO(' ');
+
+END;                                    ! SHOQUE
+
+END 
+ELUDOM

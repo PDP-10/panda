@@ -1,0 +1,1298 @@
+	TITLE CAFARD Program to exchange mail via TTY line
+	SUBTTL Written by Mark Crispin/MRC CMIRH 19 July 1984
+
+; Copyright (C) 1984, 1985, 1986, 1987 Mark Crispin.  All rights reserved.
+
+; Version components
+
+CAFWHO==0			; who last edited Cafard (0=developers)
+CAFVER==6			; Cafard's release version (matches monitor's)
+CAFMIN==1			; Cafard's minor version
+CAFEDT==^D53			; Cafard's edit version
+
+;  This is an interim program, supposedly to be replaced by the real,
+; wonderful program, written in a high-level language, knowing the
+; answer to Life, the Universe, and Everything...
+;
+;  I fear that by the time you read these comments, gentle reader, that
+; it is years after I wrote this program, and it is running everywhere.
+; Hence the name Cafard -- this program might easily become as ubiquitous
+; as a cockroach!
+;
+;  If you don't believe this is where the name comes from, I have another
+; story, but it'll cost you a beer to hear it...
+
+	SEARCH MACSYM,MONSYM	; system definitions
+	SALL			; suppress macro expansions
+	.DIRECTIVE FLBLST	; sane listings for ASCIZ, etc.
+	.TEXT "/NOINITIAL"	; suppress loading of JOBDAT
+	.TEXT "CAFARD/SAVE"	; save as CAFARD.EXE
+	.TEXT "/SYMSEG:PSECT:CODE" ; put symbol table and patch area in CODE
+	.REQUIRE HSTNAM		; host name routines
+	.REQUIRE WAKEUP		; MMailr wakeup
+	.REQUIRE CAFPRO		; Cafard protocol routines
+	.REQUIRE CAFDTR		; Cafard DTR routines
+	.REQUIRE SYS:MACREL	; MACSYM support routines
+IFNDEF OT%822,OT%822==:1
+	EXTERN $GTLCL,$SPCNS,$RMREL
+	EXTERN $WAKE
+	EXTERN $PINIT,$PBIN,$PSOUT,$PEOF
+	EXTERN $DTRON,$DTROF
+	SUBTTL Definitions
+
+A=1				; JSYS, temporary AC's
+B=2
+C=3
+D=4
+E=5
+PC=14				; JSP pointer
+
+IFNDEF FILPGS,FILPGS==^D10	; number of file pages to PMAP% at a time
+IFNDEF PDLLEN,PDLLEN==300	; stack length
+IFNDEF AUTLEN,AUTLEN==^D40	; allow for a pretty big return path
+IFNDEF LINBSZ,LINBSZ==^D40	; line buffer size in words
+IFNDEF LINTBL,LINTBL==^D20	; max number of lines to try
+IFNDEF NOTRYS,NOTRYS==^D10	; number of tries to open before giving up
+IFNDEF LOOPMX,LOOPMX==^D10	; maximum number of iterations of a loop
+
+; EMSG string
+; Outputs an error message
+
+DEFINE EMSG (STRING) <
+ HRROI A,[ASCIZ&STRING&]
+ ESOUT%
+>;DEFINE EMSG
+	SUBTTL Storage defintions
+
+	.PSECT DATA,1000	; enter DATA psect
+
+DEBUGP:	BLOCK 1			; non-zero if debugging
+LINJFN:	BLOCK 1			; JFN of line protocol is happening on
+LINBFR:	BLOCK LINBSZ		; line buffer
+LINPTR:	BLOCK 1			; pointer to current byte in line buffer
+LINCTR:	BLOCK 1			; number of bytes left in line buffer
+PCSAVE:	BLOCK 1			; save PC on error
+PDL:	BLOCK PDLLEN		; stack
+AUTHOR:	BLOCK AUTLEN		; return-path copied here
+
+	.ENDPS
+
+	.PSECT PAGDAT,300000	; paged data
+
+FILPAG:	BLOCK FILPGS*1000	; PMAP% readin area for file
+
+	.ENDPS
+	SUBTTL Start of program
+
+	.PSECT CODE,100000	; enter CODE psect
+
+; Entry vector
+
+EVEC:	JRST CAFARD		; start address
+	JRST DRAFAC		; reenter address
+IFNDEF VI%DEC,VI%DEC==:1B18
+	<FLD CAFWHO,VI%WHO>!<FLD CAFVER,VI%MAJ>!<FLD CAFMIN,VI%MIN>!VI%DEC!<FLD CAFEDT,VI%EDN>
+EVECL==.-EVEC
+
+CAFARD:	JSP PC,INIT		; do initialization crud
+	CALL CONECT		; establish connection
+	IFSKP.
+	  TMSG <Sending mail...
+>
+	  CALL SENDER		; send what we have over
+	ANSKP.
+	  TMSG <Receiving mail...
+>
+	  CALL RECVER		; receive what the other end has for us
+	  IFNSK.
+	    TMSG <Mail receive lost
+>
+	  ENDIF.
+	  CALL $WAKE		; wake up the mailer
+	ELSE.
+	  TMSG <Mail transmission lost
+>
+	ENDIF.
+	CALL CLOSER		; close the connection
+	HALTF%
+	JRST CAFARD
+
+DRAFAC:	JSP PC,INIT		; do initialization crud
+	CALL SERVER		; do the server
+	HALTF%
+	JRST DRAFAC
+
+INIT:	RESET%			; reset all I/O
+	MOVE P,[IOWD PDLLEN,PDL] ; init stack
+	SETZM LINCTR		; nothing in line input buffer
+	JRST (PC)		; return to caller
+
+SERVER:	MOVX A,GJ%SHT		; get JFN on our terminal
+	HRROI B,[ASCIZ/TTY:/]
+	GTJFN%
+	 ERCAL FATAL
+	MOVEM A,LINJFN		; save line JFN
+	MOVX B,<<FLD 7,OF%BSZ>!OF%WR!OF%RD> ; open read/write
+	OPENF%
+	 ERCAL FATAL
+	RFMOD%			; get current mode
+	TRZ B,TT%DAM!TT%PGM	; binary mode
+	SFMOD%
+	 ERCAL FATAL
+	STPAR%
+	 ERCAL FATAL
+	HRROI B,[ASCIZ/Cockroach
+/]				; send expected greeting
+	SETZ C,
+	CALL $SOUT
+	 RET
+	CALL $PINIT		; initialize protocol
+	CALL RECVER		; receive what the other end has for us
+	IFSKP.
+	  CALL $WAKE		; wake up the mailer
+	  CALL SENDER		; send what we have over
+	ANSKP.
+	  HRROI B,[ASCIZ/hcaorkcoC
+/]				; send expected greeting
+	  SETZ C,
+	  CALL $SOUT
+	   RET
+	ENDIF.
+	RET
+	SUBTTL Establish connection
+
+DLGCTX:	TRVAR <DLGJFN,DLGPTR,<LINTAB,LINTBL+1>,<LINSTR,10>,TRYCNT,LOOPTR,LOOPCN,LOSFLG>
+	MOVX A,NOTRYS		; establish try count
+	MOVEM A,TRYCNT
+	SETOM LOOPTR		; initialize loop pointer
+	SETZM LOSFLG		; "not losing" (yet)
+	JRST (PC)
+
+CONECT:	JSP PC,DLGCTX		; establish dialog context
+	MOVX A,GJ%SHT!GJ%OLD	; try to find dialog file
+	HRROI B,[ASCIZ/OPEN-DIALOG.TXT/]
+	GTJFN%
+	IFJER.
+	  EMSG <Can't get dialog file - >
+	  CALLRET LSTERR
+	ENDIF.
+	MOVEM A,DLGJFN		; save JFN we got
+	MOVX B,<<FLD 7,OF%BSZ>!OF%RD> ; open 7-bit read
+	OPENF%
+	IFJER.
+	  EMSG <Can't open dialog file - >
+	  CALLRET LSTERR
+	ENDIF.
+	MOVSI E,-LINTBL		; make pointer to line table
+	HRRI E,LINTAB
+	DO.
+	  MOVX C,^D8		; all lines are octal
+	  NIN%			; get
+	  IFJER.
+	    EMSG <Bogus line number in dialog file - >
+	    CALLRET LSTERR
+	  ENDIF.
+	  MOVEM B,(E)		; save line number we got
+	  BKJFN%
+	   ERCAL FATAL
+	  BIN%			; check out next character
+	  CAIE B,"/"		; start of speed?
+	  IFSKP.
+	    MOVX C,^D10		; get speed
+	    NIN%
+	    IFJER.
+	      EMSG <Bogus speed in dialog file - >
+	      CALLRET LSTERR
+	    ENDIF.
+	    HRLM B,(E)		; save speed we got
+	  ENDIF.
+	  BKJFN%		; sigh...
+	   ERCAL FATAL
+	  DO.
+	    BIN%		; see if another line
+	    CAIE B,.CHTAB	; ignore whitespace
+	     CAIN B,.CHSPC
+	      LOOP.
+	    CAIE B,"!"		; start of comment?
+	    IFSKP.
+	      DO.
+		BIN%		; get comment character
+		CAIE B,"!"	; end of comment?
+		 LOOP.		; no, continue eating comment characters
+	      ENDDO.
+	      LOOP.		; resume whitespace scan
+	    ENDIF.
+	  ENDDO.
+	  CAIN B,","		; saw a comma?
+	   AOBJN E,TOP.		; yes, get another line
+	ENDDO.
+	IFGE. E			; if ran out of room
+	  EMSG <Line table too long in dialog file
+>
+	  RET
+	ENDIF.
+	CAIN B,.CHCRT		; saw expected return?
+	 BIN%			; yes, get line feed
+	CAIN B,.CHLFD		; saw expected line feed?
+	IFSKP.
+	  EMSG <Extra crud in line table in dialog file
+>
+	  RET
+	ENDIF.
+	RFPTR%			; get current file position pointer
+	 ERCAL FATAL
+	MOVEM B,DLGPTR
+	SETOM 1(E)		; indicate end of table
+	DO.
+	  MOVSI E,-LINTBL	; make pointer to line table
+	  HRRI E,LINTAB
+	  DO.
+	    SKIPGE (E)		; line to grab
+	     EXIT.		; no more lines
+	    DO.
+	      MOVX A,<ASCII/TTY/> ; start TTY string name
+	      MOVEM A,LINSTR
+	      MOVE A,[POINT 7,LINSTR,20]
+	      HRRZ B,(E)	; line number
+	      MOVX C,^D8	; in octal
+	      NOUT%
+	       ERCAL FATAL
+	      MOVX B,":"	; finally a device indicator
+	      IDPB B,A
+	      SETZ B,		; tie off with null
+	      IDPB B,A
+	      MOVX A,GJ%SHT	; try to get TTY
+	      HRROI B,LINSTR
+	      GTJFN%
+	       ERJMP ENDLP.	; lost, try next line
+	      MOVEM A,LINJFN	; save JFN for later
+	      MOVX B,<<FLD 7,OF%BSZ>!OF%WR!OF%RD> ; open read/write
+	      OPENF%		; try to open the line
+	      IFJER.
+		TMSG <Line >
+		MOVX A,.PRIOU	; output line #
+		HRRZ B,(E)
+		MOVX C,^D8
+		NOUT%
+		 ERJMP .+1
+		TMSG < can't be opened - >
+		CALL LSTERR
+		MOVE A,LINJFN	; foo, release the JFN
+		RLJFN%
+		 ERJMP .+1
+		SETZM LINJFN	; no line JFN any more
+		EXIT.		; try next line
+	      ENDIF.
+	      CFIBF%		; clear out any input
+	       ERCAL FATAL
+	      CFOBF%		; and any output
+	       ERCAL FATAL
+	      RFMOD%		; get current mode
+	       ERCAL FATAL
+	      TXZ B,TT%DAM!TT%PGM ; binary mode
+	      SFMOD%
+	       ERCAL FATAL
+	      STPAR%
+	       ERCAL FATAL
+	      TMSG <Calling out on line >
+	      MOVX A,.PRIOU	; output line #
+	      HRRZ B,(E)
+	      MOVX C,^D8
+	      NOUT%
+	       ERJMP .+1
+	      TMSG <
+>
+	      MOVE A,LINJFN	; get JFN for line
+	      CALL $DTROF	; drop DTR first
+	      MOVX A,^D1000	; wait a second
+	      DISMS%
+	      MOVE A,LINJFN	; now assert DTR
+	      CALL $DTRON
+	      MOVX A,^D1000	; wait a second
+	      DISMS%
+	      HLRZ C,(E)	; get speed if any
+	      IFN. C		; was there any?
+		MOVE A,LINJFN	; yes, set the speed
+		MOVX B,.MOSPD
+		HLL C,(E)	; in both halfwords
+		MTOPR%
+		 ERCAL FATAL
+	      ENDIF.
+	      MOVE A,DLGJFN	; reset dialog to point to start
+	      MOVE B,DLGPTR
+	      SFPTR%
+	       ERCAL FATAL
+	      SETOM LOOPTR	; initialize loop pointer
+	      DO.
+		MOVE A,DLGJFN
+		BIN%		; get dialog command
+		IFNJE.
+		  XCT DLGRTB(B)	; do dialog grammar for this character
+		   LOOP.
+		  SKIPN LOSFLG	; lost in dialog or grammar?
+		   SETZM TRYCNT	; grammar punted, give up!
+		  MOVE A,LINJFN	; either way, close the line
+		  CFIBF%
+		   ERJMP .+1
+		  CFOBF%
+		   ERJMP .+1
+		  CALL $DTROF	; drop DTR...
+		  CLOSF%
+		   ERJMP .+1
+		  SETZM LINJFN	; no line JFN any more
+		ELSE.
+		  SETZM TRYCNT	; end of file, success, no more retries
+		ENDIF.
+	      ENDDO.
+	    ENDDO.
+	    SKIPE TRYCNT	; do we need to retry still?
+	     AOBJN E,TOP.	; yes, try next line in list
+	  ENDDO.
+	  SKIPN TRYCNT		; do we need to retry?
+	  IFSKP.
+	    SOSG TRYCNT		; yes, count off another retry
+	    IFSKP.
+	      MOVX A,^D60000	; wait a minute and try again
+	      DISMS%
+	      LOOP.		; still have a few more
+	    ENDIF.
+	    EMSG <Exhausted connection retries
+>
+	    RET
+	  ENDIF.
+	ENDDO.
+	MOVE A,DLGJFN		; now close off the JFN
+	CLOSF%
+	 ERJMP .+1		; ignore failure
+	SKIPN LINJFN		; still have the line?
+	 RET			; no, return failure
+	CALL $PINIT		; initialize protocol
+	RETSKP			; return success
+	SUBTTL Close connection
+
+CLOSER:	JSP PC,DLGCTX		; establish dialog context
+	MOVX A,GJ%SHT!GJ%OLD	; try to find dialog file
+	HRROI B,[ASCIZ/CLOSE-DIALOG.TXT/]
+	GTJFN%
+	 ERJMP R		; so no close dialog file exists!
+	MOVEM A,DLGJFN		; save JFN we got
+	MOVX B,<<FLD 7,OF%BSZ>!OF%RD> ; open 7-bit read
+	OPENF%
+	IFJER.
+	  EMSG <Can't open connection close dialog file - >
+	  CALLRET LSTERR
+	ENDIF.
+	DO.
+	  MOVE A,DLGJFN
+	  BIN%			; get dialog command
+	  IFNJE.
+	    XCT DLGRTB(B)	; do dialog grammar for this character
+	     LOOP.
+	  ENDIF.
+	ENDDO.
+	MOVE A,LINJFN		; end of file, close the line JFN
+	CFIBF%			; clear buffers
+	 ERJMP .+1
+	CFOBF%
+	 ERJMP .+1
+	CALL $DTROF		; drop DTR...
+	CLOSF%
+	 ERJMP .+1
+	SETZM LINJFN		; no line JFN any more
+	MOVE A,DLGJFN		; now close off the dialog JFN
+	CLOSF%
+	 ERJMP .+1		; ignore failure
+	RET			; return
+	SUBTTL Open/Close dialog grammar and execution
+
+; Dialog grammar vector
+
+DLGRTB:	NOP			; ^@ ignored
+	CALL GBOGUS		; ^A bogus character
+	CALL GBOGUS		; ^B bogus character
+	CALL GBOGUS		; ^C bogus character
+	CALL GBOGUS		; ^D bogus character
+	CALL GBOGUS		; ^E bogus character
+	CALL GBOGUS		; ^F bogus character
+	CALL GBOGUS		; ^G bogus character
+	CALL GBOGUS		; ^H bogus character
+	NOP			; ^I whitespace ignored
+	NOP			; ^J whitespace ignored
+	CALL GBOGUS		; ^K bogus character
+	NOP			; ^L whitespace ignored
+	NOP			; ^M whitespace ignored
+	CALL GBOGUS		; ^N bogus character
+	CALL GBOGUS		; ^O bogus character
+	CALL GBOGUS		; ^P bogus character
+	CALL GBOGUS		; ^Q bogus character
+	CALL GBOGUS		; ^R bogus character
+	CALL GBOGUS		; ^S bogus character
+	CALL GBOGUS		; ^T bogus character
+	CALL GBOGUS		; ^U bogus character
+	CALL GBOGUS		; ^V bogus character
+	CALL GBOGUS		; ^W bogus character
+	CALL GBOGUS		; ^X bogus character
+	CALL GBOGUS		; ^Y bogus character
+	CALL GBOGUS		; ^Z bogus character
+	CALL GBOGUS		; ^[ bogus character
+	CALL GBOGUS		; ^\ bogus character
+	CALL GBOGUS		; ^] bogus character
+	CALL GBOGUS		; ^^ bogus character
+	CALL GBOGUS		; ^_ bogus character
+	NOP			; SPACE whitespace ignored
+	CALL GCOMNT		; ! comment toggle
+	CALL GSTEXT		; " send text
+	CALL GBOGUS		; # bogus character
+	CALL GBOGUS		; $ bogus character
+	CALL GBOGUS		; % bogus character
+	CALL GBOGUS		; & bogus character
+	CALL GBOGUS		; ' bogus character
+	CALL GBOGUS		; ( bogus character
+	CALL GBOGUS		; ) bogus character
+	CALL GBOGUS		; * bogus character
+	NOP			; + success clause, ignored here
+	CALL GBOGUS		; , bogus character
+	NOP			; - failure clause, ignored here
+	CALL GBOGUS		; . bogus character
+	CALL GBOGUS		; / bogus character
+	CALL GBOGUS		; 0 bogus character
+	CALL GBOGUS		; 1 bogus character
+	CALL GBOGUS		; 2 bogus character
+	CALL GBOGUS		; 3 bogus character
+	CALL GBOGUS		; 4 bogus character
+	CALL GBOGUS		; 5 bogus character
+	CALL GBOGUS		; 6 bogus character
+	CALL GBOGUS		; 7 bogus character
+	CALL GBOGUS		; 8 bogus character
+	CALL GBOGUS		; 9 bogus character
+	CALL GBOGUS		; : bogus character
+	CALL GBOGUS		; ; bogus character
+	CALL GBEGIN		; < begin loop
+	CALL GEQUAL		; = test for desired string
+	SETOM LOOPTR		; > end of loop
+	CALL GBOGUS		; ? bogus character
+	CALL GBOGUS		; @ bogus character
+	CALL GBOGUS		; A bogus character
+	CALL GBOGUS		; B bogus character
+	CALL GBOGUS		; C bogus character
+	CALL GBOGUS		; D bogus character
+	CALL GEAT		; E eat input
+	CALL GBOGUS		; F bogus character
+	CALL GBOGUS		; G bogus character
+	CALL GBOGUS		; H bogus character
+	CALL GBOGUS		; I bogus character
+	CALL GBOGUS		; J bogus character
+	CALL GBOGUS		; K bogus character
+	CALL GLOSE		; L dialog lossage
+	CALL GBOGUS		; M bogus character
+	CALL GBOGUS		; N bogus character
+	CALL GBOGUS		; O bogus character
+	CALL GBOGUS		; P bogus character
+	CALL GBOGUS		; Q bogus character
+	CALL GBOGUS		; R bogus character
+	CALL GBOGUS		; S bogus character
+	CALL GBOGUS		; T bogus character
+	CALL GBOGUS		; U bogus character
+	CALL GBOGUS		; V bogus character
+	CALL GWAIT		; W wait 250 ms
+	CALL GLEXIT		; X exit loop
+	CALL GBOGUS		; Y bogus character
+	CALL GBOGUS		; Z bogus character
+	CALL GMESAG		; [ output to terminal
+	CALL GBOGUS		; \ bogus character
+	CALL GBOGUS		; ] bogus character
+	CALL GLOOP		; ^ go to top of loop
+	CALL GBOGUS		; _ bogus character
+	CALL GBOGUS		; ` bogus character
+	CALL GBOGUS		; a bogus character
+	CALL GBOGUS		; b bogus character
+	CALL GBOGUS		; c bogus character
+	CALL GBOGUS		; d bogus character
+	CALL GEAT		; e eat input
+	CALL GBOGUS		; f bogus character
+	CALL GBOGUS		; g bogus character
+	CALL GBOGUS		; h bogus character
+	CALL GBOGUS		; i bogus character
+	CALL GBOGUS		; j bogus character
+	CALL GBOGUS		; k bogus character
+	CALL GLOSE		; l dialog lossage
+	CALL GBOGUS		; m bogus character
+	CALL GBOGUS		; n bogus character
+	CALL GBOGUS		; o bogus character
+	CALL GBOGUS		; p bogus character
+	CALL GBOGUS		; q bogus character
+	CALL GBOGUS		; r bogus character
+	CALL GBOGUS		; s bogus character
+	CALL GBOGUS		; t bogus character
+	CALL GBOGUS		; u bogus character
+	CALL GBOGUS		; v bogus character
+	CALL GWAIT		; w wait 250 ms
+	CALL GLEXIT		; x exit loop
+	CALL GBOGUS		; y bogus character
+	CALL GBOGUS		; z bogus character
+	CALL GBOGUS		; { bogus character
+	CALL GBOGUS		; | bogus character
+	CALL GBOGUS		; } bogus character
+	NOP			; ~ end of conditional, ignored
+	CALL GBOGUS		; RUBOUT bogus character
+
+; Bogus command
+
+GBOGUS:	EMSG <Bogus command character in dialog file: >
+	MOVX A,.PRIOU
+	BOUT%
+	TMSG <
+>
+	RETSKP			; indicate we should punt
+
+; "L" dialog lossage
+
+GLOSE:	SETOM LOSFLG		; flag dialog lossage
+	RETSKP
+
+; "<" begin loop
+
+GBEGIN:	SKIPGE LOOPTR		; already in a loop?
+	IFSKP.
+	  EMSG <Nested loops not allowed
+>
+	  RETSKP		; maybe remove this restriction someday
+	ENDIF.
+	MOVE A,DLGJFN		; note this pointer
+	RFPTR%			; pointer to start of test string
+	IFJER.
+	  CALL FATAL		; strange lossage
+	  RETSKP
+	ENDIF.
+	MOVEM B,LOOPTR
+	MOVNI B,LOOPMX		; maximum number of times loops run
+	MOVEM B,LOOPCN
+	RET
+
+; "^" resume iteration
+
+GLOOP:	SKIPL B,LOOPTR		; already in a loop?
+	IFSKP.
+	  EMSG <"^" outside of loop
+>
+	  RETSKP		; maybe remove this restriction someday
+	ENDIF.
+	AOSLE LOOPCN		; ran out of iterations?
+	 RET			; yes, no-op now
+	MOVE A,DLGJFN		; reset point pointer
+	SFPTR%
+	IFJER.
+	  CALL FATAL		; strange lossage
+	  RETSKP
+	ENDIF.
+	RET
+
+; "X" exit loop
+
+GLEXIT:	MOVE A,DLGJFN		; end of loop search
+	DO.
+	  BIN%
+	   ERJMP R
+	  CAIN B,">"		; found end of loop?
+	   EXIT.		; yes, continue from that point
+	  CAIE B,""""		; quoted string?
+	   CAIN B,"!"		; comment?
+	  IFNSK.
+	    MOVE C,B		; yes, search for end of string first
+	    DO.
+	      BIN%
+	       ERJMP R
+	      CAME B,C		; end of string yet?
+	       LOOP.		; no
+	    ENDDO.
+	  ELSE.
+	    CAIE B,"["		; terminal string?
+	    IFSKP.
+	      DO.
+		BIN%
+		 ERJMP R
+		CAIE B,"]"	; end of string yet?
+		 LOOP.		; no
+	      ENDDO.
+	    ENDIF.
+	  ENDIF.
+	  LOOP.			; keep searching
+	ENDDO.
+	RET
+
+; "E" eat excess input
+
+GEAT:	MOVX C,^D6
+	DO.
+	  CALL $SIBE		; any characters available for us?
+	  IFSKP.
+	    MOVX A,^D500	; not expired yet, wait 1/2 second
+	    DISMS%
+	    SOJGE C,TOP.	; and try again
+	  ELSE.
+	    CALL $BIN		; read byte from input
+	     RETSKP
+	    LOOP.
+	  ENDIF.
+	ENDDO.
+	RET
+
+; "W" wait 250 ms
+
+GWAIT:	MOVX A,^D250		; sleep a bit
+	DISMS%
+	RET
+
+; "!" comment toggle
+
+GCOMNT:	DO.
+	  MOVE A,DLGJFN		; get a comment byte
+	  BIN%
+	  IFNJE.
+	    CAIE B,"!"		; end of comment?
+	     LOOP.
+	  ENDIF.
+	ENDDO.
+	RET
+
+; `"' output text to the line we're doing protocol on
+
+GSTEXT:	ACVAR <PRV>
+	DO.
+	  MOVE A,DLGJFN		; get a text byte to output
+	  BIN%
+	  IFNJE.
+	    CAIN B,""""		; end of text?
+	  ANSKP.
+	    CAIN B,.CHLFD	; no, is this a line feed?
+	     CAIE PRV,.CHCRT	; yes, was previous character CR?
+	    IFNSK.
+	      CALL $BOUT	; send character to line
+	       RETSKP
+	      MOVE PRV,B	; save as previous character
+	    ENDIF.
+	    LOOP.		; do next byte
+	  ENDIF.
+	ENDDO.
+	RET
+
+	ENDAV.
+
+; "[" output message to our terminal
+
+GMESAG:	DO.
+	  MOVE A,DLGJFN		; get a text byte to output
+	  BIN%
+	  IFNJE.
+	    CAIN B,"]"		; end of text?
+	  ANSKP.
+	    MOVX A,.PRIOU	; output to terminal
+	    BOUT%
+	    LOOP.
+	  ENDIF.
+	RET
+
+; "=" test for desired string
+
+GEQUAL:	STKVAR <TSTCHR,TSTBEG,TSTTMO>
+	SETZ C,			; clear running timeout value
+	MOVE A,DLGJFN		; get expected quote
+	DO.
+	  BIN%
+	   ERJMP .+1		; EOF is pretty losing...
+	  CAIL B,"0"		; numeric?
+	   CAILE B,"9"
+	    EXIT.		; not a digit!
+	  IMULI C,^D10		; a digit, another decade...
+	  ADDI C,-"0"(B)	; add in new digit
+	  LOOP.
+	ENDDO.
+	SKIPN C			; was a timeout given?
+	 MOVX C,1		; allow at least 1 second
+	LSH C,1			; timeout ticks are in 1/2 seconds
+	MOVEM C,TSTTMO		; set timeout
+	CAIN B,""""		; was it what we wanted?
+	IFSKP.
+	  EMSG <Missing required quote
+>
+	  RETSKP
+	ENDIF.
+	RFPTR%			; pointer to start of test string
+	IFJER.
+	  CALL FATAL		; strange lossage
+	  RETSKP
+	ENDIF.
+	MOVEM B,TSTBEG
+	DO.
+	  MOVE A,DLGJFN		; get byte to compare with
+	  BIN%
+	   ERJMP R
+	  CAIN B,""""		; end of test string?
+	  IFSKP.
+	    MOVEM B,TSTCHR	; save character to test for
+	    DO.
+	      CALL $SIBE	; any characters available for us?
+	      IFSKP.
+		SOSGE TSTTMO	; no, has timeout expired?
+		IFSKP.
+		  MOVX A,^D500	; not expired yet, wait 1/2 second
+		  DISMS%
+		  LOOP.		; and try again
+		ENDIF.
+		SETO B,		; "time out" character
+	      ELSE.
+		CALL $BIN	; read byte from input
+		 RETSKP
+	      ENDIF.
+	    ENDDO.
+	    IFGE. B		; exit if timed out
+	      CAMN B,TSTCHR	; was it what we expected?
+	       LOOP.		; yes, try for another
+	      MOVEM B,TSTCHR	; no, save what we got
+	      MOVE A,DLGJFN	; reset test string and get first byte
+	      MOVE C,TSTBEG
+	      RIN%
+	      CAMN B,TSTCHR	; matches last character we got?
+	       LOOP.		; yes, continue search from here
+	      BKJFN%		; oh well, back up to it again
+	       ERJMP .+1
+	      LOOP.		; and continue search
+	    ENDIF.
+	    MOVE A,DLGJFN	; search for end of string
+	    DO.
+	      BIN%		; get random character
+	       ERJMP R
+	      CAIE B,""""	; end of search string yet?
+	       LOOP.		; not yet
+	    ENDDO.
+	    MOVX C,"-"		; must search for failure clause
+	  ELSE.
+	    MOVX C,"+"		; search for success clause
+	  ENDIF.
+	ENDDO.
+	MOVE A,DLGJFN		; clause search
+	DO.
+	  BIN%
+	   ERJMP R
+	  CAIE B,"~"		; end of conditional or
+	   CAMN B,C		;  found what we are looking for?
+	    EXIT.		; yes, continue from that point
+	  CAIE B,""""		; quoted string?
+	   CAIN B,"!"		; comment?
+	  IFNSK.
+	    MOVE D,B		; yes, search for end of string first
+	    DO.
+	      BIN%
+	       ERJMP R
+	      CAME B,D		; end of string yet?
+	       LOOP.		; no
+	    ENDDO.
+	  ELSE.
+	    CAIE B,"["		; terminal string?
+	    IFSKP.
+	      DO.
+		BIN%
+		 ERJMP R
+		CAIE B,"]"	; end of string yet?
+		 LOOP.		; no
+	      ENDDO.
+	    ENDIF.
+	  ENDIF.
+	  LOOP.			; keep searching
+	ENDDO.
+	RET
+
+	ENDSV.
+
+	ENDTV.			; end of dialog conventions
+	SUBTTL Send mail to remote
+
+SENDER:	STKVAR <QUEJFN,CURPAG,<FILSIZ,2>>
+	MOVX A,GJ%IFG!GJ%OLD!GJ%SHT!.GJALL ; look at all the mail queued for us
+	HRROI B,[ASCIZ/-MAIL.*.*/]
+	GTJFN%
+	IFNJE.
+	  MOVEM A,QUEJFN	; found it, save the JFN
+	  DO.
+	    HRRZ A,QUEJFN	; open up file
+	    MOVX B,<<FLD 7,OF%BSZ>!OF%RD> ; for 7-bit read
+	    OPENF%
+	     ERCAL FATAL
+	    MOVE B,[2,,.FBBYV]	; get file I/O and byte size info
+	    MOVEI C,FILSIZ	; into FILSIZ/FILSIZ+1
+	    GTFDB%		; NOTE: depends upon .FBSIZ=.FBBYV+1
+	    MOVE B,1+FILSIZ	; get byte count
+	    LOAD C,FB%BSZ,FILSIZ ; get file byte size
+	    CAIN C,7		; 7-bit bytes?
+	    IFSKP.
+	      CAIE C,^D36	; allow 36-bit files
+	       RET		; otherwise lose!!
+	      IMULI B,5		; 5 7-bit bytes per 36-bit word
+	    ENDIF.
+	    MOVEM B,FILSIZ	; save file size
+	    SETZM CURPAG	; start at beginning of file
+	    DO.
+	      MOVS A,QUEJFN	; file to map from
+	      HRR A,CURPAG	; current page to map from
+	      MOVX B,<.FHSLF,,<FILPAG/1000>> ; map into this process at FILPAG
+	      MOVX C,PM%CNT!PM%RD!PM%PLD!FILPGS ; preload FILPGS pages for read
+	      PMAP%		; map the pages
+	      HRROI A,FILPAG	; 7-bit bytes
+	      MOVX B,FILPGS*5*^D512 ; number of bytes in this page set
+	      EXCH B,FILSIZ	; bytes to do yet in C
+	      CAMG B,FILSIZ	; more bytes after this page set?
+	      IFSKP.
+		SUB B,FILSIZ	; yes, account for this page set in count
+		EXCH B,FILSIZ	; full page set to output
+	      ELSE.
+		SETZM FILSIZ	; no, this is the last page set to do
+	      ENDIF.
+	      CALL $PSOUT	; send it out
+	       RET		; failed
+	      SKIPG FILSIZ	; more to do yet?
+	      IFSKP.
+		MOVEI A,FILPGS	; yes, bump CURPAG by number of pages just done
+		ADDM A,CURPAG
+		LOOP.		; do next set of pages
+	      ENDIF.
+	      SETO A,		; unmap file pages so we can close the file
+	      MOVX B,<.FHSLF,,<FILPAG/1000>>
+	      MOVX C,PM%CNT!FILPGS
+	      PMAP%
+	    ENDDO.
+	    CALL $PEOF		; send EOF
+	     RET		; hard error
+	    HRRZ A,QUEJFN	; close the file
+	    TXO A,CO%NRJ
+	    CLOSF%
+	     ERJMP .+1
+	    HRRZ A,QUEJFN	; all done, flush this file
+	    TXO A,DF%NRJ	; don't flush the JFN
+	    DELF%
+	     ERJMP .+1		; shouldn't happen, but don't barf
+	    MOVE A,QUEJFN	; get next file
+	    GNJFN%
+	     ERJMP ENDLP.	; no more files
+	    LOOP.
+	  ENDDO.
+	ENDIF.
+	CALL $PEOF		; send EOF
+	 RET			; hard error
+	RETSKP			; and return
+
+	ENDSV.
+	SUBTTL Receive mail from remote and queue
+
+RECVER:	STKVAR <<HSTBUF,^D20>,<TMPBUF,^D20>,TMPPTR,MLQJFN,SAVCHR,ATPTR,BEGPTR,AUTPTR,AUTCNT>
+	HRROI A,HSTBUF		; get local name
+	CALL $GTLCL
+	 RET			; can't possibly happen
+	DO.
+	  CALL $PBIN		; get character from line
+	   RET			; the link died
+	  JUMPL B,ENDLP.	; if EOF, nothing more to do
+	  MOVEM B,SAVCHR	; save character
+	  DO.
+	    HRROI A,TMPBUF	; build queued mail filename
+	    HRROI B,[ASCIZ/MAILQ:[--QUEUED-MAIL--].NEW-/]
+	    SETZ C,
+	    SOUT%		; set up initial part of name
+	     ERCAL FATAL
+	    MOVEM A,TMPPTR	; save string pointer
+	    GTAD%		; get system date/time
+	    MOVE B,A		; now output it in octal
+	    MOVE A,TMPPTR
+	    MOVX C,^D8
+	    NOUT%
+	     ERCAL FATAL
+	    HRROI B,[ASCIZ/-CAFARD-J/] ; add originating process name
+	    SETZ C,
+	    SOUT%
+	     ERCAL FATAL
+	    MOVEM A,TMPPTR
+	    GJINF%
+	    MOVE A,TMPPTR
+	    HRRZ B,C		; insert job number for unique name
+	    MOVX C,^D10		; in decimal
+	    NOUT%
+	     ERCAL FATAL
+	    HRROI B,[ASCIZ/.-1;P770000/] ; next generation, protection 770000
+	    SETZ C,
+	    SOUT%
+	     ERCAL FATAL
+	    MOVX A,GJ%NEW!GJ%FOU!GJ%PHY!GJ%SHT ; want new file
+	    HRROI B,TMPBUF
+	    GTJFN%		; try to get JFN on it
+	    IFJER.
+	      MOVX A,^D3000	; wait three seconds and try again
+	      DISMS%
+	      LOOP.
+	    ENDIF.
+	    MOVEM A,MLQJFN	; save JFN we got
+	    MOVX B,<<FLD 7,OF%BSZ>!OF%WR> ; open for write, 7-bit bytes
+	    OPENF%
+	    IFJER.
+	      MOVE A,MLQJFN	; OPENF% failed, release the JFN
+	      RLJFN%
+	       ERJMP .+1
+	      SETZM MLQJFN	; forget about it
+	      MOVX A,^D3000	; wait 3 seconds
+	      LOOP.		; and try again
+	    ENDIF.
+	  ENDDO.
+	  MOVE B,SAVCHR		; restore first character
+	  CAIE B,.CHCRT		; was there a sender argument?
+	  IFSKP.
+	    CALL $PBIN		; Nein, fress das LF
+	    IFSKP.
+	      CAIE B,.CHLFD	; Es muss hier ein LF sein!
+	    ANSKP.
+	    ELSE.
+	      TXO A,CZ%ABT	; Scheisse!
+	      CLOSF%
+	       ERJMP .+1
+	      RET		; Goetterdaemmerung...
+	    ENDIF.
+	  ELSE.
+	    MOVX B,.CHFFD	; yes, output form feed first
+	    BOUT%
+	     ERCAL FATAL
+	    HRROI B,[ASCIZ/=RETURN-PATH:/]
+	    SOUT%		; output return path header
+	     ERCAL FATAL
+	    MOVE B,SAVCHR	; output first character of return path
+	    MOVE C,[POINT 7,AUTHOR] ; init beginning of author pointer
+	    MOVEM C,BEGPTR
+	    IDPB B,C		; copy first character
+	    MOVEM C,AUTPTR
+	    SETZM ATPTR		; init pointer to atsign
+	    MOVX C,<AUTLEN*5>-1	; bytes remaining in buffer
+	    MOVEM C,AUTCNT
+	    BOUT%
+	     ERCAL FATAL
+	    DO.
+	      CALL $PBIN	; get a byte
+	      IFSKP.
+	      ANDGE. B		; must not be end of file here
+		BOUT%		; output byte to file
+		 ERCAL FATAL
+		CAIE B,"\"	; quote next character?
+		IFSKP.
+		  CALL $PBIN	; get a byte
+		  IFSKP.
+		  ANDGE. B	; must not be end of file here
+		    SOSL AUTCNT	; space left in buffer?
+		     IDPB B,AUTPTR ; yes, add char to author
+		    BOUT%	; output byte to file
+		     ERCAL FATAL
+		  ELSE.
+		    TXO A,CZ%ABT ; protocol error or link died, abort this file
+		    CLOSF%
+		     ERJMP .+1
+		    RET		; return lossage
+		  ENDIF.
+		ENDIF.
+		CAIE B,""""	; quoted string?
+		IFSKP.
+		  DO.
+		    CALL $PBIN	; get a byte
+		    IFSKP.
+		    ANDGE. B	; must not be end of file here
+		      BOUT%	; output byte to file
+		       ERCAL FATAL
+		      CAIN B,"""" ; end of quoted string?
+		       EXIT.	; yes, get out now!
+		      CAIE B,"\" ; quote next character?
+		      IFSKP.
+			CALL $PBIN ; get a byte
+			IFSKP.
+			ANDGE. B ; must not be end of file here
+			  SOSL AUTCNT ; space left in buffer?
+			   IDPB B,AUTPTR ; yes, add char to author
+			  BOUT%	; output byte to file
+			   ERCAL FATAL
+			ELSE.
+			  TXO A,CZ%ABT ; protocol error or link died
+			  CLOSF%
+			   ERJMP .+1
+			  RET	; return lossage
+			ENDIF.
+		      ENDIF.
+		      SOSL AUTCNT ; space left in buffer?
+		       IDPB B,AUTPTR ; yes, add char to author
+		    ELSE.
+		      TXO A,CZ%ABT ; protocol error or link died
+		      CLOSF%
+		       ERJMP .+1
+		      RET	; return lossage
+		    ENDIF.
+		  ENDDO.
+		ENDIF.
+		SOSL AUTCNT	; space left in buffer?
+		 IDPB B,AUTPTR	; yes, add char to author
+		CAIE B,"@"	; hostname starts now?
+		IFSKP.
+		  MOVE C,AUTPTR	; yes, save pointer to atsign
+		  MOVEM C,ATPTR
+		ENDIF.
+		CAIE B,":"	; encountered colon in A-D-L??
+		IFSKP.
+		  MOVE C,AUTPTR	; yes, all previous is routing garbage
+		  MOVEM C,BEGPTR ; so start from here
+		  SETZM ATPTR	; and forget any @ seen
+		ENDIF.
+		CAIE B,.CHLFD	; at end of line?
+		 LOOP.		; do next byte
+	      ELSE.
+		TXO A,CZ%ABT	; protocol error or link died, abort this file
+		CLOSF%
+		 ERJMP .+1
+		RET		; return lossage
+	      ENDIF.
+	    ENDDO.
+	    SETZ B,		; tie off with NUL
+	    IDPB B,AUTPTR
+	    SKIPE ATPTR		; @ found?
+	     SKIPGE AUTCNT	; yes, copy unless buffer overflowed
+	    IFSKP.
+	      MOVX B,.CHFFD	; specify sender
+	      BOUT%
+	      MOVEI B,"_"
+	      BOUT%
+	      MOVE B,ATPTR	; replace @ in copied string with NUL
+	      SETZ C,
+	      DPB C,B
+	      SOUT%		; output host
+	       ERCAL FATAL
+	      MOVE B,BEGPTR
+	      SOUT%		; output username
+	       ERCAL FATAL
+	      HRROI B,[ASCIZ/
+/]
+	      SOUT%		; and final CRLF
+	       ERCAL FATAL
+	    ENDIF.
+	  ENDIF.
+	  MOVX B,.CHFFD		; output form feed first
+	  BOUT%
+	   ERCAL FATAL
+	  HRROI B,HSTBUF
+	  SETZ C,
+	  SOUT%
+	   ERCAL FATAL
+	  HRROI B,[ASCIZ/
+/]
+	  SOUT%
+	   ERCAL FATAL
+	  DO.			; loop to slurp up recipient list
+	    CALL $PBIN		; get a byte
+	    IFSKP.
+	      IFGE. B
+		BOUT%		; output byte to file
+		 ERCAL FATAL
+		CAIE B,.CHFFD	; end of recipient list?
+		 LOOP.		; no, do next byte
+	      ENDIF.
+	    ELSE.
+	      TXO A,CZ%ABT	; the link died, abort this file
+	      CLOSF%
+	       ERJMP .+1
+	      RET		; return lossage
+	    ENDIF.
+	  ENDDO.
+	  HRROI B,[ASCIZ/
+Received: from /]		; write Received: line
+	  SETZ C,
+	  SOUT%
+	   ERCAL FATAL
+	  GJINF%
+	  HRROI A,TMPBUF	; try to get foreign name
+	  CALL $SPCNS
+	  IFSKP.
+	    HRROI A,TMPBUF	; remove relative domain
+	    CALL $RMREL
+	    MOVE A,MLQJFN
+	    HRROI B,TMPBUF	; write foreign host
+	    SETZ C,
+	    SOUT%
+	     ERCAL FATAL
+	  ELSE.
+	    MOVE A,MLQJFN	; standby just in case
+	    HRROI B,[ASCIZ/???/]
+	    SETZ C,
+	    SOUT%
+	     ERCAL FATAL
+	  ENDIF.
+	  HRROI B,[ASCIZ/ by /]
+	  SOUT%
+	   ERCAL FATAL
+	  HRROI A,HSTBUF	; remove relative domain
+	  CALL $RMREL
+	  MOVE A,MLQJFN
+	  HRROI B,HSTBUF	; write local host
+	  SOUT%
+	   ERCAL FATAL
+	  HRROI B,[ASCIZ/ with Cafard; /]
+	  SOUT%
+	   ERCAL FATAL
+	  SETO B,		; output current date/time
+	  MOVX C,OT%DAY!OT%SPA!OT%TMZ!OT%SCL!OT%822 ; RFC 822 standard date/time
+	  ODTIM%
+	   ERCAL FATAL
+	  DO.			; loop to slurp message
+	    CALL $PBIN		; get a byte
+	    IFSKP.
+	      IFGE. B
+		BOUT%		; output byte to file
+		 ERCAL FATAL
+		LOOP.		; do next byte
+	      ENDIF.
+	    ELSE.
+	      TXO A,CZ%ABT	; the link died, abort this file
+	      CLOSF%
+	       ERJMP .+1
+	      RET		; return lossage
+	    ENDIF.
+	  ENDDO.
+	  CLOSF%		; close off the file
+	   ERJMP .+1
+	  LOOP.			; do next message
+	ENDDO.
+	RETSKP
+
+	ENDSV.
+	SUBTTL I/O routines
+
+; $SIBE - Skip if bytes available from line
+;	CALL $SIBE
+; Returns +1: Number of bytes available in B
+;	  +2: No bytes available
+
+$SIBE::	SKIPLE B,LINCTR		; anything in line input buffer?
+	IFSKP.
+	  SAVEAC <A>
+	  MOVE A,LINJFN		; no, do the system call
+	  SIBE%
+	ANSKP.
+	  RETSKP
+	ENDIF.
+	RET
+
+; $BIN - Get byte from line
+;	CALL $BIN
+; Returns +1: Hard failure
+;	  +2: Success, with byte in B
+
+$BIN::	SAVEAC <A,C>
+	SOSL LINCTR		; anything in line input buffer?
+	IFSKP.
+	  CALL $SIBE		; any input in buffer for me?
+	   SKIPA C,B		; yes, get that many bytes
+	    MOVX C,1		; else just get one byte
+	  CAILE C,5*LINBSZ	; bounds check
+	   MOVX C,5*LINBSZ	; guess we should reassemble!
+	  MOVEM C,LINCTR	; note number of bytes this time
+	  MOVE A,LINJFN		; line designator
+	  MOVE B,[POINT 7,LINBFR]
+	  MOVEM B,LINPTR	; re-initialize pointer
+	  MOVN C,LINCTR		; number of bytes
+	  SIN%			; slurp up the data
+	   ERJMP R
+	  SOS LINCTR		; count this byte as having been et
+	ENDIF.
+	ILDB B,LINPTR		; read a single byte
+	MOVX A,.PRIOU
+	SKIPE DEBUGP
+	 BOUT%
+	RETSKP
+
+; $BOUT - Send character to line
+; Accepts:
+;	B/ character
+;	CALL $BOUT
+; Returns +1: Hard failure
+;	  +2: Success
+
+$BOUT::	SAVEAC <A>
+	MOVE A,LINJFN		; output string to terminal
+	BOUT%
+	 ERJMP R
+	MOVX A,.PRIOU
+	SKIPE DEBUGP
+	 BOUT%
+	RETSKP
+
+; $SOUT - Send string to line
+; Accepts:
+;	B/ string to output
+;	C/ size of string to output
+;	CALL $SOUT
+; Returns +1: Hard failure
+;	  +2: Success
+
+$SOUT::	SAVEAC <A>
+	STKVAR <<ARGS,2>>
+	DMOVEM B,ARGS
+	MOVX A,.PRIOU
+	SKIPE DEBUGP
+	 SOUT%
+	MOVE A,LINJFN		; output string to terminal
+	DMOVE B,ARGS
+	SOUT%
+	 ERJMP R
+	RETSKP
+
+; $BLOCK - Block for a short duration
+;	CALL $BLOCK
+; Returns +1: Always
+
+$BLOCK::SAVEAC <A>
+	MOVX A,^D250		; block for 250ms
+	DISMS%
+	RET
+	SUBTTL Other crud
+
+; Output last JSYS error
+
+FATAL:	EXCH 16,(P)		; save PC for message
+	MOVEM 16,PCSAVE
+	EXCH 16,(P)
+	SAVEAC <A,B,C>
+	EMSG <PC >
+	MOVX A,.PRIOU
+	HRRZ B,PCSAVE
+	MOVX C,^D8
+	NOUT%
+	 ERJMP .+1
+	TMSG <: >
+	CALL LSTERR
+	HALTF%
+	RET
+
+LSTERR:	MOVX A,.PRIOU		; output to terminal
+	HRLOI B,.FHSLF		; this fork,,last error
+	SETZ C,			; no limit
+	ERSTR%
+	 JRST ERRUND		; undefined error number
+	 NOP			; can't happen
+	TMSG <
+>
+	RET
+
+ERRUND:	EMSG <Undefined error >
+	MOVX A,.FHSLF		; get error number
+	GETER%
+	MOVX A,.PRIOU		; output it
+	HRRZS B			; only right half where error code is
+	MOVX C,^D8		; in octal
+	NOUT%
+	 ERJMP R		; ignore error here
+	TMSG <
+>
+	RET
+
+	XLIST
+	LIT
+	LIST
+
+	END EVECL,,EVEC

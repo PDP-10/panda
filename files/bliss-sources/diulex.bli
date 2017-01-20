@@ -1,0 +1,1878 @@
+MODULE DIULEX  (IDENT='253' %BLISS32 (,
+		 ADDRESSING_MODE (EXTERNAL = GENERAL))) =
+
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+!++
+!
+!  TITLE:  PARLEX
+!
+!  FACILITY:  Data Interchange Utility
+!
+!  ABSTRACT:
+!
+!	This module contains all the routines necessary to do a lexical
+!	scan of the tokens for the Data Definition Utility language.
+!
+!  ENVIRONMENT:
+!
+!	All routines run in user access mode.
+!
+!	These routines are NOT AST reentrant.
+!
+!  AUTHOR:  Colleen Deininger,	28-MAY-81
+!
+!++
+!
+! MODIFICATION HISTORY:
+!
+!   Version 3.0
+!	20-Jul-84       (CLR) Put XPORT use back in!  Use compatible Bliss!
+!	23-Feb-84 01693 (CGM) Remove XPORT use from the CDDL.
+!	 6-Jan-84 01506 (CDD) 
+!	21-Dec-83 01296 (mrw) 
+!	 9-Dec-83 01102 (mrw)  
+!	23-Nov-83 01035 (CGM) FIX BUG WHERE THE STATUS FROM DDU$$P_LEX_NUMBER
+!	                      IS NOT CHECKED.
+!	21-Nov-83 00868 (CDD) 
+!	30-Sep-83 00771 (MRW) moved imbedded CDDL messages to message file
+!	 1-Sep-83 00755 (CGM) Adding the INDEXED FOR COBOL BY clause.
+!	26-Jul-83 00730 (KJM) Added support for PL/I
+!	 8-Apr-83 00653 (MAB) Allow CDD objects to have version numbers.
+!
+!	17-Feb-83 00475 (CDD) Promote to new version
+!
+!	12-Jan-83 00116 (CDD) Change the version number to X3.0
+!
+!	16-Sep-82 00033 (CDD) 
+!
+!    Version 2.0
+!	29-Jul-82	(CGM)	Changed error severities, names and messages.
+!
+!	22-Jul-82	(CGM)	Added handling for DBMS datatype synonyms.
+!
+!	19-Jul-82	(CGM)	Added support for form feeds "<FF>".  Form
+!				feeds are replaced with a space when parsing
+!				the source.
+!
+!	23-Jun-82	(CGD)	Deleted support for back slashes since they
+!				are no longer used in fully qualified names.
+!
+!	3-Mar-82	(CGD)	Made LEX check for redundant EOF token &
+!				return.
+!				Made CDDL$_VALUEOVFL warning continue with
+!				the current token rather than ignoring it.
+!				Changed CDDL$_BADDESC to CDDL$_BADCHAR.
+!				Made LEX_COLUMN know about tabs and be
+!				set accordingly.
+!
+!	13-JAN-82	(CGD)	Added /RECOMPILE option capabilities.
+!
+!  253  Rename file to DIULEX.
+!       Gregory A. Scott 1-Jul-86
+!
+!--
+BEGIN
+
+!   INCLUDE FILES:
+
+	require 'DIUPATPROLOG';
+	library 'BLI:XPORT';
+	%if %BLISS (BLISS32) %THEN
+	require 'VMS';
+	%FI
+	library 'DIUPATDATA';
+	library 'DIUDEB';
+	library 'DIUPATLANGSP';
+
+! Table of contents:
+
+    FORWARD ROUTINE
+	DDU$$P_LEX_NAME,		! Parse CDDname, pathname, or keyword
+	DDU$$P_LEX_NUMBER,		! Parse numeric token
+	DDU$$P_LEX_PERCENT,		! Parse token beginning with percent
+	ENTER_TEXT	: NOVALUE,	! Store text in the heap
+	GET_CHAR	: NOVALUE,	! Get next input character
+	LEX		: NOVALUE,	! Get next token
+	PAR_COLUMN_NUMBER,		! Column number for token
+	PAR_GET_TOKEN,			! Manage token storage
+	PAR_LINE_NUMBER,		! Line number of a token
+	UTL_GET;			! Do heap allocation
+! Declarations for lexical locator
+
+%if %bliss (BLISS36) %then
+    literal
+	RMS$_EOF		= 9999,
+	SS$_NORMAL		= 1;
+%fi
+
+    LITERAL
+	DDU$K_SOURCE		= 0,
+	COLUMNS_PER_TAB		= 8,
+	MAX_NUM_LEX_TOKS	= 20;
+
+    $FIELD
+	LOC_COLUMN		= [$BYTE],
+	LOC_LINENUM		= [$SHORT_INTEGER],
+	LOC_UNUSED		= [$BYTE];
+
+    literal
+	LOC_SIZE		= $FIELD_SET_SIZE*%upval;
+
+    MACRO
+	LOC_STR =
+	    BLOCK [LOC_SIZE/%upval]
+		FIELD (LOC_COLUMN, LOC_LINENUM, LOC_UNUSED) %;
+
+    literal
+	BUF_SIZE		= 256;
+
+! Information about the present lexical token
+
+    OWN
+	FILE_IOB :		ref $XPO_IOB (),
+	END_OF_INPUT_LINE :	VOLATILE INITIAL (FALSE),
+	START_LINE :		%BLISS32 (LONG),
+	LEX_LINENUM :		%BLISS32 (LONG)	INITIAL (0),
+	LEX_COLUMN :		%BLISS32 (LONG)	INITIAL (0),
+	COLUMN :		%BLISS32 (LONG)	INITIAL (0),
+	LEX_LOCATOR :		LOC_STR,
+	LEX_TKNSTRT :		%BLISS32 (LONG),
+	TOKEN_STORAGE :		BLOCKVECTOR [MAX_NUM_LEX_TOKS, TKN_SIZE]
+				FIELD (TKN_FIELDS),
+	NEXT_TOKEN_INDEX :	%BLISS32 (LONG)	INITIAL (0);
+GLOBAL ROUTINE PAR_LINE_NUMBER (L) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Return the line number for a lexical token.
+!
+! INPUT PARAMETERS:
+!
+!	L		Lexical location structure
+!
+! OUTPUT PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+!--
+BEGIN
+
+    MAP
+	L :	LOC_STR;
+
+    RETURN .L [LOC_LINENUM]
+END;
+GLOBAL ROUTINE LEX_INIT (file) : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine sets up the file IOB of the file to be parsed.
+!	It should be called from PAT$PARSER before parsing begins.
+!
+! INPUT PARAMETERS:
+!
+!	file	Address of the XPORT IOB for the file to be parsed.
+!
+! OUTPUT PARAMETERS:
+!
+!	None
+!
+! IMPLICIT INPUTS:
+!
+!	None
+!
+! IMPLICIT OUTPUTS:
+!
+!	file_iob	Set to the address of the XPORT IOB for the file to
+!			be parsed.
+!
+!--
+BEGIN
+
+file_iob = .file;
+END;
+GLOBAL ROUTINE PAR_COLUMN_NUMBER (L) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Return the column number for a lexical token.
+!
+! INPUT PARAMETERS:
+!
+! 	L		Lexical location
+!
+! OUTPUT PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+!--
+BEGIN
+    MAP
+	L :	LOC_STR;
+
+    RETURN .L [LOC_COLUMN]
+END;
+ROUTINE DDU$$P_LEX_NAME (TOKEN_PTR, CHAR_PTR) =
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine lexically parses a CDD_name, path name or keyword token.
+!
+!  PARAMETERS:
+!
+!	token_ptr		address of the token block being defined.
+!	char_ptr		pointer to current character position.
+!
+!  IMPLICIT INPUTS:
+!
+!	END_OF_INPUT_LINE	TRUE if current character is at end of line
+!	LEX_TKNSTRT		Starting character position of current token
+!
+!  IMPLICIT OUTPUTS:
+!
+!	END_OF_INPUT_LINE	Flag for last character on input line
+!	LEX_TKNSTRT		Starting character position of current token
+!
+!  COMPLETION STATUS:
+!
+!	SS$_NORMAL if OK, FALSE if not
+!
+!  SIGNALLED STATUS:
+!
+!	This routine does not intercept signals sent by routines it calls.
+!
+!  SIDE EFFECTS:
+!
+!	May cause more input lines to be read.
+!
+!--
+BEGIN
+    MAP
+	TOKEN_PTR 	: REF	TKN_STR;
+
+    BIND
+	CHAR		= .CHAR_PTR;
+! Classes of characters that might appear in input text:
+
+    LITERAL
+	I_ILLEGAL	= 0,
+	I_OTHER		= 1,
+	I_LETTER	= 2,
+	I_L_PAREN	= 3,
+	I_R_PAREN	= 4,
+	I_DOT		= 5,
+	I_PSSWORD	= 6,
+	I_DIGIT		= 7,
+	I_SEMICOLON	= 8;
+
+! Class of each ASCII character:
+
+    BIND
+	IDENT = UPLIT %BLISS32 (BYTE) (
+		I_ILLEGAL,	! 00 NUL
+		I_ILLEGAL,	! 01 SOH
+		I_ILLEGAL,	! 02 STX
+		I_ILLEGAL,	! 03 ETX
+		I_ILLEGAL,	! 04 EOT
+		I_ILLEGAL,	! 05 ENQ
+		I_ILLEGAL,	! 06 ACK
+		I_ILLEGAL,	! 07 BEL
+		I_ILLEGAL,	! 08 BS
+		I_PSSWORD,	! 09 HT
+		I_ILLEGAL,	! 0A LF
+		I_ILLEGAL,	! 0B VT
+		I_ILLEGAL,	! 0C FF
+		I_ILLEGAL,	! 0D CR
+		I_ILLEGAL,	! 0E SO
+		I_ILLEGAL,	! 0F SI
+		I_ILLEGAL,	! 10 DLE
+		I_ILLEGAL,	! 11 DC1
+		I_ILLEGAL,	! 12 DC2
+		I_ILLEGAL,	! 13 DC3
+		I_ILLEGAL,	! 14 DC4
+		I_ILLEGAL,	! 15 NAK
+		I_ILLEGAL,	! 16 SYN
+		I_ILLEGAL,	! 17 ETB
+		I_ILLEGAL,	! 18 CAN
+		I_ILLEGAL,	! 19 EM
+		I_ILLEGAL,	! 1A SUB
+		I_ILLEGAL,	! 1B ESC
+		I_ILLEGAL,	! 1C FS
+		I_ILLEGAL,	! 1D GS
+		I_ILLEGAL,	! 1E RS
+		I_ILLEGAL,	! 1F US
+		I_PSSWORD,	! 20 SP
+		I_PSSWORD,	! 21 !
+		I_PSSWORD,	! 22 "
+		I_PSSWORD,	! 23 #
+		I_OTHER,	! 24 $
+		I_PSSWORD,	! 25 %
+		I_PSSWORD,	! 26 &
+		I_PSSWORD,	! 27 '
+		I_L_PAREN,	! 28 (
+		I_R_PAREN,	! 29 )
+		I_PSSWORD,	! 2A *
+		I_PSSWORD,	! 2B +
+		I_PSSWORD,	! 2C ,
+		I_OTHER,	! 2D -
+		I_DOT,		! 2E .
+		I_PSSWORD,	! 2F /
+		I_DIGIT,	! 30 0
+		I_DIGIT,	! 31 1
+		I_DIGIT,	! 32 2
+		I_DIGIT,	! 33 3
+		I_DIGIT,	! 34 4
+		I_DIGIT,	! 35 5
+		I_DIGIT,	! 36 6
+		I_DIGIT,	! 37 7
+		I_DIGIT,	! 38 8
+		I_DIGIT,	! 39 9
+		I_PSSWORD,	! 3A :
+		I_SEMICOLON,	! 3B ;
+		I_PSSWORD,	! 3C <
+		I_PSSWORD,	! 3D =
+		I_PSSWORD,	! 3E >
+		I_PSSWORD,	! 3F ?
+		I_PSSWORD,	! 40 @
+		I_LETTER,	! 41 A
+		I_LETTER,	! 42 B
+		I_LETTER,	! 43 C
+		I_LETTER,	! 44 D
+		I_LETTER,	! 45 E
+		I_LETTER,	! 46 F
+		I_LETTER,	! 47 G
+		I_LETTER,	! 48 H
+		I_LETTER,	! 49 I
+		I_LETTER,	! 4A J
+		I_LETTER,	! 4B K
+		I_LETTER,	! 4C L
+		I_LETTER,	! 4D M
+		I_LETTER,	! 4E N
+		I_LETTER,	! 4F O
+		I_LETTER,	! 50 P
+		I_LETTER,	! 51 Q
+		I_LETTER,	! 52 R
+		I_LETTER,	! 53 S
+		I_LETTER,	! 54 T
+		I_LETTER,	! 55 U
+		I_LETTER,	! 56 V
+		I_LETTER,	! 57 W
+		I_LETTER,	! 58 X
+		I_LETTER,	! 59 Y
+		I_LETTER,	! 5A Z
+		I_PSSWORD,	! 5B [
+		I_PSSWORD,	! 5C \
+		I_PSSWORD,	! 5D ]
+		I_PSSWORD,	! 5E ^
+		I_OTHER,	! 5F _
+		I_PSSWORD,	! 60 `
+		I_LETTER,	! 61 a
+		I_LETTER,	! 62 b
+		I_LETTER,	! 63 c
+		I_LETTER,	! 64 d
+		I_LETTER,	! 65 e
+		I_LETTER,	! 66 f
+		I_LETTER,	! 67 g
+		I_LETTER,	! 68 h
+		I_LETTER,	! 69 i
+		I_LETTER,	! 6A j
+		I_LETTER,	! 6B k
+		I_LETTER,	! 6C l
+		I_LETTER,	! 6D m
+		I_LETTER,	! 6E n
+		I_LETTER,	! 6F o
+		I_LETTER,	! 70 p
+		I_LETTER,	! 71 q
+		I_LETTER,	! 72 r
+		I_LETTER,	! 73 s
+		I_LETTER,	! 74 t
+		I_LETTER,	! 75 u
+		I_LETTER,	! 76 v
+		I_LETTER,	! 77 w
+		I_LETTER,	! 78 x
+		I_LETTER,	! 79 y
+		I_LETTER,	! 7A z
+		I_PSSWORD,	! 7B {
+		I_PSSWORD,	! 7C |
+		I_PSSWORD,	! 7D }
+		I_PSSWORD,	! 7E ~
+		I_ILLEGAL	! 7F DEL
+%BLISS32 (	,REP 128 OF (I_ILLEGAL)))
+	: VECTOR [%BLISS32 (,BYTE)];
+! Table of keywords:
+
+macro
+%IF %BLISS (BLISS36) %THEN
+zchar (foo, tok) = %ascii %string (%char (%charcount (foo)), foo,
+    %char (tok)) %;
+%ELSE
+zchar (foo, tok) = %ascic foo, %char (tok) %;
+%FI
+
+    BIND
+	RESERVED_TABLE = UPLIT (
+	UPLIT %BLISS32 (BYTE) ( %STRING (		! A
+		zchar (	'ALIGNED',	T_ALIGNED),
+		zchar (	'ARE',		T_ARE),
+		zchar (	'ARRAY',	T_ARRAY),
+		zchar (	'AS',		T_AS),
+		zchar ( 'ASCII_7',	T_ASCII_7),
+		zchar ( 'ASCII_8',	T_ASCII_8),
+		zchar ( 'ASCII_9',	T_ASCII_9),
+		%char (0))),
+	UPLIT %BLISS32 (BYTE) ( %STRING (		! B
+		zchar (	'BASE',		T_BASE),
+		zchar (	'BASIC',	T_BASIC),
+		zchar (	'BIT',		T_BIT),
+		zchar (	'BLANK',	T_BLANK),
+		zchar (	'BOUNDARY',	T_BOUNDARY),
+		zchar (	'BY',		T_BY),
+		zchar (	'BYTE',		T_BYTE),
+		zchar (	'BYTES',	T_BYTES),
+		%char (0))),
+	UPLIT %BLISS32 (BYTE) ( %STRING (		! C
+		zchar (	'CHARACTER',	T_CHARACTER),
+		zchar ( 'CHARACTERS',	T_CHARACTERS),
+		zchar (	'COBOL',	T_COBOL),
+		zchar (	'COLUMN_MAJOR',	T_COLUMN_MAJOR),
+		zchar (	'COMPLEX',	T_COMPLEX),
+		zchar (	'COMPUTED',	T_COMPUTED),
+		zchar (	'CONDITION',	T_CONDITION),
+		zchar (	'COPY',		T_COPY),
+		%char (0))),
+	UPLIT %BLISS32 (BYTE) ( %STRING (		! D
+		zchar (	'DATATRIEVE',	T_DATATRIEVE),
+		zchar (	'DATATYPE',	T_DATATYPE),
+		zchar (	'DATE',		T_DATE),
+		zchar (	'DECIMAL',	T_DECIMAL),
+		zchar (	'DEFAULT_VALUE', T_DEFAULT_VALUE),
+		zchar (	'DEFINE',	T_DEFINE),
+		zchar (	'DEPENDING',	T_DEPENDING),
+		zchar (	'DESCRIPTION',	T_DESCRIPTION),
+		zchar (	'DIGIT',	T_DIGIT),
+		zchar (	'DIGITS',	T_DIGITS),
+		zchar ( 'DTR',		T_DTR),
+		zchar (	'D_FLOATING',	T_D_FLOATING),
+		zchar (	'D_FLOATING_COMPLEX', T_D_FLOATING_COMPLEX),
+		%char (0))),
+	UPLIT %BLISS32 (BYTE) ( %STRING (		! E
+		zchar ( 'EBCDIC_8',	T_EBCDIC_8),
+		zchar ( 'EBCDIC_9',	T_EBCDIC_9),
+		zchar (	'EDIT_STRING',	T_EDIT_STRING),
+		zchar (	'END',		T_END),
+		%char (0))),
+	UPLIT %BLISS32 (BYTE) ( %STRING (		! F
+		zchar (	'FIELD',	T_FIELD),
+		zchar ( 'FILLER',	T_FILLER),
+		zchar (	'FLOATING',	T_FLOATING),
+		zchar (	'FLOATING_COMPLEX', T_FLOATING_COMPLEX),
+		zchar (	'FOR',		T_FOR),
+		zchar (	'FRACTION',	T_FRACTION),
+		zchar (	'FRACTIONS',	T_FRACTIONS),
+		zchar (	'FROM',		T_FROM),
+		zchar (	'F_FLOATING',	T_F_FLOATING),
+		zchar (	'F_FLOATING_COMPLEX', T_F_FLOATING_COMPLEX),
+		%char (0))),
+	UPLIT %BLISS32 (BYTE) ( %STRING (		! G
+		zchar (	'G_FLOATING',	T_G_FLOATING),
+		zchar (	'G_FLOATING_COMPLEX', T_G_FLOATING_COMPLEX),
+		zchar (	'GROUP',	T_GROUP),
+		%char (0))),
+	UPLIT  %BLISS32 (BYTE) ( %STRING (		! H
+		zchar (	'H_FLOATING',	T_H_FLOATING),
+		zchar (	'H_FLOATING_COMPLEX', T_H_FLOATING_COMPLEX),
+		%char (0))),
+	UPLIT  %BLISS32 (BYTE) ( %STRING (		! I
+		zchar (	'IF',		T_IF),
+		zchar (	'INDEXED',	T_INDEXED),
+		zchar (	'INITIAL_VALUE', T_INITIAL_VALUE),
+		zchar (	'IS',		T_IS),
+		%char (0))),
+	UPLIT  %BLISS32 (BYTE) ( %STRING (		! J
+		zchar (	'JUSTIFIED',	T_JUSTIFIED),
+		%char (0))),
+	UPLIT %BLISS32 (BYTE) (0),			! No K
+	UPLIT %BLISS32 (BYTE) ( %STRING (		! L
+		zchar (	'LEFT',		T_LEFT),
+		zchar (	'LONGWORD',	T_LONGWORD),
+		%char (0))),
+	UPLIT %BLISS32 (BYTE) ( %STRING (		! M
+		zchar ( 'MATCHING',	T_MATCHING),
+		zchar (	'MISSING_VALUE', T_MISSING_VALUE),
+		zchar ( 'MOVE',		T_MOVE),
+		%char (0))),
+	UPLIT %BLISS32 (BYTE) ( %STRING (		! N
+		zchar (	'NAME',		T_NAME),
+		zchar (	'NUMERIC',	T_NUMERIC),
+		%char (0))),
+	UPLIT %BLISS32 (BYTE) ( %STRING (		! O
+		zchar (	'OCCURS',	T_OCCURS),
+		zchar (	'OCTAWORD',	T_OCTAWORD),
+		zchar (	'OF',		T_OF),
+		zchar (	'ON',		T_ON),
+		zchar ( 'OTHERS',	T_OTHERS),
+		zchar (	'OVERPUNCHED',	T_OVERPUNCHED),
+		%char (0))),
+	UPLIT %BLISS32 (BYTE) ( %STRING (		! P
+		zchar (	'PACKED',	T_PACKED),
+		zchar (	'PICTURE',	T_PICTURE),
+		zchar (	'PLI',		T_PLI),
+		zchar (	'POINTER',	T_POINTER),
+		%char (0))),
+	UPLIT %BLISS32 (BYTE) ( %STRING (		! Q
+		zchar (	'QUADWORD',	T_QUADWORD),
+		zchar (	'QUERY_HEADER',	T_QUERY_HEADER),
+		zchar (	'QUERY_NAME',	T_QUERY_NAME),
+		%char (0))),
+	UPLIT %BLISS32 (BYTE) ( %STRING (		! R
+		zchar (	'RECORD',	T_RECORD),
+		zchar (	'RIGHT',	T_RIGHT),
+		zchar ( 'ROUNDED',	T_ROUNDED),
+		zchar (	'ROW_MAJOR',	T_ROW_MAJOR),
+		%char (0))),
+	UPLIT %BLISS32 (BYTE) ( %STRING (		! S
+		zchar (	'SCALE',	T_SCALE),
+		zchar (	'SEPARATE',	T_SEPARATE),
+		zchar (	'SIGNED',	T_SIGNED),
+		zchar ( 'SIXBIT',	T_SIXBIT),
+		zchar (	'SIZE',		T_SIZE),
+		zchar (	'STRING',	T_STRING),
+		zchar (	'STRUCTURE',	T_STRUCTURE),
+		zchar ( 'SYNC',		T_SYNC),
+		zchar ( 'SYNCHRONIZED',	T_SYNCHRONIZED),
+		%char (0))),
+	UPLIT %BLISS32 (BYTE) ( %STRING (		! T
+		zchar (	'TEXT',		T_TEXT),
+		zchar (	'THRU',		T_THRU),
+		zchar (	'TIME',		T_TIME),
+		zchar (	'TIMES',	T_TIMES),
+		zchar (	'TO',		T_TO),
+		zchar ( 'TRANSFORM',	T_TRANSFORM),
+		zchar ( 'TRUNCATED',	T_TRUNCATED),
+		zchar (	'TYPE',		T_TYPE),
+		%char (0))),
+	UPLIT %BLISS32 (BYTE) ( %STRING (		! U
+		zchar (	'UNSIGNED',	T_UNSIGNED),
+		zchar (	'UNSPECIFIED',	T_UNSPECIFIED),
+		%char (0))),
+	UPLIT %BLISS32 (BYTE) ( %STRING (		! V
+		zchar (	'VALID',	T_VALID),
+		zchar (	'VALUE',	T_VALUE),
+		zchar (	'VALUES',	T_VALUES),
+		zchar (	'VARIANT',	T_VARIANT),
+		zchar ( 'VARIANTS',	T_VARIANTS),
+		zchar (	'VARYING',	T_VARYING),
+		zchar (	'VIRTUAL',	T_VIRTUAL),
+		%char (0))),
+	UPLIT %BLISS32 (BYTE) ( %STRING (		! W
+		zchar (	'WHEN',		T_WHEN),
+		zchar (	'WORD',		T_WORD),
+		%char (0))),
+	UPLIT %BLISS32 (BYTE) (0),			! No X
+	UPLIT %BLISS32 (BYTE) (0),			! No Y
+	UPLIT %BLISS32 (BYTE) ( %STRING (		! Z
+		zchar (	'ZERO',		T_ZERO),
+		zchar (	'ZONED',	T_ZONED),
+		%char (0))) )
+	: VECTOR;
+! Lower case to upper case and dash to underscore
+
+    BIND
+	    UPCASE = ch$transtable (
+	    %c' ', %c' ', %c' ', %c' ',	! NUL, SOH, STX, ETX
+	    %c' ', %c' ', %c' ', %c' ',	! EOT, ENQ, ACK, BEL
+	    %c' ', %c' ', %c' ', %c' ',	!  BS,  HT,  LF,  VT
+	    %c' ', %c' ', %c' ', %c' ',	!  FF,  CR,  SO,  SI
+	    %c' ', %c' ', %c' ', %c' ',	! DLE, DC1, DC2, DC3
+	    %c' ', %c' ', %c' ', %c' ',	! DC4, NAK, SYN, ETB
+	    %c' ', %c' ', %c' ', %c' ',	! CAN,  EM, SUB, ESC
+	    %c' ', %c' ', %c' ', %c' ',	!  FS,  GS,  RS,  US
+	    %c' ', %c' ', %c' ', %c' ',	!  SP,   !,   ",   #
+	    %c'$', %c' ', %c' ', %c' ',	!   $,   %,   &,   '
+	    %c' ', %c' ', %c' ', %c' ',	!   (,   ),   *,   +
+	    %c' ', %c'_', %c'.', %c' ',	!   ,,   -,   .,   /
+	    %c'0', %c'1', %c'2', %c'3',	!   0,   1,   2,   3
+	    %c'4', %c'5', %c'6', %c'7',	!   4,   5,   6,   7
+	    %c'8', %c'9', %c' ', %c';',	!   8,   9,   :,   ;
+	    %c' ', %c' ', %c' ', %c' ',	!   <,   =,   >,   ?
+	    %c' ', %c'A', %c'B', %c'C',	!   @,   A,   B,   C
+	    %c'D', %c'E', %c'F', %c'G',	!   D,   E,   F,   G
+	    %c'H', %c'I', %c'J', %c'K',	!   H,   I,   J,   K
+	    %c'L', %c'M', %c'N', %c'O',	!   L,   M,   N,   O
+	    %c'P', %c'Q', %c'R', %c'S',	!   P,   Q,   R,   S
+	    %c'T', %c'U', %c'V', %c'W',	!   T,   U,   V,   W
+	    %c'X', %c'Y', %c'Z', %c' ',	!   X,   Y,   Z,   [
+	    %c' ', %c' ', %c' ', %c'_',	!   \,   ],   ^,   _
+	    %c' ', %c'A', %c'B', %c'C',	!   `,   a,   b,   c
+	    %c'D', %c'E', %c'F', %c'G',	!   d,   e,   f,   g
+	    %c'H', %c'I', %c'J', %c'K',	!   h,   i,   j,   k
+	    %c'L', %c'M', %c'N', %c'O',	!   l,   m,   n,   o
+	    %c'P', %c'Q', %c'R', %c'S',	!   p,   q,   r,   s
+	    %c'T', %c'U', %c'V', %c'W',	!   t,   u,   v,   w
+	    %c'X', %c'Y', %c'Z', %c' ',	!   x,   y,   z,   {
+	    %c' ', %c' ', %c' ', %c' ');!   |,   },   ~, DEL
+    LITERAL
+	MINUS		= %C'-';
+
+    LOCAL
+	TEXT :		vector [ch$allocation (BUF_SIZE)],
+	STATUS,
+	PTR,
+	LENGTH;
+
+! Scan characters up to the end of the string of letters and digits.
+! These characters form a CDD_name (variable name), a keyword, or part
+! of a path_name.
+
+    WHILE (NOT .END_OF_INPUT_LINE) AND
+	(.IDENT [ch$rchar (.CHAR)] EQLU I_LETTER
+	OR .IDENT [ch$rchar (.CHAR)] EQLU I_OTHER	!??
+	OR .IDENT [ch$rchar (.CHAR)] EQLU I_DIGIT)
+    DO GET_CHAR (CHAR, false);
+
+    STATUS = FALSE;
+! Check to see if the string of letters and digits is a path_name.
+! If it is, the string is not at the end of an input line and is followed
+! by a left parenthesis, a semicolon, or a dot followed by a letter (start
+! of next piece of path_name) or a minus sign.
+
+    IF NOT .END_OF_INPUT_LINE AND
+	(.IDENT [ch$rchar (.CHAR)] EQLU I_L_PAREN
+	OR .IDENT [ch$rchar (.CHAR)] EQLU I_SEMICOLON OR
+	(.IDENT [ch$rchar (.CHAR)] EQLU I_DOT
+	    AND (.IDENT [ch$rchar (ch$plus (.CHAR, 1))] EQLU I_LETTER OR
+		CH$RCHAR (ch$plus (.CHAR, 1)) EQLU MINUS)))
+    THEN		! We have a PATH_NAME
+	BEGIN
+	    TOKEN_PTR [TKN_TERM] = T_PATH_NAME;
+	    PTR = ch$ptr (TEXT);
+	    WHILE TRUE DO
+		BEGIN		! Loop on pieces of path_name
+
+		    ! Compute length of piece of path_name, convert it to
+		    ! upper case, and store it.
+
+		    LENGTH = ch$diff (.CHAR, .LEX_TKNSTRT);
+		    CH$TRANSLATE (UPCASE, .LENGTH, .LEX_TKNSTRT, 0, .LENGTH,
+			.PTR);
+		    PTR = ch$plus (.PTR, .LENGTH);
+
+		    ! Path_name followed by a semicolon, so eat the
+		    ! version number which follows.
+
+		    IF .IDENT [ch$rchar (.CHAR)] EQLU I_SEMICOLON THEN
+			BEGIN
+			    PTR = CH$MOVE (1, .CHAR, .PTR);
+			    GET_CHAR (CHAR, false);
+			    IF (NOT .END_OF_INPUT_LINE) AND
+				(CH$RCHAR (.CHAR) EQLU MINUS) THEN
+				BEGIN
+				    PTR = CH$MOVE (1, .CHAR, .PTR);
+				    GET_CHAR (CHAR, false);
+				END;
+			    WHILE (NOT .END_OF_INPUT_LINE) AND
+				(.IDENT [ch$rchar (.CHAR)] EQLU I_DIGIT) DO
+				BEGIN
+				    PTR = CH$MOVE (1, .CHAR, .PTR);
+				    GET_CHAR (CHAR, false);
+				END;
+			END;
+
+		    ! Path_name piece followed by a left parenthesis.
+		    ! Eat the characters within the parentheses.
+
+		    IF .IDENT [ch$rchar (.CHAR)] EQLU I_L_PAREN THEN
+			BEGIN
+			    PTR = CH$MOVE (1, .CHAR, .PTR);
+			    DO
+				BEGIN
+				    GET_CHAR (CHAR, false);
+				    PTR = CH$MOVE (1, .CHAR, .PTR);
+				END
+			    WHILE NOT .END_OF_INPUT_LINE AND
+				.IDENT [ch$rchar (.CHAR)] NEQU I_ILLEGAL AND
+				.IDENT [ch$rchar (.CHAR)] NEQU I_L_PAREN AND
+				.IDENT [ch$rchar (.CHAR)] NEQU I_R_PAREN AND
+				.IDENT [ch$rchar (.CHAR)] NEQU I_DOT;
+
+			    IF .IDENT [ch$rchar (.CHAR)] NEQU I_R_PAREN
+				OR .END_OF_INPUT_LINE
+				THEN EXITLOOP;
+			    GET_CHAR (CHAR, false);
+			END;
+
+		    ! End of path_name: next character is not a dot, or
+		    ! reached the end of the input line, or not at the end of
+		    ! the input line and next character is a dot but following
+		    ! character is neither a letter nor a minus sign.
+		    ! Store the path name and exit the loop to collect
+		    ! a path_name.
+
+		    IF .IDENT [ch$rchar (.CHAR)] NEQU I_DOT OR
+			.END_OF_INPUT_LINE OR
+			(NOT .END_OF_INPUT_LINE AND
+			.IDENT [ch$rchar (ch$plus (.CHAR, 1))] NEQU I_LETTER
+			and CH$RCHAR (ch$plus (.CHAR, 1)) NEQU MINUS)
+		    THEN
+			BEGIN
+			    STATUS = TRUE;
+			    ENTER_TEXT (ch$diff (.PTR, ch$ptr (TEXT)),
+				ch$ptr (TEXT), TOKEN_PTR [TKN_TEXT]);
+			    EXITLOOP;
+			END;
+
+		    ! Here if we found a dot which is not at the end of the
+		    ! input line and which is followed by a letter or a minus
+		    ! sign.  There are more path_name pieces to come, so we
+		    ! eat the dot and move the start of the path_name piece
+		    ! up to the next character, and then eat up a string of
+		    ! letters and digits.
+
+		    PTR = CH$MOVE (1, .CHAR, .PTR);
+		    LEX_TKNSTRT = ch$plus (.CHAR, 1);
+
+		    IF NOT .END_OF_INPUT_LINE
+			THEN DO  GET_CHAR (CHAR, false)
+			    WHILE (NOT .END_OF_INPUT_LINE) AND
+			    (.IDENT [ch$rchar (.CHAR)] EQLU I_LETTER
+			    OR .IDENT [ch$rchar (.CHAR)] EQLU I_OTHER	!??
+			    OR .IDENT [ch$rchar (.CHAR)] EQLU I_DIGIT)
+		END;	! Loop on pieces of path_name
+	END		! End of pathname
+! These characters do not form a path_name, so they are either a CDD_name
+! (that is, a variable) or a keyword.  We will convert the string to upper
+! case, store it, and look for it in the keyword table (RESERVED_TABLE).
+! The keyword table has an entry for each initial letter, and each entry
+! ends with a zero character.  Within each alphabetic entry, the entry for
+! a particular keyword has the legnth of the keyword, the characters which
+! make up the keyword, and a character whose numerical value is the token
+! number of the keyword.  This does constrain the token numbers available
+! for keywords, especially on 10/20, which is why they are declared in the
+! grammar with lower values than the symbols and other tokens; if this
+! becomes a problem, rewrite the ZCHAR macro, which is defined just before
+! the keyword table.
+
+    ELSE		! We have a CDD_NAME or keyword
+	WHILE TRUE DO
+	    BEGIN
+		LENGTH = ch$diff (.CHAR, .LEX_TKNSTRT);
+		CH$TRANSLATE(UPCASE, .LENGTH, .LEX_TKNSTRT, 0, .LENGTH,
+		    ch$ptr (TEXT));
+		ENTER_TEXT (.LENGTH, ch$ptr (TEXT), TOKEN_PTR [TKN_TEXT]);
+		IF .IDENT [ch$rchar (ch$ptr (TEXT))] NEQU I_LETTER THEN PTR = 0
+		    ELSE PTR =
+			ch$ptr(.RESERVED_TABLE[ch$rchar(ch$ptr(TEXT)) - %c'A']);
+		IF ch$rchar (.PTR) NEQU 0 THEN	! Check for keyword
+		    WHILE ch$rchar (.PTR) NEQU 0 DO
+			BEGIN	! Look through alphabetic entry
+			    IF ch$rchar (.PTR) EQLU .LENGTH THEN
+				IF CH$EQL (ch$rchar (.PTR), ch$plus (.PTR, 1),
+				    ch$rchar (.PTR), ch$ptr (TEXT))
+				    THEN
+					BEGIN	! Found it!
+					    TOKEN_PTR [TKN_TERM] =
+						ch$rchar (ch$plus (.PTR,
+						ch$rchar (.PTR) + 1));
+					    EXITLOOP;
+					END;
+			    PTR = ch$plus (.PTR, ch$rchar (.PTR) + 2);
+			END;	! Looking through alphabetic entry
+
+		STATUS = TRUE;
+		IF .TOKEN_PTR [TKN_TERM] EQLU T_EOF THEN	! Left by LEX
+		    TOKEN_PTR [TKN_TERM] = T_CDD_NAME;
+		EXITLOOP;
+	    END;
+    RETURN .STATUS;
+END;
+ROUTINE DDU$$P_LEX_NUMBER (TOKEN_TYPE, CHAR_PTR) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine lexically parses a numeric token.
+!
+!  INPUT PARAMETERS:
+!
+!	token_type	address of a word to be set to the type of
+!			numeric token parsed.
+!	char_ptr	pointer to current character position.
+!
+!  IMPLICIT INPUTS:
+!
+!	END_OF_INPUT_LINE	TRUE if current character is at end of line
+!
+!  IMPLICIT OUTPUTS:
+!
+!	END_OF_INPUT_LINE	Flag for last character in input line
+!
+!  COMPLETION STATUS:
+!
+!	TRUE if successful, FALSE otherwise.
+!
+!  SIGNALLED STATUS:
+!
+!	This routine does not intercept signals sent by routines it calls.
+!
+!  SIDE EFFECTS:
+!
+!	May cause input lines to be read.
+!
+!--
+BEGIN
+    BIND
+	TKN_TYPE	= .TOKEN_TYPE	%BLISS32 (: LONG),
+	CHAR		= .CHAR_PTR;
+
+    LITERAL
+	NINE		= %C'9',
+	ZERO		= %C'0',
+	E		= %C'E',
+	PLUS		= %C'+',
+	MINUS		= %C'-';
+
+    LOCAL
+	STATUS		%BLISS32 (: LONG),
+	HAS_SIGN	%BLISS32 (: LONG);
+
+    STATUS = TRUE;
+! Determine if number is signed or unsigned.
+
+    IF CH$RCHAR (.CHAR) EQLU MINUS OR CH$RCHAR (.CHAR) EQLU PLUS THEN
+	BEGIN
+	    HAS_SIGN = TRUE;
+	    GET_CHAR (CHAR, false);
+	END
+    ELSE HAS_SIGN = FALSE;
+
+    IF CH$RCHAR (.CHAR) LSSU ZERO OR CH$RCHAR (.CHAR) GTRU NINE THEN
+	STATUS = FALSE;
+    WHILE CH$RCHAR (.CHAR) GEQU ZERO AND CH$RCHAR (.CHAR) LEQU NINE
+	AND NOT .END_OF_INPUT_LINE DO
+	GET_CHAR (CHAR, false);
+
+! See if it is a signed or unsigned integer.
+
+    IF .STATUS AND CH$RCHAR (.CHAR) NEQU E AND
+	(NOT CH$EQL (1, .CHAR, 1, ch$ptr (UPLIT ('.')), %c' ') OR
+	.END_OF_INPUT_LINE OR
+	(CH$EQL (1, .CHAR, 1, ch$ptr (UPLIT('.')), %c' ') AND
+	(CH$RCHAR (ch$plus (.CHAR, 1)) LSSU ZERO OR
+	    CH$RCHAR (ch$plus (.CHAR, 1)) GTRU NINE)))
+    THEN
+	BEGIN	! It's an integer
+	    IF .HAS_SIGN THEN TKN_TYPE = T_SIGNED_INTEGER
+	    ELSE TKN_TYPE = T_UNSIGNED_INTEGER;
+	    RETURN SS$_NORMAL;
+	END;
+! See if it is a fixed-point number.
+
+    IF CH$EQL (1, .CHAR, 1, ch$ptr (UPLIT('.')), %c' ') AND .STATUS THEN
+	BEGIN
+	    GET_CHAR (CHAR, false);
+	    IF CH$RCHAR (.CHAR) LSSU ZERO OR CH$RCHAR (.CHAR) GTRU NINE THEN
+		STATUS = FALSE;
+	    WHILE CH$RCHAR (.CHAR) GEQU ZERO AND CH$RCHAR (.CHAR) LEQU NINE
+		AND NOT .END_OF_INPUT_LINE DO
+		GET_CHAR (CHAR, false);
+
+	    IF (CH$RCHAR (.CHAR) LSSU ZERO OR CH$RCHAR (.CHAR) GTRU NINE) AND
+		CH$RCHAR (.CHAR) NEQU E AND .STATUS
+	    THEN
+		BEGIN	! It's a fixed point number.
+		    TKN_TYPE = T_FIXED_POINT;
+		    RETURN SS$_NORMAL;
+		END;
+	END;
+
+! See if it is a floating-point number.
+
+    IF CH$RCHAR (.CHAR) EQLU E AND .STATUS THEN
+	BEGIN
+	    GET_CHAR (CHAR, false);
+	    IF CH$RCHAR (.CHAR) EQLU MINUS OR CH$RCHAR (.CHAR) EQLU PLUS
+	    THEN GET_CHAR (CHAR, false);
+	    IF CH$RCHAR (.CHAR) LSSU ZERO OR CH$RCHAR (.CHAR) GTRU NINE THEN
+		STATUS = FALSE;
+	    WHILE CH$RCHAR (.CHAR) GEQU ZERO AND CH$RCHAR (.CHAR) LEQU NINE DO
+		GET_CHAR (CHAR, false);
+
+	    IF .STATUS THEN
+		BEGIN	! It's a floating point number.
+		    TKN_TYPE = T_FLOATING_POINT;
+		    RETURN SS$_NORMAL;
+		END;
+	END;
+
+!   No valid number found.
+
+    LSLOCAL_SYNTAX_ERRORM (.lex_locator, 'Illegal number.');
+    RETURN .STATUS;
+END;
+ROUTINE DDU$$P_LEX_PERCENT (CHAR_PTR, TOKEN_PTR) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine lexically parses a token beginning with a percent sign.
+!
+!  PARAMETERS:
+!
+!	char_ptr		pointer to current character position.
+!	token_ptr		address of the current token pointer.
+!
+!  IMPLICIT INPUTS:
+!
+!	END_OF_INPUT_LINE	TRUE if current character is at end of line
+!	LEX_TKNSTRT		Pointer to first character in token
+!
+!  IMPLICIT OUTPUTS:
+!
+!	LEX_TKNSTRT		Updated pointer to first character in token.
+!
+!  COMPLETION STATUS:
+!
+!	TRUE if OK, FALSE otherwise.
+!
+!  SIGNALLED STATUS:
+!
+!	This routine does not intercept signals sent by routines it calls.
+!
+!  SIDE EFFECTS:
+!
+!	May read more input lines.
+!
+!--
+BEGIN
+    MAP
+	TOKEN_PTR 	: REF	TKN_STR;
+	
+    BIND
+	CHAR		= .CHAR_PTR;
+
+    LITERAL
+	ZERO		= %C'0',
+	SEVEN		= %C'7',
+	NINE		= %C'9',
+	A		= %C'A',
+	F		= %C'F',
+	O		= %C'O',
+	X		= %C'X',
+	SGL_QUOTE	= %C'''';
+
+    LOCAL
+	STATUS		%BLISS32 (: LONG);
+    GET_CHAR (CHAR, false);
+    STATUS = TRUE;
+    IF CH$RCHAR (.CHAR) EQLU X THEN		! Hex number
+	BEGIN
+	    TOKEN_PTR [TKN_TERM] = T_HEX_NUMBER;
+	    GET_CHAR (CHAR, false);
+	    IF CH$RCHAR (.CHAR) EQLU SGL_QUOTE THEN
+		DO GET_CHAR (CHAR, false)
+		    WHILE ((CH$RCHAR (.CHAR) GEQU ZERO AND
+			    CH$RCHAR (.CHAR) LEQU NINE) OR
+			(CH$RCHAR (.CHAR) GEQU A AND CH$RCHAR (.CHAR) LEQU F))
+			AND NOT .END_OF_INPUT_LINE;
+        END
+
+    ELSE IF CH$RCHAR (.CHAR) EQLU O THEN	! Octal number
+	    BEGIN
+		TOKEN_PTR [TKN_TERM] = T_OCTAL_NUMBER;
+		GET_CHAR (CHAR, false);
+		IF CH$RCHAR (.CHAR) EQLU SGL_QUOTE THEN
+		    DO GET_CHAR (CHAR, false)
+			WHILE (CH$RCHAR (.CHAR) GEQU ZERO AND
+			    CH$RCHAR (.CHAR) LEQU SEVEN
+			    AND NOT .END_OF_INPUT_LINE);
+	    END
+	ELSE STATUS = FALSE;
+			
+    IF NOT .STATUS OR CH$RCHAR (.CHAR) NEQU SGL_QUOTE
+	THEN
+	    BEGIN
+		LSLOCAL_SYNTAX_ERRORM (.lex_locator,
+		    'Illegal hexadecimal or octal number');
+		RETURN FALSE;
+	    END;
+
+    LEX_TKNSTRT = ch$plus (.LEX_TKNSTRT, 3);
+    ENTER_TEXT (ch$diff (.CHAR, .LEX_TKNSTRT),
+	.LEX_TKNSTRT, TOKEN_PTR [TKN_TEXT]);
+    RETURN .STATUS;
+END;
+ROUTINE ENTER_TEXT (LENGTH, TEXT, TEXT_PTR) : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This is a hacked up routine for storing text strings in
+!	the heap.
+!
+!  INPUT PARAMETERS:
+!
+!	length		is the length of the text to be stored.
+!	text		is a pointer to the text string to be stored.
+!
+!  OUTPUT PARAMETERS:
+!
+!	text_ptr	is the address of the text descriptor to be set to
+!			point to the text string.
+!
+!  IMPLICIT INPUTS:
+!
+!	none
+!
+!  IMPLICIT OUTPUTS:
+!
+!	none
+!
+!  COMPLETION STATUS:
+!
+!	none
+!
+!  SIGNALLED STATUS:
+!
+!	This routine does not intercept signals sent by routines it calls.
+!
+!  SIDE EFFECTS:
+!
+!	The system may be called on to allocate more heap storage.
+!
+!--
+BEGIN
+    %IF %BLISS (BLISS32) %THEN
+    MAP
+	LENGTH : LONG;
+	%FI
+
+    BIND
+	t_desc = utl_get (STR$K_D_BLN*%upval): $STR_DESCRIPTOR (class=dynamic);
+
+    $STR_DESC_INIT (DESCRIPTOR = t_desc, class=dynamic);
+    $STR_COPY (STRING=(.length, .text), TARGET=t_desc);
+    .text_ptr = t_desc;
+END;
+ROUTINE GET_CHAR (CHAR_ADDR, SKIP_COMMENT) : NOVALUE =
+!++
+!  FUNCTIONAL DESCRIPTION:
+!
+!	This routine returns the next input character and sets the line and
+!	column pointers.  It also skips over comments if requested.
+!
+!  INPUT PARAMETERS:
+!
+!	skip_comment	skip comments if TRUE
+!
+!  OUTPUT PARAMETERS:
+!
+!	char_addr	address of a pointer to be set to point to
+!			the next input character.
+!
+!  IMPLICIT INPUTS:
+!
+!	file_iob	address of XPORT IOB for file being parsed.
+!	LEX_LINENUM	Lexical line number
+!	COLUMN		Column number
+!	LEX_COLUMN	Lexical column number
+!
+!  IMPLICIT OUTPUTS:
+!
+!	START_LINE	TRUE if this is the first token on a line
+!	LEX_LINENUM	Lexical line number
+!	LEX_COLUMN	Lexical column number
+!	END_OF_INPUT_LINE TRUE if character is last one on input line
+!	COLUMN		Column number
+!
+!  COMPLETION STATUS:
+!
+!	none
+!
+!  SIGNALLED STATUS:
+!
+!	This routine does not intercept signals sent by routines it calls.
+!
+!  SIDE EFFECTS:
+!
+!	Reads input lines.
+!
+!--
+BEGIN
+    MAP
+	SKIP_COMMENT %BLISS32 ( : LONG);
+
+    BIND
+	CHAR		= .CHAR_ADDR;
+
+    LITERAL
+	TAB		= %X'09',	! a tab character
+	COMMENT_DELIM	= %C'!';	! the character '!'
+
+    OWN
+	TEMP_BUFF	: $STR_DESCRIPTOR (CLASS=DYNAMIC, STRING=(0,0)),
+	EOL_COLUMN	: %BLISS32 (BYTE) INITIAL (%CHAR (04)),	! ^D character
+	EOF_COLUMN	: %BLISS32 (BYTE) INITIAL (%CHAR (26)),	! ^Z character
+	FORM_FEED	: %BLISS32 (BYTE) INITIAL (%CHAR (12));	! ^L character
+
+    LOCAL
+	FF_PTR,
+	STATUS;
+!   Get the next character.  If the line has been totally scanned, then get
+!   the first character on the next line.  This will point past the last
+!   character on an end of line.
+
+    START_LINE = FALSE;
+
+    IF (.LEX_LINENUM EQL 0) OR (.COLUMN EQL .temp_buff [STR$H_LENGTH])
+	OR (.END_OF_INPUT_LINE)
+    THEN
+	BEGIN				! Get another line
+	    STATUS = $XPO_GET (IOB = .file_iob);
+	    $STR_COPY (STRING = $STR_CONCAT (
+		(.file_iob [IOB$H_STRING], .file_iob [IOB$A_STRING]),
+		(1, ch$ptr (EOL_COLUMN))),
+		TARGET = TEMP_BUFF);
+	    LEX_LINENUM = .LEX_LINENUM + 1;
+	    START_LINE = TRUE;
+	    IF .STATUS EQLU XPO$_END_FILE THEN
+		BEGIN
+		    LEX_COLUMN = 1;
+		    CHAR = ch$ptr (EOF_COLUMN);
+		    END_OF_INPUT_LINE = TRUE;
+		    RETURN;
+		END;
+	    IF NOT .STATUS THEN SIGNAL (.STATUS);
+
+	    FF_PTR = CH$FIND_CH (.TEMP_BUFF [STR$H_LENGTH],
+		.TEMP_BUFF [STR$A_POINTER], .FORM_FEED);
+	    WHILE NOT CH$FAIL (.FF_PTR) DO
+		BEGIN
+		    CH$MOVE (1, ch$ptr (UPLIT %BLISS32 (BYTE) (' ')), .FF_PTR);
+		    FF_PTR = CH$FIND_CH (
+			(.TEMP_BUFF [STR$H_LENGTH] -
+			ch$diff (.FF_PTR,
+			   ch$plus (.TEMP_BUFF [STR$A_POINTER], 1))),
+			ch$plus (.FF_PTR, 1), .FORM_FEED);
+		END;
+	    LEX_COLUMN = 1;
+	    COLUMN = 1;
+	END				! Get another line
+    ELSE
+	BEGIN				! Get character from current line
+	    COLUMN = .COLUMN + 1;
+	    IF (.COLUMN GTR 1) AND
+		(CH$RCHAR (ch$plus (.temp_buff [STR$A_POINTER], .COLUMN - 2))
+		EQLU TAB)
+	    THEN	! next tab position
+		LEX_COLUMN =
+		    ((.LEX_COLUMN + (COLUMNS_PER_TAB - 1)
+		    / COLUMNS_PER_TAB) * COLUMNS_PER_TAB) + 1
+	    ELSE
+		LEX_COLUMN = .LEX_COLUMN + 1;
+	END;				! Get character from current line
+!   Skip over comments if the SKIP_COMMENT flag has been set.  Treat the
+!   comment as if it were an end of line.
+
+    IF .SKIP_COMMENT THEN
+	IF (.COLUMN LEQU .temp_buff [STR$H_LENGTH]) AND
+	    CH$RCHAR (ch$plus (.temp_buff [STR$A_POINTER], .COLUMN - 1))
+	    EQLU COMMENT_DELIM
+	THEN
+	    BEGIN
+		COLUMN = .temp_buff [STR$H_LENGTH];
+		LEX_COLUMN = .temp_buff [STR$H_LENGTH];
+		END_OF_INPUT_LINE = TRUE;
+	    END;
+
+!   Set the character pointer to the current character.
+
+    CHAR = ch$plus (.temp_buff [STR$A_POINTER], .COLUMN - 1);
+
+!   Notice if we just read the last character on a line.
+
+    IF .COLUMN EQL .temp_buff [STR$H_LENGTH]
+	THEN END_OF_INPUT_LINE = TRUE
+	ELSE END_OF_INPUT_LINE = FALSE;
+END;
+ROUTINE LEX (TOKEN_PTR) : NOVALUE =
+!++
+!  FUNCTIONAL DESCRIPTION:
+!
+!	This routine returns the next input token.
+!
+!  INPUT PARAMETERS:
+!
+!	None
+!
+!  OUTPUT PARAMETERS:
+!
+!	token_ptr	Pointer to a token data structure where the new token
+!			information will be returned.
+!
+!  IMPLICIT INPUTS:
+!
+!	START_LINE	TRUE if token is the first token on a line
+!	LEX_LOCATOR	Text source location for new lexeme
+!	LEX_COLUMN	Source column
+!	LEX_LINENUM	Source line number
+!
+!  IMPLICIT OUTPUTS:
+!
+!	LEX_COLUMN	Source column
+!	LEX_LINENUM	Lexical line number, reset to zero when an end-of-file
+!			token is produced -- see code in GET_CHAR, above.
+!	LEX_TKNSTRT	Pointer to start of lexeme
+!
+!  COMPLETION STATUS:
+!
+!	none
+!
+!  SIGNALLED STATUS:
+!
+!	This routine does not intercept signals sent by routines it calls.
+!
+!  SIDE EFFECTS:
+!
+!	Reads input file.
+!
+!--
+BEGIN
+
+    MAP
+	TOKEN_PTR	: REF	TKN_STR;
+
+! Classes of characters which might appear in the input:
+
+    LITERAL
+	C_IGNORABLE	=  0,
+	C_DIGIT		=  1,
+	C_LETTER	=  2,
+	C_SLASH		=  3,
+	C_QUOTE		=  4,
+	C_PERCENT	=  5,
+	C_STAR		=  6,
+	C_DOT		=  7,
+	C_COLON		=  8,
+	C_SEMICOLON     =  9,
+	C_L_PAREN	= 10,
+	C_R_PAREN	= 11,
+	C_MINUS		= 12,
+	C_OTHERS	= 13,
+	C_EOF		= 14;
+! Class of each possible ASCII input character:
+
+    BIND
+	CLASS = UPLIT %BLISS32 (BYTE) (
+		C_IGNORABLE,	! 00 NUL
+		C_OTHERS,	! 01 SOH
+		C_OTHERS,	! 02 STX
+		C_OTHERS,	! 03 ETX
+		C_IGNORABLE, 	! 04 EOT
+		C_OTHERS,	! 05 ENQ
+		C_OTHERS,	! 06 ACK
+		C_OTHERS,	! 07 BEL
+		C_OTHERS,	! 08 BS
+		C_IGNORABLE,	! 09 HT
+		C_IGNORABLE,	! 0A LF
+		C_IGNORABLE,	! 0B VT
+		C_IGNORABLE,	! 0C FF
+		C_IGNORABLE,	! 0D CR
+		C_OTHERS,	! 0E SO
+		C_OTHERS,	! 0F SI
+		C_OTHERS,	! 10 DLE
+		C_OTHERS,	! 11 DC1
+		C_OTHERS,	! 12 DC2
+		C_OTHERS,	! 13 DC3
+		C_OTHERS,	! 14 DC4
+		C_OTHERS,	! 15 NAK
+		C_OTHERS,	! 16 SYN
+		C_OTHERS,	! 17 ETB
+		C_OTHERS,	! 18 CAN
+		C_OTHERS,	! 19 EM
+		C_EOF,		! 1A SUB
+		C_OTHERS,	! 1B ESC
+		C_OTHERS,	! 1C FS
+		C_OTHERS,	! 1D GS
+		C_OTHERS,	! 1E RS
+		C_OTHERS,	! 1F US
+		C_IGNORABLE,	! 20 SP
+		C_OTHERS,	! 21 !
+		C_QUOTE,	! 22 "
+		C_OTHERS,	! 23 #
+		C_LETTER,	! 24 $
+		C_PERCENT,	! 25 %
+		C_OTHERS,	! 26 &
+		C_QUOTE,	! 27 '
+		C_L_PAREN,	! 28 (
+		C_R_PAREN,	! 29 )
+		C_STAR,		! 2A *
+		C_DIGIT,	! 2B +
+		C_IGNORABLE, 	! 2C ,
+		C_MINUS,	! 2D -
+		C_DOT,		! 2E .
+		C_SLASH,	! 2F /
+		C_DIGIT,	! 30 0
+		C_DIGIT,	! 31 1
+		C_DIGIT,	! 32 2
+		C_DIGIT,	! 33 3
+		C_DIGIT,	! 34 4
+		C_DIGIT,	! 35 5
+		C_DIGIT,	! 36 6
+		C_DIGIT,	! 37 7
+		C_DIGIT,	! 38 8
+		C_DIGIT,	! 39 9
+		C_COLON,	! 3A :
+		C_SEMICOLON,	! 3B ;
+		C_OTHERS,	! 3C <
+		C_OTHERS,	! 3D =
+		C_OTHERS,	! 3E >
+		C_OTHERS,	! 3F ?
+		C_OTHERS,	! 40 @
+		C_LETTER,	! 41 A
+		C_LETTER,	! 42 B
+		C_LETTER,	! 43 C
+		C_LETTER,	! 44 D
+		C_LETTER,	! 45 E
+		C_LETTER,	! 46 F
+		C_LETTER,	! 47 G
+		C_LETTER,	! 48 H
+		C_LETTER,	! 49 I
+		C_LETTER,	! 4A J
+		C_LETTER,	! 4B K
+		C_LETTER,	! 4C L
+		C_LETTER,	! 4D M
+		C_LETTER,	! 4E N
+		C_LETTER,	! 4F O
+		C_LETTER,	! 50 P
+		C_LETTER,	! 51 Q
+		C_LETTER,	! 52 R
+		C_LETTER,	! 53 S
+		C_LETTER,	! 54 T
+		C_LETTER,	! 55 U
+		C_LETTER,	! 56 V
+		C_LETTER,	! 57 W
+		C_LETTER,	! 58 X
+		C_LETTER,	! 59 Y
+		C_LETTER,	! 5A Z
+		C_OTHERS,	! 5B [
+		C_OTHERS,	! 5C \
+		C_OTHERS,	! 5D ]
+		C_OTHERS,	! 5E ^
+		C_LETTER,	! 5F _
+		C_OTHERS,	! 60 `
+		C_LETTER,	! 61 a
+		C_LETTER,	! 62 b
+		C_LETTER,	! 63 c
+		C_LETTER,	! 64 d
+		C_LETTER,	! 65 e
+		C_LETTER,	! 66 f
+		C_LETTER,	! 67 g
+		C_LETTER,	! 68 h
+		C_LETTER,	! 69 i
+		C_LETTER,	! 6A j
+		C_LETTER,	! 6B k
+		C_LETTER,	! 6C l
+		C_LETTER,	! 6D m
+		C_LETTER,	! 6E n
+		C_LETTER,	! 6F o
+		C_LETTER,	! 70 p
+		C_LETTER,	! 71 q
+		C_LETTER,	! 72 r
+		C_LETTER,	! 73 s
+		C_LETTER,	! 74 t
+		C_LETTER,	! 75 u
+		C_LETTER,	! 76 v
+		C_LETTER,	! 77 w
+		C_LETTER,	! 78 x
+		C_LETTER,	! 79 y
+		C_LETTER,	! 7A z
+		C_OTHERS,	! 7B {
+		C_OTHERS,	! 7C |
+		C_OTHERS,	! 7D }
+		C_OTHERS,	! 7E ~
+		C_OTHERS	! 7F DEL
+%BLISS32 (	,REP 128 OF (C_OTHERS)))
+	: VECTOR [%BLISS32 (,BYTE)];
+    LITERAL
+	BUF_SIZE	= 256,
+	END_OF_FILE	= %X'1A',
+	END_OF_LINE	= %X'04',
+	COMMENT		= %C'!';
+
+    OWN
+	WITHIN_DESC	: %BLISS32 (LONG)	INITIAL (FALSE),
+	LOOK_AHEAD	: %BLISS32 (LONG)	INITIAL (FALSE),
+	CHAR;		! Pointer to current character
+
+    LOCAL
+	PAST_CHAR,	! Pointer to previous character
+	TEXT		: vector [ch$allocation (BUF_SIZE)],
+	STATUS %BLISS32 (: LONG);
+! Initialize the new token.
+
+    TOKEN_PTR [TKN_TERM] = T_EOF;
+    TOKEN_PTR [TKN_INTVALUE] = 0;
+    TOKEN_PTR [TKN_START_LINE] = FALSE;
+    IF .CHAR NEQU 0 THEN
+	IF CH$RCHAR (.CHAR) EQLU END_OF_FILE THEN
+	    BEGIN
+		TOKEN_PTR [TKN_LOCATOR] = .LEX_LOCATOR;
+		CHAR = 0;	! Prepare to read next file by clearing these
+		LEX_LINENUM = 0;! -- see code in GET_CHAR, above
+		RETURN;
+	    END;
+
+    WHILE TRUE DO		! Large loop to find next lexeme
+	BEGIN			! Exit this loop when a lexeme is found
+	    IF .CHAR EQLU 0 THEN
+		GET_CHAR (CHAR, true)
+	    ELSE
+		BEGIN
+		    IF .LOOK_AHEAD AND CH$RCHAR (.CHAR) EQLU COMMENT THEN
+			BEGIN
+			    LEX_COLUMN = .LEX_COLUMN - 1;
+			    COLUMN = .COLUMN - 1;
+			    LOOK_AHEAD = FALSE;
+			END;
+		    IF CH$RCHAR (.CHAR) NEQU END_OF_FILE AND NOT .LOOK_AHEAD
+		    THEN
+			IF .WITHIN_DESC THEN GET_CHAR (CHAR, false)
+			ELSE GET_CHAR (CHAR, true);
+		END;
+
+	    LOOK_AHEAD = FALSE;
+	    IF .START_LINE THEN TOKEN_PTR [TKN_START_LINE] = TRUE;
+	    LEX_LOCATOR [LOC_LINENUM] = .LEX_LINENUM; ! Set the line and column
+	    LEX_LOCATOR [LOC_COLUMN] = .LEX_COLUMN;   ! locations of the token.
+	    LEX_TKNSTRT = .CHAR;	! Save location of 1st token character.
+
+	    IF CH$RCHAR (.CHAR) EQLU END_OF_FILE AND NOT .WITHIN_DESC THEN
+		BEGIN
+		    TOKEN_PTR [TKN_TERM] = T_EOF;
+		    TOKEN_PTR [TKN_LOCATOR] = .LEX_LOCATOR;
+		    ENTER_TEXT (5, ch$ptr (UPLIT %BLISS32 (BYTE) ('<EOF>')),
+			TOKEN_PTR [TKN_TEXT]);
+		    CHAR = 0;		! Prepare to read next file by clearing
+		    LEX_LINENUM = 0;	! these -- see code in GET_CHAR, above
+		    RETURN;
+		END;
+! Code to collect DESCRIPTIONS.
+! These are special lexemes.  Each line is made into a separate T_DESCR_TEXT
+! token.  The description text ends with a '*/' or at end-of-file.
+
+	    IF .WITHIN_DESC THEN	! Inside DESCRIPTION:
+		BEGIN
+		    PAST_CHAR = .LEX_TKNSTRT;
+		    TOKEN_PTR [TKN_TERM] = T_DESCR_TEXT;
+		    WHILE TRUE DO
+			BEGIN
+			    IF .END_OF_INPUT_LINE OR
+				(CH$RCHAR (.CHAR) EQLU END_OF_LINE)
+				THEN EXITLOOP;
+			    IF .CLASS [ch$rchar (.CHAR)] EQLU C_STAR AND
+				.CLASS [ch$rchar(ch$plus(.CHAR,1))] EQLU C_SLASH
+			    THEN
+				BEGIN
+				    WITHIN_DESC = FALSE;
+				    GET_CHAR (CHAR, false);
+				    EXITLOOP;
+				END;
+			    IF CH$RCHAR (.CHAR) EQLU END_OF_FILE THEN
+				BEGIN
+				    LSLOCAL_SYNTAX_ERRORM (.lex_locator,
+					'DESCRIPTION not terminated.');
+				    TOKEN_PTR [TKN_TERM] = T_EOF;
+				    TOKEN_PTR [TKN_LOCATOR] = .LEX_LOCATOR;
+				    ENTER_TEXT (5,
+					ch$ptr(UPLIT %BLISS32 (BYTE) ('<EOF>')),
+					TOKEN_PTR [TKN_TEXT]);
+				    CHAR = 0;		! Prepare for next file;
+				    LEX_LINENUM = 0;	! See code in GET_CHAR.
+				    RETURN;
+				END;
+			    PAST_CHAR = .CHAR;
+			    GET_CHAR (CHAR, false);
+			END;
+		    IF .PAST_CHAR EQLU .LEX_TKNSTRT THEN
+			ENTER_TEXT (ch$diff (.PAST_CHAR, .LEX_TKNSTRT),
+			    .LEX_TKNSTRT, TOKEN_PTR [TKN_TEXT])
+		    ELSE
+			ENTER_TEXT (ch$diff (.PAST_CHAR, .LEX_TKNSTRT) + 1,
+			    .LEX_TKNSTRT, TOKEN_PTR [TKN_TEXT]);
+		    EXITLOOP;
+		END;		! End of DESCRIPTION code
+! Machine to handle collecting normal lexemes.
+
+	    CASE .CLASS [ch$rchar (.CHAR)] FROM C_IGNORABLE TO C_EOF OF
+		SET
+
+		[C_IGNORABLE]:		! Skip these characters
+		    TRUE;
+
+		[C_DIGIT]:		! Expect a number
+		    BEGIN
+			LOCAL
+			    TOKEN_TYPE;
+
+			LOOK_AHEAD = TRUE;
+			STATUS = DDU$$P_LEX_NUMBER (TOKEN_TYPE, CHAR);
+			IF .STATUS THEN
+			    BEGIN
+				TOKEN_PTR [TKN_TERM] = .TOKEN_TYPE;
+				ENTER_TEXT (ch$diff (.CHAR, .LEX_TKNSTRT),
+				    .LEX_TKNSTRT, TOKEN_PTR [TKN_TEXT]);
+				IF .TOKEN_TYPE EQLU T_SIGNED_INTEGER OR
+				    .TOKEN_TYPE EQLU T_UNSIGNED_INTEGER
+				THEN
+				    BEGIN
+					status = $STR_BINARY (string =
+					    .token_ptr [TKN_TEXT],
+					    result =
+					    token_ptr [TKN_INTVALUE]);
+					IF NOT .STATUS THEN
+					    LSLOCAL_SYNTAX_ERRORM (.lex_locator,
+						'value overflow.');
+					STATUS = SS$_NORMAL;
+				    END;
+				EXITLOOP;
+			    END;
+		    END;
+
+		[C_LETTER]:	! Expect a path_name, keyword, or CDD_name
+		    BEGIN
+			STATUS = DDU$$P_LEX_NAME (.TOKEN_PTR, CHAR);
+			LOOK_AHEAD = TRUE;
+			IF .STATUS THEN EXITLOOP;
+			LSLOCAL_SYNTAX_ERRORM (.lex_locator, 'bad identifier.');
+		    END;
+
+		[C_MINUS]:	! Expect a path_name or a number
+		    BEGIN
+			LOCAL
+			    TOKEN_TYPE;
+
+			LOOK_AHEAD = TRUE;
+			IF (NOT .END_OF_INPUT_LINE) AND
+			    (.CLASS [ch$rchar (ch$plus (.CHAR, 1))] EQLU C_DOT)
+			    THEN
+			    BEGIN	! A path_name
+				STATUS = DDU$$P_LEX_NAME (.TOKEN_PTR, CHAR);
+				IF NOT .STATUS THEN
+				    LSLOCAL_SYNTAX_ERRORM (.lex_locator,
+					'bad identifier.');
+			    END		! A path_name
+			ELSE
+			    BEGIN	! A number
+				STATUS = DDU$$P_LEX_NUMBER (TOKEN_TYPE, CHAR);
+				IF .STATUS THEN
+				    BEGIN
+					TOKEN_PTR [TKN_TERM] = .TOKEN_TYPE;
+					ENTER_TEXT (ch$diff (.CHAR,
+					    .LEX_TKNSTRT),
+					    .LEX_TKNSTRT, TOKEN_PTR [TKN_TEXT]);
+					IF .TOKEN_TYPE EQLU T_SIGNED_INTEGER OR
+					    .TOKEN_TYPE EQLU T_UNSIGNED_INTEGER
+					THEN
+					    BEGIN
+						status = $str_binary (
+						    string =
+						    .token_ptr [TKN_TEXT],
+						    result =
+						    token_ptr [TKN_INTVALUE]);
+						IF NOT .STATUS THEN
+						    LSLOCAL_SYNTAX_ERRORM (
+							.lex_locator,
+							'value overflow.');
+						STATUS = SS$_NORMAL;
+					    END;
+					EXITLOOP;
+				    END;
+			    END;		! A number
+		    END;
+
+		[C_SLASH]:		! Expect a description
+		    BEGIN
+			GET_CHAR (CHAR, false);
+			IF (NOT .END_OF_INPUT_LINE) AND
+			    (.CLASS [ch$rchar (.CHAR)] EQLU C_STAR) THEN
+			    WITHIN_DESC = TRUE
+			ELSE
+			    BEGIN
+				LSLOCAL_SYNTAX_ERRORM (.lex_locator,
+				    'bad character.');
+				LOOK_AHEAD = TRUE;
+			    END;
+		    END;
+
+		[C_QUOTE]:		! Expect a quoted string
+		    BEGIN
+			LOCAL
+			    PTR,
+			    TEST;
+
+			PTR = ch$ptr (TEXT);
+			TEST = .CHAR;
+			TOKEN_PTR [TKN_TERM] = T_QUOTED_STRING;
+
+			GET_CHAR (CHAR, false);
+			WHILE (CH$RCHAR (.CHAR) NEQU CH$RCHAR (.TEST) OR
+			    CH$RCHAR (ch$plus (.CHAR, 1)) EQLU CH$RCHAR (.TEST))
+			    AND CH$RCHAR (.CHAR) NEQU END_OF_LINE 
+			    AND NOT .END_OF_INPUT_LINE
+			DO
+			    BEGIN
+				IF CH$RCHAR (.CHAR) EQLU CH$RCHAR (.TEST) THEN
+				    GET_CHAR (CHAR, false);
+
+				PTR = CH$MOVE (1, .CHAR, .PTR);
+				GET_CHAR (CHAR, false);
+			    END;
+
+			IF CH$RCHAR (.CHAR) EQLU CH$RCHAR (.TEST) THEN
+			    BEGIN
+				ENTER_TEXT (ch$diff (.PTR, ch$ptr (TEXT)),
+				    ch$ptr (TEXT), TOKEN_PTR [TKN_TEXT]);
+				EXITLOOP;
+			    END
+			ELSE
+			    BEGIN
+				LOOK_AHEAD = TRUE;
+				LSLOCAL_SYNTAX_ERRORM (.lex_locator,
+				    'illegal quoted string.');
+			    END;
+		    END;
+
+		[C_PERCENT]:		! Expect a hex or octal number
+		    BEGIN
+			STATUS = DDU$$P_LEX_PERCENT (CHAR, .TOKEN_PTR);
+			IF .STATUS THEN EXITLOOP
+			ELSE LOOK_AHEAD = TRUE;
+		    END;
+
+		[C_STAR, C_DOT, C_COLON, C_SEMICOLON, C_L_PAREN, C_R_PAREN]:
+		    BEGIN		! A single-character lexeme
+			TOKEN_PTR [TKN_TERM] =
+			    (SELECTONE .CLASS [ch$rchar (.CHAR)] OF
+				SET
+				    [C_STAR]:		T_STAR;
+				    [C_DOT]:		T_DOT;
+				    [C_COLON]:		T_COLON;
+				    [C_SEMICOLON]:	T_SEMICOLON;
+				    [C_L_PAREN]:	T_L_PAREN;
+				    [C_R_PAREN]:	T_R_PAREN;
+				TES);
+			ENTER_TEXT (1, .LEX_TKNSTRT, TOKEN_PTR [TKN_TEXT]);
+			EXITLOOP;
+		    END;
+
+		[C_OTHERS]:		! Illegal character
+		    LSLOCAL_SYNTAX_ERRORM (.lex_locator, 'bad character.');
+
+		[C_EOF]:		! End-of-file (^Z)
+		    BEGIN
+		    TOKEN_PTR [TKN_TERM] = T_EOF;
+		    CHAR = 0;		! Prepare to be called again on the
+		    LEX_LINENUM = 0;	!  next file - see code in GET_CHAR.
+		    EXITLOOP;
+		    END;
+
+	    TES;
+	END;		! End of large loop to find next lexeme
+
+    TOKEN_PTR [TKN_LOCATOR] = .LEX_LOCATOR;
+
+END;
+GLOBAL ROUTINE PAR_GET_TOKEN =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine manages the token storage and gets the next lexical
+!	token.
+!
+!  INPUT PARAMETERS:
+!
+!	None
+!
+!  OUTPUT PARAMETERS:
+!
+!	None
+!
+!  IMPLICIT INPUTS:
+!
+!	none
+!
+!  IMPLICIT OUTPUTS:
+!
+!	None
+!
+!  COMPLETION STATUS:
+!
+!	The address of the lexical token.
+!
+!  SIGNALLED STATUS:
+!
+!	This routine does not intercept signals sent by routines it calls.
+!
+!  SIDE EFFECTS:
+!
+!	None
+!
+!--
+BEGIN
+
+    OWN
+	TOKEN_PTR	: REF	TKN_STR;
+
+    TOKEN_PTR = TOKEN_STORAGE [.NEXT_TOKEN_INDEX, TKN_BASE];
+    NEXT_TOKEN_INDEX = .NEXT_TOKEN_INDEX + 1;
+    IF .NEXT_TOKEN_INDEX EQLU MAX_NUM_LEX_TOKS THEN
+	NEXT_TOKEN_INDEX = 0;
+
+    LEX (.TOKEN_PTR);
+    RETURN .TOKEN_PTR
+END;
+ROUTINE UTL_GET (SIZE_REQUEST) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This is a hacked up heap allocation routine.
+!
+!  INPUT PARAMETERS:
+!
+!	size_request	is the number of bytes to be allocated.
+!
+!  OUTPUT PARAMETERS:
+!
+!	DDU-status	is the completion status of the operation.
+!
+!  IMPLICIT INPUTS:
+!
+!	none
+!
+!  IMPLICIT OUTPUTS:
+!
+!	none
+!
+!  COMPLETION STATUS:
+!
+!	The address of the allocated storage.
+!
+!  SIGNALLED STATUS:
+!
+!	This routine does not intercept signals sent by routines it calls.
+!
+!  SIDE EFFECTS:
+!
+!	VMS or XPORT may be called on to allocate more heap storage.
+!
+!--
+BEGIN
+    MAP
+	SIZE_REQUEST	%BLISS32 (: LONG);
+
+    OWN
+	ANCHOR : VECTOR [2] INITIAL (0, 0);
+
+    LITERAL
+	INITIAL_HEAP_SIZE = 1^14;		! In bytes
+
+    LOCAL
+	CURRENT : REF VECTOR,		! address of the current block from which storage is allocated
+	FIRST_FREE,				! index of the first free byte
+	HEAP_SIZE;
+
+    LOCAL
+	SIZE,					! Local for size_request
+	NODE,					! Return Value
+	L : REF VECTOR;				!
+
+%if %bliss (bliss36) %then
+macro
+LIB$GET_VM (				! Get virtual memory
+		num_bytes,		! Bytes to alocate, by reference
+		base_addr ) =		! First address allocated, by reference
+($XPO_GET_MEM (UNITS = .num_bytes, RESULT = base_addr); 1) %;
+%fi
+
+    CURRENT = .ANCHOR [0];
+
+    IF .CURRENT EQL NULL
+    THEN
+	IF .ANCHOR [1] LEQ 0
+	THEN
+	    BEGIN
+
+	    ! Use default values
+
+		HEAP_SIZE = INITIAL_HEAP_SIZE/2;
+		FIRST_FREE = INITIAL_HEAP_SIZE
+	    END
+	ELSE
+	    BEGIN
+		HEAP_SIZE = .ANCHOR [1]/2;
+		FIRST_FREE = .ANCHOR [1]
+	    END
+
+    ELSE
+	BEGIN
+	    HEAP_SIZE = .CURRENT [1];
+	    FIRST_FREE = .ANCHOR [1]
+	END;
+
+    SIZE = .SIZE_REQUEST;
+    DEB_ASSERT (.SIZE GEQ 0 AND .SIZE LSS .HEAP_SIZE, 'Invalid storage request');
+
+    IF (.FIRST_FREE + .SIZE) GTR .HEAP_SIZE
+    THEN
+	BEGIN
+
+	! We double the size of the heap to prevent fragmentation.
+
+	HEAP_SIZE = .HEAP_SIZE*2;
+
+	IF NOT LIB$GET_VM (HEAP_SIZE, L) THEN DEB_ASSERT (FALSE, 'Storage overflow');
+
+	L [0] = .ANCHOR [0];			! Chain old one in
+	ANCHOR [0] = .L;
+	FIRST_FREE = 8;
+	L [1] = .HEAP_SIZE
+	END;
+
+    NODE = .ANCHOR [0] + .FIRST_FREE;		! Location of allocated node
+    ANCHOR [1] = .FIRST_FREE + .SIZE;
+    CH$FILL (%X'00', .SIZE, .NODE);
+    .NODE
+END;						!End of UTL_GET
+
+END
+ELUDOM

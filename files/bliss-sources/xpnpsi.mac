@@ -1,0 +1,295 @@
+;
+;	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1986.
+;	ALL RIGHTS RESERVED.
+;
+;	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+;	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+;	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+;	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+;	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+;	SOFTWARE IS HEREBY TRANSFERRED.
+;
+;	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+;	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+;	EQUIPMENT CORPORATION.
+;
+;	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+;	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+;
+
+;<LCAMPBELL.BLSNET>XPNPSI.MAC.2 11-Feb-82 20:11:10, Edit by LCAMPBELL
+; Converted to modern (BLISS-36) calling conventions.
+;<LCAMPBELL.BLSNET>BLSPS2.MAC.12 11-Feb-82 19:38:10, Edit by LCAMPBELL
+; Majorly hacked, removed most routines except PSIINT, PSISIR, PSIRST, PSIWAI.
+;<WEBBER>BLSPSI.MAC 8-May-80 12:30, Edit by WHEELER
+;Changed references to .ENT0., .EXT0 to ENT0, EXT0 to correspond to new OTS
+;<WEBBER>BLSPSI.MAC.24, 12-Mar-79 14:11, Edit by WEBBER
+;Changed WAIT in PSIWAI and PSIRST to DISMS for 50 ms
+;<WEBBER>BLSPSI.MAC.19, 22-Feb-79 09:47:52, Edit by GUNN
+;Changed table sizes to be decimal 36 from octal 36
+;Added code to check for valid channel number in PSIINT
+
+
+	TITLE XPNPSI - XPN's interface to software interrupt system
+	SEARCH MONSYM,MACSYM
+	TWOSEG
+
+	ENTRY PSIINT,PSISIR,PSIWAI,PSIWXX,PSIRST
+
+;This module supplies an interface to the tricky parts of the software
+; interrupt system.  Only those functions that cannot be performed in
+; BLISS reliably are here (saving/restoring registers, etc.)
+;
+; Calls:
+;	CC = PSIINT( PRIORITY, ROUTINE, CHANNEL);
+;	CC = PSISIR( PROCESS_HANDLE);
+;	PSIWAI();
+;	PSIRST();
+;
+;	Call PSIINT for each routine that will service an interrupt
+; occurring in the specified channel at the specified priority
+; level. PSIINT modifies "CHNTAB" so that the routine will be
+; invoked on an interrupt.
+;	The routine, when entered, will have the channel number on which
+; the interrupt is occurring on the stack.  No register except the stack
+; pointer need be preserved.
+;	Call PSISIR to set up the interrupt system.  PSISIR first checks
+; to see if an SIR has already been done;  if so, it uses the already-set-up
+; LEVTAB and CHNTAB instead of its own.
+;	Call PSIWAI to dismiss the process.  PSIRXX should be stuffed with
+; either a WAIT or DISMS JSYS.  Interrupt routines desiring to wake up the
+; process should put a JFCL in PSIRXX, in case the interrupt occurs before
+; the process about to dismiss calls PSIWAI.
+;	Call PSIRST to wake up the dismissed process.  It forces the PC past
+; the DISMS or WAIT.
+
+; Register definitions:
+
+SP==17				; Stack pointer
+V==1				; Value return register
+
+	RELOC 400000
+
+;Call:	PSIINT(Channel_number,Service_routine,Priority)
+
+PSIINT::PUSH SP,2		; Protect endangered registers
+	MOVE 1,-4(SP)		; Get channel
+	SKIPN LEVPTR		; Fail if we haven't yet inited tables
+	JRST BAD2		;  ..
+	SKIPN CHNPTR		;  ..
+	JRST BAD2		;  ..
+	CAIL 1,0		; Check for valid chan #
+	CAILE 1,^D35		; 0 - 35 OK
+	JRST BAD2		; Fail on bad chan #
+	MOVEI 2,DISPAT		; Get my servicer address
+	ADDI 2,(1)		; Add the channel # call is for
+	PUSH P,1		; Save channel number
+;**; [@@@] Insert at PSIINT + 13 1/2	CLR	4-Jan-83
+	HRL	2,-3(P)		;[@@@] Get priority as well as dispatch address
+	PUSH P,2		; Save dispatch address
+	MOVEI 1,.FHSLF		; See if PA1050 is around to muck things up
+	PUSH P,3
+	GCVEC			;  ..
+	POP P,3
+	JUMPLE 2,PSIIN0		; No, thank God, just do simple things
+	MOVEI 1,6		; COMPT. function code
+	MOVEM 1,COMPTA		; Into arg block
+	HRL 1,-4(SP)		; Get level number
+	HRR 1,(SP)		; Handler address
+	MOVEM 1,COMPTA+1	; Set up COMPT. arg block
+	HRRZ 1,-4(SP)		; Get level number again
+	ADDI 1,PC1-1		; Get PC save address
+	HRL 1,-1(SP)		; Get channel number
+	MOVEM 1,COMPTA+2	; Stuff into arg block
+	MOVE 1,[3,,COMPTA]	; Length,,address of arg block
+	COMPT. 1,		; Shazzam!
+	 JFCL			; Who cares ??
+	ADJSP P,-1		; Adjust stack
+	POP P,1			; Get channel number
+	MOVE 2,-3(P)		; Get service routine address
+	MOVEM 2,BLSTAB(1)	; Set up dispatch pointer
+	POP P,2			; Restore reg 2
+	JRST GOOD		; Give good return
+
+PSIIN0:	POP P,2			; Restore handler address
+;**; [@@@] Insert at PSIIN0 + 1/2	CLR	3-Jan-83
+	SKIPE	XFLAG		;[@@@] Using extended JSYSes?
+	 JRST	NOTX		;[@@@] No, skip this
+	HRRZ	2,2		;[@@@] Yes, clear left half of CHNTAB entry
+	MOVE	1,-3(P)		;[@@@] ... and get the priority
+	DPB	1,[POINT 6,2,5]	;[@@@] ... put it into bits 0-5 of entry
+NOTX:				;[@@@] Here for non-extended JSYS case
+	MOVE 1,CHNPTR		; Get CHNTAB address
+	ADD 1,(P)		; Add channel number
+	MOVEM 2,(1)		; Store in table for monitor
+	POP P,1			; Restore channel number
+	MOVE 2,-3(SP)		; Get caller's servicer routine addr
+	MOVEM 2,BLSTAB(1)	; Store in table for my servicer
+;**; [@@@] Remove three lines at GOOD - 4	CLR	4-Jan-83
+;[@@@]	MOVE 2,-2(SP)		; Get priority
+;[@@@]	ADD 1,CHNPTR		; Add CHNTAB address to channel number
+;[@@@]	HRLM 2,(1)		;  and put priority in table for monitor
+	POP SP,2
+GOOD:	MOVEI V,1		; Return value is successful
+	POPJ SP,
+
+
+;Call: PSISIR(Process_handle)
+
+PSISIR::PUSH SP,2		; Get a register
+	MOVE 1,-2(SP)		; Get process handle
+	RIR			; Are LEVTAB and CHNTAB already declared?
+;**; [@@@] Insert at PSISIR + 2 1/2	CLR	4-Jan-83
+	 ERJMP	[		;[@@@] RIR% lost, better try XRIR%
+		MOVEI	2,3		;[@@@] Size of XRIR% block
+		MOVEM	2,XBLOCK	;[@@@] ... store it
+		MOVEI	2,XBLOCK	;[@@@] Argument block address
+		MOVE	1,-2(SP)	;[@@@] Get process handle
+		XRIR%			;[@@@] Try XRIR% now
+		 ERJMP	BAD		;[@@@] Lose gracelessly
+		SETZM	XFLAG		;[@@@] Remember to use extended JSYSes
+		MOVE	2,XBLOCK+1	;[@@@] Get level table address
+		MOVEM	2,LEVPTR	;[@@@] ... and store it
+		MOVE	2,XBLOCK+2	;[@@@] Get channel table address
+		MOVEM	2,CHNPTR	;[@@@] ... and store it
+		JRST	PSISI0		;[@@@] Join common exit
+		]			;[@@@] End of trying XRIR%
+	SETOM	XFLAG		;[@@@] Remember not to use extended JSYSes
+	SKIPE 2 		; If they are,
+	JRST [	HLRZM 2,LEVPTR		; Remember their addresses
+		HRRZM 2,CHNPTR		;  ..
+		JRST PSISI0]
+	MOVEI 2,LEVTAB		; Not already set up, assume we own the world
+	MOVEM 2,LEVPTR
+	MOVEI 2,CHNTAB
+	MOVEM 2,CHNPTR
+;**; [@@@] Insert at PSISIR + 10 1/2	CLR	3-Jan-83
+	MOVE	1,-2(SP)	;[@@@] Get process handle
+	MOVEI	2,3		;[@@@] Size of XSIR% block
+	MOVEM	2,XBLOCK	;[@@@] ... store it
+	MOVEI	2,LEVTAB	;[@@@] Level table address
+	MOVEM	2,XBLOCK+1	;[@@@] ... store it
+	MOVEI	2,CHNTAB	;[@@@] Channel table address
+	MOVEM	2,XBLOCK+2	;[@@@] ... store it
+	XSIR%			;[@@@] Try XSIR% first
+	 ERJMP	NOXSIR		;[@@@] ... must be a KS or something
+	SETZM	XFLAG		;[@@@] Remember to use extended JSYSes
+	JRST	PSISI0		;[@@@] Join common exit
+NOXSIR:	MOVE	1,-2(SP)	;[@@@] Get process handle
+	SETOM	XFLAG		;[@@@] Remember to not use extended JSYSes
+	MOVE 2,[LEVTAB,,CHNTAB]
+	SIR
+	 ERJMP BAD2
+PSISI0:	POP SP,2
+	JRST GOOD
+
+BAD2:	POP SP,2
+BAD:	SETZM V			; 0 = FAILURE
+	POPJ SP,
+
+;This routine is called (via PUSHJ SP,) when an interrupt occurs
+
+HANDLR:	AOS PTR			; In case i get interrupted here
+	POP SP,@PTR		; Save entry address
+	HRRZS @PTR		;   (minus flags)
+	PUSH SP,16		; Get a work register
+	MOVEI 16,15		; Set up to save all registers
+	PUSH SP,(16)		; Preserve register on stack
+	SOJGE 16,.-1		; and again... until AC0 has been...
+	MOVE 1,@PTR		; Subtract entry vector base address
+	SUBI 1,DISPAT+1		;   from actual entry address
+	PUSH  SP,1		; Put channel # on the stack
+	PUSHJ SP,@BLSTAB(1)	; Call user's BLISS routine
+	POP  SP,1		; Get channel # off of stack
+	SETZM 16		; Prepare to pop all register
+	POP  SP,(16)		; Restore AC
+	AOS 16			; Get next AC
+	CAIE 16,16		; Restored AC15 yet?
+	JRST .-3		; No - go pop again
+	POP  SP,16		; Now restore AC16
+	SOS PTR			; Restore 'frame' of entry vector
+	DEBRK			; Return to interrupted routine
+
+; Call: PSIWAI();
+;     - Suspends process.  Caller must set up PSIWXX to either WAIT
+;	or DISMS (this because interrupt routine will change it to JFCL
+;	to prevent fast interrupts from causing infinite sleep).
+
+PSIWAI::MOVE 1,-1(SP)		;Get wait time
+	JRST PSIWXX		;Go to low seg
+
+	RELOC
+PSIWXX::HALT			;set up by caller
+	 JFCL
+	JRST GOOD		;Return to caller
+	RELOC
+
+; Call: PSIRST();
+;     - Called from an interrupt routine, resumes the suspended process if
+;	it is at a WAIT.
+
+PSIRST::PUSH SP,2		; Protect the registers
+	MOVE 1,@PTR		; Calculate the
+	SUBI 1,DISPAT+1		;   channel number
+	MOVE 2,CHNPTR		; Address of CHNTAB
+	ADD 2,1			; Add channel number
+	HLRZ 1,(2)		; Pick up the priority on the channel
+;**; [@@@] Insert at PSIRST + 5 1/2	CLR	3-Jan-83
+	SKIPN	XFLAG		;[@@@] Extended JSYSes?
+	 LSH	1,-14		;[@@@] Yes, move priority over
+	MOVE 2,LEVPTR		; Get address of LEVTAB
+	ADDI 2,-1(1)		; Compute offset (zero-origin)
+	MOVE 1,@(2)		; Get PC for interrupted routine
+;**; [@@@] Insert at PSISRT + 10 1/2	CLR	4-Jan-83
+	SKIPN	XFLAG		;[@@@] Skip if not extended
+	 JRST	[MOVEI 1,@0(2)	;[@@@] Get PC address (first word)
+		 AOS   1	;[@@@] Get second word (real PC)
+		 MOVE  1,0(1)	;[@@@] Get instruction at real PC
+		 JRST  .+1]	;[@@@] Join main code
+	MOVE 1,-1(1)		; If the last instruction
+	CAME 1,[DISMS]		;  was WAIT or DISMS
+	CAMN 1,[WAIT]		;  ..
+;**; [@@@] Change at PSIRST + 14	CLR	4-Jan-83
+	 JRST	[MOVE 2,0(2)	;[@@@] Get PC (flags only if extended)
+		 SKIPN XFLAG	;[@@@] Skip if not extended
+		  AOS  2	;[@@@] Get second word (user PC address only)
+		 AOS  0(2)	;[@@@] Increment the user PC
+		 JRST .+1]	;[@@@] Leave literal
+	POP SP,2
+	JRST GOOD		; Return to caller
+
+DISPAT:	REPEAT ^D36,<PUSHJ SP,HANDLR> ; Create entry table (so I can
+				; figure out which chan interrupted)
+
+	RELOC
+
+BLSTAB:	REPEAT ^D36,<EXP 0>	; Dispatch to BLISS routines
+CHNTAB:	REPEAT ^D36,<EXP 0>	; Dispatch to my servers
+LEVTAB:	XWD 0,PC1
+	XWD 0,PC2
+	XWD 0,PC3
+LEVPTR:	BLOCK 1
+CHNPTR:	BLOCK 1
+;**; [@@@] Change at PC1	CLR	3-Jan-83
+PC1:	BLOCK	2		;[@@@] If using extended addressing JSYSes:
+PC2:	BLOCK	2		;[@@@] word 0: flags
+PC3:	BLOCK	2		;[@@@] word 1: PC
+;**; [@@@] Insert after PC3	CLR	3-Jan-83
+XBLOCK:	BLOCK	3		;[@@@] XRIR%/XSIR% argument block:
+				;[@@@]    count
+				;[@@@]    level table pointer
+				;[@@@]    channel table pointer
+XFLAG:	BLOCK 1			;[@@@] If 0, use extended JSYSes;
+				;[@@@]  if 1, use old JSYSes
+
+COMPTA:	BLOCK 3
+
+PTR:	EXP ADDR3-1		; Pointer to where to save entry
+				;  address when a high-P interrupt
+				;  occurs.
+ADDR3:	EXP 0
+ADDR2:	EXP 0
+ADDR1:	EXP 0
+
+	END
+  

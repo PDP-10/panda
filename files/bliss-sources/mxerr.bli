@@ -1,0 +1,598 @@
+MODULE MXERR =
+BEGIN
+
+!
+!			  COPYRIGHT (c) 1985 BY
+!	      DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASS.
+!
+! THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND  COPIED
+! ONLY  IN  ACCORDANCE  WITH  THE  TERMS  OF  SUCH  LICENSE AND WITH THE
+! INCLUSION OF THE ABOVE COPYRIGHT NOTICE.  THIS SOFTWARE OR  ANY  OTHER
+! COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY
+! OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE  IS  HEREBY
+! TRANSFERRED.
+!
+! THE INFORMATION IN THIS SOFTWARE IS SUBJECT TO CHANGE  WITHOUT  NOTICE
+! AND  SHOULD  NOT  BE  CONSTRUED  AS  A COMMITMENT BY DIGITAL EQUIPMENT
+! CORPORATION.
+!
+! DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF  ITS
+! SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.
+!
+
+!++
+! FACILITY: MX's error handling routines
+!
+! ABSTRACT:
+!
+!       This module contains the MX$ERROR_ROUTINE which is called by the $ERROR
+!   macro.  In addition, the global error table, MXERRS, is defined in this
+!   module by the $ERROR_TABLE macro.  The error strings themselves are
+!   maintained in the file MXERR.REQ.  See that file for further details...
+!
+! ENVIRONMENT:  BLISS-36
+!
+! AUTHOR: Richard B. Waddington	, CREATION DATE: 21-March-1985
+!
+! MODIFIED BY:
+!
+! 	, : VERSION
+! 01	-
+!--
+
+!
+! INCLUDE FILES:
+!
+%IF %SWITCHES(TOPS20) %THEN
+    LIBRARY 'monsym';
+    LIBRARY 'mxjlnk';
+%FI
+LIBRARY 'mxnlib';
+LIBRARY 'mxlib';
+!
+! TABLE OF CONTENTS:
+!
+
+FORWARD ROUTINE
+    mx$error_processor,               !The main error processing routine.
+    mx$build_error_message,         !Format an error string using NMU$TEXT.
+    log: NOVALUE,                   !Write an error string to the logfile.
+    link: NOVALUE;                  !Link an error string into the Message
+                                    !   Table Entry.
+!
+! OWN STORAGE:
+!
+
+$error_table ;
+
+!
+! EXTERNAL REFERENCES:
+!
+
+EXTERNAL
+        logspc,
+        mxlogf,
+        mxlogm,
+        active_message_table;
+
+EXTERNAL ROUTINE
+        mx$file_exists,
+        mx$file_routines,
+        mx$message_queue_routines,
+	nmu$text_manager,
+	nmu$sched_manager,
+	nmu$queue_manager,
+	nmu$memory_manager,
+	nmu$table_routines;
+
+%global_routine ('MX$ERROR_PROCESSOR', signal_vector_) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       This routine performs error handling for MX.  There are three classes
+!   of errors:  PROTOCOL errors, MESSAGE errors, and INTERNAL errors.  An
+!   error may have one of three severity levels: INFORMATIONAL, WARNING, and
+!   SEVERE.  The following table outlines the action taken in each case:
+!
+!              INFORMATIONAL         WARNING              SEVERE
+!           +------------------+------------------+-----------------------+
+! PROTOCOL  | Build an error string and log it in MX.LOG.  Note that      |
+!           | these errors should be filtered out by the server/spooler   |
+!           | that detected the condition.  They should never get to this |
+!           | routine.                                                    |
+!           +------------------+------------------+-----------------------+
+! MESSAGE   | Build an error string, and link it  | Build an error string,|
+!           | into the Message Data Block.  If    | and link it into the  |
+!           | the Canceled Bit is not set, then   | Message Data Block.   |
+!           | set the Restart Bit.                | Set Canceled Bit,     |
+!           |                                     | clear Restart Bit in  |
+!           |                                     | Message Data Block,   |
+!           +------------------+------------------+-----------------------+
+! INTERNAL  | Build an error string and log it in | Halt MX.              |
+!           | MX.LOG                              |                       |
+!           +------------------+------------------+-----------------------+
+!
+!       Error strings are built by making calls to the NMU$TEXT routine.
+!   Consequently, error strings may contain any directive supported by
+!   NMU$TEXT.  If an error message from MXERRS contains a directive, then the
+!   call to this routine must include the data for the error message.
+!   Similarly, if an optional message is included, and it contains directives
+!   for NMU$TEXT, then the optional data must be included.  For more details on
+!   message formats, see MXERR.REQ.
+!
+!       This routine takes an argument block with the following format:
+!
+!   SIGNAL_VECTOR:  +---------------------------+   0
+!                   |         Count             |
+!                   +---------------------------+   1
+!                   |      Condition Code       |
+!                   +---------------------------+   2
+!                   |        Message ID         |
+!                   +---------------------------+   3
+!                   | Optional message pointer  |
+!                   +---------------------------+   4
+!                   |Offset to optional msg data|
+!                   +---------------------------+   5
+!                   \    Error message data     \
+!                   \           ...             \
+!                   \                           \
+!                   \   Optional message data   \
+!                   \           ...             \
+!                   +---------------------------+
+!
+!       The message id is the index into the Active Message Table.
+!
+!       The condition code format is the same as the one defined in the Bliss
+!   Language Guide section on Condition Handling, and it contains the Severity
+!   level ($INFO, $WARNING, $SEVERE) the error code (an index into MXERRS), and
+!   the Facility ($PROTOCOL, $MESSAGE, $INTERNAL).  Note that the
+!   signal_vector is very similar to signal vectors used by the condition
+!   handling facilities of Bliss.
+!
+! FORMAL PARAMETERS:
+!
+!	Signal_vector:  The address of the argument block described above.
+!
+! IMPLICIT INPUTS:
+!
+!	MXERRS:         The global error message table.
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!       NONE
+!
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+    BIND
+        sig = .signal_vector_: VECTOR,
+        cnt = sig[0],
+        cond = sig[1]: CONDITION_VALUE,
+        msg_id =                sig[2],
+        err_opt_msg =           sig[3],
+        offset_to_opt_data =   .sig[4],
+        err_msg_data =          sig[5]: VECTOR,
+        opt_msg_data =          sig[offset_to_opt_data];
+
+    LOCAL
+        list_header,
+        len,
+        msg_data_block: REF message_table_entry,
+        err_msg;
+
+    len = mx$build_error_message(sig,err_msg);
+
+    log(.err_msg);
+
+    IF (.cond[STS$V_FAC_MX] EQL $internal) AND
+       (.cond[STS$V_SEVERITY] EQL $severe)
+    THEN
+        stop_program;
+
+    CASE .cond[STS$V_FAC_MX] FROM min_facility TO max_facility OF
+        SET
+        [$protocol,
+         $internal]:    nmu$memory_release(.err_msg, CH$ALLOCATION(.len));
+
+        [$message]:     BEGIN
+                        nmu$table_fetch(
+                            active_message_table,
+                            .msg_id,
+                            msg_data_block);
+
+                        list_header = .msg_data_block[msg_err_list];
+                        link(.err_msg, list_header);
+                        msg_data_block[msg_err_list] = .list_header;
+
+                        IF .msg_data_block[msg_state] EQL $msg_incomplete
+                        THEN
+                            RETURN -2;
+
+                        IF .cond[STS$V_SEVERITY] EQL $severe
+                        THEN
+                            msg_data_block[msg_state] = $msg_canceled
+                        ELSE
+                            IF .msg_data_block[msg_state] NEQ $msg_canceled
+                            THEN
+                                msg_data_block[msg_state] = $msg_restart;
+                        END;
+        TES;
+
+    RETURN 0;
+    END;			!End of MX$ERROR_ROUTINE
+
+%global_routine('MX$ERROR_HANDLER', SIG, MECH, ENBL) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! COMPLETION CODES:
+!
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!--
+    BEGIN
+
+    MAP
+      sig: REF VECTOR,			! signal vector
+      mech: REF VECTOR,			! mechanism vector
+      enbl: REF VECTOR;			! enable vector
+
+    BIND
+        cnt = sig[0],
+        cond = sig[1]: CONDITION_VALUE,
+        msg_id =                sig[2],
+        err_opt_msg =           sig[3],
+        offset_to_opt_data =   .sig[4],
+        err_msg_data =          sig[5]: VECTOR,
+        opt_msg_data =          sig[offset_to_opt_data],
+
+        enbcnt =                 enbl[0],
+        hdr =                   .enbl[1]: REF ipcf_hdr,
+        msg =                   .enbl[2]: REF message_table_entry,
+        rec =                   .enbl[3]: REF ipcf_rec,
+        return_value = MECH
+	[
+	%BLISS16(1)
+	%BLISS36(1)
+	%BLISS32(3)
+	];
+
+    EXTERNAL LITERAL SS$UNW;
+
+    LOCAL 
+        len,
+        err_msg;
+
+    IF sts$match(.cond, ss$unw)
+    THEN
+        RETURN 0;
+
+    len = mx$build_error_message(.sig,err_msg);
+
+    log(.err_msg);
+
+    nmu$memory_release(.err_msg, CH$ALLOCATION(.len));
+
+    return_value = 1;
+
+    CASE .cond[STS$V_FAC_MX] FROM min_facility TO max_facility OF
+        SET
+        [$protocol]:    BEGIN
+                        IF .msg EQL 0 
+                        THEN
+                            SETUNWIND()
+                        ELSE
+                            BEGIN
+                            IF .cond[STS$V_SEVERITY] EQL $err
+                            THEN
+                                BEGIN
+                                SETUNWIND();
+                                msg[msg_state] = $msg_canceled;
+                                END
+                            ELSE
+                                IF .cond[STS$V_SEVERITY] EQL $severe
+                                THEN
+                                    msg[msg_state] = $msg_canceled
+                                ELSE
+                                    msg[msg_state] = $msg_warning;
+                            END;
+
+                        IF .enbcnt EQL 3
+                        THEN
+                            rec[rec_error] = .cond[STS$V_CODE];
+                        END;
+        [$message]:     $error( SEVERITY=$warning,
+                                FACILITY=$internal,
+                                CODE=er$mle);
+
+        [$internal]:    mx$error_processor(.sig);
+        TES;
+
+    RETURN .return_value
+    END;
+%global_routine ('MX$BUILD_ERROR_MESSAGE', signal_vector_, msg_) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!          This routine builds the error message string from the error table
+!   (MXERRS) and the data in the signal vector.  This message is then copied to
+!   dynamic storage, and its address is returned.
+!
+! FORMAL PARAMETERS:
+!
+!	Signal_vector:  The address of the argument block described above.
+!
+!       Msg:    The address to return the address of the message string
+!
+! IMPLICIT INPUTS:
+!
+!	MXERRS:         The global error message table.
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!       The address of the formatted error message.
+!
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+    BIND
+        sig = .signal_vector_: VECTOR,
+        msg = .msg_,
+        cnt = sig[0],
+        cond = sig[1]: CONDITION_VALUE,
+        msg_id =                sig[2],
+        err_opt_msg =           sig[3],
+        offset_to_opt_data =    .sig[4],
+        err_msg_data =          sig[5]: VECTOR,
+        opt_msg_data =          sig[offset_to_opt_data];
+
+    BIND
+       sev_err_msg_directive = CH$PTR(UPLIT(%ASCIZ %STRING('?MX %I'))),
+       sev_opt_msg_directive = CH$PTR(UPLIT(%ASCIZ %STRING('?MX %I (%I)'))),
+       sev_opt_m20_directive = CH$PTR(UPLIT(%ASCIZ %STRING('?MX %I (%J)'))),
+       wrn_err_msg_directive = CH$PTR(UPLIT(%ASCIZ %STRING('%%MX %I'))),
+       wrn_opt_msg_directive = CH$PTR(UPLIT(%ASCIZ %STRING('%%MX %I (%I)'))),
+       wrn_opt_m20_directive = CH$PTR(UPLIT(%ASCIZ %STRING('%%MX %I (%J)')));
+
+    LOCAL
+        len,
+        directive,
+        buf_ptr,
+        arg_cnt,
+        arglist:    VECTOR[20];
+
+    STACKLOCAL
+        buf:    VECTOR[CH$ALLOCATION(256)];
+
+    directive = (
+        IF .cond[STS$V_SEVERITY] EQL sts$k_severe
+        THEN
+            SELECTONE .err_opt_msg OF
+                SET
+                [0]:            sev_err_msg_directive;
+
+                [$error_code]:  %IF %SWITCHES(TOPS20) %THEN
+                                (IF .opt_msg_data GEQ %O'600010'
+                                THEN
+                                    sev_opt_m20_directive
+                                ELSE                                    
+                                    (opt_msg_data = .mxerrs[.opt_msg_data];
+                                     sev_opt_msg_directive ))
+
+                                %ELSE
+                                    (opt_msg_data = .mxerrs[.opt_msg_data];
+                                     sev_opt_msg_directive) %FI;
+
+                [OTHERWISE]:    sev_opt_msg_directive
+                TES
+        ELSE
+            SELECTONE .err_opt_msg OF
+                SET
+                [0]:            wrn_err_msg_directive;
+
+                [$error_code]:  %IF %SWITCHES(TOPS20) %THEN
+                                (IF .opt_msg_data GEQ %O'600010'
+                                THEN
+                                    wrn_opt_m20_directive
+                                ELSE
+                                    (opt_msg_data = .mxerrs[.opt_msg_data];
+                                     wrn_opt_msg_directive ))
+
+                                %ELSE
+                                    (opt_msg_data = .mxerrs[.opt_msg_data];
+                                     wrn_opt_msg_directive ) %FI;
+
+                [OTHERWISE]:    wrn_opt_msg_directive
+                TES);
+
+    arglist[0] = .mxerrs[.cond[STS$V_CODE]];
+
+    arg_cnt = MIN(20, .cnt - 2);
+    INCR j FROM 1 TO .arg_cnt - 1 DO arglist[.j] = .err_msg_data[.j - 1];
+
+    buf_ptr = CH$PTR(buf);
+
+    len = nmu$text(buf_ptr, 256, .directive, .arg_cnt, arglist);
+
+    msg = nmu$memory_get(CH$ALLOCATION(.len));
+
+    CH$MOVE(.len, CH$PTR(buf), CH$PTR(.msg));
+
+    RETURN .len
+
+    END;			!End of MX$BUILD_ERROR_MESSAGE
+%global_routine ('log', err_msg): NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       This routine takes an error message string and appends it to the log
+!   file (MX.LOG).  NOTE--THIS ROUTINE IS NOT YET IMPLEMENTED.  AT PRESENT IT
+!   ONLY DOES A PSOUT ON TOPS-20, OR A CALL TO TASK_INFO ON TOPS-10--NOTE
+!
+! FORMAL PARAMETERS:
+!
+!	ERR_MSG: The address of the error message text string.
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!       NONE
+!
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+    LOCAL
+        len,
+        ptr,
+        error;
+    STACKLOCAL
+        tbuf:   VECTOR[CH$ALLOCATION(40)],
+        buf:    VECTOR[CH$ALLOCATION(max_string_length)];
+
+    %IF %SWITCHES(TOPS20) %THEN
+        BEGIN
+        declare_jsys(odtim);
+        $$odtim(CH$PTR(tbuf),-1,0);
+        END;
+    %ELSE
+	udtdat(-1,tbuf);
+    %FI
+    ptr = CH$PTR(buf);
+    len = $nmu$text(ptr,max_string_length, '%A   %A%/', 
+                    CH$PTR(tbuf), 
+                    CH$PTR(.err_msg)) - 1;
+
+    IF .mxlogf EQL 0
+    THEN
+        BEGIN
+        IF mx$file_exists(CH$PTR(logspc))
+        THEN
+            mxlogm = file_access_append_only
+        ELSE    
+            mxlogm = file_access_write_only;
+
+        mxlogf = mx$file_open(CH$PTR(logspc), .mxlogm, error);
+        END;
+
+    mx$file_write(.mxlogf, CH$PTR(buf), .len, error);
+    mxlogm = -1;
+    END;			!End of MX$ERROR_ROUTINE
+%routine ('link', err_msg_, header_block_): NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       This routine takes an error message string and links it into the
+!   message data block.
+!
+! FORMAL PARAMETERS:
+!
+!	ERR_MSG:        The address of the error message text string.
+!
+!       HEADER_BLOCK:   The address of the list header.
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!       NONE
+!
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+    BIND
+        err_msg = .err_msg_,
+        header_block = .header_block_;
+
+    LOCAL
+        oldblk:     REF list_blk,
+        newblk:     REF list_blk;
+
+    newblk = mx$get_list_blk;
+    newblk[lst_data] = err_msg;
+    newblk[lst_next] = 0;
+    IF .header_block EQL 0
+    THEN
+        header_block = .newblk
+    ELSE
+        BEGIN
+        oldblk = .header_block;
+
+        WHILE .oldblk[lst_next] NEQ 0 DO oldblk = .oldblk[lst_next];
+
+        oldblk[lst_next] = .newblk;
+        END;
+    END;			!End of MX$ERROR_ROUTINE
+END				!End of module
+ELUDOM

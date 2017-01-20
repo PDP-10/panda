@@ -1,0 +1,1125 @@
+TITLE TTYLOC - Alternate terminal location database
+SUBTTL Frank M. Fujimoto / Stanford University / July, 1983
+
+SEARCH MONSYM,MACSYM,JOBDAT,FNGDEF
+.REQUIRE SYS:MACREL
+.REQUIRE GETLOC
+.TEXT "TTYLOC/SAVE"
+.TEXT "/SYMSEG:PSECT:CODE"
+ASUPPRESS
+SALL
+EXTERN GETLOC
+
+VMAJOR==5
+VMINOR==4
+VWHO==4
+VEDIT==^D24
+
+SUBTTL Macro definitions
+
+;Like TMSG but output an error string
+DEFINE EMSG (STRING) <
+	HRROI A,[ASCIZ \STRING\] ;;Get the string
+	ESOUT%			;;And output it
+>;EMSG
+
+;Like TMSG but prepend a '%' - for warnings
+DEFINE WMSG (STRING) <
+	TMSG <%'STRING>
+>;WMSG
+
+;A Carriage return
+DEFINE CRLF <
+	HRROI A,[BYTE (7) .CHCRT,.CHLFD,0] ;;Get a CRLF
+	PSOUT%			;And do it
+>;CRLF
+
+;Dynamically generate a flag.  No argument initializes
+DEFINE FLAG. (FLAG) <
+IFB <FLAG>,<..FLAG==1B0>	;;No argument, initialize
+IFNB <FLAG>,<
+ IFE ..FLAG,<PRINTX Too many flags, not creating FLAG>
+ IFN ..FLAG,<
+  FLAG==..FLAG			;;Define flag
+  ..FLAG==..FLAG_<-1>		;;Setup for next flag
+ >;IFN ..FLAG
+>;IFNB
+>;FLAG.
+
+;Make a possible string pointer a byte pointer
+DEFINE MAKPTR (AC) <
+	TLC AC,-1		;;Twiddle all bits
+	TLCN AC,-1		;;Did our pointer have -1,,val?
+	 HRLI AC,(<POINT 7,0>)	;;Yes, make a byte pointer
+>;MAKPTR
+
+;Determine whether char in REG is CR or LF
+;Returns +1 if so, +2 if not
+DEFINE NCRLFP (REG) <
+	CAIE REG,.CHCRT		;;Is it a CR?
+	 CAIN REG,.CHLFD	;;How about a LF?
+>;NCRLFP
+
+;AND if not JSYS error
+DEFINE ANNJE. <
+	..TAGF (ERJMP,)
+>;ANNJE.
+
+;AND if JSYS error
+DEFINE ANJER. <
+	ERJMP .+2
+	..TAGF (JRST,)
+>;ANJER.
+
+;Define first word in a table
+DEFINE TABTOP <
+.TABLC==.
+	0			;;We'll fill this in later
+>;TABTOP
+
+;Actually fill in the first word
+DEFINE TABBOT <
+.TABSV==.
+RELOC .TABLC
+	.TABSV-.TABLC-1,,.TABSV-.TABLC-1
+RELOC .TABSV
+>;TABBOT
+
+;Define a switch
+
+DEFINE SWIENT (STRING,VALUE) <
+	[ASCIZ \STRING\],,VALUE
+>;SWIENT
+
+;Uppercase char in AC
+
+DEFINE UPCASE (AC) <
+	CAIL AC,"a"		;;Is it .GE. a lower case a?
+	 CAILE AC,"z"		;;And .LE. a lower case z?
+	  SKPA			;;Yes...
+	   SUBI AC,"a"-"A"	;;Make it upper case
+>;UPCASE
+
+SUBTTL Constant and block definitions
+
+FL=0				;Flags register
+A=1
+B=2
+C=3
+D=4
+FIL=5				;What file we're looking at now
+
+PDLEN==200			;Length of push-down stack
+NAMLEN==40			;How much we can take in RSCAN
+FILNML==30			;How long a filename we can take
+MAXFIL==10			;How many files we can nest
+LABLEN==3			;Maximum length for labels
+
+DATORG==1000			;Uninitialized impure data
+PURORG==135000			;Pure data
+CODORG==140000			;Code
+PAGORG==200000			;Paged data
+
+FILTOK=="*"			;Token that designates a file
+SWITOK=="/"			;Token that designates a switch
+CMTTOK==";"			;Token that designates a comment
+LABTOK=="<"			;This line contains a label
+GTOTOK==">"			;Go to label
+PRTTOK=="="			;Print this line literally
+PRCTOK=="+"			;Print this line with a CRLF
+MORTOK=="?"			;Do a more, " ", CR, "Y" win, others lose
+INLTOK==42			;Double quote, do inline
+
+;Different entries for stacked command files
+TT.JFN==0			;JFN for the file
+TT.PAG==1			;Page number in this process for file
+TT.LEN==2			;Length of the file
+TT.PTR==3			;Pointer to our current location in file
+TT.MAX==4			;How many of these items we have
+
+FLAG.				;Initialize flags
+FLAG. FL%JCL			;If we're reading from JCL
+FLAG. FL%SWI			;If we're doing a switch
+FLAG. FL%PCR			;If we're doing a "!" line, not "="
+FLAG. FL%BAT			;Are we a batch job?
+FLAG. FL%NEW			;Is this a new file?
+FLAG. FL%TIN			;Is the file we're looking at the default?
+
+OPDEF SKPA [TRNA]		;A faster skip always
+
+;Impure storage
+
+.PSECT DATA,DATORG
+
+PDL:	BLOCK PDLEN		;The push-down stack
+BINJFN:	BLOCK 1			;JFN for the bin file
+BINPAG:	BLOCK 1			;Location for TTYLOC bin file
+BINLEN:	BLOCK 1			;Number of pages in bin file
+FILSTK:	BLOCK TT.MAX*MAXFIL	;Block for stacking files
+OURNAM:	BLOCK NAMLEN		;Hold our foreign host name
+NAMBUF:	BLOCK NAMLEN		;Buffer for name
+FILNAM:	BLOCK FILNML		;Name of file we're going to read in
+TTYSPD:	BLOCK 1			;Speeds of terminal
+OURTTY:	BLOCK 1			;Our tty number
+OURJOB:	BLOCK 1			;Our job number
+OURUSR:	BLOCK 1			;Our user number
+
+.ENDPS
+
+;Pure storage
+
+.PSECT PURE,PURORG
+
+;Table of terminal types - get from FNGDEF
+TTYTAB:	TABTOP
+	TTYPES
+	TABBOT
+
+;Table with just one entry, to match SPLIT in /SPEED:
+SPLTAB:	TABTOP
+	SWIENT SPLIT,0
+	TABBOT
+
+;Valid switches
+SWITAB:	TABTOP
+	SWIENT LENGTH,SW.LEN	;Test for tty length
+	SWIENT SPEED,SW.SPD	;Test for tty speed
+	SWIENT TTY-NUMBER,SW.TTY ;Test for tty number
+	SWIENT TYPE,SW.TYP	;Test for tty type
+	TABBOT
+
+BINNAM:	ASCIZ \FINGER:TTYLOC.BIN;P777775\ ;Name of bin file
+NAMPTR:	POINT 7,NAMBUF		;Pointer to the name buffer
+
+EVEC:	JRST START
+	JRST REENT
+	BYTE (3) VWHO (9) VMAJOR (6) VMINOR (18) VEDIT
+EVECL==.-EVEC
+
+.ENDPS
+
+.PSECT PAGED,PAGORG
+
+BINFIL:	BLOCK 100*1000		;Generous room for mapped files
+
+.ENDPS
+
+SUBTTL The code itself
+
+.PSECT CODE,CODORG
+
+REENT:	TDZA FL,FL		;Zero all flags, not trying JCL
+START:	 MOVX FL,FL%JCL		;Here if we are using JCL
+	RESET%			;Initialize the world
+	MOVE P,[IOWD PDLEN,PDL]	;Set up push-down stack
+	CALL INIT		;Set things up
+	CALL MAPBIN		;Map in the bin file
+	CALL GETTLC		;Get the location they want
+	CALL SETLOC		;Set the location
+	CALL UNMBIN		;Unmap the bin file
+	JRST STOP		;And go shut down
+
+;Initialize the world
+
+INIT:	SAVEAC <A,B,C,D>
+	GJINF%			;Get information about ourselves
+	MOVEM A,OURUSR		;Save user number
+	MOVEM C,OURJOB		;And job number
+	TRZ D,.TTDES		;Clear our tty designator
+	MOVEM D,OURTTY		;And finally the tty number
+	RET			;Go back
+
+;Map in the bin file
+;Returns BINPAG/ Page number of bin file
+;	 BINLEN/ Number of pages
+;	 BINJFN/ JFN of bin file
+
+MAPBIN:	SAVEAC <A,B,C>
+	MOVEI A,BINFIL/1000	;Get the location of the bin file
+	MOVEM A,BINPAG		;Save it away
+	MOVE A,[SIXBIT \TTYJOB\] ;Want to see how many terminals on system
+	SYSGT%			;Get the table
+	HLRE A,B		;Get - number of ttys
+	MOVNS A			;Make it positive
+	IMULI A,.TDLEN		;Adjust to how many words should be in file
+	LSH A,-^D9		;Make it a number of pages
+	AOS A			;Increment 1 to account for 0 offset
+	MOVEM A,BINLEN		;Save number of pages to map
+	MOVX A,GJ%SHT!GJ%OLD	;Want to get the file
+	HRROI B,BINNAM		;Pointer to name of file
+	GTJFN%			;Try to get it
+	IFJER.			;That didn't work...
+	  TXO FL,FL%NEW		;Say this is a new file
+	  MOVX A,GJ%SHT!GJ%FOU	;Try creating the file
+	  HRROI B,BINNAM	;Get the name again
+	  GTJFN%		;Try to get it
+	ANJER.			;This time we're really losing
+	  EMSG <Can't get TTYLOC bin file> ;Say we can't get it
+	  JRST STOP		;Just shut down
+	ENDIF.
+	MOVEM A,BINJFN		;Save the JFN away
+	MOVX B,OF%RD!OF%WR!OF%THW ;Thawed read/write access
+	OPENF%			;Try to open the file
+	IFJER.
+	  MOVE A,BINJFN		;Get back the JFN
+	  RLJFN%		;Release it
+	   ERJMP .+1		;Ignore any errors
+	  EMSG <Can't open TTYLOC bin file> ;We can't open it
+	  JRST STOP		;Go shut down
+	ENDIF.
+	HRLZ A,BINJFN		;Get the JFN again
+	MOVE B,BINPAG		;Get the page number to map into
+	HRLI B,.FHSLF		;Map into our own process
+	MOVE C,BINLEN		;Get how many pages to map in
+	TXO C,PM%RD!PM%WR!PM%CNT ;Read/write access
+	PMAP%			;Map it in
+	TXNN FL,FL%NEW		;Is this a new file?
+	 RET			;No, go back now
+	MOVE A,BINPAG		;Get where the file is
+	LSH A,^D9		;Make it a page number
+	SETZM (A)		;Init the first location (and create the page)
+	HRLI A,1(A)		;Make first dest,,first source
+	MOVSS A			;Swap it to make a good BLT ac
+	MOVE B,BINPAG		;Again, get the page number
+	ADD B,BINLEN		;Get first page after file
+	LSH B,^D9		;Make it a location
+	BLT A,-1(B)		;Zero out the whole file
+	RET			;Now go back
+
+;Get location and put it in the bin file
+
+GETTLC:	SAVEAC <A,B,C>
+	SETZM NAMBUF		;Start with nothing in name buffer
+	HRROI C,[ASCIZ \TTYLOC>\] ;Set up prompt
+	MOVE A,C		;Get prompt again
+	TXNE FL,FL%JCL		;Is this from JCL?
+	IFSKP.			;No...
+	  PSOUT%		;Display prompt
+	ELSE.
+	  MOVEI A,.RSINI	;Initialize RSCAN buffer
+	  RSCAN%		;Do so
+	   ERJMP R		;Abort this location
+	  JUMPE A,R		;If no chars, go back
+	  DO.
+	    PBIN%		;Input a char
+	    NCRLFP A		;Is it a cr or lf?
+	     RET		;Yes, go back
+	    CAIE A," "		;Is it a space?
+	     LOOP.		;No, go for another char
+	  ENDDO.
+	ENDIF.
+	MOVE A,NAMPTR		;Get pointer to buffer for string
+	MOVX B,RD%BEL!RD%CRF!<NAMLEN*5-1> ;Break on EOL, return only LF
+	RDTTY%			;Get it
+	 ERCAL ERROR
+	TXNE FL,FL%JCL		;Did we read from JCL?
+	 TXNE B,RD%BTM		;And did we run out of characters?
+	 IFSKP.
+	   DO.
+	     PBIN%		;Read a char
+	     NCRLFP A		;Is it a CR or a LF?
+	      EXIT.		;One of the two, go back
+	     LOOP.		;Otherwise go get another char
+	   ENDDO.
+	 ENDIF.
+	SETZ C,			;Get a null
+	DPB C,A			;Deposit it on our string
+	MOVE A,NAMPTR		;Get another pointer to our buffer
+	ILDB B,A		;Get the first char
+	CAIE B,FILTOK		;Is it the token for a file?
+	 RET			;No, done
+	CALL GETNAM		;Get it
+	 RET			;If nothing, go back
+	SETZ FIL,		;Set up stack for files
+	CALL LOCFIL		;Go get location from filename
+	 SETZM NAMBUF		;If fails, don't set any location
+	RET			;Go back
+
+;LOCFIL - Get location from a file
+;Takes A/ Byte pointer to filename, ending with either Nul or Cr/Lf
+;GETNAM must have already been called
+;Returns +2/success, +1/failure
+
+LOCFIL:	SAVEAC <A,B,C,D>
+	CALL BLTNAM		;Get the file name were we can use it
+	CALL MAPFIL		;Go map in the file
+	 RET			;That didn't work, go back now
+	TXZE FL,FL%TIN		;Is this file for TTYINI?
+	 CALLRET CHKBIN		;Yes, check it and return now
+	DO.			;Read in a line at a time
+	  CALL PNTLIN		;Point to the next good line
+	   EXIT.		;If no more lines, go out of file
+	  LDB A,TT.PTR(FIL)	;Get the last char again
+	  CAIE A,FILTOK
+	  IFSKP.
+	    MOVE A,TT.PTR(FIL)	;Get pointer to our file
+	    CALL LOCFIL		;Try it out
+	     LOOP.		;Lost, go try next line
+	    RETSKP		;Won, propagate success return
+	  ENDIF.
+	  CAIE A,LABTOK		;Is it a label?
+	  IFSKP.
+	    CALL FLSHLN		;Yes, flush this line
+	     RET		;Go back if it's the end of the file
+	    LOOP.		;Otherwise go back for more
+	  ENDIF.
+	  CAIE A,GTOTOK		;Is it a goto token?
+	  IFSKP.
+	    CALL DOGOTO		;Do the goto
+	     RET		;Didn't find it, quit out of this file
+	    LOOP.		;We found it, go looping
+	  ENDIF.
+	  CAIE A,PRCTOK		;Do we print this line with a CRLF?
+	  IFSKP.
+	    TXO FL,FL%PCR	;Yes, this one flags a CRLF
+	    MOVEI A,PRTTOK	;Convince next test that we're a normal print
+	  ENDIF.
+	  CAIE A,PRTTOK		;Do we want to print this line?
+	  IFSKP.		;Yes...
+	    CALL DO.PRT		;Do the work
+	    LOOP.		;Go to the next line
+	  ENDIF.
+	  CAIE A,INLTOK		;Do they want to do it inline?
+	  IFSKP.
+	    CALL DO.INL		;Do the inline
+	     RET		;Go back if an error
+	    AOS (P)		;Set up for a skip return
+	    EXIT.		;And go out of loop
+	  ENDIF.
+	  CAIE A,MORTOK		;Do they want more processing?
+	  IFSKP.		;Yes...
+	    TXNN FL,FL%BAT	;Are we on a batch PTY?
+	    IFSKP.		;Yes, we can't MORE off of it
+	      CALL FLSHLN	;Flush that line
+	       RET		;If failed there, go back
+	      LOOP.		;Go to the next line
+	    ENDIF.
+	    DO.
+	      ILDB A,TT.PTR(FIL) ;Get a byte
+	      NCRLFP A		;Is it neither a CR nor LF?
+	      IFSKP.
+	      ANDN. A		;Nor null?
+	        CAIN A,":"	;Yes, we win, check against terminator
+		 EXIT.		;If it's terminator, go out
+		PBOUT%		;Otherwise output the char
+		LOOP.		;And get the next one
+	      ELSE.
+	        WMSG <Couldn't find end of more prompt>	;They lose
+		CRLF
+		RET		;Go back +1
+	      ENDIF.
+	    ENDDO.
+	    PBIN%		;Get the response
+	    CAIN A," "		;Is it a space?
+	    IFSKP.		;No...
+	      NCRLFP A		;Is it a CR or LF?
+	    ANSKP.		;No...
+	      UPCASE A		;Get the uppercase of the letter
+	      CAIN A,"Y"	;Is it a "Y"?
+	    ANSKP.		;No...
+	      CALL FLSHLN	;Flush the rest of the line
+	       RET		;Go back if nothing more to use
+	      LOOP.		;Otherwise get the next line
+	    ENDIF.		;If it's one of " ", CR, LF, "Y", "y", do it
+	  ELSE.
+	    CALL PRSLOC		;Go try to parse this location
+	  ANNSK.
+	    TXZ FL,FL%SWI	;Zero any flags for switches
+	    CALL FLSHLN		;Flush this line
+	     RET		;Go back if no more in file
+	    LOOP.		;Go back to next line
+	  ENDIF.
+	  MOVE B,NAMPTR		;Get a pointer to our name buffer
+	  DO.
+	    ILDB A,TT.PTR(FIL)	;Get a char from the file
+	    CAIE A,.CHTAB	;Is it a tab?
+	     CAIN A," "		;Or a space?
+	      LOOP.		;Yes, go get the next one
+	  ENDDO.
+	  CAIE A,GTOTOK		;Is it a token for a goto?
+	  IFSKP.		;Yes...
+	    CALL DOGOTO		;Do the goto
+	     RET		;Go back +1 if we didn't find it
+	    LOOP.		;And go for the next name
+	  ENDIF.
+	  DO.
+	    NCRLFP A		;Is it a CR or a LF?
+	     EXIT.		;Yes, go out
+	    JUMPE A,ENDLP.	;Exit also on null
+	    IDPB A,B		;Deposit it on our name
+	    ILDB A,TT.PTR(FIL)	;And get the next char
+	    LOOP.		;Go do another
+	  ENDDO.
+	  SETZ A,		;Get a null
+	  IDPB A,B		;Tie off our string
+	  AOS (P)		;Set up a +2 success return
+	ENDDO.
+	CALLRET UNMFIL		;Unmap the file and return
+
+;Here on a print token
+DO.PRT:	DO.
+	  ILDB A,TT.PTR(FIL)	;Get the char
+	  JUMPE A,ENDLP.	;Go back on a null
+	  CAIN A,.CHCRT		;A CR?
+	   ILDB A,TT.PTR(FIL)	;Yes, get the next char
+	  CAIN A,.CHLFD		;A line feed?
+	   EXIT.		;Yes, go out
+	  PBOUT%		;|Output it
+	  LOOP.			;Go get the next char
+	ENDDO.
+	TXZN FL,FL%PCR		;Do we want a crlf?
+	 RET			;No, go back now
+	CRLF			;Yes, do it
+	RET
+
+;Here on inline
+DO.INL:	TXNE FL,FL%BAT		;Are we batch?
+	 JRST FLSHLN		;Yes, flush the line and return
+	STKVAR <<PROMPT,20>>
+	MOVE A,[POINT 7,PROMPT] ;Get a pointer to the place to put prompt
+	MOVEI C,20*5		;Maximum number of chars in the prompt
+	DO.
+	  ILDB B,TT.PTR(FIL)	;Get a byte
+	  JUMPE B,ENDLP.	;Go out on a null
+	  NCRLFP B		;Is it a cr or lf?
+	   EXIT.		;Or end of line
+	  SOSLE C		;If we still have room
+	   IDPB B,A		;Drop the char in
+	  LOOP.			;And get the next one
+	ENDDO.
+	SETZ C,			;Get a null
+	IDPB C,A		;End the prompt with it
+	HRROI C,PROMPT		;A pointer to the prompt now
+	MOVE A,C		;Get it in A, too
+	PSOUT%			;Output it
+	MOVE A,NAMPTR		;We'll put it directly where we want it
+	MOVX B,RD%BEL!RD%CRF+<NAMLEN*5-1> ;Break on eol, only LF
+	RDTTY%			;Get the line
+	 ERJMP .+1
+	SETZ B,			;Get a null
+	DPB B,A			;Drop it over the LF
+	RETSKP			;And go back
+	ENDSV.
+
+;CHKBIN - Check if we have a location in TTYINI.NET-BIN
+;Returns +1 - no
+;	 +2 - yes
+CHKBIN:	SAVEAC <A,B>
+	STKVAR <<TEMP,20>>
+	HRROI A,TEMP		;Where to put string
+	SKIPGE B,OURTTY		;Are we detached?
+	 RET			;Yes, go back +1 now
+	TXO B,GL%PRE		;Want to prepend 'Ethernet: ' and if there
+				; then we don't have a default.  If it is
+				; then there is a default (assuming no
+				; location string begins with 'Ethernet: ')
+				; If we are not an Ethernet location then
+				; assume no default location unconditionally.
+	CALL GETLOC		;Get our information
+	 RET			;If it failed just go back now
+	TXNN B,GL%ETH		;Is this an ethernet tty?
+	 RET			;No, don't check for ethernet
+	DMOVE A,TEMP		;Get the first to words
+	CAMN A,[ASCIZ \Ether\]	;Check the first...
+	 CAME B,[ASCIZ \net: \]	;And second words
+	  RETSKP		;They don't both match, so we have default
+	RET			;Else we don't
+	ENDSV.
+
+;PNTLIN - Point to a good name in file
+;Takes FIL/ Base of this file entry
+;Returns +1 - failure, no good lines
+;	 +2 - have a good line
+
+PNTLIN:	SAVEAC <A>
+	DO.
+	  ILDB A,TT.PTR(FIL)	;Get a char
+	  JUMPE A,R		;Exit this on end of file
+	  CAIE A,.CHCRT		;Is it a carriage return?
+	  IFSKP.
+	    IBP TT.PTR(FIL)	;Yes, flush the line feed
+	    LOOP.		;And go to the next line
+	  ENDIF.
+	  CAIE A," "		;Is it a space
+	   CAIN A,.CHTAB	;Or a tab?
+	    LOOP.		;Yes, forget that char
+	  CAIE A,CMTTOK		;Is it a comment?
+	  IFSKP.
+	    DO.
+	      ILDB A,TT.PTR(FIL) ;Get a char
+	      JUMPE A,R		;If null, exit
+	      CAIE A,.CHCRT	;Is it a carriage return?
+	      IFSKP.		;Yes...
+	        IBP TT.PTR(FIL)	;Increment past the LF
+		EXIT.		;And go out of the loop
+	      ENDIF.
+	      CAIN A,.CHLFD	;Linefeed?
+	       EXIT.		;Yes, exit
+	      LOOP.		;Otherwise get another char
+	    ENDDO.
+	    LOOP.		;Go get next line
+	  ENDIF.
+	ENDDO.
+	RETSKP			;If we got here, valid line
+
+;GETNAM - Get the name, whether dialin, ether, or internet site
+;Returns +1 - Didn't find anything
+;	 +2 - Have a name of sorts in OURNAM
+
+GETNAM:	SAVEAC <A,B,C>
+	MOVEI A,.PRIOU		;For ourselves
+	MOVEI B,.MORSP		;Want to see if it's a dialin
+	MTOPR%			;Let's find out
+	IFJER.
+	  SETZ C,		;Might be detached
+	ENDIF.
+	MOVEM C,TTYSPD		;Save tty speeds
+	SKIPGE B,OURTTY		;Get our terminal w/o flags
+	 RET			;Go back now if detached
+	HRROI A,OURNAM		;Where we want to store our name
+	TXO B,GL%DES		;Only want a description of where we are
+	CALL GETLOC		;Try to get the information
+	 RET			;Don't have anything
+	SETZ C,			;Get a null
+	IDPB C,A		;Drop it on the end of our name
+	RETSKP			;Go back now
+
+;PRSLOC - Parse a location
+;Takes FIL/ pointer to file block
+;Returns: +1 - failure, location didn't parse
+;	  +2 - Success - location was parsed and switches match
+
+PRSLOC:	SAVEAC <A,B,C>
+	MOVE C,[POINT 7,OURNAM]	;Get a pointer to our name
+	LDB A,TT.PTR(FIL)	;Get the char to start with
+	DO.			;Here if we're ready to parse something
+	  CAIN A,":"		;Is it a colon?
+	   JRST CHKCOL		;Check the colon
+	  CAIN A,SWITOK		;Is it a switch?
+	   JRST CHKSWI		;Check it
+	  ILDB B,C		;Get the next char of our site name
+	  UPCASE A		;Uppercase both chars
+	  UPCASE B
+	  CAME A,B		;Are they the same chars?
+	   RET			;No, go back +1
+	  ILDB A,TT.PTR(FIL)	;Yes, they are so get next char from file
+	  LOOP.			;And loop
+	ENDDO.
+
+CHKCOL:	JUMPL C,RSKP		;If we didn't read any chars, default, win
+	ILDB B,C		;Get the next char of our host name
+	CAIE B,"#"		;Is it a port delimiter?
+	 SKIPN B		;Or a null?
+	  RETSKP		;Yes, we win again
+	RET			;Otherwise, we didn't win
+
+CHKSWI:	DO.
+	  CALL PRSSWI		;It's the switch, try to parse it
+	   RET			;Didn't win, go back +1
+	  TXZE FL,FL%SWI	;Did we want another switch?
+	   LOOP.		;Yes, go do it
+	ENDDO.
+	RETSKP			;If here, all switches won, we go back +2
+
+;PRSSWI - Parse a switch
+;Takes FIL/ Pointer to file information
+;Returns +1 - didn't succeed
+;	 +2 - succeeded
+
+PRSSWI:	SAVEAC <A,B,C,D>
+	STKVAR <<THISSW,20>>
+	MOVE C,[POINT 7,THISSW]	;Pointer to what our string is
+	DO.
+	  ILDB A,TT.PTR(FIL)	;Get a char
+	  JUMPE A,BADSWI	;It's a bad switch if it's a null
+	  NCRLFP A		;Is it a CR or LF?
+	   JRST BADSWI		;Yes, bad
+	  CAIN A,":"		;A colon?
+	   EXIT.		;Yes, go out
+	  IDPB A,C		;Drop the byte in our buffer
+	  LOOP.			;Do another
+	ENDDO.
+	SETZ A,			;Get a null
+	IDPB A,C		;Drop it on our string to tie it off
+	MOVEI A,SWITAB		;Pointer to our switch table
+	HRROI B,THISSW		;Pointer to the switch we want
+	TBLUK%			;Look it up
+	TXNN B,TL%NOM!TL%AMB	;If we get no match or it's ambiguous
+	IFSKP.
+	  EMSG <Invalid switch - />
+	  HRROI A,THISSW	;Get our switch
+	  PSOUT%		;Show the switch we didn't like
+	  JRST STOP		;And shut us down
+	ENDIF.
+	HRRZ A,(A)		;Get our dispatch location
+	JRST (A)		;Go do it
+	ENDSV.
+
+BADSWI:	EMSG <Bad format for TTYLOC file:  couldn't find end of switch>
+	JRST STOP
+
+;Here on /LENGTH:xx
+
+SW.LEN:	STKVAR <<VALUE,10>>
+	HRROI A,VALUE		;Where we want our data
+	CALL BLTVAL		;Get it
+	IFSKP.
+	  HRROI A,VALUE		;Where the value should be
+	  CALL GETNUM
+	ANSKP.
+	  MOVEI A,.MORLL	;Want to read tty length
+	  CALL GETMTP		;Get the value
+	  CAME A,B		;Do they match?
+	   RET			;No, go back +1
+	  RETSKP		;Otherwise go back +2
+	ELSE.
+	  EMSG <Bad value for /LENGTH switch>
+	  JRST STOP
+	ENDIF.
+	RET			;Go back
+
+;Here on /SPEED:xxx
+;Can also use SPLIT instead of an integer
+
+SW.SPD:	STKVAR <<VALUE,10>>
+	HRROI A,VALUE		;Where we want to store the switch value
+	CALL BLTVAL		;Get the switch value where we want it
+	 JRST BADSPD
+	MOVEI A,SPLTAB		;Table that contains split
+	HRROI B,VALUE		;Pointer to the value
+	TBLUK%			;Look it up
+	TXNE B,TL%NOM!TL%AMB	;No match or ambiguous?
+	IFSKP.			;It was SPLIT...
+	  MOVE B,[^D150,,^D1200] ;We are split speed
+	ELSE.
+	  HRROI A,VALUE		;Where we want to read the number from
+	  CALL GETNUM		;Get the number
+	   JRST BADSPD		;We lost, oh well
+	  HRLS B		;Make 0,,Val into Val,,Val
+	ENDIF.
+	MOVEI A,.MORSP		;Get the speed
+	CALL GETMTP		;Get the speed
+	CAME A,B		;Are they the same?
+	 RET			;No, we lose
+	RETSKP			;We win, go back +2
+
+BADSPD:	EMSG <Bad value for /SPEED switch>
+	JRST STOP		;Shut us down
+	ENDSV.
+
+;Here on /TTY-NUMBER:xxx
+
+SW.TTY:	STKVAR <<VALUE,10>>
+	HRROI A,VALUE		;Where we want our data
+	CALL BLTVAL		;Get it
+	IFSKP.
+	  HRROI A,VALUE		;Where the value should be
+	  CALL GETNUM
+	ANSKP.
+	  CAME B,OURTTY		;Is this the tty number we're on?
+	   RET			;No, go back +1
+	  RETSKP		;It is, go back +2
+	ELSE.
+	  EMSG <Bad value for /TTY-NUMBER: switch>
+	  JRST STOP
+	ENDIF.
+	RET			;Go back
+
+;Here on /TYPE:xxx
+
+SW.TYP:	STKVAR <<VALUE,10>>
+	HRROI A,VALUE		;Pointer to destination
+	CALL BLTVAL		;Get our value
+	IFSKP.			;If we won...
+	  MOVEI A,TTYTAB	;List of tty types
+	  HRROI B,VALUE		;Pointer to what we want to test
+	  TBLUK%		;Look for it
+	  TXNE B,TL%NOM!TL%AMB	;If it's not there or ambiguous,
+	ANSKP.			;Say it's an error
+	  HRRZ D,(A)		;Get the type of tty
+	  MOVEI A,.PRIOU	;For ourselves...
+	  GTTYP%		;Get our type
+	  CAME B,D		;Do they match?
+	   RET			;Here if no good, go back +1
+	  RETSKP		;Otherwise go back +2
+	ELSE.
+	  EMSG <Bad value for /TYPE switch>
+	  JRST STOP
+	ENDIF.
+	ENDSV.
+
+;DOGOTO - Go to a label
+;Takes FIL/ Pointer to file block
+;Returns +1 - couldn't find label
+;	 +2 - got label
+
+DOGOTO:	SAVEAC <A,B,C,D>
+	STKVAR <<LABNAM,LABLEN>>
+	MOVEI C,LABLEN*5-1	;Maximum number of chars in label
+	MOVE B,[POINT 7,LABNAM]	;Pointer to where we'll store the name
+	DO.
+	  ILDB A,TT.PTR(FIL)	;Get a char
+	  JUMPE A,R		;Go back +1 on null
+	  CAIE A,.CHCRT		;Is it a CR?
+	  IFSKP.
+	    IBP TT.PTR(FIL)	;Point past the LF
+	    EXIT.		;And go out of the loop
+	  ENDIF.
+	  CAIN A,.CHLFD		;Is it a line feed?
+	   EXIT.		;Yes, go out
+	  IDPB A,B		;Otherwise drop it on our name
+	  SOJG C,TOP.		;Go thru as many as we can
+	  CALL FLSHLN		;Flush the line
+	   RET			;If we hit end of file, we won't find label
+	ENDDO.
+	SETZ C,			;Get a null
+	IDPB C,B		;Drop it on our label
+	DO.
+	  CALL PNTLIN		;Point to a good line
+	   JRST NOLABL		;It didn't work, complain
+	  LDB A,TT.PTR(FIL)	;Get the first char on the line
+	  CAIN A,LABTOK		;Is this a label?
+	  IFSKP.
+	    CALL FLSHLN		;Flush to the end of this line
+	     JRST NOLABL	;We didn't win
+	    LOOP.		;Go to the next line
+	  ENDIF.
+	  MOVE C,[POINT 7,LABNAM] ;Get a pointer to the label we want
+	  MOVEI D,LABLEN*5-1	;Get how many chars we can have
+	  DO.
+	    ILDB A,C		;Get a char from our label
+	    SOJL D,ENDLP.	;If out of chars, we know we have a null, win
+	    IFE. A		;If we hit a null
+	      ILDB B,TT.PTR(FIL) ;Get the next char
+	      CAIE B,.CHCRT	;Did we get a carriage return?
+	      IFSKP.
+	        IBP TT.PTR(FIL)	;Yes, increment the pointer
+		SETZ A,		;Say we're winning
+		EXIT.		;And go out
+	      ENDIF.
+	      SETO A,		;Say we're losing
+	      CALL FLSHLN	;We didn't win, flush the line
+	       RET		;Go back +1 if failed
+	      EXIT.		;Go out
+	    ENDIF.
+	    ILDB B,TT.PTR(FIL)	;Get a char from the file
+	    JUMPE B,R		;If no more chars in file, we lose
+	    CAIE B,.CHCRT	;Reached the end of this label?
+	    IFSKP.		;Yes, ours is too long for it
+	      CALL FLSHLN	;Flush to the end of the line
+	       RET		;Go back +1 if it failed
+	      SETO A,		;Flag that we're failing
+	      EXIT.		;Go out
+	    ENDIF.
+	    CAMN A,B		;Do they match?
+	     LOOP.		;Yes, try the next chars
+	  ENDDO.
+	  JUMPN A,TOP.		;If A isn't null, go to the next line
+	ENDDO.
+	CALL FLSHLN		;Flush this line to the end
+	 RET			;We found the label, but nothing to do
+	RETSKP			;We won, go back +2
+
+NOLABL:	WMSG <Couldn't find label - > ;Say we couldn't find the label
+	HRROI A,LABNAM		;Get a pointer to the label they wanted
+	PSOUT%			;Output it
+	CRLF
+	RET			;Go back +1
+
+;BLTNAM - Get us a good filename
+;Takes A/ pointer to name, delimited with Nul, Cr, or Lf
+;Returns FILNAM/ File name
+
+BLTNAM:	SAVEAC <B,C>
+	MOVE B,[POINT 7,FILNAM]	;Get a pointer to the name we're building
+	SETZM FILNAM		;In case nothing there
+	DO.
+	  ILDB C,A		;Get a char
+	  CAIN C,.CHCRT		;Is it a CR?
+	   ILDB C,A		;Yes, get the next char
+	  CAIN C,.CHLFD		;Is it a LF?
+	   EXIT.		;Yes, go out
+	  JUMPE C,ENDLP.	;Go out on null, too
+	  IDPB C,B		;Deposit the char
+	  LOOP.			;And continue
+	ENDDO.
+	SETZ C,			;Get a null
+	IDPB C,B		;Tie off filename with it
+	RET			;Go back
+
+;GETNUM - Get a number from a string
+;Takes A/ Pointer to number
+;Returns A/ Updated pointer
+;	 B/ value returned from NIN%
+;+1 if failed
+;+2 if succeeded
+
+GETNUM:	SAVEAC <C>
+	MAKPTR A		;Make this a byte pointer
+	MOVEI C,^D10		;Radix decimal
+	NIN%			;Try to get the number
+	 ERJMP R		;Return +1 if failed
+	LDB C,A			;Get the next char
+	JUMPN C,R		;If it's not a null, we failed
+	RETSKP			;otherwise we won
+
+;Takes A/ function to MTOPR%
+;Returns A/ What MTOPR% returned in C
+GETMTP:	SAVEAC <B,C>
+	MOVEM A,B		;Put argument in right place
+	MOVEI A,.PRIOU		;Our tty
+	MTOPR%			;Get the value
+	MOVE A,C		;Get returned value
+	RET			;And go back
+
+;Move a switch value
+;Takes A/ Pointer to destination
+;Returns +1 - failure
+;	 +2 - Success, A/ Updated pointer
+
+BLTVAL:	SAVEAC <B>
+	MAKPTR A		;Make this a byte pointer
+	DO.
+	  ILDB B,TT.PTR(FIL)	;Get a char
+	  JUMPE B,R		;Bad if we hit a null
+	  NCRLFP B		;A CR of LF?
+	   RET			;Yes, it's bad
+	  CAIE B,SWITOK		;Is it a token for a switch?
+	  IFSKP.
+	    TXO FL,FL%SWI	;Flag that we'll have a switch
+	    EXIT.		;And go out
+	  ENDIF.
+	  CAIN B,":"		;Is this the end of the entry?
+	   EXIT.		;Yes, go out
+	  IDPB B,A		;Drop the char on our string
+	  LOOP.			;Get another char
+	ENDDO.
+	SETZ B,			;Get a null
+	IDPB B,A		;Tie off the string
+	RETSKP			;Go back
+
+;Flush all characters until an end of lin
+;Takes FIL/ Pointer to file block
+;Returns +1 - end of file reached
+;	 +2 - got end of line, A/ First char on next line
+
+FLSHLN:	SAVEAC <A>
+	LDB A,TT.PTR(FIL)	;Get the last char we had
+	DO.
+	  JUMPE A,R		;Go back if we have nothing left in the file
+	  CAIE A,.CHCRT		;Is the char from the file a CR?
+	  IFSKP.
+	    IBP TT.PTR(FIL)	;Yes, increment past the LF
+	    EXIT.		;And go out of the loop
+	  ENDIF.
+	  CAIN A,.CHLFD		;But if we really have a line feed
+	   EXIT.		;Go out now
+	  ILDB A,TT.PTR(FIL)	;Otherwise get the next char
+	  LOOP.			;And keep going to flush rest of line
+	ENDDO.
+	RETSKP			;Go back +2
+
+;MAPFIL - Map in the file
+;Takes FILNAM/ Name of file
+;      FIL/ Pointer to last file block
+;Returns +1 - Failure
+;	 +2 - Success, FIL updated, if FL%TIN set then was '*'
+
+MAPFIL:	SAVEAC <A,B,C,D>
+	STKVAR <OLDFIL>
+	MOVEM FIL,OLDFIL	;Save old pointer away
+	IFE. FIL
+	  MOVE D,BINPAG		;Yes, need to set up base
+	  ADD D,BINLEN		;Add the length to the page number
+	  MOVEI FIL,FILSTK	;And set up the pointer
+	ELSE.			;Otherwise...
+	  CAIE FIL,<TT.MAX-1>*MAXFIL+FILSTK ;At the top of the stack?
+	  IFSKP.
+	    WMSG <Can't nest files that deeply>
+	    CRLF
+	    RET			;Go back +1
+	  ENDIF.
+	  MOVE D,TT.PAG(FIL)	;Get location of last file
+	  ADD D,TT.LEN(FIL)	;Get its length
+	  ADDI FIL,TT.MAX	;Point to the next block
+	ENDIF.
+	MOVE A,[POINT 7,FILNAM]	;Get pointer to filename
+	MOVEM A,B		;Store it here, too
+	ILDB A,A		;Get the first char
+	SKIPE A			;If we don't have anything in our name
+	IFSKP.			;Then it's the default file
+	  CAIE FIL,FILSTK	;Are we at the top of our stack?
+	  IFSKP.		;Yes..
+	    SETZ FIL,		;Say we have nothing else on the stack
+	  ELSE.
+	    SUBI FIL,TT.MAX	;Point back a block
+	  ENDIF.
+	  TXO FL,FL%TIN		;Say we're using ttyini
+	  SETZM NAMBUF		;Zero our location
+	  RETSKP		;And go back a winner
+	ENDIF.
+	MOVX A,GJ%SHT!GJ%OLD	;Short form, old file
+	GTJFN%			;Get the file
+	IFNJE.			;If we won
+	  HRRZM A,TT.JFN(FIL)	;Save the JFN
+	  SIZEF%		;Get its size
+	   ERJMP .+1		;Ignore any errors
+	  MOVEM C,TT.LEN(FIL)	;And its length
+	  MOVX B,OF%RD		;Want read access
+	  OPENF%		;Try to get it
+	ANNJE.
+	  MOVE B,D		;Get the page for our file
+	  MOVEM B,TT.PAG(FIL)	;And save it away, too
+	  HRLI B,.FHSLF		;This will be mapped into our area
+	  HRLZ A,TT.JFN(FIL)	;Get the JFN
+	  TXO C,PM%RD!PM%CNT	;Multiple page read access
+	  PMAP%			;Get it
+	  MOVE A,TT.PAG(FIL)	;Get our page again
+	  LSH A,^D9		;Make it a location
+	  HRLI A,(<POINT 7,0>)	;Make that a byte pointer
+	  MOVEM A,TT.PTR(FIL)	;And save it away
+	  RETSKP		;Go back +2
+	ENDIF.
+	WMSG <Couldn't open TTYLOC data file>
+	CRLF
+	SETZM NAMBUF		;Zero the name buffer
+	MOVE A,TT.JFN(FIL)	;Get the JFN
+	RLJFN%			;Release it
+	 ERJMP .+1		;Ignore any errors
+	MOVE A,OLDFIL		;Get back the original pointer
+	RET			;Go back +1
+	ENDSV.
+
+;UNMFIL - Unmap the file
+;Takes FIL/ Pointer to file we want
+
+UNMFIL:	SAVEAC <A,B,C>
+	SETO A,			;So we can unmap
+	MOVE B,TT.PAG(FIL)	;Get where the file's mapped
+	HRLI B,.FHSLF		;In our process
+	MOVE C,TT.LEN(FIL)	;Get how many pages long it is
+	TXO C,PM%RD!PM%CNT	;Multiple page unmap
+	PMAP%			;Do it
+	MOVE A,TT.JFN(FIL)	;Get the JFN
+	CLOSF%			;Close the file
+	 ERJMP .+1		;Ignore any errors
+	CAIE FIL,FILSTK		;Are we at the top of the stack?
+	IFSKP.
+	  SETZ FIL,		;Yes, zero-fy it
+	ELSE.
+	  SUBI FIL,TT.MAX	;No, bump down one on the stack
+	ENDIF.
+	RET			;Go back
+
+;Set the location we want
+
+SETLOC:	SAVEAC <A,B,C,D>
+	ACVAR <BINLOC>
+	SKIPGE C,OURTTY		;Are we detached?
+	 RET			;Yes, don't do anything
+	TXZ C,.TTDES		;Make sure we don't have a terminal designator
+	IMULI C,.TDLEN		;Multiply by length for pointer in db
+	MOVE BINLOC,BINPAG	;Get page number for bin file
+	LSH BINLOC,^D9		;Make it a location
+	ADDM C,BINLOC		;Point to our location
+	MOVE A,NAMPTR		;Get a pointer to the name we chose
+	ILDB A,A		;Get the first char
+	IFE. A			;Is it null?
+	  SETZM .TDWHO(BINLOC)	;And say no one has this slot
+	  SETZM .TDLOC(BINLOC)	;Clear any string (just in case)
+	ELSE.
+	  SETOM .TDLKD(BINLOC)	;Lock the bin file
+	  MOVE C,OURJOB		;Get our job number
+	  STOR C,TL%JOB,.TDWHO(BINLOC) ;Save away the job number
+	  HRRZ A,OURUSR		;Isolate right half of user number
+	  STOR A,TL%USR,.TDWHO(BINLOC) ;Store that away, too
+	  MOVE A,[POINT 7,.TDLOC(BINLOC)] ;Pointer to destination
+	  MOVE B,NAMPTR		;Get a pointer to the name we chose
+	  MOVEI D,.TDLLN*5-1	;Maximum number of chars we can xfer
+	  DO.
+	    ILDB C,B		;Get a char
+	    IDPB C,A		;Drop the byte
+	    JUMPE C,ENDLP.	;Go out on null
+	    SOJG D,TOP.		;Otherwise get the next one if we can
+	    IDPB D,A		;Tie off string with final null
+	  ENDDO.
+	ENDIF.
+	SETZM .TDLKD(BINLOC)	;Unlock the file
+	RET			;And go back
+	ENDAV.
+
+;Unmap the bin file
+;Takes BINJFN/ JFN for binfile
+;      BINPAG/ Page number where bin file is mapped
+;      BINLEN/ How many pages long bin file is
+
+UNMBIN:	SAVEAC <A,B,C>
+	SETO A,			;For unmapping
+	MOVE B,BINPAG		;Get the page number to unmap
+	HRLI B,.FHSLF		;From our process
+	MOVE C,BINLEN		;How many pages to unmap
+	TXO C,PM%RD!PM%WR!PM%CNT ;Multiple page unmap
+	PMAP%			;Do it
+	MOVE A,BINJFN		;Get the JFN
+	CLOSF%			;Close the file
+	 ERJMP .+1		;Ignore any errors here
+	RET			;Go back
+
+;CPYSTR - copy a string, can take either byte or string pointers
+;Takes A/ destination pointer
+;      B/ source pointer
+;Returns A/ Updated pointer, null byte not copied
+
+CPYSTR:	SAVEAC <B,C>
+	MAKPTR A		;Make this a byte pointer
+	MAKPTR B		;And this one too
+	DO.
+	  ILDB C,B		;Get a char
+	  JUMPE C,R		;Go back if it's a null
+	  IDPB C,A		;It isn't, drop it on our string
+	  LOOP.			;And get another
+	ENDDO.
+
+;Error handler
+;Call with CALL or ERCAL
+
+ERROR:	EXCH A,(P)		;Save a register, put pushed loc in a
+	PUSH P,B
+	PUSH P,C
+	AND A,[37,,777777]	;So we can get sections
+	SUBI A,2		;Subtract two from PC to point to jsys
+	PUSH P,A		;Save PC from being clobbered by EMSG
+	EMSG <Error at >	;Start error message
+	MOVEI A,.PRIOU		;On primary output
+	HLRZ B,(P)		;Get left half to b
+	MOVEI C,^D8		;Radix octal
+	IFN. B
+	 NOUT%			;Output the left half
+	  ERJMP ERRERR
+	 TMSG <,,>		;Divide left and right half
+	ENDIF.
+	MOVEI A,.PRIOU		;To tty
+	POP P,B			;Get location again
+	HRRZS B			;Zero left half
+	NOUT%			;Output location
+	 ERJMP ERRERR
+	TMSG < - >
+	MOVEI A,.PRIOU		;To tty, again
+	HRLOI B,.FHSLF		;With last error on our own fork
+	SETZ C,			;With no limit
+	ERSTR%			;Print error string
+	 ERJMP ERRERR		;Undefined error number
+	  ERJMP ERRERR		;Other error
+	POP P,C
+	POP P,B
+	POP P,A			;Save the registers
+	JRST STOP
+
+STOP:	HALTF%			;Stop
+	EMSG <Can't continue>
+	JRST STOP		;Go back and stop again
+
+ERRERR:	EMSG <Error within an error> ;Really losing now
+	JRST STOP		;Bye bye
+
+END <EVECL,,EVEC>

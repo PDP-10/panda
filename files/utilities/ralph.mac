@@ -1,0 +1,1295 @@
+;<UTILITIES>RALPH.MAC.14,  1-Mar-82 04:58:14, Edit by MRC
+; Make the program work, as it once did:
+;  Remove the cutesy KEYBEG and KEYEND macros
+;  Write a new KEYWRD macro that actually does something useful
+;  Rename the routines to .COPY, .DDT, etc.
+;<B.BOMBADIL>RALPH.MAC.13,  1-Dec-81 15:26:27, Edit by B.BOMBADIL
+;<B.BOMBADIL>RALPH.MAC.12,  1-Dec-81 15:05:27, Edit by B.BOMBADIL
+;improve documentation
+;add entry vector information
+;<B.BOMBADIL>RALPH.MAC.9, 30-Nov-81 22:02:51, Edit by B.BOMBADIL
+;implement a STATUS command (code swiped from MSTR.FAI)
+;<B.BOMBADIL>RALPH.MAC.8, 30-Nov-81 20:56:20, Edit by B.BOMBADIL
+;fix bug that was causing a copy of a cylinder range not to terminate
+; (was using cylinder count instead of track count for the repeat count)
+;<B.BOMBADIL>RALPH.MAC.6, 30-Nov-81 14:59:21, Edit by B.BOMBADIL
+;add a DDT command to get UDDT conveniently
+;<B.BOMBADIL>RALPH.MAC.1, 30-Nov-81 14:23:41, Edit by B.BOMBADIL
+;convert to MACRO assembly
+;correct silly spelling errors
+;<B.BOMBADIL>RALPH.FAI.2,  7-Sep-81 01:05:05, Edit by B.BOMBADIL
+;check if destination unit is write locked or part of a mounted structure
+;<LOUGHEED>RALPH.FAI.40,  6-Sep-81 16:41:43, Edit by LOUGHEED
+;add time stamps
+;minor code cleanups
+;<B.BOMBADIL>RALPH.FAI.39,  5-Sep-81 18:21:39, Edit by B.BOMBADIL
+;<B.BOMBADIL>RALPH.FAI.38,  4-Aug-81 21:21:39, Edit by B.BOMBADIL
+;finish recoding - should now work for both RP04 and RP06 drive types
+;<B.BOMBADIL>RALPH.FAI.35,  4-Aug-81 17:36:34, Edit by B.BOMBADIL
+;install cylinder range checking for RP06
+;<B.BOMBADIL>RALPH.FAI.23,  6-Apr-81 18:45:22, Edit by B.BOMBADIL
+;finish substantial part COMND% parsing
+;put fancy driver in front of pack copy routine
+;<B.BOMBADIL>RALPH.FAI.14,  6-Apr-81 16:00:40, Edit by B.BOMBADIL
+;start adding COMND% jsys interface
+;<B.BOMBADIL>RALPH.FAI.7,  1-Apr-81 23:02:40, Edit by B.BOMBADIL
+;modifications to PCOPY
+;  1.) allow user to select a range of cylinders
+;  2.) print out each cylinder number during the pack copy
+
+
+Title RALPH - Image Mode Pack Copier
+Search Monsym,Macsym
+asuppress
+;;sall
+
+a=1
+b=2
+c=3
+d=4
+w=5
+x=6
+y=7
+z=10
+s=12
+t=13
+u=14
+;15,16 reserved for Macsym
+p=17
+
+pdlen==200			;size of pushdown stack
+buflen==50			;size of comnd% buffers
+rtymax==5			;maximum value of retry counter
+
+;disk parameters for RP04 and RP06
+
+rp4tks== ^D19*^D400		;number of tracks on an RP04
+rp6tks== ^D19*^D800		;number of tracks on an RP06
+
+nrpt== ^D20			;number of sectors/track
+nrpp== 4			;number of sectors/page
+nwpr==200			;number of words/sector
+nwpp==nwpr*nrpp			;number of words/page
+
+Subttl  COMND% Macro Definitions
+
+;NOISE
+;make some guide words for parsing
+
+define noise (str) <
+	movei a,csb
+	movei b,[flddb. .cmnoi,,<-1,,[asciz/str/]>]
+	comnd
+>
+
+
+;KEYWRD - keyword table entry
+
+DEFINE KEYWRD (KWD,ADR,FLG) <
+ IFB <FLG>,<
+  IFNB <ADR>,<[ASCIZ/KWD/],,ADR>
+  IFB <ADR>,<[ASCIZ/KWD/],,.'KWD>
+ >;IFB <FLG>
+ IFNB <FLG>,<
+  IFNB <ADR>,<[	CM%FW!FLG
+		ASCIZ/KWD/],,ADR>
+  IFB <ADR>,<[	CM%FW!FLG
+		ASCIZ/KWD/],,.'KWD>
+ >;IFNB <FLG>
+>;DEFINE KEYWRD
+
+Subttl Error Handling Macros
+
+;EMSG
+;pretty print a general error message
+
+define emsg (str) <
+	 jrst [ hrroi a,[asciz/str/]
+	 	call pmsg
+		haltf%
+		jrst .-1 ]
+>
+
+
+;JMSG
+;informative error messages for JSYS failure returns
+
+define jmsg (str) <
+	 erjmp [ ifnb <str>,<hrroi a,[asciz/str/]>
+		 ifb <str>,<hrroi a,[asciz/JSYS error/]>
+		 call perr ]
+>
+
+;CMSG
+;macro to be used with a COMND% jsys no parse condition
+;prints error string and jumps to reparse address
+
+define cmsg (str) <
+	  jrst [ hrroi a,[asciz/str/]
+		 call pmsg
+		 jrst parse ]
+>
+
+Subttl Storage
+
+loc 1000			;start on a page boundary
+
+;next three buffers must be aligned on page boundaries
+
+verbuf:	block 1000*^D95
+tkbuf:	block 1000*^D95
+batbuf:	block 1000
+
+
+;COMND% storage
+
+csb:	xwd 0,repars		;flags, reparse address
+	xwd .priin,.priou	;jfns for I/O
+	-1,,[asciz/RALPH>/]	;pointer to prompt
+	-1,,cmdbuf		;holds whole command being assembled
+	-1,,cmdbuf
+	buflen*5-1		;number of bytes in CMDBUF
+	block 1
+	-1,,atmbuf		;pointer to atom buffer
+	buflen*5-1		;number of bytes in ATMBUF
+	0			;address of GTJFN% block
+
+
+atmbuf:	block buflen		;atom buffer for COMND%
+cmdbuf:	block buflen		;command buffer for COMND%
+pdlist:	block pdlen		;main pushdown list
+diskf:	block .msrln		;MSTR% info for "FROM" disk unit
+diskt:	block .msrln		;MSTR% info for "TO" disk unit
+disks:	block .msrln		;MSTR% info for STATUS command
+namef:	block 10		;structure name string for "FROM" disk
+namet:	block 10		;structure name string for "TO" disk
+names:	block 10		;structure name string for STATUS command
+aliasf:	block 10		;alias name string for "FROM" disk
+aliast:	block 10		;alias name string for "TO" disk
+aliass:	block 10		;alias name string for STATUS command
+chunf:	block 1			;channel,,unit for "FROM" disk
+chunt:	block 1			;channel,,unit for "TO" disk 
+cylrng:	block 1			;range of cylinders to be copied
+dsktyp:	block 1			;disk type code returned by MSTR%
+wtdesg:	block 1			;write designator
+rddesg:	block 1			;read designator
+rtycnt:	block 1			;retry count
+errsts:	block 1			;status flags from a failing DSKOP%
+hilow:	block 1			;directional flag used by PCOPY
+cylnum:	block 1			;current cylinder number
+chnun:	block 1			;used by PARDSK
+dskadr:	block 1			;used by PRDADR error routine
+coradr:	block 1			;....
+headrp:	block 1			;-1 if STATUS header has been printed
+
+Subttl Main Program
+
+;initialization and main loop
+
+start:	tmsg <RALPH - Image mode pack copier for RP04 and RP06 disk drives.
+Version of 1-December-1981.>	;print banner on startup
+reent:	reset%			;clean up the world
+	move p,[iowd pdlen,pdlist] ;set up the stack
+	movei a,.fhslf		;a/ for this fork
+	rpcap%			;read capabilities
+	txnn b,sc%whl+sc%opr	;WOPR?
+	 emsg <WHEEL or OPERATOR privileges required> ;no, you lose...
+	move c,b		;c/ set up capability mask
+	epcap%			;enable capabilities
+parse:	movei a,csb
+	movei b,[flddb. .cmini]
+	comnd%			;initialize the COMND% jsys parsing
+repars:	move p,[iowd pdlen,pdlist] ;reset up the stack in case of reparse
+	movei a,csb
+	movei b,[flddb. .cmkey,,comtab]
+	comnd%			;parse a keyword
+	txne a,cm%nop		;successful parse?
+	 cmsg <Unable to parse command>	;not the right way to handle this
+	hrrz b,(b)		;fetch address of subroutine
+	call (b)		;call subroutine
+	jrst parse		;return to top of loop
+
+
+;command table
+
+COMTAB:	COMTBL,,COMTBL
+	KEYWRD (COPY)		;do a pack copy
+	KEYWRD (DDT)		;invoke DDT
+	KEYWRD (EXIT)		;exit gracefully
+	KEYWRD (HELP)		;help with this program
+	KEYWRD (QUIT,.EXIT,CM%INV) ;synonym for EXIT
+	KEYWRD (STATUS)		;display information on the disk drives 
+COMTBL==.-COMTAB-1		;TABLE LENGTH
+
+Subttl Miscellaneous Utility Routines
+
+;R,RSKP
+;we don't link in MACREL, so we need these fragments and definitions
+
+rskp:	aos (p)			;+2 return
+r:	ret			;+1 return
+
+
+;PMSG
+;here to pretty print an error message
+;takes	a/ pointer to error string
+;returns +1 always
+
+pmsg:	push p,a
+	movei a,.priou		;a/ reading from the tty
+	rfpos%			;get cursor position
+	hrroi a,[byte(7) 15,12,0] ;a/ a CRLF
+	trne b,-1		;skip if against left margin
+	psout%			;print a CRLF otherwise
+	pop p,a			;restore the string pointer
+	esout%			;print the message
+	ret			;return to caller
+
+
+;PERR
+;like PMSG, but prints most recent error message
+;takes	a/ pointer to error string
+;never returns
+
+perr:	call pmsg		;print the string
+	tmsg < - >		;print the separator
+	movei a,.priou		;a/ to the terminal
+	hrloi b,.fhslf		;b/ most recent error for this process
+	setz c,			;c/ no string length limit
+	erstr%			;print the error string
+	 jfcl			;ignore errors
+	  jfcl			;...
+	haltf%			;shut us down
+	jrst .-1		;and stay shut down
+
+Subttl COMND% Utility Subroutines
+
+;CONFRM
+;wait for the user to confirm the command
+
+confrm:	push p,a		;save the AC's we will clobber
+	push p,b
+	push p,c
+	movei a,csb		;a/ address of state block
+	movei b,[flddb. .cmcfm,cm%sdh,,<Press RETURN>]
+	comnd%			;parse a return
+	txne a,cm%nop
+	 cmsg <Not confirmed>
+ 	pop p,c			;restore AC's
+	pop p,b
+	pop p,a
+	ret			;return to caller
+
+
+;PARDSK
+;parse the channel,unit address of a disk pack
+;returns +1 with chn,,unit in AC1
+
+pardsk:	movei a,csb
+	movei b,[flddb. .cmnum,cm%sdh,10,<Channel number>]
+	comnd%			;parse an octal number
+	txne a,cm%nop
+	 cmsg <Octal Channel number>
+	hrlm b,chnun		;store channel number
+	movei a,csb
+	movei b,[flddb. .cmcma,cm%sdh,,<A comma>]
+	comnd%			;parse a comma
+	txne a,cm%nop
+	 cmsg <Comma to separate the channel and unit numbers>
+	movei a,csb
+	movei b,[flddb. .cmnum,cm%sdh,10,<Unit number>]
+	comnd%			;parse an octal number
+	txne a,cm%nop
+	 cmsg <Octal unit number>
+	hrrm b,chnun		;store channel number
+	move a,chnun		;put values where the caller can find them
+	ret			;return to caller
+
+
+;PARCYL
+;parse a cylinder range, but don't verify its correctness
+;returns: +1 always
+;	  CYLRNG = -1 means entire disk
+;	  CYLRNG <> -1 is interpreted as <first,,last> cylinder
+
+parcyl:	noise (CYLINDERS)	;some noise
+	setom cylrng		;range of -1 means entire disk
+	movei a,csb
+	movei b,[flddb. .cmcfm,cm%sdh,,<RETURN to copy all cylinders>,,<[
+		 flddb. .cmnum,cm%sdh,12,<Number of first cylinder>]>]
+	comnd%
+	txne a,cm%nop
+	 cmsg <RETURN or decimal number>
+	ldb c,[point 9,(c),8]	;get last field parsed
+	cain c,.cmcfm		;confirmed?
+	 ret			;yes, return now
+	hrlm b,cylrng
+	noise (TO)
+	movei a,csb
+	movei b,[flddb. .cmnum,cm%sdh,12,<Last cylinder>]
+	comnd%
+	txne a,cm%nop
+	 cmsg <Decimal number>
+	hrrm b,cylrng
+	call confrm		;wait for confirmation
+	ret
+
+Subttl EXIT and HELP Commands
+
+;EXIT
+;leave RALPH gracefully
+
+.exit:	noise (FROM RALPH)	;noise
+	call confrm		;wait for confirmation
+	haltf%			;shut down
+	jrst start		;restart on a continue command
+
+
+;HELP
+;here to tell the user what the RALPH commands are
+
+.help:	call confrm		;wait for confirmation
+	hrroi a,hlpmsg
+	psout%
+	ret
+
+hlpmsg:	asciz\
+RALPH is an image mode pack copier for RP04 and RP06 disk drives.  The
+differences between the two drive types are handled by RALPH at runtime.
+You are not allowed to copy between dissimilar drive types.  The primary
+command is:
+
+     COPY (FROM) chn,unit (TO) chn,unit (CYLINDERS) 0 (TO) 799
+
+The cylinder range is optional; it defaults to the correct range for
+either type of drive.  An RP06 has cylinders 0 through 799; an RP04
+has cylinders 0 through 399.
+
+For safety's sake, a detailed analysis of the two packs is printed out
+and RALPH halts in a continuable state before actually commencing the
+pack copy.
+
+Time stamps are output before and after the pack copy.  During the copy,
+each cylinder number is printed on the terminal before RALPH begins copying
+that particular cylinder.
+
+The STATUS command displays relevant disk drive information.
+
+The DDT command puts you into UDDT.  Type R$G to return to command level.
+
+The EXIT (or QUIT) command leaves RALPH gracefully.
+\
+
+Subttl DDT - Transfer Control to UDDT
+
+.ddt:	call confrm		;wait for confirmation
+	move a,[xwd .fhslf, 770] ;a/ this fork,,page 770
+	rmap%			;read map for first DDT page
+	came a,[-1]		;-1 means it doesn't exist
+	jrst ddt0		;we already have it, go start it
+	movx a,gj%sht+gj%old	;a/ looking for an old file
+	hrroi b,[asciz/SYS:UDDT.EXE/] ;b/ this is the file spec
+	gtjfn%			;get jfn
+	 jmsg <Can't find DDT!>
+	hrli a,.fhslf		;a/ process,,file jfn
+	get%			;GET the file
+	hrrzs a			;a/ jfn
+	rljfn%			;release it
+	 jfcl			;ignore an error here
+	movei a,.fhslf		;a/ fork handle
+	move b,[xwd evecl,evec]	;b/ entry vector
+	sevec%			;reset our munged entry vector
+ddt0:	tmsg <[You are in DDT; R$G to return]
+>
+	move a,.jbsym##		;get symbol table pointer
+	hrrz b,770001		;DDT wants it living in this address
+	movem a,(b)		;store it
+	move a,.jbusy##		;get undefined symbols pointer
+	hrrz b,770002		;DDT wants it living in a special place
+	movem a,(b)		;store it also
+	jrst 770000		;transfer to DDT
+
+Subttl STATUS - Status of the System Disk Drives
+
+;STATUS
+;pretty print a summary of the disks on the system
+
+.statu:	noise (OF THE DISK DRIVES) ;some noise
+	call confrm		;wait for confirmation
+	setom disks+.msrch	;set up start of loop over all disks
+	setom disks+.msrct
+	setom disks+.msrun
+	setom headrp		;print status header
+stat0:	setzm names
+	setzm aliass
+	move a,[point 7,names]
+	movem a,disks+.msrsn	;structure name
+	move a,[point 7,aliass]
+	movem a,disks+.msrsa	;alias name
+	move a,[xwd .msrln,.msrnu]
+	movei b,disks
+	mstr%			;get status info in disks
+	 erjmp [ movei a,.fhslf	;Check for done.
+		 geter		;get most recent error
+		 camn b,[xwd .fhslf, mstx18] ;"no more units in system"
+		 ret
+		 emsg <MSTR% error other than no more units in system> ]
+	call prunit		;yes
+	jrst stat0		;loop over all units
+
+
+;TYPTAB
+;table of disk type strings
+
+typtab:	0
+	point 7,[asciz/RP04/]
+	0
+	0
+	0
+	point 7,[asciz/RP05/]
+	point 7,[asciz/RP06/]
+	point 7,[asciz/RP07/]
+	point 7,[asciz/RP20/]
+	point 7,[asciz/RM03/]
+typtl==.-typtab
+
+
+;OUTSTAT
+; output status information about structure ala STRTST.
+
+define outstat(flag)<
+;;	move b,disks+.msgst
+;;	hrroi c,[asciz/. /]
+;;	hrroi d,[asciz/X /]
+;; ...are assumed to be before this call.
+	move a,c
+	txne b,flag
+	move a,d
+	psout%
+>
+
+
+;PRUNIT
+;print status of unit described in DISKS
+
+prunit:	skipn headrp		;do a header?
+	jrst prun0		;nope
+	setzm headrp		;do it only once.
+	tmsg <	 Part of mounted structure
+	 | In use by diagnostic
+	 | | Drive off-line
+	 | | | Read error
+	 | | | | Bad BAT block
+	 | | | | | Bad HOME block
+	 | | | | | | Write-protected
+Ch# Un#	 V V V V V V V	Type   Units   Unit#   Swap space   Name   Alias
+>
+prun0:	movei a,.priou
+	move b,disks+.msrch
+	movx c,no%lfl!2b17!^D10
+	nout%			;channel
+	 jfcl
+	move b,disks+.msrun
+	movx c,no%lfl!4b17!^D10
+	nout%			;unit
+	 jfcl
+	tmsg <   >
+	move b,disks+.msrst
+	hrroi c,[asciz/. /]
+	hrroi d,[asciz/X /]
+	outstat ms%mnt
+	outstat ms%dia
+	outstat ms%ofl
+	outstat ms%err
+	outstat ms%bbb
+	outstat ms%hbb
+	outstat ms%wlk
+	tmsg < >
+	ldb b,[point 9,disks+.msrst,17]
+	skipe a,typtab(b)
+	caile b,typtl		;in range?
+	 hrroi a,[asciz/????/]
+	psout%			;print device type
+	movei a,.priou
+	hrrz b,disks+.msrns
+	movx c,no%lfl!6b17!^D10
+	nout%			;logical unit number
+	 jfcl
+	hlrz b,disks+.msrns
+	movx c,no%lfl!^D8b17!^D10
+	nout%			;number of units in structure.
+	 jfcl
+	move b,disks+.msrsw
+	movx c,no%lfl!^D15b17!^D10
+	nout%			;swapping space	
+	 jfcl
+	tmsg <   >
+	movei a,.priou
+	hrroi b,names
+	movei c,6
+	setz d,
+	sout%			;structure name
+	movei a," "
+	addi c,1
+	pbout%			;put in some filler
+	sojge c,.-1
+	movei a,.priou
+	hrroi b,aliass
+	movei c,10
+	sout%			;structure alias
+	tmsg <
+>
+	ret
+
+Subttl COPY - Image Mode Pack Copy
+
+.copy:	noise (FROM)		;some noise
+	call pardsk		;parse chan,unit
+	movem a,chunf		;store it
+	noise (TO)		;more noise
+	call pardsk		;parse chan,unit
+	movem a,chunt		;store it
+	call parcyl		;parse a cylinder range
+	call dskinf		;get info on disks, detect obvious blunders
+	call rnginf		;set up cylinder ranges, detect human errors
+	call tellme		;tell user what is getting smashed, confirm
+	setz b,			;build read designator in B
+	tlo b,(1b1)		;physical addresses being specified
+	hlrz a,chunf		;fetch channel number
+	dpb a,[point 5,b,6]	;set it
+	hrrz a,chunf		;fetch unit number
+	dpb a,[point 6,b,12]	;set it
+	movem b,rddesg		;set up read designator
+	setz b,			;build write designator in B
+	tlo b,(1b1)		;physical addresses being specified
+	hlrz a,chunt		;fetch channel number
+	dpb a,[point 5,b,6]	;set it
+	hrrz a,chunt		;fetch unit number
+	dpb a,[point 6,b,12]	;set it
+	movem b,wtdesg		;set up write designator
+	tmsg <
+Copy started >
+	call tstamp		;timestamp
+	call copy1		;copy a disk pack
+	tmsg <
+Copy completed >
+	call tstamp		;timestamp
+	ret			;return to caller
+
+
+;DSKINF
+;get information on the FROM and TO disks
+
+dskinf:	hlrz a,chunf
+	movem a,diskf+.msrch	;store channel number
+	setom diskf+.msrct	;controller must be -1
+	hrrz a,chunf
+	movem a,diskf+.msrun	;store unit number
+	move a,[point 7,namef]
+	movem a,diskf+.msrsn	;store pointer to structure name
+	move a,[point 7,aliasf]
+	movem a,diskf+.msrsa	;store pointer to structure alias
+	move a,[xwd .msrln, .msrus] ;a/ length of arg block,,function code
+	movei b,diskf		;b/ address of argument block
+	mstr%			;read structure information
+	 jmsg <MSTR% failed on "FROM" unit> ;some error
+	hlrz a,chunt
+	movem a,diskt+.msrch	;store channel number
+	setom diskt+.msrct	;controller must be -1
+	hrrz a,chunt
+	movem a,diskt+.msrun	;store unit number
+	move a,[point 7,namet]
+	movem a,diskt+.msrsn	;store pointer to structure name
+	move a,[point 7,aliast]
+	movem a,diskt+.msrsa	;store pointer to structure alias
+	move a,[xwd .msrln, .msrus] ;a/ length of arg block,,function code
+	movei b,diskt		;b/ address of argument block
+	mstr%			;read structure information
+	 jmsg <MSTR% failed on "TO" unit> ;some error
+	move a,diskt+.msrst	;fetch status word for destination disk
+	txne a,ms%mnt		;part of a mounted structure?
+	 emsg <Destination unit is part of a mounted structure>	;yes, die
+	txne a,ms%wlk		;write locked?
+	 emsg <Destination unit is write locked> ;yes, die
+	ldb a,[point 9,diskf+.msrst,17]	;fetch disk type for "FROM" disk
+	ldb b,[point 9,diskt+.msrst,17]	;fetch disk type for "TO" disk
+	came a,b		;skip if the same
+	 emsg <Selected disk units are not of the same type> ;nope, die now
+	caie a,.msrp4		;RP04?
+	cain a,.msrp6		;RP06?
+	 skipa			;yes, we know about those
+	  emsg <RALPH only knows about RP04 and RP06 disk drives>
+	movem a,dsktyp		;store disk type
+	ret			;return to caller
+
+
+;RNGINF
+;verify the correctness of the specified cylinder range 
+;takes	CYLRNG - cylinder range that user specified
+;returns +1 always, with W - <repeat count,,first track>
+;		         CYLNUM - number of first cylinder
+;			 HILOW -  0 if going low to high, -1 otherwise
+
+
+rnginf:	setzm hilow		;assume going from low to high
+	setzm cylnum		;assume we start with cylinder zero
+	move a,cylrng		;fetch cylinder range
+	move b,dsktyp		;fetch disk type
+	came a,[-1]		;everything?
+	 jrst rngin0		;no, must examine things carefully
+	hrlzi w,rp6tks		;assume <repeat count,,intial track> for RP06
+	caie b,.msrp6		;skip if assumption correct
+	hrlzi w,rp4tks		;else <repeat count,,intial track> for RP04
+	ret
+
+rngin0:	movei d,rp6tks-1	;assume maximum cylinder number for RP06
+	caie b,.msrp6		;skip if assumption is correct
+	movei d,rp4tks-1	;maximum cylinder number for RP04
+	hlrz b,a		;b contains initial cylinder
+	hrrz c,a		;c contains final cylinder
+	camle b,d
+	 emsg <Initial cylinder number out of range>
+	camle c,d
+	 emsg <Final cylinder number out of range>
+	sub c,b			;calculate difference
+	setzm hilow		;assume going from low to high
+	skipge c		;diff is positive if going from low to high
+	 setom hilow		;no, going backwards, from high to low
+	movms c			;get magnitude of difference
+	addi c,1		;fence post -  cyl to cyl inclusive
+	imuli c,^D19		;convert cylinder count to track count
+	hrlz w,c		;set up repeat count
+	movem b,cylnum		;set up initial cylinder number
+	imuli b,^D19		;convert to initial track number
+	hrr w,b			;set up initial track number
+	ret			;return to caller
+
+
+;TELLME
+;tell user what he or she is about to smash
+;returns +1 always
+
+tellme:	tmsg <Source:      >
+	movei d,diskf
+	call tell		;tell about source disk
+	tmsg <
+Destination: >
+	movei d,diskt
+	call tell		;tell about destination disk
+	tmsg <
+Cylinders:   >
+	skipge cylrng
+	 jrst [ tmsg <All>
+		jrst tellm0 ]
+	movei a,.priou
+	hlrz b,cylrng
+	movei c,12
+	nout%			;first cylinder
+	 jfcl
+	tmsg < to >
+	movei a,.priou
+	hrrz b,cylrng
+	movei c,12
+	nout%			;last cylinder
+	 jfcl
+tellm0:	tmsg <
+Type CONTINUE to proceed with pack copy.
+>
+	haltf%			;return to EXEC
+	ret			;return to caller when continued
+
+
+;TELL
+;write out information on a disk unit
+;takes	d/ address of MSTR% information block
+
+tell:	tmsg <Chn >
+	movei a,.priou
+	hrrz b,.msrch(d)
+	movei c,10
+	nout%			;print channel number
+	 jfcl
+	tmsg <, Unit >
+	movei a,.priou
+	hrrz b,.msrun(d)
+	nout%			;print unit number
+	 jfcl
+	move b,dsktyp
+	cain b,.msrp4
+	hrroi a,[asciz/; an RP04/]
+	cain b,.msrp6
+	hrroi a,[asciz/; an RP06/]
+	psout%			;print drive type
+	tmsg <; Str >
+	hrro a,.msrsn(d)
+	psout%			;print structure ID
+	tmsg < (>
+	hrro a,.msrsa(d)
+	psout%			;print structure alias
+	tmsg <); Logical unit >
+	movei a,.priou
+	hlrz b,.msrns(d)
+	movei c,10
+	nout%			;logical unit number
+	 jfcl
+	tmsg < of >
+	movei a,.priou
+	hrrz b,.msrns(d)
+	nout%			;number of units in structure
+	 jfcl
+	ret
+
+
+;TSTAMP
+;print the current TAD on console, follow with CRLF
+;returns +1 always
+
+tstamp:	movei a,.priou		;a/ to consoleo
+	seto b,			;b/ -1 for current TAD
+	setz c,			;c/ default format
+	odtim%			;print the time
+	tmsg <
+>				;end with a crlf
+	ret			;return to caller
+
+Subttl Pack Copying Routines
+
+;COPY1
+;copy from one pack to another
+;takes	RDDESG - read designator
+;	WTDESG - write designator
+;	W - track counter (repeat count,,first track)
+;	CYLNUM - first cylinder number
+
+copy1:	movei a,rtymax		;get maximum number of retries
+	movem a,rtycnt		;set up retry count
+	hrroi a,[byte (7)15,12,0] ;set up a pointer to a crlf
+	move b,cylnum		;fetch current cylinder number
+	idivi b,12		;divide by 10.
+	skipn c			;skip if remainder
+	 psout%			;otherwise print a crlf
+	movei a,.priou
+	move b,cylnum
+	move c,[no%lfl!<6,,12>]
+	nout% 			;print current cylinder number
+	 jfcl
+copy1m:	move a,rddesg		;read designator
+	movei b,tkbuf		;address to store data
+	call rdcyl
+	move a,wtdesg		;write designator
+	movei b,tkbuf		;address to write from
+	call wtcyl
+	move a,wtdesg		;write designator
+	movei b,verbuf		;verify buffer
+	call rdcyl
+copy1p:	movei a,tkbuf
+	movei b,verbuf
+	call compcy
+	 jrst [ sosle rtycnt	;count retries
+		jrst copy1m	;try to copy the cylinder again
+		jrst cmperr ]	;failed to copy, go report and haltf%
+copy1x:	add w,[xwd -^D19,0]	;decrement the repeat count
+	hlre a,w		;fetch new repeat count
+	jumple a,r		;we're all done, return
+	dmove a,[ xwd 0,^D19
+		    1  ] 	;assume going low to high
+	skipe hilow		;going from high to low?
+	dmove a,[ xwd 0,-^D19
+		   -1 ]		;yes, use different fix up values
+	add w,a			;fix up track count
+	addm b,cylnum		;fix up cylinder number
+	jrst copy1		;loop back for more
+
+
+;COMPCY
+;compare cylinders
+;skip return on success
+
+compcy:	skipa	x,[<-5000>*^D19,,0]
+compar:	movsi	x,-5000		;length of a track
+	hrli	a,x
+	hrli	b,x
+cmplp:	move	y,@a		;fetch one comparand
+	came	y,@b
+	jrst	[ push p,a
+		  tmsg <Compare error in COMPCY.  Type CONTINUE to proceed.
+>
+		  pop p,a
+		  haltf%
+		  ret]
+	aobjn	x,cmplp		;loop thru buffer
+	retskp
+
+
+;CMPERR
+;here to report a verification failure
+;continues with next cylinder if user desires
+
+cmperr:	tmsg	<Unable to verify copy of cylinder >
+	movei	a,.priou
+	move	b,cylnum	;fetch current cylinder number
+	movei	c,12
+	nout%
+	 jfcl
+	tmsg	<
+Type CONTINUE to proceed.
+>
+	haltf%
+	jrst	copy1x
+
+Subttl Cylinder Level Read/Write Routines
+
+;RDCYL
+;read a cylinder
+;takes	w/ track
+;	a/ disk designator to read from
+;	b/ core buffer
+
+rdcyl:	push p,w
+	push p,a
+	push p,b		;save the base address
+	push p,[0]		;save the count, thus far
+rdcyl1:	move b,(p)		;get the count
+	move w,-3(p)		;get the track number
+	add w,b			;add track count
+	imuli b,5000		;times size of a track
+	add b,-1(p)		;add base address
+	move a,-2(p)		;get the designator
+	call rdtrk
+	aos b,(p)		;increment the count
+	caige b,^D19		;finished with all the surfaces
+	jrst rdcyl1		;no, loop until done
+	pop p,(p)		;unwind
+	pop p,b
+	pop p,a
+	pop p,w
+	ret 
+
+
+;WTCYL 
+;write a cylinder
+;takes	w/ track
+;	a/ disk designator to read from
+;	b/ core buffer
+
+wtcyl:	push p,w
+	push p,a
+	push p,b		;save the base address
+	push p,[0]		;save the count, thus far
+wtcyl1:	move b,(p)		;get the count
+	move w,-3(p)		;get the track number
+	add w,b			;add track count
+	imuli b,5000		;times size of a track
+	add b,-1(p)		;add base address
+	move a,-2(p)		;get the designator
+	call wttrk
+	aos b,(p)		;increment the count
+	caige b,^D19		;enough?
+	jrst wtcyl1		;???
+	pop p,(p)		;unwind
+	pop p,b
+	pop p,a
+	pop p,w
+	ret
+
+Subttl Track Level Read/Write Routines
+
+;RDTRK, WRTRK
+;here to read or write a track
+;takes	b/ buffer address
+
+rdtrk:	skipa x,[call readp]
+wttrk:	move x,[call writep]
+	push p,b		;save buffer address
+	hrrz c,w		;track number
+	imuli c,nrpt		;times number of records/track
+	add a,c			;origin of track
+	push p,a		;save it too.
+	xct x			;read/write page 0
+	move a,(p)
+	move b,-1(p)
+	addi b,2000
+	addi a,10
+	xct x			;page 2
+	move a,(p)
+	move b,-1(p)
+	addi b,4000
+	addi a,20
+	xct x			;page 4
+	move a,(p)
+	move b,-1(p)
+	addi b,1000
+	addi a,4
+	xct x			;page 1
+	move a,(p)
+	move b,-1(p)
+	addi b,3000
+	addi a,14
+	xct x			;page 3
+	adjsp p,-2		;fix up the stack
+	ret 			;return to caller
+
+Subttl Page Level Read/Write Routines
+
+;READP 
+;takes a/ disk address (channel, unit, record)
+;      b/ core address
+
+readp:	push p,a		;a/ save disk address
+	push p,b		;save core address as well
+	move c,b		;c/ core address
+	movei b,1000		;b/ word count, read only.
+	dskop%			;read the disk
+	jumpe a,readp1		;jump if ok
+	movem a,errsts		;store error status flags
+	tmsg <Read error >
+	pop p,b
+	pop p,a
+	call pradrs		;print address and status
+	tmsg  <
+Type CONTINUE to attempt recovery of page by sectors.
+>
+	haltf%			;stop while user thinks about it
+	call readps		;read page by sectors
+	ret			;return to caller
+
+readp1:	pop	p,b
+	pop	p,a
+	ret
+
+
+;WRITEP
+;write from core to disk
+;takes	a/ disk address
+;	b/ core address
+
+writep:	push p,a
+	push p,b
+	move c,b		;address to c
+	move b,[dop%wr!1000]	;word count, write
+	dskop%
+	movem a,errsts
+	jumpe a,readp1		;return ok
+	tmsg <Write error >
+	pop p,b
+	pop p,a
+	call pradrs		;print address and status
+	tmsg <
+Type CONTINUE to proceed.>
+	haltf%
+	ret
+
+
+;PRADRS
+;print useful information on an error
+;takes	a/ disk address
+;	b/ core address
+;	ERRSTS - error flags returned by DSKOP%
+
+pradrs:	tmsg <Chan >
+	ldb b,[point 5,dskadr,6]
+	movei a,.priou
+	movei c,10
+	nout% 
+	 jfcl 
+	tmsg <;   Unit >
+	ldb b,[point 6,dskadr,12]
+	movei a,.priou
+	movei c,10
+	nout% 
+	 jfcl 
+	tmsg  <;   Address = >
+	ldb b,[point 19,dskadr,35]
+	movei a,.priou
+	movei c,10
+	nout%
+	 jfcl
+	tmsg	<;   Status = >
+	move	b,errsts
+	movei	a,.priou
+	movei	c,10
+	nout%
+	 jfcl
+	tmsg 	<
+>
+	move	a,dskadr
+	move	b,coradr
+	ret
+
+
+;READPS
+;read failing page by sectors
+;sectors that can't be read are left with nulls
+
+readps:	push p,a		;disk address
+	push p,b		;core address
+	setzm (b)		;clear first word of core buffer
+	hrli a,(b)		;first part of blt pointer
+	hrri a,1(b)		;second part
+	blt a,777(b)		;clear entire core buffer
+redps0:	move c,0(p)		;core address   - do sector zero
+	movei b,200		;read one record
+	move a,-1(p)		;disk address
+	dskop% 
+	jumpe a,redps1		;on to sector one
+	movem a,errsts
+	move a,-1(p)
+	move b,(p)
+	call pradrs
+redps1:	move c,0(p)		;core address - for sector one
+	addi c,200
+	movei b,200
+	move a,-1(p)
+	addi a,1		;offset to sector one
+	dskop% 
+	jumpe a,redps2		;on to sector two
+	movem a,errsts		;save error status
+	move a,-1(p)
+	addi a,1
+	move b,(p)
+	addi b,200
+	call pradrs
+redps2:	move c,0(p)		;core address - for sector two
+	addi c,400		;offset to sector two
+	movei b,200
+	move a,-1(p)
+	addi a,2		;sector two
+	dskop% 
+	jumpe a,redps3
+	movem a,errsts
+	move a,-1(p)
+	addi a,2
+	move b,0(p)
+	addi b,400
+	call pradrs
+redps3:	move c,0(p)		;core address - for sector three
+	addi c,600
+	movei b,200
+	move a,-1(p)
+	addi a,3		;sector three
+	dskop% 
+	jumpe a,redps4
+	movem a,errsts
+	move a,-1(p)
+	addi a,3
+	move b,0(p)
+	addi b,600
+	call pradrs
+redps4:	pop p,b
+	pop p,a
+	ret
+
+
+Subttl Unused Subroutines
+
+;RONLY
+
+RONLY:	MOVSI	W,-rp6TKS		;NUMBER OF TRACKS TO READ
+	SETZM	TKPRNT#		;LAST TRACK # WE PRINTED
+RONLY1:	MOVEI	A,RTYMAX
+	MOVEM	A,RTYCNT
+	HRRZ	A,W		;TRACK NUMBER
+	IDIVI	A,^D100
+	CAMG	A,TKPRNT
+	JRST	RONLY2
+	MOVEM	A,TKPRNT
+	MOVEI	A,.PRIOU
+	HRRZ	B,W
+	MOVE	C,[NO%LFL!<10,,12>]
+	NOUT%
+	ERJMP	.+1
+	HRROI	A,CRLF
+	PSOUT%
+RONLY2:	MOVE	A,RDDESG	;READ DESIGNATOR
+	MOVEI	B,TKBUF		;ADDRESS TO STORE DATA
+	CALL	RDCYL
+	ADD	W,[^D19,,^D19]
+	JUMPL	W,RONLY1
+	TMSG	<RONLY done
+>
+	RET
+
+
+
+
+define pchun (a,b) <
+	jfcl			;;to prevent assembly errors
+>
+
+DETEST:	MOVE	A,[PCHUN(2,3)]
+	MOVEM	A,RDDESG
+	MOVEI	W,1247*23+10	;THE TRACK TO TRY
+	MOVEI	B,TKBUF
+	CALL	RDTRK
+	HALTF%
+
+
+DATEST:	MOVE	A,[PCHUN(2,3)]
+	MOVEM	A,RDDESG
+	MOVEM	A,WTDESG
+	MOVEI	A,1
+	MOVEM	A,PATX
+DATST1:	MOVEI	B,TKBUF
+	CALL	PATGEN
+	CALL	POSGEN
+	MOVE	A,WTDESG
+	CALL	WTTRK
+	MOVE	A,RDDESG
+	MOVEI	B,VERBUF
+	CALL	RDTRK
+	MOVEI	A,TKBUF
+	MOVEI	B,VERBUF
+	CALL	COMPAR
+	JFCL
+	JRST	DATST1
+
+
+PATGEN:	MOVE	C,PATX
+	MOVSI	D,-5000		;size of a track
+	HRRI	D,(B)		;where to stuff it!
+PATGN1:	MOVEM	C,(D)
+	ROT	C,1
+	SKIPGE	C
+	TRC	C,1
+	AOBJN	D,PATGN1
+	MOVEM	C,PATX
+	POPJ	P,
+
+POSGEN:	MOVM	W,PATX
+	IDIVI	W,^D15200
+	MOVE	W,X
+	POPJ	P,
+
+PATX:	1
+
+
+
+BATCLR:	MOVE	A,[PCHUN(1,0)]
+	MOVEM	A,RDDESG
+	CALL	BATCLA
+	MOVE	A,[PCHUN(2,2)]
+	MOVEM	A,RDDESG
+	CALL	BATCLA
+	TMSG	<Bat clear done
+>
+	HALTF%
+
+BATCLA:	MOVE	A,RDDESG
+	MOVEI	B,200
+	MOVEI	C,BATBUF
+	ADDI	A,2
+	DSKOP%
+	JUMPE	A,BATCL1
+	HALTF%
+	JRST	.-1
+
+BATCL1:	MOVE	A,RDDESG
+	ADDI	A,13
+	MOVEI	B,200
+	MOVEI	C,BATBUF+200
+	DSKOP%
+	JUMPE	A,BATCL2
+	HALTF%	
+	JRST	.-1
+
+BATCL2:	MOVE	A,['BAT   ']
+	CAMN	A,BATBUF
+	CAME	A,BATBUF+200
+	JRST	[HALTF%
+		JRST .]
+	MOVEI	A,606060
+	CAMN	A,BATBUF+176
+	CAME	A,BATBUF+376
+	JRST	[HALTF%
+		JRST .]
+BATCLX:	SETZM	BATBUF+3
+	MOVE	A,[BATBUF+3,,BATBUF+4]
+	BLT	A,BATBUF+175
+	SETZM	BATBUF+203
+	MOVE	A,[BATBUF+203,,BATBUF+204]
+	BLT	A,BATBUF+375
+	MOVE	A,RDDESG
+	MOVE	B,[DOP%WR+200]
+	MOVEI	C,BATBUF
+	ADDI	A,2
+	DSKOP%
+	JUMPE	A,BATCL3
+	HALTF%
+	JRST	.-1
+
+BATCL3:	MOVE	A,RDDESG
+	ADDI	A,13
+	MOVE	B,[DOP%WR+200]
+	MOVEI	C,BATBUF+200
+	DSKOP%
+	JUMPE	A,BATCL4
+	HALTF%	
+	JRST	.-1
+
+BATCL4:	RET
+
+
+;	random read routine
+
+RANR:	MOVE	A,[PCHUN(2,3)]
+	MOVEM	A,RDDESG		;read designator
+	MOVEI	A,1
+	MOVEm	A,IRAN			;initial random number
+RANR1:	MOVE	A,IRAN
+	IDIV	A,[rp6TKS*NRPT-4] 	;divide to make a random page
+	MOVM	A,B
+	IOR	A,RDDESG
+	MOVEI	A,TKBUF
+	CALL	READP
+	JFCL
+	CALL	MAKRAN
+	JRST	RANR1
+
+MAKRAN:	MOVE	A,IRAN
+	ROT	A,1
+	SKIPGE	A
+	TRC	A,1
+	MOVEM	A,IRAN
+	RET
+
+IRAN: 0
+
+CRLF: BYTE(7)15,12,0
+
+
+; READING AND WRITING A TRACK
+
+RTRKR:	TDZA	C,C		;CLEAR WRITE BIT
+WTRKR:	MOVSI	C,(DOP%WR)	;SET WRITE BIT
+	PUSH	P,A
+	PUSH	P,B
+	HRRI	C,NWPR		;FLAGS,,WORD COUNT
+	MOVEI	D,(W)		;TRACK NUMBER
+	IMULI	D,NRPT		;TIMES RECORDS/TRACK = STARTING RECORD
+	IOR	A,D		;DISK ADDRESS
+	PUSH	P,A		;SAVE IT.
+	MOVSI	D,-NRPT		;NUMBER OF RECORDS/TRACK
+	EXCH	B,C		;B GETS FLAGS,,COUNT,  C GETS ADDRESS
+RWTRKR:	MOVE	A,(P)		;GET DISK ADDRESS
+	ADDI	A,(D)		;ADD RECORD NUMBER
+	MOVEI	C,(D)		;GET RECORD NUMBER
+	IMULI	C,NWPR		;CONVERT TO WORD NUMBER
+	ADD	C,-1(P)		;ADD BASE ADDRESS
+	DSKOP%
+	JUMPN	A,[ TMSG <DSKOP% failed>
+		    HALTF%
+		    JRST .-1 ]
+	AOBJN	D,RWTRKR
+	ADJSP	P,-1		;TRIM THE STACK
+	POP	P,B
+	POP	P,A
+	RET			;RETURN TO CALLER
+
+
+;entry vector
+
+evec:	jrst start		;START address
+	jrst reent		;REENTER address
+evecl==.-evec
+
+	end	<evecl,,evec>

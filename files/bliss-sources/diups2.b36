@@ -1,0 +1,715 @@
+%TITLE 'DIU Sender (slave and user job) IPCF routines'
+
+MODULE DIUPS2 (IDENT = '253',
+               LANGUAGE(BLISS36),
+               ENTRY(ip_init,           ! Initialize IPCF stuff
+                     ip_check,          ! Check to see if there is a master
+                     ip_enter,          ! Enter a request in the queue
+                     ip_delete,         ! Delete a request from the queue
+                     ip_find,           ! Find a request or requests
+                     ip_modify,         ! Modify a request
+                     ip_status,         ! Report status of a transfer
+                     ip_connect_me      ! Request connect to correct directory
+                     )
+               )=
+BEGIN
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+! FACILITY: DIU-20 (Data Interchange Utility for TOPS-20)
+!
+! ABSTRACT:  This module provides the Interprocess communication facilities 
+!            required by DIU User Jobs and DIU Slave Jobs for communication 
+!            with the DIU Controlling Job.
+!
+! ENVIRONMENT:  TOPS-20 V6.1    XPORT
+!               BLISS-36 V4     RMS V3.1
+!
+! AUTHOR: Larry Campbell                      CREATION DATE: March 21, 1982
+%SBTTL 'Revision History'
+! HISTORY:
+!
+!  253  Change IPCF20 library to DIUIP2.
+!       Gregory A. Scott 1-Jul-86
+!
+!  252	Remove library of CONDIT.
+!	Sandy Clemens  1-Jul-86
+!
+!  215  Delete routine IP_LIST, work is done in SHOQUE now.
+!       Gregory A. Scott 3-Jun-86
+!
+!  174  Remove library TOPS20, use library MONSYM instead.
+!       Gregory A. Scott 20-May-86
+!
+!  165  Remove qlist_indent macro since it is not used.  Use page 277 for slave
+!       job IPCF pages to avoid interrupt/non-interrupt race problem with doing
+!       commands from spooler job.
+!       Gregory A. Scott 16-May-86
+!
+!  164  Call new routine SHOQUE rather than D$SHRQ from ip_list.
+!       Gregory A. Scott 16-May-86
+!
+!  146  Errors returned from IP_TALK weren't getting signalled properly.
+!       Gregory A. Scott 7-May-86
+!
+!  140  Add routine IP_CHECK which checks to see if there is a spooler.
+!       Gregory A. Scott 4-May-86
+!
+!  135  Routine  IP_CONNECT_ME  now  puts  the  message  saying  that  we  have
+!       connected somewhere in the log file itself,  rather  than  having other
+!       routines do it.            
+!       Gregory A. Scott 1-May-86
+!
+!  134  Previous edit made SHOW QUEUE with nothing in the queue signal an error
+!       (from IP_FIND) so that you would get %DIU event 53: The queue is  empty
+!       rather than [The queue is empty].
+!       Gregory A. Scott 30-Mar-86
+!
+!  133  Add routine IP_TALK which sends a message  to  the spooler  and gets  a
+!       response back.  It also sets the send/recieve quotas to +INF if we  are
+!       the spooler.
+!       Gregory A. Scott 29-Apr-86
+!
+!  126  Get a new  master PID from  the name  each time incase  the spooler  is
+!       shutdown.
+!       Gregory A. Scott 26-Apr-86
+!
+!  123  Zero the rcvpid in IP_INIT.
+!       Gregory A. Scott 23-Apr-86
+!
+!  121  Remove historical code commented out by RDF who also probably moved all
+!       of the comments to AFTER the code that it applies to.
+!       Gregory A. Scott 19-Apr-86
+!
+!       V01-000 RDF0001         Rick Fricchione               10-Aug-1984
+!               Convert from FTSIPS. Modify to use new request block 
+!               and new routines.  Clean up code, and comment.
+!
+!       V00-00  AWN0001         Andy Nourse                   -no-date-
+!               Allow multiple /NOTIFY options to be displayed by SHOW 
+!               QUEUE. Put in ENTRY points.
+!--
+%SBTTL 'Libraries'
+
+LIBRARY 'BLI:XPORT';                    ! XPORT package
+LIBRARY 'DIU';                          ! DIU data structures
+LIBRARY 'MONSYM';                       ! TOPS-20 monitor symbols
+LIBRARY 'DIUIP2';                       ! IPCF macros
+%SBTTL 'Forward Routine'
+
+FORWARD ROUTINE
+    ip_init : NOVALUE,                  ! Initialize IPCF stuff
+    ip_check,                           ! Check if there is (yet) a spooler
+    ip_talk,                            ! Talk to the spooler
+    ip_enter,                           ! Enter a request in the queue
+    ip_delete,                          ! Delete a request from the queue
+    ip_find,                            ! Find a request or requests
+    ip_modify,                          ! Modify a request
+    ip_status,                          ! Report status of a transfer
+    ip_connect_me;                      ! request connect to correct directory
+
+%SBTTL 'Static Storage'
+
+BIND ip_page = %O'277000' : BLOCK [512] FIELD (DIUQ$$MESSAGE_FIELDS);
+
+OWN
+    %IF %SWITCHES(DEBUG)
+        %THEN my_name : $STR_DESCRIPTOR (STRING = '[SYSTEM]DIUDEB'),
+        %ELSE my_name : $STR_DESCRIPTOR (STRING = '[SYSTEM]DIU'),
+    %FI
+    master_PID,                         ! PID to send to the spooler 
+    slave_PID;                          ! PID to send from the slave
+
+EXTERNAL
+    mst_flag,                           ! 1 if we are (yet) the spooler
+    rcvpid,                             ! PID to recieve spooler stuff on
+    tty : $XPO_IOB ();                  ! IOB for terminal
+%SBTTL 'External Routines'
+
+EXTERNAL ROUTINE
+    ip$get_pid,                         ! Get the PID of a process
+    ip$quota : NOVALUE,                 ! Set the send/recieve quotas
+    ip$send,                            ! Send an IPCF message
+    ip$receive,                         ! Receive an IPCF message
+    ip$delete_PID : NOVALUE,            ! Delete a PID
+    s$jobno,                            ! Get our job number
+    s$time,                             ! Return current date/time
+    s$dtstr : NOVALUE,                  ! Convert date/time to string
+    SHOQUE : NOVALUE,                   ! Display queue entries
+    q$copy_req_block : NOVALUE,         ! Copy a request block
+    q$release_chain : NOVALUE,          ! Release chain of request blocks
+    q$valid_req_block;                  ! Validate a request block
+%SBTTL 'Routine IP_INIT'
+
+GLOBAL ROUTINE ip_init : NOVALUE =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION
+!
+!       Initialize the IPCF interface.
+!
+! FORMAL PARAMETERS
+!
+!       None
+!
+! IMPLICIT OUTPUTS
+!
+!       master_PID, slave_PID, rcvPID: zeroed
+!--
+
+rcvpid = 0;                             ! No recieve pid
+master_PID = 0;                         ! No spooler pid
+slave_PID = 0;                          ! No slave   pid
+
+END;                                ! End of ip_init
+%SBTTL 'Routine IP_CHECK'
+
+GLOBAL ROUTINE ip_check =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION
+!
+!       Check to see if there is (yet) a spooler job around.  Used in DIUC20 to
+!       see if certain spooler command can typed because you are not (yet)  the
+!       spooler.
+!
+! ROUTINE VALUE:
+!
+!       TRUE: there is a spooler out there somewhere, he may be you.
+!       FALSE: there is not (yet) a spooler
+!
+!--
+LOCAL s_pid;                            ! Temporary pid for our use
+
+IF .mst_flag THEN RETURN TRUE;          ! If we are the spooler, return now
+
+s_pid = 0;                              ! Make sure this is zeroed
+
+IF ((IP$GET_PID(my_name,s_pid)) NEQ 0)  ! Is the spooler pid name assigned?
+THEN BEGIN                              ! Yes
+     IP$DELETE_PID(.s_pid);             ! Delete the pid we just got
+     RETURN TRUE;                       ! There is a spooler out there
+     END;
+
+IF .s_pid NEQ 0                         ! Toss any pid we got
+THEN IP$DELETE_PID(.s_pid);
+
+RETURN FALSE;                           ! There is not (yet) a spooler
+
+END;
+%SBTTL 'Routine IP_TALK'
+
+ROUTINE ip_talk =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION
+!
+!       Send a page via IPCF to the spooler, get a response.  A new spooler job
+!       pid and a new slave job pid is acquired each time through here.  A  new
+!       slave pid is acquired to  insure we will bet  only one response to  our
+!       messages, and a new master pid  is acquired to insure that the  spooler
+!       job is (yet) started.
+!
+! IMPLICIT INPUTS
+!
+!       ip_page: filled with a page of data to send to the spooler
+!
+! IMPLICIT OUTPUTS
+!
+!       ip_page: filled with return (ack) message
+!
+! ROUTINE VALUE:
+!
+!       DIU$_NORMAL         - successful completion
+!       DIU$_QUEUE_EMPTY    - the queue is empty
+!       DIU$_NO_MASTER      - DIU master job not running
+!       DIU$_NO_SEND        - can't send IPCF to master
+!       DIU$_NO_RECEIVE     - can't receive IPCF from master
+!
+!--
+LOCAL
+    pdb : $$PDB_DECL,
+    retcode;
+
+! Flush PID so rcv queue is empty
+
+IF .slave_pid NEQ 0 THEN IP$DELETE_PID(.slave_pid);
+slave_pid = 0;
+
+! Get a new master_PID each time to insure that the spooler is still there
+
+IF (master_PID = IP$GET_PID (my_name, slave_PID)) EQL 0
+THEN SIGNAL(DIU$_NO_MASTER);
+
+! Set quotas to +inf if we are (yet) the spooler
+
+IF .mst_flag THEN IP$QUOTA(.slave_pid, %O'777', %O'777');
+
+! Send the message, page mode
+
+IF NOT (retcode = IP$SEND (.master_PID, slave_PID, ip_page, 512))
+THEN SIGNAL(DIU$_NO_SEND, .retcode<lh>);
+
+! Try and receieve the response
+
+pdb[PDB$$H_MESSAGE_ADDRESS] = ip_page;
+pdb[PDB$$H_MESSAGE_LENGTH] = 512;
+IF NOT (retcode = IP$RECEIVE (slave_PID, pdb,
+                              %FIELDEXPAND (PDB$$H_MESSAGE_ADDRESS, 0) + 1))
+THEN SIGNAL(DIU$_NO_RECEIVE, .retcode<lh>);
+
+! Got a message, check code returned
+
+IF .ip_page[DIUQ$B_FUNCTION] NEQ DIUQ$K_ACK
+THEN RETURN(.ip_page[DIUQ$G_COMP_CODE]);
+
+RETURN(DIU$_NORMAL)                     ! return OK
+
+END;
+%SBTTL 'Routine IP_ENTER'
+
+GLOBAL ROUTINE ip_enter (p_req_block) =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION
+!
+!   Enter a request in the queue.
+!
+! FORMAL PARAMETERS
+!
+!   p_req_block         - pointer to the request block
+!
+! IMPLICIT INPUTS
+!
+!   NONE
+!
+! IMPLICIT OUTPUTS
+!
+!   The request block is updated with the request ID number assigned.
+!
+! ROUTINE VALUE 
+!
+!   DIU$_NORMAL         - successful completion
+!   DIU$_NO_MASTER      - DIU master job not running
+!   DIU$_NO_SEND        - can't send IPCF to master
+!   DIU$_NO_RECEIVE     - can't receive IPCF from master
+!
+!--
+BIND
+    req_block = .p_req_block : $DIU_BLOCK;
+
+LOCAL
+    retcode;
+
+! Make some cursory validity checks on the request block
+
+IF NOT (retcode = Q$VALID_REQ_BLOCK(req_block))
+THEN RETURN (SIGNAL(.retcode));
+
+! Set up the enter message.
+
+Q$COPY_REQ_BLOCK(req_block,ip_page[DIUQ$Z_REQ_BLOCK]);
+ip_page[DIUQ$H_LENGTH] = 512;
+ip_page[DIUQ$B_FUNCTION] = DIUQ$K_ENTER;
+
+! Send the message and get a response
+
+IF NOT (retcode = IP_TALK())
+THEN RETURN(.retcode);
+
+! Copy the request block returned to the caller
+
+Q$COPY_REQ_BLOCK(ip_page[DIUQ$Z_REQ_BLOCK], req_block);
+
+RETURN(DIU$_NORMAL)                     ! return OK
+
+END;                                    ! End of ip_enter
+%SBTTL 'Routine IP_DELETE'
+
+GLOBAL ROUTINE ip_delete (req_ID) =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION
+!
+!   Delete a request from the queue.
+!
+! FORMAL PARAMETERS
+!
+!   req_ID              - the request ID of the request to be deleted
+!
+! IMPLICIT INPUTS
+!
+!   None
+!
+! IMPLICIT OUTPUTS
+!
+!   None
+!
+! ROUTINE VALUE 
+!
+!   DIU$_NORMAL         - completed OK
+!   DIU$_NO_MASTER      - no master DIU running
+!   DIU$_NO_SEND        - can't send to master DIU
+!   DIU$_NO_RECEIVE     - can't read master's response
+!    or any failure code returned by the master
+!--
+
+LOCAL retcode,
+      pdb : $$PDB_DECL;
+
+! Can't delete 1 or 0
+
+IF .req_ID LSS 2 
+THEN RETURN(DIU$_INVALID_REQUEST);
+
+! Set up the delete message
+
+ip_page[DIUQ$G_REQ_ID] = .req_ID;
+ip_page[DIUQ$H_LENGTH] = 512;
+ip_page[DIUQ$B_FUNCTION] = DIUQ$K_DELETE;
+
+! Send the message and get a response
+
+retcode = IP_TALK();
+
+RETURN(.retcode)
+
+END;                                ! End of ip_delete
+%SBTTL 'Routine IP_FIND'
+
+GLOBAL ROUTINE ip_find (p_req_block, chain_returned) =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION
+!
+!   Find a request or requests that match a given request.
+!
+! FORMAL PARAMETERS
+!
+!   p_req_block         - pointer to request block
+!   chain_returned      - cell to receive address of chain of blocks returned
+!
+! IMPLICIT INPUTS
+!
+!   None
+!
+! IMPLICIT OUTPUTS
+!
+!   Dynamic memory is allocated to hold a chain of requests returned,
+!   and the address of the chain is returned to the caller.
+!
+! ROUTINE VALUE
+!
+!   DIU$_NORMAL         - successful completion
+!   DIU$_NO_MASTER      - no master DIU running
+!   DIU$_NO_SEND        - can't send IPCF to master
+!   DIU$_NO_RECEIVE     - can't read reply from master
+!   DIU$_NO_MEMORY      - insufficient dynamic memory
+!    or any error code returned from master
+!--
+
+BIND
+    req_block = .p_req_block : $DIU_BLOCK;
+
+LOCAL
+    message_count,
+    chain_head,
+    this_block,
+    prev_block,
+    last_sequence_number,
+    retcode,
+    pdb : $$PDB_DECL;
+
+! Set up the message.
+
+Q$COPY_REQ_BLOCK(req_block, ip_page[DIUQ$Z_REQ_BLOCK]);
+ip_page[DIUQ$H_LENGTH] = 512;
+ip_page[DIUQ$B_FUNCTION] = DIUQ$K_FIND;
+
+! Send the message and get a response
+
+IF NOT (retcode = IP_TALK())
+THEN RETURN(.retcode);
+
+! Got a response.  Save it and get some more if possible.
+
+last_sequence_number = 0;
+chain_head = 0;
+prev_block = chain_head;
+WHILE 1 DO
+    BEGIN
+      IF NOT $XPO_GET_MEM(UNITS=DIU$K_LEN+%UPVAL,RESULT=this_block)
+        THEN BEGIN
+               Q$RELEASE_CHAIN(.chain_head);
+               SIGNAL (DIU$_NO_MEMORY);
+             END;
+      ! Get memory to allocate this block
+
+      IF .ip_page[DIUQ$H_SEQUENCE_NUMBER] NEQ .last_sequence_number + 1
+         THEN SIGNAL (DIU$_MISSED_MESSAGE);
+      ! Messages out of sequence
+
+      last_sequence_number = .ip_page[DIUQ$H_SEQUENCE_NUMBER];
+      ! No, update it
+
+      (.prev_block) = .this_block;
+      (.this_block) = 0;
+      ! Link this block to the next block, advance to next block
+
+      Q$COPY_REQ_BLOCK(ip_page[DIUQ$Z_REQ_BLOCK],.this_block+1);
+      ! Copy request block returned to block we just got in heap
+
+      IF .ip_page[DIUQ$G_COMP_CODE] NEQ DIU$_MORE THEN EXITLOOP;
+      ! If no more messages, quit
+
+      pdb[PDB$$H_MESSAGE_ADDRESS] = ip_page;
+      pdb[PDB$$H_MESSAGE_LENGTH] = 512;
+      IF NOT (retcode = IP$RECEIVE(slave_PID, pdb,
+                                  %FIELDEXPAND(PDB$$H_MESSAGE_ADDRESS,0)+1))
+      THEN SIGNAL(DIU$_NO_RECEIVE, .retcode<lh>);
+      ! Did we get an ack for this
+
+      prev_block = .this_block;        
+      
+    END; %(while)%
+
+    (.chain_returned) = .chain_head;
+    ! Update the callers argument
+
+RETURN (DIU$_NORMAL);
+
+END;                                ! End of ip_find
+
+%SBTTL 'Routine IP_MODIFY'
+
+GLOBAL ROUTINE ip_modify (req_ID, item_code, new_value) =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION
+!
+!   Modify a request in the queue.
+!
+! FORMAL PARAMETERS
+!
+!   req_ID              - request ID of request to hack
+!   item_code           - code indicating which parameter to change
+!   new_value           - new value of parameter.  In the case of
+!                         DIUQ$K_LOG_FILESPEC, this is the address of
+!                         a descriptor for the new filespec.
+!
+! IMPLICIT INPUTS
+!
+!   NONE
+!
+! IMPLICIT OUTPUTS
+!
+!   NONE
+!
+! ROUTINE VALUE
+!
+!   DIU$_NORMAL         - successful completion
+!   DIU$_NO_MASTER      - no master DIU running
+!   DIU$_NO_SEND        - can't send IPCF to master
+!   DIU$_NO_RECEIVE     - can't read reply from master
+!   DIU$_NO_MEMORY      - insufficient dynamic memory
+!    or any error code returned from master
+!--
+
+LOCAL
+        retcode,
+        pdb : $$PDB_DECL;
+
+! Set up the modify message.
+
+ip_page[DIUQ$G_REQ_ID] = .req_ID;
+ip_page[DIUQ$B_FUNCTION] = DIUQ$K_MODIFY;
+ip_page[DIUQ$B_ITEM_CODE] = .item_code;
+
+! When modifying the log file, copy it, otherwise just set the value 
+
+IF .item_code EQL DIUQ$K_LOG_FILESPEC
+   THEN BEGIN
+        MAP new_value : REF $STR_DESCRIPTOR();
+        CH$MOVE(.new_value[STR$H_LENGTH],
+                .new_value[STR$A_POINTER],
+                CH$PTR(ip_page[DIUQ$T_STATUS_TEXT]));
+        ip_page[DIUQ$H_STATUS_TEXT] = .new_value[STR$H_LENGTH];
+        END
+   ELSE ip_page[DIUQ$G_NEW_VALUE] = .new_value;
+
+! Send the message and get a response
+
+IF NOT (retcode = IP_TALK())
+THEN SIGNAL(.retcode);
+
+RETURN (.retcode)
+
+END;                                ! End of ip_modify
+%SBTTL 'Routine IP_STATUS'
+
+GLOBAL ROUTINE ip_status (datum, datum2, p_descr) =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Send a status message to the master DIU.  This is used by slave
+!   jobs to report their status in completing a transfer.
+!
+! FORMAL PARAMETERS:
+!   datum               - arbitrary data item to pass, usually condition code
+!   datum2              - additional data, frequently a block count
+!   p_descr             - pointer to descriptor for additional text
+!
+! IMPLICIT INPUTS:
+!   job_index           - global in module DIU -- our job handle
+!   s$jobno is called because we need to stuff our job number
+!   into the message.
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   DIU$_NORMAL         - successful completion
+!   DIU$_NO_MASTER      - no master DIU running
+!   DIU$_NO_SEND        - can't send IPCF to master
+!   DIU$_NO_MEMORY      - insufficient dynamic memory
+!    or any error code returned from master
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+EXTERNAL
+        job_index;
+
+BIND
+        descr = .p_descr : $STR_DESCRIPTOR ();
+
+LOCAL
+        retcode,
+        pdb : $$PDB_DECL;
+ 
+! Set up the status message.
+
+ip_page[DIUQ$H_LENGTH] = 512;
+ip_page[DIUQ$B_FUNCTION] = DIUQ$K_STATUS;
+ip_page[DIUQ$G_COMP_CODE] = .datum;
+ip_page[DIUQ$G_2ND_CODE] = .datum2;
+ip_page[DIUQ$H_SENDER_JOB] = s$jobno ();
+ip_page[DIUQ$G_JOB_HANDLE] = .job_index;
+ip_page[DIUQ$H_STATUS_TEXT] = .descr[STR$H_LENGTH];
+ 
+! Move optional text
+
+CH$MOVE (MAX(.descr[STR$H_LENGTH], 255),
+             .descr[STR$A_POINTER],
+             CH$PTR(ip_page[DIUQ$T_STATUS_TEXT]));
+ 
+! Get a new master_PID each time to insure that the spooler is still there
+
+IF (master_PID = IP$GET_PID (my_name, slave_PID)) EQL 0
+THEN SIGNAL(DIU$_NO_MASTER);
+
+! Send the message to the master job
+
+IF NOT (retcode = IP$SEND (.master_pid, slave_pid, ip_page, 512))
+THEN SIGNAL(DIU$_NO_SEND, .retcode<lh>);
+
+RETURN (DIU$_NORMAL)
+
+END;                                ! End of ip_status
+%SBTTL 'Routine IP_CONNECT_ME'
+
+GLOBAL ROUTINE ip_connect_me (dir_num, p_dir_descr) =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Connect me (a slave job) to the directory in which I should be executing.
+!
+! FORMAL PARAMETERS:
+!   dir_num             - target directory number
+!
+! IMPLICIT INPUTS:
+!   job_index           - global in module DIU -- our JOBSTATUS handle
+!   p_dir_descr         - pointer to descriptor for directory name string
+!                         Used for error messages only
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   NONE
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+
+BIND dir_descr = .p_dir_descr : $STR_DESCRIPTOR ();
+
+EXTERNAL job_index;
+
+LOCAL retcode,
+      pdb : $$PDB_DECL;
+
+! Set up the connect message.
+
+ip_page[DIUQ$H_LENGTH] = 512;
+ip_page[DIUQ$B_FUNCTION] = DIUQ$K_CONNECT_ME;
+ip_page[DIUQ$G_COMP_CODE] = .dir_num;
+ip_page[DIUQ$G_2ND_CODE] = 0;
+ip_page[DIUQ$H_SENDER_JOB] = s$jobno ();
+ip_page[DIUQ$G_JOB_HANDLE] = .job_index;
+
+! Flush PID so rcv queue is empty
+
+ip$delete_PID (.slave_pid);
+slave_PID = 0;
+
+! Get a new master_PID each time to insure that the spooler is still there
+
+IF (master_PID = IP$GET_PID (my_name, slave_PID)) EQL 0
+THEN SIGNAL(DIU$_NO_MASTER);
+
+! Send the message to the master job
+
+IF NOT (retcode = IP$SEND (.master_pid, slave_pid, ip_page, 512))
+THEN SIGNAL(DIU$_NO_SEND, .retcode<lh>);
+
+! Now try to receive acknowledgement
+
+pdb[PDB$$H_MESSAGE_ADDRESS] = ip_page;
+pdb[PDB$$H_MESSAGE_LENGTH] = 512;
+IF NOT (retcode = ip$receive (slave_PID, pdb,
+                                 %FIELDEXPAND (PDB$$H_MESSAGE_ADDRESS, 0) + 1))
+THEN SIGNAL(DIU$_NO_RECEIVE, .retcode<lh>);
+
+! Got a message.  Check code returned.
+
+IF .ip_page[DIUQ$B_FUNCTION] NEQ DIUQ$K_ACK
+THEN RETURN (SIGNAL(DIU$_NO_CONNECT,
+                    .ip_page[DIUQ$G_COMP_CODE],
+                    0, 
+                    dir_descr))
+ELSE SIGNAL(DIU$_CONNECTED_TO,0,0,dir_descr);
+
+RETURN (DIU$_NORMAL)
+END;                                    ! End of ip_connect_me
+
+END
+ELUDOM

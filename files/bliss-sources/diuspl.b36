@@ -1,0 +1,542 @@
+%TITLE 'DIU Spooler Start/Stop Routines'
+
+MODULE DIUSPL (IDENT = '257',
+               ENTRY(sp$start,                 ! Start spooler
+                     sp$stop,                  ! Stop spooler
+                     sp$shut                   ! Shut down spooler entirely
+                     )
+               )=
+BEGIN
+
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+! FACILITY:  DIU-20. (Data Interchange Utility for TOPS-20)
+!
+! ABSTRACT:    This module contains the top level spooler routines.  These
+!              routines declare the current job as the DIU master, initialize 
+!              the job scheduler, and set up the interrupt system so that 
+!              appropriate routines are called to handle IPCF messages,network 
+!              topology changes, and timer interrupts.
+!
+! ENVIRONMENT: TOPS-20 V6.1 (privileged)    XPORT.
+!              BLISS-36 V4                  RMS V3 
+
+! HISTORY:
+!
+!  257  Change library BLI:MONSYM to just MONSYM.
+!       Gregory A. Scott 7-Jul-86
+!
+!  216  Call routine S$NOMOUNT when becoming the spooler so we can run  without
+!       incrementing the mount count for every regulated structure.
+!       Gregory A. Scott 3-Jun-86
+!
+!  171  Call routine C$CONTROL_C for control C interrupts.
+!       Gregory A. Scott 19-May-86
+!
+!  164  Go NOINT while starting the spooler.
+!       Gregory A. Scott 16-May-86
+!
+!  154  Use routine j$kill instead of s$kiljob.
+!       Gregory A. Scott 12-May-86
+!
+!  152  Use new routine to write to  the  system  LOG  file  for  the  "maximum
+!       requests set to n" message from SP$START.
+!       Gregory A. Scott 11-May-86
+!
+!  144  DIU$MESSAGE calls from here should always write to the system LOG file.
+!       Gregory A. Scott 7-May-86
+!
+!  140  Spooler restart aborted error wasn't furnishing the version number for
+!       FAO output.
+!       Gregory A. Scott 4-May-86
+!
+!  135  A restart  should show  us the  maximum simultaneous  requests.   Don't
+!       decrement NJOB here, it is done when we get the IPCF that the job died.
+!       Gregory A. Scott 1-May-86
+!
+!  134  A START command should counteract any shutdown in progress.   We  don't
+!       have to write to the LOG file ourselves now since DIU$MESSAGE does it.
+!       Gregory A. Scott 30-Apr-86
+!
+!  133  Set IPCF send/recieve quotas to +INF for rcvpid.
+!       Gregory A. Scott 29-Apr-86
+!
+!  132  Enable illegal instruction and illegal memory read/write panic channels
+!       so that we can recover from  problems.  Add routine SP$PANIC to  handle
+!       these conditions.  Add control-C trap.  Move spooler restart logic that
+!       checks for restart loops here from DIUERR since panic interrupts  don't
+!       signal errors.
+!       Gregory A. Scott 28-Apr-86
+!
+!  130  Call MAKEPROMPT to reset the prompt string in SP$SHUT and SP$START.
+!       Gregory A. Scott 28-Apr-86
+!
+!  126  Change calls to S$ACTIVATE.  Regular STOP  command  was broken by  last
+!       edit.  STOP/NOW shouldn't call  SP$SHUT, but wait for  it to be  called
+!       after all of the jobs logout.
+!       Gregory A. Scott 26-Apr-86
+!
+!  125  Output a little different  message if we  have been restarted.   Output
+!       proper event codes to LOG file on start/stop/shut messages.  Only  call
+!       SP$SHUT at the end of SP$STOP if we have to mumble around killing jobs.
+!       Gregory A. Scott 24-Apr-86
+!
+!  122  Output the  DIU version  to the  system LOG  file at  startup, put  the
+!       spooler startup message  in the  LOG file before  any possible  message
+!       from opening the queue file.
+!       Gregory A. Scott  22-Apr-86
+!
+!    57	Enable the interrupt system at the end of routine SP$STOP.
+!	Sandy Clemens	4-Dec-85
+!
+!    56	Make STOP/NOWAIT complete shutting down the queue.
+!	Sandy Clemens	3-Dec-85
+!
+!    52 Make sure PSI channels which are enabled by STARTing queue are
+!       disabled when by STOP command.
+!	Sandy Clemens	12-Nov-85
+!
+! V01-004  DPR0001		Doug Rayner		25-Jul-85
+!	    Change use of PSI a little for TOPS-10
+!
+! V01-003  RDF0001           Rick Fricchione               26-Oct-1984
+!          Modify for DIU.  Clean up can comment.  Make blocks
+!          readable, and put in any DIU specifics.
+!
+! V01-002  AWN0002           Andy Nourse                    --- no date ---
+!          Put in entry points.
+!--
+
+!**************************************************************************
+!**                    F O R W A R D   R O U T I N E S 
+!***************************************************************************
+FORWARD ROUTINE
+%IF %SWITCHES(TOPS20)
+%THEN
+    sp$panic : NOVALUE,                 ! panic interrupt handler
+%FI
+    sp$start : NOVALUE,                 ! Start spooler
+    sp$stop  : NOVALUE,                 ! Stop spooler
+    sp$shut  : NOVALUE;                 ! Shut down spooler entirely
+
+!**************************************************************************
+!**                    L I B R A R Y   F I L E S 
+!***************************************************************************
+
+LIBRARY 'BLI:XPORT';                    ! XPORT is our trusted friend
+%IF %SWITCHES(TOPS10) %THEN
+LIBRARY 'BLI:UUOSYM';                   ! TOPS-10 UUO symbols
+%ELSE
+LIBRARY 'MONSYM';                       ! TOPS-20 JSYS symbols
+REQUIRE 'JSYSDEF';                      ! TOPS-20 JSYS linkages
+%FI
+LIBRARY 'DIU';                          ! Our library
+LIBRARY 'FAO';                          ! Formatted Ascii Output library
+
+!**************************************************************************
+!**             G L O B A L S   A N D   E X T E R N A L S 
+!***************************************************************************
+GLOBAL
+    mst_flag : INITIAL (0) VOLATILE,
+    rcvpid,                             ! PID for master to receive queries on
+
+%IF %SWITCHES(DEBUG)
+%THEN
+    my_name : $STR_DESCRIPTOR (STRING = '[SYSTEM]DIUDEB'),
+%ELSE
+    my_name : $STR_DESCRIPTOR (STRING = '[SYSTEM]DIU'),
+%FI
+%IF %SWITCHES(TOPS20) %THEN
+    topology_failure : INITIAL (0),     ! Net topology interrupt failure
+%FI
+    shutdown;                           ! Shutdown pending flag
+
+EXTERNAL
+%IF %SWITCHES(TOPS20) %THEN
+    i_channel,                          ! IPCF interrupt channel
+    t_channel,                          ! Timer interrupt channel
+    n_channel,                          ! Network topology interrupt channel
+    c_channel,                          ! Control-c channel
+%FI
+    time_restart,                       ! nonzero if we have been restarted
+    njob,                               ! Number of jobs in progress
+    mjob,                               ! Max no. of jobs
+    tty : $XPO_IOB (),                  ! IOB for user's terminal
+    jobstatus : BLOCKVECTOR [DIU$K_MAX_MJOB, DIUJ$K_LEN]
+                FIELD (DIUJ$$JOBSTAT_FIELDS);
+
+EXTERNAL ROUTINE
+%IF %SWITCHES(TOPS20) %THEN             ! TOPS-20 external routines
+    C$CONTROL_C : NOVALUE,              ! Exit unless we are (yet) the spooler
+    S$ACTIVATE : NOVALUE,               ! Activate an interrupt channel
+    S$DEACTIVATE : NOVALUE,             ! Deactivate an interrupt channel
+    S$ATI : NOVALUE,                    ! Attach Terminal Interrupt character
+    S$DTI : NOVALUE,                    ! Detach Terminal Interrupt character
+    S$RESTART : NOVALUE,                ! Restart this program
+    S$RIR,                              ! Read interrupt addresses
+    S$TOPINT,                           ! Net topology change interrupt setup
+    S$NOMOUNT : NOVALUE,                ! Allos us ot ignore increment mount ct
+    IP$QUOTA : NOVALUE,                 ! Set send/rec quotas
+    IP$INT_SET : NOVALUE,               ! IPCF interrupt setup
+%ELSE                                   ! TOPS-10 external routines
+    ip$eat : NOVALUE,                   ! Clean out the IPCF recv queue
+    psi$add_condition,                  ! Add a condition to the PSI system
+    psi$remove_condition,               ! Remove condition from the PSI system
+%FI                                     ! End TOPS-10/TOPS-20 conditional
+    MAKEPROMPT : NOVALUE,               ! Make a new prompt string for operator
+    DIU$MESSAGE,                        ! DIU message printer
+    j$kill,                             ! Logout a job
+    L$EVENT : NOVALUE,                  ! Log an event to system log file
+    IPC_MASTER,                         ! Declare ourselves master
+    IPC_HNDLR,                          ! IPCF interrupt handler
+    Q$INIT,                             ! Open or create queue file
+    S$TIME,                             ! Return time of day
+    S$HALT : NOVALUE,                   ! Halt this fork
+    S$NOINT : NOVALUE,                  ! Disable interrupts
+    S$OKINT : NOVALUE,                  ! Enable interrupts
+    SCHED : NOVALUE,                    ! Scheduler
+    IP$DELETE_PID : NOVALUE;            ! Delete a PID
+
+!****************************************************************************
+!**                           S P $ S T A R T
+!****************************************************************************
+GLOBAL ROUTINE sp$start : NOVALUE =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!       This routine starts the spooler.  We get the DIU spooler pid, set  some
+!       flags, and call the scheduler to get something to do.  If we are inside
+!       a shutdown, then we just clear the shutdown flag and return.
+!
+! IMPLICIT INPUTS:
+!       mst_flag: 1 if we are (yet) the spooler
+!       shutdown: 1 if we are shutting down
+!       time_restart: 0 if we haven't been started yet
+!
+! IMPLICIT OUTPUTS:
+!       rcvpid: set to the named spooelr job pid
+!
+! SIDE EFFECTS:
+!       sched is called to (maybe) run some jobs
+!--
+
+BIND jobver = %O'137';                  ! Where the version is kept
+
+LOCAL
+     vlist : VECTOR[2] PRESET ([0] = 1),        ! List for passing to FAO
+     time_current,                              ! current time
+     retcode;
+
+! See if we have been here before.  If I am the spooler and I am being shut
+! down, then the shutdown will be aborted and I will restart.  If I'm already
+! started just give a message and exit.
+
+IF .mst_flag
+THEN IF .shutdown
+     THEN BEGIN                         ! Here if START after STOP
+          DIU$MESSAGE(DIU$_SHUTDOWN_ABORTED,0,0,TRUE);
+          shutdown = 0;                 ! We are not (yet) shutting down
+          RETURN;                       ! Don't try anything else but return
+          END
+     ELSE BEGIN                         ! Here if we are the spooler already
+          DIU$MESSAGE(DIU$_ALREADY_STARTED,0,0,TRUE);
+          RETURN;                       ! Return now before damage is done
+          END;
+
+%IF %SWITCHES(TOPS10)
+%THEN                                   ! on the -10,
+ip$eat(0);                              ! Clean out the recv queue
+%FI
+
+! I am not (yet) the spooler until I get my PID
+
+IF NOT (retcode = ipc_master (my_name, rcvpid))
+THEN SIGNAL (.retcode);
+
+! I am (yet) the spooler.  Turn off the interrupt system for now, init flags
+
+S$NOINT();                              ! Turn off the interrupt system
+mst_flag = 1;                           ! Set flag saying we are master
+shutdown = 0;                           ! We aren't (yet) shutting down
+njob = 0;                               ! No jobs active (yet)
+MAKEPROMPT();                           ! I am going to need (yet) a new prompt
+
+! Determine what has been going on.  We have either not (yet) been started,
+! we haven't been started in over a minute (we restart), or we have been
+! started less than a minute ago (we abort).
+
+time_current = S$TIME();                ! Get the current time
+vlist[1] = .jobver;                     ! Copy version number to FAO vector
+
+IF .time_restart NEQ 0                  ! Get proper message please
+THEN retcode = DIU$_SPOOLER_RESTARTED   ! We've been warm started
+ELSE retcode = DIU$_SPOOLER_STARTED;    ! Brrrr.  Cold start.
+
+IF .time_current LSS .time_restart+((60^18)/(60*60*24)) ! Up .lt. 1 minute?
+THEN BEGIN
+     time_restart = 1;                  ! Next time let me go please
+     DIU$MESSAGE(DIU$_SPOOLER_ABORTED,0,vlist,TRUE); ! Yes, abort it
+     S$HALT();                          ! Halt the fork allow continue
+     END;
+time_restart = .time_current;           ! Set the time that we were restarted
+
+! Squirt a startup message in the system log file and to the operator
+
+DIU$MESSAGE(.retcode,0,vlist,TRUE);     ! Type the message out
+
+! Output the mjob setting to the log file.
+
+vlist[1] = .mjob;                       ! Load the mjob setting
+L$EVENT(DIU$_MAXIMUM_REQ_SET,0,vlist);  ! Write max stuff to system log file
+
+! Pry open the system queue file (hello RMS, are you there today?)
+
+IF NOT (retcode = q$init ())            ! Open or create the queue file 
+THEN SIGNAL (DIU$_BUG,.retcode);        ! Something wrong with the queue
+
+%IF %SWITCHES(TOPS10) %THEN
+! Assign interrupt channels for IPCF messages, timer events, and
+! network topology changes.  Only IPCF messages need special handling,
+! other events just call the scheduler.
+psi$add_condition($PCIPC, 0, 0, ipc_hndlr);
+psi$add_condition($PCTMR, 0, 0, sched);
+psi$add_condition($PCNET, 0, 0, sched);
+%ELSE
+
+! Activate interrupt channels for IPCF messages, timer events, network topology
+! changes, control-c trap, and panic channels.
+
+s$activate(.i_channel,ipc_hndlr);       ! IPCF interrupts
+s$activate(.t_channel,sched);           ! TIMER interrupts
+s$activate(.n_channel,sched);           ! Network status change interrupts
+s$activate(.c_channel,c$control_c);     ! Control C interrupts
+s$activate($ICILI,SP$PANIC);            ! Illegal instruction
+s$activate($ICIRD,SP$PANIC);            ! Illegal memory read
+s$activate($ICIWR,SP$PANIC);            ! Illegal memory write
+
+! Enable interrupts for IPCF messages arriving on our PID, network topology
+! changes, and control-c trap.
+
+IP$INT_SET(.rcvpid, .i_channel);        ! Set IPCF interrupts for master pid
+IP$QUOTA(.rcvpid, %O'777', %O'777');    ! Set send/rec quota to +inf
+IF NOT S$TOPINT(.n_channel) THEN topology_failure = 1;  ! Set topology ints
+S$ATI($TICCC,.c_channel);               ! Set control-C trap
+
+! Allow us to touch any structure on the system since we are yet a spooler
+
+S$NOMOUNT();                            ! Do a MSTR MSIIC function
+
+%FI                                     ! End of TOPS-20 only code
+
+! Make all job status blocks available
+
+INCR index FROM 0 TO DIU$K_MAX_MJOB - 1
+     DO jobstatus[.index, DIUJ$V_INUSE] = 0;
+
+! Call the scheduler to start any jobs in the queue.
+
+SCHED();
+
+! Turn the interrupt system on and return
+
+S$OKINT();
+
+END;                                ! End of sp$start
+
+!*********************************************************************
+!**                       S P $ S T O P 
+!*********************************************************************
+GLOBAL ROUTINE sp$stop (now_flag) : NOVALUE =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Stop the spooler and queue manager.
+!
+! FORMAL PARAMETERS:
+!   now_flag            - Boolean value:
+!                         TRUE  - Immediately abort all current transfers
+!                         FALSE - Allow all current transfers to complete
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   NONE
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+
+LOCAL scode;                            ! spooler stop event code
+
+IF NOT .mst_flag                        ! Are we (yet) the spooler?
+THEN SIGNAL(DIU$_NOT_STARTED);          ! Oops, we are not (yet) the spooler
+
+shutdown = 1;                           ! Flag pending shutdown
+time_restart = 1;                       ! Let restarts work later
+
+! Print a message depending on spooler shutdown status
+
+IF .now_flag
+THEN scode = DIU$_SPOOLER_STOP_NOW      ! STOP/NOW command
+ELSE scode = DIU$_SPOOLER_STOP;         ! STOP command
+
+DIU$MESSAGE(.scode,0,0,TRUE);           ! Write it to terminal and log file
+
+! If there aren't any jobs running shutdown the spooler and return now.
+
+IF .njob EQL 0
+THEN BEGIN
+     SP$SHUT();
+     RETURN;
+     END;
+
+! If it was a regular stop command and there were jobs running wait for them
+! to finish up; don't shutdown the spooler yet.
+
+IF NOT .now_flag THEN RETURN;
+
+! STOP/NOWAIT specified and there are jobs active.  Abort all inuse jobs.
+
+S$NOINT();                              ! Turn off interrupts
+
+INCR index FROM 0 TO DIU$K_MAX_MJOB - 1
+DO IF .jobstatus[.index, DIUJ$V_INUSE]
+   THEN j$kill(.jobstatus[.index, DIUJ$H_REQUEST_ID],
+               .scode);
+
+S$OKINT();                              ! Enable the interrupt system
+
+END;                                    ! End of sp$stop
+
+!************************************************************************
+!**                            S P $ S H U T 
+!************************************************************************
+GLOBAL ROUTINE sp$shut : NOVALUE =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Completely shut down spooler.   After a STOP  command, this routine  is
+!       called if there are  no active slave jobs.   If there are active  slave
+!       jobs, this routine is called when  the last one finishes.  The  spooler
+!       pid is deleted and all interrupts are disabled.
+!
+! IMPLICIT INPUTS:
+!       rcvpid: spooler pid
+!       shutdown: flag that we are shutting down
+!       mst_flag: flag that we are (yet) the spooler
+!
+! IMPLICIT OUTPUTS:
+!       rcvpid: zeroed
+!       shutdown: cleared
+!       mst_flag: cleared, because we are not (yet) the spooler again
+!
+! SIDE EFFECTS:
+!       The spooler pid is deleted.
+!       All enabled interrupts are disabled.
+!       A new prompt is made for the spooler job.
+!--
+
+! Tell the operator and the LOG file about this event.
+
+DIU$MESSAGE(DIU$_SPOOLER_DOWN,0,0,TRUE);   ! Tell the operator ane the log file
+
+! Deativate the interrupt system.
+
+%IF %SWITCHES(TOPS10) 
+%THEN
+      IP$DELETE_PID(.rcvpid,0);
+      psi$remove_condition($PCIPC, ipc_hndlr);
+%ELSE
+      IP$DELETE_PID(.rcvpid);           ! That's all for the pid
+      s$deactivate(.n_channel);         ! Network topology interrupts
+      s$deactivate(.t_channel);         ! Timer interrupts
+      s$deactivate(.i_channel);         ! IPCF interrupts
+      s$deactivate(.c_channel);         ! Control C interrupts
+      S$DTI($TICCC);                    ! No longer trapping control C
+%FI
+
+! Shut off the flags indicating that I am the spooler and shutdown in progress
+
+rcvpid = 0;                             ! No longer a spooler pid
+mst_flag = 0;                           ! We are not (yet) the spooler again
+shutdown = 0;                           ! We aren't shutting down any more
+
+! Make a new prompt string for the user.
+
+MAKEPROMPT();
+
+END;                                    ! End of sp$shut
+
+%IF %SWITCHES(TOPS20) %THEN
+ROUTINE SP$PANIC (channel) : novalue =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       This routine is called on a panic interrupt to print a fatal error and
+!       restart the spooler.
+!
+! FORMAL PARAMETERS:
+!
+!       channel: channel that we were interrupted on
+!
+! SIDE EFFECTS:
+!
+!       Program is restarted
+!
+!--
+BEGIN
+ 
+LOCAL elist : VECTOR[2] PRESET ([0] = 1),        ! List for passing to FAO
+      edesc : $STR_DESCRIPTOR(CLASS=DYNAMIC),    ! spooler message
+      epc,                                       ! PC of error
+      etype;                                     ! Error type
+
+! Compute the error code from the channel number we were called with. 
+
+etype = (SELECTONE .channel OF
+         SET
+         [$ICILI]: DIU$_PANIC_ILL_INST;
+         [$ICIRD]: DIU$_PANIC_ILL_READ;
+         [$ICIWR]: DIU$_PANIC_ILL_WRIT;
+         TES);
+
+! Get the PC that the error occured at
+
+epc = S$RIR();                          ! Get levtab,,chntab
+elist[1] = (..((.epc<LH>)+2))-1;        ! Get the interrupt chan 3 pc
+
+! Tell the operator and the log file about the bad news
+
+DIU$MESSAGE(.etype,0,elist,TRUE);       ! Tell me about it please
+
+! Restart the program
+
+s$restart();                            ! Never returns
+
+END;                                    ! End of s$panic
+%FI                                     ! End of TOPS20 conditional
+
+END                                     ! End of module DIUSPL
+ELUDOM

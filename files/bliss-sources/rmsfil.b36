@@ -1,0 +1,761 @@
+%TITLE 'F I L E S -- prologue handlers'
+!<BLF/REQUIRE 'RMSBLF.REQ'>
+MODULE files (IDENT = '2.0'
+		) =
+BEGIN
+!
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1984, 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+
+!++
+! FACILITY:	RMS
+!
+! ABSTRACT:
+!
+!	FILES contains all routines which create and
+!	process the prologue blocks within RMS-20 files.
+!
+! ENVIRONMENT:	User mode
+!
+! AUTHOR: Ron Lusk , CREATION DATE: 31-Mar-83
+!
+! MODIFIED BY:
+!
+!	Ron Lusk, 8-Jul-83 : VERSION 2
+! 417	-   Fix calculation of WINPAGEGLOBAL in DOKEYBLOCKS (and DOAREABLOCKS
+!	    if necessary).  The global page number is calculated to be
+!	    sect#,,page# (i.e., 2,,666) rather than 0,,global-page# (0,,2666).
+!	    This is causing the process handle on a PMAP to change from
+!	    .FHSLF (400000) to 400002.
+!
+!--
+
+!
+! TABLE OF CONTENTS
+!
+!
+!	SETPLOG		-   Create a File Prologue Block
+!	IDXFILEPROLOG	-   Create the indexed file prologue
+!	DOAREABLOCKS	-   Create the area descriptors
+!	DOKEYBLOCKS	-   Create the index descriptors
+!	GETIDB		-   Locate an Index Descriptor Block
+!
+! INCLUDE FILES:
+!
+
+REQUIRE 'rmsreq';
+
+!
+! MACROS:
+!
+!   None.
+!
+! EQUATED SYMBOLS:
+!
+!   None.
+!
+! OWN STORAGE:
+!
+!   None.
+!
+! EXTERNAL REFERENCES:
+!
+!   None.
+!
+%SBTTL 'SETPLOG - create prologue'
+
+GLOBAL ROUTINE setplog =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	SETPLOG creates a file prologue in free core when an
+!	RMS-20 file is initially created.  The prologue does
+!	not include the end-block.  The prologue is not
+!	written out to the file until after the $CREATE is
+!	determined to have been successful.
+!
+!	The file prologue is always written at the address
+!	contained in the global variable FPT.
+!
+!	All fields in the File Prologue which are common for
+!	all file organizations are initialized by this
+!	routine.  Fields which are used only for indexed
+!	files (area, adboffset, keys, idboffset) are set up
+!	by the corresponding routine (DOAREABLOCKS or
+!	DOKEYBLOCKS) when the rest of the prologue
+!	structures are created.  All reserved fields in this
+!	block are automatically zeroed because the page on
+!	which this page is being created is a new file page.
+!
+! FORMAL PARAMETERS
+!
+!	None.
+!
+! IMPLICIT INPUTS
+!
+!	FPT	-   address of the file prologue in core
+!
+! ROUTINE VALUE:
+!
+!	None.
+!
+! SIDE EFFECTS:
+!
+!	?
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	temp,
+	endptr : REF BLOCK;
+
+    TRACE ('SETPLOG');
+    fpt [blocktype] = fpblock;			! Set file code
+    fpt [blocklength] = fptsize;		! And size
+    fpt [fptrfm] = .fab [fabrfm, 0];		! Record format
+    fpt [fptbsz] = .fab [fabbsz, 0];		! Byte-size
+    fpt [fptbks] = .fab [fabbks, 0];		! Use bucket size in FAB
+    fpt [fptorg] = .fab [faborg, 0];		! Organization
+    fpt [fptrat] = .fab [fabrat, 0];		! Attributes
+    fpt [fptmrs] = .fab [fabmrs, 0];		! Maximum record size
+    fpt [fptmrn] = .fab [fabmrn, 0];		! Maximum file size
+!+
+!   Note that the NXTBKT field in the prologue is set by
+!   DOKEYBLOCKS, when each Index descriptor block is
+!   initially created.
+!
+!
+!   The other fields are already clear because this is a new
+!   file page.
+!
+!   Set up the end block for Sequential/Relative files.
+!-
+    endptr = .fpt + .fpt [blocklength];		! Adjust new pointer
+    endptr [wholeword] = endblock^leftlsh + endblocksize;
+    RETURN true;
+    END;					! End of SETPLOG
+
+%SBTTL 'IDXFILEPROLOG -- index prologue routine'
+
+GLOBAL ROUTINE idxfileprolog =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine is used to create all blocks within the
+!	File Prologue which are unique to indexed files.
+!	This routine creates the following blocks:
+!		1)  Area Descriptors
+!		2)  Index Descriptors
+!
+! FORMAL PARAMETERS
+!
+!	None.
+!
+! IMPLICIT INPUTS
+!
+!	PLOGPAGE    -	Number of free page which contains
+!			the first page of the file prologue.
+!
+! COMPLETION CODES:
+!
+!	TRUE	-   Success
+!	FALSE	-   Error
+!		    No free pages found for multi-page
+!		    prologue.
+!
+! SIDE EFFECTS:
+!
+!	?
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	window_number,				! Page number of file window
+	file_page_number;			! File Prologue Page
+
+    TRACE ('IDXFILEPROLOG');
+!+
+!   Set up the page number of the current prologue.
+!-
+    file_page_number = 0;			! Always start on page 0
+    window_number = .plogpage;			! Find where Prologue is
+!+
+!   Create the Area Descriptors.
+!-
+    doareablocks (window_number, file_page_number);
+!+
+!   Create all Index Descriptor Blocks.
+!-
+    RETURN dokeyblocks (.window_number, .file_page_number)
+    END;					! End of IDXFILEPROLOG
+
+%SBTTL 'DOAREABLOCKS - Set up FPT Area Descriptors'
+
+GLOBAL ROUTINE doareablocks (			! Set up Area Descriptors
+    p_window_number, 				! Prologue's memory page
+    p_file_page_number				! Prologue's file page (0)
+    ) : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	DOAREABLOCKS creates the Area Descriptors in the
+!	prologue of an indexed file.
+!
+! FORMAL PARAMETERS
+!
+!	WINDOW_NUMBER	    -   Page where prologue is currently
+!				mapped
+!	FILE_PAGE_NUMBER    -   File page number of the File
+!				Prologue (always 0).
+!
+! IMPLICIT INPUTS
+!
+!	?
+!
+! ROUTINE VALUE:
+!
+!	None.
+!
+! SIDE EFFECTS:
+!
+!	?
+!
+!--
+
+    BEGIN
+
+    BIND
+	window_number = .p_window_number,
+	file_page_number = .p_file_page_number;
+
+    REGISTER
+	movingptr : REF BLOCK,			! Temporary pointer variable
+	adbptr : REF BLOCK,			! Area descriptor pointer
+	areaindex,				! Index for ADB
+	prologptr : REF BLOCK,			! File Prologue pointer
+	default_bucket_size,			! Default size of the bucket
+	areacount;				! Count of area descriptors
+
+    LOCAL
+	xabptr : REF BLOCK;			! Pointer to user XAB
+
+    TRACE ('DOAREABLOCKS');
+!+
+!   Set up the pointers.
+!-
+    prologptr = .window_number^p2w;		! Pointer to window
+    adbptr = .prologptr [blocklength] + .prologptr;
+!+
+!   Create a null header for this block.
+!-
+    adbptr [wholeword] = (adbcode^blktypelsh);
+    areacount = 1;				! Start off with 1 area
+!+
+!   Create the default area.
+!-
+    default_bucket_size = .fab [fabbks, 0];	! Get user's bucket size
+
+    IF .default_bucket_size EQL 0		! Did he use default?
+    THEN
+	default_bucket_size = defbucketsize;	! Yes - set up default
+
+    adbptr [.areacount, adbbkz] = 		! Store BKZ in first ADB
+    .default_bucket_size;
+
+!++
+!   Note that the Area ID is already 0 so we don't have to
+!   set it.
+!--
+
+!+
+!   Create an entry for each ADB.
+!-
+    xabptr = .fab [fabxab, 0];			! Get first XAB
+
+    UNTIL .xabptr EQL 0 DO
+	BEGIN
+	xabptr = .xabptr OR .blksec;		! Get global address
+
+	IF .xabptr [xabcod, 0] EQL codarea	! Do only for
+	    					!   area allocation XABs
+	THEN
+	    BEGIN
+	    areaindex = (.areacount*areadescsize) + 1;
+	    areacount = .areacount + 1;		! Bump the number of areas
+
+	    IF (adbptr [.areaindex, adbbkz] = .xabptr [xabbkz, 0]) EQL 0
+	    THEN 				! Use the default bucket size
+		adbptr [.areaindex, adbbkz] = .default_bucket_size
+
+	    END;
+
+!+
+!   Fetch address of next XAB in chain.
+!-
+	xabptr = .xabptr [xabnxt, 0]		! Advance XAB
+	END;
+
+!+
+!   Fill in the length of the ADB in the block header.
+!-
+    adbptr [blocklength] = 			! Add 1 for header size
+    (.areacount*areadescsize) + 1;
+!+
+!   Fill in some prologue information about the ADB.
+!-
+    prologptr [fptareas] = .areacount;		! Fill in number of areas
+    prologptr [fptadb] = .adbptr;		! And address of ADB offset
+    RETURN 					! No status returned
+    END;					! End of DOAREABLOCKS
+
+%SBTTL 'DOKEYBLOCKS -- Set up IDBs'
+
+GLOBAL ROUTINE dokeyblocks (window_number, file_page_number) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	DOKEYBLOCKS creates the index descriptors which ar
+!	put in the prologue of an indexed file.
+!
+!	Each index descriptor contains all information which
+!	is required by RMS-20 to process a record according
+!	to the particular key.
+!
+!	The chain of Index Descriptor Blocks begins
+!	immediately following the Area Descriptors in the
+!	File Prologue.  Each IDB is linked to the next one.
+!
+! FORMAL PARAMETERS
+!
+!	WINDOW_NUMBER	    -	process page into which file
+!				prologue is mapped.
+!	FILE_PAGE_NUMBER    -	file page number of prologue
+!
+! IMPLICIT INPUTS
+!
+!	?
+!
+! COMPLETION CODES:
+!
+!	TRUE	-   OK
+!	FALSE	-   Error
+!		    No free pages left for multi-page prologue
+!
+! SIDE EFFECTS:
+!
+!	?
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	multipageflag,
+	xabptr : REF BLOCK,
+	prologptr : REF BLOCK,
+	idbptr : REF BLOCK,
+	winpageglobal,				! Global window page
+						!   (includes section number)
+	lastidbptr : REF BLOCK,
+	idbcount,
+	idblen;					! Number of words in an IDB
+
+    TRACE ('DOKEYBLOCKS');
+!+
+!   Assume that this is a one-page prologue.
+!-
+    multipageflag = false;
+!+
+!   Set up some pointers.
+!-
+    prologptr = .window_number^p2w;
+    winpageglobal = .window_number OR (.rmssec^w2p);	! Global page	!M417
+    idbptr = .prologptr [blocklength] + .prologptr;	! Hop over file data
+    idblen = .idbptr [blocklength] + .idbptr;	! Hop over area blocks
+    idbptr = .idblen;				! Otherwise BLISS clobbers it?
+    lookat ('	ADDR OF IDB: ', idbptr);
+!+
+!   Make File Prologue point to IDBs.
+!-
+    prologptr [fptidb] = .idbptr;		! Fill in prologue
+    idbcount = 0;				! Clear key counter
+    lastidbptr = 0;				! Show this is first
+!+
+!   We will now scan the XAB chain.
+!-
+    xabptr = .fab [fabxab, 0];			! Get chain address
+
+    UNTIL .xabptr EQL 0 DO 			! Scan for key XABs
+	BEGIN
+	xabptr = .xabptr OR .blksec;		! Get global pointer
+!+
+!   Check if this is a key XAB.
+!-
+
+	IF .xabptr [xabcod, 0] EQL codkey	! Key XAB?
+	THEN
+	    BEGIN
+!+
+!   Create an Index Descriptor Block.
+!-
+	    makeidb (.prologptr, 		! Pointer to IDB
+		.idbptr, 			! Index descriptor
+		.xabptr);			! XAB
+!+
+!   Make this IDB point to where the next IDB is likely to go.
+!-
+	    idblen = .idbptr [blocklength];	! Get an IDB's length
+	    idbptr [idbnxt] = 			! Build pointer
+	    (.file_page_number^p2w) + ((.idbptr + .idblen) AND ofsetmask);
+	    lastidbptr = .idbptr;		! Save for possible
+	    					!   alternate IDBNXT
+	    idbptr = .idbptr + .idblen;		! Point at next one
+!+
+!   Is there room for one more IDB on this page?  If the end
+!   of the next possible IDB doesn't fit on this page, then
+!   we have to map a new page for the prologue.
+!-
+
+	    IF ((.idbptr + .idblen)^w2p) NEQ (.window_number)	!
+	    THEN
+		BEGIN				! Yes, we will overlap
+						!   onto the next page
+		file_page_number = .file_page_number + 1;	! Bump page
+		lastidbptr [idbnxt] = .file_page_number^p2w;
+!+
+!   Do we need a new page?
+!-
+
+		IF .multipageflag EQL false
+		THEN
+		    BEGIN
+		    multipageflag = true;
+		    rtrace (%STRING (		!
+			    '	Allocating extra prologue page...', 	!
+			    %CHAR (13), %CHAR (10)));	!
+
+		    IF (window_number = gpage (1)) EQL false	!
+		    THEN
+			RETURN false
+		    ELSE
+			winpageglobal = .window_number OR (.rmssec^w2p);!M417
+
+		    END
+		ELSE
+		    pagout (			! Flush previous page
+			.fst [fstjfn], 		! JFN
+			.file_page_number - 1, 	! To
+			.winpageglobal, 	! From
+			1);			! Count of pages
+
+!+
+!   Now, map the next page into our window.
+!-
+		pagin (.fst [fstjfn], 		! JFN
+		    .file_page_number, 		! From
+		    .winpageglobal, 		! To
+		    axupd, 			! Access
+		    1);				! Count of pages
+		idbptr = .window_number^p2w;
+		END;
+
+	    idbcount = .idbcount + 1		! BUMP COUNT
+	    END;
+
+!+
+!   Fetch the next XAB in the chain.
+!-
+	xabptr = .xabptr [xabnxt, 0]		! Go to next XAB
+	END;
+
+!+
+!   Clear the "next" pointer in the last IDB we made.
+!-
+
+    IF .lastidbptr NEQ 0 THEN lastidbptr [idbnxt] = 0;
+
+!+
+!   If we allocated an extra page for the prologue, then
+!   write it out (the first page will be written out later).
+!-
+
+    IF .multipageflag
+    THEN
+	BEGIN
+	pagout (.fst [fstjfn], 			! JFN
+	    .file_page_number, 			! To
+	    .winpageglobal, 			! From
+	    1);					! Count of pages
+	ppage (.window_number, 1, true)
+	END;
+
+!+
+!   We have now created all Index Descriptor Blocks.
+!
+!   We must now store the key count in the File Prologue.
+!-
+    prologptr [fptkeys] = .idbcount;
+    lookat ('# OF IDB-S:', idbcount);
+!+
+!   Also, reset the NXTBKT field if we had a
+!   multi-page prologue.
+!-
+    prologptr [fptnxtbkt] = (.file_page_number + 1);
+!+
+!   Set up file size and adjust the "official" EOF.
+!-
+    fst [fstsof] = .prologptr [fptnxtbkt]^p2w;
+    adjeof (.fst [fstjfn], .fst [fstsof], false);
+    RETURN true
+    END;					! End of DOKEYBLOCKS
+
+%SBTTL 'MAKEIDB - create an index descriptor'
+
+GLOBAL ROUTINE makeidb (			! Create an IDB
+    prologptr : REF BLOCK, 			! Prologue address
+    idbptr : REF BLOCK, 			! IDB's address
+    xabptr : REF BLOCK				! Corresponding XAB
+    ) : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	MAKEIDB creates a single Index Descriptor Block in
+!	the prologue of an indexed file.  Each descriptor
+!	completely describes the characteristics of a
+!	particular record key.  Each XAB which is used to
+!	ceate these descriptors has already been checked for
+!	errors.
+!
+!	The general structure of an Index Descriptor Block
+!	is:
+!
+!	    Header (1 word)
+!	    Generated information (fixed-length)
+!	    User XAB (variable length)
+!	    Key name (6 words)
+!
+!	The following fields are set up by this routine:
+!
+!	    BLOCKTYPE
+!	    BLOCKLENGTH
+!	    LEVELS (assumed to be 0 because this is
+!		a new page)
+!	    All fields fetched from the XAB
+!	    KEY-NAME
+!
+!	The following fields are *not* set up by this
+!	routine and are listed with a description of who
+!	sets them up:
+!
+!	    ROOT	-   when the root is initially
+!			    allocated.
+!	    NXTIDB	-   when the next IDB is created
+!			    (by DOKEYBLOCKS)
+!
+!
+!
+! FORMAL PARAMETERS
+!
+!	PROLOGPTR	-   start of file prologue
+!	IDBPTR		-   place to write IDB
+!	XABPTR		-   user XAB
+!
+! IMPLICIT INPUTS
+!
+!	?
+!
+! ROUTINE VALUE:
+!
+!	None.
+!
+! SIDE EFFECTS:
+!
+!	?
+!
+!--
+
+    BEGIN
+
+    REGISTER
+	movingptr : REF BLOCK,
+	sizeofxab,
+	tempac;
+
+    LOCAL
+	temp;
+
+    MAP
+	tempac : BLOCK [1];
+
+    TRACE ('MAKEIDB');
+!+
+!   Set the size of this XAB
+!-
+    sizeofxab = .xabptr [blocklength];
+!+
+!   Fill in header of IDB.
+!-
+    idbptr [blockheader] = 			!
+    (idbcode^blktypelsh) + .sizeofxab + idbsize;
+
+!++
+!   We will now move the entire user's XAB into this block.
+!   Note that we assume that all fields are initially zero
+!   (since this is a virgin file page), so we don't have to
+!   clear any fields.
+!--
+
+    movingptr = .idbptr + idbxaboffset;		! Point to XAB
+!+
+!   Move the entire XAB into the file IDB.
+!-
+
+    IF .rmssec NEQ 0
+    THEN
+	xcopy (.xabptr, 			! From
+	    .movingptr, 			! To
+	    .sizeofxab)				! Size
+    ELSE
+	movewords (.xabptr, 			! From
+	    .movingptr, 			! To
+	    .sizeofxab);			! Size
+
+    xabptr = .movingptr;			! Reset the pointer to the
+    						!   new XAB position
+!+
+!   We have now moved the XAB in.  We must check if there is
+!   a key-name and, if so, move it to this ADB.
+!-
+
+    IF (tempac = .xabptr [xabknm, 0]) NEQ 0
+    THEN
+	BEGIN
+	!
+	!   Default to section number of the FAB
+	!
+
+	IF .tempac<lh> EQL 0			!
+	THEN
+	    tempac = .tempac OR .blksec;
+
+	IF .rmssec NEQ 0
+	THEN
+	    xcopy (.tempac, 			! From
+		.movingptr + .sizeofxab, 	! To
+		keynamesize)			! Size
+	ELSE
+	    movewords (.tempac, 		! From
+		.movingptr + .sizeofxab, 	! To
+		keynamesize)			! Size
+	END;
+
+!+
+!   If debugging, dump the IDB.
+!-
+%IF dbug
+%THEN
+    begindebug (dbblocks)			!
+    bugout(%STRING ('*Dump of IDB *: ', %CHAR (13), %CHAR (10)));	!
+    dumpidb (.idbptr);				!
+    enddebug;					!
+%FI
+    RETURN
+    END;					! End of MAKEIDB
+
+%SBTTL 'GETIDB - locate an IDB'
+
+GLOBAL ROUTINE getidb (bktdesc : REF BLOCK) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	GETIDB locates an Index Descriptor Block in the file
+!	prologue of an indexed file.  This routine assumes
+!	that the global KDB is set to point to the current
+!	Key Descriptor Block.  This routine will locate the
+!	associated index descriptor and return a pointer to
+!	it.  It is the caller's responsibility to flush the
+!	bucket descriptor which is returned.
+!
+!	Locking is **never** done for the File Prologue.
+!
+! FORMAL PARAMETERS
+!
+!	BKTDESC	    -	Address of caller's bucket descriptor.
+!
+! IMPLICIT INPUTS
+!
+!	?
+!
+! ROUTINE VALUE:
+!
+!	FALSE	    -	error
+!	Not False   -	address in core of index descriptor
+!
+! SIDE EFFECTS:
+!
+!	?
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	filebucket : BLOCK [1];			! Bucket of index descriptor
+
+    REGISTER
+	fileaddress,				! Address of the IDB
+	idbptr : REF BLOCK;
+
+    TRACE ('GETIDB');
+!+
+!   Fetch the address of the index descriptor on disk.
+!-
+    fileaddress = .kdb [kdbidbaddr];		! Get address
+    filebucket = (.fileaddress^w2p)^p2b;	! Convert to bucket number
+!+
+!   Get the bucket which contains this IDB.
+!-
+
+    IF getbkt (.filebucket, 			! Bucket number
+	    1, 					! Bucket size
+	    false, 				! Lock flag
+	    .bktdesc) EQL false			! Bucket descriptor
+    THEN
+	RETURN false;				! Return FALSE on error
+
+!+
+!   Form an in-core pointer to the Index Descriptor.
+!-
+    idbptr = (.bktdesc [bkdbktadr]) OR (.fileaddress AND ofsetmask);
+    RETURN .idbptr
+    END;					! End of GETIDB
+
+END						! End of Module FILES
+
+ELUDOM
+    

@@ -1,0 +1,637 @@
+;;; **********************************************************************
+;;; This code was written as part of the Spice Lisp project at
+;;; Carnegie-Mellon University, and has been placed in the public domain.
+;;; If you want to use this code or any part of Spice Lisp, please contact
+;;; Scott Fahlman (FAHLMAN@CMUC). 
+;;; **********************************************************************
+;;;
+;;; Error handling functions for Spice Lisp.
+;;;    these functions are part of the standard Spice Lisp environment.
+;;;
+;;; Written by Jim Large
+;;; changes made by David McDonald and Walter van Roggen
+;;;
+;;; **********************************************************************
+
+(in-package 'lisp)
+
+(export '(*error-cleanup-forms* signal error cerror warn break
+	  *break-on-warnings* *backtrace-print-length*
+	  *backtrace-print-level*))
+
+;;; Condition-handler-bindings is the binding stack which associates condition
+;;;  names with handler functions.  It is a list of forms
+;;;  (condition-name . handler-function) where condition name is a symbol, and
+;;;  handler-function is a function object.
+
+(defvar condition-handler-bindings ()
+  "The binding stack where condition handlers are stored.")
+
+;;; *break-entries* is a list of entry points to the break system.  
+;;; The stack tracing functions use this to figure out the boundary
+;;; between the break code and the user's code.
+
+(defvar *break-entries* '(signal signal-cerror error cerror warn break))
+
+;;; *Error-output* is the stream object which error messages are sent to.
+
+(proclaim '(special *error-output*))
+
+;;; (DILL  7/28/82) -- I put these in to make this compile with the
+;;; new XC.
+
+(proclaim '(special *query-io* *trace-output* *terminal-io*
+		  *standard-output* *standard-input*))
+
+(proclaim '(special pp-hash-table *pprint-recursive-call*))
+
+;;; Break Loop
+
+;;; All calls to this function should be through the break macro which is in
+;;;  Error-macros.slisp, and is known to the compiler.
+;;;
+;;; The first thing internal-break-loop does is evaluate the forms in
+;;;  *error-cleanup-forms* for side effects.  *error-cleanup-forms* is bound
+;;;  to nil while this happens to prevent disaster.
+;;;
+;;; Then, we enter an REP loop which is like the top level loop except that
+;;;  the standard streams are rebound to *terminal-io*,
+;;;  + ++ & friends are bound to their present values,
+;;;  *evalhook is BOUND to (),
+;;;  *error-cleanup-forms* is bound to (),
+;;;  A handler that throws back to the break loop is bound for all errors,
+;;;  The symbols '$P and '$G and the form '(RETURN <form>) are all treated
+;;;   specialy if they are typed in.
+
+(defvar *error-cleanup-forms* ()
+  "A list of forms which will be evaluated for side effect when break is
+  called.")
+
+(defvar *backtrace-print-length* 5
+  "How many elements to print on each level during a backtrace.  Unlimited
+  if null.")
+
+(defvar *backtrace-print-level* 4
+  "How many levels deep to print during a backtrace.  Unlimited if null.")
+
+(defvar *break-prompt* "> " "Prompt string used in breakpoint loops.")
+
+(proclaim '(special break-level))
+
+(proclaim '(special - + ++ +++ * ** *** / // ///))
+
+(proclaim '(special *evalhook*))
+
+(defun dump-stack (error-level)
+  (let ((sp (car error-level))
+	(p (cdr error-level))
+	item)
+    (multiple-value-setq (sp p item)
+      (nextbl sp p))
+    (do ()
+        ((null sp))
+      (cond (p
+	       (if (memq item '(speval sprevl)) (return-from dump-stack nil))
+	       (terpri)
+	       (prin1 sp)
+	       (princ " compiled call to ")
+	       (write item
+		      :length *backtrace-print-length*
+		      :level *backtrace-print-level*))
+            ((and (listp (setq item (cdr item))) (eq (car item) 'block))
+             (terpri)
+	     (prin1 sp)
+             (princ " ****** ")
+             (write (cadr item)
+		    :length *backtrace-print-length*
+		    :level *backtrace-print-level*))
+            (t
+	       (if (memq item '(speval sprevl)) (return-from dump-stack nil))
+	       (terpri)
+	       (prin1 sp)
+	       (princ " ")
+               (write item
+		      :length *backtrace-print-length*
+		      :level *backtrace-print-level*)))
+      (multiple-value-setq (sp p item)
+        (nextbl sp p)))))
+
+;;; Prettyprint current level only
+(defun dump-stack-1 (error-level)
+  (let ((sp (car error-level))
+	(p (cdr error-level))
+	(*print-pretty* t)
+	item)
+    (multiple-value-setq (sp p item)
+      (nextbl sp p))
+    (cond (p
+	   (if (memq item '(speval sprevl)) (return-from dump-stack-1 nil))
+	   (terpri)
+	   (prin1 sp)
+	   (princ " compiled call to ")
+	   (format t "~S" item))
+	  ((and (listp (setq item (cdr item))) (eq (car item) 'block))
+	   (terpri)
+	   (prin1 sp)
+	   (princ " ****** ")
+	   (format t "~S" (cadr item)))
+	  (t
+	   (if (memq item '(speval sprevl)) (return-from dump-stack-1 nil))
+	   (terpri)
+	   (prin1 sp)
+	   (princ " ")
+	   (format t "~S" item)))
+    ))
+
+;;; We have to look up the stack to figure out the break level.
+;;; The obvious thing is to increment break-level each time we
+;;; enter a break.  However because of the way we manipulate
+;;; the SP context, this results in all levels looking like 1.
+
+(defun get-break-level nil
+   (do ((sp (spdlpt) (1- sp))
+        (levels 0))
+       ((eq sp 0) (1+ (/ levels 2)))
+     (if (eq (spdlft sp) 'break-level)
+	 (setq levels (1+ levels)))))
+
+
+(defun internal-break-loop ()
+  "Break loop.  But you should be using the Break function"
+
+  (do ((*error-cleanup-forms* ())
+       (e-forms *error-cleanup-forms* (cdr e-forms)))
+      ((atom e-forms))
+    (eval (car e-forms)))
+  (clear-input *terminal-io*)
+
+  (condition-bind ((() #'break-condition-handler))
+   (prog (This-Eval
+	  (error-level (get-error))
+	  (*standard-input* *terminal-io*)
+	  (*standard-output* *terminal-io*)
+	  (*error-output* *terminal-io*)
+	  (*query-io* *terminal-io*)
+	  (*trace-output* *terminal-io*)
+	  (* *) (** **) (*** ***)
+	  (+ +) (++ ++) (+++ +++)
+	  (/ /) (// //) (/// ///)
+	  (*evalhook* ())
+	  (*Error-cleanup-forms* ())
+	  (? "You are in a breakpoint caused by an error.
+The following special commands are available:
+
+BK - show the active calls (the stack)
+PP - prettyprint current stack level
+^^ - return to top level
+^  - exit from one level of break
+OK - continue from the failed operation, using NIL
+(OK <value>) - continue from the failed operation, using <value>
+     [not needed for undefined function or var if you have defined it]
+GO - retry the bad form. Hope you changed something so it works now
+(RETURN <value>) - return value from bad form
+<integer> - set context to specified level (-1 for level of error)
+
+Anything else will be EVAL'ed as a Lisp form in the context 
+of the error.")
+	  (break-level (get-break-level)))
+    LOOP
+     (fresh-line)
+     (princ break-level)
+     (princ *break-prompt*)
+     (catch 'break-loop-catcher 
+      (setq +++ ++ ++ + + - - (Read))
+      (cond ((integerp -)
+	     (if (minusp -)
+		 (setq error-level (get-error))
+		 (setq error-level (cons - nil))))
+	    ((and (consp -) (eq (car -) 'OK))
+	     (return (speval (car error-level) (cadr -))))
+	    ((and (consp -) (eq (car -) 'RETURN))
+	     (sprevl (car error-level) (cadr -)))
+	    ;; These guys are escapes, not real $igns.
+	    ;; but for VAX, accept dollars too (2nd case) %%%
+	    ((memq - '(^^ $G)) (throw 'top-level-catcher ()))
+	    ((eq - '^))
+	    ((memq - '(OK $P)) (return ()))
+	    ((memq - '(BK $S)) (dump-stack error-level))
+	    ((and (symbolp -)
+		  (string-equal - 'PP)) (dump-stack-1 error-level))
+	    ((eq - 'GO) (spredo (car error-level)))
+	    ((eq - '?) (princ ?))
+	    (T (setq This-Eval
+                (multiple-value-list (speval (car error-level) -)))
+	       (Dolist (x this-eval) (fresh-line) (prin1 x))
+	       (terpri)
+	       (setq /// // // / / this-eval)
+	       (setq *** ** ** * * (car This-Eval))))
+      )
+     (when (eq - '^) (setq - nil) (throw 'break-loop-catcher nil))
+     (go loop))))))
+
+(defvar %error-error-depth% 0)
+
+(defun error-error (&rest messages)
+  (prog ((%error-error-depth% (1+ %error-error-depth%)))
+    (when (> %error-error-depth% 3)
+      (exit)
+      (throw 'TOP-LEVEL-CATCHER ()))
+    (dolist (item messages) (princ item *terminal-io*))
+   REPEAT
+    (internal-break-loop)
+    (princ "Can't Proceed.")
+    (go REPEAT)))
+
+
+
+;;; infinite error protect is used by ferror & friends to keep lisp
+;;;  out of hyperspace.
+
+(defvar *max-error-depth* 3 "The maximum number of nested errors allowed.")
+(defvar *current-error-depth* 0 "The current number of nested errors.")
+
+(defmacro infinite-error-protect (&rest forms)
+  `(let ((*current-error-depth* (1+ *current-error-depth*)))
+     (if (> *current-error-depth* *max-error-depth*)
+	 (error-error "Help! " *current-error-depth* " nested errors.")
+	 ,@forms)))
+;;; Signal
+
+;;; (Signal condition-name args) searches for a handler which will handle
+;;;  the condition condition-name.  Searches down the condition-handler-
+;;;  bindings list for the first handler which is bound to condition-name,
+;;;  and which will accept the call.  If none accept, return ().
+;;;
+;;; Handler is queried by calling it with all of the args to signal.  If it
+;;;  returns nil, then it refuses.  Otherwise signal returns all of the
+;;;  values returned by the handler.
+;;;
+;;; Condition-handler-bindings is a list of forms (name . function).
+;;;
+;;; Any handler for the condition () will be offered the chance to handle
+;;;  any condition.  This feature is not part of common-lisp, but is useful
+;;;  for the break loop which wants to catch all errors.
+
+(eval-when (eval)
+(defun signal (condition-name &rest args)
+  "Finds a handler for condition-name, and calls it with same args as signal"
+	(apply #'signal* condition-name args)))
+)
+
+(defun signal* (condition-name &rest args)
+  (let ((pp-hash-table (make-hash-table :test #'eq))
+	(*pprint-recursive-call* nil))
+    ;;cdr down the list.  if we reach the end, return ().
+    (do* ((bind-list condition-handler-bindings (cdr bind-list))
+	  (binding (car bind-list) (car bind-list)))
+	 ((null bind-list) ())
+      ;;for each binding of the right condition, query & return values if win.
+      (when (or (null (car binding))			;or the null condition.
+		(eq (car binding) condition-name))
+	(let ((result (multiple-value-list
+		       (apply (cdr binding) condition-name args))))
+	  (if (car result) (return (values-list result)))
+	  ))
+      )))
+;;; Do-Failed-Handler
+
+;;; Do-failed-handler is called by error, ferror, and %sp-internal-error
+;;;  whenever a handler attempts to correct an uncorrectable error, or by
+;;;  cerror whenever the handler returns something other than :return.
+;;;  The args to do-failed-handler are exactly the args that were given to
+;;;  the handler which failed, except that ARGS is not a rest arg.
+;;;
+;;; The control string we pass to the :failed-handler handler is pretty
+;;;  hairy.  There are three cases of it so that the result will look
+;;;  like the thing that signaled the error.
+
+(defconstant error-style-failure-string
+  "A handler for, ~s, tried to correct the uncorrectable error,~%~
+     (error ~3g~@{ ~s~}),~%~
+     which was originaly signaled in the function, ~2g~s.~%")
+
+(defconstant cerror-style-failure-string
+  "A handler for, ~s, failed to return, :return, while correcting the error,~%~
+     (cerror ~0g~s~3g~@{ ~s~}),~%~
+     which was originaly signaled in the function, ~2g~s.~%")
+
+
+(defun do-failed-handler (condition correctablep callers-name
+			  control-string args)
+  (apply #'error
+	 (cond (correctablep cerror-style-failure-string)
+	       (t error-style-failure-string))
+	 condition
+	 ()
+	 callers-name
+	 control-string
+	 args))
+;;; Ferror (obsolete) & Error
+
+;;; Error-body does the work of signaling a fatal error.  It is called from 
+;;;  ERROR, and %SP-INTERNAL-ERROR.  It never returns.
+;;;
+;;; CALLERS-NAME	-- Name of user function that raised the error
+;;; CONDITION		-- Name of condition to signal.
+;;; CONTROL-STRING	-- format control string.
+;;; ARGS		-- args for control-string.
+
+(defun error-body (callers-name condition control-string args)
+  (if (apply #'signal*
+	     condition
+	     ()	;null continue-string means not correctable error.
+	     callers-name
+	     control-string
+	     args)
+      (do-failed-handler condition () callers-name control-string args)
+      (if (eq condition :error)
+	  (error-error "No handler for condition, :error.")
+	  (error-body callers-name :error control-string args))))
+
+
+;get-caller attempts to find the name of the system routine that had
+;problems.  
+
+(defun get-caller nil
+  (let* ((item (get-error))
+	 (sp (car item))
+	 (p (cdr item)))
+;;since we are interpreted, many calls will generate funcall
+    (if (and sp (not p) (eq (spdlrt sp) 'funcall))
+	(multiple-value-setq (sp p item)
+	    (nextbl sp p)))
+;;if current thing is PUSHJ P,ERROR, we don't want to see "ERROR"
+;;We have to find ERROR by using nextbl from slightly above,
+;;since get-error only gives us the SP and P
+    (when p
+	(multiple-value-setq (sp p item)
+	    (nextbl sp (1+ p)))
+	(if (memq item *break-entries*)
+	    (multiple-value-setq (sp p item)
+		(nextbl sp p))))
+;;Now use what we have
+    (cond ((not sp) nil)
+	  (p item)
+	  ((speval sp '(boundp '%benv%))
+	   (car (last (speval sp '%benv%)))))))
+
+;;; get-error attempts to find sp and p values to use as the context
+;;; for the break loop.
+;;;
+;;; We find the first blip beyond the error system, and use its sp,p.
+;;; The problem with this is that it may leave the user in the middle
+;;; of system code.  I have thought of all sorts of heuristics, and
+;;; not come up with anything that can predict where the user is going
+;;; to want to debug.  Let him set the context himself if he doesn't
+;;; like this...
+
+(defun get-error nil
+  (let ((sp (spdlpt))
+        (p nil)
+        item)
+    (multiple-value-setq (sp p item)
+      (nextbl sp p))
+    (do ()
+        ((and (not p)
+	      (listp (cdr item))
+	      (eq (cadr item) 'block)
+	      (memq (caddr item) *break-entries*)))
+      (multiple-value-setq (sp p item)
+         (nextbl sp p))
+      (if (not sp)
+	  (return-from get-error nil)))
+;; We now have the block for the entry to the break system.
+;; The next call is what we want
+    (multiple-value-setq (sp p item)
+      (nextbl sp p))
+    (if sp
+	(cons sp p)
+	nil)))
+
+;;; The common lisp ERROR function.
+
+(eval-when (eval)
+(defun error (control-string &rest args)
+  "Signals a fatal error.  Control-string & args are formatted to
+  *error-output*."
+  (apply #'error* control-string args))
+)
+
+(defun error* (control-string &rest args)
+  (let ((pp-hash-table (make-hash-table :test #'eq))
+	(*pprint-recursive-call* nil))
+    (infinite-error-protect
+     (error-body (get-caller) ':error control-string args))))
+;;; Cerror
+
+(eval-when (eval)
+(defun cerror (continue-format-string error-format-string &rest args)
+  "Signals a continuable error.  See manual for details."
+  (apply #'cerror* continue-format-string error-format-string args))
+)
+
+(defun cerror* (continue-format-string error-format-string &rest args)
+  (let ((pp-hash-table (make-hash-table :test #'eq))
+	(*pprint-recursive-call* nil))
+    (infinite-error-protect
+     (let ((callers-name (get-caller)))
+       (cerror-body callers-name
+		    :error
+		    error-format-string
+		    continue-format-string
+		    args)))))
+
+
+(eval-when (eval)
+(defun signal-cerror (callers-name condition error-string continue-string args)
+  (signal-cerror* callers-name condition error-string continue-string args))
+)
+
+(defun signal-cerror* (callers-name condition error-string continue-string
+		       args)
+  (declare (ignore callers-name))
+  (let ((pp-hash-table (make-hash-table :test #'eq))
+	(*pprint-recursive-call* nil))
+    (infinite-error-protect
+     (cerror-body (get-caller)
+		  condition error-string continue-string args))))
+
+;;; Cerror-body is an internal version of cerror which is called by CERROR,
+;;; and %sp-internal-error.
+
+(defun cerror-body (callers-name condition error-string continue-string args)
+  (let ((result (multiple-value-list
+		 (apply #'signal*
+			condition
+			continue-string
+			callers-name
+			error-string
+			args))))
+    (cond ((null (car result))
+	   (if (eq condition :error)
+	       (error-error "No handler for condition, :error.")
+	       (cerror-body callers-name :error "Baz?" continue-string args)))
+	  ((eq (car result) ':return)
+	   (values-list (cdr result)))
+	  (T
+	   (do-failed-handler condition 'T callers-name continue-string args))
+	  )))
+;;; Warn & Break
+
+(defvar *break-on-warnings* ()
+  "If non-NIL, then WARN will enter a break loop before returning.")
+
+(eval-when (eval)
+(defun warn (format-string &rest args)
+  "Formats format-string & args to *error-output* as a warning message."
+  (apply #'warn* format-string args))
+)
+
+(defun warn* (format-string &rest args)
+  (let ((pp-hash-table (make-hash-table :test #'eq))
+	(*pprint-recursive-call* nil))
+    (format *error-output*
+	    (if *break-on-warnings*
+		"~%Warning-breakpoint in function ~s:~%"
+		"~%Warning in function ~s:~%")
+	    (get-caller))
+    (apply #'format *error-output*
+	   format-string
+	   args)
+    (when *break-on-warnings* (internal-break-loop))
+    ()))
+
+(eval-when (eval)
+(defun break (&optional format-string &rest args)
+  "Formats format-string & args to *error-output* & then enters break loop."
+  (apply 'break* format-string args))
+)
+
+(defun break* (&optional format-string &rest args)
+  (let ((pp-hash-table (make-hash-table :test #'eq))
+	(*pprint-recursive-call* nil))
+    (cond (format-string
+	   (format *error-output* "~%Breakpoint:~%")
+	   (apply #'format *error-output*
+		  format-string
+		  args))
+	  (T (format *error-output* "~%Breakpoint")))
+    (internal-break-loop)))
+;;; Error-Init
+
+;;; Error-init is called at init time to initialize the error system.
+;;;  it initializes the internal error table, and condition-psetq's the
+;;;  error conditions which should always be present in the system.
+;;;
+;;; Only those error conditions which are common to both vax lisp and 
+;;;  spice lisp are condition-psetq'd here.  Implementation specific
+;;;  conditions are done in the init file.
+
+(defun error-init ()
+
+  (setq condition-handler-bindings ())   ;make sure it is empty.
+
+  (condition-psetq
+   :error #'default-condition-handler
+   :unbound-variable #'default-unbound-variable-handler
+   :undefined-function #'default-undefined-function-handler
+   ))
+;;; macros used by error handlers
+
+;;; dont-proceed is the standard way to drop the user into a break loop
+;;;  when we are handling a fatal error.
+
+(defmacro dont-proceed ()
+  '(prog ()
+   foo
+     (internal-break-loop)
+     (warn "The current error is not correctable.")
+     (go foo)))
+
+
+;;; Error-Print formats an error message in the standard way.
+(defun error-print (message args function continue-string)
+  (format *error-output* "~%Error in function ~s.~%" function)
+  (apply #'format *error-output* message args)
+  (when continue-string
+    (format *error-output* "~%If continued: ")
+    (apply #'format *error-output* continue-string args)))
+;;; Default-Condition-Handler & Break-Condition-Handler
+
+;;; Default-condition-handler handles most of the conditions which are defined
+;;;  in the Spice Lisp environment.  The handler prints a message, and enters
+;;;  a break loop.  A default message is provided for each condition which
+;;;  this handler will accept.
+
+(defun default-condition-handler
+  (ignore continue-string function-name error-string &rest args)
+  (error-print error-string args function-name continue-string)
+  (if continue-string
+      (values ':return (internal-break-loop))
+      (dont-proceed))
+  )
+
+
+
+;;; Break-condition-handler is a generic handler which will print a message,
+;;;  and then punt back to the most recent break loop.  Break binds this to
+;;;  unimportant conditions.
+
+(defun break-condition-handler
+  (ignore ignore ignore error-string &rest args)
+  (apply #'format
+	 *error-output*
+	 error-string
+	 args)
+  (princ "
+Error flushed.
+" *error-output*)
+  (throw 'break-loop-catcher ())
+  )
+;;; Default-Undefined-Function-Handler
+
+;;; Default-undefined-function-handler is a handler for the :undefined-function
+;;;  condition.  If the error is signaled correctably, then the correction
+;;;  value is obtained by forcing the user to define the function in a
+;;;  break-loop
+
+(defun default-undefined-function-handler
+  (ignore continue-string function error-string &rest args)
+
+  (error-print error-string args function continue-string)
+  (if continue-string
+      (prog ()
+       loop
+	(internal-break-loop)
+	(if (fboundp (car args))
+	    (return (values ':return (symbol-function (car args)))))
+	(format *error-output*
+		"~%;Warning, Can not proceed until ~S has been defun'd."
+		(car args))
+	(go loop))
+      ;; if not continue-string
+      (dont-proceed)))
+;;; Default-Unbound-Variable-Handler
+
+;;; Default-unbound-variable handler is a handler for the :unbound-variable
+;;;  condition.  If the error is signaled correctably, then the correction
+;;;  value is obtained by forcing the user to setq the symbol in the
+;;;  break loop.
+
+
+(defun default-unbound-variable-handler
+  (ignore continue-string function error-string &rest args)
+
+  (error-print error-string args function continue-string)
+  (if continue-string
+      (prog ()
+       loop
+	(internal-break-loop)
+	(if (boundp (car args))
+	    (return (values ':return (symbol-value (car args)))))
+	(format *error-output*
+		"~%;Warning, Can not proceed until ~S has been Setq'd."
+		(car args))
+	(go loop))
+      ;; if not continue-string
+      (dont-proceed)))

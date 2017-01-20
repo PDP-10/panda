@@ -1,0 +1,2195 @@
+		 TITLE	TAR-20 - Read/Write TAR format tapes
+		SUBTTL	/ Marshall T. Rose & John L. Romine 
+
+		  SALL
+
+		SEARCH MONSYM, MACSYM
+		.TEXT	"TAR/SAVE"
+
+		VGROUP==1
+		VMAJOR==3		; release 3, July 1984
+		VMINOR==0
+		 VEDIT==^d73
+
+COMMENT	\
+
+Questions about this program can be sent to:	BUG-TAR-20@UCI.ARPA
+
+	Computing Support Group
+	Department of Information and Computer Science
+	University of California, Irvine
+	Irvine, CA  92717
+
+Things left to do:
+	UPDATE (U)	?
+	BLOCKSIZE (B)	?
+	LINK (L)	N/A
+	PRESERVE (P)	N/A
+								END COMMENT \
+
+COMMENT @
+
+    This is (a copy of) the standard UC system disclaimer that disavows
+    any responsibility for the (mis)use of this software.
+
+ 	Copyright (C) 1983, 1984 by
+ 	      The Regents of the University of California
+
+ 			       DISCLAIMER
+
+ 	"Although   each   program   has   been  tested  by  its
+ 	contributor, no warranty, express or implied, is made by
+ 	the  contributor  or the University of California, as to
+ 	the accuracy and functioning of the program and  related
+ 	program material, nor shall the fact of the distribution
+ 	constitute any such warranty, and no  responsibility  is
+ 	assumed   by   the  contributor  or  the  University  of
+ 	California in connection herewith."
+							end comment @
+
+
+;
+; TAR.MAC - read and write Unix TAR format tapes on Tops-20 systems.
+; This program allows the user to read/write/create/directory TAR format
+; tapes.  It is intended to be used as means for transferring files from
+; a UNIX system to a Tops-20 system, and vice-versa.
+;
+; Originally Written by:
+;	9/82	Marshall T. Rose	Information & Computer Science Dept.
+;					University of California, Irvine
+; Modification History:
+;	1/83	John L. Romine		Information & Computer Science Dept.
+;					University of California, Irvine
+;	Action commands implemented:	WRITE, EXTRACT, TYPE, HELP
+;	Option commands implemented:	ASK, VERBOSE, NOSUPERSEDE, NOMTIME
+;
+; Current Restrictions:
+;	o Directorying and restoring w/ arguments can be slow since each
+;	  tape block is copied into the FILBUF area, whether or not it is
+;	  needed.
+;
+; Edit		Date	Who
+; jlr$01	3/14/83	John L. Romine		Univ of Calif, Irvine. ICS dept
+;			fix problem with './' filenames.  all leading
+;			'.'s & '/'s, are stripped off.  edit (^d172).
+; jlr$02	3/25/83 John L. Romine		Univ of Cal, Irvine. ICS dept
+;			fix bug in previous fix (jlr$01) edit (^d174)
+; etm$01	1/11/84 Tim Morgan		Univ of Cal, Irvine. ICS dept
+;			add EIGHTBIT option (etm$01)	edit (^d175)
+;
+; 4/26/84	John Romine	Univ. of Calif, Irvine, ICS Dept.
+; Version 2.0	All edits prior to 4/26/84 applied, and ifdefs removed.
+;		New SET command added to set options (which stick).
+;		Per command options are no longer available.
+;		SKIP command added to skip forward/backward savesets.
+;
+; July 1984	John Romine	Univ. of Calif, Irvine, ICS Dept.
+; Version 3.0	With much help from Frank <Wancho@Simtel-20>, added ITS-Binary
+;		mode.  36-bit files are checked for sixbit/DSK8/ and written in
+;		8-bit, otherwise 7-bit.
+;		Always allow writing 8-bit files.  EightBit option is only
+;		used when reading the tape.
+
+SUBTTL	Definitions
+
+; ACs
+		F==0		; Flags
+		A==1		; JSYS arguments/scratch
+		B==2		;  ..
+		C==3		;  ..
+		D==4		;  ..
+		E==5		;  ..
+		T==6		; Scratch
+	       TT==7		;  ..
+	        M==10		;  ..
+	        N==11		;  ..
+	        O==12		;  ..
+	        Q==13		; Miscellaneous
+	        X==14		;  ..
+		Y==15		;  ..
+		V==16		;  ..
+		P==17		; PDL pointer
+
+; OPdefs
+	OPDEF	XEC	[PUSHJ	P,0]
+	OPDEF	RET	[POPJ	P,0]
+	OPDEF	PJRST	[JRST]
+	DEFINE	RETSKP	<JRST	CPOPJ1>
+
+	OPDEF	PRINT	[1B8]
+	OPDEF	UTYPE	[2B8]
+	OPDEF	UETYPE	[3B8]
+	OPDEF	UERR	[4B8]
+
+		  PAGE
+; Macros
+	DEFINE	TYPE(X),<		;; type string
+		UTYPE	[ASCIZ@X@]
+	>
+
+	DEFINE	CTYPE(X),<		;; type CR-LF and string 
+		UTYPE	10,[ASCIZ@X@]
+	>
+
+	DEFINE	CITYPE(X),<		;; type CR-LF (maybe) and string
+		UTYPE	1,[ASCIZ@X@]
+	>
+
+	DEFINE	ETYPE(X),<		;; type string (w/ fmt)
+		UETYPE	[ASCIZ@X@]
+	>
+
+	DEFINE	CETYPE(X),<		;; type CR-LF and string (w/ fmt)
+		UETYPE	10,[ASCIZ@X@]
+	>
+
+	DEFINE	CIETYPE(X),<		;; type CR-LF (maybe) & string (w/ fmt)
+		UETYPE	1,[ASCIZ@X@]
+	>
+
+	DEFINE	DEFERR(X,Y),<
+		DEFINE	X(Z),<
+			IFIDN <Z>,<>,<UERR Y,0>
+			IFDIF <Z>,<>,<UERR Y,[ASCIZ@Z@]>
+		>
+	>
+
+;  1B9='?' 0B9='%'
+; 1B10=Type JSYS error
+; 3B12=Return to EXEC, 2B12=Return to caller
+
+	DEFERR	WARN,3
+	DEFERR	JWARN,7
+	DEFERR	ERROR,13
+	DEFERR	JERROR,17
+	DEFERR	FATAL,12
+	DEFERR	JFATAL,16
+
+		EOL==" "-100
+
+		  PAGE
+; Constants
+
+		  NPDL==177		; Size of PDL
+		 NUPDL==20		; Size of secondary PDL
+
+		MAXJFN==^D20		; Number of nested TAKEs
+
+		MAXCHR==^D500		; Size of character buffer
+		MAXLEN==<MAXCHR+5>/5	; Size in words
+
+		 ABCHR==^D100		; Size of atom buffer
+		 ABLEN==<ABCHR+5>/5	; Size in words
+
+		STRCHR==1K*5		; Size of string buffer
+		STRLEN==<STRCHR+5>/5	; Size in words
+
+		CMGLEN==16		; Size of a GTJFN block
+
+		TABLEN==10		; Number of file groups to allow
+
+		CMPCNT==^D21
+		CMPMAX==^D20
+		CMPLEN==CMPCNT*CMPMAX
+
+		TBLOCK==^D512		; TAR's magic numbers
+		NBLOCK==^D20
+
+		  PAGE
+; Storage
+
+	DEFINE	LDBLK(LIST)<		;; Load a block with data and allocate
+					;; enough space for largest word
+		..LEN==0
+		IRP LIST,<LDWRD(LIST)>
+		RELOC .+..LEN
+	>
+
+	DEFINE	LDWRD(A)<		;; Load one word, check max length
+		.LDWRD(A)
+	>
+
+	DEFINE	.LDWRD(A,B)<		;; Auxilary function
+		RELOC .+A
+		IFB<B>,<0;>B
+		RELOC .-A-1
+		IFGE A-..LEN,<..LEN==A+1>
+	>
+
+	DEFINE DATA(ADDR,SIZE)<		;; Define a block of storage
+ADDR:	IFB<SIZE>,<BLOCK 1;>BLOCK SIZE
+	>
+
+
+	DEFINE	TYPOPT(flag,text,mode)<	;; display an option
+			xlist
+		 ifb<mode>< skipn flag>
+		 ifnb<mode>< skipe flag>
+	  	  type <No >
+	 	 type	<text>
+		 print	eol
+			list
+	>; typopt
+
+	DEFINE	ZERO(BEGIN,END)<	;; Zero a block of memory
+		PUSH	P,A
+		SETZM	BEGIN			;; Zero it TOPS-20 style
+		MOVE	A,[BEGIN,,BEGIN+1]	;;  ..
+		BLT	A,END-1			;;  ..
+		POP	P,A
+	>; ZERO
+		  PAGE
+; COMND. JSYS
+
+	DEFINE FIELD(FDB,ERROR)<	;; Parse a given field
+		MOVEI B,FDB
+		CALL DOCOM
+		IFB<ERROR>< JRST COMERR>
+		IFNB<ERROR>< JRST ERROR>
+	>
+
+	DEFINE	KEYWD(BLK) <		;; Parse a keyword
+		RFIELD	[FLDDB.	.CMKEY,,BLK]
+	>
+
+		  PAGE
+	DEFINE	NOISE(MSG) <		;; Parse noise
+		RFIELD 	[FLDDB.	.CMNOI,,<-1,,[ASCIZ @MSG@]>]
+	>
+
+	DEFINE CONFRM(ERROR)<		;; Get a confirmation
+		CALL	DOCFM
+		 IFB<ERROR><JRST COMERR>
+		 IFNB<ERROR><JRST ERROR>
+	>
+
+	DEFINE RFIELD(FDB)<		;; Auxilary function
+		 XLIST
+		MOVEI	A,CMSTAT
+		MOVEI	B,FDB
+		COMND
+		 ERJMP	ERSCAN
+		TXNE	A,CM%NOP
+		JRST	ERSCAN
+		  LIST
+	>
+
+	DEFINE TABLE<			;; Start a table
+		...BEG==.
+		BLOCK 1
+	>
+
+	DEFINE T(TEXT,VALUE)<		;; Keyword entry
+		[ASCIZ @TEXT@],,VALUE
+	>
+
+	DEFINE T1(TEXT,VALUE,FLAGS)<
+		[FLAGS!CM%FW
+		 ASCIZ @TEXT@],,VALUE
+	>
+
+	DEFINE TEND<			;; End a table
+		...LEN==.-...BEG
+		.ORG ...BEG
+		...LEN-1,,...LEN
+		.ORG .+...LEN
+	>
+SUBTTL	Pure Storage
+
+		   LOC	41
+		   JSR	UUOH
+		 RELOC
+
+
+EVEC:	JRST MAIN			; Start address
+	JRST MAIN			; Reenter address
+	BYTE (3)VGROUP (9)VMAJOR (6)VMINOR (18)VEDIT
+	EVECL==.-EVEC			; length of vector
+
+
+INIBLK:	FLDDB.	.CMINI			; Initialize command line
+
+CMSTAT:	LDBLK	<<.CMFLG,REPARS>,<.CMIOJ,<.PRIIN,,.PRIOU>>,<.CMBFP,<-1,,CMBUF>>,<.CMPTR,<-1,,CMBUF>>,<.CMCNT,MAXCHR>,<.CMINC,0>,<.CMABP,<POINT 7,ABBUF>>,<.CMABC,ABCHR>,<.CMGJB,CMGJFN>>
+
+
+COMAND:	FLDDB.	.CMKEY,,COMKEY		; Parse command keyword
+COMKEY:	TABLE				; COMMAND keywords
+	T	CREATE,		Z.CREATE
+	T1	E,	COMK2,			CM%INV!CM%ABR
+	T	EXIT,		Z.EXIT
+COMK2:	T	EXTRACT,	Z.RESTORE
+	T	HELP,		Z.HELP
+	T	QUIT,		Z.EXIT
+	T	REWIND,		Z.REWIND
+	t	SET,		z.set	; set options
+	T	SKIP,		z.skip		; skip tape
+	T1	T,	COMK3,			CM%INV!CM%ABR
+	T	TAKE,		Z.TAKE
+	T	TAPE,		Z.TAPE
+COMK3:	T	TYPE,		Z.DIRECTORY
+	T	WRITE,		Z.WRITE
+	TEND
+
+setcmd:	flddb.	.cmcfm,cm%sdh,,<Confirm to list options>,,optcmd
+optcmd:	flddb.	.cmkey,,optkey
+optkey:	TABLE
+	T	Ask,		s.ask
+	T	EightBit,	S.EIGHTBIT
+	T	ITS-Binary,	s.itsbinary
+	T	MTime,		s.mtime
+	T	NO,		S.NO
+	T	Supersede,	s.supersede
+	T	Verbose,	s.verbose
+	TEND
+
+		  PAGE
+numcmd:	flddb.	.cmnum,,^d10,,<1>
+
+	;;01234567890123456789012345678901
+BRKMSK: ^B000000000110010000000000000100000000	;  0-31: 0-31
+	^B100000000000000000000000000000010000	; 32-63: 32-47,58-63
+	^B000000000000000000000000000000000000	; 64-95: 64,91-95
+	^B000000000000000000000000000000010000	; 96-127 96,123-127
+
+RESCMD:	FLDDB.	.CMCFM,CM%SDH,,,,NAMCMD
+
+NAMCMD:	<FLD(.CMFLD,CM%FNC)!CM%SDH!CM%HPP!CM%BRK+CFMCMD>
+	0
+	<POINT 7,[ASCIZ@TAR filename@]>
+	0
+	BRKMSK
+
+WRTCMD:	
+
+FILCMD:	FLDDB.	.CMFIL,CM%SDH,,<File specification>,,CMACMD
+FILBLK:	LDBLK	<<.GJGEN,GJ%OLD!GJ%IFG!GJ%FLG!.GJALL>,<.GJEXT,<-1,,[ASCIZ@*@]>>>
+	FILLEN==.-FILBLK
+
+CMACMD:	FLDDB.	.CMCMA,,,,,CFMCMD			; comma
+
+TAPCMD:	FLDDB.	.CMDEV,CM%SDH,,<Tape unit>,<TAR:>,TAPCM1
+TAPCM1:	FLDDB.	.CMFIL,CM%SDH,,<Disk file name>
+
+TAKCMD:
+TAKFIL:	FLDDB.	.CMFIL,CM%SDH,,<Command file name>,,CFMCMD
+
+TAKBLK:	LDBLK	<<.GJGEN,GJ%OLD!.GJDEF>,<.GJNAM,<-1,,[ASCIZ @Tar@]>>,<.GJEXT,<-1,,[ASCIZ @cmd@]>>>
+	TAKLEN==.-TAKBLK
+
+CFMCMD:	FLDDB.	.CMCFM			; Accept confirmation
+
+SUBTTL	Impure Storage
+
+CORBEG:!
+
+DATA	PRINTP				; Non-trivial to print out
+
+DATA	PDL,	NPDL			; PushDownList
+
+DATA	MPP				; Saved PDL ptr for SAVACS/RSTACS
+
+DATA	INUUO				; Prevent recursive LUUOs
+
+DATA	TEMPAC				; Temporary storage
+
+DATA	UUOPDL,	NUPDL			; LUUO PDL
+
+DATA	UUOACS,	20			; ACs saved over LUUO
+
+
+DATA	CMGJFN,	CMGLEN			; GTJFN argument block
+DATA	CMBUF,	MAXLEN			; Command buffer
+DATA	ABBUF,	ABLEN			; Atom buffer
+
+DATA	REPPDL				; PDL saved for reparse
+DATA	REPPC				; PC saved for reparse
+DATA	SYSCOM				; EXEC command
+DATA	CMJFNS				; TAKE file JFN
+DATA	CMJFNP				; PDL pointer into JFNSTK
+DATA	JFNSTK,MAXJFN			; TAKE file JFNs
+
+		  PAGE
+DATA	DSKMTA				; MTA: is really a disk
+DATA	MTAJFN				; JFN for MTA:
+DATA	MTABUF,	ABLEN			; Its ASCIZ representation
+
+DATA	CURJFN				; Current JFN in use
+
+DATA	FILCNT				; Count of JFNs in FILTAB
+DATA	FILTAB,	TABLEN			; File JFNs
+
+DATA	STRBUF,	STRLEN			; Buffer for scratch work
+
+DATA	CMPBUF,	CMPLEN
+DATA	CMPFLG
+
+DATA	OPTFLG			; generic option flag (-1 = true)
+DATA	CRTFLG				; create flag: -1="create" the tape
+DATA	NSUPFLG				; no supersede flag: -1=no supersede
+DATA	VRBFLG				; verbose flag: -1=be verbose
+DATA	ASKFLG				; ask flag: -1=ask for confirmation
+DATA	NTIMFLG				; no mtime flag: -1=don't restore mtime
+DATA	DOTFLG				; filename flag: if "." seen
+DATA	EIGHTFLG			; Allow non-ascii files/write 8-bit
+DATA	ITSFLG				; Allow ITS-BINARY & 36ASCII files
+DATA	ASCII				; Reading a 7-bit file?
+DATA	BYTSIZ				; Bytesize of file
+DATA	EOFFLG				; EOF flag
+
+DATA	BLOCKS				; The number of blocks to write
+DATA	BYTES				; remaining bytes to write
+
+DATA	FCMPBF,	<^D100/5>+1		; restore compare filename buffer
+
+DATA	TBUF,	<NBLOCK*TBLOCK+4>/4	; Tape buffer
+
+DATA	FILBUF, <TBLOCK+4>/4		; File buffer
+
+	FILEND==.-1
+
+; this block is used for the directory information on a file.
+; the filenames are strings, and the rest are numbers.
+
+DIRBLK:
+DATA	FILNAM,	<^D100/5>+1		; file name
+DATA	MODE				; mode			(644)
+DATA	UID				; user i.d.		(0=root)
+DATA	GID				; group i.d.		(0=unknown)
+DATA	SIZE				; file size	
+DATA	MTIME				; modifcation time	(0=?)
+DATA	CHKSUM				; checksum for dir. record
+DATA	LNKFLG				; link flag		(unused)
+DATA	LNKNAM,	<^D100/5>+1		; file link name	(unused)
+	DIREND==.-1
+
+	COREND==.-1
+
+		  PAGE
+DEBUG:	BLOCK	1			; Non-trivial if debugging
+
+SAVACS:	Z
+	JRST	[PUSH	P,MPP		; Save MPP
+		 ADJSP  P,17		; Reserve 17 slots
+		 MOVEM  P,MPP		; Save P
+		 MOVEM	16,(P)		; Save AC 16
+		 MOVEI	16,-16(P)	; BLT the rest
+		 BLT	16,-1(P)	;  ..
+		 JRST	@SAVACS]	; Continue
+
+RSTACS:	Z
+	JRST	[MOVSI	16,-16(P)	; BLT ACs back
+		 BLT	16,16		;  ..
+		 ADJSP	P,-17		; Restore PDL
+		 POP	P,MPP		; Get back MPP
+		 JRST	@RSTACS]	; Continue
+SUBTTL	Main
+
+MAIN:	RESET				; all I/O
+
+	MOVE	F,[A,,B]		; ZAP ACs
+	SETZ	A,			;  ..
+	BLT	F,P			;  ..
+
+	MOVE	P,[IOWD NPDL,PDL]	; Get PDL pointer
+
+	SETZB	F,CORBEG		; ZAP impure area
+	MOVE	A,[CORBEG,,CORBEG+1]	;  ..
+	BLT	A,COREND		;  ..
+
+	SETOM	INUUO			; Init LUUO counter
+	SETOM	PRINTP			; Enable printing
+
+	XEC	INITAR			; See if we can get TAR:
+	MOVE	A,[-MAXJFN,,JFNSTK-1]	; Init other stuff
+	MOVEM	A,CMJFNP		;  ..
+	SETOM	SYSCOM			; Assume EXEC command
+	SETZM	CMJFNS			; Not doing TAKE
+
+ERSCAN:	SETZM	SYSCOM			; Not an EXEC command now
+COMLOP:	CALL	CLEAN			; Clean up
+	SKIPE	CMJFNS			; Don't EXIT during TAKE
+	 JRST	COMLP1			;  ..
+	SKIPE	SYSCOM			; EXEC command?
+	HALTF				;  Yes, done
+	SETZM	SYSCOM			; Not any more
+COMLP1:	HRROI	A,[ASCIZ @TAR>@]	; Set prompt
+	CALL	DOINI			; and Initialize
+	CALL	CLEAN			; Clean up
+
+COMLP2:	FIELD	COMAND,CMEOFC		; Set-up command defaults
+	HRRZ	B,(B)			; Get dispatch address
+	JRST	(B)			; And go to it
+
+		  PAGE
+DOINI:	MOVEM	A,CMSTAT+.CMRTY		; Set prompt
+	MOVE	A,(P)			; Set reparse info
+	MOVEM	A,REPPC			;  ..
+	MOVEM	P,REPPDL		;  ..
+	SKIPN	A,CMJFNS		; Doing TAKE?
+	 MOVE	A,[.PRIIN,,.PRIOU]	;  Nope
+	MOVEM	A,CMSTAT+.CMIOJ		; Set it
+	MOVEI	A,CMSTAT		; Set initial state
+	MOVEI	B,INIBLK		;  ..
+	COMND				; Go
+	 ERJMP	%FATAL			;  Oops
+	TXNN	A,CM%NOP		; No parse?
+	 RET				;  Okay
+	JRST	%FATAL			; Bye
+
+
+DOCFM:	MOVEI	B,CFMCMD		; Get set for confirm
+DOCOM:	MOVEI	A,CMSTAT		; Get current state
+	COMND				; Parse
+	 ERJMP	CPOPJ			;  Failed so leave
+	TXNN	A,CM%NOP		; Parsed?
+CPOPJ1:	 AOS	(P)			;  Yes, so win
+CPOPJ:	RET				; No, so lose
+
+
+REPARS:	MOVE	P,REPPDL		; Here to reparse
+	MOVE	A,REPPC			;  ..
+	MOVEM	A,(P)			;  ..
+	RET				; All fixed up
+
+
+CMEOFC:	SKIPN	CMJFNS			; Doing TAKE?
+	 JRST	COMERR			;  No, keep going
+	MOVEI	A,.FHSLF		; Get our last error
+	GETER				;  ..
+	 ERJMP	COMERR			; Oh well
+	HRRZ	B,B			; Did we hit EOF?
+	CAIE	B,IOX4			; Yes
+	 JRST	COMERR			;  Nope
+	HLRZ	B,CMJFNS		; So get JFN of file
+	CIETYPE	<[End of %2J]>		; Say it
+	PRINT	EOL			; End line
+	CALL	TAKFIN			; Finish it
+	JRST	COMLOP			; And back to it
+
+		  PAGE
+COMERR:	CALL	ERRET			; Report the error
+	JRST	COMLOP			; And return
+
+
+ERRET:	CALL 	ERRDO			; Handle TAKE files
+	JERROR	<Command error>		; Report error
+	RET				; Done
+
+
+ERRDO:	SKIPN	CMJFNS			; TAKE file in use?
+	 RET				;  No, nothing to do
+	HLRZ	B,CMJFNS		; Yes, so say it
+	WARN	<Error reading %2J, command file terminated>
+	CALL	TAKFIN			; Finish up
+	JRST	ERRDO			; And recurse
+
+
+TAKFIN:	HLRZ	A,CMJFNS		; Close up current file
+	MOVE	B,CMJFNP		;  ..
+	POP	B,CMJFNS		;  ..
+	MOVEM	B,CMJFNP		;  ..
+	CLOSF				;  ..
+	 JWARN	<Error closing command file>
+	RET				; Done
+
+
+CLEAN:	HRROI	A,[0]			; Read it into nowhere
+	RSCAN				;  ..
+	 ERJMP	.+1			;  ..
+	MOVX	A,CZ%NCL!FLD(.FHSLF,CZ%PRH)
+	CLZFF				; Clear it all
+	 ERJMP	.+1			;  ..
+	RET				; Done
+SUBTTL	SET - Set options
+
+Z.SET:	SETOM	OPTFLG		; clear generic flag location
+	FIELD	SETCMD		; set command table
+	HRRZ	C,C
+	CAIE	C,SETCMD	; a confirm?
+	 JRST	[HRRZ	B,(B)		; no, get dispatch address
+		JRST	(B)]		;  and go to it.
+	CITYPE	<Current Options:>
+	PRINT	EOL
+	TYPOPT	ASKFLG, Ask
+	TYPOPT	EIGHTFLG,EightBit	;ascii (normal) = no eightbit
+	TYPOPT	ITSFLG, ITS-Binary
+	TYPOPT	NTIMFLG, MTime, no
+	TYPOPT	VRBFLG, Verbose
+	TYPOPT	NSUPFLG, Supersede, no
+	JRST	COMLOP
+		 page
+
+S.NO:	SETCMM	OPTFLG		; complement option flag
+	FIELD	OPTCMD	; look up option
+	HRRZ	B,(B)		; find dispatch, and
+	JRST	(B)		; go to it.
+
+S.SUPE:	SETCMM	OPTFLG		; negate option, set=0
+	NOISE	(existing disk files)
+	CONFRM
+	MOVE	A,OPTFLG
+	MOVEM	A,NSUPFLG	; the no supersede flag
+	JRST	COMLOP		; all done
+
+S.MTIM:	SETCMM	OPTFLG		; negate option.  set=0
+	NOISE	(restore modification time)
+	CONFRM
+	MOVE	A,OPTFLG
+	MOVEM	A,NTIMFLG		; the no mtime flag
+	JRST	COMLOP			; all done
+
+S.VERB:	NOISE	(mode)
+	CONFRM
+	MOVE	A,OPTFLG
+	MOVEM	A,VRBFLG		; the verbose flag
+	JRST	COMLOP			; all done
+
+S.ASK:	NOISE	(for confirmation)
+	CONFRM
+	MOVE	A,OPTFLG
+	MOVEM	A,ASKFLG		; the ask flag
+	JRST	COMLOP			; all done
+
+S.EIGH:	NOISE	(when Extracting)	; Noise
+	CONFRM				; Confirm
+	MOVE	A,OPTFLG
+	MOVEM	A,EIGHTFLG		; Set flag on confirm
+	JRST	COMLOP			; And back
+
+S.ITSB:	NOISE	(and 36-Bit Ascii ok to write)	; noise
+	confrm
+	move	a,optflg
+	movem	a,itsflg
+	jrst	comlop
+
+SUBTTL	WRITE - Create/Write files
+
+Z.WRIT:	TDZA	F,F			; WRITE
+Z.CREA:	 SETO	F,			;  CREATE
+	MOVEM	F,CRTFLG		; Note it
+	NOISE	(files)			; Noise
+	SETZM	FILCNT			; No entries there
+	
+WRITE0:	SETZM	CMGJFN			; Zero GTJFN block
+	MOVE	A,[CMGJFN,,CMGJFN+1]	;  ..
+	BLT	A,CMGJFN+CMGLEN-1	;  ..
+	MOVE	A,[FILBLK,,CMGJFN]	; Copy defaults
+	BLT	A,CMGJFN+FILLEN-1	;  ..
+	FIELD	WRTCMD			; Parse it
+
+	HRRZ	C,C			; See what we got
+	CAIE	C,FILCMD		; A file spec?
+	 JRST	WRITE1			;  No, check on
+	AOS	A,FILCNT		; Yes, increment count
+	CAILE	A,TABLEN		; Check it
+	 JRST	[ERROR	<Too many files specified>
+		 JRST	COMLOP]		;  Oops
+	MOVEM	B,FILTAB-1(A)		; Save JFN
+	JRST	WRITE0			; And again
+
+WRITE1:	CAIN	C,CMACMD		; A comma?
+	 JRST	WRITE0			;  Yes, ignore it
+	
+	CAIE	C,CFMCMD		; Confirmed?
+	 JRST	WRITE0			;  No, punt
+	SKIPE	FILCNT			; Any files?
+	 JRST	WRITE2			;  Yes, so go
+	MOVX	A,GJ%OLD!GJ%IFG!GJ%FLG!GJ%SHT!.GJALL
+	HRROI	B,[ASCIZ@*.*.*@]	; No, do everything
+	GTJFN				; ..
+	 ERJMP	[JWARN	<>		;  Oops
+		 JRST	COMLOP]		;  ..
+	MOVEM	A,FILTAB		; Save it
+	AOS	FILCNT			; Set count to 1
+
+WRITE2:	XEC	DOREP			; Do it
+	JRST	COMLOP			; Done
+SUBTTL	DOREP - Do the work
+
+DOREP:	SKIPE	CRTFLG			; create tape?
+	 JRST	DOCRT			;  nope, just write
+
+DOWRT:	MOVX	T,OF%RD			; open for reading
+	XEC	SETAPE			; gettape, set modes, & rewind
+	 RET
+	XEC	SKPEOT			; goto eot, and backup
+	 CALLRET RELTAP			; close tape and error return
+	MOVE	E,T			; save recno.
+	CALL	RELTAP			; close and release tape
+	MOVX	T,OF%WR			; open for writing (at eot)
+	XEC	SETAPE			; Get tape, and set modes
+	 RET			;  Oops.
+	MOVE	T,E			; restore record pointer
+	JRST	DORP00			; go to it.
+
+DOCRT:	MOVX	T,OF%WR			; Set for write (implies read)
+	XEC	SETAPE			; Get tape, and set modes
+	 RET			;  Oops.
+	SETZ	T,
+
+DORP00:	SETZ	X,			; Zero counter
+DOREP0:	MOVE	A,FILTAB(X)		; Get JFN
+	XEC	DOGRP			; Do the file group
+	ADDI	X,1			; Increment
+	CAMGE	X,FILCNT		; Done?
+	 JRST	DOREP0			;  No, again
+
+	XEC	PUTEMP			; Delimit it
+	XEC	PUTEMP			;  ..
+	XEC	FLUSHT			;  ..
+
+	CALLRET	RELTAPE			; relase tape, and done
+
+SUBTTL	DOGRP - Handle a group of files
+
+DOGRP:	MOVEM	A,CURJFN		; Save current JFN
+DOGRP0:	XEC	DOFIL			; Do the file
+	MOVE	A,CURJFN		; Get it back
+	GNJFN				; Another?
+	 RET				;  No, done
+	JRST	DOGRP0			; Yes, do it
+
+SUBTTL	DOFIL - Handle a single file
+DOFIL:	MOVEI	Y,(A)			; Copy JFN
+	MOVEI	A,(Y)			; Get JFN
+	MOVX	B,<1,,.FBCTL>		; get the ctl info
+	MOVEI	C,D			; into here
+	GTFDB%				;  ..
+	 ERJMP	[JFATAL	<GTFDB failed for %15J>]
+	TXNE	D,FB%DIR!FB%OFF		;Ignore .DIRECTORY and offline files
+	  RET
+
+	SKIPN	VRBFLG			; be verbose?
+	 SKIPE	ASKFLG			;  or ask?
+	  CIETYP	< %15J>			;  yes, Say it
+
+	MOVEI	A,(Y)			; Get JFN
+	MOVX	B,<1,,.FBBYV>		; get the I/O info
+	MOVEI	C,D			; into here
+	GTFDB				;  ..
+	 ERJMP	[JFATAL	<GTFDB failed for %15J>]
+	LDB	A,[POINTR(D,FB%BSZ)]	; Get the byte size
+	MOVEM	A,BYTSIZ		; and save it for later
+	SETOM	ASCII			; Assume it's ascii
+	CAIN	A,7			; check
+	 JRST	DOFIL3			; j/it is
+	SETZM	ASCII			; it's not an ascii file
+	CAIN	A,^D8			; if not, see if it is 8-Bit
+	 JRST	TIM.2			; j/yes, 8-bit
+	CAIN	A,^D36			; 36-bit?
+	 SKIPN	ITSFLG			;  and ITS-Binary ok?
+	  JRST	[WARN	<File %15J Invalid Bytesize (%1D)> ;nope, you lose
+		 RET]
+	MOVEI	A,(Y)			;36-bit, so check for sixbit/DSK8/
+	MOVX	B,FLD(^D8,OF%BSZ)!OF%RD
+	OPENF%
+	 ERJMP	[JERROR	<Error opening %15J>
+		RET]
+	MOVEI	A,(Y)
+	BIN%				; check for sixbit /DSK8/
+	CAIE	B,223
+	 JRST	NOITS
+	BIN%				; ..
+	CAIE	B,72
+	 JRST	NOITS
+	BIN%				; ..
+	CAIE	B,330
+	 JRST	NOITS
+	BIN%				; ..
+	JUMPN	B,NOITS
+	; Always allow writing 8-bit files to tape.	;; 2-Jul-84/JLR
+TIM.2:	;SKIPN	EIGHTFLG			; it is ok to be 8-bit?
+	;  JRST	[WARN	<File %15J not ASCII>
+	;	MOVE	A,BYTSIZ
+	;	CAIN	A,^D36
+	;	 XEC	CLOSIT
+	;	RET]
+	JRST	DOFIL3
+
+CLOSIT:	MOVEI	A,(Y)
+	TXO	A,CO%NRJ		; Okay, close it (but keep JFN)
+	CLOSF				;  ..
+	 JWARN	<Error closing %15J>	;  sigh
+	RET
+
+NOITS:	XEC	CLOSIT
+	WARN	<Assuming file %15J 36-Bit Ascii>
+	SETOM	ASCII			; Assume it's ascii...
+
+DOFIL3:	CALL	WRINFO			; Prepare Dir info.
+
+	SKIPN	VRBFLG			; be verbose?
+	 SKIPE	ASKFLG			;  or ask?
+	  SKIPA				;   yes, don't jump
+	   JRST	DOFIL9			;    no, skip this stuff
+	TYPE	( => )
+	MOVE	A,[POINT 8,FILBUF]
+	PSOUT%
+
+	SKIPN	ASKFLG			; ask?
+	 JRST	DOFIL9			;  nope, jump
+	XEC	ASKCFM			; save?
+	 RET				;  nope, skip this file
+
+DOFIL9:	CALL	WRITAP			; Write Dir info to tape
+	MOVX	B,FLD(7,OF%BSZ)!OF%RD	; Assume 7-bit ASCII
+	SKIPE	ASCII			; if ascii, don't test further
+	 JRST	DOFILA			;  just go open the file
+	MOVE	A,BYTSIZ		; check bytesize
+	CAIN	A,^D36			; If ITS,
+	 JRST	DOFIL0			;  j/already open
+	MOVX	B,FLD(^D8,OF%BSZ)!OF%RD	; otherwise, Assume 8-bit
+dofila:	MOVEI	A,(Y)			; Get JFN
+	OPENF%				;  ..
+	 ERJMP	[JERROR	<Error opening %15J>
+		 RET]
+	
+	SETZM	EOFFLG			; clear EOF
+DOFIL0:	SKIPN	EOFFLG			; EOF?
+	 SKIPG	BLOCKS			;  or no more blocks to write?
+	  JRST	DOFIL1			;   Yes, done
+	MOVEI	A,(Y)			; Get JFN
+	move	b,[point 8,filbuf]
+	MOVX	C,-TBLOCK		; Read this many characters
+	SIN%				; Read the string
+	 ERJMP	[GTSTS%			; Check status
+		 TXNE	B,GS%EOF	; EOF?
+		  SETOM	EOFFLG		;  yes, set flag
+		 JRST	.+1]		; and continue
+	XEC	WRITAP			; write to tape
+	SOS	BLOCKS			; Decrement blocks
+	JRST	DOFIL0			; And again
+
+DOFIL1:	SKIPE	BLOCKS			; Check it
+	 WARN	<File %15J changed size!> ;  ..
+	movei	a,(y)
+	TXO	A,CO%NRJ		; Okay, close it (but keep JFN)
+	CLOSF				;  ..
+	 JWARN	<Error closing %15J>	;  sigh
+	SKIPN	D,BLOCKS		; All done?
+	 JRST	DOFIL2			;  Yes
+	XEC	PUTEMP			; No, fill it out
+	SOJG	D,.-1			;  ..
+	RET
+
+DOFIL2:	SKIPN	VRBFLG			; be verbose?
+	 SKIPE	ASKFLG			;  or ask?
+	  TYPE	< [OK]>			;   Yes, so say we're done
+	RET
+		PAGE
+; this subr skips the tape to the end-of-tar-tape.  the last valid
+; TAR block (512*20 bytes) is read, and the T accumulator is pointed back one
+; "block" to the next "block" (record) to xfer. 
+; the tape is backed up one block so the next write works ok.
+
+SKPEOT:	MOVEI	T,NBLOCK			; preset to read 1 tape block
+SKPET0:	XEC	RDTAPE				; read a (dir) record
+	SKIPN	FILBUF				; check for end of tar tape
+	 JRST	SKPET3	; ** here's the exit **	;  that's right, so return
+	CALL	RDINFO				; decode the dir info
+	 RET					; just return, don't close jfn
+	MOVE	D,SIZE				; find file size
+	ADDI	D,TBLOCK-1			;  so that we can
+	IDIVI	D,TBLOCK			;  skip an appropriate
+	MOVEM	D,BLOCKS			;  number of "blocks".
+
+	SKIPN	BLOCKS				; any length to the file?
+	 JRST	SKPET0				; no, so don't read.
+
+SKPET1:	XEC	RDTAPE				; read a block
+	SOSLE	BLOCKS				; decrement count
+	 JRST	SKPET1				; doit again.
+	JRST	SKPET0				; ready to print next file.
+
+SKPET3:	SOSGE	T				; back up "block" count
+	 JRST	[JFATAL <Invalid BLOCK number in SKPEOT>]	; Nooooo.
+
+	MOVE	A,MTAJFN
+	MOVX	B,.MOBKR
+	SKIPN	DSKMTA
+	 MTOPR
+	  ERJMP	[JERROR <Unable to backspace tape>
+		 RET]
+	RETSKP
+
+; NXTFIL - skip tape to the next file, using the SIZE in DIRBLK
+
+NXTFIL:	MOVE	D,SIZE				; find file size
+	ADDI	D,TBLOCK-1			;  so that we can
+	IDIVI	D,TBLOCK			;  skip an appropriate
+	MOVEM	D,BLOCKS			;  number of "blocks".
+
+	SKIPE	BLOCKS				; any length to the file?
+	 CALL	SKPFIL				;  yes, so call skpfil
+	RET					; ready for next file.
+
+; SKPFIL - skip tape up BLOCKS number of blocks.
+
+SKPFIL:	CALL	SKPTAP				; read a block
+	SOSLE	BLOCKS				; decrement count
+	 JRST	SKPFIL				; doit again.
+	RET					; ready for next file.
+
+SUBTTL	Miscellaneous tape activities - Writing
+
+PUTEMP:	SETZM	FILBUF			; Zero it TOPS-20 style
+	MOVE	A,[FILBUF,,FILBUF+1]	;  ..
+	BLT	A,FILEND-1		;  ..
+;	JRST	WRITAP			;  ..
+
+
+WRITAP:	CAIGE	T,NBLOCK		; recno >= nblock?
+	 JRST	WRITA0			;  No, go on
+	XEC	FLUSHT			; Yes, flush it
+	SETZ	T,			;  and zero recno
+writa0:	movx	a,<point 8,0,-1>
+	move	v,t
+	imuli	t,tblock
+	idivi	t,4
+
+	HRRI	A,TBUF(T)		; Point to word
+	SKIPE	TT			; Further alignment?
+	 IBP	A			;  ..
+	SOJG	TT,.-1			;  ..
+	MOVEI	T,1(v)			; Increment recno
+	XEC	COPY			; Copy it
+	CAIGE	T,NBLOCK		; recno >= nblock?
+	 JRST	WRITA1			;  No, we're done
+	XEC	FLUSHT			; Yes, flush it
+	SETZ	T,			; and zero recno
+WRITA1:	RET				; Done
+
+
+copy:	move	b,[point 8,filbuf]
+	MOVX	C,-TBLOCK		; Get number of bytes
+	SOUT				; Transfer
+	RET				; Done
+
+
+FLUSHT:	MOVE	A,MTAJFN		; Get JFN
+	move	b,[point 8,tbuf]
+	MOVX	C,-TBLOCK*NBLOCK	; Write this many chars
+	SOUT				;  ..
+	RET				;  ..
+SUBTTL	TIME - Time Conversion Routines
+
+; TPSTIM - convert a 20/20 internal time into a unix type time format
+;          expects the 20/20 internal time in E, returns the unix time in B
+
+TPSTIM:	MOVSI	B,^D1970		; the magic year
+	SETZ	C,			; no month, or day of month
+	MOVX	D,IC%UTZ		; use GMT timezone
+	IDCNV%				; convert 1/1/70, result into B
+	 ERJMP	[JFATAL <IDCNV failed for 1/1/70>]
+	SUBB	E,B			; subtract 1/1/70, result in B, & E.
+
+	HLRZ	B,B			; put days in lower half
+	IMULI	B,^D86400		; number of seconds in a day
+	
+	HRRZ	E,E			; strip off full days, leaving fraction
+	IMULI	E,^D86400		; multiply by no. secs. in a day
+	HLRZ	E,E			; truncate to secs. (divide by 1 day)
+	ADD	B,E			; add up & put result in B
+	RET
+
+; UNXTIM - convert a unix type time into a 20/20 internal time.
+;          expects unix time in E, returns 20/20 time in B.
+
+UNXTIM:	HRLZI	B,^D1970		; vintage year: 1970	; MTIME
+	SETZ	C,			; no day or month or day
+	MOVX	D,IC%UTZ		; time zone GMT
+	IDCNV%				; convert to internal format
+	 ERJMP	[JFATAL <INCNV failed for 1/1/70>]
+
+	MOVE	D,E			; the modification date
+	MOVE	C,D			; save a copy
+	IDIVI	D,^D86400		; truncate to days only
+	MOVE	E,D			; save divided time
+	HRLZ	D,D			; move to top half of word
+	ADD	B,D			; add to 1/1/70
+
+	IMULI	E,^D86400		; integer days only
+	SUB	C,E			; now C has seconds since 0000-GMT
+	HRLZ	C,C			; the most it could be (i.e. 1 day)
+	IDIVI	C,^D86400		; divide back to fraction of a day
+	ADD	B,C			; add to previous result
+	RET
+SUBTTL	DIRECT -  directory the tape
+
+Z.DIRE:	NOISE	(directory of files)				; noise
+	SETZM	CMPFLG
+DIRMOR:	MOVEI	B,RESCMD
+	XEC	DOCOM
+	 JRST	COMERR
+	HRRZ	C,C				; get command block addr.
+	CAIN	C,RESCMD			; a return?
+	 JRST	DIRTAP				;  yes, go on
+
+	HRROI	A,CMPBUF			; a filename
+	MOVEI	B,CMPCNT			; 21 word filenames
+	IMUL	B,CMPFLG
+	ADD	A,B				; A holds the "to" addr
+	HRROI	B,ABBUF				; from
+	MOVEI	C,^D100				; terminate on a null
+	SETZ	D,
+	SOUT					; xfer
+	SETZ	B,				; now write a null
+	BOUT					;  ..
+	AOS	CMPFLG				; increment count
+	MOVE	A,CMPFLG			; check it.
+	CAIGE	A,CMPMAX			; hit max yet?
+	 JRST	DIRMOR				;  no, do one more
+	CONFRM					; & confirm
+
+DIRTAP:	MOVX	T,OF%RD				; Set for read
+	XEC	SETAPE				; get tape, and setup modes
+	 JRST	COMLOP				;  Oops.
+
+	SKIPN	VRBFLG				; be verbose?
+	 JRST	DIRTA0				;  no, jump around this stuff
+;		 1111 222/333 44444444 Jan 23, 1982 23:59 6666666...
+	TYPE	<Mode UID/GID     Size Modification time  Filename>
+	PRINT	EOL
+
+DIRTA0:	MOVEI	T,NBLOCK			; preset to read 1 tape block
+DIREC0:	CALL	RDTAPE				; read a (dir) record
+	SKIPN	FILBUF				; check for end of tar tape
+	 JRST	DIREC9	; ** here's the exit **	;  that's right, so return
+	CALL	RDINFO				; decode the dir info
+	 jrst	direc9	; also exit (on error)
+
+	MOVE	E,CMPFLG		; restore filenames?
+	JUMPE	E,DIREGO		;  nope, restore everything
+
+DIRCMP:	MOVE	A,[POINT 7,CMPBUF,-1]	; compare filename
+	MOVEI	B,CMPCNT		; 21 word filename fields.
+	IMUL	B,E
+	ADD	A,B
+
+	MOVE	B,[POINT 7,FILNAM,-1]	; tape filename
+DIRCM0:	ILDB	C,A			; compare character
+	ILDB	D,B			; compare with this
+	JUMPE	C,DIRCM1		; end?  yes, check for other name "/"
+	JUMPE	D,DIRCM5		;  Oops, ended too soon, skip this file
+	CAMN	C,D			; same?
+	 JRST	DIRCM0			;  yes, check next char.
+	CAIL	C,"A"			; convert to lower case
+	 CAILE	C,"Z"			;  ..
+	  SKIPA				;  ..
+	   ADDI	C,"a"-"A"		;  ..
+	CAMN	C,D			; same?
+	 JRST	DIRCM0			;  yes, check next char.
+DIRCM5:	SOJGE	E,DIRCMP		; next filename
+
+	JRST	DIRSKP			; don't show.
+
+DIRCM1:	JUMPE	D,DIREGO		; end of filename, so restore it.
+	CAIE	D,"/"			; next char a slash?
+	 JRST	DIRCM5			; do next filename
+
+DIREGO:	CALL	PRINFO				; and print it on terminal
+
+DIRSKP:	CALL	NXTFIL				; skip to the next file
+	JRST	DIREC0				; do the next file.
+
+DIREC9:	CALL	RELTAPE		; release tape
+	JRST	COMLOP		; return to top level.
+
+SUBTTL	RESTORE	- RESTORE FILES FROM TAPE
+
+Z.REST:	NOISE	(files)				; restore all the tape files
+	SETZM	CMPFLG
+RESMOR:	MOVEI	B,RESCMD
+	XEC	DOCOM
+	 JRST	COMERR
+	HRRZ	C,C				; get command block addr.
+	CAIN	C,RESCMD			; a return?
+	 JRST	REST99
+
+	HRROI	A,CMPBUF			; a filename
+	MOVEI	B,CMPCNT			; 21 word filenames
+	IMUL	B,CMPFLG
+	ADD	A,B				; A holds the "to" addr
+	HRROI	B,ABBUF				; from
+	MOVEI	C,^D100				; terminate on a null
+	SETZ	D,
+	SOUT					; xfer
+	SETZ	B,				; now write a null
+	BOUT					;  ..
+	AOS	CMPFLG				; increment count
+	MOVE	A,CMPFLG			; check it.
+	CAIGE	A,CMPMAX			; hit max yet?
+	 JRST	RESMOR				;  no, do one more
+	CONFRM					; & confirm
+
+REST99:	XEC	RESTOR				; doit
+	 SKIPA					; skip the crlf if error
+	CITYPE	<>				; a crlf
+	CALL	RELTAPE				; release tape, and
+	JRST	COMLOP				; return to top level.
+
+RESTOR:	MOVX	T,OF%RD				; Set for read
+	XEC	SETAPE				; get the tape, and setup modes
+	 RET					;  Oops
+	MOVEI	T,NBLOCK			; preset to read 1 tape block
+RESTO0:	XEC	RDTAPE				; read a (dir) record
+	SKIPN	FILBUF				; check for end of tar tape
+	 RETSKP		; ** here's the exit **	;  that's right, so return
+	call	RDINFO				; decode the dir info
+	 ret		; error
+	MOVE	E,CMPFLG		; restore filenames?
+	JUMPE	E,RESTGO		;  nope, restore everything
+
+RESCMP:	MOVE	A,[POINT 7,CMPBUF,-1]	; compare filename
+	MOVEI	B,CMPCNT		; 21 word filename fields.
+	IMUL	B,E
+	ADD	A,B
+
+	MOVE	B,[POINT 7,FILNAM,-1]	; tape filename
+RSTCM0:	ILDB	C,A			; compare character
+	ILDB	D,B			; compare with this
+	JUMPE	C,RSTCM1		; end?  yes, check for other name "/"
+	JUMPE	D,RSTCM5		;  Oops, ended too soon, skip this file
+	CAMN	C,D			; same?
+	 JRST	RSTCM0			;  yes, check next char.
+	CAIL	C,"A"			; convert to lower case
+	 CAILE	C,"Z"			;  ..
+	  SKIPA				;  ..
+	   ADDI	C,"a"-"A"		;  ..
+	CAMN	C,D			; same?
+	 JRST	RSTCM0			;  yes, check next char.
+RSTCM5:	SOJGE	E,RESCMP
+
+RSTSKP:	CALL	NXTFIL			; no good.  skip this file
+	JRST	RESTO0			; next file.
+
+RSTCM1:	JUMPE	D,RESTGO		; end of filename, so restore it.
+	CAIE	D,"/"			; next char a slash?
+	 JRST	RSTCM5			; do next filename
+
+		  PAGE
+RESTGO:	SKIPN	VRBFLG			; verbose?
+	 SKIPE	ASKFLG			; ask?
+	  SKIPA
+	   JRST	RESTG1			;  no, jump
+	HRROI	A,FILNAM
+	CIETYP	< %1W>
+
+RESTG1:	MOVE	A,[POINT 7,FILNAM,-1]		; filename "from" bp for cvtout
+	MOVE	B,[POINT 7,STRBUF,-1]		; "to" bp (converted filename)
+	CALL	CVTOUT				; convert filename to 20/20 fmt
+
+	HRROI	Y,FILNAM			; preset for error
+	MOVX	A,GJ%SHT!GJ%FOU!GJ%NEW	; short form, for output use, new only
+	SKIPN	NSUPFLG			; supersede existing files? skip if no
+	 TDZ	A,[GJ%NEW]		;  yes, so remove 'new' restriction
+	HRROI	B,STRBUF			; the modified filename
+	MOVE	D,B				; in case of error
+	GTJFN
+	 ERJMP	[JWARN	<Can't restore %15W>	; oops.
+		 JRST	RSTSKP]			; do the 'ex on' (next one)
+	MOVEI	Y,(A)				; save the JFN
+
+	SKIPN	VRBFLG			; verbose?
+	 SKIPE	ASKFLG			;  ask?
+	  SKIPA
+	   JRST	RESTG2			;   no, jump
+	TYPE	( => )			; point to new filename
+	MOVEI	A,(Y)			; now print the...
+	ETYPE	<%1J>			; 20/20 filename
+	
+	SKIPN	ASKFLG			; ask?
+	 JRST	RESTG2			;  nope, jump
+	XEC	ASKCFM			; restore?
+	 JRST	RSTSKP			;  no, skip this file
+
+RESTG2:	MOVEI	A,(Y)				; get back JFN
+	MOVX	B,FLD(7,OF%BSZ)!OF%WR		; open for writing (7 bit word)
+	SKIPE	EIGHTFLG			; s/not 8-bit
+	  MOVX	B,FLD(^D8,OF%BSZ)!OF%WR		; Otherwise, open in 8-bit
+	OPENF%					; open it.
+	 ERJMP	[JERROR	<Error opening %15J>	;  Oops.
+		 RET]
+			page
+	MOVE	D,SIZE				; find file size
+	IDIVI	D,TBLOCK			; skip an appropriate
+	MOVEM	D,BLOCKS			;  number of "blocks".
+	MOVEM	E,BYTES				; and number of extra bytes
+
+RESTO1:	SOSGE	BLOCKS				; any more full blocks?
+	 SKIPE	BYTES				;  no, any extra bytes?
+	  SKIPA					; a full block.
+	   JRST	RESTO2	; ** here's the exit **	; no blocks or bytes, all done.
+	XEC	RDTAPE				; read a tape block
+	MOVEI	A,(Y)				; get the mta JFN (destination)
+	MOVE	B,[POINT 8,FILBUF]
+	MOVX	C,-TBLOCK			; preset one "block"'s worth
+	SKIPGE	BLOCKS				; a full block?
+	 MOVN	C,BYTES				;  no, just remaining bytes
+	SOUT%					; restore to the file.
+	SKIPL	BLOCKS				; all done?
+	 JRST	RESTO1				;  no, doit again.
+
+RESTO2:	SKIPE	NTIMFLG				; 'no mtime' flag set?
+	 JRST	REST04				;  yes, don't restore mtime
+	MOVE	E,MTIME				; get the time
+	CALL	UNXTIM				; and set it to 20/20 format
+	MOVE	C,B				; put the 20/20 time in C
+	MOVEI	A,(Y)				; get the JFN
+	HRLI	A,.FBWRT			; set the user write date
+	SETO	B,				; modify a whole word
+	CHFDB%					; Set the time.
+	 ERJMP	[JWARN	<Error setting MTIME>
+		 JRST .+1]
+REST04:	MOVEI	A,(Y)				; get the JFN
+	CLOSF%					; close the disk file
+	 JWARN	<Error Closing %15J>
+	SKIPN	VRBFLG
+	 SKIPE	ASKFLG
+	  TYPE	< [OK]>
+	JRST	RESTO0				; do the next file
+		  PAGE
+; CVTOUT - convert filename from TAR tape to 20/20 disk format.
+;          expects "from" bp in A, and "to" bp in B.
+
+CVTOUT:	SETZM	DOTFLG				; no "." seen yet.
+	MOVEI	E,^D38				; 0-38
+
+rest05:	ildb	c,a
+	jumpe	c,rest11			;really should be an error
+	caie	c,"."				;was it a '.'?
+	 cain	c,"/"				; or perhaps a '/'?
+	  jrst	rest05				;either way, get another char
+	jrst	cvtnrm
+REST10:	ILDB	C,A				; get a byte from A
+	JUMPE	C,REST11			; a null?  yes := all done.
+
+	CAIE	C,"."				; a "."?
+	 JRST	CVTNRM				;  Nope
+
+CVTOU1:	MOVEI	E,^D38				; 0-38
+	SKIPE	DOTFLG				; seen one already?
+	 JRST	CVTDOT				;  yes, jump.
+
+	AOS	DOTFLG				; set dotflg
+	JRST	RESTOK				; and write it.
+
+CVTDOT:	PUSH	P,A			; save pointers		; 2nd dot
+	PUSH	P,B			;  ..
+	MOVEI	C,^D10			; decimal radix
+	NIN%				; read it
+	 ERJMP	REST23			;  forget it.  just write an "_"
+	LDB	C,A
+	JUMPN	C,REST23		; didn't end w/ null, so forget it.
+
+	MOVEI	C,"."			; so a "." is OK
+	SKIPA
+REST23:	 MOVEI	C,"_"			; no good.  write an "_" instead
+	POP	P,B			; restore pointers
+	POP	P,A			;  ..
+	JRST	RESTOK			; write it. (whatever it is)
+
+CVTNRM:	CAIL	C,"0"
+	 CAILE	C,"9"
+	  SKIPA
+	   JRST	RESTOK			; "0" - "9"
+	CAIN	C,"-"
+	 JRST	RESTOK			; "-"
+	CAIN	C,"_"
+	 JRST	RESTOK			; "_"
+	CAIL	C,"A"
+	 CAILE	C,"Z"
+	  SKIPA
+	   JRST	RESTOK			; "A" - "Z"
+	CAIL	C,"a"
+	 CAILE	C,"z"
+	  SKIPA
+	   JRST	RESTOK			; "a" - "z"
+
+	SOJE	E,CVTOU8		; jump if no room for 2 chars
+	MOVEI	D,"V"-100		; a control-V (quote)
+	IDPB	D,B			;  write it.
+
+RESTOK:	IDPB	C,B			; write the character
+	SOJGE	E,REST10		; char. count ok?, yes jump
+CVTOU8:	WARN	<Truncating filename component>		; truncate filename
+CVTOU9:	ILDB	C,A			; read another
+	JUMPE	C,REST11		; a null?  jump to end
+	CAIE	C,"."			; a "."? 
+	 JRST	CVTOU9			;  no, read another
+	JRST	CVTOU1			; yes, go to it.
+
+REST11:	SETZ	D,			; terminate w/ a null
+	IDPB	D,B			; write it.
+	RET				; all done.
+
+; ASKCFM - ask for confirmation
+;          returns:  +1: not confirmed,  +2: confirmed
+
+ASKCFM:	HRROI	A,[ASCIZ@  Confirm? @]	; confirm message
+	PSOUT				; print it.
+	HRROI	A,STRBUF
+	MOVEI	B,^D80
+	HRROI	C,[ASCIZ@
+  Confirm? @]
+	RDTTY
+	 JWARN	<RDTTY failed>
+	MOVE	A,[POINT 7,STRBUF,-1]
+	ILDB	A,A
+	CAIE	A,"Y"			; a "Y"?
+	 CAIN	A,"y"			; no, a "y"?
+	  SKIPA				;  yes, skip
+	   RET
+	RETSKP				; confirmed
+SUBTTL	RDINFO - Read Info for File into DIRBLK
+
+; RDINFO - read the directory info for one file into DIRBLK, from FILBUF.
+
+RDINFO:	SETZM	DIRBLK			; zero the DIRBLK directory
+	MOVE	A,[DIRBLK,,DIRBLK+1]	;  info area.
+	BLT	A,DIREND-1		;  ..
+
+	MOVE	V,[POINT 8,FILBUF,-1]
+	MOVEI	A,^d148		;=100+8+8+8+12+12
+	ADJBP	A,V
+	MOVE	V,A			; keep a copy in v
+	MOVEI	C,^D8		; octal mode
+	NIN%				; read (preset octal) CHKSUM
+	 ERJMP	[jerror <Can't read checksum>
+		 ret]
+	MOVEM	B,CHKSUM	;save to compare...
+
+	SETZ	B,			; Zero initial checksum
+	MOVE	A,[POINT 8,FILBUF,-1]
+	MOVX	D,TBLOCK		; Number of characters to check
+RDINF3:	ILDB	C,A			; Fetch a byte
+	ADDI	B,(C)			; Fold it in
+	SOJG	D,RDINF3		; More?
+
+	MOVE	A,V			; pointer to chksum area
+	MOVEI	D,^D8			; 8 bytes
+RDINF4:	ILDB	C,A			; get a byte
+	SUBI	B,(C)			; fold it OUT
+	MOVEI	C," "			; and add in a space
+	ADDI	B,(C)			; ..
+	SOJG	D,RDINF4		; more?
+
+	CAME	B,CHKSUM		; checksum ok?
+	 JRST	[MOVE	C,CHKSUM
+		 ERROR <Checksum not verified (%2D != %3D)>
+		 RET]
+
+	MOVE	V,[POINT 8,FILBUF,-1]
+	MOVE	A,V			; source (A) is FILBUF
+	MOVE	B,[POINT 7,FILNAM,-1]	; dest (B) is FILNAM (in DIRBLK)
+	MOVEI	C,^D100			; length of filename, or...
+	SETZ	D,			; terminate on a null.
+	SIN				; read it
+	 ERJMP	[JERROR	<SIN failed for filename>
+		 RET]
+	IDPB	D,B			; tack on a null, just in case
+	MOVEI	A,^D100			; filename char[100]
+	ADJBP	A,v			; adjust
+	MOVE	v,A			; and save it.
+ 
+	MOVEI	C,^D8			; read octal MODE
+	NIN
+	 ERJMP	[JERROR <NIN failed for mode>
+		 RET]
+	MOVEM	B,MODE
+	MOVEI	A,^D8			; mode is char[8]
+	ADJBP	A,v			; adjust bp to next field
+	MOVE	v,A			; and save it.
+
+	NIN%				; read (preset octal) uid
+	 ERJMP	[JWARN <NIN failed for uid>
+		 RET]
+	MOVEM	B,UID
+	MOVEI	A,^D8			; uid is char[8]
+	ADJBP	A,v			; adjust
+	MOVE	v,A			; and save it.
+	
+	NIN%				; read (preset octal) GID
+	 ERJMP	[JWARN <NIN failed for gid>
+		 RET]
+	MOVEM	B,GID
+	MOVEI	A,^D8			; gid char[8]
+	ADJBP	A,v			; adjust
+	MOVE	v,A			; save it.
+
+	NIN%				; read (preset octal) SIZE
+	 ERJMP	[JERROR <NIN failed for size>
+		 RET]
+	MOVEM	B,SIZE
+	MOVEI	A,^D12			; size char[12]
+	ADJBP	A,v			; adjust
+	MOVE	v,A			; save it.
+
+	NIN%				; read (preset octal) MTIME
+	 ERJMP	[JWARN <NIN failed for mtime>
+		 RET]
+	MOVEM	B,MTIME
+	MOVEI	A,^D12			; mtime char[8]
+	ADJBP	A,v			; adjust
+	MOVE	v,A			; save it.
+	RETSKP
+SUBTTL	WRINFO - Prepare File Info for Writing
+
+WRINFO:	SETZM	FILBUF			; Zero it TOPS-20 style
+	MOVE	A,[FILBUF,,FILBUF+1]	;  ..
+	BLT	A,FILEND-1		;  ..
+	
+	MOVE	V,[POINT 8,FILBUF,-1]
+	HRROI	A,STRBUF		; Point to where to stuff file name
+	MOVEI	B,(Y)			; Copy JFN
+	MOVE	C,[221110,,1]		; Get flags
+	JFNS%				; Move it
+
+	MOVE	A,[POINT 7,STRBUF,-1]	; Point to it
+	MOVEI	D,^D100			; The most we'll copy
+	SETZM	DOTFLG			; zero flag; indicates open acct spec.
+WRTIN0:	ILDB	B,A			; Get a byte
+	JUMPE	B,WRTIN1		; Done?
+	CAIE	B,"V"-100		; a control-V?
+	 JRST	WRTI00			;  no, go along normally
+	ILDB	B,A			; get the next byte
+	JUMPE	B,WRTIN1		; If a null, then done.
+	JRST	WRTI01			;  else, write it.
+
+WRTI00:	CAIN	B,":"			; check unquoted special chars
+	 JRST	WRTI09			;  ah ha! a ":", so convert it.
+	CAIE	B,"<"			; is it a "<"?
+	 JRST	WRTI03			;  nope, so continue
+	AOS	DOTFLG			; found a "<", so set the flag,
+	JRST	WRTIN0			;  and get the next char
+
+WRTI03:	SKIPN	DOTFLG			; any "<"s seen?
+	 JRST	WRTI01			;  no, so go normal
+	CAIE	B,">"			; is it a ">"?
+	 JRST	WRTI04			;  nope, so jump to wrti04
+	SETZM	DOTFLG			; zero the flag
+	SKIPA				;  and skip, using replacement char.
+WRTI04:	 CAIN	B,"."			; is it a "."? if not, skip to wrti01
+WRTI09:	MOVEI	B,"/"			; use the replacement char
+
+WRTI01:	CAIL	B,"A"			; No, make lowercase
+	CAILE	B,"Z"			;  ..
+	 SKIPA				;  ..
+	ADDI	B,"a"-"A"		;  ..
+	IDPB	B,V			; Write it
+	SOJG	D,WRTIN0		; More room?
+	SKIPN	VRBFLG			; be verbose?
+	 SKIPE	ASKFLG
+	  WARN	<Filename truncated - %15J>	; yes, so warn them.
+	JRST	WRTIN2			;  No, go for more
+WRTIN1:	IDPB	B,V			; Here when have to fill
+	SOJG	D,.-1			;  ..
+
+WRTIN2:	MOVE	A,V			; Copy bp
+	MOVX	B,644			; Now dump mode (rw-r--r--)
+	MOVX	C,FLD(^D7,NO%COL)!FLD(^D8,NO%RDX)
+	NOUT%				;  ..
+	 ERJMP	[JFATAL	<NOUT failed for mode>]
+	MOVX	B,0			; Now dump uid (root)
+	IDPB	B,A			; (after binding off mode)
+	MOVX	C,FLD(^D7,NO%COL)!FLD(^D8,NO%RDX)
+	NOUT%				;  ..
+	 ERJMP	[JFATAL	<NOUT failed for uid>]
+	MOVX	B,0			; Now dump gid (unknown)
+	IDPB	B,A			; (after binding off uid)
+	MOVX	C,FLD(^D7,NO%COL)!FLD(^D8,NO%RDX)
+	NOUT%				;  ..
+	 ERJMP	[JFATAL	<NOUT failed for gid>]
+	IDPB	B,A			; Bind off gid
+	MOVE	v,A			; Get back bp
+
+	MOVEI	A,(Y)			; Get JFN		; FILE LENGTH
+	MOVX	B,<1,,.FBSIZ>		; get the size
+	MOVEI	C,D			; into here
+	GTFDB%				;  ..
+	 ERJMP	[JFATAL	<GTFDB failed for %15J>]
+	MOVE	A,BYTSIZ
+	CAIE	A,^D36			; byte count in 36-bit words?
+	 JRST	WRTINX
+	SKIPE	ASCII			; is file ascii?
+	 JRST	WRTINY			;  j/yes, (7-bit) ascii
+	SUBI	D,1			; Subtract out ITS header word
+	IMULI	D,4			; 4 8-bit bytes/word
+	JRST	WRTINX
+WRTINY:	IMULI	D,5			; 5 7-bit bytes/word
+WRTINX:	MOVE	A,V			; Copy bp
+	MOVE	B,D			; Dump size
+	MOVX	C,FLD(^D11,NO%COL)!FLD(^D8,NO%RDX)
+	NOUT				;  ..
+	 ERJMP	[JFATAL	<NOUT failed for size>]
+	SETZ	B,			; bind off size
+	IDPB	B,A			; write it.
+
+	ADDI	D,TBLOCK-1		; Okay, calculate blocks
+	IDIVI	D,TBLOCK		;  ..
+	MOVEM	D,BLOCKS		;  ..
+
+	MOVE	V,A			; copy bp (save it)
+	MOVEI	A,(Y)			; get JFN of file
+	MOVX	B,<1,,.FBWRT>		; get user write date
+	MOVEI	C,E			; put result in E
+	GTFDB%
+	 ERJMP	[JFATAL <GTFDB failed for %15J>]
+	CALL	TPSTIM			; convert to unix time format
+	MOVE	A,V			; restore bp
+	MOVX	C,FLD(^D11,NO%COL)!FLD(^D8,NO%RDX)	; write mtime
+	NOUT%				;  ..
+	 ERJMP	[JFATAL	<NOUT failed for mtime>]
+	SETZ	B,
+	IDPB	B,A			; Bind off mtime
+	MOVE	V,A			; Get back bp ( save it)
+
+	MOVEI	D,^D8			; Fill out checksum area
+	MOVEI	B," "			;  ..
+	 IDPB	B,A			;  ..
+	SOJG	D,.-1			;  ..
+	SETZ	B,			; Zero initial checksum
+	MOVE	A,[POINT 8,FILBUF,-1]
+	MOVX	D,TBLOCK		; Number of characters to check
+WRTIN3:	ILDB	C,A			; Fetch a byte
+	ADDI	B,(C)			; Fold it in
+	SOJG	D,WRTIN3		; More?
+
+	MOVE	A,V			; Copy bp
+	MOVX	C,FLD(^D6,NO%COL)!FLD(^D8,NO%RDX)
+	NOUT%				;  Dump checksum
+	 ERJMP	[JFATAL	<NOUT failed for checksum>]
+	RET				; all done. (do a jrst writap)
+SUBTTL	Miscellaneous tape activities - Reading
+
+; RDTAPE - read one 512 byte record from the tape buffer (TBUF) into the file
+;          buffer (FILBUF).  Enter w/ T preset to NBLOCK, when reading at BOT.
+
+RDTAPE:	CALL	SKPTAP			; advance a "block"
+	CALL	DUPY			; copy the block
+	RET				; all done.
+
+; SKPTAP - advance one 512 byte record; read tape if necessary.
+
+SKPTAP:	CAIGE	T,NBLOCK		; recno >= nblock?
+	 JRST	RDTAP0			;  No, go on
+	XEC	GRABT			; Yes, grab another
+	SETZ	T,			;  and zero recno
+RDTAP0:	MOVX	A,<POINT 8,0,-1>
+	MOVE	V,T
+	IMULI	T,TBLOCK
+	IDIVI	T,4			; 4 8-bit bytes
+
+	HRRI	A,TBUF(T)		; Point to word
+	SKIPE	TT			; Further alignment?
+	 IBP	A			;  ..
+	SOJG	TT,.-1			;  ..
+	MOVEI	T,1(V)			; Increment recno
+	RET				; Done
+
+; DUPY - copy the current "block" into FILBUF
+
+DUPY:	MOVE	B,[POINT 8,FILBUF]
+	MOVX	C,-TBLOCK		; Get number of bytes
+	SIN%				; Transfer
+	RET				; Done
+
+; GRABT - grab another 512*20 byte block from the tape.
+
+GRABT:	MOVE	A,MTAJFN		; Get JFN (source)
+	MOVE	B,[POINT 8,TBUF]
+	MOVX	C,-TBLOCK*NBLOCK	; Read this many chars
+	SIN%				;  ..
+	RET				;  ..
+
+		PAGE
+; PRINFO - print the directory info currently in DIRBLK to the terminal
+
+PRINFO:	MOVEI	A,.PRIOU			; output to terminal
+	SKIPN	VRBFLG				; be verbose?
+	 JRST	PRTNAM				;  no, just print filename
+
+	MOVE	B,MODE						; MODE
+	MOVX	C,NO%LFL!FLD(^D4,NO%COL)!FLD(^D8,NO%RDX)
+	NOUT%
+	 ERJMP	[JFATAL <NOUT failed for mode>]
+
+	MOVE	B,UID						; UID
+	MOVX	C,NO%LFL!FLD(^D4,NO%COL)!FLD(^D10,NO%RDX)
+	NOUT%
+	 ERJMP	[JFATAL <NOUT failed for uid>]
+
+	MOVEI	B,"/"		; write a "/"
+	BOUT%			; ..
+
+	MOVE	B,GID						; GID
+	MOVX	C,FLD(^D4,NO%COL)!FLD(^D10,NO%RDX)
+	NOUT%
+	 ERJMP	[JFATAL <NOUT failed for gid>]
+
+	MOVE	B,SIZE						; SIZE
+	MOVX	C,NO%LFL!FLD(^D8,NO%COL)!FLD(^D10,NO%RDX)
+	NOUT%
+	 ERJMP	[JFATAL <NOUT failed for size>]
+
+	MOVEI	B," "			; write a space
+	BOUT%				; ..
+
+	MOVE	E,MTIME			; convert unix time into 20/20 time
+	CALL	UNXTIM			;  ..
+	MOVX	C,OT%4YR!OT%DAM!OT%SPA!OT%NSC	; this way: Jan 23 1982 23:59
+	ODTIM%				; doit.
+	 ERJMP	[JERROR <ODTIM failed for mtime>
+		 JRST .+1]
+
+	MOVEI	B," "			; write a space
+	BOUT%				; ..
+
+PRTNAM:	MOVE	B,[POINT 7,DIRBLK,-1]				; FILENAME
+	MOVEI	C,^D100				; char[100]...
+	SETZ	D,				; or a null
+	SOUT					; write it.
+
+	PRINT	EOL
+	RET
+
+SUBTTL	TAPE  - declare the tape unit
+
+Z.TAPE:	NOISE	(unit is)		; Noise
+	FIELD	TAPCMD			; Get a device
+	MOVE	T,B			; Save the designator
+	HRRZ	C,C			; See what we got
+	CAIE	C,TAPCMD		; A tape?
+	 JRST	[CONFRM
+		 HRROI A,MTABUF		; Make filestring
+		 MOVE B,T		; JFN
+		 MOVX C,JS%SPC		; Output full spec
+		 JFNS%
+		 SETOM DSKMTA		; Flag MTA is really a disk
+		 JRST COMLOP]
+	CONFRM				; Confirm
+	SETZM	DSKMTA			; Flag MTA is really an MTA
+	HLRZ	E,T			; Get .DVDES+DV.TYP
+	CAIE	E,.DVDES+.DVMTA		; A tape unit?
+	 JRST	[HRROI	A,ABBUF		;  No, so type it
+		 ERROR	<Device %1W: is not a tape unit>
+		 JRST	COMLOP]		;  and leave
+	HRROI	A,STRBUF		; Get "the" name
+	MOVE	B,T			;  ..
+	DEVST				;  ..
+	 ERJMP	[JERROR	<DEVST failed>	;  Oops
+		 JRST	COMLOP]		;   ..
+	MOVEI	C,":"			; Write the colon
+	IDPB	C,A			;  ..
+	SETZ	C,			; Bind it
+	IDPB	C,A			;  ..
+	MOVX	A,GJ%SHT		; Short form
+	HRROI	B,STRBUF		; Point to it
+	HRROI	C,STRBUF		; Copy (in case of error)
+	GTJFN				; Get it
+	 ERJMP	[JERROR	<Unable to access %3W>
+		 JRST	COMLOP]		;  Oops
+	RLJFN				; Okay, release it
+	 JWARN	<Error releasing %3W>	;  sigh
+	HRROI	A,MTABUF		; Copy it
+	HRROI	B,STRBUF		;  ..
+	SETZ	C,			;  ..
+	SOUT				;  ..
+	JRST	COMLOP			; Done
+SUBTTL	REWIND - Rewind the tape
+
+Z.REWI:	NOISE	(tape unit)		; Noise
+	CONFRM				; Confirm
+	MOVX	T,OF%RD			; Set for read
+	XEC	GETAPE			; Get the unit
+	 JRST	COMLOP			;  Failed!
+	MOVX	B,.MOREW		; Get rewind function
+	HRROI	D,MTABUF		; Copy (in case of error)
+	SKIPN	DSKMTA
+	 MTOPR				; Do it
+	  ERJMP	[JWARN	<Unable to rewind %4W>
+		 JRST	.+1]		;  ..
+	CALL	RELTAPE			; release tape
+	JRST	COMLOP			; Done
+
+		  PAGE
+GETAPE:	SKIPN	MTABUF			; Specified
+	 JRST	[ERROR	<No tape unit specified>
+		 RET]			;  Nope
+
+	MOVX	A,GJ%SHT		; Get it
+	HRROI	B,MTABUF		;  ..
+	HRROI	C,MTABUF		; Copy (in case of error)
+	GTJFN				;  ..
+	 ERJMP	[JERROR	<Unable to access %3W>
+		 SETZM	MTABUF		;  ..
+		 RET]			;  ..
+	MOVEM	A,MTAJFN		; Save it
+
+	MOVX	B,FLD(^d8,OF%BSZ)		; Open it
+	TDO	B,T			;  ..
+	OPENF				;  ..
+	 ERJMP	GETAP0			;  You lose
+
+	MOVX	B,.MOCLE		; Clear previous status
+	SKIPN	DSKMTA
+	 MTOPR				;  ..
+	  ERJMP	.+1			;  sigh
+	RETSKP				; Win
+
+GETAP0:	HRROI	B,MTABUF		; Oops
+	JERROR	<Unable to read %2W>	; Say it
+	MOVE	A,MTAJFN		; Get back JFN
+	RLJFN				; Release it
+	 JWARN	<Error releasing %2W>	;  sigh
+	RET				; Lose
+
+SETAPE:	XEC	GETAPE				; Get the tape & Setup modes
+	 RET				;  Oops.
+	XEC	SETMOD			; set modes: industry & bytes/record.
+	 CALLRET RELTAPE		;  Oops.
+	RETSKP
+
+SETREW:	MOVE	A,MTAJFN		; rewind tape
+	MOVX	B,.MOREW
+	SKIPN	DSKMTA
+	 MTOPR
+	  ERJMP	[JERROR	<Unable to rewind tape>
+		 RET]
+	RETSKP
+			 page
+SETMOD:	MOVE	A,MTAJFN		; Get the tape unit's JFN
+	MOVX	B,.MOSDM		; Set the mode
+	MOVX	C,.SJDM8		; Industry compatible
+	SKIPN	DSKMTA
+	 MTOPR				; Do it
+	  ERJMP	[JERROR	<Unable to set industry compatible mode>
+		 RET]
+	MOVE	A,MTAJFN
+	MOVX	B,.MOSRS
+	MOVX	C,TBLOCK*NBLOCK
+	SKIPN	DSKMTA
+	 MTOPR
+	  ERJMP	[JERROR	<Unable to set bytes per record>
+		 RET]
+	RETSKP
+
+RELTAP:	MOVE	A,MTAJFN		; Get tape-unit's JFN
+	HRROI	B,MTABUF		; Copy (in case of error)
+	CLOSF%				; Close it
+	 JWARN	<Error closing %2W>	;  Oops
+	RET
+
+SUBTTL	SKIP - Skip Tape
+
+Z.SKIP:	NOISE	(number of savesets)
+	FIELD	NUMCMD
+	MOVE	TT,B		;save the number
+	CONFRM
+
+	MOVX	T,OF%RD			; Set for read
+	XEC	SETAPE			; Get the unit, and set modes
+	 JRST	COMLOP				;  Failed!
+	CALL	Z.SK0		; skip tape
+	CALL	RELTAPE
+	JRST	COMLOP		; and return to command loop
+
+Z.SK0:	MOVX	T,.MOFWF	; default is forward	; skip value in TT
+	JUMPG	TT,Z.SK1
+	MOVX	T,.MOBKF		; backward file
+	MOVNS	TT,TT	; negate nfiles to move
+
+Z.SK1:	MOVE	B,T			; skip file
+	HRROI	D,MTABUF		; Copy (in case of error)
+	SKIPN	DSKMTA
+	 MTOPR				; Do it
+	  ERJMP	[jwarn	<Unable to advance %4W>
+		 JRST	.+1]		;  ..
+	SOJGE	TT,Z.SK1
+
+	hrroi	d,mtabuf		; copy (in case of error)
+	gdsts%
+	 erjmp	[jwarn <Unable to stat %4W>
+		 jrst .+1]
+	TXNE	B,MT%BOT		; at bot?
+	 RET				;  yes, don't go forward.
+
+z.sk2:	movx	b,.mofwf		; and go forward one file
+	hrroi	d,mtabuf
+	SKIPN	DSKMTA
+	 mtopr%
+	  erjmp	[jwarn <Unable to skip %4W>
+		 jrst .+1]
+	RET
+
+SUBTTL	EXIT - terminate Tar
+
+Z.EXIT:	NOISE	(from Tar)		; Noise
+	CONFRM				; Confirm
+	HALTF				; Stop
+	JRST	COMLOP			; And back
+SUBTTL	HELP - try to be useful
+
+Z.HELP:	NOISE	(with Tar)		; Noise
+	CONFRM				; Confirm
+	MOVX	A,GJ%SHT!GJ%OLD
+	HRROI	B,[ASCIZ@HLP:TAR.COM@]
+	GTJFN
+	 ERJMP	[ERROR	<No help file available>
+		 JRST	COMLOP]
+HELP1:	MOVX	B,FLD(^D7,OF%BSZ)!OF%RD
+	OPENF
+	 ERJMP	[JERROR	<Can't open help file>
+		 JRST	COMLOP]			; And back
+	MOVE	Y,A
+HELP0:	MOVE	A,Y
+	BIN
+	 ERJMP	COMLOP
+	JUMPE	B,COMLOP
+	MOVEI	A,.PRIOU
+	BOUT
+	JRST	HELP0
+
+SUBTTL	TAKE - read commands from a file
+
+Z.TAKE:	NOISE	(commands from)		; Noise
+	SETZM	CMGJFN			; Zero GTJFN block
+	MOVE	A,[CMGJFN,,CMGJFN+1]	;  ..
+	BLT	A,CMGJFN+CMGLEN-1	;  ..
+	MOVE	A,[TAKBLK,,CMGJFN]	; Copy TAKBLK 
+	BLT	A,CMGJFN+TAKLEN-1	;  ..
+	FIELD	TAKCMD			; Parse it
+	HRRZ	C,C			; See what we got
+	CAIN	C,CFMCMD		; Confirm?
+	 JRST	DOTAK1			;  Yes
+	MOVE	D,B			; No, save JFN
+	CONFRM				; Confirm
+	MOVE	A,CMJFNP		; Get pointer
+	AOBJP	A,[CALL ERRDO		;  Too many, close 'em all up
+		   ERROR <Too many nested TAKE commands>
+		   JRST COMLOP]
+	MOVEI	A,(D)			; Open it
+	MOVX	B,FLD(7,OF%BSZ)!OF%RD	;  ..
+	OPENF				;  ..
+	 ERJMP	[JERROR	<Error opening command file>
+		 JRST COMLOP]		;  oh well
+	MOVE	A,CMJFNP		; Set up for new file
+	PUSH	A,CMJFNS		;  ..
+	MOVEM	A,CMJFNP		;  ..
+	HRLI	D,.NULIO		;  ..
+	MOVSM	D,CMJFNS		;  ..
+	JRST	COMLOP			; And back
+
+DOTAK1:	SKIPE	CMJFNS			; TAKE file in progress?
+	 CALL	TAKFIN			;  Yes, close it down
+	JRST	COMLOP			; And back
+SUBTTL	INITAR - Try to get the TAR: device
+
+INITAR:	HRROI	A,[ASCIZ@Tar:@]		; Get the device designator for TAR:
+	STDEV				;  ..
+	 ERJMP	CPOPJ			;  Not there
+	HLRZ	A,B			; Is it a tape unit?
+	CAIE	A,.DVDES+.DVMTA		;  ..
+	 RET				;  Nope
+
+	HRROI	A,STRBUF		; Get the "official" name
+	DEVST				;  ..
+	 RET				;  Sigh
+	MOVEI	C,":"			; Bind it
+	IDPB	C,A			;  ..
+	SETZ	C,			;  ..
+	IDPB	C,A			;  ..
+
+	MOVX	A,GJ%SHT		; Get a handle on it
+	HRROI	B,STRBUF		;  ..
+	GTJFN				;  ..
+	 RET				;  Sigh
+	RLJFN				; Release it
+	 ERJMP	.+1			;  Say what?
+
+	HRROI	A,MTABUF		; Copy it
+	HRROI	B,STRBUF		;  ..
+	SETZ	C,			;  ..
+	SOUT				;  ..
+	RET				;  ..
+SUBTTL	UUOH - LUUO handler
+
+; UUO enters here via JSR UUOH
+UUOH:	0			;Ret adr for JSR entry
+	AOSE INUUO		;Recursive call?
+	 JRST [	MOVEM A,TEMPAC	;Yes???
+		HRROI A,[ASCIZ/Recursive UUO call illegal!/]
+		PSOUT
+		MOVE A,TEMPAC
+		JRST %FATAL]
+	MOVEM A,UUOACS+A	;Save an ac
+	MOVEM P,UUOACS+P	;And the stack
+	MOVE P,[IOWD NUPDL,UUOPDL]  ;Set up local stack
+	PUSH P,UUOH		;Save the calling pc
+	PUSH P,[UUORTP]		;Put stack restore entry on
+	LDB A,[POINT 9,40,8]	;a := opcode field
+	JRST @UUOS(A)		;Dispatch to handler routine
+	
+; Here to save whole ac block and set up for RET to restore acs and
+; return.  Entered by JSR UUOSV
+UUOSV:	0
+	MOVE A,UUOACS+A		;Restore entry a
+	MOVEM 16,UUOACS+16	;Save all ACs (P done on entry)
+	MOVEI 16,UUOACS
+	BLT 16,UUOACS+15
+	PUSH P,[UUORT]		;Put ac restore entry on stack
+	JRST @UUOSV
+
+; Here to restore ac block and return +1 to user.
+UUORT:	MOVSI 16,UUOACS		;Restore ACs
+	BLT 16,16
+	RET
+
+; Here to restore single ac and return +1 to user.
+UUOFRT:	MOVE A,UUOACS+A		;Recover ac
+	RET
+
+; Here to restore return adr and caller's stack ptr
+UUORTP:	POP P,UUOH		;UUOH := return adr
+	MOVE P,UUOACS+P		;p := caller's stack
+	SOS INUUO		;Reset the entry flag
+	JRST @UUOH
+
+; UUO handler dispatch table
+UUOS:	0
+	%PRINT
+	%TYPE
+	%ETYPE
+	%ERROR
+
+		  PAGE
+;; Print a character
+%PRINT:	HRRZ A,40		;Get byte
+	CAIN A,EOL		;PRINT EOL means do CRLF
+	 JRST [	XEC CRLF	;Do it
+		JRST UUOFRT ]
+	PBOUT
+	JRST UUOFRT		;Take fast return
+
+;; Type a string after crlf if needed
+%TYPE:	SKIPN PRINTP
+	 JRST UUOFRT
+	XEC TYCRIF		;Check if we should do a CRLF
+%TYPE0:	HRRO A,40		;Get string
+	PSOUT
+	JRST UUOFRT
+
+;; Do a conditional crlf
+TYCRIF:	MOVE A,40		;Get instruction
+	TLNE A,(<10,0>)		;Wants CRLF all the time?
+	 JRST CRLF		;Yes
+	TLNE A,(<1,0>)		;Wants fresh line?
+	 JRST CRIF		;Yes
+	RET
+
+;; Do crlf if not at start of line currently
+CRIF:	PUSH P,A
+	PUSH P,B
+	XEC CRIF1		;Do it
+	SKIPA
+POPCBA:	POP P,C
+POPBAJ:	POP P,B
+CPOPAJ:	POP P,A
+	RET
+
+CRIF1:	MOVEI A,.PRIOU
+	RFPOS
+	TRNE B,-1		;If not at start of line,
+	 XEC CRLF1		;Type CRLF
+	RET
+
+;; Do crlf unconditionally
+CRLF:	PUSH P,A
+	XEC CRLF1
+	JRST CPOPAJ
+
+CRLF1:	HRROI A,CRLF0
+	PSOUT
+	RET
+
+CRLF0:	ASCIZ/
+/
+
+		  PAGE
+;; Print error messages
+%ERROR:	JSR UUOSV		;Save the ac context
+	XEC CRIF		;Get a fresh line
+	MOVE B,40		;Get instruction
+	TLNE B,(<10,0>)		;Wants %?
+	 SKIPA A,["?"]		;No
+	  MOVEI A,"%"
+	PBOUT
+%ERR1:	TRNN B,-1		;Any message to print?
+	 JRST %ERR2		;No
+	XEC %ETYE0		;Yes, print it out
+	MOVE B,40		;And recover instruction
+%ERR2:	TLNN B,(<4, 0>)		;Wants JSYS error message?
+	 JRST %ERR3
+	HRROI A,[ASCIZ / - /]
+	TRNE B,-1		;If a previous message, type delimiter
+	 PSOUT
+	MOVEI A,.PRIOU
+	HRLOI B,.FHSLF		;This fork
+	SETZ C,
+	ERSTR
+	 NOP
+	 NOP
+%ERR3:	XEC CRLF
+	LDB A,[POINT 2,40,12]	;Get low order bits of ac field
+	JRST %ERRS(A)
+
+%ERRS:	JRST %FATAL		;0 - not used
+%ERRET:	JRST %FATAL		;1 - not used
+	JRST %FATAL		;2 - return to EXEC
+	RET			;3 - return to user
+
+;; Here on fatal error
+%FATAL:	HALTF
+	HRROI A,[ASCIZ /?Can't continue
+/]
+	PSOUT
+	JRST %FATAL
+
+		  PAGE
+;; Here to print a string, filling in escape sequences
+%ETYPE:	JSR UUOSV		;Save the ac context
+	SKIPN PRINTP
+	 RET
+	XEC TYCRIF		;Type a CRLF maybe
+%ETYE0:	HRRZ N,40
+%ETYS0:	HRLI N,(<POINT 7,0>)	;Get byte pointer to string
+%ETYP1:	ILDB A,N		;Get char
+	JUMPE A,CPOPJ		;Done
+	CAIE A,"%"		;Escape code?
+	 JRST %ETYP0		;No, just print it out
+	SETZ O,			;Reset AC
+%ETYP2:	ILDB A,N
+	CAIL A,"0"		;Is it part of addr spec?
+	 CAILE A,"7"
+	  JRST %ETYP3		;No
+	IMULI O,^D8		;Yes, increment address
+	ADDI O,-"0"(A)
+	JRST %ETYP2
+%ETYP3:	CAIG A,"Z"
+	 CAIGE A,"A"
+	  JRST %ETYP0
+	XEC @%ETYTB-"A"(A)	;Do dep't thing
+	JRST %ETYP1
+
+%ETYP0:	PBOUT
+	JRST %ETYP1
+
+		  PAGE
+%ETYTB:	%ETYPA			;A - print time
+	%ETYPB			;B - print date
+	%ETYP0			;C
+	%ETYPD			;D - print decimal
+	%ETYER			;E - error code
+	%ETYPF			;F - floating
+	%ETYP0			;G
+	%ETYPH			;H - RH as octal
+	%ETYP0			;I
+	%ETYPJ			;J - filename
+	REPEAT 4,<%ETYP0>	;K, L, M, N
+	%ETYPO			;O - octal
+	%ETYPP			;P - pluralizer
+	REPEAT 2,<%ETYP0>	;Q, R
+	%ETYPS			;S - string with escape sequences
+	%ETYPT			;T - date and time
+	%ETYPU			;U - user name
+	%ETYP0			;V
+	%ETYPW			;W - string with no escapes
+	REPEAT 3,<%ETYP0>	;X, Y, Z
+
+		  PAGE
+;; Print time only
+%ETYPA:	MOVSI C,(OT%NDA)	;No day, just time
+	JRST %ETYB0
+
+;; Options for printing just day or date/time
+%ETYPT:	TDZA C,C		;Both date and time
+%ETYPB:	 MOVSI C,(OT%NTM)	;No time, just day
+%ETYB0:	JUMPE O,.+2		;If AC field spec'd
+	 SKIPA B,UUOACS(O)	;Use it
+	  SETO B,		;Else use now
+	MOVEI A,.PRIOU
+	ODTIM
+	RET
+
+;; Print decimal and octal numbers
+%ETYPD:	SKIPA C,[^D10]		;Decimal
+%ETYPO:	 MOVEI C,^D8		;Octal
+	MOVE B,UUOACS(O)	;Get data
+%ETYO0:	MOVEI A,.PRIOU
+	NOUT
+	 NOP
+	RET
+
+;; Print string for specified error code
+%ETYER:	MOVEI A,.PRIOU
+	MOVSI B,.FHSLF		;This fork
+	HRR B,UUOACS(O)		;Get error code
+	SETZ C,
+	ERSTR
+	 NOP
+	 NOP
+	RET
+
+		  PAGE
+;; Print floating point number
+%ETYPF:	MOVEI A,.PRIOU
+	MOVE B,UUOACS(O)
+	SETZ C,
+	FLOUT
+	 NOP
+	RET
+
+;; Print RH of number in octal
+%ETYPH:	MOVEI C,^D8
+	HRRZ B,UUOACS(O)
+	JRST %ETYO0
+
+;; Print file name from jfn
+%ETYPJ:	MOVEI A,.PRIOU
+	HRRZ B,UUOACS(O)
+	MOVE C,[001110,,1]
+	JFNS
+	RET
+
+;; Add "S" depending on the value of a number
+%ETYPP:	MOVEI A,"s"
+	MOVE B,UUOACS(O)
+	CAIE B,1
+	 PBOUT			;Make plural unless just one
+	RET
+
+;; Recursive string output with escape sequence handling
+%ETYPS:	PUSH P,N
+	SKIPE N,UUOACS(O)
+	 XEC %ETYS0		;Recursive call
+CPOPNJ:	POP P,N
+	RET
+
+;; Print directory or user name
+%ETYPU:	MOVEI A,.PRIOU
+	MOVE B,UUOACS(O)
+	DIRST
+	 NOP
+	RET
+
+;; String output without further escape sequence handling
+%ETYPW:	MOVE A,UUOACS(O)
+	TLNN A,-1
+	 HRLI A,(<POINT 7,0>)
+	PSOUT
+	RET
+SUBTTL	The End!
+
+TAR$L::					; literals go here
+
+		   END <EVECL,,EVEC>

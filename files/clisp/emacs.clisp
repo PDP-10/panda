@@ -1,0 +1,206 @@
+;;; -*- Mode:CLisp; Package:Emacs -*-
+; Aida::Ss:<Clisp.Upsala>Emacs.Clisp.7,  8-May-86 01:30:50, Edit by Victor
+; Make get-definition hack special forms.
+; Aida::Ss:<Clisp.Upsala>Emacs.Clisp.50,  1-Sep-85 15:44:28, Ed: Victor
+; Completed the Lisp part, I think?
+;;; ****************************************************************
+;;; This is the Lisp part of the Common Lisp<->Emacs interface, written by
+;;; Bjorn Victor, Computing Science Dept, Uppsala University, Sweden.
+
+(provide "EMACS")
+(in-package "EMACS" :nicknames '("TECO"))
+;(shadow )
+(export '(ed edit emacs start-emacs kill-emacs get-definition))
+(eval-when (eval load)
+  (or (fboundp (find-symbol "EDITOR-MODIFIED-P" *lisp-package*))
+      (load "clisp:modified-p.lap")))
+;(require)
+(use-package "LISP")
+
+(import '(lisp::editor-kill-fork lisp::editor-create-fork
+	  lisp::editor-buffer-size lisp::editor-call-fork 
+	  lisp::editor-get-fork lisp::editor-set-modified
+	  lisp::editor-write-channel lisp::editor-run-fork
+	  lisp::editor-clip-buffer lisp::editor-set-jcl
+	  lisp::editor-clear-buffer lisp::editor-read-channel
+	  lisp::editor-modified-p
+	  lisp::pretty-lambda-to-defun))
+
+
+(make-feature :emacs)
+
+(defconstant ESC (string #\escape) "The Escape character")
+(defvar *emacs-started* nil "Flag that Emacs started our way")
+
+(defun string-conc (&rest args)
+  "Concatenate args to one string"
+  (apply #'concatenate
+	 (cons 'string
+	       (mapcar #'string
+		       args))))
+
+; Same thing as editor-create-fork, except it starts EMACS in entry vector
+; position 2, to set FS LISPT nonzero.
+(defun init-emacs-top-level ()
+  "Initiate emacs top level"
+  (cond (*emacs-started*
+	 (editor-set-modified nil))	; Make sure buffer isn't modified
+	(t
+	 (editor-kill-fork)		; Kill any Emacs
+	 (setq *emacs-started* (editor-get-fork))	; Get a new
+	 (editor-set-jcl (string-conc "CLISP " ESC "m(m.m CLISP mode" ESC ")"
+				      ESC "0fsEXIT" ESC ESC)) ; Set up JCL
+	 (editor-run-fork 2)		; Make FS LISPT nonzero
+	 (editor-set-modified nil)))	; Make sure buffer isn't modified
+	 
+  t)
+
+
+(defun start-emacs ()
+  "Start EMACS.
+  Good for re-setting terminal length etc, which is only read at start.
+  Good anytime EMACS seems screwed up."
+  (emacs t))
+
+(defun emacs (&optional start-it)
+  "Read-Eval-Print top level for Emacs.
+  The optional Start-It argument should be non-nil to start Emacs
+  instead of just continuing it."
+  (let ((terminal-modes (get-terminal-modes *terminal-io*)))
+    (unwind-protect
+     (catch 'user::exit-emacs
+       (set-terminal-modes *terminal-io* :translate nil)
+       (init-emacs-top-level)		; Init Emacs
+       (loop
+	(when (editor-modified-p)	; User wants something done
+	  (let ((input (read (editor-read-channel) nil)) ; Read what
+		(och (editor-write-channel)))
+	    (editor-buffer-size 0)	; Close gap
+	    (let ((*standard-output* och))
+	      (dolist (x (multiple-value-list (eval input))) ; Eval to buffer
+		(format t "~S~%" x)))	; And print result there too
+	    (editor-clip-buffer och))	; Clip buffer
+	  (editor-set-modified nil))	; Don't redo it
+	(editor-run-fork	        ; Continue (or start) Emacs
+	 (and start-it (progn (setq start-it nil)
+			      0)))))
+					; Throw out: Reset terminal
+     (apply #'set-terminal-modes *terminal-io* terminal-modes)))
+  (editor-set-modified nil))		; Make sure we don't read again
+
+(defun ed (&optional thing)
+  "Edits something.  With no argument or NIL, just continues EMACS.
+  With a symbol name, it edits the incore definition.
+  With a pathname or string, it edits a file."
+  (cond ((null thing))			; No args
+	((symbolp thing)		; Edit function
+(error "NYI - This feature is Not Yet Implemented~%~
+       Meanwhile, use M-X Edit Definition$ in EMACS instead")
+	 (if (not (get-definition thing)) ; Any definition?
+	     (error "No definition for ~S to edit." thing)) ; No
+	 (tell-emacs :edit-function thing)) ; Yes, tell Emacs to edit it
+	(t				; Else must be a filespec
+	 (tell-emacs :edit-file (namestring thing)))) ; Tell Emacs about it
+  (emacs))				; And go to Emacs
+
+(defmacro edit (&optional thing)
+  "Edits something.  Just like ED except that is does not evaluate its
+  argument."
+  `(ed ',thing))
+
+(defun tell-emacs (&optional &key
+			     (edit-file nil ?file)
+			     (edit-function nil ?function)
+			     (teco-code nil ?teco))
+  "Tell Emacs to do something through JCL."
+  (init-emacs-top-level)
+  (cond (?file
+	 (let ((jcl (string-conc "CLISP m(m.mFind File" ESC
+					  ")" edit-file ESC)))
+	   (if ?teco
+	       (setq jcl (string-conc jcl ESC teco-code)))
+	   (editor-set-jcl jcl)))
+	(?function
+	 (let ((jcl
+		(string-conc "CLISP m(m.mEdit Definition" ESC ")"
+			     edit-function ESC))) 
+	   (editor-set-jcl jcl)))
+	((and ?teco (not ?file))
+	 (editor-set-jcl (string-conc "CLISP " teco-code)))
+	(t
+	 (error "You must tell me what to tell Emacs"))))
+
+
+(defun kill-emacs ()
+  "Kills Emacs, as we know it"
+  (setq *emacs-started* nil)
+  (editor-kill-fork))
+
+
+(defun get-definition (sym)
+  "Get a definition for sym.  Either a sexpr or a filename is returned."
+  (flet ((car-or-it (x)
+	   (if (listp x) (car x) x)))
+  (if (not (fboundp sym)) nil		; No definition?
+    (cond ((or (compiledp sym) (special-form-p sym)) ; If compiled, 
+	   (car-or-it
+	    (documentation sym 'lisp::source))) ; try getting the source file
+	  ((car-or-it (documentation sym 'lisp::source)))
+	  (t
+	   (let ((fun (symbol-function sym)))	; Else get function
+	     (case (car fun)
+	       (lambda			; Get a lambda
+		(string-trim '(#\Newline #\Space #\Tab)
+			     (with-output-to-string (s)
+			       (pprint (pretty-lambda-to-defun sym fun) s))))
+	       (macro			; Or a macro
+		(string-trim '(#\Newline #\Space #\Tab)
+			     (with-output-to-string (s)
+			       (pprint
+				(cons 'macro (cdr (pretty-lambda-to-defun
+						   sym (cdr fun)))) s))))
+	       (t `(setf (symbol-function ,sym) ',fun))))))))) ; Or something else
+
+;;;**** This should already have been in Doc-Strings.Clisp
+
+(defmacro def-doc (sym descr)
+  `(lisp::%set-documentation ,sym 'function ,descr))
+
+(def-doc 'editor-call-fork
+  "Calls the editor fork's Fs Superior with the integer arg given")
+
+(def-doc 'editor-set-jcl
+  "Sets up JCL for the editor")
+
+(def-doc 'editor-run-fork
+  "Starts the editor. With a small integer arg starts the fork at that entry
+  vector offset. If arg is NIL and the fork has been started, continues, else
+  starts in entry vector offset 0.")
+
+(def-doc 'editor-clear-buffer
+  "Clears the current buffer")
+
+(def-doc 'editor-write-channel
+  "Returns a channel for writing into the buffer at point.")
+
+(def-doc 'editor-read-channel
+  "Returns a channel for reading from the buffer.")
+
+(def-doc 'editor-create-fork
+  "Make sure the editor has a valid buffer")
+
+(def-doc 'editor-clip-buffer
+  "Call after done writing - updates point, etc.")
+
+(def-doc 'editor-set-modified
+  "Sets the current buffer modified or not (T/NIL)")
+
+(def-doc 'editor-kill-fork
+  "Kill the current editor fork if it exists")
+
+(def-doc 'editor-buffer-size
+  "Returns the size of the buffer")
+
+(def-doc 'editor-get-fork
+ "Make sure we have an editor fork.  Creating it if needed.")
+

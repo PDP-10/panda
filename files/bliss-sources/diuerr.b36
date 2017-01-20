@@ -1,0 +1,971 @@
+%TITLE 'DIU error handler code'
+
+MODULE DIUERR (IDENT = '252',
+               LANGUAGE(BLISS36),
+               ENTRY(DIU$MESSAGE,       ! Print DIU error message
+                     DIU$ERRMSG,        ! Return DIU error message text
+                     DIU$ABORT,         ! DIU standard SIGNAL handler
+                     E$FILES)           ! Return offensive filenames from FABs
+		) =
+BEGIN
+!++
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+! FACILITY:     DIU-10/20 (Data Interchange Utility for TOPS-10/20)
+!
+! ABSTRACT:     This module contains the various routines needed to provide
+!               condition and error handling support for DIU-10/20.
+!
+! ENVIRONMENT:  TOPS-10 V7.02 or TOPS-20 V6.1, RMS V3, BLISS-36 V4, XPORT
+
+! HISTORY:
+!
+!  252	Remove library of CONDIT.
+!	Sandy Clemens  1-Jul-86
+!
+!  240  Make DIXTAB global so that it can be used from DIUCSR.
+!       Gregory A. Scott 19-Jun-86
+!
+!  236  Change library of DIXLIB to DIUDIX.
+!       Sandy Clemens  19-Jun-86
+!
+!  171  No need to call S$LGOUT (slave will HALTF causing LGOUT), so remove it.
+!       Gregory A. Scott 19-May-86
+!
+!  150  E$LIST should treat NAM$A_ESA and NAM$A_RSA fields  as  byte  pointers,
+!       not as the address of the start of the string.
+!       Gregory A. Scott 9-May-86
+!
+!  147  Be a little smarter about returning error message strings from here  so
+!       that DIU events are always labelled  as such, and other error  messages
+!       are prefixed by DIU (e.g. "?DIU RMS event nnnnnn: text").
+!       Gregory A. Scott 8-May-86
+!
+!  144  Add extra argument to DIU$MESSAGE which  is a logical flag.  If  FALSE,
+!       then never write this error to the system log, if TRUE, write it to the
+!       system log if we are the spooler.
+!       Gregory A. Scott 7-May-86
+!
+!  135  Clean up  routines DIU$$ERRMSG  and  DIX$ERRMSG, remove  TOPS20  macro.
+!       Punt the extra quotes around the additonal text in DIU$ERRMSG.
+!       Gregory A. Scott 1-May-86
+!
+!  134  Routine DIU$MESSAGE now sends  the error to the  system log file if  we
+!       (yet) the spooler job.  Routine  DIU$$ERRMSG doesn't need to be  global
+!       and doesn't need to do two $STR_COPYs when one will do.
+!       Gregory A. Scott 30-Apr-86
+!
+!  132  Restart timing logic should be in SP$START, not here.
+!       Gregory A. Scott 28-Apr-86
+!
+!  126  Add output of CRLF  at the end of  all messages output by  DIU$MESSAGE.
+!       This makes  TAKE/NOECHO stuff  look  better.  Routine  E$FILES  doesn't
+!       return a value any more.
+!       Gregory A. Scott 26-Apr-86
+!
+!  123  Handle code2 properly if  a TOPS-20 error  code in DIU$ABORT.   Restart
+!       the spooler if we are (yet) the spooler and we enter DIU$ABORT.  Change
+!       name R$$LIST to E$FILES, because DIL  has an R$$LIST.  Use Sandy's  new
+!       code in E$FILES (nee R$$LIST).
+!       Gregory A. Scott 23-Apr-86
+!
+!   105	Change error messages to display '%DIU Event nnn: ...' rather than
+!	'%DIU20: Event nnn: ...'.
+!	Sandy Clemens	1-Apr-86
+!
+!    64	Teach DIU about the new signal codes from PATPARSER.  Add setting
+!       and clearing of GLOBAL patpar_warn flag.  Do general cleanup.
+!	Sandy Clemens  15-Jan-86
+!
+!    52 Make error text NOT display passwords.
+!	Sandy Clemens	12-Nov-85
+!
+!    11	Remove error table definition from ERROR.B36 and put it into DIU.R36
+!       for the general world to use.  Add DIU$CONVERR error to DIU.R36.
+!       Sandy Clemens	26-Jun-85
+!
+!    10	Make default transform generation code use the DIU top level condition
+!       handler rather than DIU$TRANS_HANDLER.
+!       Sandy Clemens	20-Jun-85
+!
+!    04 - Don't subtract error base from error code twice
+!    03 - Do not do R$$LIST on an NLB. BLISSNET may pass one
+!    02 - Move D$ERDR, DAP$ERROR, and XPN$SIGNAL to DAPERR
+!    01 - Write this module
+!--
+
+!***********************************************************************
+!**                     L I B R A R Y     F I L E S
+!***********************************************************************
+LIBRARY 'BLI:XPORT';
+LIBRARY 'BLISSNET';
+LIBRARY 'RMSINT';
+LIBRARY 'DAP';
+
+UNDECLARE %QUOTE PP;
+UNDECLARE %QUOTE ASCIZ_LEN;
+UNDECLARE %QUOTE CLEARV;
+UNDECLARE %QUOTE ASCIZ_STR;
+UNDECLARE %QUOTE STR_PREFIX;
+UNDECLARE %QUOTE ASCIZ_TO_FIXED_DESCRIPTOR;
+UNDECLARE %QUOTE STR_STRING_PLUS_REMAINDER;
+UNDECLARE %QUOTE ASCIZ_TO_DESCRIPTOR;
+UNDECLARE %QUOTE STR_INCLUDE;
+UNDECLARE %QUOTE STR_EXCLUDE;
+UNDECLARE %QUOTE STR_REMAINDER;
+UNDECLARE %QUOTE STR_STRING_PLUS_PREFIX;
+
+LIBRARY 'DIU';
+
+UNDECLARE STS$K_SEVERE,                 ! these are defined in DIUDIX also
+          STS$K_ERROR,
+          STS$K_WARNING,
+          STS$K_SUCCESS,
+          STS$K_INFO,
+          SS$_NORMAL;
+
+LIBRARY 'DIUDIX';
+
+
+
+FORWARD ROUTINE
+%IF %SWITCHES(TOPS10)
+%THEN          DIU$WTO,
+%FI
+               DIU$MESSAGE,
+               DIU$ERRMSG,
+               DIX$ERRMSG : NOVALUE,
+               DIU$$ERRMSG : NOVALUE,
+               E$FILES : NOVALUE,
+               DIU$ABORT;
+
+
+! Macros to build the error tables
+
+!
+! Declare MACRO $DIU$ERROR which is expanded once for each error code
+! (thanks to $DIU$ERRORS which is defined in DIU.R36).  Define this
+! macro here to expand to the error message text table.  NOTE:  this
+! macro is defined differently in DIU.R36 (and used there to define
+! the literal names for the error messages) so UNDECLARE it first and
+! then redefine it.
+!
+!
+UNDECLARE %QUOTE $DIU$ERROR;
+
+MACRO
+
+     $DIU$ERROR [CODE, SCODE, VALUE, SEVERITY, TEXT] =
+
+         [%COUNT, DIU$G_ERRTAB_CODE] =
+                  (VALUE^3) + DIU$K_FACILITY_CODE + %NAME( STS$K_, SEVERITY),
+         [%COUNT, DIU$B_ERRTAB_DTYPE] = STR$K_DTYPE_T,
+         [%COUNT, DIU$B_ERRTAB_CLASS] = STR$K_CLASS_F,
+         [%COUNT, DIU$H_ERRTAB_LENGTH] = %CHARCOUNT (%REMOVE (TEXT)),
+         [%COUNT, DIU$A_ERRTAB_POINTER] = CH$PTR (UPLIT (TEXT))
+     %;
+
+
+LITERAL DIX$K_FACILITY_CODE = DIX$K_FACILITY^18;
+
+!++
+! Define DIX message table for DIU.  Look at module DIUDIX to see how the
+! errors are defined.  To easily use the existing DIX messages from DIUDIX,
+! define MACRO COND_DAT to do what is needed by DIU, ie. make the message
+! table in the same format as the DIU error message table.  Then declare the
+! DIX message table and use DIX$DEF_CONS for the macro to define the PRESET
+! values.  DIX$DEF_CONS expands to repeated calls of COND_DAT, once for each
+! condition defined in DIUDIX...  However, DIX$DEF_CONS leaves a trailing
+! "," so we have to clean up after that in the PRESET declaration...  It's
+! ugly but it works!
+!--
+
+COMPILETIME msg_cnt = 0;                ! needed for COND_DAT macro
+
+MACRO                                   ! DIX$DEF_CONS (used below) expands to
+                                        !  repeated calls to COND_DAT
+     cond_dat (name, short_name, cond_value, msg_txt) =
+
+          %ASSIGN (msg_cnt, msg_cnt + 1)
+
+          [%NUMBER (msg_cnt), DIU$G_ERRTAB_CODE] = cond_value,
+          [%NUMBER (msg_cnt), DIU$B_ERRTAB_DTYPE] = STR$K_DTYPE_T,
+          [%NUMBER (msg_cnt), DIU$B_ERRTAB_CLASS] = STR$K_CLASS_F,
+          [%NUMBER (msg_cnt), DIU$H_ERRTAB_LENGTH] =
+                                    %CHARCOUNT (%REMOVE (msg_txt)),
+          [%NUMBER (msg_cnt), DIU$A_ERRTAB_POINTER] =
+                                    CH$PTR (UPLIT (msg_txt)),
+     %;
+
+!
+! OWN STORAGE:
+!
+
+STRUCTURE ORIGINNED_BITVECTOR[VAL;LOWEST,HIGHEST]=
+          [(HIGHEST-LOWEST+%BPUNIT)/%BPUNIT]
+          (((VAL-LOWEST)/%BPUNIT)+ORIGINNED_BITVECTOR)
+          <(VAL-LOWEST) MOD %BPUNIT,1>;
+
+PSECT
+    OWN=$HIGH$;
+
+GLOBAL                                  ! DIU error table (see DIU.R36)
+   DIUTAB : DIU_ERROR_TABLE (diu$k_errtab_length)
+            PRESET ($DIU$ERRORS),
+                                        ! DIX error table (see DIUDIX)
+   DIXTAB : DIU_ERROR_TABLE (dix_max_cond + 1)
+            PRESET (DIX$DEF_CONS                ! this macro leaves a trailing
+                    [0, DIU$G_ERRTAB_CODE] = 0  ! comma so clean up after ti
+                   );
+
+PSECT
+    OWN=$LOW$;
+
+!
+! EQUATED SYMBOLS
+!
+LITERAL
+       SUPRESS_SELECTED_RMS_CODES=1,  ! Only print STV on 'unusual' RMS errors
+       SUPRESS_REMOTE_STV=2;
+
+!
+! EXTERNAL REFERENCES:
+!
+EXTERNAL VERBOSITY: BITVECTOR[16];        ! How much info is enuff?
+EXTERNAL SRMSTV: ORIGINNED_BITVECTOR[RMS$K_ERR_MIN,RMS$K_ERR_MAX];
+
+EXTERNAL
+        time_restart,
+        mst_flag      : VOLATILE,       ! We are the spooler if nonzero
+%IF %SWITCHES (TOPS10) %THEN
+        detached,                       ! Detached (Master started on FRCLIN)
+%FI
+        INTERACTIVE,                    ! Set if interactive job
+        TTY : $XPO_IOB ();              ! Terminal IOB
+
+EXTERNAL ROUTINE
+%IF %SWITCHES (TOPS10) %THEN
+		S$WTO,
+%FI
+                MOVE_WITHOUT_PASSWORD,
+                L$TEXT : NOVALUE,
+                LJ$ULOG : NOVALUE,
+                IP_STATUS,
+                S$RESTART : NOVALUE,
+                S$TIME,
+                S$CRIF : NOVALUE,
+                FAOL,
+                RMS$ERRMSG,
+                DAP$ERRMSG,
+                XPN$ERRMSG;
+
+
+GLOBAL ROUTINE DIU$MESSAGE (code, code2, addtext, logflag) =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Find a message to match the error code, print it in the terminal and 
+!       send it to the system log file if we are (yet) the spooler.
+!
+! FORMAL PARAMETERS:
+!
+!	CODE: DAP/RMS/XPN/XPO/... error code
+!       CODE2: Secondary code
+!       ADDTEXT: Descriptor to additional text
+!       LOGFLAG: if FALSE, never write to the system log
+!                if TRUE, write to the system log if we are the spooler
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! COMPLETION CODES:
+!
+!	The primary code (CODE) that was passed to us
+!
+! SIDE EFFECTS:
+!
+!	The error message may be written to the system log file.
+!
+!--
+LOCAL severity,                         ! Message severity
+      facility,                         ! Flag for DIU facility message
+      line: $STR_DESCRIPTOR(CLASS=DYNAMIC),
+      descr: $STR_DESCRIPTOR(CLASS=DYNAMIC);
+
+! Init the local dynamic descriptors
+
+$STR_DESC_INIT(DESC=descr, CLASS=DYNAMIC);
+$STR_DESC_INIT(DESC=line, CLASS=DYNAMIC);
+
+! Get the message text built
+
+DIU$ERRMSG(.code,.code2,.addtext,descr,%REF(0));
+
+! If we are (yet) the spooler and this message is worthy of the system log 
+! file then send the text to the system log file please.
+
+IF .mst_flag AND .logflag THEN l$text(descr);
+
+! Type the message on the terminal, prefixed by the proper character based on
+! the severity of the message.
+
+S$CRIF();                               ! Get to left margin if not there now
+
+severity = (SELECT .code OF             ! Compute message severity
+            SET
+            [RMS$K_SUC_MIN TO RMS$K_SUC_MAX]: STS$K_SUCCESS; ! RMS success
+            [RMS$K_ERR_MIN TO RMS$K_ERR_MAX]: STS$K_ERROR;  ! RMS error
+            %IF %SWITCHES (TOPS20)
+                %THEN [%O'600000' TO %O'677777']: STS$K_ERROR; ! TOPS-20 error
+                %FI
+            [OTHERWISE]: .code<0,3>;    ! standard error, standard severity
+            TES);
+
+facility = (.code GEQ DIU$K_FACILITY_CODE) AND
+           (.code LEQ DIU$K_FACILITY_CODE+%O'777777');
+
+SELECT .severity OF                     ! Construct line for terminal user
+SET
+
+[STS$K_SUCCESS,                         ! "info" message
+ STS$K_INFO] : $STR_COPY(TARGET=line, STRING='[');
+
+[STS$K_WARNING] : $STR_COPY(TARGET=line, STRING='%');
+
+[STS$K_ERROR,
+ STS$K_SEVERE] : $STR_COPY(TARGET=line, STRING='?');
+
+[ALWAYS] : BEGIN
+           IF NOT .facility
+           THEN $STR_APPEND(TARGET=line, STRING='DIU ');
+           $STR_APPEND(TARGET=line, STRING=descr);
+           END;
+
+[STS$K_SUCCESS,                         ! "info" message
+ STS$K_INFO] : $STR_APPEND(TARGET=line, STRING=']');
+
+TES;                                    ! End of SELECT .severity
+
+$XPO_PUT(IOB=TTY, STRING=$STR_CONCAT(line,%CHAR(13,10)));
+
+$XPO_FREE_MEM(STRING=line);             ! Free the memory we got for the line
+$XPO_FREE_MEM(STRING=descr);            ! Free the memory we got for the text
+
+.code                                   ! Return the code we got
+
+END;                                    ! End of DIU$MESSAGE
+
+GLOBAL ROUTINE DIU$ERRMSG (CODE,CODE2,ADDTEXT,DESC,LEN) = 
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Find a message to match the error code
+!
+! FORMAL PARAMETERS:
+!
+!	CODE: DAP/RMS/XPN/XPO/... error code
+!       CODE2: Secondary code
+!       ADDTEXT: Additional text (usually a filespec)
+!       DESC: Target Descriptor for error text
+!       LEN: Length of error text
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	Length of text (same as is stored into LEN)
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+    MAP DESC: REF $STR_DESCRIPTOR();
+    MAP ADDTEXT: REF $STR_DESCRIPTOR();
+
+    LOCAL TDESC: $STR_DESCRIPTOR(CLASS=DYNAMIC);
+    LOCAL T2DESC: $STR_DESCRIPTOR(CLASS=DYNAMIC);
+    LOCAL LEN2: INITIAL(0);
+
+    $STR_DESC_INIT(DESC=TDESC, CLASS=DYNAMIC);
+    $STR_DESC_INIT(DESC=T2DESC, CLASS=DYNAMIC);
+
+    SELECT .CODE OF SET
+           [DIU$_TEXT]:
+               BEGIN
+               $STR_COPY(STRING=ADDTEXT[$], TARGET=DESC[$]);
+               .LEN=.ADDTEXT[STR$H_LENGTH];
+               RETURN .LEN
+               END;
+           [RMS$K_SUC_MIN TO RMS$K_SUC_MAX,
+            RMS$K_ERR_MIN TO RMS$K_ERR_MAX]:
+                        RMS$ERRMSG(.CODE,TDESC,.LEN);
+           [RMS$K_ERR_MIN TO RMS$K_ERR_MAX]:
+                        BEGIN           ! Secondary status code is
+                        IF (.CODE2 NEQ 0)       ! probably system error code
+                        AND ((.SRMSTV[.CODE]    ![4]
+                              AND .VERBOSITY[SUPRESS_SELECTED_RMS_CODES])
+                             EQL 0)
+                        THEN            ! Print secondary code
+                            BEGIN
+                            ! First see if it is a DAP code or system code
+                            SELECT .CODE2 OF
+                            SET
+%IF %SWITCHES (TOPS20)
+%THEN
+                            [1 TO 50,   ! DECNET disconnect code
+                             RMS$K_ERR_MIN TO RMS$K_ERR_MAX,  ! RMS code
+                             XPN$$SELECT_XPN_ERRORS,
+                             %O'600000' TO %O'677777']: ;     ! System.
+%ELSE
+                            [1 TO 63,   ! TOPS-10 UUO error code
+                             RMS$K_ERR_MIN TO RMS$K_ERR_MAX,  ! RMS code
+                             XPN$$SELECT_XPN_ERRORS,
+                             %O'600000' TO %O'677777']: ;     ! System.
+%FI
+                            [OTHERWISE]: CODE2=.CODE2^3+SS$_ERROR ! DAP. make
+                                                +DAP$K_FACILITY_CODE; !standard
+                            TES;
+                            DIU$ERRMSG(.CODE2,0,0,T2DESC,LEN2);
+                            END;
+                        END;
+
+           [DAP$K_FACILITY_CODE TO DAP$K_FACILITY_CODE + %O'7777777']:
+                        BEGIN
+                        DAP$ERRMSG(.CODE,TDESC,.LEN);
+                        IF (.CODE2 NEQ 0)
+                        AND (.VERBOSITY[SUPRESS_REMOTE_STV] EQL 0)
+                        THEN ($STR_COPY(STRING=$STR_CONCAT(' STV=',
+                                                           $STR_ASCII(.CODE2,
+                                                                      BASE8),
+                                                           ' '),
+                                       TARGET=T2DESC);
+                              LEN2=.T2DESC[STR$H_LENGTH]);
+                        END;
+
+           [DIU$K_FACILITY_CODE TO DIU$K_FACILITY_CODE + %O'777777']:
+                        BEGIN
+                        DIU$$ERRMSG(.CODE,TDESC,.LEN);
+                        IF (.CODE2 NEQ 0)
+                        THEN
+                            DIU$ERRMSG (.CODE2,0,0,T2DESC,LEN2)
+                        END;
+
+           [DIX$K_FACILITY_CODE TO DIX$K_FACILITY_CODE + %O'777777']:
+                        BEGIN
+                        DIX$ERRMSG(.CODE,TDESC,.LEN);
+                        IF (.CODE2 NEQ 0)
+                        THEN
+                            DIU$ERRMSG (.CODE2,0,0,T2DESC,LEN2)
+                        END;
+
+%IF %SWITCHES (TOPS10) %THEN
+           [1 TO 63]:	! Probably TOPS-10 UUO error.  We have no
+			!  easy way to distinguish these since they
+			!  are UUO dependant.  Just put it out in octal
+			BEGIN
+			LOCAL
+			    status_buf : VECTOR[CH$ALLOCATION(80)],
+			    status_descr : $STR_DESCRIPTOR(CLASS = BOUNDED);
+
+			$STR_DESC_INIT(STRING = (80,CH$PTR(status_buf)),
+				DESC = status_descr, CLASS = BOUNDED);
+
+			$STR_COPY(TARGET=status_descr,
+				STRING = $STR_CONCAT('Secondary status = ',
+				    $STR_ASCII(.code, BASE8, LEADING_BLANK)));
+
+			DIU$ERRMSG(DIU$_TEXT, 0, status_descr, T2DESC, LEN2);
+			END;
+%FI
+           [OTHERWISE]:
+                        BEGIN
+                        XPN$ERRMSG(.CODE,TDESC,.LEN,0);
+                        IF (.CODE2 NEQ 0)
+                        THEN
+                            DIU$ERRMSG (.CODE2,0,0,T2DESC,LEN2)
+                        END;
+           TES;
+
+    IF .LEN2 NEQ 0                      ! Secondary status text?
+    THEN $STR_APPEND(TARGET=TDESC,
+                     STRING=$STR_CONCAT(%CHAR (13,10),  ! CRLF
+                                        '-', %CHAR (9),
+                                        T2DESC));
+                     
+    IF .addtext NEQ 0                   ! Additional arguments
+    THEN
+        IF .addtext[STR$B_DTYPE] EQL 0  ! If this is not a descriptor
+        THEN
+            BEGIN
+            !+
+            ! Call FAOL with the argument list (less the arg counts)
+            !-
+            LOCAL
+                outlen: INITIAL(512),
+                outbuf: $STR_DESCRIPTOR(CLASS=DYNAMIC_BOUNDED, STRING=(0,0));
+
+            $XPO_GET_MEM( CHARACTERS=.outlen, DESC=outbuf );
+
+            FAOL(tdesc,outlen,outbuf,.addtext+1);  ! Skip arg count of vector
+
+            $STR_COPY( STRING=outbuf, TARGET=tdesc );
+            $XPO_FREE_MEM( STRING=outbuf );
+            END
+        ELSE
+            IF .addtext[STR$H_LENGTH] GTR 0     ! Additional text if available
+            THEN $STR_APPEND(TARGET=TDESC,
+                             STRING=$STR_CONCAT(%CHAR(13,10,%C'-',9),
+                                                ADDTEXT[$]));
+
+    .LEN=.TDESC[STR$H_LENGTH];          ! Get length of all this
+    $STR_COPY(STRING=TDESC[$],TARGET=DESC[$]);  ! Copy to user
+    $XPO_FREE_MEM(STRING=TDESC);        ! Give back to memory manager
+
+    .LEN                                ! Return length of text
+    END;
+
+
+ROUTINE DIX$ERRMSG (code, desc, len) : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION
+!
+!       This routine is  used by DIU  error handling to  extract the DIX  error
+!       text from DIXTAB (the DIX error table used by DIU).  The error  message
+!       is appended  to the  buffer described  by desc  and the  length of  the
+!       message is copied to the location pointed to by len.
+!
+! FORMAL PARAMETERS
+!
+!       code: DIX error code
+!       desc: string descriptor being built by DIU error handling (returned)
+!       len:  address to return length of the error message string (returned)
+!
+!--
+BEGIN
+
+MAP desc : REF $STR_DESCRIPTOR();
+
+INCR indx FROM 0 TO dix_max_cond DO
+     IF .dixtab[.indx, DIU$G_ERRTAB_CODE] EQL .code    ! if condition is found
+     THEN BEGIN                                        ! in DIX error table
+          $STR_APPEND(TARGET = .desc,   ! string the DIX error message
+                      STRING = $STR_CONCAT ('DIX event ',
+                                            $STR_ASCII(.code, BASE10),
+                                            ': ',
+                                            dixtab[.indx, DIU$T_ERRTAB_TEXT]));
+         .len = .desc[STR$H_LENGTH];    ! save length to return
+         RETURN;                        ! return to caller
+         END;
+
+! If we get here, there was no text for the error passed to this routine
+! so tell the user we don't recognize this one.
+
+$STR_APPEND(TARGET = .desc,
+            STRING = $STR_CONCAT ('Undefined DIX event code ',   ! make message
+                                 $STR_ASCII (.code, BASE10)));
+.len = .desc[STR$H_LENGTH];             ! return new length
+
+
+END;                                    ! DIX$ERRMSG
+
+GLOBAL ROUTINE DIU$$ERRMSG (code,desc,len) : NOVALUE = 
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Return error message for DIU code
+!
+! FORMAL PARAMETERS:
+!
+!	CODE: DIU error code
+!       DESC: target descriptor for error text (returned)
+!       LEN: Length of error text (returned)
+!
+! IMPLICIT INPUTS:
+!
+!       diutab: table of diu error codes derived from DIU.R36
+!
+!--
+
+BEGIN
+
+LOCAL diucode;                          ! DIU event code number
+
+MAP desc : REF $STR_DESCRIPTOR();
+
+diucode = (.code AND (NOT %O'1000000'))^-3;     ! Extract the code number
+
+! loop through the error table, gather the error code string and pass it back.
+
+INCR i FROM 0 TO DIU$K_ERRTAB_LENGTH    ! Loop through the table
+DO BEGIN
+   IF .diutab[.i,DIU$G_ERRTAB_CODE] EQL .code
+   THEN BEGIN
+        $STR_COPY(TARGET=.desc,
+                  STRING=$STR_CONCAT('DIU event ',
+                                     $STR_ASCII(.diucode,BASE10),
+                                     ': ',
+                                     diutab[.i,DIU$T_ERRTAB_TEXT]));
+        .len = desc[STR$H_LENGTH];
+        RETURN;
+        END
+    END;
+
+!No text for error code if we get here
+
+$STR_COPY(TARGET=.desc,
+          STRING=$STR_CONCAT('undefined DIU event code ',
+                             $STR_ASCII (.diucode, BASE10)));
+.len = desc[STR$H_LENGTH];
+
+END;                                    ! DIU$$ERRMSG
+
+GLOBAL ROUTINE DIU$ABORT (SIGNAL_ARGS, MECH_ARGS, ENABLE_ARGS) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Generic DIU condition handler.
+!
+! FORMAL PARAMETERS:
+!
+!	SIGNAL_ARGS: addr of vector of SIGNAL arguments,
+!       MECH_ARGS: not used,
+!       ENABLE_ARGS: args passed when this handler was established
+!
+! IMPLICIT INPUTS:
+!
+!	mst_flag: 1 if we are (yet) the spooler
+!       detached: 1 if we are detached (TOPS-10)
+!
+! IMPLICIT OUTPUTS:
+!
+!       patpar_warn: 1 if error during parse of transform/description file
+!
+! COMPLETION CODES:
+!
+!	0: Resignal, 1: Continue
+!
+!--
+
+BEGIN
+
+MAP signal_args : REF VECTOR,
+    mech_args : REF VECTOR,
+    enable_args : REF VECTOR;
+
+EXTERNAL patpar_warn;
+
+LOCAL severity,
+      code,
+      code2,
+      arglist,
+      addtext: $STR_DESCRIPTOR (CLASS = DYNAMIC, STRING = (0,0));
+
+! First signal arg is the error code.
+
+code = .signal_args[1];
+
+IF .signal_args[1] EQL DIU$_PATPAR  ! set flag if error is from PATPAR
+THEN patpar_warn = 1
+ELSE IF (.signal_args[1] EQL DIU$_PARDES)
+     OR (.signal_args[1] EQL DIU$_PARTRA)
+     THEN patpar_warn = 0;          ! reset flag
+
+SELECTONE .signal_args[1] OF        ! set severity
+           SET
+           [SS$_UNWIND] :               ! for unwind, make a quick exit!
+                RETURN STS$K_CONTINUE;
+
+           [RMS$K_ERR_MIN TO RMS$K_ERR_MIN+%O'7777']:   ! RMS-20 predates
+                severity = STS$K_ERROR;                 !  corporate standard
+
+           [RMS$K_SUC_MIN TO RMS$K_SUC_MIN+%O'17']:     ! Ditto
+                severity = STS$K_NORMAL;
+
+           [%O'600000' TO %O'677777'] :
+                severity = STS$K_ERROR; ! JSYS error
+
+           [OTHERWISE] :                ! set severity ala Corporate standard
+                severity = .(signal_args[1])<0,3>;
+           TES;
+
+IF (.signal_args[0] GEQ 3)                  ! If we have that many args
+   AND (.signal_args[2]+3 EQL .signal_args[0]) ! and the second is fao count
+THEN BEGIN                              ! STV is arg after FAO block
+     ! Handle the VMS-ish form of the SIGNAL which is basically:
+     !   SIGNAL ( STS, number-of-FAO-args, FAO-args, ..., STV )
+     code2 = .signal_args [.signal_args[2] + 3];     ! set code2 to STV
+     arglist = signal_args[2];          ! Pass vector to routine
+     END
+ELSE BEGIN                              ! process "non-VMS-ish" form
+     code2 = (IF .signal_args[0] GEQ 2  ! set code2 to the STV
+              THEN .signal_args[2]<RH>  ! return rh only
+              ELSE 0);
+     IF (.signal_args[0] GEQ 3)      ! Were we passed a block?
+        AND (.signal_args[3] NEQ 0)
+     THEN BEGIN                      ! yes, we were passed a block
+          LOCAL blk: REF $RAB_DECL,
+                current : $STR_DESCRIPTOR (CLASS=BOUNDED),
+                temp : $STR_DESCRIPTOR (CLASS=DYNAMIC);
+          !
+          ! Look for a FAB from which to get the filespec
+          !
+          blk = .signal_args[3];     ! this may be it
+          SELECT .blk[RAB$H_BID] OF  ! let's look at it
+                 SET
+                 [FAB$K_BID]:            ! is it a FAB?
+                    BEGIN
+                    E$FILES(.blk,addtext);
+                    $STR_DESC_INIT(DESC=current,CLASS=BOUNDED,
+                                   STRING=(.addtext[STR$H_LENGTH],
+                                           .addtext[STR$A_POINTER]));
+                    $STR_DESC_INIT(DESC=temp,CLASS=DYNAMIC);
+                    MOVE_WITHOUT_PASSWORD(current,temp);
+                    $STR_COPY(STRING=temp,TARGET=addtext);
+                    END;
+                [RAB$K_BID]:            ! is it a RAB?
+                    BEGIN
+                    E$FILES(.blk[RAB$A_FAB],addtext);
+                    $STR_DESC_INIT(DESC=current, CLASS=BOUNDED,
+                                   STRING = (.addtext[STR$H_LENGTH],
+                                             .addtext[STR$A_POINTER]));
+                    $STR_DESC_INIT(DESC=temp,CLASS=DYNAMIC);
+                    MOVE_WITHOUT_PASSWORD(current,temp);
+                    $STR_COPY(STRING=temp,TARGET=addtext);
+                    END;
+
+                TES;
+          END;
+     !
+     ! If signaller passed additional text, use it
+     !
+     IF (.signal_args[0] GEQ 4)      ! unless RMS stuff was requested
+        AND (.signal_args[3] EQL 0)
+        AND (.signal_args[4] NEQ 0)
+     THEN $STR_COPY (TARGET = addtext, STRING = .signal_args[4]);
+     arglist = addtext;
+END;
+
+! Tell someone about it
+
+IF .interactive
+THEN                                    ! We are master or running /noqueue
+     %IF %SWITCHES (TOPS20)             ! TOPS-20 only
+     %THEN
+     DIU$MESSAGE(.code,.code2,.arglist,TRUE) ! Type on terminal
+     %ELSE
+     BEGIN                              ! TOPS-10 only
+     IF .mst_flag AND .detached
+     THEN DIU$WTO(.code,.code2,.arglist)        ! If detached, send to OPR
+     ELSE DIU$MESSAGE(.code,.code2,.arglist,TRUE); ! Otherwise type on terminal
+     END
+     %FI                                ! end TOPS-20/TOPS-10 conditional
+ELSE BEGIN                              ! We are a slave job
+     !
+     ! Log this in user log file, and send IPCF to master job
+     !
+     LJ$ULOG(.code,.code2,.arglist);    ! Put it in the user's log file
+     IP_STATUS(.code,.code2,.arglist);  ! Put it in the system's log file
+     END;
+
+$XPO_FREE_MEM(STRING=addtext);          ! Free dynamic string memory
+
+CASE .SEVERITY FROM 0 TO 7 OF
+      SET
+      [STS$K_ERROR, STS$K_WARNING]:  SETUNWIND();
+      [STS$K_NORMAL, STS$K_INFO]: RETURN STS$K_NORMAL;
+      [STS$K_FATAL,INRANGE]:
+             BEGIN
+             OWN CNT;                   ! Number of signal arguments
+             OWN STS;                   ! Status code
+             OWN STV;                   ! Secondary status
+             OWN BLK;                   ! Block that got error
+             OWN TXT;                   ! Additional text, if any
+
+             CNT=.signal_args[0];       ! Save these
+             STS=.signal_args[1];       ! in case anyone
+             STV=.signal_args[2];       ! wants to examine
+             BLK=.signal_args[3];       ! the
+             TXT=.signal_args[4];       ! carcass
+
+             IF .interactive            ! Are we not a slave job?
+             THEN BEGIN                 ! We are interactive
+                  $XPO_PUT(IOB=TTY, STRING=%CHAR(13,10)); ! Put a CRLF on TTY
+                  IF .mst_flag          ! Are we (yet) the spooler?
+                  THEN S$RESTART()      ! Yes, restart myself
+                  ELSE $XPO_TERMINATE(CODE=XPO$_PREV_ERROR); ! Drop back 5 punt
+                  END;
+             END;
+      TES;
+
+STS$K_RESIGNAL                          ! Return resignal code if error/warning
+
+END;                                    ! End of DIU$ABORT
+
+GLOBAL ROUTINE E$FILES (p_fab, p_desc) : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION
+!
+!       The purpose of this routine  is to copy the file  name from one of  RMS
+!       structures (the FAB is passed) into the descriptor passed.  If there is
+!       a NAM block address in  the FAB passed, look at  the RSA.  If it has  a
+!       file name in it, then copy from  the RSA to the descriptor passed.   If
+!       the RSA is empty, try the ESA.  If it has something in it, copy that to
+!       the descriptor passed.  If there  is no NAM block,  or the RSA and  ESA
+!       are both empty, then copy the file name from directly from the FAB into
+!       the descriptor passed.
+!
+! FORMAL PARAMETERS
+!
+!       p_fab -- FAB to use to find the file name
+!       desc -- descriptor into which the file name is copied
+!--
+BEGIN
+
+BIND desc = .p_desc : REF $STR_DESCRIPTOR (CLASS = DYNAMIC),
+     fab = .p_fab : $FAB_DECL,
+     nam = .fab [FAB$A_NAM] : $NAM_DECL;
+
+IF nam NEQ 0                            ! if a name block exists
+THEN BEGIN
+     IF .nam[NAM$H_RSL] NEQ 0           ! if the RSL has something in it
+     THEN BEGIN
+          $STR_COPY(TARGET = desc,      ! $STR_FORMAT copies the string over
+                    STRING = $STR_FORMAT((.nam[NAM$H_RSL],
+                                          .nam[NAM$A_RSA]),
+                                         UP_CASE));
+          RETURN;
+          END
+     ELSE IF .nam[NAM$H_ESL] NEQ 0      ! else if the ESL has something in it
+          THEN BEGIN
+               $STR_COPY(TARGET = desc, ! $STR_FORMAT copies the string over
+                         STRING = $STR_FORMAT((.nam[NAM$H_ESL],
+                                               .nam[NAM$A_ESA]),
+                                              UP_CASE));
+               RETURN;
+               END;
+     END;
+
+! If we got here, then either there is no NAM block, or both the RSA and ESA
+! buffers were empty, so copy the file name directly from the FAB.
+
+$STR_COPY (TARGET = desc,
+           STRING = $STR_FORMAT((ASCIZ_LEN(.fab[FAB$A_FNA]),
+                                 .fab[FAB$A_FNA]),
+                                UP_CASE));
+
+END;                                    ! E$FILES
+
+%IF %SWITCHES (TOPS10) %THEN
+
+GLOBAL ROUTINE DIU$WTO (CODE,CODE2,ADDTEXT) = 
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Find a message to match the error code
+!
+! FORMAL PARAMETERS:
+!
+!	CODE: DAP/RMS/XPN/XPO/... error code
+!       CODE2: Secondary code
+!       ADDTEXT: Descriptor to additional text
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! COMPLETION CODES:
+!
+!	The primary code (CODE) that was passed to us
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+    LOCAL SEVERITY;
+    LOCAL DESCR: $STR_DESCRIPTOR(CLASS=DYNAMIC);
+    LOCAL MSG  : $STR_DESCRIPTOR(CLASS=DYNAMIC);
+    LOCAL LEN;                          ! Length of message
+
+    $STR_DESC_INIT(DESC=DESCR, CLASS=DYNAMIC);
+    $STR_DESC_INIT(DESC=MSG,   CLASS=DYNAMIC);
+
+    DIU$ERRMSG(.CODE,.CODE2,.ADDTEXT,DESCR,LEN);
+
+    SEVERITY=(SELECT .CODE OF
+                  SET
+                  [RMS$K_SUC_MIN TO RMS$K_SUC_MAX]: SS$_NORMAL;
+                  [RMS$K_ERR_MIN TO RMS$K_ERR_MAX]: SS$_ERROR;
+                  %IF %SWITCHES (TOPS20)
+                  %THEN [%O'600000' TO %O'677777']: SS$_ERROR; ! TOPS-20 error
+                  %FI
+                  [OTHERWISE]: .CODE<0,3>;      ! Standard severity
+                  TES);
+
+    SELECT .SEVERITY OF
+            SET
+            [STS$K_SUCCESS, STS$K_INFO] :
+                $STR_COPY(TARGET=MSG,
+                         STRING=$STR_CONCAT ('[DIU ',
+                                             (.LEN,.DESCR[STR$A_POINTER]),
+                                             ']'));
+
+            [STS$K_WARNING] :
+                $STR_COPY(TARGET=MSG,
+                         STRING=$STR_CONCAT ('%DIU ',
+                                             (.LEN,.DESCR[STR$A_POINTER])));
+
+            [OTHERWISE] :
+                $STR_COPY(TARGET = MSG,
+                         STRING=$STR_CONCAT ('?DIU ',
+                                            (.LEN,.DESCR[STR$A_POINTER])));
+            TES;
+
+    s$wto(msg);			! Send to OPR
+
+    $XPO_FREE_MEM(STRING=DESCR);
+    $XPO_FREE_MEM(STRING=MSG);
+    .CODE                               ! Return the code we got
+    END;                                ! End of DIU$TWO
+
+%FI
+
+
+END				!End of module
+ELUDOM

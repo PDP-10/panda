@@ -1,0 +1,513 @@
+;;;; This is a -*-Lisp-*- file
+
+;;; Loads Dec-20 Common Lisp Lap files into CLISP.  
+;;; Written by JoSH.
+
+;;; LAP code (this version) looks much like ordinary MIDAS (or MACRO)
+;;; code. For the common instruction, the format is (opcode reg1 efad reg2),
+;;; which translates into   opcode reg1,efad(reg2).
+
+;;; some instructions do not fall into this schema.  Besides the special
+;;; case ones, the "instructions" that reference code addresses are
+;;; of the general form (opcode tag) where tag is an integer.  
+;;; Opcodes for these are LABEL, JRST, and JRST1.  (JRST1 foo) means
+;;; jrst foo+1.
+
+;;; registers are named symbolically, eg. P, Q, O2, etc.
+;;; Stack references are compiled completely, to give instructions like
+;;; (move o1 -3 q)
+
+;;; (special n)               special #n (from constants list)
+;;; (constant n)              constant #n (from constants list)
+
+
+
+(in-package "COMPILER")
+ 
+(proclaim '(fixnum t))
+
+;;;; the loader runs in the compiler package but must read files
+;;; with *package* set to the user's package so his functions
+;;; and constants etc will be read right.  To read the lap instructions
+;;; into the right package, we use the pair of readmacros #_ 
+;;; (read the following form in the compiler package) and #0_
+;;; (used inside a #_ form to read a subform in the package prevailing
+;;; outside the #_).
+
+;;; note that *clc-package* is defined in Lclc.Clisp
+
+(defvar *back-package* nil
+  "to save the outside package in #_ / #0_ constructs")
+
+(defun |#_-reader| (stream char arg)
+  (declare (ignore char))
+  (if arg (let ((*package* *back-package*)) (read stream t nil t))
+      (let ((*back-package* *package*) (*package* *clc-package*))
+	(read stream t nil t))))
+
+(set-dispatch-macro-character #\# #\_ #'|#_-reader|)
+
+
+(defvar codelist nil
+  "List of LAP code.")
+
+(defvar codewords 0
+  "Number of code words needed for this function.  In pass 2 this is the
+  actual address of the function.")
+
+(defvar secnum 1
+  "Section number for this code, in the left half.")
+
+(defvar constants 0
+  "The address of the constants block (full word address)")
+
+(defvar consts 0
+  "The address of the constants block (half word address)")
+
+(defvar constants-lst nil
+  "A list of all the constants used in this function.")
+
+(defvar ucon nil
+  "Unboxed constants list.")
+
+(defvar labels nil
+  "Vector of label addresses, indexed by label number.")
+
+(defvar orgucon 0
+  "Address of the first unboxed constant.")
+
+(defvar odd-section nil
+  "If in an odd section this is T, else NIL.")
+
+;;; Get the name and type from the header
+(defvar funname nil
+  "Name of the function.")
+
+(defvar funtype nil
+  "Type of the function.")
+
+(defvar entry-pts nil
+  "List of entry points into the function gotten from the compiler.")
+
+(defvar entry-vector nil
+  "Entry vector to be used in the actual function defn.")
+
+(defvar rest-arg nil
+  "If non-nil, there is a rest arg for this function; an arbitratily
+  large number of args might be passed.")
+
+(defvar funclist nil
+  "list of all functions called in this function")
+
+
+;;;; Auxiliary functions and macros used in the instruction processing
+
+;;; Cinst counts the number of codewords needed for this function.  This
+;;; is done in pass 1.
+
+(eval-when (eval)
+(defmacro cinst (nw) `(incf codewords ,nw)))
+
+;;; Cfunc "counts" functions called
+(defun cfunc (fn) (pushnew fn funclist))
+
+;;; lapval turns 'o2 into 6, etc
+(defun lapval (ob)
+  (cond ((null ob) 0)
+	((numberp ob) ob)
+	((symbolp ob) (if (> (%sp-get-value ob) #o1000000) (diep ob)
+			  (%sp-get-value ob)))
+	((consp ob) ob)
+	(t (error "can't assess ~S" ob))))
+
+;;; Dinst deposits the instruction at the codewords location.  This is done
+;;; in pass 2.
+
+(eval-when (eval)
+(defmacro dinst (inst reg efad)
+  `(progn (%deposit-instruction codewords ,inst ,reg ,efad)
+	  (incf codewords))))
+
+;;; Dpast computes the offset from the register.
+
+(eval-when (eval)
+(defmacro dpast (off reg)			; assemble "off(reg)"
+  `(+ (rh ,off) (ash ,reg 18))))
+
+(eval-when (eval)
+(defmacro atpast (off reg)			; assemble "@off(reg)"
+  `(+ indirect (rh ,off) (ash ,reg 18))))
+
+;;; Dconst returns the location of the given constant.
+
+(eval-when (eval)
+(defmacro dconst (con)
+  `(+ consts ,con)))
+
+;;; Dspec returns the location of the given special, with the indirect
+;;; bit turned on to reference tha value cell.
+
+(eval-when (eval)
+(defmacro dspec (con)
+  `(+ consts ,con indirect)))
+
+;;; Dentry gives you the address of an entry point
+
+(defun dentry (ent)
+  (case (setq ent (nth ent entry-pts))
+    (2-few (get '%TOO-FEW-ARGS 'sym))
+    (2-many (get '%TOO-MANY-ARGS 'sym))
+    (t (+ secnum (svref labels ent)))))
+
+;;; Jump constants.  Used by PUSHJ
+
+(eval-when (eval)
+(defmacro dfunc (func)
+  `(+ indirect (rh (%function-address-block ,func codewords)))))
+
+;; deposit internal entry point
+(defun diep (func &aux (x (get func 'SYM)))
+  (or x (error "~S is not a system internal entry point." func))
+  (if (= (ash x -18) (ash codewords -18))
+      (rh x)
+      (+ indirect (rh (or (%int-ent-tab x codewords)
+			  (+ (position x ucon) orgucon)))))))
+
+(defun ciep (func &aux (x (get func 'SYM)))
+  (or x (error "~S is not a system internal entry point." func))
+  (or (< x #o1000000) (%int-ent-tab x codewords) (pushnew x ucon)))
+
+(eval-when (eval)
+(defmacro .bp (len off efad) `(+ (ash ,len 24) (ash ,off 30) ,efad)))
+
+
+;;;; this is the loader itself
+
+(defmacro lap (fname fntype entry-pts constants-lst &rest fnlist)
+  `(lap1 ',fname ',fntype ',(cadr entry-pts) ',constants-lst
+	 ',(caddr entry-pts) ',fnlist))
+
+(defun lap1 (funname funtype entry-pts constants-lst
+		     rest-arg codelist)
+  (let ((codewords 0)
+	(constants (length constants-lst))
+	(consts 0)
+	(funclist nil)
+	(x nil)
+	(entry-vector (make-array 9))			; [Victor]
+	(labels (create-labels)))
+    ;; Pass 1 counts the number of instructions and defines labels
+    (cpass-1)
+    ;; now we know how big it is, 
+    (setq x (%allocate-bps constants codewords (length funclist) NIL))
+    (setq constants (car x))		; Address of start of constants
+    (setq consts (rh constants))
+    (setq codewords (cdr x))		; Address of start of code block
+    (setq secnum (ash codewords -18))
+    (setq odd-section (not (eq 1 secnum)))
+    (setq secnum (ash secnum 18))
+    (coderel codewords)			; Relocate code to absolute locations.
+    (condep)				; Deposit constants
+    (cpass-2)
+    (setf (svref entry-vector 7) funname)
+    (%sp-set-definition funname (if (memq funtype
+					  '(expr closure auxiliary one-shot))
+				    `(subr ,entry-vector)
+				    `(macro subr ,entry-vector))))
+  (if (eq funtype 'one-shot) (funcall funname))
+  funname)
+
+(defun create-labels ()
+  (let ((hi 0))
+    (dolist (x codelist)
+      (if (eq 'label (car x))
+	  (setq hi (max (cadr x) hi))))
+    (make-array (1+ hi))))
+
+;;; Coderel relocates code (labels) to absolute locations.
+
+(defun coderel (codad)
+  (setq codad (rh codad))
+  (dotimes (i (length labels))
+    (if (svref labels i)
+	(incf (svref labels i) codad))))
+
+;;; Condep deposits constants into core.
+
+(defun condep ()
+  (let ((z constants))
+    (dolist (x constants-lst)
+      (%deposit-object-pointer z x)
+      (incf z))))
+
+
+
+;;; machine-code related functions and constants
+
+(defun rh (w) (boole boole-and w #o777777))
+
+(defvar indirect #o20000000)	; Specifies "@" in an address
+
+(defvar p	(get 'p 'sym))		; regular PDL for fn linkage
+(defvar sp	(get 'sp 'sym))		; binding stack
+(defvar o1	(get 'o1 'sym))		; first of the five LISP object regs
+(defvar o2	(+ o1 1))  (%put 'o2 'sym o2)
+(defvar o3	(+ o1 2))  (%put 'o3 'sym o3)
+(defvar o4	(+ o1 3))  (%put 'o4 'sym o4)
+(defvar o5	(+ o1 4))  (%put 'o5 'sym o5)
+(defvar o6	(get 'o6 'sym))		; temp for lots of things
+(defvar q	(get 'q 'sym))		; the value stack for locals
+(defvar n	(get 'n 'sym))		; for number of args
+(defvar w2	(get 'w2 'sym))		; for jsp links to internals
+(defvar w3	(+ w2 1))
+(defvar w4	(+ w2 2))
+(defvar mvp     (get 'mvp 'sym))	; M V stack pointer
+(defvar ufo	(get 'ufo 'sym))
+(defvar at%dsp  5)			; fadr block offset--
+					; make sure this agrees w/BOOT!!!
+
+
+;;; Macro opcode octal definitions
+
+(defvar jsp    #o265)
+(defvar adjsp  #o105)
+(defvar pushj  #o260)
+(defvar popj   #o263)
+(defvar move   #o200)
+(defvar dmove  #o120)
+(defvar movem  #o202)
+(defvar dmovem #o124)
+(defvar movei  #o201)
+(defvar xmovei #o415)
+(defvar addi   #o271)
+(defvar subi   #o275)
+(defvar add    #o270)
+(defvar sub    #o274)
+(defvar jrst   #o254)
+(defvar camn   #o316)
+(defvar came   #o312)
+(defvar camle  #o313)
+(defvar caml   #o311)
+(defvar camge  #o315)
+(defvar camg   #o317)
+(defvar jumpe  #o322)
+(defvar jumpn  #o326)
+(defvar setam  #o426)
+(defvar setzm  #o402)
+(defvar setzb  #o403)
+(defvar push   #o261)
+(defvar pop    #o262)
+(defvar tlnn   #o607)
+(defvar tlne   #o603)
+(defvar tdzn   #o636)
+(defvar tdcn   #o656)
+(defvar caia   #o304)
+(defvar cain   #o306)
+(defvar caige  #o305)
+(defvar caile  #o303)
+(defvar cail   #o301)
+(defvar caig   #o307)
+(defvar caie   #o302)
+(defvar setz   #o400)
+(defvar jump   #o320)
+(defvar aos    #o350)
+(defvar xct    #o256)
+(defvar movn   #o210)
+(defvar ldb    #o135)
+(defvar jumpa  #o324)
+(defvar tlz    #o621)
+(defvar add    #o270)
+(defvar skipe  #o332)
+(defvar skipa  #o334)
+(defvar skipn  #o336)
+(defvar tdza   #o634)
+(defvar lsh    #o242)
+(defvar hlrz   #o554)
+
+
+;;; Def-p1 creates a macro-like pass-1 processor for the specified op.
+
+(eval-when (eval)
+(defmacro def-p1 (fn name arglist &body body)
+  `(progn
+    (defun ,name ,(if arglist (cons '&optional arglist)) ,@body)
+    (setf (get ',fn 'cp1) ',name))))
+
+;;; Dlm creates a macro-like Pass-2 processor for the specified op.
+
+(eval-when (eval)
+(defmacro dlm (fn name arglist &body body)
+  `(progn
+    (defun ,name ,(if arglist (cons '&optional arglist)) ,@body)
+    (setf (get ',fn 'cp2) ',name))))
+
+
+
+;;; Pass 1 over the lap code.  If there is a special processor the this
+;;; lapcode instruction, run that.  Or if the efad field might be an
+;;; internal sym reference, check it.
+
+(defun cpass-1 ()
+  (dolist (inst codelist)
+    (let ((p1 (get (car inst) 'cp1)))
+      (cond (p1 (apply p1 (cdr inst)))
+	    (t (cinst 1)
+	       (and (caddr inst) (symbolp (caddr inst))
+		    (ciep (caddr inst)))))))
+  (cond (ucon (setq orgucon codewords) (cinst (length ucon)))))
+
+;;; count the sub-entry-vector code, if any
+
+(def-p1 code-start code-start-cp1 ()
+  (let ((lep (length entry-pts)))
+    (if (> lep 7) (cinst (- lep 3)))))
+
+(def-p1 call call-cp1 (fn nargs)
+  (cfunc fn)
+  (cinst (if (< nargs 6) 1 2)))
+
+(def-p1 fcall fcall-cp1 (nargs)
+  (cinst (if (< nargs 6) 4 5)))
+
+(def-p1 icall icall-cp1 (fn)
+  (ciep fn)  (cinst 1))
+
+(def-p1 label label-cp1 (lbl)
+  (setf (svref labels lbl) (rh codewords)))
+
+(def-p1 spec-bind spec-bind-cp1 (var)
+  (cinst 2))
+
+(def-p1 unbind unbind-cp1 (nv)
+  (cinst (ceiling nv 5)))
+
+(def-p1 continue continue-cp1 ()
+  (cinst 0))
+
+(def-p1 adjust-values adjust-values-cp1 (nv)
+  (cinst (case nv (0 1) ((1 2) 3) ((3 4) 5) (5 7) (t 2))))
+
+
+
+;;; Pass 2 over the lap code.  Run the special processor for each lapcode
+;;; instruction.  These generate and deposit the actual code.
+
+(defun cpass-2 ()
+  (dolist (inst codelist)
+    (let ((spec (get (car inst) 'cp2)))
+      (if spec (apply spec (cdr inst)) (stdinst inst))))
+  (dolist (x ucon) (%deposit-word codewords x) (incf codewords)))
+
+(defun stdinst (inst)
+  (let ((opcode (lapval (car inst)))
+	(reg1 (lapval (cadr inst)))
+	(efad (lapval (caddr inst)))
+	(reg2 (lapval (cadddr inst))))
+    (dinst opcode reg1 
+	   (+ (ash reg2 18)
+	      (cond ((numberp efad) (rh efad))
+		    ((eq (car efad) 'constant) (+ consts (cadr efad)))
+		    ((eq (car efad) 'special)
+		     (+ consts (cadr efad) indirect))
+		    (t (error "Can't grok ~S" inst)))))))
+
+(dlm code-start code-start-cp2 ()
+  (let ((lep (length entry-pts)))
+     (dotimes (enum 6)		; iterate over 0-5
+       (setf (svref entry-vector enum) (dentry enum)))
+     (setf (svref entry-vector 6)
+	   (if (> lep 7)
+	       codewords
+	       (dentry 6)))
+     (when (> lep 7)
+	(dinst caile n (1- lep))
+	(if rest-arg (dinst jrst 0 (rh (dentry (1- lep))))
+	    (dinst jrst 0 (diep '%TOO-MANY-ARGS)))
+	(dinst jrst 0 (+ indirect (dpast (- codewords 5) n)))
+	(do ((x (nthcdr 6 entry-pts) (cdr x))
+	     (i 6 (1+ i)))
+	    ((null x))
+	  (dinst 0 0 (dentry i))))))
+
+(dlm spec-bind spec-bind-cp2 (var)
+     (dinst push sp (dconst (cadr var)))
+     (dinst push sp (dspec (cadr var))))
+
+(dlm unbind unbind-cp2 (nv)
+     (dotimes (i (floor nv 5)) (dinst pushj p (diep 'ub5)))
+     (unless (zerop (mod nv 5))
+	     (dinst pushj p (diep (nth (mod nv 5)
+				       '(nil ub1 ub2 ub3 ub4))))))
+
+(dlm jrst jrst-cp2 (lbl reg)
+     (setq reg (lapval reg))
+     (dinst jrst 0 (+ (svref labels lbl) (ash reg 18))))
+
+(dlm jrst1 jrst1-cp2 (lbl reg)
+     (setq reg (lapval reg))
+     (dinst jrst 0 (+ 1 (svref labels lbl) (ash reg 18))))
+
+(dlm jumpe jumpe-cp2 (reg lbl reg2)
+     (setq reg (lapval reg))
+     (setq reg2 (lapval reg2))
+     (dinst jumpe reg (+ (svref labels lbl) (ash reg2 18))))
+
+(dlm jumpn jumpn-cp2 (reg lbl reg2)
+     (setq reg (lapval reg))
+     (setq reg2 (lapval reg2))
+     (dinst jumpn reg (+ (svref labels lbl) (ash reg2 18))))
+
+(dlm jumpe1 jumpe1-cp2 (reg lbl reg2)
+     (setq reg (lapval reg))
+     (setq reg2 (lapval reg2))
+     (dinst jumpe reg (+ 1 (svref labels lbl) (ash reg2 18))))
+
+(dlm jumpn1 jumpn1-cp2 (reg lbl reg2)
+     (setq reg (lapval reg))
+     (setq reg2 (lapval reg2))
+     (dinst jumpn reg (+ 1 (svref labels lbl) (ash reg2 18))))
+
+(dlm icall icall-cp2 (fn)
+     (dinst pushj p (diep fn)))
+
+(dlm call call-cp2 (fn nargs)
+     (cond ((< nargs 6)
+	      (dinst pushj p (+ nargs (dfunc fn))))
+	   (t (dinst movei n nargs)
+	      (dinst pushj p (+ 6 (dfunc fn))))))
+
+(dlm fcall fcall-cp2 (nargs)
+     (unless (< nargs 6) (dinst movei n nargs))
+     (dinst skipe w2 (dpast at%dsp o6))
+     (dinst tlne o6 #o760000)
+     (dinst pushj p (diep 'ufo))
+     (dinst pushj p (atpast (min nargs 6) w2)))
+
+(dlm label label-cp2 (lbl)
+    (or (eq (svref labels lbl) (rh codewords))
+	(error "Label mismatch at label ~S.  Addr ~S doesn't equal ~S."
+	       lbl (svref labels lbl) (rh codewords)))))
+
+(dlm continue continue-cp2 ()
+     nil)
+
+(dlm adjust-values adjust-values-cp2 (v)
+     (case v
+       (0 (dinst movei n 0))
+       ((1 2) (dinst caige n 2)
+	      (dinst  dmovem 0 (dpast o1 n))
+	      (dinst movei n v))
+       ((3 4) (dinst caige n 4)
+	      (dinst  dmovem 0 (dpast o1 n))
+	      (dinst caige n 2)
+	      (dinst  dmovem 0 (dpast o3 n))
+	      (dinst movei n v))
+       (5 (dinst caige n 5)
+	  (dinst  dmovem 0 (dpast o1 n))
+	  (dinst caige n 3)
+	  (dinst  dmovem 0 (dpast o3 n))
+	  (dinst caige n 1)
+	  (dinst  movem 0 o5)
+	  (dinst movei n v))
+       (t (dinst movei w2 v)
+	  (dinst pushj p (diep 'adjust-values)))))

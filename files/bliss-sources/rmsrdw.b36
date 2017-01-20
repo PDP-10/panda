@@ -1,0 +1,580 @@
+
+%TITLE 'R D W R I T   -- $READ/$WRITE processor'
+!<BLF/REQUIRE 'RMSBLF.REQ'>
+MODULE rdwrit (IDENT = '3.0'
+		) =
+BEGIN
+
+GLOBAL BIND
+    rdwrv = 3^24 + 0^18 + 614;			! Edit date: 1-Apr-86
+
+!+
+!
+!
+!    FUNCTION:	THIS MODULE CONTAINS ALL ROUTINES WHICH PROCESS
+!    THE $READ MACRO FOR RMS-20.
+!    AUTHOR:	A. Nourse
+!
+!
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1977, 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+!
+!
+!    **********	TABLE OF CONTENTS	**************
+!
+!    ROUTINE			FUNCTION
+!    =======			========
+!
+!    $READ			ACTION ROUTINE FOR $READ USER MACRO
+!    $WRITE                     ACTION ROUTINE FOR $WRITE USER MACRO
+!
+!    503                        Implement $READ (AN, 6-84)
+!    537                        Ext addr fix
+!    572                        Put in conditionals for TOPS-10
+!                               (AN/DR 19-Sep-95)
+!-
+
+REQUIRE 'RMSREQ';
+REQUIRE 'RMSOSD';                       ! SYSTEM-DEPENDANT
+LIBRARY 'CONDIT';
+
+!
+! TABLE OF CONTENTS
+!
+
+FORWARD ROUTINE
+    $READ,
+    $WRITE,
+    DOREAD,
+    DOWRITE;
+
+%IF %SWITCHES(TOPS20)
+%THEN
+FORWARD ROUTINE
+    WBUCKET,
+    NEXT_BUCKET;
+%FI
+
+!
+! MACROS:
+!
+
+KEYWORDMACRO
+    GET_BUCKET(BUCKET,BUCKET_SIZE=1,LOCK=0,DESC)=
+        IF NOT GETBKT(BUCKET,BUCKET_SIZE,LOCK,DESC)
+        THEN SIGNAL (Rms$_Rnf, 0, rab[0,0,0,0] ) %,
+
+    PUT_BUCKET(DESC,UPDATE=1)=
+       PUTBKT(UPDATE,DESC) %;
+
+MACRO FREE_BUCKET[]=PUT_BUCKET(%REMAINING,UPDATE=0) %;
+
+MACRO Copy(From_Addr, To_Addr, Size)=               ! Copy a block of memory
+      (REGISTER
+           tmpac1 = 6,
+           tmpac2 = 7,
+           tmpac3 = %O'10';
+
+       IF .RmsSec NEQ 0                  ! If not in section 0
+       THEN
+           BEGIN
+           BIND
+               extend_block = UPLIT (Ext$k_Xblt^27);  !m511
+
+           tmpac1 = size;
+           tmpac2 = from_addr;
+           tmpac3 = to_addr;
+
+           IF .tmpac2<18, 18> EQL 0 THEN tmpac2 = .tmpac2 OR .rmssec;
+
+           IF .tmpac3<18, 18> EQL 0 THEN tmpac3 = .tmpac3 OR .rmssec;
+
+           $extend_inst (tmpac1, extend_block)
+           END
+       ELSE
+           BEGIN
+           TmpAc1<Lh>=(From_Addr);           ! FROM_ADDR is source addr
+           TmpAc1<Rh>=(To_Addr);             ! TO_ADDR is destination addr
+           Blt(TmpAc1,((To_Addr)+(Size)-1))  ! SIZE is length of block
+           END ) %;
+!
+! EQUATED SYMBOLS:
+!
+
+LITERAL FIRST_VBN=1;
+
+
+%SBTTL '$READ - $READ processor'
+
+GLOBAL ROUTINE $read (rabblock, errorreturn) =
+! $GET
+! ====
+! PROCESSOR FOR $READ MACRO
+! INPUT:
+!	ADDRESS OF USER RECORD BLOCK (RAB)
+!	ADDRESS OF USER ERROR ROUTINE
+! OUTPUT:
+!	<STATUS FIELD>
+!
+! FORMAT OF THE $GET MACRO:
+!
+!		$READ	<RAB-ADDRESS> [,<ERROR-ADDRESS>]
+!
+! RAB FIELDS USED AS INPUT TO $READ:
+!
+!	ISI		INTERNAL STREAM IDENTIFIER
+!	RAC		RECORD ACCESS
+!       BKT             BUCKET NUMBER
+!	RFA		RECORD'S FILE ADDRESS
+!	ROP		RECORD OPTIONS
+!		RB$LOC		USE LOCATE MODE
+!		RB$RAH		READ-AHEAD
+!	UBF		ADDRESS OF USER RECORD BUFFER
+!	USZ		SIZE OF USER RECORD BUFFER
+!
+! RAB FIELDS WHICH ARE RETURNED BY $READ:
+!
+!	BKT		BUCKET NUMBER
+!	RBF		ADDRESS OF RECORD TRANSFERED
+!	RFA		RECORD'S FILE ADDRESS
+!	RSZ		SIZE OF RECORD TRANSFERED
+!	STS		STATUS OF OPERATION
+!	STV		ADDITIONAL STATUS INFORMATION
+    BEGIN
+    rmsentry ($read);
+
+    !+
+    !    FETCH THE ADDRESS OF THE USER RAB AND ERROR ROUTINE
+    !-
+
+    rab = .rabblock;				! Get RAB address
+    erradr = .errorreturn;			! AND USER ERROR ADDRESS
+!+
+!    PERFORM STANDARD SET-UP AND CHECK FOR READ ACCESS.
+!    NOTE THAT IF ANY BIT IN THE FAC FIELD IS SET OTHER THAN
+!    FB$PUT, THEN A $READ OPERATION IS LEGAL
+!-
+    rsetup (axget + axupd + axdel + axtrn);	! SET UP PARAMETERS
+
+    !+
+    !    SET UP THE USER'S RBF FIELD
+    !-
+
+    IF (Rab [Rab$a_Rbf] = .Rab [Rab$a_Ubf]) LEQ minuserbuff		!m502
+    THEN usererror (er$ubf);
+
+    IF .fst [fst$v_remote]              				!a501
+    THEN                                                                !a501
+        dap$get ( .rab, .erradr )                                       !a501
+    ELSE				      				!a501
+        doread ( .rab, .erradr );                                       !a503 
+    !+
+    !    PAD THE USER'S BUFFER, IF HE WANTS IT.
+    !-
+
+    IF (chkflag (rab [rabrop, 0], roppad) NEQ 0) THEN padbuffer ();
+
+    !+
+    !    INDICATE THAT THIS OPERATION WAS A SUCCESS
+    !-
+
+    setsuccess;					! THIS WAS DONE CORRECTLY
+
+    !+
+    !    EXIT TO THE USER
+    !-
+
+    usrret ()
+    END;					! End $Read
+%SBTTL 'WRITE - $WRITE processor'
+
+GLOBAL ROUTINE $write (rab_block, errorreturn) =
+! $PUT
+! ====
+! PROCESSOR FOR $WRITE MACRO
+! INPUT:
+!	ADDRESS OF USER RECORD BLOCK (RAB)
+!	ADDRESS OF USER ERROR ROUTINE
+! OUTPUT:
+!	<STATUS FIELD OF USER RAB>
+! ROUTINES CALLED:
+!
+! FORMAT OF THE $WRITE MACRO:
+!
+!		$WRITE	<RAB-ADDRESS> [,<ERROR-ADDRESS>]
+!
+! RAB FIELDS USED AS INPUT BY $WRITE:
+!
+!	ISI		INTERNAL STREAM IDENTIFIER
+!	RAC		RECORD ACCESS
+!	RBF		ADDRESS OF USER RECORD BUFFER
+!	RSZ		SIZE OF RECORD
+!	BKT		BUCKET NUMBER
+!
+! RAB FIELDS WHICH ARE SET BY $WRITE:
+!
+!	BKT		BUCKET NUMBER
+!	RBF		ADDRESS OF BUFFER FOR NEXT RECORD (-11 COMPATIBILITY)
+!	RFA		RECORD'S FILE ADDRESS
+!	STS		COMPLETION STATUS CODE
+!	STV		ADDITIONAL STATUS INFORMATION
+    BEGIN
+
+    LOCAL
+	errorcode;				! USED TO SAVE AN ERROR CODE
+
+    rmsentry ($write);
+
+    !+
+    !    FETCH INPUT ARGS
+    !-
+
+    rab = .rab_block;				! GET ADDRESS OF RAB
+    erradr = .errorreturn;			! AND USER ERROR ADDRESS
+    rsetup (axput);				! DO OTHER STUFF
+!+
+!
+!    	 ERROR PROCESSING FOR $PUT MACRO   
+!    						
+!     THE FOLLOWING ERRORS ARE CHECKED:		
+!    	1. RFA ADDRESSING IS ILLEGAL		
+!    	2. RECORD-SIZE < = MAX-REC-SIZE		
+!    	3. RECORD BUFFER MUST BE PROPER		
+!-
+    errorcode = 0;				! ASSUME NO ERROR
+
+    IF .rab [rabrbf, 0] LEQ minuserbuff THEN errorcode = er$rbf; ! CHECK BUFFER
+
+    !+
+    !    WAS THERE AN ERROR?
+    !-
+
+    IF .errorcode NEQ 0
+    THEN
+	BEGIN
+	usrsts = .errorcode;
+	usrerr ()				! EXIT FROM RMS
+	END;
+
+    !+
+    !    *****  END OF ERROR PROCESSING FOR $WRITE ******
+    !-
+
+    IF .fst[fst$v_remote]						  !a501
+    THEN                                                                  !a501
+        Dap$Put (.rab, .erradr)						  !a501
+    ELSE                                                                  !a501
+    !+
+    !    FILE IS LOCAL.
+    !-
+        DoWrite (.Rab, .erradr);					  !a503
+
+
+    !+
+    !    SET THE "SUCCESS" BIT AND REMEMBER THAT THIS WAS A $PUT
+    !-
+
+    setsuccess;					! SET SUCCESS BIT AND LAST-OPER
+
+    !+
+    !    RETURN THE RFA OF THIS RECORD TO THE USER
+    !-
+
+    rab [rabrfa, 0] = .rst [rstdatarfa];
+
+    !+
+    !    EXIT TO THE USER
+    !-
+
+    usrret ();					! Exit
+    1
+    END;					! End $PUT
+
+
+%SBTTL 'DoRead -- Local file Read'
+ROUTINE DoRead ( P_Urab, Err )  =	! Get a page from a file
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Get a page from an open local file.
+!
+! FORMAL PARAMETERS:
+!
+!       P_URAB: Address of RAB as defined by RMS
+!       ERR: Address of error routine
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+    BIND Rab=.P_Urab: $Rab_decl;
+    BIND Rst=.Rab[Rab$a_Isi]: $Rms_Rst;
+    BIND Cbkd=Rst[RST$z_Current_Bucket]: $Rms_Bucket_Descriptor;
+    BIND Cbfd=.Cbkd[Bkt$a_Buffer_Desc]: $RMS_Buffer_Descriptor;
+
+    !Free the buffer if necessary
+    IF Cbfd NEQ 0                       ! Is there any buffer descriptor?
+    THEN
+        BEGIN
+        IF .Cbfd[Buf$v_Use_Count] GTR 0 ! Is a bucket in the buffer?
+        THEN FREE_BUCKET( Desc=Cbkd);   ! Yes. free it.
+        END;
+
+    Rab[Rab$g_Rfa]=.Rab[Rab$g_Bkt];     ! Assume we get what we asked for
+                                        ! (If not, handler will fix it)
+
+    ! Special case for VBN 0, which is the FDB of the file
+    IF .Rab[Rab$g_Rfa] EQL 0
+    THEN
+        BEGIN
+        %IF %SWITCHES(TOPS20)
+        %THEN
+
+        BIND Fab=UAddr(.Rab[Rab$a_Fab]): $Fab_decl;
+        Rab[Rab$h_Rsz]=$Fblen;          ! Length of FDB
+
+        Gtfdb( .Fab[Fab$h_Jfn], $Fblen^18, UAddr( .Rab[Rab$a_Ubf] ) );
+
+        %ELSE
+
+	Rab[Rab$h_Rsz] = 0;
+
+        %FI
+
+        RETURN Rms$_Normal
+        END;
+
+    ! See if the requested page of the file exists
+    ! and find the next one in any case
+
+%IF %SWITCHES(TOPS20)
+%THEN
+    IF Next_Bucket( Rab ) NEQ .Rab[Rab$g_Bkt]
+    THEN                                ! Requested bucket nonexistant
+        BEGIN
+        IF .Rab[Rab$v_Kge]
+        OR (.Rab[Rab$b_Rac] EQL Rab$k_Seq)
+        OR (.Rab[Rab$b_Rac] EQL Rab$k_Tra)
+        OR (.Rab[Rab$b_Rac] EQL Rab$k_Bft)
+        THEN Rab[Rab$g_Rfa]=.Rst[Rst$g_Next_Record_Pointer]
+        ELSE Usererror ( Rms$_Rnf )
+        END;
+
+%ELSE
+
+    !+
+    ! If words written is greater than pagesize * bucket in question, at least
+    ! one word of the bucket in question exists
+    !-
+
+    IF .Fst[Fst$g_sof_words] LEQ (.Rab[Rab$g_Bkt] - 1) * pagesize
+    THEN
+	BEGIN
+	Rab[Rab$h_Sts] = Rms$_Eof;
+	Rab[Rab$h_Stv] = 0;
+	Usererror(.Rab[Rab$h_Sts])
+	END;
+
+%FI
+
+    Get_Bucket(Desc=Cbkd, Bucket=(.Rab[Rab$g_Rfa]-First_Vbn));
+
+    Rab[Rab$h_Rsz]=Pagesize*.Cbkd[Bkt$v_Size];
+
+    IF .rab[Rab$v_Loc]                  ! Locate Mode?
+    THEN Rab[Rab$a_Rbf]=.cbkd[Bkt$a_Address]+.RmsSec      !Point RBF at bucket
+    ELSE
+        BEGIN                           ! Move Mode
+        Rab[Rab$a_Rbf]=.rab[Rab$a_Ubf];         !Point RBF at user's buffer
+        Copy(.cbkd[Bkdbktadr],UAddr(.rab[Rab$a_Rbf]),.rab[Rab$h_Rsz]);
+        END;
+
+    Rms$_Normal
+    END;                                !End of Doread
+
+%SBTTL 'DoWrite -- Local file Write'
+ROUTINE Dowrite (P_Urab,Err) =	! Put a page
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Put a page to an open local file.
+!
+! FORMAL PARAMETERS:
+!
+!       P_URAB: Address of  RAB as defined by RMS
+!       ERR: Address of error routine
+!
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!--
+
+    BEGIN
+    BIND Rst=.Rab[Rab$a_Isi]: $Rms_Rst;
+    BIND Cbkd=Rst[Rst$z_Current_Bucket]: $RMS_Bucket_Descriptor;
+    BIND Cbfd=.CBKD[Bkt$a_Buffer_Desc]: $RMS_Buffer_Descriptor;
+
+    !Free the buffer if necessary
+    IF Cbfd NEQ 0                       ! Is there any buffer descriptor?
+    THEN
+        BEGIN
+        IF .Cbfd[Buf$v_Use_Count] GTR 0  ! Is a bucket in the buffer?
+        THEN Free_Bucket( Desc=Cbkd );   ! Yes. free it.
+        END;
+
+    Rab[Rab$g_Rfa]=.Rab[Rab$g_Bkt];     ! Assume we got what we wanted
+
+    ! Special case for VBN 0, which is the FDB of the file
+    ! Note that words in the FDB
+    !  that corrrespond to zero words in the buffer are not changed!
+    IF .Rab[Rab$g_Rfa] EQL 0
+    THEN
+        BEGIN
+        %IF %SWITCHES(TOPS20)
+        %THEN
+        BIND Fab=UAddr(.Rab[Rab$a_Fab]): $Fab_decl;
+        PSECT OWN=$HIGH$;
+        OWN Fdb_Mask:VECTOR[$Fblen]  ! Mask of what CHFDB can change
+                     PRESET([$Fbctl]=Fb_Tmp+Fb_Prm+Fb_Del+Fb_Nod+Fb_Inv+Fb_For
+                                     +Fb_Fcf,
+                                     ! Temporary, Permanent, Deleted, No-dump,
+                                     ! Invisible, File Class (RMS/not-RMS)
+                            [$Fbprt]=%O'777777',! Protection of file
+                            [$Fbbyv]=Fb_Ret+Fb_Bsz+Fb_Mod, ! GenRetent,bsz,mode
+                            [$Fbsiz]=-1,        ! Size of file in bytes
+                            [$Fbcrv]=-1,        ! Creation Date/Time
+                            [$Fbwrt]=-1,        ! Last user write dtm
+                            [$Fbref]=-1,        ! Last user read dtm
+                            [$Fbusw]=-1         ! User settable word
+                            );
+                            
+        LOCAL Ptr: REF VECTOR;
+        Local Len;
+
+        Ptr=UAddr(.Rab[Rab$a_Rbf]);            ! Pointer to 'record'
+
+        INCR i FROM 0 TO MIN(.Rab[Rab$h_Rsz],$Fblen)-1
+        DO  BEGIN
+            IF (.Fdb_Mask[.i] NEQ 0) ! If anything to change here
+            AND (.Ptr[.i] NEQ 0)     ! and we provided something there
+            THEN Chfdb(Cf_Nud+(.i^18)+.Fab[Fab$h_Jfn],.Fdb_Mask[.i],.Ptr[.i])
+            END;
+
+        Gtfdb (.Fab[Fab$h_Jfn], $xwd(1,$Fbsiz),rst[rsthybyte]);  ! 614
+
+        %FI
+        RETURN Rms$_Normal
+        END;
+
+    !+
+    ! Get the correct bucket and copy into it
+    !-
+    Get_Bucket(Desc=Cbkd, Bucket=(.Rab[Rab$g_Rfa]-First_Vbn));
+    Copy( UAddr(.Rab[Rab$a_Rbf]), .Cbkd[Bkt$a_Address], .Rab[Rab$h_Rsz] );
+    Put_Bucket(Update=1, Desc=Cbkd);                          ! Write it out
+    Rms$_Normal
+    END;			!End of DoWrite
+
+
+%IF %SWITCHES(TOPS20)
+%THEN
+ROUTINE Next_Bucket( Urab )=
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!    Find next bucket of file
+!
+! FORMAL PARAMETERS:
+!
+!    URAB: Address of RAB
+!
+! RETURNED VALUE:
+!
+!    Next bucket (page) number
+!
+! SIDE EFFECTS:
+!
+!   If no next page, RMS$_EOF is signalled
+!   All other errors signal as RMS$_BUG
+!--
+    BEGIN
+    LOCAL Nextb;
+
+    If Ffufp(((.Fab[Fab$h_Jfn])^18)+(.Rab[Rab$g_Rfa]-First_Vbn);Nextb)
+    THEN
+        Rst[Rst$g_Next_Record_Pointer] = .Nextb<Rh>+First_Vbn
+    ELSE                                ! If no next page
+        BEGIN                           ! probably end of file
+        Rab[Rab$h_Rsz] = 0;             ! No record size          !a566
+
+        Rab[Rab$H_Sts]=(IF .nextb EQL Ffufx3    ! Is it end of file?
+                        THEN Rms$_Eof
+                        ELSE Rms$_Bug);
+        Rab[Rab$H_Stv]=.nextb;          ! Secondary status is TOPS-20 code
+                  
+        Usererror ( .Rab[Rab$h_sts] )
+        END
+    END;
+
+
+GLOBAL ROUTINE Wbucket =	! Put current bucket
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Put current bucket to an open local file.
+!
+!--
+    BEGIN
+    BIND Cbkd=Rst[Rst$z_Current_Bucket]: $Rms_Bucket_Descriptor;
+    BIND Cbfd=.cbkd[Bkt$a_Buffer_Desc ]: $Rms_Buffer_Descriptor;
+
+    IF Cbfd NEQ 0                       ! Is there any buffer descriptor?
+    THEN
+        BEGIN
+        IF .cbfd[buf$v_use_count] GTR 0 ! Is a bucket in the buffer?
+        THEN Put_Bucket(Update=1, Desc=Cbkd);   ! Write it out
+        END;
+     END;			!End of Wbucket
+%FI
+
+END
+
+ELUDOM
+    

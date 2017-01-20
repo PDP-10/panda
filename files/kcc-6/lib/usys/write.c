@@ -1,0 +1,1277 @@
+/*
+**	WRITE - URT low-level I/O write
+**
+**	(c) Copyright Ken Harrenstien 1989
+**		for all changes after v.65, 11-Aug-1988
+**	Copyright (C) 1986 by Ian Macky, SRI International
+**	Edits for ITS:  Copyright (C) 1988 Alan Bawden
+*/
+
+#include <c-env.h>
+#if SYS_T20+SYS_10X+SYS_T10+SYS_CSI+SYS_WTS+SYS_ITS	/* Systems supported for */
+
+#include <stddef.h>
+#include <string.h>		/* memcpy etc */
+#include <signal.h>		/* for SIGXFSZ */
+#include <sys/usydat.h>
+#include <sys/usysio.h>
+#include <sys/urtint.h>
+#include <errno.h>
+
+#if SYS_T20
+#include <jsys.h>
+
+#define BUFFER_SIZE(uf) UIO_BUFSIZ
+
+#elif SYS_ITS
+#include <sysits.h>
+
+#define BUFFER_SIZE(uf) ((UIO_BUFSIZ / 4) * uf->uf_nbpw)
+
+#elif SYS_T10+SYS_CSI+SYS_WTS
+#include <muuo.h>
+#include <macsym.h>
+#define BUFFER_SIZE(uf) UIO_BUFSIZ
+
+#endif
+
+/* Internal routines */
+
+#if defined(__STDC__) || defined(__cplusplus)
+# define P_(s) s
+#else
+# define P_(s) ()
+#endif
+
+/* cusys:write.c */
+#if SYS_T20+SYS_10X+SYS_T10+SYS_CSI+SYS_WTS+SYS_ITS	
+static int outisys P_((struct _ufile *uf,const char *buf,int nbytes));
+#if SYS_10X+SYS_T20
+static int outsys P_((struct _ufile *uf,const char *buf,int nbytes));
+#endif 
+#if SYS_T10+SYS_CSI+SYS_WTS
+static int outsys P_((struct _ufile *uf,const char *buf,int nbytes));
+#endif 
+#if SYS_T10+SYS_CSI+SYS_WTS
+static int outdev P_((struct _ufile *uf,const char *buf,int nbytes));
+static int outbuf P_((struct _ufile *uf,const char *buf,int cnt));
+static int ofrcbuf P_((struct _ufile *uf));
+static int outblk P_((struct _ufile *uf,const char *buf,int nbytes));
+static int iobprime P_((struct _ufile *uf,int nbytes));
+static int iobdump P_((struct _ufile *uf,int newblk));
+static int iobload P_((struct _ufile *uf,int newblk));
+static void t10bsync P_((struct _ufile *uf));
+static void t10bunsync P_((struct _ufile *uf));
+static int w_eofp P_((struct _ufile *uf));
+static int w_in P_((struct _ufile *uf,int iop));
+static int w_out P_((struct _ufile *uf,int iop));
+static int w_uset P_((struct _ufile *uf,int op,int blk));
+static int outtty P_((struct _ufile *uf,const char *buf,int nbytes));
+static int outctm P_((struct _ufile *uf,const char *buf,int nbytes));
+#endif 
+#if SYS_ITS
+static int outsys P_((struct _ufile *uf,const char *buf,int nbytes));
+#endif 
+#if SYS_ITS
+static int doiot P_((struct _ufile *uf,int *wptr,int wcnt,int *valptr));
+#endif 
+#endif 
+
+#undef P_
+
+
+int
+write(fd, vbuf, nbytes)
+register int fd;
+const void *vbuf;
+register size_t nbytes;
+{
+    register struct _ufile *uf;
+    register int n, i;
+    register const char *buf = (char *)vbuf;
+    char *bufp;
+    char cbuf[UIO_BUFSIZ];	/* Temporary conversion buffer on stack */
+    int ncvt;
+
+    USYS_BEG();
+    if (!(uf = _UFGET(fd)) || !(uf->uf_flgs & UIOF_WRITE))
+	USYS_RETERR(EBADF);
+    if (nbytes <= 0) {
+	if (nbytes == 0) USYS_RET(0);
+        USYS_RETERR(EINVAL);
+    }
+
+    /* Check for and handle unconverted case */
+    if (!(uf->uf_flgs & UIOF_CONVERTED)) {
+	n = outisys(uf, buf, nbytes);
+	USYS_RET(n);
+    }
+
+    /* Handle converted case */
+    ncvt = nbytes;		/* Get # bytes to convert */
+#if SYS_ITS
+    bufp = (BYTE_PTR_OF_SIZE(uf->uf_bsize, cbuf)) - 1;
+#else
+    bufp = cbuf-1;		/* Use temporary conversion buffer on stack */
+#endif
+    --buf;
+    while (ncvt > 0) {
+	register char *cp;
+	n = (BUFFER_SIZE(uf))/2;
+	if (n > ncvt) n = ncvt;		/* Find # to cvt this pass */
+	ncvt -= n;
+	cp = bufp;
+	do {
+	    if ((*++cp = *++buf) == '\n') {
+						/* Copy bytes - if see LF, */
+		*cp = '\r';			/* replace with CR */
+		*++cp = '\n';			/* and add LF */
+	    }
+	} while (--n > 0);
+
+	/* Now find # bytes converted and actually output them. */
+	i = cp - bufp;
+	cp = bufp+1;
+	if ((n = outisys(uf, cp, i)) <= 0)
+	    USYS_RET(n);		/* Interrupted or error */
+	if (n < i) {			/* Output truncated? */
+	    /* Ugh, what to do about this case??  For now, nothing.
+	    ** A fancy recovery wd be to scan back thru user string until
+	    ** hit real count we stopped at, then return # of user chars that
+	    ** corresponds to.  But that can lose if stop at a \n; still
+	    ** need to output \n the next time write() is called.  Ugh!!
+	    */
+	}
+    }
+    USYS_RET(nbytes);			/* Return # bytes */
+}
+
+static int
+outisys(uf, buf, nbytes)
+struct _ufile *uf;
+const char *buf;
+int nbytes;
+{
+    int i, n, nreq = nbytes, ntot = 0;
+
+    for (;;) {			/* Loop for interrupt continuation */
+	if ((n = outsys(uf, buf, nreq)) > 0)
+	    return n + ntot;		/* Normally wins */
+	if (n == 0) {			/* Error? */
+#if !(SYS_10X+SYS_T20)
+	    errno = EIO;		/* Error code not set yet */
+#endif
+	    if ((errno == EWOULDBLOCK) && ntot)
+					/* If block after parital output, */
+		return ntot;		/* Return amount output */
+	    return -1;			/* Else return error */
+	}
+	/* Interrupted.  n has negative of # bytes left to write. */
+	i = USYS_END();			/* Allow ints, see if handler done */
+	USYS_BEG();			/* Disable interrupts again */
+	if (i < 0) {			/* Handler wants call interrupted? */
+	    if (ntot) return ntot;	/* If any written, return that */
+	    errno = EINTR;		/* Else fail this way */
+	    return -1;
+	}
+
+	/* Can proceed from interrupt!  Update things... */
+	/* Ensure UF is still OK (int rtn may have closed/reopened) */
+	if (uf->uf_nopen <= 0) {
+	    errno = EIO;		/* Fail if switcheroo happened */
+	    return -1;
+	}
+	ntot += nreq + n;
+	buf += nreq + n;	/* Update pointer by # bytes written */
+	nreq = -n;		/* Set new # bytes to write */
+    }
+}
+
+#if 0 	/* unfinished cruft */
+
+static int
+out_bcvt(uf, buf, nbytes)
+register struct _ufile *uf;
+char *buf;
+int nbytes;
+{
+    int ncvt;
+    char *bufp;
+    int ocnt;
+    int r, n;
+
+    ncvt = nbytes;		/* Get # bytes to convert */
+    for (;;) {
+	if (--(uf->uf_wleft) < 0) {	/* No more room in current buffer? */
+	    
+	}
+    }
+}
+
+static int
+out_empbuf(uf)
+struct _ufile *uf;
+{
+    int i;
+
+    while ((i = out_cbuf(uf)) < 0) {
+	/* Interrupted!  Buffer (block) not written at all. */
+	i = USYS_END();		/* Allow ints for a moment, check handler */
+	USYS_BEG();		/* Disable interrupts again */
+	if (i < 0)		/* Was a handler done that wants failure? */
+	    break;		/* Yes, return interrupt indicator */
+
+	/* Can proceed from interrupt!  Update things... */
+	/* Ensure UF is still OK (int rtn may have closed/reopened) */
+	if (uf->uf_nopen <= 0 || !uf->uf_bpbeg) {
+	    errno = EIO;	/* Fail if switcheroo happened */
+	    return 0;
+	}
+    }				/* And continue loop to re-try call! */
+    return i;		/* Return win, lose, or int */
+}
+
+/* OUT_CBUF - Empty conversion buffer auxiliary
+**	Ensures room in a buffer to supply raw data for conversion routine.
+**	Must set uf_bpbeg, uf_cp, uf_wleft.
+** Returns:
+**
+**	-1 if interrupted, but buffer was output.
+**	0   if error.
+**	> 0 Success
+*/
+static int
+out_cbuf(uf)
+register struct _ufile *uf;
+{
+    int n;
+
+#if SYS_T10+SYS_CSI+SYS_WTS
+    /* If disk or some random buffered channel, invoke buffer force */
+    if (uf->uf_type == UIO_DVDSK || uf->uf_boring.br_bp)
+	return out_buf(uf);
+#endif
+    /* Simple buffer, just force out with outsys() and empty it */
+    n = outsys(uf, uf->uf_bpbeg, uf->uf_blen);
+    if (n > 0) {
+	uf->uf_cp = uf->uf_bpbeg;
+	uf->uf_wleft = uf->uf_blen;
+	uf->uf_bpos = uf->uf_pos;
+    } else if (n < 0) {
+	/* Interrupted... */
+	if (-n >= uf->uf_blen)
+	    return n;		/* Should come here for block type stuff */
+	/* Should only get partial output for stuff that isn't block-oriented.
+	*/
+	uf->
+    }
+    return n;
+}
+#endif /* Unfinished cruft */
+
+#if SYS_10X+SYS_T20
+
+/*
+ *	Get number of characters available for output.
+ *	Returns -1 if space available, but actual count is unknown.
+ */
+int _nwrite(uf, arg)
+struct _ufile *uf;
+long *arg;
+{
+  if (!(uf->uf_flgs & UIOF_WRITE))	/* Fail if not open for write */
+    return -1;
+#if SYS_T20+SYS_10X
+  {
+    int acs[5], i;
+
+    *arg = -1;			/* Default, assume output possible */
+    acs[1] = uf->uf_ch;		/* JFN on stream */
+    i = jsys(SOBF, acs);	/* Check output buffer, space avail to AC2 */
+    if (i < 0) return -2;	/* Interrupted? */
+    if (i == 0) return -1;	/* Failed? */
+    *arg = acs[2];		/* Get space available */
+    if (i == 2)			/* Did SOBF skip? */
+      *arg = 0;			/* Yes, output buffer full, no space */
+    acs[1] = uf->uf_ch;
+    if (jsys(GTSTS,acs)
+	&& !(acs[2] & GS_ERR))	/* If no exceptional conditions */
+      switch (uf->uf_type) {	/* do special checks */
+      case _DVTCP:		/* TCP, use GDSTS */
+	acs[1] = uf->uf_ch;
+	if (jsys(GDSTS,acs) > 0) {
+	  i = (acs[2] >> 18) & RH; /* Get transmit state */
+	  switch (i) {
+	  case 0:		/* NOTSYN */
+	  case 2:		/* FINSNT */
+	    (*arg)++;		/* Flag exceptional condition to see */
+	  }
+	}      
+	break;
+	
+      case _DVPIP:		/* Pipe, use GDSTS */
+	acs[1] = uf->uf_ch;
+	if (jsys(GDSTS,acs) > 0) {
+	  *arg = ((acs[3] >> 18) & RH) - (acs[3] & RH);
+	  /* Compute actual space available */
+	  if (acs[2] & 020) (*arg)++; /* If read side closed, add 1 more */
+	}
+	break;
+      }
+  }
+#endif
+  return 0;			/* Give success return */
+}
+
+/* OUTSYS(uf, buf, nbytes) - TOPS-20/TENEX system-dependent output
+**	Returns:
+**		> 0  Won, return value is # of bytes written.
+**		= 0  Failed.
+**		< 0  Interrupted; value is -<# of bytes LEFT to be written>.
+**	In all cases, uf_pos is updated to reflect
+**	any bytes that were actually written.
+*/
+static int
+outsys(uf, buf, nbytes)
+struct _ufile *uf;
+int nbytes;
+const char *buf;
+{
+    int i, num, ablock[5];
+    long avail;
+
+    if (uf->uf_flgs & UIOF_NDELAY) /* If non-blocking I/O, */
+      switch (uf->uf_type) {	/* And a device we care about */
+      case _DVTTY:
+      case _DVPTY:
+      case _DVPIP:
+      case _DVTCP:
+	num = _nwrite(uf, &avail);
+	if (num == -2) return -nbytes;	/* If interrupted, say so */
+	
+	/* If got answer, and no space, return */
+	if (!num && !avail) {
+	  errno = EWOULDBLOCK; /* Tell user */
+	  return 0;		/* And return error */
+	}
+	if (!num && (avail > 0) && (nbytes > avail)) nbytes = avail;
+				/* Limit to space available */
+	break;
+      }
+
+    switch (uf->uf_type) {
+	case _DVDSK:
+	    num = SOUT;			/* Not interruptible */
+	    break;
+	case _DVTTY:
+	case _DVPTY:
+	case _DVPIP:
+	default:
+	    num = SOUT | JSYS_OKINT;	/* Allow interrupts */
+	    break;
+	case _DVTCP:			/* SOUTR to Force output */
+	    num = SOUTR | JSYS_OKINT;
+	    break;
+    }
+    ablock[1] = uf->uf_ch;		/* JFN */
+    ablock[2] = (int) (buf - 1);	/* 1 before buffer */
+    ablock[3] = -nbytes;		/* -# bytes to write */
+    num = jsys(num, ablock);
+
+    /* Now update vars */
+    uf->uf_pos += (i = nbytes + ablock[3]);	/* Find # bytes written */
+    if (num > 0)		/* SOUT succeeded? */
+	return i;		/* Yes, all's well (probably) */
+
+    if (num == 0)		/* If error, decode */
+        switch (ablock[0]) {	/* SOUT failed somehow, translate error */
+	case monsym("LNGFX1"):
+	    errno = EFBIG;	/* File too big */
+	    raise(SIGXFSZ);	/* Turn on this signal */
+	    break;		/* And handle as if interrupted */
+	case IOX11:
+	    errno = EDQUOT;	/* Quota exceeded */
+	    return 0;
+	case IOX34:
+	    errno = ENOSPC;	/* No space on disk */
+	    return 0;
+	case monsym("IOX5"):	/* Device or data error */
+	    if ((uf->uf_type == _DVPIP)	/* If pipe, */
+		&& (jsys(GDSTS,ablock))	/* And get status, */
+		&& (ablock[2] & 20)) { /* And read side has been closed */
+	      /* Attempt to write to pipe with no one to read it */
+	      errno = EPIPE;	/* Give special error */
+	      raise(SIGPIPE);	/* And raise this signal */
+	      return 0;
+	    }
+	    /* Fall into default error */
+	default:
+	    errno = EIO;	/* Random error */
+	    return 0;
+	}
+    return (ablock[3] < 0 ?	/* See if anything left to write */
+	    ablock[3] : i);	/* return -N if so, else claim we won. */
+}
+#endif /* T20+10X */
+
+#if SYS_T10+SYS_CSI+SYS_WTS
+
+/* OUTSYS(uf, buf, nbytes) - TOPS-10/CSI/WAITS system-dependent output
+**	Returns:
+**		> 0  Won, return value is # of bytes written.
+**		= 0  Failed.
+**		< 0  Interrupted; value is -<# of bytes LEFT to be written>.
+**	In all cases, uf_pos is updated to reflect
+**	any bytes that were actually written.
+*/
+
+static int
+outsys(uf, buf, nbytes)
+struct _ufile *uf;
+int nbytes;
+const char *buf;
+{
+    switch(uf->uf_type) {
+	case UIO_DVDSK:		/* Block device, always buffered */
+	    return outblk(uf, buf, nbytes);
+
+	case UIO_DVTTY:		/* TTY, always force out immediately */
+	    return outtty(uf, buf, nbytes);
+
+	default:	/* Could test a flag bit for immediate forcing? */
+			/* For time being, always assume buffered and force. */
+	    return outdev(uf, buf, nbytes);
+    }
+}
+#endif /* T10+CSI+WTS */
+
+#if SYS_T10+SYS_CSI+SYS_WTS
+static int
+outdev(uf, buf, nbytes)
+struct _ufile *uf;
+int nbytes;
+const char *buf;
+{
+    register int n, nleft;
+
+    if ((n = outbuf(uf, buf, nbytes)) <= 0)
+	return n;		/* Error or interrupted */
+
+    /* Find # bytes still in buffer, and force them out. */
+    /* Note return value if positive is 1 greater than actual # output */
+    if ((nleft = ofrcbuf(uf)) <= 0) {
+	if (nleft == 0)		/* If error, just return that; errno is set */
+	    return 0;
+	/* Interrupt.  Special hackery to make sure that (1) caller sees
+	** interrupt indication, and (2) resumption of call will attempt
+	** to output the remaining buffer stuff!
+	** Back up to start of whatever we just put in this buffer; must
+	** check to avoid backing up over old stuff!
+	*/
+	if (nleft < -nbytes)		/* More bytes than we just wrote? */
+	    nleft = -nbytes;		/* Yeah, only back up that much */
+	uf->uf_boring.br_bp += nleft;	/* Back up byte ptr (note neg #!) */
+	uf->uf_boring.br_cnt -= nleft;	/* Back up cnt      (  " ) */
+	return nleft;			/* Say interrupted */
+    }
+    return n;			/* Success, return total # bytes written */
+}
+
+static int
+outbuf(uf, buf, cnt)
+struct _ufile *uf;
+int cnt;
+void char *buf;
+{
+    register int copcnt, n;
+    int nout = 0;
+
+  for (;;) {
+    if ((copcnt = uf->uf_boring.br_cnt) <= 0) {
+	/* Must get another output buffer. */
+	if ((n = ofrcbuf(uf)) <= 0) {	/* Force out buff (maybe init) */ 
+	    return (n == 0) ? 0		/* Error, return 0 (errno is set) */
+			: -cnt;		/* Interrupted, say how much left */
+	}
+	if ((copcnt = uf->uf_boring.br_cnt) <= 0) {
+	    errno = EIO;		/* Must have buffer space by now!!! */
+	    return 0;			/* Ugh, UUO failed to update count */
+	}
+    }
+
+    /* Now have room ready in an output buffer. */
+    if (copcnt > cnt)			/* Have more room than needed? */
+	copcnt = cnt;			/* Yeah, limit to this much */
+
+    /* Note the bump of the byte pointer before giving it to memcpy.
+    ** We lose big if this is ever anything but an <IBP 0,> because
+    ** ADJBP preserves the incorrect alignment that the monitor stupidly
+    ** set up!
+    */
+    memcpy(++(uf->uf_boring.br_bp), buf, copcnt);	/* Copy */
+    uf->uf_boring.br_cnt -= copcnt;	/* Update bfr hdr */
+    uf->uf_boring.br_bp += copcnt-1;	/* Update ptr, compensate for bump */
+
+    /* Now see if must output another bufferful */
+    nout += copcnt;			/* Update # bytes written */
+    if ((cnt -= copcnt) <= 0)		/* Update # left */
+	break;
+    buf += copcnt;			/* Must get more, update src ptr */
+  }
+    return nout;
+}
+
+/* OFRCBUF - force out anything in output buffer.
+**	Returns > 0   = # bytes forced out, plus 1.
+**			(hence a value of 1 means nothing was in buffer)
+**		== 0  = Error, errno is set.
+**		< 0   = Interrupted, # bytes left in buffer.
+*/
+static int
+ofrcbuf(uf)
+struct _ufile *uf;
+{
+    register int ret, nbytes;
+
+    /* Find # bytes written into buffer, if any */
+    nbytes = uf->uf_blen - uf->uf_boring.br_cnt;
+    if (nbytes > 0) {
+	ret = w_out(uf, 0);
+	if (ret > 0) {		/* Success? */
+	 } else if (ret < 0) {	/* Interrupted? */
+	    return -nbytes;	/* Say this much not done */
+	} else {		/* Failure of some kind */
+#if 0
+	    oerr(uf);		/* Set errno to something meaningful */
+#else
+	    errno = EIO;
+#endif
+	    return 0;
+	}
+    }
+    return nbytes+1;
+}
+
+/* OUTBLK - output user bytes to block device.
+**	Returns:
+**		<= 0 if error.  Note interrupts not possible.
+**		> 0 if won, all of user string was output or put in buffer.
+**			This value is == nbytes to satisfy caller expectations.
+*/
+static int
+outblk(uf, buf, nbytes)
+register struct _ufile *uf;
+register const char *buf;
+int nbytes;
+{
+    register int n, ucnt = nbytes;
+    for (;;) {
+	if ((n = uf->uf_wleft) <= 0) {	/* Any bytes left in buffer? */
+	    if (!_blkprime(uf, ucnt))	/* Get room (maybe write old buff) */
+		return 0;		/* Error */
+	    n = uf->uf_wleft;		/* Got room, see how much */
+	}
+	if (ucnt < n) n = ucnt;
+	memcpy(uf->uf_cp, buf, n);	/* Copy bytes from user space */
+
+	/* Now update vars */
+	uf->uf_flgs |= UIOF_BMODIF;	/* Say buffer modified */
+	if ((uf->uf_pos += n) > uf->uf_flen)
+	    uf->uf_flen = uf->uf_pos;	/* May need to update EOF */
+	uf->uf_cp += n;
+	uf->uf_wleft -= n;
+	if ((uf->uf_rleft -= n) < 0)
+	    uf->uf_rleft = 0;
+	if ((ucnt -= n) <= 0)
+	    return nbytes;		/* Won, return total done */
+	buf += n;			/* More bytes to do, update user ptr */
+    }
+}
+
+/* _BLKPRIME - Primes buffer for block device.
+**	Initializes buffer for either reading or writing.
+**	nbytes must either be 0 for reading,
+**	or the # of bytes needed for writing.
+**	Never interrupts, returns 0 if error, > 1 if succeed.
+*/
+int
+_blkprime(uf, nbytes)
+register struct _ufile *uf;
+int nbytes;
+{
+    register int n;
+
+    /* If writing, and channel open for appending, must force new pos to EOF */
+    if (nbytes && (uf->uf_flgs & UIOF_APPEND))	/* If appending, new pos */
+	uf->uf_pos = uf->uf_flen;		/* is always EOF! */
+
+    if (iobprime(uf, nbytes))		/* Dump old, load new buff */
+	return 0;			/* Ugh, error! */
+    n = uf->uf_pos - uf->uf_bpos;	/* Find offset now */
+
+    /* Current buffer is now right one, "n" has # bytes offset into buffer */
+    uf->uf_cp = uf->uf_bpbeg + n;
+    uf->uf_wleft = uf->uf_blen - n;
+    if ((uf->uf_rleft = uf->uf_flen - uf->uf_pos) > uf->uf_wleft)
+	uf->uf_rleft = uf->uf_wleft;
+    else if (uf->uf_rleft <= 0) {
+	uf->uf_rleft = 0;
+	uf->uf_eof = 1;
+    }
+
+    /* If reading, and channel also open for appending, must ensure
+    ** that any attempt to write will force a re-init.
+    */
+    if (!nbytes && (uf->uf_flgs & UIOF_APPEND))
+	uf->uf_wleft = 0;		/* Force write to re-init. */
+    return 1;
+}
+
+/* IOBPRIME - Set up new buffer block.
+**	Seeks to and reads in block specified by uf_pos.
+**	If nbytes is:
+**	0 - we're doing reading.
+**		If new block is within known size of file, seek and get it.
+**		Otherwise, don't seek at all; set uf_bpos to system
+**			position, clear flags, and zap counts.
+**			This is necessary because T10 USETI won't work.
+**	N - we're doing writing.
+**		If nothing needs to be read, just do a write-seek.
+**		Else, do a read-seek and read stuff in.
+**
+**	Updates uf_bpos and flags.
+*/
+static int
+iobprime(uf, nbytes)
+struct _ufile *uf;
+int nbytes;
+{
+    int err, newblk, curblk;
+    long newpos;
+
+    newblk = uf->uf_pos / uf->uf_blen;		/* Blk # seeking to */
+    curblk = uf->uf_bpos / uf->uf_blen;		/* Blk # in buffer */
+
+    if (newblk == curblk		/* If at right block */
+      && (uf->uf_flgs&(UIOF_BREAD|UIOF_BMODIF)))	/* and stuff in buff */
+	return 0;			/* then we win, instant success */
+
+    /* Must discard current buffer.
+    ** If buffer was modified, we have to dump it out.  Note that
+    ** if UIOF_BREAD is set, the current sys I/O pointer is at the block
+    ** past uf_bpos, thus we have to seek there.  Otherwise, the sys pointer
+    ** is precisely uf_bpos and we use -1 to tell iobdump it needn't seek.
+    */
+    if (uf->uf_flgs & UIOF_BMODIF) {	/* If modified stuff in buff */
+	if (err = iobdump(uf, (uf->uf_flgs&UIOF_BREAD) ? curblk : -1))
+	    return err;			/* Ugh, error */
+	/* Note iobdump always sets UIOF_BREAD if it succeeds. */
+    }
+    if (uf->uf_flgs & UIOF_BREAD) {	/* About to flush flag, so */
+	uf->uf_bpos += uf->uf_blen;	/* use it to update actual position */
+	++curblk;			/* now! */
+    }
+    uf->uf_flgs &= ~(UIOF_BREAD|UIOF_BMODIF);	/* Forget old buff! */
+
+    /* Now prepare a new buffer.  This is done either by reading in
+    ** the old contents from device, or by clearing the buffer.
+    */
+#if SYS_T10+SYS_CSI+SYS_WTS
+    newpos = newblk * uf->uf_blen;	/* Set what new buffer pos shd be. */
+    if (nbytes == 0) {			/* If reading */
+	if (newpos >= uf->uf_flen) {	/* If past EOF... */
+	    /* Trying to seek past EOF, mustn't attempt USETI or we lose. */
+	    uf->uf_cp = NULL;			/* Ensure stuff zapped */
+	    uf->uf_rleft = uf->uf_wleft = 0;
+	    return 0;				/* And do nothing else */
+	}
+    } else {				/* Writing */
+	if (newpos >= uf->uf_flen		/* If past EOF, or don't */
+	  || nbytes >= uf->uf_blen		/* need to read anything */
+	  || !(uf->uf_flgs&(UIOF_READ|UIOF_OREAD))) {	/* or can't read */
+	    /* Don't need to load buffer, just clear it.  Because we may
+	    ** not write buff out yet, don't even seek either.  Instead,
+	    ** just set UIOF_BREAD to pretend zapped buffer was "read",
+	    ** and this combined with UIOF_BMODIF will always force a
+	    ** seek to uf_bpos when the buffer is finally dumped.
+	    */
+	    uf->uf_bpos = newpos;		/* Pseudo-seek */
+	    if (uf->uf_bsize != 9		/* Unless bytes fill a word, */
+	      || nbytes < uf->uf_blen)		/* & will fill entire buff, */
+		memset(uf->uf_bpbeg, 0, uf->uf_blen);	/* clear buffer! */
+	    uf->uf_flgs |= UIOF_BREAD|UIOF_BMODIF;
+	    return 0;
+	}
+    }
+
+    /* OK to load up new buffer, so do it.  This sets uf_bpos if seek done. */
+    if (err = iobload(uf, (newblk == curblk ? -1 : newblk)))
+	return err;
+#endif
+    return 0;
+}
+
+/* _BLKFIN - Finalize block-mode I/O just prior to closing file.
+**	This is needed for various things:
+**	T10 to write out anything still in a modified buffer.
+**	CSI in order to set the screwy last-word bits for 8-bit files.
+**	T20/10X to flush page map and maybe set file size.
+**
+**	Updates uf_bpos and flags.
+**	Returns 0 if succeeded, else error.
+*/
+int
+_blkfin(uf)
+struct _ufile *uf;
+{
+#if SYS_T20+SYS_10X
+    /* Must force out final page if any and flush from map.
+    */
+
+#elif SYS_T10+SYS_CSI+SYS_WTS
+    int err;
+
+    if (!(uf->uf_flgs & UIOF_WRITE))	/* If not writing, */
+	return 0;			/* nothing to do! */
+    if (uf->uf_bsize == 8) {
+	int *ip;
+	if (uf->uf_pos = uf->uf_flen)
+	    --(uf->uf_pos);		/* Seek to within last wd */
+	if (err = iobprime(uf, 1))	/* Go there! */
+	    return err;			/* Ugh, error */
+	ip = (int *) uf->uf_cp;		/* Get ptr to last word */
+	*ip &= 017;			/* Zap low 4 bits */
+	if (uf->uf_flen & 03)		/* Add count in */
+	    *ip |= 4 - (uf->uf_flen & 03);
+	uf->uf_flgs |= UIOF_BMODIF;	/* Say buffer munged */
+    }
+    if (uf->uf_flgs & UIOF_BMODIF)
+	return iobdump(uf, ((uf->uf_flgs & UIOF_BREAD)
+		? (uf->uf_bpos/uf->uf_blen)	/* Must seek to block */
+		: -1 ));			/* Right place, no seek */
+#endif
+    return 0;
+}
+
+/* IOBDUMP - Write out buffer block.
+**	If newblk < 0, writes to whatever current system block is.
+**	If newblk >= 0, seeks to that block and writes there.
+**	Updates uf_bpos and flags.
+**	Returns 0 if succeeded, else error.
+*/
+static int
+iobdump(uf, newblk)
+struct _ufile *uf;
+int newblk;
+{
+#if SYS_T20+SYS_10X
+    /* Must check to see whether to set EOF -- do so if EOF is within
+    ** current buffer or just past it.
+    */
+
+#elif SYS_T10+SYS_CSI+SYS_WTS
+    extern void _panic();
+    int n, iowd[2];
+
+    if (uf->uf_boring.br_bp) {		/* Buffered output, yeech. */
+	if (newblk >= 0) {		/* If seeking, double yeech!!! */
+	    if (!(uf->uf_flgs & UIOF_ISSYNC))	/* Not synched yet, so */
+		t10bsync(uf);			/* do it now. */
+	}
+	if (uf->uf_pos == 0			/* If writing at BOF */
+	  && (uf->uf_flgs & UIOF_ISSYNC))	/* and we're synched */
+	    t10bunsync(uf);			/* Turn off synch! */
+
+	if (newblk >= 0) {
+	    /* Ugh, do seek, even though it will probably lose.
+	    ** Note that we can't have filled the buffer before now,
+	    ** or the USETO may force it out -- hard to be sure with T10.
+	    */
+	    w_uset(uf, _FOUSO, newblk);		/* Do USETO */
+	    uf->uf_bpos = newblk * uf->uf_blen;
+	}
+
+	/* See whether EOF is within current buffer.  If so, have to be
+	** careful to write only that many bytes (wds) and no more, since there
+	** is no other way to set file size!
+	*/
+	if (uf->uf_blen != uf->uf_boring.br_cnt)
+	    _panic("iodump: bad monitor OUT cnt!");
+	if (uf->uf_blen > (uf->uf_flen - uf->uf_bpos))
+	    n = uf->uf_flen - uf->uf_bpos;		/* # written */
+	else n = uf->uf_blen;
+	uf->uf_boring.br_cnt = uf->uf_blen - n;
+	uf->uf_boring.br_bp = uf->uf_bpbeg + (n-1);	/* T10 wants ILDB bp */
+	if (w_out(uf, 0) <= 0) {	/* Do OUT */
+	    errno = EIO;		/* Set error # */
+	    return 1;			/* and return error indication */
+	}
+	uf->uf_bpbeg = uf->uf_boring.br_bp;
+	++(uf->uf_bpbeg);	/* Get properly aligned byte pointer!!! */
+				/* Lose if this is anything but <IBP 0,> */
+
+    } else {			/* Dump mode seek, much simpler! */
+
+	if (newblk >= 0) {
+	    w_uset(uf, _FOUSO, newblk);		/* Do USETO */
+	    uf->uf_bpos = newblk * uf->uf_blen;
+	}
+
+	/* See whether EOF is within current buffer.  If so, have to be
+	** careful to write only that many words and no more, since there
+	** is no other way to set file size!
+	*/
+	if ((uf->uf_bpos + uf->uf_blen) > uf->uf_flen) {
+	    n = 36/uf->uf_bsize;			/* # bytes/word */
+	    n = ((uf->uf_flen - uf->uf_bpos)+n-1) / n;	/* Rounded-up # wds */
+	} else n = UIO_T10_DSKWDS;
+	iowd[0] = _IOWD(n, (int)(int *)(uf->uf_bpbeg));
+	iowd[1] = 0;
+	if (w_out(uf, iowd) <= 0) {	/* Do OUT */
+	    errno = EIO;		/* Set error # */
+	    return 1;			/* and return error indication */
+	}
+    }
+    uf->uf_flgs &= ~UIOF_BMODIF;	/* Say buff no longer modified */
+    uf->uf_flgs |= UIOF_BREAD;		/* and pretend has "read" stuff */
+#endif
+    return 0;				/* Success */
+}
+
+/* IOBLOAD - Read in buffer block.
+**	If newblk < 0, reads from whatever current system block is.
+**	If newblk >= 0, seeks to that block and reads it.
+**	Updates uf_bpos and flags.  Does not check or change UIOF_BMODIF.
+**	May set uf_eof if EOF was unexpectedly encountered.
+**	Returns 0 if succeeded, else error.
+*/
+static int
+iobload(uf, newblk)
+struct _ufile *uf;
+int newblk;
+{
+#if SYS_T10+SYS_CSI+SYS_WTS
+    int iop, iowd[2];
+
+    uf->uf_flgs &= ~UIOF_BREAD;		/* Ensure flag off in case error */
+    if (uf->uf_biring.br_bp) {		/* Buffered input, yeech. */
+	iop = 0;			/* Use buffer ring normally */
+	if (newblk >= 0) {		/* If seeking, double yeech!!! */
+	    if (!(uf->uf_flgs & UIOF_ISSYNC)) {	/* If not synched yet, */
+		t10bsync(uf);			/* do so now */
+		iop = uf->uf_biring.br_buf;	/* And re-init buffer ring */
+	    }
+	}
+	if (uf->uf_pos == 0			/* If reading from BOF */
+	  && (uf->uf_flgs & UIOF_ISSYNC))	/* and we're synched */
+	    t10bunsync(uf);			/* Turn off synch! */
+
+    } else {			/* Dump mode seek, much simpler setup! */
+	iowd[0] = _IOWD(UIO_T10_DSKWDS, (int)(int *)(uf->uf_buf->b_data));
+	iowd[1] = 0;
+	iop = (int)iowd;		/* Use dump vector */
+    }
+
+    /* Now do the seek and block read. */
+    if (newblk >= 0) {
+	w_uset(uf, _FOUSI, newblk);	/* Do USETI */
+	uf->uf_bpos = newblk * uf->uf_blen;
+    }
+    if (w_in(uf, iop) <= 0) {		/* Do IN UUO */
+	if (w_eofp(uf)) {		/* EOF? */
+	    uf->uf_eof = -1;		/* Yeah, unexpected EOF! */
+	    if (uf->uf_flen > uf->uf_bpos)	/* If had wrong filesize, */
+		uf->uf_flen = uf->uf_bpos;	/* fix it now. */
+	    return 0;		/* Return OK but don't set UIOF_BREAD! */
+	}
+	errno = EIO;		/* Ugh, something else.  Set error # */
+	return 1;		/* and return error indication */
+    }
+    if (uf->uf_biring.br_bp) {		/* Buffered input, yeech. */
+	uf->uf_bpbeg = uf->uf_biring.br_bp;
+	++(uf->uf_bpbeg);		/* Get properly aligned BP!!! */
+    }
+#endif
+    uf->uf_flgs |= UIOF_BREAD;		/* Buffer now has READ data */
+    return 0;				/* Success */
+}
+
+/* Various support routines */
+
+/* T10BSYNC - Set IO.SYN status bit and wait until I/O quiescent.
+**	For the sake of input, flush the use bit for each buffer in the
+**	input ring, to avoid being given a stale buffer on the next IN.
+*/
+static void
+t10bsync(uf)
+struct _ufile *uf;
+{
+    if (!_filopuse) {
+	int status;
+	MUUO_IO("GETSTS", uf->uf_ch, &status);
+	status |= uuosym("IO.SYN");		/* Turn on synch! */
+	MUUO_IO("SETSTS", uf->uf_ch, status);
+	MUUO_CH("WAIT", uf->uf_ch);		/* Sigh! */
+    } else {
+	struct _foblk fo;
+	fo.fo_chn = uf->uf_ch;
+	fo.fo_fnc = _FOGET;
+	MUUO_ACVAL("FILOP.", XWD(1,(int)&fo), &fo.fo_ios);
+	fo.fo_ios |= uuosym("IO.SYN");		/* Turn on synch! */
+	fo.fo_fnc = _FOSET;
+	MUUO_AC("FILOP.", XWD(2,(int)&fo));
+	fo.fo_fnc = _FOWAT;
+	MUUO_AC("FILOP.", XWD(1,(int)&fo));
+    }
+    uf->uf_flgs |= UIOF_ISSYNC;
+
+    /* Clear input buffer ring if one, by clearing all buffer use bits.
+    ** The caller must be careful to point to one of these buffers on the
+    ** next IN monitor call.
+    */
+    if (uf->uf_biring.br_bp) {
+	struct _iob *b, *cb;
+	b = cb = (struct _iob *)(uf->uf_biring.br_buf-1);
+	for (;;) {
+	    b->bf_iou = 0;		/* Clear use bit for buffer */
+	    b = (struct _iob *) (b->bf_nba-1);	/* Get next buffer */
+	    if (b == cb) break;		/* Stop when back at first buffer */
+	}
+    }
+}
+
+/* T10BUNSYNC - Clear IO.SYN status bit.
+*/
+static void
+t10bunsync(uf)
+struct _ufile *uf;
+{
+    if (!_filopuse) {
+	int status;
+	MUUO_IO("GETSTS", uf->uf_ch, &status);
+	status &= ~uuosym("IO.SYN");	/* Turn off synch! */
+	MUUO_IO("SETSTS", uf->uf_ch, status);
+    } else {
+	struct _foblk fo;
+	fo.fo_chn = uf->uf_ch;
+	fo.fo_fnc = _FOGET;
+	MUUO_ACVAL("FILOP.", XWD(1,(int)&fo), &fo.fo_ios);
+	fo.fo_ios &= ~uuosym("IO.SYN");		/* Turn off synch! */
+	fo.fo_fnc = _FOSET;
+	MUUO_AC("FILOP.", XWD(2,(int)&fo));
+    }
+    uf->uf_flgs &= ~UIOF_ISSYNC;
+}
+
+static int
+w_eofp(uf)
+struct _ufile *uf;
+{
+    int status;
+    if (!_filopuse) MUUO_IO("GETSTS", uf->uf_ch, &status);
+    else {
+	status = XWD(uf->uf_ch, _FOGET);
+	MUUO_ACVAL("FILOP.", XWD(1,(int)&status), &status);
+    }
+    return status & uuosym("IO.EOF");
+}
+
+static int
+w_in(uf, iop)
+struct _ufile *uf;
+{
+    if (!_filopuse) return !MUUO_IO("IN", uf->uf_ch, iop);
+    else {
+	int arg[2];
+	arg[0] = XWD(uf->uf_ch, _FOINP);
+	arg[1] = iop;
+	return MUUO_AC("FILOP.", XWD(2,(int)&arg));
+    }
+}
+
+static int
+w_out(uf, iop)
+struct _ufile *uf;
+{
+    if (!_filopuse) return !MUUO_IO("OUT", uf->uf_ch, iop);
+    else {
+	int arg[2];
+	arg[0] = XWD(uf->uf_ch, _FOOUT);
+	arg[1] = iop;
+	return MUUO_AC("FILOP.", XWD(2,(int)&arg));
+    }
+}
+
+static int
+w_uset(uf, op, blk)
+struct _ufile *uf;
+{
+    ++blk;
+    if (!_filopuse) {
+	if (op == _FOUSO) MUUO_IO("USETO", uf->uf_ch, blk);
+	else MUUO_IO("USETI", uf->uf_ch, blk);
+	return 0;
+    } else {
+	int arg[2];
+	arg[0] = XWD(uf->uf_ch, op);
+	arg[1] = blk;
+	return MUUO_AC("FILOP.", XWD(2,(int)&arg));
+    }
+}
+
+/* OUTTTY - Output to TTY device.
+*/
+static int
+outtty(uf, buf, nbytes)
+struct _ufile *uf;
+int nbytes;
+register const char *buf;
+{
+#if SYS_CSI
+    register struct _tty *tp;
+    struct _toblk to;
+    int val;
+
+    if (!_trmopuse)
+#endif
+    if (uf->uf_ch == UIO_CH_CTTRM)	/* If controlling TTY, */
+	return outctm(uf, buf, nbytes);	/* must handle specially. */
+    else return outdev(uf, buf, nbytes); /* No, just treat as normal dev */
+
+#if SYS_CSI
+    tp = &USYS_VAR_REF(ttys[uf->uf_dnum]); /* Get TTY struct for this UF */
+    to.to_fnc = _TOOUT;		/* Function: output byte string */
+#if (UIO_CH_CTTRM != -1)	/* Make sure this the convenient value */
+#error Must fix CSI outtty() for UIO_CH_CTTRM!
+#endif
+    to.to_udx = XWD(-1,uf->uf_ch);	/* Specify which TTY */
+    to.to_arg.io.bp = buf-1;		/* Set up ILDB byte pointer */
+    to.to_arg.wd[0] = XWD(0,nbytes);	/* Clear LH, put # bytes into RH */
+
+    if (tp->sg.sg_flags & RAW)		/* If raw mode, always use 8 bits */
+	to.to_arg.wd[0] |= _TOFLG_8BIT;
+    for (;;) switch (MUUO_ACVAL("TRMOP.", XWD(4,(int)&to), &val)) {
+	case -1: return -(nbytes - to.to_arg.io.cnt);	/* Interrupt */
+	case 0:
+	    if (val == 016) {	/* Attempt recovery from bad byte */
+#if 0
+		if ((val = to.to_arg.io.cnt) == 0 || --val == 0)
+		    return nbytes;		/* Succeed if all gone */
+		++to.to_arg.io.bp;		/* Bump past bad byte */
+#endif
+		continue;			/* Keep going */
+	    }
+	    errno = EIO;		/* Ugh, random I/O error! */
+	    return 0;
+	default:
+	    return nbytes;
+    }
+#endif /* CSI */
+}
+
+/* OUTCTM - Output to Controlling Terminal
+*/
+static int
+outctm(uf, buf, nbytes)
+struct _ufile *uf;
+int nbytes;
+register const char *buf;
+{
+    register struct _tty *tp;
+    register int cnt;
+    int ch;
+
+    tp = &USYS_VAR_REF(ttys[0]); /* Get ptr to controlling TTY struct */
+    if (tp->tt_uf != uf) {	/* Cross-check... */
+	errno = EIO;
+	return 0;
+    }
+    --buf;				/* For PDP-10 efficiency */
+    cnt = nbytes;
+    if (tp->sg.sg_flags & RAW) {	/* Raw mode? */
+	do {
+	    ch = *++buf;
+#if SYS_WTS		/* WAITS - no raw mode TTCALL yet */
+	    if (MUUO_TTY("OUTCHR", &ch) < 0)
+#else
+	    if (MUUO_TTY("IONEOU", &ch) < 0)
+#endif
+		return -cnt;		/* Interrupted */
+	} while (--cnt > 0);
+    } else {				/* Normal mode */
+	do {
+	    ch = *++buf;
+	    if (MUUO_TTY("OUTCHR", &ch) < 0)
+		return -cnt;		/* Interrupted */
+	} while (--cnt > 0);
+    }
+    return nbytes;
+}
+
+#endif /* T10+CSI+WTS */
+
+#if SYS_ITS
+
+/* OUTSYS(uf, buf, nbytes) - system-dependent output
+**	Returns:
+**		> 0  Won, return value is # of bytes written.
+**		= 0  Failed.
+**		< 0  Interrupted; value is -<# of bytes LEFT to be written>.
+**	In all cases, _uiopos is updated to reflect
+**	any bytes that were actually written.
+*/
+
+static int
+outsys(uf, buf, nbytes)
+struct _ufile *uf;
+int nbytes;
+const char *buf;
+{
+    int val;
+    int n = nbytes;
+
+    switch (uf->uf_type) {
+	/* case _DVxxx:		   Non-blocking devices */
+	default:		/* DSK-like devices */
+	    if (uf->uf_flgs & UIOF_HANDPACK)
+		val = _outblock(uf, buf, &n);
+	    else {
+		char *ptr = buf - 1;
+		val = SYSCALL3("siot", uf->uf_ch, &ptr, &n);
+	    }
+    }
+
+    n = nbytes - n;		/* n = number of bytes written */
+    uf->uf_pos += n;		/* update pos */
+    if (!val) return n;		/* nothing unusual, return */
+				/* What if N is 0?  (EWOULDBLOCK?) */
+				/* Code in read() always returns EIO... */
+
+    /* There is no way for an interrupt to happen yet, because */
+    /* we haven't provided a way to give permission, but here is the */
+    /* code to handle it anyway: */
+    if (val < 0) {		/* interrupted? */
+	n = n - nbytes;		/* n = - bytes to go */
+	return (n ? n : nbytes);	/* if none to go, ignore interrupt */
+    }
+
+    errno = EIO;
+    return 0;
+}
+#endif /* SYS_ITS */
+
+#if SYS_ITS
+
+/* Block mode:  Simulate the way SIOT would behave were it
+ * possible to specify the byte-size in a unit mode open.
+ */
+
+static int doiot(uf, wptr, wcnt, valptr)
+  struct _ufile *uf;
+  int *wptr, wcnt, *valptr;
+{
+    int iotptr = ((- wcnt) << 18) | ((int) wptr);
+    *valptr = SYSCALL2("iot", uf->uf_ch, &iotptr);
+    return (iotptr & 0777777) - ((int) wptr);
+}
+
+#define IOT_BUFSIZ 300		/* in words */
+
+int _outblock(uf, ptr, cntptr)
+  struct _ufile *uf;
+  int *cntptr;
+  const char *ptr;
+{
+    int iotbuffer[IOT_BUFSIZ];
+    int iotbuffer_cnt = IOT_BUFSIZ * uf->uf_nbpw;
+    char *iotbuffer_ptr = ALIGNED_BYTE_PTR(uf->uf_bsize, iotbuffer) - 1;
+    int bcnt = uf->uf_zcnt;
+    char *bptr = iotbuffer_ptr + bcnt;
+    int cnt = *cntptr;
+    int words, bytes, val, n;
+
+    iotbuffer[0] = uf->uf_zbuf[0];
+    uf->uf_zcnt = 0;
+
+    /* Advance to a word boundary if possible */
+    if (bcnt > 0) {
+	while (bcnt < uf->uf_nbpw && cnt > 0) {
+	    *++bptr = *ptr++;
+	    cnt--;
+	    bcnt++;
+	}
+    }
+
+    /* Compute how many words and bytes user is offering */
+    words = cnt / uf->uf_nbpw;
+    bytes = cnt % uf->uf_nbpw;
+
+    /* If his byte pointer is aligned, and has the right size, then we */
+    /* can IOT words directly from his buffer */
+    if (words > 0 && ptr == ALIGNED_BYTE_PTR(uf->uf_bsize, ptr)) {
+
+	/* If we have a word in our buffer, output that one first.  If */
+	/* it doesn't go, return. */
+	if (bcnt > 0 && doiot(uf, iotbuffer, 1, &val) < 1) {
+	    uf->uf_zbuf[0] = iotbuffer[0];
+	    uf->uf_zcnt = bcnt - 1;
+	    *cntptr = cnt + 1;
+	    return val;
+	}
+
+	/* Now output his words.  If they don't all go, or there are no */
+	/* extra bytes, then we're done. */
+	if ((n = doiot(uf, ((int *) ptr), words, &val)) < words
+	    || bytes <= 0) {
+	    *cntptr = cnt - (n * uf->uf_nbpw);
+	    return val;
+	}
+
+	/* There are extra bytes, so fall through into general case */
+	ptr += words * uf->uf_nbpw;
+	cnt -= words * uf->uf_nbpw;
+	bptr = iotbuffer_ptr;
+	bcnt = 0;
+    }
+
+    ptr--;			/* ILDB from now on */
+
+    for (;;) {
+
+	/* Assuming our buffer contains bcnt bytes, copy as many bytes */
+	/* from the user as possible */
+	if ((n = iotbuffer_cnt - bcnt) > cnt) n = cnt;
+	cnt -= n;
+	bcnt += n;
+	while (n-- > 0) *++bptr = *++ptr;
+
+	/* How many words and bytes in our buffer? */
+	words = bcnt / uf->uf_nbpw;
+	bytes = bcnt % uf->uf_nbpw;
+
+	/* Output all the words.  If they don't all go, return but save */
+	/* an almost-full word (in case we put it there to start with!). */
+	if (words > 0 && (n = doiot(uf, iotbuffer, words, &val)) < words) {
+	    uf->uf_zbuf[0] = iotbuffer[n];
+	    uf->uf_zcnt = uf->uf_nbpw - 1;
+	    *cntptr = cnt + bytes + ((words - n) * uf->uf_nbpw);
+	    return val;
+	}
+
+	/* The words are gone, so if we have picked up all his bytes, */
+	/* then save any partial word and return. */
+	if (cnt <= 0) {
+	    uf->uf_zbuf[0] = iotbuffer[words];
+	    uf->uf_zcnt = bytes;
+	    *cntptr = 0;
+	    return 0;
+	}
+
+	/* Reset buffer, and loop */
+	bcnt = 0;
+	bptr = iotbuffer_ptr;
+    }
+}
+#endif /* SYS_ITS */
+
+#endif /* T20+10X+T10+CSI+WAITS+ITS */

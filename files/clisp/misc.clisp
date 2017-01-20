@@ -1,0 +1,342 @@
+;;; This is a -*-Lisp-*- file.
+
+;;; **********************************************************************
+;;; This code was written as part of the Spice Lisp project at
+;;; Carnegie-Mellon University, and has been placed in the public domain.
+;;; If you want to use this code or any part of Spice Lisp, please contact
+;;; Scott Fahlman (FAHLMAN@CMUC). 
+;;; **********************************************************************
+
+;;; Assorted miscellaneous functions for Spice Lisp.
+
+;;; Written and maintained by Scott Fahlman.
+;;; Contributions made by Dan Aronson, Skef Wholey and Rob MacLachlan.
+
+;;; *******************************************************************
+
+(in-package 'lisp)
+
+(export '(documentation common perq spice cmu variable describe
+	  featurep encode-universal-time sleep edit ed kill-editor time
+	  lisp-implementation-type lisp-implementation-version machine-type
+	  machine-version machine-instance software-type software-version
+	  short-site-name long-site-name dribble inspect disassemble))
+
+(defun documentation (symbol doc-type)
+  "Returns the documentation string of Doc-Type for the Symbol, or NIL if
+  none exists.  System doc-types are VARIABLE, FUNCTION, STRUCTURE, TYPE,
+  ARGS, and SETF."
+  (case doc-type
+    (variable (get symbol '%var-documentation))
+    (function (get symbol '%fun-documentation))
+    (structure (get symbol '%struct-documentation))
+    (type (get symbol '%type-documentation))
+    (setf (get symbol '%setf-documentation))
+    (args (get symbol '%args-documentation))
+    (source (get symbol '%source-documentation))
+    (t (cdr (assoc doc-type (get symbol '%documentation))))))
+
+(defun %set-documentation (symbol doc-type string)
+  (case doc-type
+    (variable (%put symbol '%var-documentation string))
+    (function (%put symbol '%fun-documentation string))
+    (structure (%put symbol '%struct-documentation string))
+    (type (%put symbol '%type-documentation string))
+    (setf (%put symbol '%setf-documentation string))
+    (args (%put symbol '%args-documentation string))
+    (source (%put symbol '%source-documentation string))
+    (t (let ((pair (assoc doc-type (get symbol '%documentation))))
+	 (if pair (%rplacd pair string)
+	     (push (cons doc-type string) (get symbol '%documentation)))))))
+
+(proclaim '(special *features*))
+
+(defun featurep (x)
+  "If X is an atom, see if it is present in *FEATURES*.  Also
+  handle arbitrary combinations of atoms using NOT, AND, OR."
+  (cond ((atom x) (memq x *features*))
+	((eq (car x) 'not) (not (featurep (cadr x))))
+	((eq (car x) 'and)
+	 (every #'featurep (cdr x)))
+	((eq (car x) 'or)
+	 (some #'featurep (cdr x)))
+	(t nil)))
+
+;;; Describe:
+
+;;; This is a list of things that are to be suppress from the property
+;;; list that the user probably doesn't want to see.
+
+(defvar *implementation-properties*
+  '(;; Documentation properties:
+    %var-documentation %fun-documentation %struct-documentation
+    %type-documentation %setf-documentation %args-documentation
+    %source-documentation
+    %documentation
+    ;;
+    ;; Evaluator properties:
+    globally-special globally-special-type %constant defstruct-description
+    structure-print constant-value
+    ;;
+    ;; Setf:
+    setf-inverse setf-method-expander setf-expander
+    ;;
+    ;; Pprint:
+    simple-read-macro specially-grind
+    ;;
+    ;; Things used by clc:
+    ;; Rest of things added in by LCLC.CLISP after compiler package is defined
+    globally-special-in-compiler sym))
+    
+;;; Desc-Doc prints the specified kind of documentation about the given Symbol.
+
+(defun desc-doc (symbol name string)
+  (let ((doc (documentation symbol name)))
+    (when doc
+      (format t "~%~A~%  ~A" string doc))))
+
+(defun desc-arglist (symbol)
+  (let ((function (symbol-function symbol)))
+    (cond ((and (listp function)
+		(eq (car function) 'macro))
+	   '(&rest **macroarg**))
+	  ((and (listp function)
+		(eq (car function) 'lambda))
+	   (cadr function))
+	  ((compiledp function)
+	   (let ((args (get symbol '%args-documentation '**noargs**)))
+	     (if (eql args '**noargs**)
+		 '(**arglist**)
+		 args))))))
+
+
+(defun describe (x)
+  "Prints a description of the object X."
+  (format t "~%~S is a ~S." x (type-of x))
+  (typecase x
+   (symbol
+    (if (boundp X)
+	(format t "~%Its value is ~S." (symbol-value x)))
+    (desc-doc x 'variable "Documentation on the variable:")
+    (if (fboundp x)
+	(let ((function (symbol-function x))
+	      (*package* (symbol-package x)))
+	  (format t
+		  "~%It can be called as a ~a in the following way:~%  ~S"
+		  (cond ((and (listp function) (eq (car function) 'macro))
+			 "macro")
+			((special-form-p x)
+			 "special form")
+			(t "function"))
+		  (cons x (desc-arglist x)))))
+    (desc-doc x 'function "Documentation on the function:")
+    (desc-doc x 'structure "Documentation on the structure:")
+    (desc-doc x 'type "Documentation on the type:")
+    (desc-doc x 'setf "Documentation on the SETF form:")
+    (when (compiledp x)
+      (let ((doc (documentation x 'source)))
+	(when doc				; Hair, nowadays
+	  (if (or (not (listp doc))
+		  (and (= 1 (length doc)) (setq doc (first doc))))
+	      (format t "~&It was defined in the file:~%  ~a" doc)
+	    (format t "~&It was defined in the files:~%  ~{~a~^, ~}" doc)))))
+    (do ((plist (symbol-plist x) (cddr plist)))
+	((null plist) ())
+      (unless (member (car plist) *implementation-properties*)
+	(format t "~%Its ~S property is ~S." (car plist) (cadr plist)))))
+   (hash-table
+    (format t "~%It currently has ~S entries and ~S buckets."
+	    (hash-table-count x) (hash-table-size x))))
+  (terpri)
+  (values))
+
+(defun inspect (x)
+  "An interactive version of Describe."
+  (describe x))
+
+(defun remove-arg-docs ()
+  "Removes %args-documentation property from internal symbols (in lisp
+  package).  This is called in CBOOT.MIC before saving core image."
+  (maphash
+   #'(lambda (key symbol)
+       (if (not (gethash key (package-external-symbols *lisp-package*)))
+	   (remprop symbol '%args-documentation)))
+   (package-internal-symbols *lisp-package*)))
+
+(defun encode-universal-time (sec min hour date month year &optional zone)
+  "Returns the time in Universal Time format given the components of Decoded
+  Time format."
+	(%sp-encode-universal-time (+ (* hour 3600) (* min 60) sec)
+				   date month year zone))
+
+
+(defun sleep (n)
+  "This function causes execution to be suspended for N seconds.  N may
+  be any non-negative, non-complex number."
+  ;;%sp-sleep can't sleep more than about 12 hours, which is 43200 sec.
+  ;;BIG is the number of these periods.  LITTLE is the remainder in sec.
+  (multiple-value-bind (big little) (floor n 43200)
+    ;;Now do the correct number of 12 hour periods
+    (dotimes (i big) (%sp-sleep 43200))
+    ;;Now do the remainder.  Convert to millisec first
+    (%sp-sleep (round (* little 1000)))))
+
+
+;;; Other Environment Inquiries.
+
+(defun lisp-implementation-type ()
+  "DECSYSTEM-20 Common Lisp")
+
+(defvar *lisp-implementation-version*
+   (multiple-value-bind (ign1 ign2 ign3 date month year) (get-decoded-time)
+	(setq month (case month
+			(1 "Jan")
+			(2 "Feb")
+			(3 "Mar")
+			(4 "Apr")
+			(5 "May")
+			(6 "Jun")
+			(7 "Jul")
+			(8 "Aug")
+			(9 "Sep")
+			(10 "Oct")
+			(11 "Nov")
+			(12 "Dec")))
+	(format nil "Version of ~D-~A-~D" date month year)))
+
+(defun lisp-implementation-version ()
+  *lisp-implementation-version*)
+
+(defun machine-type ()
+  "PDP-10")
+
+(defun machine-version ()
+  "KL-10 Model B or C")
+
+(defun machine-instance ()
+  (%sp-host))
+
+(defun software-type ()
+  "TOPS-20")
+
+(defun software-version ()
+  (let ((sysver (lisp::%sp-sysver)))
+    (concatenate 'string
+		 "Version "
+		 (subseq sysver (1+ (position #\space sysver :from-end t))))))
+
+(defun short-site-name ()
+  (with-open-file (x "system:short-site-name.txt")
+    (values (read-line x))))
+
+(defun long-site-name ()
+  (with-open-file (x "system:long-site-name.txt")
+    (values (read-line x))))
+
+;the editor interface
+
+(defmacro edit (&optional thing)
+  "Edits something.  Just like ED except that is does not evaluate its
+  argument."
+  `(ed ',thing))
+
+(defun ed (&optional thing)
+  "Edits something.  With no argument or NIL, just continues EMACS.
+  With a symbol name, it edits the incore definition.
+  With a pathname or string, it edits a file."
+  (cond ((null thing)
+	 (editor-create-fork)   ;make sure there is a valid buffer
+	 (editor-run-fork 0)	;restart EMACS
+	 nil)
+	((symbolp thing)
+	 (if (not (fboundp thing))
+	     (error "No definition for ~S to edit." thing))
+	 (editor-clear-buffer)	;we are going to be the definition in
+	 (let ((*standard-output* (editor-write-channel))
+	       (stuff (symbol-function thing)))
+           (if (and (listp stuff) (listp (cdr stuff)))
+	       (case (car stuff)
+	         (lambda (pprint (pretty-lambda-to-defun thing stuff)))
+	         (macro (pprint (cons 'macro (cdr (pretty-lambda-to-defun
+						   thing (cdr stuff))))))
+	         (t (pprint `(setf (symbol-function ,thing) ',stuff))))
+	       (pprint `(setf (symbol-function ,thing) ',stuff)))
+           (editor-clip-buffer))
+	 (editor-run-fork 0)
+	 (let ((c (editor-read-channel)))
+	   (eval (read c)))
+;the following is to eliminate a problem caused by editing a function and
+;then editing a file.  editing a file uses visit file.  That notices
+;that the buffer had been modifed (by editing the function) and then
+;offers to write the buffer to some totally bogus file.  It seems right
+;that after reading the function back into memory we should clear the
+;modified bit anyway, since EMACS does this after writing to a file.
+	 (editor-set-modified nil))
+	(t  ;not symbol - this should be a file name
+	 (editor-create-fork)
+	 (editor-set-jcl (string-concatenate "clisp " (namestring thing)))
+	 (editor-call-fork -1)  ;tells EMACS to take a file name
+	 (editor-run-fork 0)    ;now go edit it
+	 nil)))
+
+(defun kill-editor nil
+  "Kills the EMACS subfork."
+  (editor-kill-fork))
+
+(defvar *dribble-file* nil)
+(defvar *old-stdin* nil)
+(defvar *old-stdout* nil)
+
+(defun dribble (&optional file)
+  "Creates a readable record of the interactive session in the given file.
+  (DRIBBLE) closes the session."
+    (if file
+	(if *dribble-file*
+	    (error "Dribble file is already open")
+	    (progn
+		(setq *old-stdin* *standard-input*)
+		(setq *old-stdout* *standard-output*)
+		(setq *dribble-file* (open file :direction :output))
+		(setq *standard-input* (make-echo-stream
+				        *old-stdin*
+					*dribble-file*))
+		(setq *standard-output* (make-broadcast-stream 
+					 *dribble-file*
+					 *old-stdout*))
+		(format t "~&;Starting dribble session.  End with (DRIBBLE)~%")))
+	(if (not *dribble-file*)
+	    (error "Dribble file is not open")
+	    (progn
+	        (format t "~&;Closing dribble file ~a.~%"
+			(namestring (truename *dribble-file*)))
+		(close *dribble-file*)
+		(setq *standard-input* *old-stdin*)
+		(setq *standard-output* *old-stdout*)
+		(setq *dribble-file* nil)))))
+
+;;;;;
+;;; Time macro times the evaluation of a form
+;;;;;
+
+(defmacro time (form)
+  "Evaluates the Form and outputs timing statistics on *Trace-Output*."
+  `(let ((gtime (lisp::get-gc-time))
+	 (ncons (lisp::speak-nwds))
+	 (wtime (get-internal-real-time))
+	 (rtime (get-internal-run-time)))
+     (multiple-value-prog1 ,form
+       (setq rtime (- (get-internal-run-time) rtime)
+	     wtime (- (get-internal-real-time) wtime)
+	     gtime (- (lisp::get-gc-time) gtime)
+	     ncons (- (lisp::speak-nwds) ncons))
+       (format *trace-output*
+	       "~%;In TIME: run ~D ms; real ~D ms; GC ~D ms; ~D words used.~%"
+	       rtime wtime gtime ncons))))
+
+;;; Disassemble stub for anyone trying to use it.
+
+(defun disassemble (form)
+  "Should print out the reverse-assembled version of the function given.
+  This is not implemented in our version.  Use DDT."
+  (declare (ignore form))
+  (error "Disassemble is not implemented.  Use DDT."))

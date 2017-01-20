@@ -1,0 +1,1239 @@
+MODULE RRECORD (	! DAP Data Record Operations    ! (formerly GETPUT)
+		IDENT = '3(624)'
+                %BLISS36(,ENTRY(
+                                Dap$Get,
+                                Dap$$Get,
+                                Dap$Put,
+                                Dap$Update,
+                                Dap$$Put,
+                                Dap$Crc,
+                                Dap$Handle
+                                ))
+		) =
+BEGIN
+
+!
+!			  COPYRIGHT (c) 1981, 1986 BY
+!	      DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASS.
+!
+! THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND  COPIED
+! ONLY  IN  ACCORDANCE  WITH  THE  TERMS  OF  SUCH  LICENSE AND WITH THE
+! INCLUSION OF THE ABOVE COPYRIGHT NOTICE.  THIS SOFTWARE OR  ANY  OTHER
+! COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY
+! OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE  IS  HEREBY
+! TRANSFERRED.
+!
+! THE INFORMATION IN THIS SOFTWARE IS SUBJECT TO CHANGE  WITHOUT  NOTICE
+! AND  SHOULD  NOT  BE  CONSTRUED  AS  A COMMITMENT BY DIGITAL EQUIPMENT
+! CORPORATION.
+!
+! DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF  ITS
+! SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.
+!
+
+!++
+! FACILITY:  DAP
+!
+! ABSTRACT:  Routines to transfer records or blocks of file data.
+!
+!
+! ENVIRONMENT:  RMS, BLISSNET, XPORT, Some 36-bit specific code.
+!
+! AUTHOR:	Andrew Nourse, CREATION DATE:  3-Jan-82
+!
+! 624	    - Double-word byte rotations for image $GETs were requiring
+!	      a user buffer to be an even number of words, else end+1
+!             word was overwritten.
+! 613       - Add DIL8 type class to support DIL formatted 8-bit
+!             records generated (only) by DIU
+! 577       - Fix random block mode
+! 574       - Clear recordsize at start of remote get
+! 573       - Return correct error on invalid access information
+! 572       - Handle fatal error better
+! 561       - Fix $Update
+! 557       - Fix multistream
+! 555       - Fix image mode recordsize lossage
+! 511 12    - Fix VMS ASCII
+!     11    - Remove shell routines and RMS-ify. Implement DAP$UPDATE.
+!     10    - Provide dap$$get and dap$$put entry points
+!             Move all pure data to hiseg
+!     07    - Eat residue of message if data-overrun
+!     06    - improve record size checking
+!     05    - Adjust message size to account for byte size
+!     04    - Put in ENTRY points
+!     03    - Don't reinit descriptor after setting it up for ASCII
+!     02    - Workaround RMS-20/FAL-20 habit of leaving CRLFs on records
+!     01    - The beginning
+!--
+
+!
+! CONDITIONAL COMPILATION:
+!
+
+COMPILETIME FTPASSIVE=(%VARIANT AND 2) NEQ 0;   ! /VARIANT:2 for FAL
+! Interlock. Makes sure all modules compiled correct variant
+! Link error (multiply-defined global symbol) if wrong
+GLOBAL LITERAL RRE$$P = FTPASSIVE;
+
+!
+! INCLUDE FILES:
+!
+
+REQUIRE 'RMSREQ';
+!LIBRARY 'BLI:XPORT';
+!LIBRARY 'RMS';
+ LIBRARY 'BLISSNET';
+ LIBRARY 'CONDIT';
+!LIBRARY 'DAP';
+
+!
+! TABLE OF CONTENTS:
+!
+
+FORWARD ROUTINE
+        Dap$Get,
+        Dap$$Get,
+        Dap$Put,
+        Dap$$Put,
+        Dap$Crc: NOVALUE,
+        Dap$Handle;             ! Condition handler
+
+!
+! MACROS:
+!
+
+MACRO   BREAK_CHARACTERS= %O'12' TO %O'14', %O'20' TO %O'24', %O'32', %O'33' %;
+                          ! <ESC><^Z><DC1-4><DLE><FF><VT> and <LF>
+
+MACRO   ROTC(LOW_AC,BITS)=MACHOP(%O'245',LOW_AC,BITS) %;   
+! Rotate-combined (LOW_AC is the lower of 2 contiguous accumulators)
+
+!
+! EQUATED SYMBOLS:
+!
+%IF %BLISS(BLISS36)
+%THEN
+LITERAL Ma_Return = 1;
+%FI
+
+
+!LITERAL $Chcrt=%O'15',                                ! Carriage return
+!        $Chlfd=%O'12';                                ! Linefeed
+
+LITERAL Loac=6,                            ! Ac's to user for
+        Hiac=7;                            ! ROTC
+!
+! PURE DATA:
+!
+
+PSECT OWN=$HIGH$;
+
+OWN T_Crlf: INITIAL (%ASCII %STRING(%CHAR(13),%CHAR(10))),
+    D_Crlf: $Str_Descriptor(String=(2,CH$PTR(T_Crlf)));
+
+
+!
+! EXTERNAL REFERENCES:
+!
+EXTERNAL ROUTINE
+                Dap$Get_Byte,
+                Dap$Put_Byte,
+                Dap$Get_2Byte,
+                Dap$Put_2Byte,
+                Dap$Get_Message,
+                Dap$Put_Message,
+                Dap$Get_Variable_String,
+                Dap$Get_String,
+                Dap$Get_Status,
+                Dap$Get_Header,
+                Dap$Put_String,
+                Dap$Put_Control,
+                Dap$Put_Header,
+                Dap$Get_Ack,
+                Dap$Unget_Header,
+                Dap$Error_Dap_Rms,
+                Dap$Eat_Message,
+                R$Null,
+                UAPointer,
+                TGUPointer,
+                UAddr;
+
+GLOBAL ROUTINE Dap$Get (P_Rab: REF $Rab_Decl,
+                          Err)  =	! Get a record (remote)
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Get a record from an open file on another system
+!
+! FORMAL PARAMETERS:
+!
+!       P_RAB: Addr of RAB
+!       ERR: Address of error routine
+!
+! COMPLETION CODES:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+    BIND
+        Rab=.P_Rab: $Rab_decl,
+        Rst=.Rab[Rab$a_Isi]: $Rms_Rst;
+
+    Dap$$Get(Rab, Rst, .Err)       ! Call DAP$$GET to do the work
+    END;                           ! using the DIB pointed to by the FAB
+GLOBAL ROUTINE Dap$$Get (P_Rab: REF $Rab_Decl,
+                         P_Rst: REF $Rms_Rst,
+                         P_Err)  =	! Get a record (remote)
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Get a record from an open file on another system
+!
+! FORMAL PARAMETERS:
+!
+!       P_RAB: Address of RAB
+!       P_RST: Address of RST
+!       P_ERR: Address of error routine
+!
+! COMPLETION CODES:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+    BIND
+        Rab=.P_Rab: $Rab_Decl,
+        Rst=.P_Rst: $Rms_Rst,
+        Fst=.Rst[Rst$a_Fst]: $Rms_Fst,
+        Config=.Fst[Fst$a_Config]: $XabCfg_decl,
+        Fab=UAddr(.Rab[Rab$a_Fab]): $Fab_decl, !m506
+        Idd=.Fst[Fst$a_I_Dd]: $Dap_Descriptor,
+        Odd=.Fst[Fst$a_O_Dd]: $Dap_Descriptor,
+        Typ=UAddr(.Fab[Fab$a_Typ]): $Typ_Decl; !m506
+
+    BIND ROUTINE $$Errrtn=.P_Err: Rms_Ercal;
+
+    LOCAL class;
+    LOCAL Adata: $Str_Descriptor(),
+          Bdata: $Xpo_Descriptor();
+    LOCAL Bytes_Per_Word;
+    LOCAL Display: BITVECTOR[28];
+    LOCAL Rabsav: VOLATILE;
+    LOCAL Errsav: VOLATILE;
+
+    ENABLE Dap$Handle(Rabsav,Errsav);           ! Set up condition handler
+    Errsav=$$Errrtn;                            ! Handler will need these
+    Rabsav=Rab;                                 ! 
+
+    Clearv(Display);
+
+    UsrSts = Rms$_Suc;                  ! Assume success will occur     !a560
+    UsrStv = 0;                                                         !a560
+
+    class = .Fst[Fst$h_File_Class];     !a541 use FST file class if present
+
+    Rab[Rab$h_Rsz] = 0;                 ! Clear his record size         !a574
+
+    IF .class EQL 0
+    THEN
+        BEGIN
+        IF Typ NEQ 0 
+        THEN class=.Typ[Typ$h_Class]    ! Use TYP block if any
+        ELSE class= Typ$k_Ascii;
+        END;
+
+    IF (.Rab[Rab$b_Rac] EQL Rab$k_Blk)
+    OR (.Rab[Rab$b_Rac] EQL Rab$k_Bft)
+    THEN class = Typ$k_Image;
+
+    IF .Rst[Rst$v_No_Send_Control] EQL 0   ! Send control on first GET only
+    THEN                                   ! if file transfer mode, 
+        BEGIN                              ! otherwise, on every GET
+        LOCAL rac;
+
+        rac=.Rab[Rab$b_Rac];
+
+        Dap$Put_Control( Odd, Rab, Dap$k_Get, Display ); 
+        Dap$Put_Message( Odd );
+
+        IF (.rac EQL Rab$k_Seq)         ! Seq turns to transfer mode if
+        AND NOT .config[xab$v_sequential_access]        ! not supported
+        THEN rac = Rab$k_Tra;            ! It can't, use file xfer mode
+
+        SELECT .rac OF
+               SET
+               [Rab$k_Tra, Rab$k_Bft]:              ! If File transfer mode
+                      Rst[Rst$v_No_Send_Control]=1; ! No more ctl messages
+               TES;
+        END;
+
+    Bytes_per_Word = %BPUNIT / .Fst[Fst$h_Bsz]; ! How many bytes fit a word
+
+    DO  BEGIN
+        SELECT Dap$Get_Header(Idd) OF
+        SET
+        [Dap$k_Data]:
+            BEGIN                               ! Process data from remote
+            IF .Fst[Fst$v_Accopt_Crc]
+            THEN
+                BEGIN
+                Dap$Crc( Idd, Rst );    ! Note that this eats the message!
+                Dap$Unget_Header( Idd );        ! Restore message         !a561
+                Dap$Get_Header( Idd );          ! Re-read header          !a561
+                END;
+
+            Rab[Rab$g_Rfa]=Get_Vbn(Idd);
+
+            Rab[Rab$a_Rbf]=.Rab[Rab$a_Ubf]; ! Use user's buffer
+
+            CASE .class FROM 0 TO Typ$k_Class_Max OF
+                  SET
+                  [Typ$k_Ascii]:
+                      BEGIN       ! Ascii File                          !m560vv
+
+                      Rst[Rst$h_Record_Size]                              !m561
+                      = Rab[Rab$h_Rsz]
+                      = .Idd[Dap$h_Length] - .Fab[Fab$b_Fsz];
+
+                      IF .Rab[Rab$h_Rsz] GTR (.Rab[Rab$h_Usz]*.Bytes_Per_Word)
+                      THEN                         ![6] record too big
+                          BEGIN
+                          UsrSts = Rms$_Rtb;
+                          UsrStv = .Rab[Rab$h_Rsz]; ! real recsize
+                          Rab[Rab$h_Rsz] = (.Rab[Rab$h_Usz]*.Bytes_Per_Word)
+                                           - .Fab[Fab$b_Fsz] ; !what user got
+
+                          Dap$Eat_Message( Idd );  ![7]
+
+                          EXITLOOP Rms$_Rtb;  ! Exit the loop, don't return
+                          END;                                          !m560^^
+
+                      $Str_Desc_Init( Descriptor=Adata,
+                                      String=(.Rab[Rab$h_Usz]*.Bytes_per_word,
+                                              UAPointer(CH$PTR(.Rab[Rab$a_Ubf],
+                                                               0, !offset!m511
+                                                               .Fst[Fst$h_Bsz]
+                                                               )
+                                                        )
+                                              )
+                                      );
+
+                      IF .Fab[Fab$b_Fsz] NEQ 0                          !a555vv
+                      THEN
+                          BEGIN
+                          IF .Fab[Fab$v_Rfm] EQL Fab$k_Lsa      ! Sequenced
+                          THEN Rab[Rab$h_Lsn] = Dap$Get_2Byte( Idd )
+                          ELSE
+                              BEGIN
+                              LOCAL fhdrbuf: VECTOR[CH$ALLOCATION(20)],
+                              hdrdesc: $Str_Descriptor();
+
+                              $Str_Desc_Init( Desc=hdrdesc,
+                                              String=(20,
+                                                      CH$PTR(fhdrbuf, 0, 8) ));
+                              Dap$Get_String( Idd, hdrdesc );
+                              END;
+                          END;                                          !a555^^
+
+                      Dap$Get_String( Idd, Adata );      
+                      END;                      ! Ascii
+
+
+                  %IF %BLISS(BLISS36)           ! 36-bit dependant code follows
+                  %THEN 
+                  [Typ$k_Image, Typ$k_DIL8]:
+                  !+
+                  !   9 bytes for every 2 words packed this way:
+                  !   !========================================!
+                  !   !..5!   4    !   3    !   2    !    1    !
+                  !   !========================================!
+                  !   !   9    !   8    !   7    !   6    ! 5...
+                  !   !========================================!
+                  !-
+                      BEGIN                     ! Binary file
+                      REGISTER
+                          a=Loac,
+                          b=Hiac;
+                      LOCAL ptr: REF VECTOR;       ! Pointer to buffer
+                      LOCAL rsizw;                                        !a555
+                      LOCAL uszc;                  ! USZ range check      !624
+
+                      ptr=UAddr(.Rab[Rab$a_Ubf]);
+
+                      uszc = .Rab[Rab$h_Usz];      ! 624
+                      !+
+                      ! Calculate record size in words
+                      !-
+                      RSizW =  (.Idd[Dap$h_Length]/9)
+                               +((.Idd[Dap$h_Length]+4)/9);               !m555
+
+                      IF (.Rab[Rab$b_Rac] EQL Rab$k_Blk)                  !M566
+                      OR (.Rab[Rab$b_Rac] EQL Rab$k_Bft)                  !M566
+                      THEN Rab[Rab$h_Rsz] = .RsizW        ! block mode 
+                      ELSE
+                          !+
+                          ! Calculate the record size in record bytes:
+                          !
+                          ! Size in words * bytes per word
+                          ! less extra bytes at end of last word.
+                          ! 
+                          ! Extra bytes at end of last word is calculated
+                          ! from the bitcnt after adjusting it for the extra
+                          ! 4 bits we send if the word count is odd, and
+                          ! the number of extra bits in every word.
+                          !-
+                          Rab[Rab$h_Rsz]
+                              = .RSizW * (%BPUNIT/.Fst[Fst$h_Bsz])
+                                - ( ( .Idd[Dap$h_Bitcnt]
+                                      - (%BPUNIT MOD .Fst[Fst$h_Bsz])
+                                      - ((.RSizW AND 1) * 4) )
+                                    / .Fst[Fst$h_Bsz] );
+
+                      Rst[Rst$h_Record_Size] = .Rab[Rab$h_Rsz];           !a561
+
+                      IF .RSizW GTR .Rab[Rab$h_Usz]                   !a560vv
+                      THEN                      ! record too big
+                          BEGIN
+                          UsrSts = Rms$_Rtb;
+                          UsrStv = .Rab[Rab$h_Rsz]; ! real recsize
+
+                          Rab[Rab$h_Rsz] =
+                            .Rab[Rab$h_Usz] * (%BPUNIT/.Fst[Fst$h_Bsz])
+                            - ( ( .Idd[Dap$h_Bitcnt]
+                                  - (%BPUNIT MOD .Fst[Fst$h_Bsz])
+                                  - ((.RSizW AND 1) * 4) )
+                                / .Fst[Fst$h_Bsz] );
+
+                          Dap$Eat_Message( Idd );
+
+                          EXITLOOP Rms$_Rtb;
+                          END;
+
+
+                      DECR i FROM (.Idd[Dap$h_Length]/9)-1 TO 0
+                      DO
+                          BEGIN
+                          a=b=0;
+
+                          DECR j FROM 8 TO 0 	 ! Do 9 times
+                          DO ( a=.a+Dap$Get_Byte(Idd); ! Get a byte
+                               Rotc(a,-8) ); ! Rotate
+
+                          ptr[0]=.a; ! Write to user's buffer
+                          ptr[1]=.b; ! two words
+                          ptr=.ptr+2; ! Increment the pointer
+                          uszc=.uszc-2; ! Decrement USZ count		!624
+                          END;
+
+                      a=b=0;
+
+                      ! If the DAP buffer is not even multiple of 9 bytes
+                      ! do the last few, and rotate the doubleword
+                      ! back to its original orientation
+
+                      IF .Idd[Dap$h_Length] GTR 0
+                      THEN
+                          BEGIN
+                          LOCAL rotates; ! To make 72 bits of rotation
+                                            ! when all the data is read
+                          LOCAL temp;    ! TGS
+
+                          rotates=(.Idd[Dap$h_Length]-9)*8;
+
+                          DECR i FROM .Idd[Dap$h_Length]-1 TO 0
+                          DO ( a=.a+Dap$Get_Byte(Idd); ! Get a byte
+                               Rotc(a,-8) ); ! Rotate
+
+                          Rotc(a, .Rotates); ! Rotate the bytes
+                                                  ! the rest of the way
+                          ptr[0]=.a; ! Write to user's buffer
+                          uszc=.uszc-1; ! Decrement remaining USZ count	!624
+                          IF .uszc LEQ 0 ! Beyond user's USZ?		!624
+                          THEN temp=.b   ! Yes, don't store more	!624
+                          ELSE ptr[1]=.b; ! No, store next word		!624
+                          uszc=.uszc-1;					!624
+                          END;
+                      END;
+
+                  [Typ$k_Macy11,
+                   Typ$k_Byte]:
+                  %ELSE ! Non-36-bit machines
+                  [Typ$k_Macy11,
+                   Typ$k_Byte,
+                   Typ$k_Image]:
+                  %FI ! End of system-dependant
+                  BEGIN ! Just copy into buffer
+                  LOCAL ptr: $Byte_Pointer;
+
+                  Rst[Rst$h_Record_Size]                                  !m561
+                  = Rab[Rab$h_Rsz]
+                  = .Idd[Dap$h_Length] - .Fab[Fab$b_Fsz];                 !m560
+
+                  IF .Rab[Rab$h_Rsz] GTR (.Rab[Rab$h_Usz]*(%BPUNIT/8))    !m560
+                  THEN                  ! record too big
+                      BEGIN
+                      UsrSts = Rms$_Rtb;                               !a560
+                      UsrStv = .Rab[Rab$h_Rsz]; ! real recsize         !a560
+                      Rab[Rab$h_Rsz] = .Rab[Rab$h_Usz]*(%BPUNIT/8)     !a560
+                                       - .Fab[Fab$b_Fsz] ; !what user got
+
+                      Dap$Eat_Message( Idd );  ![7]
+
+                      EXITLOOP Rms$_Rtb;  ! Exit the loop, don't return !m560
+                      END;
+
+                  ptr=.Rab[Rab$a_Ubf];                 ! Make 2-word  !m506
+                  TGUPointer(ptr,.Fst[Fst$h_bsz]);     ! Byte pointer !m506
+
+                  DECR i FROM .Rab[Rab$h_Rsz] TO 0     ! Write the data
+                  DO CH$WCHAR_A( Dap$Get_Byte(Idd), ptr );
+                  END;
+                   
+               [INRANGE,OUTRANGE]: SIGNAL(Dap$_Aor);
+               TES;
+
+            EXITLOOP Rms$_Suc;          ! WIN                !m555
+            END;
+
+        [Dap$k_Status]:
+            BEGIN
+            LOCAL e;
+
+            e = Dap$Get_Status( Idd );          ! End of file or error
+            Usrsts = Dap$Error_Dap_Rms(.e);
+            Usrstv = .e<Dapcode>;
+            IF .Usrsts GTR Rms$k_Err_Min    ! Is this an error
+            THEN $$Error( Get, Rab );       ! Yes. barf out.
+            END;                            ! error code
+
+%IF FTPASSIVE                           ! Only used by FAL
+%THEN
+        [Dap$k_Access_Complete]:
+            BEGIN
+            Dap$Unget_Header( Idd );
+            RETURN Rab[Rab$h_Sts]=0;       ! Not done yet
+            END;
+%FI
+
+        [OTHERWISE]:                            ! somebody screwed up
+
+            BEGIN
+            ! DAP Syncronization Error
+            $$Error( Get,
+                     Rab,
+                     Rms$_Dpe,
+                     Dap$k_Mac_Sync+.Idd[Dap$b_Operator] );             !m577
+
+            RETURN .Usrsts
+            END;
+        TES
+        END WHILE 1;
+
+        BEGIN
+        Local Tsts,
+              Tstv;
+
+        Tsts = .UsrSts;
+        Tstv = .UsrStv;
+
+        IF .Rst[Rst$v_No_Send_control] EQL 0    ! If record mode,       !a555
+        THEN
+            Dap$Get_Ack( Idd );                ! get status
+
+        IF .Tsts NEQ Rms$_Suc
+        THEN
+            BEGIN
+            USRSTS = .Tsts;
+            UsrStv = .Tstv;
+            END;
+        END;
+
+    Rab[Rab$h_Sts] = .UsrSts;
+    Rab[Rab$h_Stv] = .UsrStv;
+
+    (.UsrSts LSS Rms$k_Err_Min)         ! True if not an error
+    END;			!End of DAP$$GET
+
+GLOBAL ROUTINE Dap$Put (P_Rab: REF $Rab_Decl, Err)  =	! Put a record (remote)
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Put a record to an open file on another system.
+!
+! FORMAL PARAMETERS:
+!
+!       P_RAB: A RAB as defined by RMS
+!       ERR: Address of error routine
+!
+! COMPLETION CODES:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+    BIND
+        Rab=.P_Rab: $Rab_Decl,          ! 
+        Rst=.rab[Rab$a_Isi]: $Rms_Rst;  ! Rst, to pass to following 
+
+    Dap$$Put (Rab, Rst, .Err)         ! Call DAP$$PUT to do the work, using RST
+    END;                              !  pointed to by FAB 
+GLOBAL ROUTINE Dap$Update (P_Rab: REF $Rab_Decl, Err)  = ! Update record
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       $UPDATE a record to an open file on another system.
+!
+! FORMAL PARAMETERS:
+!
+!       P_RAB: A RAB as defined by RMS
+!       ERR: Address of error routine
+!
+! COMPLETION CODES:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+    BIND
+        Rab=.P_Rab: $Rab_Decl,          ! 
+        Rst=.Rab[Rab$a_Isi]: $Rms_Rst,  ! Rst, to pass to Dap$$Put
+        Fst=.Rst[Rst$a_Fst]: $Rms_Fst,  ! Fst, pointing to dap descrs
+        Odd=.Fst[Fst$a_O_dd]: $Dap_Descriptor, ! output descriptor
+        Idd=.Fst[Fst$a_I_dd]: $Dap_Descriptor; ! input descriptor
+
+    LOCAL
+         display: BITVECTOR[28] INITIAL(0), ! DISPLAY field 
+         v;                             ! Return value goes here
+
+    Dap$Put_Control( Odd, Rab, Dap$k_Update, Display );        
+
+    Rst[Rst$v_No_Send_Control]=1;     ! Supress Control $PUT message
+
+    v = Dap$$Put( Rab, Rst, .Err );   ! Call DAP$$PUT to do the work, using RST
+
+    Dap$Get_Ack( Idd );               ! check for status always           !m602
+                                      ! we must be in record mode for $UPDATE
+    Rst[Rst$v_No_Send_Control]=0;     ! Control messages should be sent
+
+    .v                                !  Return value
+    END;                              !  pointed to by FAB 
+GLOBAL ROUTINE DAP$$PUT (P_Rab: REF $Rab_Decl,
+                         P_Rst: REF $Rms_Rst,
+                         P_ERR)  =	! Put a record (remote)
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Put a record to an open file on another system.
+!
+! FORMAL PARAMETERS:
+!
+!       P_RAB: Address of RAB
+!       P_RST: Address of RST
+!       P_ERR: Address of error routine
+!
+! COMPLETION CODES:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+    BIND
+        Rab=.P_Rab: $Rab_Decl,                  ! Bind formals so 
+        Rst=.P_Rst: $Rms_Rst;                   ! they may be accessed
+    BIND ROUTINE $$Errrtn=.P_Err: Rms_Ercal;
+
+    BIND                                !m506 vv
+        Fab=UAddr(.Rab[Rab$a_Fab]): $Fab_Decl,  ! RMS FAB pointed to by above
+        Typ=UAddr(.Fab[Fab$a_Typ]): $Typ_Decl,         ! Data type
+        Fst=.Rst[Rst$a_Fst]: $Rms_Fst,          ! 
+        Odd=.Fst[Fst$a_O_Dd]: $Dap_Descriptor,  ! our message descriptor
+        Idd=.Fst[Fst$a_I_Dd]: $Dap_Descriptor,  ! input message descriptor
+        Config=.Fst[Fst$a_Config]: $XabCfg_decl;! Configuration message data
+
+    LOCAL Class;
+    LOCAL Bdata: $Xpo_Descriptor();             ! will point to binary data
+    LOCAL S;
+    LOCAL Adata: $Str_Descriptor();             ! this will point to ascii data
+    LOCAL Display: BITVECTOR[28] INITIAL(0);
+    LOCAL unterminated_record: INITIAL(0);      ! Ascii record needs CRLF
+    LOCAL fhdrbuf: VECTOR[CH$ALLOCATION(20)],
+          hdrdesc: $Str_Descriptor();
+
+
+    LOCAL rabsav: VOLATILE;
+    LOCAL errsav: VOLATILE;
+    LOCAL rsizb;                    ! Record size in bytes                !a571
+
+    ENABLE Dap$Handle(Rabsav,Errsav);           ! Setup condition handler
+    Errsav=$$Errrtn;                            ! Handler will need these
+    Rabsav=Rab;                                 ! 
+
+
+    class = .Fst[Fst$h_File_Class];     !a541 use FST file class if present
+
+    !+
+    ! Default the file class if necessary
+    ! This should have been done already
+    !-
+    IF .class EQL 0
+    THEN
+        BEGIN
+        IF Typ NEQ 0 
+        THEN class=.Typ[Typ$h_Class]    ! Use TYP block if any
+        ELSE class= Typ$k_Ascii;
+        END;
+
+    IF (.Rab[Rab$b_Rac] EQL Rab$k_Blk)
+    OR (.Rab[Rab$b_Rac] EQL Rab$k_Bft)
+    THEN class = Typ$k_Image;
+
+
+    !+
+    ! Send Control message on first PUT only if file transfer mode,
+    ! If record mode send Control message on every PUT.
+    !-
+    IF .Rst[Rst$v_No_Send_Control] EQL 0
+    THEN
+        BEGIN
+        LOCAL rac;
+
+        rac=.Rab[Rab$b_Rac];
+
+
+        !+
+        ! If the remote system does not support Sequential Record Access  
+        ! Change it to File transfer mode.
+        !-
+        IF (.rac EQL Rab$k_Seq)         
+        AND NOT .config[xab$v_sequential_access]        ! not supported
+        THEN Rab[Rab$b_Rac] = Rab$k_Tra;  ! It can't, use file xfer mode  !m555
+
+        !+
+        ! Now send the control message
+        !-
+        Dap$Put_Control( Odd, Rab, Dap$k_Put, Display );        
+                                                                !d555
+        !+
+        ! Remember not to send any more Control Messages after this
+        ! If we are in file transfer mode.
+        !-
+        SELECT .Rab[Rab$b_Rac] OF
+               SET
+               [Rab$k_Tra, Rab$k_Bft]:              ! If File transfer mode
+                      BEGIN
+                      Rst[Rst$v_No_Send_Control]=1; ! No more ctl messages
+                      Rab[Rab$b_Rac] = .rac;    ! Restore user-set value
+                      END;
+               TES;
+
+        END;
+
+    Init_Message( Odd );                        ! Initialize descriptor
+
+    Odd[Dap$b_Operator]=Dap$k_Data;             ! Set up a DATA message
+    Odd[Dap$b_StreamId]=.Rst[Rst$v_StreamId];   ! Set up stream id !a557
+    Odd[Dap$v_Mflags_Length]=1;                 ! Always send length field
+
+    CASE .Class FROM 0 TO Typ$k_Class_Max OF
+    SET
+    [Typ$k_Image]:
+        BEGIN
+        IF (.Rab[Rab$b_Rac] EQL Rab$k_Bft)
+        OR (.Rab[Rab$b_Rac] EQL Rab$k_Blk)                               !m561
+        THEN
+            BEGIN
+            RsizB = (Pagesize/2)*9;    ! Block mode, use page size
+            Odd[Dap$h_BitCnt] = 0;     ! 0 bit count                     !m561
+            END
+        ELSE
+            BEGIN
+            LOCAL bytesperword,
+                  bitcnt,
+                  rsizw;
+
+            bytesperword = (%BPUNIT/.Fst[Fst$h_Bsz]);
+
+            rsizw=(.Rab[Rab$h_Rsz]+.bytesperword-1)/.bytesperword;
+            rsizb= ((.rsizw/2)*9)+ ((.rsizw AND 1)*5);
+            ! 9 bytes per 2 words + 5 bytes for last word
+
+            bitcnt = 4*( .rsizw AND 1 )      ! Last byte is only half a byte
+                     + ( %BPUNIT MOD .Fst[Fst$h_Bsz] ) ! Add in slack per word
+                     + ( ( ( .bytesperword
+                             - ( .Rab[Rab$h_Rsz] MOD .bytesperword )
+                           ) MOD .bytesperword
+                         ) *.Fst[Fst$h_Bsz]
+                       ) ; ! finally, account for the number of extra bytes
+
+            IF (.bitcnt NEQ 0)              ! If we have slack at the end !m571
+            THEN
+                BEGIN 
+                !+
+                ! If remote system supports bitcnt
+                ! Then send entire word & say how much is slack.
+                ! Otherwise, Don't send slack bytes, remote can't
+                ! tell them from data
+                !-
+                IF .Config[Xab$v_BitCnt]     
+                THEN Odd[Dap$v_Mflags_BitCnt] = 1    ! We will send bitcount
+                ELSE RSizB = .RSizB - ( .bitcnt / 8 ) ;
+                END;
+
+            Odd[Dap$h_Bitcnt] = .bitcnt;
+            END;
+
+        Odd[Dap$h_Length]=1+.rsizb;    ! Null recnum (at least)           !m571
+        END;
+
+    [Typ$k_DIL8]:
+        BEGIN
+        !
+        ! DIL8 mode means we are ALWAYS talking to an 8-bit system, so
+        ! we will NEVER be using block mode -- always record mode.
+        !
+        ! Copy the record size directly from the RAB.  Since we are always
+        ! copying full 8-bit bytes to full 8-bit bytes, there should never
+        ! be any "bitcount".
+        !
+        rsizb = .Rab[Rab$h_Rsz];        ! use record size in bytes from the RAB
+
+        Odd[Dap$h_Bitcnt] = 0;          ! always zero
+
+        Odd[Dap$h_Length]=1+.rsizb;     ! Null recnum (at least)
+        END;
+
+    [0,
+     Typ$k_Ascii,
+     Typ$k_Macy11,
+     Typ$k_Byte]:
+        BEGIN                           ! Record mode
+        LOCAL tptr,
+              second_last,              ! 2nd-last char
+              last;                     ! last char
+
+        tptr=UAPointer(CH$PTR(.Rab[Rab$a_Rbf],0,.Fab[Fab$v_Bsz])); !m506
+        $Str_Desc_Init( Descriptor=Adata, String=(.Rab[Rab$h_Rsz],.tptr));
+             
+        tptr=CH$PLUS(.tptr,.Rab[Rab$h_Rsz]-2);
+        second_last=CH$RCHAR_A(tptr);
+        last=CH$RCHAR_A(tptr);
+
+        SELECT .LAST OF
+        SET
+        [Break_Characters]: unterminated_record=0;  ! Terminator on record
+        [$CHLFD]:
+            IF .second_last EQL $Chcrt
+            THEN unterminated_record=2;             ! Default terminator
+        [OTHERWISE]:
+            BEGIN
+            IF (.Rab[Rab$h_Sts] EQL Rms$_Eof)
+            THEN unterminated_record=4          ! No terminator, End of file
+            ELSE unterminated_record=1;         ! No terminator
+            END;
+        TES;
+
+        ! If Implied CRLF, and CRLF is the terminator, then strip it off
+        IF .Fab[Fab$v_Cr] AND (.unterminated_record EQL 2)
+        THEN Adata[Str$h_Length]=.Adata[Str$h_Length]-2;
+
+        Odd[Dap$h_Length]=.Adata[Str$h_Length] ! Length of data in record
+                          + 1                  ! Null RECNUM field
+                          + .Fab[Fab$b_Fsz];   ! Fixed header size
+
+                                                       ! + null RECNUM field
+
+        ! ASCII STREAM wants CRLFs in record, adjust count if necessary
+        IF (.Fab[Fab$v_Rfm] EQL Fab$k_Stm) AND .unterminated_record
+        THEN Odd[Dap$h_Length]=.Odd[Dap$h_Length]+2;
+
+        END;                            ! End Ascii & Byte mode
+
+    [INRANGE, OUTRANGE]: SIGNAL(Dap$_Aor);
+    TES;
+
+    !+
+    ! Check if the record is too big
+    !-
+    IF .Odd[Dap$h_Length] GTR .Odd[Dap$h_Message_Length]
+    THEN
+        BEGIN
+        $$Error( Put, Rab, Rms$_Rtb, .Odd[Dap$h_Message_Length]); 
+        RETURN Rms$_Rtb
+        END;
+
+    !+
+    ! Account for the RECNUM field if we need to send it
+    ! It is really only necessary if we are in block file transfer mode
+    !-
+    IF (.Rab[Rab$b_Rac] EQL Rab$k_Bft)          ! If block mode file transfer
+    OR (.Rab[Rab$b_Rac] EQL Rab$k_Blk)          ! or random block mode    !a577
+    THEN Odd[Dap$h_Length] = .Odd[Dap$h_Length] + %BPVAL/8;
+
+
+    !+
+    ! Build the message header
+    !-
+    Put_Header(Odd);
+
+    !+
+    ! Put in the (probably null) RECNUM field
+    !-
+    IF (.Rab[Rab$b_Rac] EQL Rab$k_Bft)          ! If block mode file transfer
+    OR (.Rab[Rab$b_Rac] EQL Rab$k_Blk)          ! or random block mode    !a577
+    THEN Put_Vbn(Odd,.Rab[Rab$g_Bkt])           ! Build record number
+    ELSE Dap$Put_Byte(Odd,0);                   ! 0 length if not used
+    ! Note that DAP Bucket numbers start at 1, RMS-36 starts at 0
+
+    !Now! At Last! The Data!!!!!
+    CASE .class FROM 0 TO Typ$k_Class_Max OF
+    SET
+    [Typ$k_Ascii]:
+        BEGIN
+        IF .Fab[Fab$b_Fsz] NEQ 0                ! Put the fixed header  !a555vv
+        THEN
+            BEGIN
+            IF .Fab[Fab$v_Rfm] EQL Fab$k_Lsa    ! If sequenced
+            THEN Dap$Put_2Byte( Odd, .Rab[Rab$h_Lsn] );
+
+            ! Dap$Put_String( Odd, hdrdesc );
+            END;
+
+        Dap$Put_String(Odd,Adata);              ! Put the data in
+
+        ! ASCII STREAM wants records terminated
+        IF .unterminated_record AND (.Fab[Fab$v_Rfm] EQL Fab$k_Stm)
+        THEN Dap$Put_String(Odd,D_Crlf);        ! Put back the CRLF
+        END;
+
+    [Typ$k_Image,                              ! Binary Data or
+     Typ$k_DIL8]:                              ! DIL8 format data
+        BEGIN
+        LOCAL ptr: REF VECTOR;                 ! Pointer to buffer
+
+        ptr=UAddr(.Rab[Rab$a_Rbf]);
+
+        !========================================!
+        !..5!   4    !   3    !   2    !    1    !
+        !========================================!
+        !   9    !   8    !   7    !   6    ! 5...
+        !========================================!
+
+        INCR i FROM 0 TO .RSizB-1
+        DO  BEGIN
+            REGISTER a=loac;
+            REGISTER b=hiac;
+
+            IF ( .i MOD 9 ) EQL 0
+            THEN
+                BEGIN
+                a=.ptr[0];                     ! Get a word of data
+                b=.ptr[1];                     ! and another word
+                ptr=.ptr+2;                    ! Increment the pointer
+                END;
+
+            ! The following is to convince the BLISS compiler
+            ! not to trash the register.  BLISS does not know what
+            ! ROTC does, so it 'optimizes' and steps on register B
+            ! thinking it is unused.
+            b=.b;
+
+            Dap$Put_Byte(Odd,.a);           ! Put out a byte
+            Rotc(a,-8);                     ! Rotate to next one
+            END;
+        END;
+
+    [Typ$k_Macy11,  ! Conversion has already been done, just send bytes
+     Typ$k_Byte]:   ! Byte image data
+        BEGIN
+        LOCAL ptr;
+        ptr=UAPointer(CH$PTR(.Rab[Rab$a_Rbf],0,8));
+
+        DECR i FROM .Rab[Rab$h_Rsz]-1 TO 0
+        DO Dap$Put_Byte(Odd,CH$RCHAR_A(ptr));
+        END;
+    [INRANGE,OUTRANGE]: SIGNAL(Dap$_Aor);
+    TES;
+ 
+    IF .Fst[Fst$v_Accopt_Crc]
+    THEN Dap$Crc( Odd, Rst );
+
+    IF NOT .Fab[Fab$v_Dfw]                      ! If write is not deferred
+    THEN Dap$Put_Message(Odd);                  ! Send out the message
+
+    IF .Rst[Rst$v_No_Send_control] EQL 0        ! If record mode,    !a555
+    THEN Dap$Get_Ack( Idd )                     ! check for status
+    ELSE Rab[Rab$h_Sts]=Rms$_Suc;               ! WIN
+
+    SS$_NORMAL
+    END;			!End of DAP$$PUT
+
+GLOBAL ROUTINE DAP$CRC ( p_dd: REF $Dap_Descriptor,
+                         p_Rst: REF $Rms_Rst        ) : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Include message in CRC calculation
+!
+! FORMAL PARAMETERS:
+!
+!	P_DD:  Address of DAP descriptor for data message
+!	P_RST: Address of RST for stream
+!
+! SIDE EFFECTS:
+!
+!       Message will be eaten.
+!       Call Dap$Unget_Header to get it back (must do for input)
+!
+!--
+
+    BEGIN
+    LITERAL
+        Dap$m_Crc_Polynomial=%O'164405',
+        Dap$k_Crc_Initial=%O'177777';
+
+    MACRO
+        $Dap$Crc [ byt ] =
+           (COMPILETIME crc=byt;
+            $Dap$Crc1
+            $Dap$Crc1
+            $Dap$Crc1
+            $Dap$Crc1
+            $Dap$Crc1
+            $Dap$Crc1
+            $Dap$Crc1
+            $Dap$Crc1
+
+            %PRINT( 'Crctab[',%NUMBER(byt),']=',%NUMBER(crc))
+
+            crc ) %,
+
+        $Dap$Crc1 =
+            %IF crc
+            %THEN %ASSIGN( crc, (crc^-1) XOR Dap$m_Crc_Polynomial )
+            %ELSE %ASSIGN( crc, (crc^-1) )
+            %FI
+            %;
+%(
+        $Dap$Bit_Explode (bits)[] =
+           bits
+           %IF (%COUNT NEQ 7)
+           %THEN , $Dap$Bit_Explode( bits^-1 )
+           %FI %,
+
+        $Dap$Integers ( max ) [] =
+           %IF max GTR 0
+           %THEN $Dap$Integers( max-1 ),
+           %FI 
+           max %;
+
+)%
+
+    OWN CrcTab: VECTOR[256]
+                INITIAL( $Dap$Crc( 0,
+                                    1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+                                    11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+                                    21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
+                                    31, 32, 33, 34, 35, 36, 37, 38, 39, 40,
+                                    41, 42, 43, 44, 45, 46, 47, 48, 49, 50,
+                                    51, 52, 53, 54, 55, 56, 57, 58, 59, 60,
+                                    61, 62, 63, 64, 65, 66, 67, 68, 69, 70,
+                                    71, 72, 73, 74, 75, 76, 77, 78, 79, 80,
+                                    81, 82, 83, 84, 85, 86, 87, 88, 89, 90,
+                                    91, 92, 93, 94, 95, 96, 97, 98, 99, 100,
+                                    101, 102, 103, 104, 105,
+                                     106, 107, 108, 109, 110,
+                                    111, 112, 113, 114, 115,
+                                     116, 117, 118, 119, 120,
+                                    121, 122, 123, 124, 125,
+                                     126, 127, 128, 129, 130,
+                                    131, 132, 133, 134, 135,
+                                     136, 137, 138, 139, 140,
+                                    141, 142, 143, 144, 145,
+                                     146, 147, 148, 149, 150,
+                                    151, 152, 153, 154, 155,
+                                     156, 157, 158, 159, 160,
+                                    161, 162, 163, 164, 165,
+                                     166, 167, 168, 169, 170,
+                                    171, 172, 173, 174, 175,
+                                     176, 177, 178, 179, 180,
+                                    181, 182, 183, 184, 185,
+                                     186, 187, 188, 189, 190,
+                                    191, 192, 193, 194, 195,
+                                     196, 197, 198, 199, 200,
+                                    201, 202, 203, 204, 205,
+                                     206, 207, 208, 209, 210,
+                                    211, 212, 213, 214, 215,
+                                     216, 217, 218, 219, 220,
+                                    221, 222, 223, 224, 225,
+                                     226, 227, 228, 229, 230,
+                                    231, 232, 233, 234, 235,
+                                     236, 237, 238, 239, 240,
+                                    241, 242, 243, 244, 245,
+                                     246, 247, 248, 249, 250,
+                                    251, 252, 253, 254, 255 ) );
+
+
+    BIND dd=.p_dd: $Dap_Descriptor;
+    BIND rst=.p_rst: $Rms_Rst;
+    LOCAL
+          check;                        ! Temp checksum
+
+    Dap$Unget_Header( dd );             ! Back up to beginning of message
+    Dap$Get_Header( dd );               ! Eat the header
+    Dap$Get_Variable_String( dd, 0, 8 ); ! Eat the recnum
+
+    Check = .Rst[Rst$h_Checksum];       ! Copy checksum to temp    !m561vv
+                                        ! Compiler may think it volatile
+    DECR i FROM .dd[Dap$h_Length]-1 TO 0
+    DO
+        BEGIN
+        Check = .Check XOR Dap$Get_Byte( dd );
+        Check = .Crctab[.Check AND %O'377'] XOR (.Check ^ -8);
+        END;
+
+    Rst[Rst$h_Checksum] = .Check;       ! Store resulting checksum     !m561^^
+    END;
+
+
+GLOBAL ROUTINE DAP$HANDLE (Signal_Args: REF VECTOR,
+                           Mech_Args: REF VECTOR,
+                           Enable_Args: REF VECTOR) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Condition handler for requests
+!
+! FORMAL PARAMETERS:
+!
+!	SIGNAL_ARGS: addr of vector of SIGNAL arguments,
+!       MECH_ARGS: not used,
+!       ENABLE_ARGS: args passed when this handler was established
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! COMPLETION CODES:
+!
+!	0: Resignal, 1: Continue
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+    BIND Blk=..Enable_Args[1]: $Rab_Decl;          ! RMS block
+    BIND ROUTINE $$Errrtn=..Enable_Args[2]: Rms_Ercal;       ! Error routine
+    BIND Fab=(IF .Blk[Rab$h_Bid] EQL Rab$k_Bid
+              THEN UAddr(.Blk[Rab$a_Fab])
+              ELSE Blk): $Fab_Decl;
+    BIND Fst=.Fab[Fab$a_Ifi]: $Rms_Fst;
+
+    LOCAL Severity;
+
+    Severity= .(Signal_Args[1])<0,3>;
+
+    SELECT .Signal_Args[1] OF
+           SET
+           [SS$_UNWIND]:
+                         BEGIN
+                         RETURN STS$K_NORMAL;
+                         END;
+           [Rms$k_Suc_Min TO Rms$k_Suc_Max]: Severity=SS$_NORMAL;
+
+           [Rms$k_Err_Min TO Rms$k_Err_Max]:
+                         Severity=SS$_ERROR;
+           [Rms$k_Err_Min TO Rms$k_Err_Max, Rms$k_Suc_Min TO Rms$k_Suc_Max]:
+                         BEGIN
+                         Usrsts=.Signal_Args[1];
+                         Usrstv=.Signal_Args[2];
+                         END;
+
+           [Dap$k_Facility_Code TO Dap$k_Facility_Code+%O'7777777']:
+                         BEGIN
+                         ! Flag an error unless this is a success code
+                         Fst[Fst$v_Error]=(NOT .Severity);
+
+                         Usrsts=Dap$Error_Dap_Rms(.Signal_Args[1]);
+                         Usrstv=.(Signal_Args[1])<Dapcode>;
+                         END;
+
+           [Dap$_Eof]:   Fst[Fst$v_Error]=0;    ! End-of-File is special
+
+           [Xpn$$Select_Xpn_Errors]:
+                         IF NOT .Severity       ! If this is a connect error
+                         THEN                   ! then change to RMS code
+                             BEGIN
+                             Fab[Fab$v_Drj]=0;  ![14] Link is no good any more
+                             Fst[Fst$v_Drj]=0;  ! Link no good any more   !a521
+                             Fst[Fst$v_File_Open]=Fst[Fst$v_Access_Active]=0;
+                                          ![14] Abort means it is not open any more
+                             $Xpn_Close( Nlb=.Fst[Fst$a_Nlb], Failure=R$Null );
+                             Usrsts=Rms$_Dcf;
+                             Usrstv=.Signal_Args[1]; ! XPN code
+                             END;
+
+           [Xpn$_Aborted, Xpn$_Disconn]:
+                         BEGIN
+                         Severity=STS$K_ERROR;  ! Treat as error
+                         Blk[Rab$h_Sts]=Rms$_dcb;
+                         END;       ! Network link broken (Abort or Disconnect)
+
+           [Xpn$_No_Open, Xpn$_Rejected]:
+                         Usrstv=.Signal_Args[2];
+                         ! DECnet reason code will be STV for
+                         ! unspecified open error
+
+           [Xpn$_No_Access]:
+                         UsrSts=Rms$_Iac;                             !a573
+
+           [OTHERWISE]:
+                BEGIN
+                Usrsts=Rms$_Bug;        ! Should not occur
+                Usrstv=.Signal_Args[1]; !
+                Severity=SS$_FATAL;             !
+                END;
+           TES;
+
+    Blk[Rab$h_Sts]=.Usrsts;
+    Blk[Rab$h_Stv]=.Usrstv;
+
+    CASE .SEVERITY FROM 0 TO 7 OF
+         SET
+         [STS$K_FATAL,STS$K_ERROR]:                                   !m572
+                BEGIN
+                $$Error(Open,Blk);              !? Should get operation too
+                
+                SETUNWIND();
+
+                ! Return status code
+                Mech_Args[Ma_Return]=Blk[Rab$h_Sts]=.UsrSts;
+                RETURN 0; !Actual return value is ignored here
+                END;
+         [STS$K_WARNING]:  
+                BEGIN
+                $$Error(Open,Blk);              !? Should get operation too
+                RETURN STS$K_NORMAL;
+                END;
+         [STS$K_NORMAL, STS$K_INFO]: RETURN STS$K_NORMAL;
+         [INRANGE]: ;
+         TES;
+
+    SS$_RESIGNAL
+    END;			!End of DAP$HANDLE
+END				!End of module
+ELUDOM

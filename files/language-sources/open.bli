@@ -1,0 +1,1099 @@
+MODULE OPEN (	! Open a file using RMS or DAP
+		IDENT = '20'
+                %BLISS36(,ENTRY(
+                                r$open,       !open a file
+                                r$create,     !create a new file
+                                r$close,      !close a file
+                                r$reset,      !abort a file
+                                r$erase,      !delete a file
+                                rl$close,     !close a local file
+                                dap$openfile, !open a remote file (using dap)
+                                dap$close,    !close a remote file (using dap)
+                                dap$handle    !RMS DAP condition handler
+                                ))
+		) =
+BEGIN
+!  COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1981, 1986.
+!  ALL RIGHTS RESERVED.
+!  
+!  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!  COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!  THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!  ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!  AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!  SOFTWARE IS HEREBY TRANSFERRED.
+!  
+!  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!  NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!  EQUIPMENT CORPORATION.
+!  
+!  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!  ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+
+!++
+! FACILITY: DAP/RMS
+!
+! ABSTRACT:
+!     Open a file using DAP if the file is on another system,
+!     or using RMS if it is on the same system.
+!
+! ENVIRONMENT: BLISSNET, RMS, XPORT, Transportable Code.
+!
+! AUTHOR:	Andrew Nourse, CREATION DATE: 2-Jan-82
+!
+! 20    - Poor-man's routing now invoked by setting PMRFLG to -1
+! 17    - Undefined ASCII to non-stream sets CR only if no other RAT bits set
+! 16    - R$OPEN should merge related filespec
+!       - R$ERASE should call DAP$NEXTFILESPEC for additional filespecs
+! 15    - R$OPEN & R$CREATE continue after signalling RMS$_SUP for remote-only
+! 14    - Make R$RESET get rid of link.
+! 13    - Have R$RESET check the NEW FILE bit in the FST
+! 12    - Send ACCESS COMPLETE(PURGE) as interrupt message
+! 11    - Work around IAS wierdnesses
+! 10    - Tell RMS that file is stream if using block mode
+! 07    - Don't set implied CRLF unless user does not know format
+! 06    - Give DD's pointers to each other
+! 05    - Make DAP$CLOSE eat entire DATA message also
+! 04    - Make DAP$CLOSE eat entire ACCESS COMPLETE message
+! 03    - Put in ENTRY points
+! 02    - Eat messages in pipe on close
+! 01	- The beginning
+!--
+
+!
+! INCLUDE FILES:
+!
+
+LIBRARY 'RMS';
+LIBRARY 'RMSBLK';
+LIBRARY 'DAP';
+LIBRARY 'BLISSNET';
+LIBRARY 'CONDIT';
+
+!
+! TABLE OF CONTENTS:
+!
+
+FORWARD ROUTINE
+	R$OPEN,           !Open a file
+        R$CREATE,         !Create a new file
+        R$CLOSE,          !Close a file
+        R$RESET,          !Abort a file
+        R$ERASE,          !Delete a file
+        RL$CLOSE,         !Close a local file
+        DAP$OPENFILE,     !Open a remote file (using DAP)
+        DAP$CLOSE,        !Close a remote file (using DAP)
+        DAP$HANDLE;       !Condition handler for DAP RMS routines
+!
+! MACROS:
+!
+
+
+!
+! EQUATED SYMBOLS:
+!
+
+COMPILETIME MULTIPLE_FILESPECS=1;       ![16] On for mult-filespec support
+
+LITERAL OBJ_FAL=17;                     !The FAL Object Type
+
+%IF %BLISS(BLISS36)
+    %THEN
+    %IF %SWITCHES(TOPS20)
+        %THEN
+            LITERAL OUR_OSTYPE=DAP$K_TOPS20;
+            LITERAL MA_RETURN = 1;
+
+        %FI
+    %FI
+
+!
+! OWN STORAGE:
+!
+
+GLOBAL
+    PMRFLG: INITIAL(0);                 ! Set nonzero for poor-man's routing
+
+!
+! EXTERNAL REFERENCES:
+!
+
+EXTERNAL ROUTINE
+                SETAI,
+                DAP$PUT_MESSAGE,
+                DAP$GET_MESSAGE,
+                DAP$GET_CONFIG,
+                DAP$PUT_CONFIG,
+                DAP$PUT_ATTRIBUTES,
+                DAP$PUT_BITVECTOR,
+                DAP$PUT_ACCESS,
+                DAP$PUT_BYTE,
+                DAP$PUT_HEADER,
+                DAP$GET_HEADER,
+                DAP$GET_STATUS,
+                DAP$GET_ATTRIBUTES,
+                DAP$ERROR_DAP_RMS,
+                DAP$MERGE,
+                DAP$UNGET_HEADER,
+                DAP$SIZE_BITVECTOR,
+                DAP$GET_BYTE,
+                DAP$GET_BITVECTOR,
+                RMS$DIRECTORY,
+                RMS$SEARCH,
+                RMS$MERGE,
+                RL$CLMACY11,
+                RL$ERASE,
+                R$NULL,
+                XPN$SIGNAL;
+%IF MULTIPLE_FILESPECS
+%THEN
+EXTERNAL ROUTINE DAP$NEXTFILESPEC;
+%FI
+EXTERNAL D_CFG;
+EXTERNAL T20BUG: BITVECTOR,
+         VMSBUG: BITVECTOR,
+         RSXBUG: BITVECTOR,
+         RSTBUG: BITVECTOR,
+         IASBUG: BITVECTOR,
+         T10BUG: BITVECTOR,
+         RTBUG:  BITVECTOR;
+EXTERNAL COPYRIGHT; ! Keep the legal office happy
+
+GLOBAL ROUTINE R$OPEN (FAB,ERR)  =	! Open a (possibly remote) file
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Open a file.
+!       If the filename contains a remote node-id,
+!       communicate with FAL on the remote system to open the file,
+!       otherwise, open it using RMS.
+!
+! FORMAL PARAMETERS:
+!
+!	FAB: An RMS FAB, ready to open a file.
+!       ERR: Address of error routine
+!    
+!
+! COMPLETION CODES:
+!
+!	RMS$_SUC or RMS error code
+!
+! SIDE EFFECTS:
+!
+!	Associated data structures (for RMS or DAP) allocated
+!
+!--
+
+    BEGIN
+    MAP FAB: REF $FAB_DECL;
+    BIND ROUTINE $$ERRRTN=.ERR: RMS_ERCAL;      ! Error routine
+    BIND TYP=.FAB[FAB$A_TYP]: $TYP_DECL;
+    BIND NAM=.FAB[FAB$A_NAM]: $NAM_DECL;        ! Name block, if present
+    LOCAL CLASS;
+
+    IF TYP NEQ 0
+    THEN CLASS=.TYP[TYP$H_CLASS]
+    ELSE CLASS=TYP$K_CLASS_ASCII;
+
+    IF .CLASS EQL 0 THEN CLASS=TYP$K_CLASS_ASCII;
+
+    IF FIND_SUBSTRING(.FAB[FAB$A_FNA],PP('::')) NEQ 0
+    THEN
+        BEGIN
+        FAB[FAB$V_REMOTE]=1;                    ! Remember
+
+        IF NAM NEQ 0                            ![16] Merge related file
+        THEN DAP$MERGE(FAB[$],MERGE$M_RLF,.ERR);! 
+
+        DAP$OPENFILE(FAB[$],DAP$K_OPEN,0,.ERR)    ! File is remote.
+        END
+    ELSE
+        BEGIN                                  ! File is Local
+        LOCAL RFM, MRS;
+
+        ! Caller can set this bit before the call to disable local files.
+        IF .FAB[FAB$V_REMOTE]       ! Must it be remote?
+        THEN                                   ! If caller sets the bit
+            BEGIN                              ! (s)he does not support
+            FAB[FAB$H_STS]=RMS$_SUP;           ! local RMS file access
+            $$ERROR(OPEN,FAB[$]);              ! Which this is. complain
+            RETURN .FAB[FAB$H_STS]             ![15] Do not continue
+            END;
+
+        IF (NAM NEQ 0)                         ! Fill in NAM block if any
+        THEN                                   ! 
+            BEGIN                              ! Name block exists
+            IF .NAM[NAM$H_WCC_COUNT] EQL 0     ! If Search has not been done
+            THEN                               !  then we should do one
+                BEGIN                          !  so wildcarding will work
+                RMS$DIRECTORY(FAB[$],.ERR);    ! Check for wildcards.
+                RMS$SEARCH(FAB[$],R$NULL);     !  and fill in NAM block
+                IF .FAB[FAB$V_FOP_CIF] EQL 0   ! Create-if nonexistant?
+                AND (.FAB[FAB$H_STS] NEQ RMS$_SUC) ! successful?
+                THEN $$ERROR(OPEN,FAB[$])      ! Give error if not
+                END;                           ! with components of filespec
+            END;                               ! NAM block processing
+
+        IF (.CLASS EQL TYP$K_CLASS_MACY11)     ! For MACY11 files:
+        OR .FAB[FAB$V_FAC_BIO]                 ![10] or if BLOCK I/O
+        THEN                                   ! 
+            BEGIN                              ! Pretend ASCII if MACY11
+            RFM=.FAB[FAB$Z_RFM];               ! because RMS does not yet
+            FAB[FAB$Z_RFM]=FAB$K_RFM_STM;      ! really know about MACY11 files
+            MRS=.FAB[FAB$H_MRS];               ! Save the original MRS value
+            END;                               ! 
+
+        IF (.FAB[FAB$Z_RFM] EQL FAB$K_RFM_UDF) ! If record format not known
+        THEN FAB[FAB$Z_RFM]=FAB$K_RFM_STM;     ! Default to /STREAM
+
+        IF .FAB[FAB$V_FOP_CIF]                 ! If create-if, do a $CREATE
+        THEN $CREATE(FAB=FAB[$],ERR=.ERR)      !  since RMS-20 ignores CIF
+        ELSE $OPEN(FAB=FAB[$],ERR=.ERR);       !  on $OPEN
+
+        IF (.CLASS EQL TYP$K_CLASS_MACY11)     ! For MACY11 files:
+        OR .FAB[FAB$V_FAC_BIO]                 ![10] or if BLOCK I/O
+        THEN                                   ! 
+            BEGIN                              ! Restore what was
+            FAB[FAB$Z_RFM]=.RFM;               ! changed to satisfy RMS
+            FAB[FAB$H_MRS]=.MRS;               ! or changed by RMS
+            END;                               ! 
+        END;                                   ! Local File Open
+
+    .FAB[FAB$H_STS]                     ! Returned status
+    END;			!End of R$OPEN
+GLOBAL ROUTINE R$CREATE (FAB,ERR)  =       ! Create a (possibly remote) file
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Open a new file.
+!       If the filename contains a remote node-id,
+!       communicate with FAL on the remote system to open the file,
+!       otherwise, open it using RMS.
+!
+! FORMAL PARAMETERS:
+!
+!	FAB: An RMS FAB, ready to open a file.
+!       ERR: Address of error routine
+!
+! COMPLETION CODES:
+!
+!	RMS codes
+!
+! SIDE EFFECTS:
+!
+!	A new file will be created
+!
+!--
+
+    BEGIN
+    MAP FAB: REF $FAB_DECL;
+    BIND ROUTINE $$ERRRTN=.ERR: RMS_ERCAL;      ! Error routine
+
+    BIND NAM=.FAB[FAB$A_NAM]: $NAM_DECL;        ! Name block if present
+    BIND TYP=.FAB[FAB$A_TYP]: $TYP_DECL;
+    LOCAL CLASS;
+    LOCAL RFM, MRS;
+
+    IF TYP NEQ 0
+    THEN CLASS=.TYP[TYP$H_CLASS]
+    ELSE CLASS=TYP$K_CLASS_ASCII;
+
+    IF .CLASS EQL 0 THEN CLASS=TYP$K_CLASS_ASCII;
+
+    IF FIND_SUBSTRING(.FAB[FAB$A_FNA],PP('::')) NEQ 0
+    THEN
+        BEGIN
+        FAB[FAB$V_REMOTE]=1;                    ! Remember
+
+        IF NAM NEQ 0
+        THEN DAP$MERGE(FAB[$],MERGE$M_CREATE+MERGE$M_RLF,.ERR);
+
+        DAP$OPENFILE(FAB[$],DAP$K_CREATE,0,.ERR)  ! File is remote.
+        END
+    ELSE
+        BEGIN
+        ! Caller can set this bit before the call to disable local files.
+        IF .FAB[FAB$V_REMOTE]       ! Must it be remote?
+        THEN
+            BEGIN
+            FAB[FAB$H_STS]=RMS$_SUP;
+            $$ERROR(OPEN,FAB[$]);   ! Yes. complain
+            RETURN .FAB[FAB$H_STS]      ![15] Do not continue
+            END;
+
+        IF NAM NEQ 0
+        THEN
+            BEGIN                       ! Merge related filespec, get resultant
+            RMS$MERGE(FAB[$],MERGE$M_CREATE+MERGE$M_RLF,.ERR);
+            END;
+
+        IF .CLASS EQL TYP$K_CLASS_MACY11
+        THEN
+            BEGIN
+            RFM=.FAB[FAB$Z_RFM];        ! Save real record format
+            MRS=.FAB[FAB$H_MRS];
+            FAB[FAB$Z_RFM]=FAB$K_RFM_STM;
+            END;
+
+        IF .FAB[FAB$Z_RFM] EQL FAB$K_RFM_UDF    ! If record format not known
+        THEN FAB[FAB$Z_RFM]=FAB$K_RFM_STM;      ! Default to /STREAM
+
+        $CREATE(FAB=FAB[$],ERR=.ERR);
+
+        IF .CLASS EQL TYP$K_CLASS_MACY11        ! Restore real record format
+        THEN
+            BEGIN
+            FAB[FAB$Z_RFM]=.RFM;
+            FAB[FAB$H_MRS]=.MRS;
+            END;
+        END;
+    .FAB[FAB$H_STS]                     ! Return status code
+    END;			!End of R$CREATE
+
+GLOBAL ROUTINE R$ERASE (FAB,ERR)  =       ! Delete a (possibly remote) file
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Delete a file.
+!       If the filename contains a remote node-id,
+!       communicate with FAL on the remote system to delete the file,
+!       otherwise, delete it using RMS.
+!
+! FORMAL PARAMETERS:
+!
+!	FAB: An RMS FAB, ready to open a file.
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! COMPLETION CODES:
+!
+!	RMS$_SUC or RMS error code
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+    MAP FAB: REF $FAB_DECL;
+
+    IF FIND_SUBSTRING(.FAB[FAB$A_FNA],PP('::')) NEQ 0
+    THEN
+        BEGIN
+        %IF MULTIPLE_FILESPECS          ![16] Try for multiple filespecs
+        %THEN
+        DO  BEGIN
+            FAB[FAB$V_REMOTE]=1;                     ! Remember
+            DAP$OPENFILE(FAB[$],DAP$K_ERASE,0,.ERR)  ! File is remote.
+            END WHILE DAP$NEXTFILESPEC(FAB[$],.ERR)  ![16] try for more
+        %ELSE
+        FAB[FAB$V_REMOTE]=1;                     ! Remember
+        DAP$OPENFILE(FAB[$],DAP$K_ERASE,0,.ERR)  ! File is remote.
+        %FI
+        END
+    ELSE RL$ERASE(FAB[$],.ERR);
+    .FAB[FAB$H_STS]                     ! Return status code
+    END;			!End of ERASE
+
+GLOBAL ROUTINE R$CLOSE (FAB,ERR)  =	! Close a (possibly remote) file
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Close a file
+!
+! FORMAL PARAMETERS:
+!
+!	FAB: An RMS FAB for open file.
+!       ERR: Address of error routine
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! COMPLETION CODES:
+!
+!	RMS$_SUC or RMS error code
+!
+! SIDE EFFECTS:
+!
+!	Internal blocks deallocated
+!
+!--
+
+    BEGIN
+    MAP FAB: REF $FAB_DECL;
+
+    IF .FAB[FAB$V_REMOTE]
+    THEN
+        BEGIN
+        DAP$CLOSE(FAB[$],DAP$K_ACCOMP_COMMAND,.ERR)     ! File is remote.
+        END
+    ELSE
+        BEGIN
+        RL$CLOSE(FAB[$],.ERR);          ! Call local close routine
+        END;
+    .FAB[FAB$H_STS]                     ! Returned status code
+    END;			!End of R$CLOSE
+GLOBAL ROUTINE R$RESET (FAB,ERR)  =	! Reset a (possibly remote) file
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Reset (close/abort) a file
+!
+! FORMAL PARAMETERS:
+!
+!	FAB: An RMS FAB for open file.
+!       ERR: Address of error routine
+!
+! COMPLETION CODES:
+!
+!	RMS$_SUC or RMS error code
+!
+! SIDE EFFECTS:
+!
+!	Internal blocks deallocated
+!
+!--
+
+    BEGIN
+    MAP FAB: REF $FAB_DECL;
+
+    IF .FAB[FAB$V_REMOTE]
+    THEN                                ! File is remote.
+        BEGIN
+        DAP$CLOSE(FAB[$],DAP$K_ACCOMP_PURGE,.ERR);      ! Close file
+
+        IF (.FAB[FAB$H_FOP] NEQ RMS$_SUC)       ![14] If close failed
+        AND (.FAB[FAB$V_FOP_DRJ] EQL 0) ![14] and link should close too
+        THEN
+            BEGIN
+            BIND DIB=.FAB[FAB$A_IFI]: $DIB;
+            DIB[DIB$V_ACCESS_ACTIVE]=DIB[DIB$V_FILE_OPEN]=0; ![14] just break
+            DAP$CLOSE(FAB[$],DAP$K_ACCOMP_PURGE,.ERR)        ![14] link
+            END;                        
+        END
+    ELSE
+        BEGIN
+        BIND FST=.FAB[FAB$A_IFI]: $RMS_FST;
+        IF .FST[FST$V_NEW_FILE]              ![13] NEVER DELETE AN OLD FILE
+        THEN $FAB_STORE(FAB=FAB[$],FOP=DLT); ! Set DELETE bit
+        R$CLOSE(FAB[$],.ERR);           ! and close it
+        END;
+    .FAB[FAB$H_STS]                     ! Returned status code
+    END;			!End of R$RESET
+
+GLOBAL ROUTINE RL$CLOSE (FAB: REF $FAB_DECL, ERR)=
+    BEGIN
+    IF .FAB[FAB$A_IFI] NEQ 0        ! File really open?
+    THEN
+        BEGIN
+        BIND TYP=.FAB[FAB$A_TYP]: $TYP_DECL;        ! Datatype block
+        LOCAL DRJ;
+        LOCAL CLASS;
+        DRJ=.FAB[FAB$V_FOP_DRJ];        ! Save DRJ bit
+        IF .FAB[FAB$V_FOP_DLT] THEN FAB[FAB$V_FOP_DRJ]=1; ! Keep JFN if delete
+        CLASS=(IF TYP NEQ 0 THEN .TYP[TYP$H_CLASS] ELSE TYP$K_CLASS_ASCII);
+        CASE .CLASS FROM 0 TO TYP$K_CLASS_MAX OF
+             SET
+             [TYP$K_CLASS_MACY11]: RL$CLMACY11(FAB[$],.ERR);
+             [INRANGE]:  $CLOSE(FAB=FAB[$],ERR=.ERR);
+             [OUTRANGE]: SIGNAL(FAB[FAB$H_STS]=RMS$_BUG,0,FAB[$]);
+             TES;
+
+        IF .FAB[FAB$V_FOP_DLT]              ! Should we delete it?
+        THEN $ERASE(FAB=FAB[$]);            ! yes indeed
+
+        FAB[FAB$V_FOP_DRJ]=.DRJ;        ! Restore DRJ
+        END;
+
+    %IF %SWITCHES(TOPS20)
+        %THEN
+            BEGIN
+            LIBRARY 'TWENTY';
+            REQUIRE 'JSYSDEF';
+            IF (.FAB[FAB$H_JFN] NEQ 0)      ! Is the JFN still there?
+            AND (.FAB[FAB$V_FOP_DRJ] EQL 0) !  and should go away
+            THEN
+                BEGIN
+                JSYS_RLJFN(.FAB[FAB$H_JFN]); ! Try to release it
+                FAB[FAB$H_JFN]=0;            !  and zero it
+                END;
+            END;
+        %FI
+    .FAB[FAB$H_STS]                     ! Return status
+    END;                                ! RL$CLOSE
+
+GLOBAL ROUTINE DAP$OPENFILE (FAB: REF $FAB_DECL,
+                             FUNCTION,
+                             NFAB: REF $FAB_DECL,
+                             ERR): =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!   OPEN/CREATE/... A REMOTE FILE
+!
+! FORMAL PARAMETERS:
+!
+!   FAB: An RMS FAB with a NODEID embedded in the filespec.
+!   FUNCTION: ACCESS message function code (DAP) or 0 to exchange configs only
+!   NFAB: New FAB for Rename
+!   ERR: Address of error routine
+!
+! COMPLETION CODES:
+!
+!   RMS codes
+!
+! SIDE EFFECTS:
+!
+!  If .FAB[FAB$A_DIB] is zero:
+!   A DIB is allocated.  FAB[FAB$A_DIB] will point to it
+!   A NLB is allocated.  DIB[DIB$A_NLB] will point to it
+!   2 $DAP_DESCRIPTORs are allocated, DIB[DIB$A_(I,O)_DD] point to them
+!   A Configuration Block is allocated. DIB[DIB$A_CONFIG] will point to it
+!
+!   For ERASE and EXECUTE, the requested operation will have been completed
+!   and the above data strucures de-allocated.
+!--
+    BEGIN
+    MAP FAB: REF $FAB_DECL;
+    MAP NFAB: REF $FAB_DECL;          ! New name for rename
+    LOCAL FABSAV: VOLATILE;
+
+    LOCAL NLB : REF $XPN_NLB();
+    LOCAL DIB : REF $DIB;
+    LOCAL ACCOPT: BITVECTOR[35] INITIAL(0),
+          DISPLAY: BITVECTOR[28] INITIAL(0);
+    LOCAL CFGBLK: REF $CONFIG;
+    LOCAL OBUF,
+          IDD: REF $DAP_DESCRIPTOR,
+          ODD: REF $DAP_DESCRIPTOR;
+    LOCAL CLASS;
+    LOCAL ERRSAV: VOLATILE;
+
+    ENABLE DAP$HANDLE(FABSAV,ERRSAV);
+    ERRSAV=.ERR;
+    FABSAV=.FAB;                        ! Handler will need this
+
+    IF .FAB[FAB$A_DIB] EQL 0
+    THEN
+        BEGIN
+        $XPO_GET_MEM(UNITS=DAP$K_BUFFER_SIZE %BLISS36(/4), RESULT=OBUF);
+                                            ! Allocate output buffer
+
+        $XPO_GET_MEM(UNITS=DAP$K_DESCRIPTOR_LEN, RESULT=ODD, FILL=0);
+        $XPN_DESC_INIT(DESCRIPTOR=ODD[$],CLASS=DYNAMIC_BOUNDED,
+                       BINARY_DATA=(DAP$K_BUFFER_SIZE,.OBUF,BYTES));
+
+        $XPO_GET_MEM(UNITS=DAP$K_DESCRIPTOR_LEN, RESULT=IDD, FILL=0);
+        $XPN_DESC_INIT(DESCRIPTOR=IDD[$],CLASS=BOUNDED);
+
+        $XPO_GET_MEM(UNITS=NLB$K_LENGTH, RESULT=NLB, FILL=0); ! Allocate an NLB
+        $XPN_NLB_INIT(NLB=NLB[$]);
+
+        $XPO_GET_MEM(UNITS=DIB$K_LENGTH, RESULT=DIB, FILL=0); ! Allocate a DIB
+
+        !Now set up the pointers:
+        !
+        !   +---------+   +---------+   +---------+
+        !   |   FAB   |-->|   DIB   |-->| CONFIG  |
+        !   +---------+   +----+----+   +---------+
+        !            ,----'    V    `-.
+        !   +---------+   +---------+ :  
+        !   |   IDD   |   |   ODD   | :  
+        !   +---------+   +--+------+ :
+        !            `--.    V        ;
+        !            +-----------+<--'
+        !            |    NLB    |
+        !            +-----------+
+        ! 
+
+        FAB[FAB$A_DIB]=DIB[$];              ! Point the Fab at the DIB
+        DIB[DIB$A_NLB]=NLB[$];              ! Point the DIB at the NLB
+        DIB[DIB$A_I_DD]=IDD[$];             !  ... and the input descriptor
+        DIB[DIB$A_O_DD]=ODD[$];             !  ... and the output descriptor
+
+        ODD[DAP$A_NLB]=NLB[$];              ! Output descriptor points to NLB
+        IDD[DAP$A_NLB]=NLB[$];              ! Input descriptor ...
+
+        IDD[DAP$A_OTHER_DD]=ODD[$];         ![6] DD's should point
+        ODD[DAP$A_OTHER_DD]=IDD[$];         ![6]  to each other
+
+        $XPO_GET_MEM(UNITS=CONFIG$K_LEN, RESULT=CFGBLK, FILL=0); ! Alloc config
+        DIB[DIB$A_CONFIG]=CFGBLK[$];        ! Point the Dib at it
+
+        SET_ACCESS_INFO (NLB[$],.FAB[FAB$A_FNA]);   ! Extract access info
+                                                        ! from nodename
+
+        !++
+        ! Open the link
+        !--
+
+        IF .PMRFLG NEQ 0  ![10] PMRFLG is patched to enable poor-man's routing
+        THEN
+        $XPN_OPEN (NLB=NLB[$], OBJECT=OBJ_FAL, TYPE=ACTIVE,
+                   OPTIONS=(WAIT,PMR),                  ! ask for PMR
+                   BUFFER_SIZE=DAP$K_BUFFER_SIZE,       ! Tell PMR buffer size
+                   TIMEOUT = 180, FAILURE=XPN$SIGNAL)
+        ELSE
+        $XPN_OPEN (NLB=NLB[$], OBJECT=OBJ_FAL, TYPE=ACTIVE,
+                   OPTION=WAIT,
+                   TIMEOUT = 180, FAILURE=XPN$SIGNAL);
+
+        DAP$PUT_CONFIG(ODD[$],DAP$K_BUFFER_SIZE);
+        DAP$PUT_MESSAGE(ODD[$]);                    ! Send configuration
+
+        DAP$GET_CONFIG(IDD[$],CFGBLK[$]);           ! Get one back
+
+        ! Workaround VMS BYTLM bug.
+        ! If user BYTLM is less than our buffersize, VMS FAL hangs
+        ! trying to send a message that is too large.
+        ! Currently we set a limit of what the VAX sends us - 256
+        IF .VMSBUG[VMS_BUG_BYTLM_HANG]  ! VMS does not check its own limit
+        AND (.CFGBLK[CONFIG$B_OSTYPE] EQL DAP$K_VMS)
+        THEN
+            BEGIN                   ! Exchange new configurations
+            LOCAL BUFSIZ;           ! Gets lower of our max or vms's
+            OWN VMSSLP: INITIAL(256);  !! Patchable
+
+            BUFSIZ=MIN(.CFGBLK[CONFIG$H_BUFSIZ]-.VMSSLP, DAP$K_BUFFER_SIZE);
+
+            DAP$PUT_CONFIG(ODD[$],.BUFSIZ);
+            DAP$PUT_MESSAGE(ODD[$]);
+            DAP$GET_CONFIG(IDD[$],CFGBLK[$]);
+            CFGBLK[CONFIG$H_BUFSIZ]=.BUFSIZ;        ! Don't forget the slop
+            END;
+        END
+    ELSE
+        BEGIN                           ! Set up local pointers
+        DIB=.FAB[FAB$A_DIB];
+        IDD=.DIB[DIB$A_I_DD];
+        ODD=.DIB[DIB$A_O_DD];
+        NLB=.DIB[DIB$A_NLB];
+        CFGBLK=.DIB[DIB$A_CONFIG];
+        END;
+
+    ! Remember the function we were trying to do
+    DIB[DIB$B_OPERATION]=.FUNCTION;
+    DIB[DIB$A_NEW_FAB]=NFAB[$];         ! Remember new FAB (for RENAME)
+
+    IF (.CFGBLK[CONFIG$H_BUFSIZ] GTR 0)
+    THEN ODD[DAP$H_MESSAGE_LENGTH]=     ![14] Use remote buffer size if smaller
+           MIN(.ODD[DAP$H_MESSAGE_LENGTH],.CFGBLK[CONFIG$H_BUFSIZ]);
+
+    ! The link is now open, and CONFIG messages have been exchanged.
+    ! Subsequent accesses over the same link can skip this block
+
+    IF (.DIB[DIB$V_FILE_OPEN] AND .FAB[FAB$V_FOP_DRJ]) ! Already opened
+    OR (.FUNCTION EQL 0)                       ! or didn't want to
+    THEN RETURN (FAB[FAB$H_STS]=RMS$_SUC);     ! Return if that's all we wanted
+
+    !
+    ! Check for unsupported features
+    !
+
+    ! Block mode is only permissible between homogenous systems
+    IF .FAB[FAB$V_FAC_BIO] AND (.CFGBLK[CONFIG$B_OSTYPE] NEQ OUR_OSTYPE)
+    THEN SIGNAL(FAB[FAB$H_STS]=RMS$_SUP,
+                FAB[FAB$H_STV]=DAP$K_MAC_UNSUPPORTED+DAP$K_MIC_ACCESS_FAC,
+                FAB[$]);
+
+    ! Default to ASCII if no datatype specified
+
+    IF .FAB[FAB$A_TYP] NEQ 0
+    THEN CLASS=.BLOCK[.FAB[FAB$A_TYP],TYP$H_CLASS]
+    ELSE CLASS=0;
+
+    IF .CLASS EQL 0 THEN CLASS=TYP$K_CLASS_ASCII;
+
+    ! Default the RFM to something reasonable if this is an ASCII file
+
+    IF (.CLASS EQL TYP$K_CLASS_ASCII) AND (.FAB[FAB$Z_RFM] EQL FAB$K_RFM_UDF)
+    THEN
+        BEGIN
+        CASE .CFGBLK[CONFIG$B_OSTYPE]
+        FROM 1 TO DAP$K_OSTYPE_MAX OF
+        SET
+        [DAP$K_RSTS,
+         DAP$K_TOPS10,
+         DAP$K_TOPS20,
+         DAP$K_RT11,
+         DAP$K_OS8,
+         DAP$K_RTS8]:  FAB[FAB$Z_RFM]=FAB$K_RFM_STM;
+        [INRANGE]:
+             BEGIN
+             FAB[FAB$Z_RFM]=FAB$K_RFM_VAR;      ![7] Variable
+             IF .FAB[FAB$H_RAT] EQL 0           ![17] If no record attributes
+             THEN FAB[FAB$V_RAT_CR]=1;          ![7] Set Implied CRLF
+             END;
+        [OUTRANGE]: SIGNAL(RMS$_DPE,
+                           DAP$K_MAC_INVALID+DAP$K_MIC_CONFIG_OSTYPE,
+                           FAB[$]);
+        TES;
+        END;     
+
+    IF .FAB[FAB$V_FOP_CIF] THEN FAB[FAB$V_FOP_SUP]=0; ![11] CIF overrides SUP
+
+    DAP$PUT_ATTRIBUTES(ODD[$],FAB[$]);          ! Send Attributes
+    
+    ! If FOP bit CIF (Create-if) is set, make CREATE into OPEN
+    IF .FAB[FAB$V_FOP_CIF] AND (.FUNCTION EQL DAP$K_CREATE)
+    THEN FUNCTION=DAP$K_OPEN;
+
+    ! Now see what attributes we want back on the access.
+    ! We will ask for whatever we have XAB's, etc for.
+    IF .FAB[FAB$A_NAM] NEQ 0 THEN DISPLAY[DAP$V_DISPLAY_NAM]=1; ! File name
+
+        BEGIN
+        LOCAL XAB: REF $XABDAT_DECL;
+
+        XAB=.FAB[FAB$A_XAB];                        ! Search the XAB chain
+        WHILE .XAB NEQ 0
+        DO  BEGIN
+            CASE .XAB[XABDAT$Z_COD] FROM XABKEY$K_COD TO XABSUM$K_COD OF
+                SET
+    !            [XABKEY$K_COD]: DISPLAY[DAP$V_DISPLAY_KEY]=1;
+    !            [XABALL$K_COD]: DISPLAY[DAP$V_DISPLAY_ALL]=1;
+                [XABDAT$K_COD]: DISPLAY[DAP$V_DISPLAY_DTM]=1;
+    !            [XABSUM$K_COD]: DISPLAY[DAP$V_DISPLAY_SUM]=1;
+    !            [XABPRO$K_COD]: DISPLAY[DAP$V_DISPLAY_PRO]=1;
+                [INRANGE]:;
+                TES;
+            XAB=.XAB[XABDAT$A_NXT];                 ! On to the next one
+            END;
+        END;
+        DISPLAY[DAP$V_DISPLAY_ATT]=1;   ! Always get main attributes
+
+    DAP$PUT_ACCESS(ODD[$],FAB[$],.FUNCTION,ACCOPT,DISPLAY,NFAB[$]);! And Access
+    DAP$PUT_MESSAGE(ODD[$]);
+
+    DIB[DIB$V_ACCESS_ACTIVE]=1;                 ! Access is now active
+
+    SELECT .FUNCTION OF
+    SET
+
+    [DAP$K_DIRECTORY]:
+        RETURN FAB[FAB$H_STS]= RMS$_SUC;        ! Get directory info on SEARCH
+
+    [OTHERWISE]:
+        DAP$GET_ATTRIBUTES(IDD[$],FAB[$]);      ! Get returned Attributes
+
+    [DAP$K_OPEN, DAP$K_CREATE, DAP$K_SUBMIT]:
+        DIB[DIB$V_FILE_OPEN]=.DIB[DIB$V_ACCESS_ACTIVE]; ! File is open, or
+                                                        ! access is complete
+    [DAP$K_EXECUTE, DAP$K_ERASE]:
+        DIB[DIB$V_FILE_OPEN]=0;           ! These operations do not open files
+    TES;
+
+    IF (.FAB[FAB$V_FOP_DRJ] EQL 0)
+    AND (.DIB[DIB$V_FILE_OPEN] EQL 0)
+    THEN
+        BEGIN                           ! Close the link & free data strs
+        DAP$CLOSE(FAB[$],DAP$K_ACCOMP_COMMAND,.ERR);
+        DIB[DIB$V_ACCESS_ACTIVE]=0;
+        END;
+
+    FAB[FAB$H_STS]=RMS$_SUC
+    END;			!End of DAP$OPENFILE
+GLOBAL ROUTINE DAP$CLOSE (FAB,FUNCTION,ERR): =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!   Close a remote file
+!
+! FORMAL PARAMETERS:
+!
+!   FAB: An RMS FAB with a NODEID embedded in the filespec.
+!   FUNCTION: ACCESS message function code (DAP)
+!   ERR: Address of error routine
+!
+! SIDE EFFECTS:
+!
+!   If there are no more files coming:
+!    The link is closed
+!    The DIB attatched to the FAB, and its subsidiary data structures are freed
+!   If there is another file (wildcarding), the attributes are read into FAB
+!--
+    BEGIN
+    MAP FAB: REF $FAB_DECL;
+    BIND DIB=.FAB[FAB$A_DIB]: $DIB;
+    BIND ODD=.DIB[DIB$A_O_DD]: $DAP_DESCRIPTOR;
+    BIND IDD=.DIB[DIB$A_I_DD]: $DAP_DESCRIPTOR;
+    BIND NLB=.DIB[DIB$A_NLB]: $XPN_NLB();
+    BIND C=.DIB[DIB$A_CONFIG]: $CONFIG;
+    LOCAL V;                            ! Temp for returned value
+    LOCAL FABSAV: VOLATILE;
+    LOCAL ERRSAV: VOLATILE;
+    LOCAL SEND_INTERRUPT: INITIAL(0);   ![12] Flag for interrupt message
+
+    ENABLE DAP$HANDLE(FABSAV,ERRSAV);   ! Setup Condition handler
+    ERRSAV=.ERR;
+    FABSAV=.FAB;                        ! Handler will need this
+
+    IF .FAB[FAB$A_IFI] EQL 0            ! Make sure it's open
+    THEN
+        BEGIN                           ! No DIB there
+        FAB[FAB$H_STS]=RMS$_IFI;        ! Don't do it
+        SIGNAL(RMS$_IFI,0,FAB[$]);
+        RETURN .FAB[FAB$H_STS];         ! Even if handler doesn't care
+        END;
+
+    IF .FUNCTION EQL DAP$K_ACCOMP_PURGE ![12] Purge is sent as interrupt
+    THEN
+        BEGIN
+        SEND_INTERRUPT=1;
+
+        ! Forget what we were going to send
+        ODD[DAP$H_BYTES_REMAINING]=16;   ! Max length for interrupt message
+        ODD[DAP$A_DATA]=CH$PLUS(.ODD[DAP$A_DATA],-.ODD[DAP$H_BYTES_USED]);
+        ODD[DAP$H_BYTES_USED]=0;                          !to data in message
+        END;
+
+    IF (.FAB[FAB$V_FAC_PUT] EQL 0) AND (.FUNCTION EQL DAP$K_ACCOMP_PURGE)
+    THEN FUNCTION=DAP$K_ACCOMP_COMMAND; ! Some FAL's interpret purge as
+                                        ! erase, even for input files!!
+
+    IF .DIB[DIB$V_FILE_OPEN]            ! Send Access complete if file open,
+    THEN                                ! otherwise don't bother
+        BEGIN
+        LOCAL FOP: BITVECTOR[42] INITIAL(REP ((%BPUNIT+41)/%BPUNIT) OF (0));
+        LOCAL FOPLENGTH;
+
+        $DAP_MOVE_BITS(FAB,FAB$V_FOP_,FOP,DAP$V_FOP_,
+                       RWO,RWC,POS,DLK,LCK,
+                       CTG,SUP,NEF,TMP,MKD,DMO,
+                       WCK,RCK,CIF,LKO,SQO,MXV,SPL,
+                       SCF,DLT,CBT,WAT,DFW,TEF,OPF,
+                       DRJ,DFW);
+
+        IF .IASBUG[IAS_BUG_ACM_FOP]     ![11] IAS does not like most fop bits
+        AND (.C[CONFIG$B_OSTYPE] EQL DAP$K_IAS)
+        THEN FOP=(.FOP AND DAP$V_FOP_SPL);
+
+	FOPLENGTH=DAP$SIZE_BITVECTOR(FOP,6,0);
+
+        INIT_MESSAGE(ODD[$]);
+        ODD[DAP$B_OPERATOR]=DAP$K_ACCESS_COMPLETE;
+        ODD[DAP$V_MFLAGS_LENGTH]=1;
+        ODD[DAP$H_LENGTH]=.FOPLENGTH+1; ! Count length of FOP
+        DAP$PUT_HEADER(ODD[$]);
+        DAP$PUT_BYTE(ODD[$],.FUNCTION); ! COMMAND (normal) or PURGE (punt)
+
+        IF .FOPLENGTH NEQ 0             ! Send FOP if needed
+        THEN DAP$PUT_BITVECTOR(ODD[$],FOP,6);
+
+        IF .SEND_INTERRUPT NEQ 0        ![12] Interrupt message?
+        THEN ODD[DAP$V_INTERRUPT]=1;    ! 
+        DAP$PUT_MESSAGE(ODD[$]);            ! Send it
+
+        WHILE 1 DO                      ![2] Clean out pipeline
+            BEGIN
+            V=DAP$GET_HEADER(IDD[$]); ! Get response
+
+            SELECT .V OF SET
+            [DAP$K_ACCESS_COMPLETE]:
+                BEGIN                               ! Yes,
+                LOCAL CMPFUNC;
+                LOCAL FOP: BITVECTOR[42];
+
+                CMPFUNC=DAP$GET_BYTE(IDD[$]);         ![4] Eat rest of message
+                IF .CMPFUNC NEQ DAP$K_ACCOMP_RESPONSE ![4] Is it a response
+                THEN SIGNAL(RMS$_DPE,0,FAB[$]);       ![4] Error if not
+
+                DIB[DIB$V_FILE_OPEN]=0;             ! File is not open any more
+                DIB[DIB$V_ACCESS_ACTIVE]=0;         ! No access any more
+
+                IF .IDD[DAP$H_BYTES_REMAINING] GTR 0
+                THEN
+                    BEGIN
+                    DAP$GET_BITVECTOR(IDD[$],FOP,6);  ![4] Eat FOP field if any
+                    $DAP_MOVE_BITS(FOP,DAP$K_FOP_,FAB,FAB$V_FOP_,
+                                   RWO,RWC,POS,DLK,LCK,
+                                   CTG,SUP,NEF,TMP,MKD,DMO,
+                                   WCK,RCK,CIF,LKO,SQO,MXV,SPL,
+                                   SCF,DLT,CBT,WAT,DFW,TEF,OPF,
+                                   DRJ,DFW);
+                    END;
+
+                EXITLOOP FAB[FAB$H_STS]=RMS$_SUC;
+                END;
+            [DAP$K_NAME]:
+                BEGIN
+                EXITLOOP DAP$UNGET_HEADER(IDD[$]);  ! Back up for SEARCH
+                END;                             
+            [DAP$K_STATUS]:
+                BEGIN
+                LOCAL E;
+                E=DAP$GET_STATUS(IDD[$]);   ! End of file or error
+                FAB[FAB$H_STS]=DAP$ERROR_DAP_RMS(.E);
+                FAB[FAB$H_STV]=.E<DAPCODE>;
+                IF .FAB[FAB$H_STS] NEQ RMS$_EOF ! Break out for unusual errors
+                THEN EXITLOOP SIGNAL(.FAB[FAB$H_STS],.FAB[FAB$H_STV],FAB[$]);
+                END;                            ! error code
+
+            [DAP$K_DATA]: WHILE .IDD[DAP$H_LENGTH] GTR 0 ![2] Eat data
+                          DO DAP$GET_BYTE(IDD[$]);                ![2] 
+
+            [OTHERWISE]: SIGNAL(RMS$_DPE,0,FAB[$]);
+            TES;
+            END; ! WHILE 1
+        END;
+
+    ! Note that DRJ must be set, if wildcarding,
+    ! until all files have been read.
+
+    IF (.FAB[FAB$V_FOP_DRJ] EQL 0)      ! Should we keep things open?
+    THEN
+        BEGIN
+        $XPN_CLOSE(NLB=NLB[$], FAILURE=0);  ! Close the link
+
+        $XPO_FREE_MEM(BINARY_DATA=(DAP$K_DESCRIPTOR_LEN,IDD[$]));
+        $XPO_FREE_MEM(BINARY_DATA=(NLB$K_LENGTH,NLB[$]));    
+        $XPO_FREE_MEM(BINARY_DATA=(DAP$K_BUFFER_SIZE %BLISS36(/4),
+                                   %BLISS36( .(ODD[DAP$A_DATA])<0,18>)+1 )
+                                  );       ! Deallocate output buffer
+        $XPO_FREE_MEM(BINARY_DATA=(DAP$K_DESCRIPTOR_LEN,ODD[$]));
+        $XPO_FREE_MEM(BINARY_DATA=(DIB$K_LENGTH,DIB[$]));
+        FAB[FAB$A_DIB]=0;
+            END;
+
+    .V
+    END;                ! DAP$CLOSE
+
+GLOBAL ROUTINE DAP$HANDLE (SIGNAL_ARGS,MECH_ARGS,ENABLE_ARGS) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Condition handler for requests
+!
+! FORMAL PARAMETERS:
+!
+!	SIGNAL_ARGS: addr of vector of SIGNAL arguments,
+!       MECH_ARGS: not used,
+!       ENABLE_ARGS: args passed when this handler was established
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! COMPLETION CODES:
+!
+!	0: Resignal, 1: Continue
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+    MAP SIGNAL_ARGS: REF VECTOR,
+        MECH_ARGS: REF VECTOR,
+        ENABLE_ARGS: REF VECTOR;
+
+    BIND BLK=..ENABLE_ARGS[1]: $FAB_DECL;          ! RMS block
+    BIND ROUTINE $$ERRRTN=..ENABLE_ARGS[2]: RMS_ERCAL;       ! Error routine
+
+    LOCAL SEVERITY;
+
+    SEVERITY= .(SIGNAL_ARGS[1])<0,3>;
+
+    SELECT .SIGNAL_ARGS[1] OF
+           SET
+           [SS$_UNWIND]:
+                         BEGIN
+                         RETURN STS$K_NORMAL;
+                         END;
+           [RMS$K_SUC_MIN TO RMS$K_SUC_MAX]: SEVERITY=SS$_NORMAL;
+
+           [RMS$K_ERR_MIN TO RMS$K_ERR_MAX]:
+                         SEVERITY=SS$_ERROR;
+           [RMS$K_ERR_MIN TO RMS$K_ERR_MAX, RMS$K_SUC_MIN TO RMS$K_SUC_MAX]:
+                         BEGIN
+                         BLK[FAB$H_STS]=.SIGNAL_ARGS[1];
+                         BLK[FAB$H_STV]=.SIGNAL_ARGS[2];
+                         END;
+
+           [DAP$K_FACILITY_CODE TO DAP$K_FACILITY_CODE+%O'7777777']:
+                         BEGIN
+                         BLK[FAB$H_STS]=DAP$ERROR_DAP_RMS(.SIGNAL_ARGS[1]);
+                         BLK[FAB$H_STV]=.(SIGNAL_ARGS[1])<DAPCODE>;
+                         END;
+
+           [XPN$$SELECT_XPN_ERRORS]:
+                         IF NOT .SEVERITY       ! If this is a connect error
+                         THEN                   ! then change to RMS code
+                             BEGIN
+                             BLK[FAB$H_STS]=RMS$_CON;
+                             BLK[FAB$H_STV]=.SIGNAL_ARGS[1]; ! XPN code
+                             END;
+
+           [XPN$_ABORTED, XPN$_DISCONN]:
+                         BEGIN
+                         MAP BLK: $RAB_DECL;
+                         BIND FAB=(IF .BLK[RAB$H_BID] EQL RAB$K_BID
+                                   THEN .BLK[RAB$A_FAB]
+                                   ELSE BLK[$]): $FAB_DECL;
+
+                         BIND DIB=.FAB[FAB$A_DIB]: $DIB;
+
+                         FAB[FAB$V_FOP_DRJ]=0;  ![14] Link is no good any more
+                         DIB[DIB$V_FILE_OPEN]=DIB[DIB$V_ACCESS_ACTIVE]=0;
+                                      ![14] Abort means it is not open any more
+                         SEVERITY=STS$K_ERROR;  ! Treat as error
+                         BLK[RAB$H_STS]=RMS$_NLB;
+                         END;       ! Network link broken (Abort or Disconnect)
+
+           [XPN$_NO_OPEN, XPN$_REJECTED]:
+                         BLK[FAB$H_STV]=.SIGNAL_ARGS[2];
+                         ! DECnet reason code will be STV for
+                         ! unspecified open error
+
+           [OTHERWISE]:
+                BEGIN
+                BLK[FAB$H_STS]=RMS$_BUG;        ! Should not occur
+                BLK[FAB$H_STV]=.SIGNAL_ARGS[1]; !
+                SEVERITY=SS$_FATAL;             !
+                END;
+           TES;
+
+
+    CASE .SEVERITY FROM 0 TO 7 OF
+         SET
+         [STS$K_ERROR]:
+                BEGIN
+                $$ERROR(OPEN,BLK);              !? Should get operation too
+                SETUNWIND();
+                MECH_ARGS[MA_RETURN]=.BLK[FAB$H_STS];   ! Return status code
+                RETURN 0;
+                END;
+         [STS$K_WARNING]:  
+                BEGIN
+                $$ERROR(OPEN,BLK);              !? Should get operation too
+                RETURN STS$K_NORMAL;
+                END;
+         [STS$K_NORMAL, STS$K_INFO]: RETURN STS$K_NORMAL;
+         [STS$K_FATAL,INRANGE]: ;
+         TES;
+
+    SS$_RESIGNAL
+    END;			!End of DAP$HANDLE
+END            !End of module
+ELUDOM

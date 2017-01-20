@@ -1,0 +1,548 @@
+;SX:<K.KDO>CLEAN.FAI.41, 25-May-80 16:26:36, Edit by B.BOMBADIL
+;add <SPACE>, <BACKSPACE>, and <RUBOUT> commands
+;modify internal help message
+;SX:<K.KDO>CLEAN.FAI.40, 5-Apr-80 20:25:45, Edit by Y.YDUJ
+;implementation of T(ype) command and bugfixes in P(ush) command.
+
+		Title	CLEAN - clean up directory
+
+;Original version written by Michael Heathman @SUMEX, June 1975
+;Modified for LOTS by David Roode, July 1977
+;Rewritten by Kirk Lougheed, September 1979
+
+Search Monsym
+Extern .Jbsa
+
+a=1
+b=2
+c=3
+f=5
+p=17
+
+maxfil== =500			;maximum number of files
+pdlen==30			;length of push down stack
+fdblen==30			;length of fdb
+filfld==17			;length of filename field
+namfld== =35			;length of username field
+
+opdef	call	[pushj	p,]
+opdef	ret	[popj	p,]
+
+crlf:	byte(7) 15, 12, 0
+execj:	block 1			;jfn for the inferior exec
+execf:	block 1			;fork handle for inferior exec
+modin:	block 1			;mode word for tty input
+modout:	block 1			;mode word for tty output
+jfn:	block 1			;file jfn
+freead:	block 1			;current location of free memory
+total:	block 1			;total number of files in the group
+temp:	block 20		;used with the gfust jsys
+direct:	block maxfil		;array of string pointers
+pdlist:	block pdlen		;the stack
+fdb:	block fdblen		;the file descriptor block
+pagenm:	block 1			;page number for the process page to PMAP to.
+filpag:	block 1			;page number of the file we are typing
+noint:	block 1			;interrupt flag
+pcsave:	block 1			;save PC here on ctrl/o
+
+;interrupt tables
+
+chntab:	1,,shutof		;channel 0 for ctrl-o
+	block =15
+levtab:	pcsave
+	block 2
+
+
+;here is the table of commands
+
+comtab:	12,,nxtfil		;get the next file
+	" ",,nxtfil		;SPACE is synonym for LINEFEED
+	"D",,delete		;delete the file
+	"?",,ques		;give the help message
+	"^",,backup		;get the previous file
+	"H"-100,,backup		;BACKSPACE is synonym for ^
+	177,,backup		;RUBOUT is synonym for ^
+	"U",,undele		;undelete the file
+	"T",,type		;type the file
+	"F",,quit		;quit now
+	"P",,exec		;push to an inferior exec
+comlen==.-comtab
+
+
+
+;here is the main program
+
+start:	RESET			;sanitize the world
+	move	p,[iowd pdlen, pdlist] ;set up the subroutine stack
+	call	getfil		;get the file group specification
+	call	init		;print header, init the file stack, set up
+				;interrupts.
+loop:	call	file		;print a file spec
+	call	option		;check for instructions
+	call	(a)		;execute the instruction
+	jrst	loop		;look at next file
+
+
+;here is the help message
+
+ques:	hrroi	a,[asciz/
+
+	   CLEAN is a program for quickly deleting certain files in a
+	directory.  By default CLEAN examines all the files in your
+	connected directory.  You can specify a certain group of files,
+	say Passgo programs, by typing "clean *.pgo" to the EXEC prompt.
+
+	CLEAN commands:
+
+	Ignore the file: <RETURN>, <SPACE>
+	Backup to previous file: ^, <BACKSPACE>, <RUBOUT>
+	Delete the file: D
+	Undelete the file: U
+	Leave CLEAN: F    (going past the last file also causes CLEAN to stop)
+	Type the file: T   (^O will abort the typeout)
+	Push to another EXEC: P
+
+/]
+	psout
+	ret
+
+
+			Subttl	GETFIL
+
+;here to get a file group specification
+;Checks the rescan buffer first, then uses default if necessary
+
+getfil:	movei	a,.rsini	;read from rescan buffer
+	RSCAN
+	 erjmp	defalt		;go get the default file group on a error
+	jumpe   a,defalt	;nothing in rescan buffer, use default
+flush:	PBIN			;get a byte
+	cain	a,12
+	 jrst	defalt		;no file group in buffer, use the default
+	caie	a,40
+	cain	a,11
+	 jrst	getit		;looks like user specified a file group
+	jrst	flush		;keep flushing characters
+
+;here to get a file specification
+
+defalt:	movsi	a,(gj%old!gj%del!gj%ifg) ;short form flags
+	hrri	a,.gjall	;all generations
+	hrroi	b,[asciz/*.*.*/] ;default file spec
+	jrst	get		;skip to the jsys call
+getit:	movei	a,jfnblk	;argument block for long form GTJFN
+	setz	b,
+get:	GTJFN
+	 erjmp	error
+	movem	a,jfn
+	ret
+
+
+;here is the specification block for the GTJFN call
+
+jfnblk:	gj%old!gj%del!gj%ifg!gj%xtn!gj%fns!gj%cfm+.gjall
+	.priou,,.priou
+	block 2
+	-1,,[asciz/*/]
+	-1,,[asciz/*/]
+	block 4
+
+
+
+
+		Subttl	INIT
+
+;here to print the header and set up the file stack
+
+init:	movei	a,.priin
+	RFMOD
+	movem	b,modin		;save original mode word
+	trz	b,tt%eco
+	SFMOD			;set to no echo
+	movei	a,.priou
+	RFMOD
+	movem	b,modout	;save original mode word
+	tlz	b,(tt%len)
+	STPAR			;set terminal length zero
+	call	setint		;set up interrupt stuff.
+	hrroi	a,[byte(7) 15,12,11,11,0]
+	PSOUT
+	movei	a,.priou
+	move	b,jfn
+	move	c,[1b2+1b5+1b8+1b11+1b14+1b35]
+	JFNS			;the file group specification
+	hrroi	a,[asciz/    Type ? for help.
+
+File	       Pages  Writer        Written      Read      Time   Status
+/]
+	PSOUT			;the rest of the header
+	hlrz	a,.jbsa
+	movem	a,freead	;start of free memory 
+	setz	f,		;first index into array
+
+loadx:	move	a,freead	;get free memory
+	movem	a,direct(f)	;store its location in the pointer array
+	add	a,[point 7, 0]	;set up actual pointer
+	hrrz	b,jfn		;file jfn
+	setz	c,		;full file spec
+	JFNS
+	addi	a,2		;make sure that there is at least one null
+	hrrzm	a,freead	;store next free memory location
+	move	a,jfn
+	GNJFN			;get next jfn
+	 erjmp	init2		;failed, must be at end of group
+	addi	f,1		;increment array index
+	jrst	loadx
+
+init2:	movem	f,total		;store total number of files in group
+	setz	f,		;start at beginning of group
+	move	a,freead	;get back free address
+	hrlm	a,.jbsa		;and update it.
+	ret
+
+
+				Subttl	FILE
+
+;here to print out a file specification
+
+file:	movsi	a,(gj%old!gj%sht!gj%del)
+	hrro	b,direct(f)
+	GTJFN			;get a jfn for the file spec
+	 erjmp	error
+	movem	a,jfn
+
+	movei	a,.priou
+	hrrz	b,jfn
+	move	c,[1b8+1b11+1b14+1b35]
+	JFNS			;print out the file spec
+	
+	hrrz	a,jfn
+	hrlzi	b,fdblen
+	movei	c,fdb
+	GTFDB			;get file descriptor block
+
+	movei	a,.priou	;get cursor position
+	RFPOS
+	hrrzs	b		;get just column number
+	subi	b,filfld	;space out to FILFLD'th column
+	jumpge	b,[ hrroi   a,crlf  ;if name too large, do it on next line
+		    PSOUT
+		    movni   b,filfld
+		    jrst    .+1 ]
+	movei	a,40
+	PBOUT
+	aojl	b,.-1
+
+	movei	a,.priou	;write out pages
+	hrrz	b,fdb+.fbbyv
+	move	c,[no%lfl!no%oov+3B17+12]
+	NOUT
+	 erjmp [caie	c,noutx2  ;recover if it's just column overflow
+		 jrst	error
+		hrroi	a,crlf
+		PSOUT
+		movni	b,filfld+3
+		movei	a,40
+		PBOUT
+		aojl	b,$.-1
+		jrst	.+1]
+
+	hrroi	a,[asciz/   /]
+	PSOUT
+
+	hrli	a,.gflwr	;last writer
+	hrr	a,jfn
+	hrroi	b,temp		;dump the name here
+	GFUST
+	hrroi	a,temp
+	PSOUT
+	
+	movei	a,.priou
+	RFPOS			;what column are we at now?
+	hrrzs	b
+	cail	b,namfld
+	 jrst	[ hrroi	 a,crlf
+		  PSOUT
+		  setz	 b,
+		  jrst	 .+1 ]
+	subi	b,namfld
+	movei	a,40
+	PBOUT
+	aojl	b,.-1		;space over to end of name field
+
+write:	movei	a,.priou	;write out last write date
+	move	b,fdb+.fbwrt
+	move	c,[ot%spa+ot%ntm]
+	skipn	b
+	 jrst  [ hrroi  a,[asciz /  never /]
+		 PSOUT
+		 jrst   .+2 ]
+	ODTIM
+
+	hrroi	a,[asciz/   /]
+	PSOUT
+
+	movei	a,.priou	;write out last read date
+	move	b,fdb+.fbref
+	move	c,[ot%spa+ot%ntm]	
+	skipn	b
+	 jrst  [ hrroi a,[asciz /  never           /]
+		 PSOUT
+		 jrst   status ]
+	ODTIM
+
+	hrroi	a,[asciz/  /]
+	PSOUT
+	movei	a,.priou
+	move	b,fdb+.fbref
+	move	c,[ot%nda+ot%12h+ot%nsc]
+	ODTIM			;last read time
+
+status:	move	a,fdb+.fbctl
+	tlne	a,(fb%del)
+	 jrst	del
+	hrroi	a,[asciz /    ?    /]
+	PSOUT
+	ret
+
+del:	hrroi	a,[asciz/   Del   /]
+	PSOUT
+	ret
+
+
+			Subttl	OPTION
+
+;here to check for commands, returns legal address in A, beeps otherwise
+
+option:	PBIN			;get command
+	cain	a,15
+	 jrst	option		;a CR, just ignore
+	cail	a,"a"
+	caile	a,"z"
+	jrst	.+2
+	andi	a,137		;upper case any lower case letters
+	movsi	c,-comlen
+opt:	hlrz	b,comtab(c)
+	camn	a,b
+	 jrst	match		;a legal command
+	aobjn	c,opt
+	movei	a,7
+	PBOUT			;garbage, ring the bell
+	jrst	option
+
+match:	caie	a,"D"
+	cain	a,"U"
+	PBOUT			;echo these commands
+	hrrz	a,comtab(c)	;get the subroutine address in a
+	ret
+
+Subttl TYPE the file
+
+type:	movei	a,.priou
+	move	b,modout	;get orig out word
+	STPAR			;set terminal length what it was.
+	setzm	noint		;let ^O happen.
+	move 	a,jfn
+	movei	b,of%rd		;read access only, don't need to worry about
+				;byte size; will use PMAP.
+	OPENF
+	 erjmp  error
+	hlr	b,.jbsa
+	idivi	b,1000		;make page num 'stead of memory loc.
+	skipe	c		;skip if there was no remainder, cuz then we 
+				;are on a page boundary already, else add one
+				;to our page number so we dont clobber nuthin'
+	 addi	b,1
+	movem 	b,pagenm
+	hrrzs	fdb+.fbbyv	;flush anything but length of file.
+	hrroi	a,[asciz/
+/]
+	PSOUT
+	setzm	filpag
+ty0:	hrrz	a,filpag	;get file page we are mapping in
+	caml	a,fdb+.fbbyv	;fdb+.fbbyv has the length of the file.
+	 jrst	ty1
+	hrl	a,jfn		;jfn in left half
+	hrli	b,.fhslf	;ourselves.
+	hrr	b,pagenm	;and the process page to map to.
+	movsi	c,(pm%rd+pm%pld)
+	PMAP
+	 erjmp  error
+	movei	a,.priou
+	move	b,pagenm	;retrieve the page
+	imuli	b,1000		; and make it a location.
+	hrro	b,b		;make it a pointer
+	movni	c,5000		;number of bytes
+	SOUT
+	 erjmp	error
+	aos	filpag
+	jrst	ty0
+ty1:	setom	noint		;no more interrupts.
+	movei	a,.priou	;now fix up the world after ourselves:
+	move	b,modout
+	tlz	b,(tt%len)
+	STPAR			;set terminal length back to zero
+        seto	a,
+	hrli	b,.fhslf
+	hrr	b,pagenm
+	movsi	c,(pm%rd)
+	PMAP			;unmap the last page
+	 erjmp	error
+	ret
+
+
+			Subttl	SUBROUTINES
+
+;here to go onto the next file
+
+nxtfil:	hrroi	a,crlf
+	PSOUT
+	camn	f,total
+	 jrst	quit		;die if no more files
+	addi	f,1
+	hrrz	a,jfn
+	RLJFN			;release the old jfn
+	 erjmp	error
+	ret
+
+;here to delete or undelete a file
+
+undele:	skipa	c,[0]		;turn off delete bit
+delete:	movsi	c,(fb%del)	;turn on delete bit
+	hrli	a,.fbctl
+	hrr	a,jfn
+	movsi	b,(fb%del)
+	CHFDB
+	call	nxtfil		;advance to next file
+	ret
+
+;here to backup to the last file
+
+backup:	hrroi	a,crlf
+	PSOUT
+	jumpe	f,back		;go ring a bell if can't back up
+	subi	f,1
+	hrrz	a,jfn
+	RLJFN
+	 erjmp	error
+	ret
+
+back:	movei	a,7
+	PBOUT
+	ret
+
+
+	SUBTTL Interrupt Handling
+
+;interrupt handling code stolen from PTYPE.  Here to set up the interrupt
+;stuff, will turn it on/off in TYPE.
+setint:	movei	a,.fhslf	;current process
+	move	b,[levtab,,chntab] ;interrupt tables
+	SIR			;set interrupts
+	EIR			;enable interrupts
+	move	b,[1b0]		;activate channel 0 
+	AIC
+	move	a,[.ticco,,0]	;control-o assigned to channel 0
+	ATI
+	ret
+
+;here is the routine to fake a control-o
+
+shutof:	skipe	noint		;skip if allowing interrupts
+	DEBRK			;just debreak
+	setom	noint		;don't interrupt ourselves
+	movei	a,.priou	;our output file
+	CFOBF			;zap it
+	hrroi	a,[asciz/^O...
+/]
+	PSOUT
+	movei	a,ty1		;debreak to end of type code
+	movem	a,pcsave
+	DEBRK			;return from interrupt
+
+
+			Subttl	EXEC
+
+;here to push to an inferior exec.
+;restore tty type to what he wanted when start exec, restore to 
+;no-echo after POP.
+
+exec:	hrroi a,[asciz/
+
+Use the "POP" command to return to CLEAN from the lower fork EXEC.
+/]
+	PSOUT
+
+	movei	a,.priin	;first fix up tty mode.
+	move	b,modin
+	SFMOD			;resume echoing
+	movei	a,.priou
+	move	b,modout
+	STPAR			;resume original tty page length
+
+	movsi	a,(gj%old!gj%sht) ;get lower fork exec
+	hrroi	b,[asciz/PS:<SYSTEM>EXEC.EXE/]
+	GTJFN
+	 erjmp	error
+	movem	a,execj
+
+	movsi	a,(cr%cap)	;create fork with same caps
+	CFORK
+	 erjmp	error	
+	movem	a,execf
+	FFORK
+
+	hrlzs	a
+	hrr	a,execj		;get jfn
+	GET
+					
+	move	a,execf		;start fork
+	setz	b,
+	SFRKV
+	RFORK
+
+	WFORK			;wait for fork to finish
+	KFORK			;kill fork, release jfns
+
+	movei	a,.priin	;now fix tty mode.
+	RFMOD
+	trz	b,tt%eco
+	SFMOD			;set to no echo
+	movei	a,.priou
+;	RFMOD
+;	tlz	b,(tt%len)
+;	STPAR			;set terminal no page
+
+	ret
+
+
+
+
+;here to handle a fatal JSYS error
+
+error:	hrroi	a,[asciz/JSYS error - /]
+	ESOUT
+	movei	a,.priou
+	hrloi	b,.fhslf
+	setz	c,
+	ERSTR
+	 jfcl
+	 jfcl
+	RESET			;release jfns, reset some tty parameters
+	jrst	stop
+
+
+;here to quit gracefully, resetting the tty parameters
+
+quit:	movei	a,.priin
+	move	b,modin
+	SFMOD			;resume echoing
+	movei	a,.priou
+	move	b,modout
+	STPAR			;resume original tty page length
+stop:	HALTF
+	jrst	stop		;no good to restart
+
+
+	end	start
+

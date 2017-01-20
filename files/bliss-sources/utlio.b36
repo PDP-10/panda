@@ -1,0 +1,1121 @@
+%TITLE 'U T L I O -- RMSUTL bucket I/O'
+!<BLF/REQUIRE 'RMSBLF.REQ'>
+MODULE utlio (					! Module to do Bucket I/O
+		IDENT = '2.0'
+		) =
+BEGIN
+!
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1980, 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+!
+
+!++
+! FACILITY:	RMSUTL
+!
+! ABSTRACT:
+!
+!	THIS MODULE DOES ALL THE BKT I/O FOR RMSUTL.
+!	IT ALSO DOES INTRA-BKT PROCESSING UPON ID'S & ENTRY NUMBERS.
+!	THE BK$ ROUTINES INSURE THE TOP-LEVEL CODE DOESNT KNOW ABOUT BD'S.
+!	ALL THAT IS REQUIRED IS CALLING BK$PUT DURING C.CLOSE.
+!	OF COURSE, YOU MAY CALL BK$PUT IF YOU WANT TO WRITE A BKT.
+!
+! AUTHOR:	A. UDDIN		CREATION DATE: 08-14-80
+!
+! MODIFIED BY:
+!
+!	Ron Lusk, 3-Feb-84 : VERSION 2.0
+! 423	-   Fix up for version 2: reformat, cleanup.
+! 430	-   Change BK$PROL to get the prologue properly.
+! 455	-   Make CURRBD a GLOBAL so that US.IDX (in UTLUSE)
+!	    can get to it for a bucket check.
+!
+! COMMON RETURNS:
+!
+!	-1 IF OPERATION ABORTED (MSG ALWAYS OUTPUT)
+!	0 IF OPERATION FAILED (EG. ENTRY # TO BK$ENT TOO LARGE)
+!	ON SUCCESS, BKT NUMBER OR BKT ADDRESS USUALLY
+! TABLE OF CONTENTS:
+!
+
+%IF 0
+%THEN
+
+FORWARD ROUTINE
+    bk$adb,
+    bk$data,
+    bk$down,
+    bk$ent,
+    bk$get,
+    bk$id,
+    bk$idb,
+    bk$next,
+    bk$put : NOVALUE,
+    bk$prol,
+    bk$root,
+    bk$up,
+    bk$dent,
+    bd$get,
+    bd$put : NOVALUE;
+
+%FI
+
+!
+! REQUIRE FILES:
+!
+
+REQUIRE 'sys:rmslus';
+
+LIBRARY 'rmslib';
+
+LIBRARY 'utlext';
+
+!
+! MODULE-LEVEL DATA
+!
+
+GLOBAL 						! So UTLUSE can get it	!A455
+    currbd : BLOCK [bdsize];			! Master bucket desc'r	!M455
+
+OWN
+    arglst : BLOCK [5],
+    p_in_file,					! Number of page in file for
+    						!   BD$GET consistency check
+    rddesc : BLOCK [rdsize],			! Record descriptor
+    						!   for $UTLINT calls
+    tempbd : BLOCK [bdsize];			! Use this bucket descriptor
+
+						!   if we don't want to
+						!   clobber CURRBD
+!
+! MACROS:
+!
+!	None.
+!
+! EQUATED SYMBOLS:
+!
+
+LITERAL
+    rfmfix = fb$fix,				!SO SIZEOF--- RMS MACROS WORK
+    sidhsz = sidrhdrsize,			!JUST FOR CONVEN
+    one = 1;
+
+GLOBAL LITERAL
+    bbm_err = 0,
+    bbm_info = 1,
+    bbm_none = 2;
+
+%SBTTL 'BK$ADB - Get area descriptor'
+
+GLOBAL ROUTINE bk$adb (area_no) = 		! Get area descriptor
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine returns address of the area descriptor corresponding
+!	to the given area number.
+! FORMAL PARAMETERS:
+!
+!	The area number
+!
+! IMPLICIT INPUTS:
+!
+!	<list of inputs from global or own storage>
+!
+! IMPLICIT OUTPUTS:
+!
+!	None
+! RETURNS:
+!
+!	Addr. of ADB
+! SIDE EFFECTS:
+!
+!	The Prolog page will be read in.
+!--
+
+    BEGIN
+
+    LOCAL
+	prolog : REF BLOCK;
+
+    prolog = bk$prol ();			! Get pointer to prologue
+
+    IF .prolog LEQ 0 THEN RETURN -1;		! Transit return failure
+
+    IF .area_no GEQ .prolog [fptareas] THEN RETURN 0;	! Area # out of range
+
+    prolog = .prolog + fptsize + 1;		! Pointer to first ADB
+    prolog = .prolog + (.area_no*areadescsize);	! Calc addr of desired ADB
+    RETURN .prolog;
+    END;					! End of routine BK$ADB
+
+%SBTTL 'BK$CHK - check bucket validity'
+
+GLOBAL ROUTINE bk$chk (bkt_no) =
+! BK$CHK - CHK VALIDITY OF BKT BUT DO NOT OVWRITE CURR BKT
+! ARGUMENTS:
+!	BKT_NO = P# OF BKT TO CHK
+! RETURNS:
+!	-1 IF UNEXP ERR OR BKT CLOBBED
+!	1 IF P# OF BKT OK
+    BEGIN
+    clear (tempbd, bdsize);			!INSURE CLEAN SLATE
+
+    IF bd$get (.bkt_no, 1, 0, tempbd, bbm_err) GEQ 0
+    THEN
+	BEGIN					!SUCCESS
+	bd$put (tempbd, 0);
+	RETURN 1;				!TELL USER AFTER CLEANING UP
+	END
+    ELSE
+	RETURN -1;				!FAILURE
+
+    END;
+
+%SBTTL 'BK$DATA - Get leftmost data bucket'
+
+GLOBAL ROUTINE bk$data (bktno) = 		! Get the leftmost data bkt.
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine returns the bucket address and the bucket
+!	number of the 'leftmost' data bucket under the current
+!	bucket.
+! FORMAL PARAMETERS:
+!
+!	BKTNO		PAGE OF BKT TO BEGIN SCAN AT
+! RETURNS:
+!
+!	BUCKET # FND
+    BEGIN
+
+    LOCAL
+	p_in_bkt,
+	nextbd : BLOCK [bdsize],
+	bktptr : REF BLOCK;
+
+    p_in_bkt = .kdb [kdbibkz];			! Bucket size of index
+    						! page for current KRF
+
+    !+
+    !    Get the bucket. There shouldn't be any errors. If there
+    !    are,  they should be reported back as system errors.
+    !-
+
+    IF bd$get (.bktno, .p_in_bkt, 0, currbd, bbm_err) LEQ 0 THEN RETURN -1;
+
+    bktptr = .currbd [bkdbktadr];		! GET ADR OF BKT IN CORE
+
+    IF .bktptr [bhbtype] NEQ btypeindex
+    THEN
+	BEGIN
+	txtout (utldbc);			!DATA BKT ALREADY CURRENT
+	RETURN .bktno;				!JUST SHIP BACK ORIG VALUE
+	END;
+
+    !+
+    !    We now go down the tree till we locate
+    !    the Data bucket.
+    !-
+
+    DO
+	BEGIN
+	rddesc [rdrecptr] = .bktptr + bhhdrsize;	!ADDR OF FIRST REC.
+	bld_arg_lst (arglst, u$gtbktptr, rddesc, currbd, nextbd);
+	$utlint (arglst, bugerr);
+
+	IF .arglst [0, wrd] EQL false
+	THEN
+	    BEGIN				!TROUBLE GOING DOWN A LEVEL
+	    m$erms (arglst, UPLIT (%ASCIZ'?UTLUIO unable to do I/O'));
+	    RETURN -1;
+	    END;
+
+	bktptr = .nextbd [bkdbktadr];		! GET ADR OF BKT
+	bd$put (currbd, false);			! RELEASE BKT WE ARE DONE WITH
+	movebktdesc (nextbd, currbd);		! MAKE THE NEW BKD CURRENT
+	END
+    UNTIL .bktptr [bhlevel] EQL datalevel;
+
+    RETURN .currbd [bkdbktno];			! RETURN BKT NO. VIA REF. ARG
+    END;					! end of routine BK$DATA
+
+%SBTTL 'BK$DENT - expunge entry from bucket'
+
+GLOBAL ROUTINE bk$dent (bkpage, bktadr, recptr) =
+! BK$DENT - EXPUNGES ANY TYPE OF ENTRY FROM A BKT
+! ARGUMENTS:
+!	BKPAGE = FILE PAGE OF ENTRY'S BKT
+!	BKTADR = ADDR OF BUFFER THAT CONTAINS THE BKT
+!	RECPTR = ADDR IN BUFFER OF THE ENTRY TO BE EXPUNGED
+! NOTES:
+!	IF ENTRY IS UDR, THEN ITS RRV (IF ONE) IS EXPUNGED, & WRITTEN TOO
+!	HOWEVER IT IS CALLER'S RESPONS TO WRITE OUT PAGE OF DEL ENT
+! CONSIS CHKS MADE:
+!	EXPUNGE PRIM DATA ENTRY ONLY IF DEL OR RRV BIT ON
+!	EXP INDEX ENTRY ONLY IF IT DOESNT PT AT VALID BKT
+!	EXP SIDR ONLY IF RFA ARRAY EMPTY
+! IMPLICIT INPUTS:
+!	FAB
+!	CURRENT KDB
+    BEGIN
+
+    LABEL
+	idxlen;
+
+    LOCAL
+	i,
+	inuse,
+	ptr : REF BLOCK,
+	temp,
+	rsizw;
+
+    MAP
+	recptr : REF BLOCK,
+	bktadr : REF BLOCK;
+
+    IF .bktadr [bhbtype] EQL btypeindex		!IS IT INDEX ENTRY?
+    THEN
+	BEGIN					!YES, SET SIZ & CHK IF OK TO DEL
+idxlen :
+	BEGIN
+	rsizw = .kdb [kdbkszw] + 1;		!SIZE OF INDEX ENTRY
+
+	IF .recptr [irbucket] GTR .p_in_file THEN LEAVE idxlen;	!OK TO DEL
+
+	clear (tempbd, bdsize);			!START WITH NULL BKT DESC
+	temp = bd$get (.recptr [irbucket], 1, 0, tempbd, bbm_none);	! GET THIS BKT
+
+	IF .temp LSS 0				!DID CALL AT LEAST SUCC?
+	THEN
+	    RETURN -1;				!NO, DONT PLAY WITH FIRE
+
+	ptr = .tempbd [bkdbktadr];		!GET PTR TO IT
+	inuse = .ptr [bhnextbyte];		!GET WDS IN USE
+	bd$put (tempbd, 0);			!FREE IT
+
+	IF .temp EQL 1 AND .inuse NEQ bhhdrsize
+	THEN
+	    BEGIN				!OOPS, VALID NON-EMPTY PAGE
+	    txtout (utlvex);			!VALID ENTRY MAY NOT BE EXPUNGED
+	    RETURN -1;
+	    END;
+
+	END;					!END IDXLEN BLOCK
+	END
+    ELSE
+	BEGIN					!DATA ENTRY
+	rsizw = sizeofanyrecord (recptr);	!SIZE OF ARB DATA ENTRY
+
+	IF .kdb [kdbref] EQL 0			!IS IT PRIM-DATA BKT?
+	THEN
+	    BEGIN				!YES
+
+	    IF rrvflag (recptr) EQL 0 AND deleteflag (recptr) EQL 0
+	    THEN
+		BEGIN				!UNDELETED REC ENTRY
+		txtout (utlvex);		!VALID ENTRY MAY NOT BE EXPUNGED
+		RETURN -1;
+		END;
+
+	    IF rrvflag (recptr) EQL 0		!IS IT REC ENTRY?
+	    THEN
+
+		IF makerfa (.bkpage, .recptr [drrecordid]) NEQ .recptr [drrrvaddress]
+		THEN
+		    BEGIN			!YES, & THERE IS AN RRV FOR IT
+		    rddesc [rdrecptr] = 0;	!START AT TOP OF PAGE
+		    rddesc [rdrfa] = .recptr [drrrvaddress];	! AND FIND THIS REC
+		    bld_arg_lst (arglst, u$fbyrfa, rddesc, tempbd);
+		    $utlint (arglst, bugerr);	!FIND RRV
+
+		    IF .arglst NEQ 0		!DID IT SUCCEED?
+		    THEN
+			BEGIN			!YES
+			bk$dent (.tempbd [bkdbktno], .tempbd [bkdbktadr], .rddesc [rdrecptr]);
+						!DELETE THE RRV
+			setupd (tempbd);	!INDIC RRV PAGE MODIF
+			bd$put (tempbd, 0);	!RELEASE RRV'S BKT
+			END;			!END, DEL RRV
+
+		    END;			!END, REC ENTRY WITH RRV
+
+	    END					!END, PRIM-DATA PAGE
+	ELSE
+
+	    INCR i				!
+		FROM sidhsz + .kdb [kdbkszw]	!
+		TO .recptr [sidrrecsize] + sidhsz - 1 DO
+		BEGIN				!SIDR PAGE
+
+		IF .recptr [.i, wrd] NEQ 0	!NON-NULL SIDR
+		THEN
+		    BEGIN			!YES, CANT DEL IT
+		    txtout (utlvex);		!VALID ENTRY MAY NOT BE EXPUNGED
+		    RETURN -1;
+		    END;
+
+		END;				!IF EXIT LOOP, RFA ARRAY EMPTY
+
+	END;					!END, IS DATA PAGE
+
+    temp = (.bktadr + .bktadr [bhnextbyte]) - (.recptr + .rsizw);	!# OF WRDS TO MOVE
+    movewords (.recptr + .rsizw, .recptr, .temp);	!MOVE REST OF BKT UP
+    bktadr [bhnextbyte] = .bktadr [bhnextbyte] - .rsizw;	! Fix header
+    RETURN 1;
+    END;					! End BK$DENT
+
+%SBTTL 'BK$DOWN - Get specified bucket'
+
+GLOBAL ROUTINE bk$down (bktno, entry_no) = 	!Get the bkt pointed to by ENTRY_NO
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine returns the address and entry number of the bucket down
+!	the tree which is pointed to by ENTRY_NO in the current bkt.
+! FORMAL PARAMETERS:
+!
+!	ENTRY_NO	Entry no in current bkt which points to the
+!			required bkt.
+! RETURNS:
+!
+!	BKT # LOCATED
+    BEGIN
+
+    LOCAL
+	p_in_bkt,
+	movingptr : REF BLOCK,
+	bktptr : REF BLOCK;
+
+    p_in_bkt = .kdb [kdbibkz];			!GET INDEX BKT SIZE FOR CURR KRF
+    ! BRING STARTING BKT IN
+
+    IF bd$get (.bktno, .p_in_bkt, 0, currbd, bbm_err) LEQ 0	!
+    THEN
+	RETURN -1;				! INDICATE OPR ABORTED
+
+    bktptr = .currbd [bkdbktadr];		! ADDR IN CORE OF CURR BKT
+
+    IF .bktptr [bhbtype] NEQ btypeindex		! START BKT INDEX BKT?
+    THEN
+	BEGIN
+	txtout (utldbc);
+	RETURN .bktno;				!JUST SHIP ORIG VAL BACK
+	END;
+
+    movingptr = .bktptr + bhhdrsize;		! ADDR OF FIRST RECORD
+
+    !+
+    !    POSITION TO ENTRY_NO IN BUCKET
+    !    CHECK IF IT IS INSIDE THE BKT.
+    !-
+
+    movingptr = .movingptr + (.entry_no - 1)*(.kdb [kdbkszw] + 1);
+
+    IF .movingptr GEQ .bktptr [bhnextbyte] + .bktptr
+    THEN
+	BEGIN
+	txtout (utlsen);			!ENT FOR DOWN NON-EX
+	RETURN -1;				! CURRENT BKT NOT INDEX
+	END;
+
+    RETURN .movingptr [irbucket];		!PICK UP BKT NO FROM ENTRY
+    END;					! end of routine BK$DOWN
+
+%SBTTL 'BK$ENT - fetch entry address'
+
+GLOBAL ROUTINE bk$ent (entry_no) = 		! Return addr of ENTRY_NO in current bkt
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine returns the addr of ENTRY_NO in the
+!	current bkt. The current bkt can be either an index
+!	bucket or a data bkt.
+! FORMAL PARAMETERS:
+!
+!	ENTRY_NO
+! IMPLICIT INPUTS:
+!
+!	CURRBD, KDB
+! RETURNS:
+!
+!	False IF BAD ENTRY NUMBER
+!	Addr. of Entry in Bucket.
+    BEGIN
+
+    LOCAL
+	bkttype,
+	movingptr : REF BLOCK,
+	bktptr : REF BLOCK;
+
+    IF .currbd [bkdbktsize] EQL 0
+    THEN
+	BEGIN
+	txtout (utliue);			!NO CURR BKT
+	RETURN -1;
+	END;
+
+    bktptr = .currbd [bkdbktadr];		! ADDR OF BKT IN CORE
+    bkttype = .bktptr [bhbtype];		! GET BKT TYPE
+    movingptr = .bktptr + bhhdrsize;		! POS TO 1ST ENTRY
+
+    !+
+    !    Scan the bucket until the requested entry is reached.
+    !-
+
+    INCR j FROM 1 TO .entry_no - 1 DO
+	BEGIN
+
+	IF .movingptr GEQ .bktptr [bhnextbyte] + .bktptr	!
+	THEN
+	    RETURN false;			! FAIL IF END OF DATA
+
+	movingptr = .movingptr + 		!
+	(IF .bkttype EQL btypeindex		!
+	THEN .kdb [kdbkszw] + 1			!
+	ELSE sizeofanyrecord (movingptr));	!
+	END;
+
+    cu$ent = .entry_no;				!RET ENTRY # FOUND
+
+    IF .movingptr GEQ .bktptr [bhnextbyte] + .bktptr
+    THEN
+	RETURN false				!FAIL IF END OF DATA
+    ELSE
+	RETURN .movingptr;			! RETURN ENTRY ADDR.
+
+    END;					! end of routine BK$ENT
+
+%SBTTL 'BK$GET'
+
+GLOBAL ROUTINE bk$get (bkt_no) =
+    RETURN bk$gc (.bkt_no, bbm_info);
+
+%SBTTL 'BK$GOK'
+
+GLOBAL ROUTINE bk$gok (bkt_no) =
+    RETURN bk$gc (.bkt_no, bbm_err);
+
+%SBTTL 'BK$GQI'
+
+GLOBAL ROUTINE bk$gqi (bkt_no) =
+    RETURN bk$gc (.bkt_no, bbm_none);
+
+%SBTTL 'BK$GC - map bucket and return address'
+
+GLOBAL ROUTINE bk$gc (bkt_no, retopt) =
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine maps in the requested bkt and returns
+!	its address.
+! FORMAL PARAMETERS:
+!
+!	BKT_NO		BUCKET NUMBER TO MAP
+!	RETOPT		IF BBM_INFO, THEN RETS SUCC FOR CLOB BKT
+!			IF BBM_ERR, THEN RETS FAILURE FOR CLOB BKT
+! IMPLICIT OUTPUTS:
+!
+!	CU$TYPE IS SET
+! RETURNS:
+!
+!	ADDRESS OF BKT LOCATED
+    BEGIN
+
+    LOCAL
+	getcase,
+	bktptr : REF BLOCK;
+
+    IF chkflag (utlflg, ut_dbad) NEQ 0
+    THEN
+	BEGIN
+	txtout (utlepc);			!DATA ENVIR NOT ESTAB
+	RETURN -1;
+	END;
+
+!+
+!    GET REQUESTED BUCKET. ASSUME ITS SIZE TO BE 1.
+!    IF BKT SIZE GTR 1, BD$GET REREADS CORRECT SIZE AUTOMAT
+!-
+    getcase = bd$get (.bkt_no, 1, 0, currbd, .retopt);
+
+    IF .getcase LSS 0 THEN RETURN -1;		!COULDNT GET IT, MSG ALR OUTPUT
+
+    bktptr = .currbd [bkdbktadr];		!MAKE BKT ACCESSIBLE
+    cu$type = bk$type (.bktptr, .getcase);	!DET TYPE OF BKT
+    RETURN .bktptr;				!RET BKT'S ADDR
+    END;					! end of routine BK$GET
+
+%SBTTL 'BK$ID - return entry given ID'
+
+GLOBAL ROUTINE bk$id (id) =
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine returns the addr. of bucket entry whose ID
+!	matches the given ID.
+! FORMAL PARAMETERS:
+!	ID	Record ID
+! IMPLICIT INPUTS:
+!	CURRENT BKT DESC
+!
+! IMPLICIT OUTPUTS:
+!	CU$ENT SET TO ENTRY # OF FND ID
+!
+! RETURNS:
+!	0 IF LOOP TERMINATED WITHOUT SUCCESS
+!	Address of FOUND Entry
+    BEGIN
+
+    LOCAL
+	bkttype,
+	movingptr : REF BLOCK,
+	bktptr : REF BLOCK;
+
+    IF .currbd [bkdbktsize] EQL 0
+    THEN
+	BEGIN
+	txtout (utliue);			!NO CURR BKT
+	RETURN -1;
+	END;
+
+    bktptr = .currbd [bkdbktadr];		! ADDR OF BKT IN CORE
+
+    IF .bktptr [bhlevel] GTR datalevel
+    THEN 					! BKT IS NOT DATA BKT
+	BEGIN
+	txtout (utlbnd);
+	RETURN -1;
+	END;
+
+    movingptr = .bktptr + bhhdrsize;		! POSN PAST HEADER
+    cu$ent = 1;					!START WITH 1ST ENTRY
+
+    !+
+    !    SCAN THE BKT. TIL THE ENTRY WITH REQUESTED ID IS REACHED.
+    !-
+
+    WHILE .movingptr LSS .bktptr [bhnextbyte] + .bktptr DO
+	BEGIN
+
+	IF .movingptr [drrecordid] EQL .id THEN RETURN .movingptr;	!SUCCESS
+
+	movingptr = .movingptr + sizeofanyrecord (movingptr);
+	cu$ent = .cu$ent + 1;			!SET CTR TO NEXT 1
+	END;
+
+    RETURN false;
+    END;					! end of routine BK$ID
+
+%SBTTL 'BK$IDB - return IDB address'
+
+GLOBAL ROUTINE bk$idb (krf) =
+! FUNCTIONAL DESCRIPTION:
+!
+!	Returns ADDR OF Index Descriptor block for SPECIFIED KRF
+! FORMAL PARAMETERS:
+!
+!	KRF	Target index no. (key of ref.)
+! IMPLICIT OUTPUTS:
+!
+!	CURRBD SETUP
+! RETURNS:
+!
+!	0 (BAD KRF)
+!	Addr. of DESIRED IDB
+    BEGIN
+
+    LOCAL
+	idbadr;
+
+    LOCAL
+	t1;					!SAVE CURR KREF
+
+    t1 = .kdb [kdbref];				!RESET AT END OF CALL
+
+    IF NOT m$kdb (.krf)				!SET ENVIR
+    THEN
+	RETURN false;				!UNLESS BAD KRF
+
+    bd$put (currbd, 0);				!CLEAR OLD STUFF
+    bld_arg_lst (arglst, u$getidb, currbd);
+    $utlint (arglst, bugerr);
+
+    IF .arglst [0, wrd] EQL false
+    THEN
+	BEGIN
+	m$erms (arglst, UPLIT (%ASCIZ'?UTLUIO unable to do I/O'));
+	RETURN -1;
+	END;
+
+    idbadr = .arglst [0, wrd];			! RETURN IDB ADDR.
+    m$kdb (.t1);				!RESTORE ORIG KDB INFO
+    RETURN .idbadr;				!DONE
+    END;					! end of routine BK$IDB
+
+%SBTTL 'BK$NEXT - get next bucket'
+
+GLOBAL ROUTINE bk$next (bktno) = 		!Get the Next bkt at the same lvl.
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine traverses the index structure in the horizontal
+!	direction. It gets the bkt at the same level of the tree with
+!	the next higher group of keys.
+! FORMAL PARAMETERS:
+!
+!	BKTNO		bucket no. whose NEXT bkt is desired
+! RETURNS:
+!
+!	BKT # FND
+! SIDE EFFECTS:
+!
+!	DISPLAYS INFO MSG IF STARTING BKT IS RIGHTMOST
+    BEGIN
+
+    LOCAL
+	bktptr : REF BLOCK;
+
+    ! ONLY NEED BKT HDR, SO CAN READ 1 PAGE REGARDLESS OF BKT SIZE
+
+    IF bd$get (.bktno, 1, 0, currbd, bbm_info) LSS 0 THEN RETURN -1;
+
+    bktptr = .currbd [bkdbktadr];		!GET PTR TO IT
+
+    IF chkflag (bktptr [bhflags], bhflgend) NEQ 0	!
+    THEN
+	txtout (utlnbl);			! THERE IS NO NEXT BKT
+
+    bktptr = .currbd [bkdbktadr];		! GET PTR TO IT (rpt cause bliss bug)
+    RETURN .bktptr [bhnextbkt];			!RET NEXT PTR
+    END;					! end of routine BK$NEXT
+
+%SBTTL 'BK$PUT - release a bucket'
+
+GLOBAL ROUTINE bk$put (flag) : NOVALUE = 	!Routine to release a bkt.
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine always releases the bucket that is
+!	described by CURRBD. MAY BE CALLED WHEN NO BKT CURRENT.
+! FORMAL PARAMETERS:
+!
+!	FLAG	Update flag
+! IMPLICIT INPUTS:
+!
+!	CURRBD
+!
+    BEGIN
+    bd$put (currbd, .flag);
+    RETURN;
+    END;					! end of routine bk$put
+
+%SBTTL 'BK$PROL - return prologue bucket'
+
+GLOBAL ROUTINE bk$prol = 			!Returns the address of Prolog bucket
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine returns the address of the bucket contaning
+!	the file prolog. It does it in an inelegant manner:
+!	It calls on RMS to read the IDB for the key of ref. in
+!	the current KDB. The bucket descriptor that is returned
+!	is the bkt desc of the prolog page.
+! IMPLICIT INPUTS:
+!
+!	KDB
+! IMPLICIT OUTPUTS:
+!
+!	CURRBD is set up.
+! RETURNS:
+!
+!	ADDR OF PROLOG IF IT COULD BE OBTAINED
+!
+    BEGIN
+
+    LOCAL
+	prologue_table : REF BLOCK;
+
+%IF 0
+%THEN
+
+    LOCAL
+	t1;
+
+    !+
+    !    Read the IDB.
+    !-
+
+    t1 = bk$idb (0);				! Take advantage of fact that
+    						!   1st IDB is on 1st file page
+
+    IF .t1 LEQ 0 THEN RETURN .t1;		! Transmit return failure
+
+%FI
+
+    bd$put (currbd, 0);				! Clear old stuff	!A430
+    bld_arg_lst (arglst, 			! Argument list		!A430
+	u$getbkt, 				! GETBKT call		!A430
+	0, 					! Page 0		!A430
+	1, 					! Only 1 page needed	!A430
+	0, 					! No locking		!A430
+	currbd);				! Return bucket desc.	!A430
+    $utlint (arglst, bugerr);			! Make the call		!A430
+    prologue_table = .currbd [bkdbktadr];	! Address of prologue
+    p_in_file = .prologue_table [fptnxtbkt];	! Set to current value,
+    						!   keep it up to date
+    RETURN .prologue_table;			! Return address of prologue
+    END;					! End of routine BK$PROL
+
+%SBTTL 'BK$ROOT - map root bucket'
+
+GLOBAL ROUTINE bk$root (krf) = 			!Maps the Root bkt and returns its no.
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine maps the root bkt for the given key-of-ref.
+! FORMAL PARAMETERS:
+!
+!	KRF	Key of reference
+! RETURNS:
+!
+!	0, IMPLYING EMPTY INDEX
+!	Bucket number OF DESIRED ROOT BKT
+    BEGIN
+
+    LOCAL
+	t1;
+
+    IF NOT m$kdb (.krf)				!SET ENVIR FOR SPEC KEY
+    THEN
+	BEGIN
+	txtout (utlfni);			!BAD KRF
+	RETURN -1;
+	END;
+
+    bd$put (currbd, 0);				!CLEAR OLD STUFF
+    bld_arg_lst (arglst, u$getroot, rddesc, currbd);
+    $utlint (arglst, bugerr);			!HAVE RMS MAP ROOT
+
+    IF .arglst [0, wrd] EQL false
+    THEN
+	BEGIN
+	t1 = .$field (sts, arglst);		!GET STATUS RET BY GETROOT
+
+	IF .t1 EQL er$rnf OR .t1 EQL er$eof THEN RETURN false;	! INDEX EMPTY
+
+	m$erms (arglst, UPLIT (%ASCIZ'?UTLUIO unable to do I/O'));
+	RETURN -1;
+	END;
+
+    RETURN .currbd [bkdbktno];
+    END;					! end of routine BK$ROOT
+
+%SBTTL 'BK$TYPE - return bucket type'
+
+GLOBAL ROUTINE bk$type (bktptr, getcase) =
+! FUNCTIONAL DESCRIPTION:
+!	CALCULATES BKT TYPE OF GIVEN BKT
+! ARGUMENTS:
+!	BKTPTR = PTR TO BKT TO BE TYPED
+!	GETCASE = 1 UNLESS BKT CLOBBED
+! RETURNS:
+!	BKT TYPE
+    BEGIN
+
+    MAP
+	bktptr : REF BLOCK;
+
+    IF .getcase NEQ 1				!CLOBBERED BKT?
+    THEN
+	RETURN bty_clob;			!YES, CALL WAS _NONE OR _INFO
+
+    IF .bktptr [bhlevel] NEQ 0			!INDEX BKT?
+    THEN
+	RETURN bty_idx;				!YES
+
+    IF .kdb [kdbref] EQL 0			!NO, IS IT UDR?
+    THEN
+	RETURN bty_prim				!YES
+    ELSE
+	RETURN bty_sec;				!NO, 2NDARY DATA BKT
+
+    END;					! OF BK$TYPE
+
+%SBTTL 'BK$UP - return previous bucket number'
+
+GLOBAL ROUTINE bk$up (bktno) =
+! FUNCTIONAL DESCRIPTION:
+!	THIS ROUTINE RETURNS THE BUCKET NUMBER OF THE PREVIOUS BUCKET,
+!	I.E., THE BUCKET WHICH POINTS TO THE CURRENT BUCKET.
+! FORMAL PARAMETERS:
+!	BKTNO.	BUCKET NO. WHOSE PREVIOUS BKT IS DESIRED
+! RETURNS:
+!	FND BKT #
+!	0 IF ALREADY AT ROOT
+    BEGIN
+
+    LOCAL
+	level,
+	bktptr : REF BLOCK;
+
+    ! GET BKT, ABORT IF ERRS OR IF CLOB
+
+    IF bd$get (.bktno, 1, 0, tempbd, bbm_err) LEQ 0 THEN RETURN -1;	! COULDNT GET BKT
+
+    bktptr = .tempbd [bkdbktadr];		! ADDR OF BKT
+    level = .bktptr [bhlevel];			! SAVE CURRENT LEVEL
+
+    IF chkflag (bktptr [bhflags], bhflgroot) NEQ 0 THEN RETURN 0;	!ALREADY AT ROOT
+
+    rddesc [rduserptr] = 			!
+    m$kloc (buf$k1, .bktptr + bhhdrsize, bk$type (.bktptr, 1));	!GET (COMBINING IF NECES) 1ST KEY IN BKT
+
+    !+
+    !    Set up to actually call the FOLLOWPATH fucntion in RMS
+    !-
+
+    rddesc [rdusersize] = .kdb [kdbksz];	!LEN OF KEY TO FIND
+    bd$put (tempbd, 0);				!CLEAR OLD STUFF
+    bld_arg_lst (arglst, u$folopath, rddesc, tempbd);
+    $utlint (arglst, bugerr);
+
+    IF .arglst [0, wrd] EQL false
+    THEN
+	BEGIN					!KEY FROM FILE, SO MUST FIND IT
+	txtout (utlaff);			!COULDNT FIND 1ST KEY ON PAGE
+	RETURN -1;
+	END;
+
+    bd$put (tempbd, 0);				!CLEAR THIS TOO
+
+    !+
+    !    MAKE SURE MASTER BKT NO. AND THE ONE IN THE PATH ARRAY,
+    !    CORRESPONDING TO THE CURRENT LEVEL,  MATCH
+    !-
+
+    IF .path [.level, pathbkt] EQL .bktno
+    THEN
+	RETURN .path [.level + 1, pathbkt]	! GET PREV BKT NUMBER
+    ELSE
+	BEGIN
+	txtout (utlaff);			!KEY NOT FND
+	RETURN -1;
+	END;
+
+    END;					! end of routine BK$UP
+
+%SBTTL 'BD$GET - call RMS GETBKT'
+
+GLOBAL ROUTINE bd$get (bktno, pagcnt, lockflg, bd, retopt) = 	!CALL ON THE RMS 'GETBKT' FUNC
+! FUNCTIONAL DESCRIPTION:
+!	SETS UP BKT DESC TO DESIRED BKT, READING IT IN IF NECESSARY
+!
+! FORMAL PARAMETERS:
+!	BKTNO = 1ST PAGE IN FILE OF DESIRED BKT
+!	PAGCNT = # OF P TO READ
+!	LOCKFLG (ALWAYS 0)
+!	BD = PTR TO BKT DESC THAT RMS FILLS IN
+!	RETOPT = VALUE TO CTL BAD BKT HDR RETURN ACTION
+!
+! RETURNS NORMALLY:
+!	1 WITH BD SETUP & BKT READ IN
+!	-1 IF ANY ERROR MSG OUTPUT
+! RETURNS FOR CLOBBERED BKT:
+!	-1 & MSG FOR BBM_ERR
+!	0 FOR BBM_INFO
+!	MSG-PTR FOR BBM_NONE
+!
+! NOTES:
+!	BD$GET HAS A PROBLEM IN THAT RMS BUCKETS CAN BE DIFFERENT SIZE
+!	FOR DIFFERENT AREAS. TO LOCALIZE THE IMPACT OF THIS, IT PUTS
+!	AND REGETS THE BKT IF THE BKT SIZE PASSED BY CALLER IS WRONG.
+!	IT USES THE CURR KDB PLUS BKT TYPE TO DETERMINE ACTU BKT SIZE.
+!	IF THE PARTIAL-GET IS THE ONLY CURRENT ACCESSOR OF THE BKT,
+!	TWIDDLE RMS'S BUFFER DESC FOR THE BKT TO INSURE IT MAPS WHOLE BKT.
+    BEGIN
+
+    LOCAL
+	bktsiz;					!ACTU # OF P IN BKT
+
+    LOCAL
+	bktptr : REF BLOCK;
+
+    LOCAL
+	bbm;
+
+    MAP
+	bd : REF BLOCK;
+
+    bd$put (.bd, 0);				!CLEAR OLD STUFF
+
+    IF .p_in_file LEQ .bktno			!REF PAST EOF?
+    THEN
+	BEGIN					!MAYBE, CHK IF FILE EXTENDED
+
+	IF bk$prol () EQL -1			!GET PROLOG TO RESET P_IN_FILE
+	THEN
+	    RETURN -1;				!OOPS (MSG ALR OUTPUT)
+
+	IF .p_in_file LEQ .bktno
+	THEN
+	    BEGIN				!"STILL" PAST EOF, GIVE ERROR
+	    txtout (utlppe, .bktno);		!PAGE PAST EOF
+	    RETURN -1;
+	    END;
+
+	END;
+
+    bld_arg_lst (arglst, u$getbkt, .bktno, .pagcnt, .lockflg, .bd);
+    $utlint (arglst, bugerr);
+
+    IF .arglst [0, wrd] EQL false
+    THEN
+	BEGIN					!OOPS
+	m$erms (arglst, UPLIT (%ASCIZ'?UTLUIO unable to do I/O'));
+	RETURN -1;
+	END;
+
+    bktptr = .bd [bkdbktadr];			! ADDR OF BKT IN CORE
+    !MAKE CONSIS CHKS:
+    ! INDEX MUST HAVE NON-0 LEVEL
+    ! DATA MUST HAVE 0 LEVEL
+    ! NEXTBYTE MUST BE GTR 2 AND LE BKT SIZE
+    ! AREA # MUST AGREE WITH KDB
+    bbm = 0;					!SET TO DEFINED VAL
+
+    IF .bktptr [bhbtype] EQL btypedata
+    THEN
+
+	IF .bktptr [bhlevel] EQL 0		!DOES LEVEL AGREE WITH TYPE?
+	THEN
+	    BEGIN				!YES, SET DATA BKT SIZE
+	    bktsiz = .kdb [kdbdbkz];		! FROM KDB
+
+	    IF .kdb [kdbdan] NEQ .bktptr [bhthisarea]	!
+	    THEN
+		bbm = UPLIT (%ASCIZ'area number');
+
+	    END
+	ELSE
+	    bbm = UPLIT (%ASCIZ'type/level');	!BAD INFO IN BKT HDR
+
+    IF .bktptr [bhbtype] EQL btypeindex
+    THEN
+
+	IF .bktptr [bhlevel] NEQ 0		!DOES LEV AGREE FOR IDX BKT?
+	THEN
+	    BEGIN				!YES, SET DATA BKT SIZE
+	    bktsiz = .kdb [kdbibkz];		! FROM KDB
+
+	    IF .kdb [kdbian] NEQ .bktptr [bhthisarea] THEN bbm = UPLIT (%ASCIZ'area number');
+
+	    END
+	ELSE
+	    bbm = UPLIT (%ASCIZ'type/level');
+
+    IF .bktptr [bhbtype] GTR 1			!TYPE OUT OF RANGE?
+    THEN
+	bbm = UPLIT (%ASCIZ'type');		!YES
+
+    IF .bktptr [bhnextbyte] LSS bhhdrsize	!1ST FREE TOO SMALL?
+	OR .bktptr [bhnextbyte] GTR (.bktsiz^p2w)	! OR TOO LARGE?
+    THEN
+	bbm = UPLIT (%ASCIZ'words-in-use');	!YES TO EITHER
+
+    IF .bbm NEQ 0				!BAD BKT MSG SET UP?
+    THEN
+	BEGIN
+
+	IF .retopt EQL bbm_none			!LET CALLER PUT MSG?
+	THEN
+	    RETURN .bbm;			!YES, RET PTR TO BAD INFO
+
+	IF .retopt EQL bbm_err			!TREAT AS BARF CONDIT?
+	THEN
+	    BEGIN				!YES, PUT ERR MSG
+	    bd$put (.bd, 0);			!CLEAN UP AFT ABORT
+	    txtout (utlpne, .bktno, .bbm, .kdb [kdbref]);
+	    RETURN -1;
+	    END;
+
+	IF .retopt EQL bbm_info			!TREAT AS INFO COND?
+	THEN
+	    BEGIN				!YES, DISP/CH B H
+	    txtout (utlpni, .bktno, .bbm, .kdb [kdbref]);
+	    RETURN 0;				!DONT TRUST REST OF BKT
+	    END;
+
+	END;
+
+    ! GET WHOLE BKT NOW IF PARTIAL BKT SIZE WAS SPEC
+
+    IF .pagcnt NEQ .bktsiz			!DID THE KLUDGE LUCK OUT?
+    THEN
+	BEGIN					!NO, GET RIGHT SIZE
+
+	LOCAL
+	    bfd : REF BLOCK;			!PTR TO BKT'S BUFF DESC
+
+	bd$put (.bd, 0);			!RELEASE PARTIAL BKT
+	bfd = .bd [bkdbfdadr];			!GET PTR TO BUFF DESC
+
+	IF .bfd [bfdusecount] EQL 0		!WAS EARLIER GETBKT ONLY USER?
+	THEN
+	    bfd [bfdbktsiz] = 0;		!YES, MAKE RMS THINK BUFF EMPTY
+
+	bld_arg_lst (arglst, u$getbkt, .bktno, .bktsiz, .lockflg, .bd);
+	$utlint (arglst, bugerr);
+
+	IF .arglst [0, wrd] EQL false
+	THEN
+	    BEGIN				!OOPS
+	    m$erms (arglst, UPLIT (%ASCIZ'?UTLUIO unable to do I/O'));
+	    RETURN -1;
+	    END;
+
+	END;
+
+    RETURN 1;					! SUCCESS
+    END;					! end of routine BD$GET
+
+%SBTTL 'BD$PUT - Call RMS PUTBKT'
+
+GLOBAL ROUTINE bd$put (bd, updateflag) : NOVALUE = 	!CALL THE RMS 'PUTBKT' FUNC
+! FUNCTIONAL DESCRIPTION:
+!
+!	RELEASE THE SPEC BKT, OUTPUTTING IF UPDATEFLAG SET
+!
+! FORMAL PARAMETERS:
+!
+!	BD = PTR TO BKT DESC TO RELEASE
+!	UPDFLAG = TRUE IF BKT SHOULD BE WRITTEN
+!
+    BEGIN
+
+    MAP
+	bd : REF BLOCK;
+
+    IF nullbd (bd) THEN RETURN;			!BKT DESC EMPTY
+
+    bld_arg_lst (arglst, u$putbkt, .updateflag, .bd);
+    $utlint (arglst, interr);			! NO ERRORS EXPECTED
+    setnullbd (bd);				!INSURE NOT "PUT" TILL AGAIN OCC
+    RETURN;
+    END;					! end of routine PUTBKT
+
+END
+
+ELUDOM

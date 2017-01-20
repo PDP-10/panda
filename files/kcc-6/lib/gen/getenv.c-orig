@@ -1,0 +1,393 @@
+/* 
+** GETENV, PUTENV - Get and put value for environment name
+**
+**	Copyright (c) 1987 by Ken Harrenstien, SRI International
+**
+** Original idea of using logical names from:
+**	Bill Palmer / Stanford University / November 1984
+*/
+
+#include <c-env.h>
+#if SYS_T20+SYS_10X+SYS_T10+SYS_CSI+SYS_WTS	/* Systems supported for */
+
+#include <stddef.h>		/* For NULL */
+#include <stdlib.h>
+#include <string.h>
+
+#if __STDC__
+#define CONST const
+#else
+#define CONST
+#endif
+
+#ifndef _MAXENVNAME
+#define _MAXENVNAME 40		/* Max size of environment name (less 1) */
+#endif
+
+struct evar {
+	struct evar *enext;
+	char *ename;
+	char *evalue;
+};
+
+#if (SYS_T20+SYS_10X)
+#include <jsys.h>
+#include <monsym.h>		/* For term type defs */
+#include <ctype.h>		/* For isupper/tolower */
+
+#elif SYS_T10+SYS_CSI+SYS_WTS
+#include <muuo.h>
+#include <macsym.h>
+#include <stdio.h>		/* For sprintf */
+#endif
+
+static struct evar *env_list = 0;
+
+static struct evar *iputenv(), *sevterm(), *sevhome();
+
+char *
+getenv(name)
+CONST char *name;
+{
+    register struct evar *ep;
+
+    /* Search existing env vars for a match */
+    for (ep = env_list; ep; ep = ep->enext) {
+	if (strcmp(name, ep->ename)==0)		/* If matched exactly, */
+	    return ep->evalue;			/* return value for name! */
+    }
+
+    /* No existing match, try to check other sources */
+#if SYS_T20
+	/* For TOPS-20, we use silly hack of having logical name defs
+	** be environment vars.  To avoid conflicts with real device
+	** names etc, all such vars have "CENV-" prefixed to the normal
+	** variable name.  e.g. "TERM" is looked up as the logical name
+	** "CENV-TERM:".
+	*/
+    {
+	register char *cp;
+	int acs[5];
+	char lognam[5 + _MAXENVNAME];
+	char logbuf[1000];		/* Lots of room */
+
+	strncat(strcpy(lognam,"CENV-"), name, _MAXENVNAME-5-1);
+	acs[1] = _LNSJB;		/* First try jobwide logical name */
+	acs[2] = (int)(lognam-1);	/* Need backed-up BP for jsys */
+	acs[3] = (int)(logbuf-1);	/* Store into here */
+	logbuf[0] = 0;			/* Ensure buffer starts clear */
+	if (jsys(LNMST, acs) == 0) {	/* If jobwide failed, */
+	    acs[1] = _LNSSY;		/* then try systemwide */
+	    jsys(LNMST, acs);
+	}
+	if (logbuf[0]) {			/* If we won... */
+	    for (cp = logbuf; *cp; ++cp)	/* Convert to lowercase */
+		if (isupper(*cp))
+		    *cp = tolower(*cp);
+	    ep = iputenv(name, logbuf);		/* Store it as env var! */
+	    return (ep ? ep->evalue : NULL);	/* and return alloced value */
+	}
+    }
+
+#elif SYS_CSI
+	/* On CSI, try using "global command variables" in a similar fashion,
+	** where the prefix is "C$" (short since name length is limited)
+	** The string returned in the block will have this format:
+	**	"C$VAR :=[=] text-of-variable"
+	** The variable names are forced to uppercase, and there may be
+	** either one or two equal signs (plus space) separating it from the
+	** actual text of the variable.
+	** Fortunately, variable text is stored exactly as-is, without case
+	** smashing.
+	*/
+    {
+#define NAMEWDS 500
+	int i;
+	char *cp;
+	int bigblk[NAMEWDS];
+
+	bigblk[0] = NAMEWDS-1;
+	cp = (char *)(int)(_KCCtype_char7 *)&bigblk[1];	/* 7-bit pointer */
+	i = strlen(name);
+	if (i > (NAMEWDS-4)*sizeof(int))
+	    return NULL;		/* Name too long */
+	strcpy(cp, "C$");
+	strncpy(cp+2, name, i+6);	/* Ensure last word cleared */
+	if (CSIUUO_AC("REDUU$", XWD(-014,(int)bigblk))) {
+	    /* Won!  Parse returned string to extract actual text */
+	    if ((cp = strstr(cp, ":=")) && (cp = strchr(cp, ' '))) {
+		ep = iputenv(name, ++cp);		/* Store as env var! */
+		return (ep ? ep->evalue : NULL);	/* and return value */
+	    }
+	}
+    }
+#endif
+
+    /* Try checking for specific names which have standard meanings */
+    if (strcmp(name, "TERM")==0)	/* TERMCAP terminal type */
+	return (ep = sevterm()) ? ep->evalue : 0;
+    if (strcmp(name, "HOME")==0)	/* User's home directory */
+	return (ep = sevhome()) ? ep->evalue : 0;
+
+    return NULL;			/* Give up, failed */
+}
+
+/* PUTENV - based on SYSV description.
+**	Argument is a string in "name=value" form.  Adds this to 
+** the environment of current process.  Not clear if we want to
+** emulate the (vague) SYSV description which indicates that putenv
+** may only store a pointer, and the actual string buffer remains under
+** user control.
+*/
+int
+putenv(namval)
+char *namval;
+{
+    register char *np, *cp;
+    register int i;
+    register struct evar *ep, *prep;
+    char name[_MAXENVNAME];
+
+    /* Get "name" part isolated in temp buffer (to avoid changing orig str) */
+    for (i = _MAXENVNAME, cp = name, np = namval; *np != '=';) {
+	if (*np == 0 || --i > 0)	/* If not in name=val format */
+	    return -1;			/* then fail */
+	*cp++ = *np++;
+    }
+    *cp = 0;			/* Tie off name string */
+    ++np;			/* Point to value string */
+
+    /* Search existing env vars for a match */
+    for (ep = env_list, prep = NULL; ep; ep = ep->enext) {
+	if (strcmp(name, ep->ename)==0)		/* If matched exactly, */
+	    break;				/* stop loop */
+	prep = ep;				/* Save previous ptr */
+    }
+
+    if (ep == NULL)				/* If didn't find, */
+	return (iputenv(name, np) ? 0 : -1);	/* just add it */
+
+    if (strlen(np) <= strlen(ep->evalue)) {	/* If new string small enuf */
+	strcpy(ep->evalue, np);			/* just copy over old one */
+	return 0;				/* and win! */
+    }
+
+    /* Must delete old entry, then add new one */
+    if (prep) prep->enext = ep->enext;		/* Unlink from list */
+    else env_list = ep->enext;
+    free((char *)ep);				/* Free up old struct */
+    return (iputenv(name, np) ? 0 : -1);	/* Then add new and return */
+}
+
+/* IPUTENV - auxiliary for getenv() and putenv().
+**	Takes a name/value pair and strings it into the environment
+** variable list.
+*/
+static struct evar *
+iputenv(name, value)
+char *name, *value;
+{
+    register struct evar *ep;
+    register int nl, vl;
+
+    nl = strlen(name);
+    vl = strlen(value);
+    ep = (struct evar *) malloc(sizeof(struct evar) + nl+1 + vl+1);
+    if (ep != NULL) {
+	ep->ename = (char *)(ep+1);	/* Name starts right after struct */
+	ep->evalue = ep->ename + nl+1;	/* Value right after that */
+	strcpy(ep->ename, name);	/* Copy the strings */
+	strcpy(ep->evalue, value);
+	ep->enext = env_list;		/* Link into head of list */
+	env_list = ep;
+    }
+    return ep;		/* NULL or pointer to new linked-in var */
+}
+
+/* Auxiliary routines for specific environment names */
+
+/* Find and set HOME variable */
+static struct evar *
+sevhome()
+{
+    char buf[500];
+
+#if SYS_T20+SYS_10X
+    int acs[5];
+    jsys(GJINF, acs);		/* Get user # in AC 1 */
+    acs[2] = acs[1];		/* Set up for DIRST% */
+#if SYS_T20
+    strcpy(buf, "PS:<");	/* on T20 must add punctuation */
+    acs[1] = (int) (buf+3);
+#else				/* on 10X system adds punct for us */
+    acs[1] = (int) (buf-1);
+#endif
+    if (!jsys(DIRST, acs))
+	return NULL;
+#if SYS_T20
+    strcat((char *)acs[1], ">");
+#endif
+
+#elif SYS_T10+SYS_CSI
+    int ppn = 0;
+    MUUO_ACVAL("GETPPN", 0, &ppn);
+    sprintf(buf, "[%o,%o]", FLDGET(ppn, _LHALF), ppn&_RHALF);
+
+#else
+
+    strcpy(buf, "DSK:");	/* Cheat */
+#endif
+
+    return iputenv("HOME", buf);
+}
+
+/* Find and set TERM variable */
+
+static struct evar *
+sevterm()
+{
+#if SYS_T20+SYS_10X
+    register char *str;
+    int acs[5];
+
+    acs[1] = _CTTRM;
+    jsys(GTTYP, acs);		/* Get our terminal type */
+    switch (acs[2]) {
+	default:	str = NULL;	break;	/* If don't know type */
+
+#if monsymdefined(".TT33")
+	case monsym(".TT33"):	str = "tty33";	break;
+#endif
+#if monsymdefined(".TT35")
+	case monsym(".TT35"):	str = "tty35";	break;
+#endif
+#if monsymdefined(".TT37")
+	case monsym(".TT37"):	str = "tty37";	break;
+#endif
+#if monsymdefined(".TTEXE")
+	case monsym(".TTEXE"):	str = "execuport"; break; /* Probably not in TERMCAP */
+#endif
+#if monsymdefined(".TTDEF")
+	case monsym(".TTDEF"):	str = "DEFAULT";	break;	/* ???? */
+#endif
+#if monsymdefined(".TTIDL")
+	case monsym(".TTIDL"):	str = "IDEAL";	break;		/* ???? */
+#endif
+#if monsymdefined(".TTV05")
+	case monsym(".TTV05"):	str = "vt05";	break;		/* Not in TERMCAP */
+#endif
+#if monsymdefined(".TTV50")
+	case monsym(".TTV50"):	str = "vt50";	break;
+#endif
+#if monsymdefined(".TTL30")
+	case monsym(".TTL30"):	str = "la30";	break;		/* Not in TERMCAP? */
+#endif
+#if monsymdefined(".TTG40")
+	case monsym(".TTG40"):	str = "gt40";	break;
+#endif
+#if monsymdefined(".TTL36")
+	case monsym(".TTL36"):	str = "la36";	break;		/* Not in TERMCAP? */
+#endif
+#if monsymdefined(".TTV52")
+	case monsym(".TTV52"):	str = "vt52";	break;
+#endif
+#if monsymdefined(".TT100")
+	case monsym(".TT100"):	str = "vt100";	break;
+#endif
+#if monsymdefined(".TTL38")
+	case monsym(".TTL38"):	str = "la38";	break;		/* Not in TERMCAP? */
+#endif
+#if monsymdefined(".TT120")
+	case monsym(".TT120"):	str = "la120";	break;
+#endif
+#if monsymdefined(".TT125")
+	case monsym(".TT125"):	str = "vt125";	break;
+#endif
+#if monsymdefined(".TTK10")
+	case monsym(".TTK10"):	str = "gigi";	break;	/* DEC VK100 */
+#endif
+#if monsymdefined(".TT102")
+	case monsym(".TT102"):	str = "vt102";	break;
+#endif
+#if monsymdefined(".TTH19")
+	case monsym(".TTH19"):	str = "h19";	break;
+#endif
+#if monsymdefined(".TT131")
+	case monsym(".TT131"):	str = "vt131";	break;		/* Not in TERMCAP? */
+#endif
+#if monsymdefined(".TT200")
+	case monsym(".TT200"):	str = "vt200";	break;
+#endif
+#if monsymdefined(".TTADM")
+	case monsym(".TTADM"):	str = "adm3a";	break;
+#endif
+#if monsymdefined(".TTDAM")
+	case monsym(".TTDAM"):	str = "dm2500";	break;
+#endif
+#if monsymdefined(".TTHP")
+	case monsym(".TTHP"):	str = "hp2645";	break;
+#endif
+#if monsymdefined(".TTHAZ")
+	case monsym(".TTHAZ"):	str = "h1500";	break;
+#endif
+#if monsymdefined(".TT43")
+	case monsym(".TT43"):	str = "tty43";	break;
+#endif
+#if monsymdefined(".TTSRC")
+	case monsym(".TTSRC"):	str = "soroc";	break;	/* Soroc 120 */
+#endif
+#if monsymdefined(".TTGIL")
+	case monsym(".TTGIL"):	str = "gillotine"; break;	/* Not in TERMCAP? */
+#endif
+#if monsymdefined(".TTTEL")
+	case monsym(".TTTEL"):	str = "t1061";	break;	/* Teleray 1061 */
+#endif
+#if monsymdefined(".TTTEK")
+	case monsym(".TTTEK"):	str = "tek4025";	break;
+#endif
+#if monsymdefined(".TTANN")
+	case monsym(".TTANN"):	str = "aaa";	break;	/* Ann Arbor */
+#endif
+#if monsymdefined(".TTCPT")
+	case monsym(".TTCPT"):	str = "concept100";	break;
+#endif
+#if monsymdefined(".TTIBM")
+	case monsym(".TTIBM"):	str = "ibm3101";	break;	/* IBM 3101-20 */
+#endif
+#if monsymdefined(".TTTVI")
+	case monsym(".TTTVI"):	str = "tvi912";	break;
+#endif
+#if monsymdefined(".TTTK3")
+	case monsym(".TTTK3"):	str = "tek4023";	break;
+#endif
+#if monsymdefined(".TTDM2")
+	case monsym(".TTDM2"):	str = "dm1520";	break;
+#endif
+#if monsymdefined(".TTAMB")
+	case monsym(".TTAMB"):	str = "ambassador";	break;	/* Ann Arbor */
+#endif
+#if monsymdefined(".TTESP")
+	case monsym(".TTESP"):	str = "esprit";	break;	/* Hazeltine */
+#endif
+#if monsymdefined(".TTFRD")
+	case monsym(".TTFRD"):	str = "freedom100";	break;
+#endif
+#if monsymdefined(".TTFR2")
+	case monsym(".TTFR2"):	str = "freedom200";	break;
+#endif
+#if monsymdefined(".TTANS")
+	case monsym(".TTANS"):	str = "ansi";	break;
+#endif
+#if monsymdefined(".TTAVT")
+	case monsym(".TTAVT"):	str = "avt";	break;	/* Concept AVT */
+#endif
+    }	/* end of switch on terminal type */
+
+    if (str)				/* If found something */
+	return iputenv("TERM", str);	/* return that! */
+#endif	/* T20+10X */
+
+    return NULL;			/* Fail */
+}
+
+#endif /* T20+10X+T10+CSI+WTS */

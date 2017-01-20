@@ -1,0 +1,1033 @@
+ %TITLE 'PRPARCOM - parse a command'
+MODULE PRPARCOM (				! Parse a command
+		IDENT = '3-016'			! File: PRPARCOM.BLI Edit:GB3016
+) =
+BEGIN
+!COPYRIGHT (c) DIGITAL EQUIPMENT CORPORATION 1981, 1988.  ALL RIGHTS RESERVED.
+!
+!THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED ONLY
+!IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH THE INCLUSION OF 
+!THE ABOVE COPYRIGHT NOTICE.  THIS SOFTWARE OR ANY OTHER COPIES THEREOF MAY 
+!NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY OTHER PERSON.  NO TITLE
+!TO AND OWNERSHIP OF THE SOFTWARE IS HEREBY TRANSFERRED.
+!
+!THE INFORMATION IN THIS SOFTWARE IS SUBJECT TO CHANGE WITHOUT NOTICE AND 
+!SHOULD NOT BE CONSTRUED AS A COMMITMENT BY DIGITAL EQUIPMENT CORPORATION.
+!
+!DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR RELIABILITY OF ITS 
+!SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+!
+!++
+! FACILITY:	EDT -- The DEC Standard Editor
+!
+! ABSTRACT:
+!
+!	Parse a command.
+!
+! ENVIRONMENT:	Runs on TOPS-20 only
+!
+! AUTHOR: Chris Gill, CREATION DATE: March 1, 1983
+!
+! MODIFIED BY:
+!
+! 3-001 - Created. CJG 1-Mar-1983
+! 3-002 - Change the way that filespecs are handled. CJG 28-Jun-1983
+! 3-003 - Add code for PUSH command and tidy up. CJG 25-Sep-1983
+! 3-004 - Add PROMPT_LENGTH so that we can get error pointer in right place. CJG 7-Oct-1983
+! 3-005 - Add TRACE and XDDT commands. CJG 10-Oct-1983
+! 3-006 - Add SET SEARCH IGNORE parsing. CJG 2-Nov-1983
+! 3-007 - Apply some modifications required by fixes in PRFILE. CJG 12-Dec-1983
+! 3-008 - Fix problem when <ESC> and Control-R interact. CJG 20-Dec-1983
+! 3-009 - Make Control-H work remove some old code. CJG 20-Dec-1983
+! 3-010 - Check for control-C being typed. CJG 5-Jan-1984
+! 3-011 - Allow SUBSTITUTE string to be terminated by <CR>. GB 2-May-1984
+! 3-012 - Allow control chars as SUBSTITUTE string delimiters. GB 2-May-1984
+! 3-013 - Fix TAB ADJUST to parse a range specification.  GB 20-Jul-1984
+! 3-014 - Allow <LF> as a null command. GB 24-Jul-1984
+! 3-015 - Fix problems with numeric zero argument on some SET commands. GB 7-Sep-1984
+! 3-016 - Fix bug in comment handling which causes command buffer size to be
+!	  reduced by 2 for each comment parsed. GB 15-Oct-1984
+!--
+
+%SBTTL 'DECLARATIONS'
+!
+! TABLE OF CONTENTS:
+!
+
+REQUIRE 'EDTSRC:TRAROUNAM';
+
+REQUIRE 'EDTSRC:PARLITS';
+
+FORWARD ROUTINE
+    EDT$$PA_CMD,
+    PA_PARSE;
+
+!
+! INCLUDE FILES:
+!
+
+REQUIRE 'EDTSRC:EDTREQ';
+
+REQUIRE 'SYS:JSYS';
+
+REQUIRE 'EDTSRC:PARDATA';
+
+!
+! EXTERNAL REFERENCES:
+!
+
+    EXTERNAL
+!	CMD_BUF,			! Command line buffer.
+	CMD_PTR,			! Pointer into command buffer.
+	CMD_END,			! Pointer to end of current command.
+	CMD_LEN,			! Length of command.
+	VFY,				! verify switch
+	INP_SRC,			! Source of input
+	DEFKEY,				! Flag for DEFINE KEY
+	TAB_SIZ,			! Size of a tab
+	TI_WID,				! Terminal width
+	PA_CURCMD : REF NODE_BLOCK,	! Current command node
+	PA_CURTOK,			! start of the current token
+	PA_CURTOKLEN,			! Length of current token
+	PA_CURRNG,			! Current range node
+	PA_MORE,			! More on command line
+	PA_ERRNO,			! Error number of parsing error.
+	PA_SP,				! Parse stack pointer
+	PROMPT_LENGTH,			! Length of prompt
+	WRT_NAM : BLOCK,		! Descriptor for WRITE command
+	OUT_NAM : BLOCK,		! Descriptor for EXIT command
+	INC_NAM : BLOCK,		! Descriptor for INCLUDE command
+	TEMP_BUFFER,			! Temp string buffer
+	HELP_DFLT,			! Help defaults for PA_FILE
+	CMD_DFLT,			! Command defaults for PA_FILE
+	CC_WAIT,			! ^C may be typed and should be handled
+	CC;				! Control-C flag
+
+    EXTERNAL ROUTINE
+	EDT$$FMT_CRLF,			! Terminate an output line
+	EDT$$FMT_CH,
+	EDT$$FMT_LIT,
+	EDT$$MSG_TOSTR,
+	EDT$$PA_TSTMACCAL,		! Test atom for being a macro name
+	EDT$$PA_NEW_NOD,		! Create a new node
+	EDT$$PA_SCANTOK : NOVALUE,	! Find length of current atom
+	EDT$$PA_SWITCH,			! Parse a switch
+	EDT$$PA_GET_KEY,		! Parse a key name
+	EDT$$PA_GET_CHAR,		! Get a single character
+	EDT$$PA_FILE,			! Parse a filespec
+	EDT$$PA_BUFFER,			! Parse a buffer name
+	EDT$$PA_NUMBER,			! Parse a decimal number
+	EDT$$PA_COLON,			! Parse a colon
+	EDT$$PA_RANGE;			! Parse a range specifier
+
+!
+! MACROS:
+!
+!	NONE
+!
+!
+! OWN STORAGE
+!
+!	NONE
+!
+
+%SBTTL 'EDT$$PA_CMD  - parse a command'
+
+GLOBAL ROUTINE EDT$$PA_CMD(
+		PROMPT,
+		PRLEN) = 			! Parse a command
+
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine is called to parse a single command on the current command 
+!	line. The command will be read from the relevent file or the terminal
+!	which allows for full recognition. In this case, a copy of the command
+!	is returned in the command buffer. If the parse is successful, a 1 is
+!	is returned and the parsing stack contains a description of the command.
+!	CMD_PTR  is left pointing at the '\' or <CR> which are are the only
+!	valid terminators of commands.  If an error occurs, a 0 is returned,
+!	and PA_MORE is left as zero to indicate that no more data exists on the
+!	command line.
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	CMD_BUF
+!	CMD_PTR
+!	CMD_END
+!	CMD_LEN
+!	VFY
+!	INP_SRC
+!
+! IMPLICIT OUTPUTS:
+!
+!	PA_CURCMD
+!	PA_SP
+!	PA_CURTOK
+!	PA_ERRNO
+!
+! ROUTINE VALUE:
+!
+!	1 = parse was successful
+!	0 = parse failed, PA_ERRNO  set
+!
+! SIDE EFFECTS:
+!
+!	MANY
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	C_FLAG,				! COMND flags
+	C_DATA,				! COMND data pointer
+	C_FDB,				! COMND actual FDB used
+	STS : INITIAL (0);
+
+
+    MESSAGES ((UNXCHRAFT, UNRCOM));
+
+!+
+! Indicate that if a control-C is typed it should be handled by aborting
+! the COMND JSYS.
+!-
+
+    CC_WAIT = -1;
+
+!+
+! Initialise the COMND JSYS ready for a command. This is only done if
+! there is no more data in the rescan buffer.
+!-
+
+    IF (.PA_MORE EQL 0) THEN
+	BEGIN
+	IF (.PRLEN NEQ 0) THEN PROMPT_LENGTH = .PRLEN;
+	CH$WCHAR (0, CH$MOVE (.PRLEN, .PROMPT, CH$PTR (TEMP_BUFFER,, BYTE_SIZE)));
+	CSB [$CMRTY] = CH$PTR (TEMP_BUFFER,, BYTE_SIZE);
+	IF (NOT COMMAND (FD_INI))
+	THEN
+	    BEGIN
+	    CC_WAIT = 0;
+	    RETURN (0);
+	    END;
+	IF (.CC NEQ 0) THEN STS = -1;
+	END;
+
+!+
+! Loop around the parser as long as a reparse is required. When an error
+! occurs or the command is accepted, then continue.
+!-
+
+    PA_MORE = 0;
+    WHILE (.STS EQL 0) DO
+	BEGIN
+!+
+! Initialize the command node pointer and the parsing stack pointer.
+!-
+	PA_CURCMD = 0;
+	PA_SP = -1;
+	PA_ERRNO = 0;
+
+	STS = PA_PARSE ();			! Parse a command
+
+	IF (.STS EQL 1) THEN
+	    BEGIN
+
+!+
+! The command has been parsed - make sure that it ends correctly.
+!-
+
+	    IF (NOT COMMAND (FD_END))
+	    THEN
+		BEGIN
+		CC_WAIT = 0;
+		RETURN (0);
+		END;
+	    IF (.CC NEQ 0)
+	    THEN
+		STS = -1
+	    ELSE
+		BEGIN
+		IF ((.C_FLAG AND CM_RPT) NEQ 0) THEN STS = 0;
+		IF ((.C_FLAG AND CM_NOP) NEQ 0) THEN 
+		    BEGIN
+		    PA_ERRNO = EDT$_UNXCHRAFT;
+		    STS = -1;
+		    END;
+		END;
+	    END;
+	END;
+
+!+
+! If the command ended with '\', then indicate more to come
+!-
+
+	IF (.STS EQL 1) THEN
+	    BEGIN
+	    IF (.C_FDB<0,18> EQL FD_END) THEN
+		BEGIN
+		PA_CURTOK = .CSB [$CMPTR];
+		PA_CURTOKLEN = .CSB [$CMINC];
+		PA_MORE = 1;
+		END;
+
+	    CMD_LEN = 256 - .CSB [$CMCNT];
+	    CC_WAIT = 0;
+	    RETURN (1);
+	    END;
+
+!+
+! There was an error - if it occured because of control-C then tidy up,
+! go to a new line for the message, and exit now. (Assume no other errors)
+!-
+
+    IF (.CC NEQ 0) THEN
+	BEGIN
+	PA_MORE = 0;
+	PA_ERRNO = 0;
+	CC_WAIT = 0;
+	EDT$$FMT_CRLF ();
+	RETURN (0);
+	END;
+
+!+
+! The command failed to parse correctly - indicate the error
+!-
+
+    IF (.PA_ERRNO EQL 0) THEN PA_ERRNO = EDT$_UNRCOM;
+
+!+
+! Print the command with an indication of where the error is. If the
+! user ended the bad field with an escape, then send <CR><LF> first.
+! Also take account of the prompt length so we get the pointer in the
+! right place.
+!-
+
+    IF ((.INP_SRC NEQ INP_TERM) AND (.VFY EQL 0)) THEN
+	BEGIN
+	EDT$$FMT_CH (%C' ');
+	EDT$$FMT_LIT (CH$PTR (CMD_BUF,, BYTE_SIZE), .CMD_LEN);
+	EDT$$FMT_CRLF ();
+	END;
+
+    IF ((.CSB [$CMFLG] AND CM_ESC) NEQ 0) THEN EDT$$FMT_CRLF ();
+
+    DECR I FROM (CH$DIFF (.CSB [$CMPTR], CH$PTR (CMD_BUF,, BYTE_SIZE)) +
+	.PROMPT_LENGTH) TO 0 DO EDT$$FMT_CH (%C' ');
+    EDT$$FMT_CH (%C'^');
+    EDT$$FMT_CRLF ();
+    PROMPT_LENGTH = 0;
+
+!+
+! Print the corresponding error message and ensure that other commands
+! on this line are not parsed.
+!-
+
+    EDT$$MSG_TOSTR (.PA_ERRNO);
+    EDT$$FMT_CRLF ();
+    PA_MORE = 0;
+    CC_WAIT = 0;
+    RETURN (0);
+    END;
+
+END;
+
+%SBTTL 'PA_PARSE - Parse the individual commands'
+
+ROUTINE PA_PARSE =			! Start parsing a command
+
+BEGIN
+
+!+
+! This routine parses the command keyword and dispatches to the relevent
+! subroutine to parse the rest of the command. If a reparse is required,
+! the value of the routine is set to 0, if an error occurs, it is set to
+! -1, else it is set to 1.
+!-
+
+
+    OWN
+	PARSED_FILE : BLOCK [DSC$K_SIZE];	! Space for parsed files
+
+    LOCAL
+	C_FLAG,				! COMND flags
+	C_DATA,				! COMND data pointer
+	C_FDB,				! COMND actual FDB used
+	CMDTYP,				! Command type or subtype
+	STS;
+
+    LITERAL				! Filespec parsing flags
+	F_REQD   = 1,			! Filespec required
+	F_EXIT   = 2,			! EXIT command
+	F_OUTPUT = 4,			! Parse an output filespec
+	F_RELEAS = 8;			! Release the JFN when done
+
+    MESSAGES ((ASREQ, QUOSTRREQ, MACKEYREQ, INVPARFOR, NUMVALREQ, NUMVALILL,
+		UNXCHRAFT, UNRCOM, INVVALSET, ENTMUSTBE, NONALPNUM,
+		SUBSTRNUL, INVSTR));
+
+    BEGIN
+
+!+
+! Parse the command keyword
+!-
+
+    STS = 0;
+    IF (NOT COMMAND (FD_CMD)) THEN RETURN (-1);
+    IF (.CC NEQ 0) THEN RETURN (-1);
+    IF ((.C_FLAG AND CM_RPT) NEQ 0) THEN RETURN (0);
+    IF ((.C_FLAG AND CM_NOP) NEQ 0) THEN RETURN (-1);
+
+!+
+! If the atom ended in an escape, then don't try to match it with a buffer
+! name (we can't do recognition on these). If the atom parsed OK and it is
+! not a buffer name, then treat it as a good command. Otherwise, try to
+! make a range node out of it. If the command is just a carriage return,
+! then default to NULL, ignore the command if it is a comment.
+!-
+
+    SELECTONE .C_FDB<0,18> OF
+
+	SET
+
+    [ FD_CMD ] :
+
+	BEGIN
+!+
+! Found a valid command keyword. If recognition was not used, then see
+! if it is a macro name. Otherwise, see to it.
+!-
+	IF ((.C_FLAG AND CM_ESC) EQL 0)
+	THEN
+	    BEGIN
+	    EDT$$PA_SCANTOK (0,1);
+	    IF (EDT$$PA_TSTMACCAL ()) THEN RETURN (1);
+	    END;
+	CMDTYP = .(.C_DATA)<0,18>;
+	END;
+
+    [ FD_CMM ] :
+
+	BEGIN
+!+
+! Found an alphanumeric field. If it is not a macro name then fail, if
+! it was empty, then try to parse a range.
+!-
+	STS = 1;
+	EDT$$PA_SCANTOK (0,1);
+	IF (.PA_CURTOKLEN NEQ 0) THEN
+
+	    BEGIN
+	    IF (EDT$$PA_TSTMACCAL ()) THEN RETURN (1);
+	    CMDTYP = CH$RCHAR (.PA_CURTOK);
+	    IF (.CMDTYP GEQ %C'@') THEN RETURN (-1);
+	    CSB [$CMINC] = .CSB [$CMINC] + .PA_CURTOKLEN;	! Backup
+	    CSB [$CMPTR] = .PA_CURTOK;
+	    CSB [$CMCNT] = .CSB [$CMCNT] + .PA_CURTOKLEN;
+	    END;
+
+	CMDTYP = COM_NULL;
+	END;
+
+    [ FD_CMT ] :
+
+	BEGIN
+
+!+
+! Set the command type appropriately, and backup to the <CR><LF> so that
+! the end of line parsing will work.
+!-
+
+	LOCAL
+	    PTR,
+	    LEN;
+
+	LEN = CH$DIFF (.CSB [$CMPTR], CH$PTR (CMD_BUF,, BYTE_SIZE));
+	IF (.LEN LEQ 2) THEN
+	    CMDTYP = COM_NULL
+	ELSE
+	    CMDTYP = -1;
+	PTR = CH$PLUS (.CSB [$CMPTR], -1);
+	WHILE (CH$RCHAR (.PTR) EQL %O'15') OR (CH$RCHAR (.PTR) EQL %O'12') DO
+		    BEGIN
+		    CSB [$CMINC] = .CSB [$CMINC] + 1;
+		    CSB [$CMPTR] = .PTR;
+		    CSB [$CMCNT] = .CSB [$CMCNT] + 1;
+		    PTR = CH$PLUS (.PTR, -1);
+		    END;
+	END;
+
+    TES;
+
+!+
+! Get a new parse node for this command
+!-
+
+	IF (.PA_CURCMD NEQ 0) THEN PA_CURCMD [ NEXT_COM ] = .PA_SP;
+
+	IF ((PA_CURCMD = EDT$$PA_NEW_NOD (COM_NODE, .CMDTYP)) EQL 0) THEN RETURN (0);
+	IF (.CMDTYP EQL -1) THEN RETURN (1);
+
+	CASE .CMDTYP FROM COM_NULL TO LAST_COM OF
+	    SET
+
+	    [ COM_NULL ] :
+
+		BEGIN
+		IF .STS
+		THEN
+		    RETURN (EDT$$PA_RANGE (1))		! Just parse a range
+		ELSE
+		    CSB [$CMCNT] = .CSB [$CMCNT] + 2;	! Fix the counter
+		END;
+
+	    [ COM_CHANGE, COM_FILL, COM_FIND, COM_INSERT, COM_REPLACE ] :
+
+		BEGIN
+		RETURN (EDT$$PA_RANGE (1));		! Just parse a range
+		END;
+
+	    [ COM_COPY, COM_MOVE ] :
+
+		BEGIN
+		STS = EDT$$PA_RANGE (2);		! Parse a range subcommand
+		IF (.STS LEQ 0) THEN RETURN (.STS);
+		IF (NOT COMMAND (FD_RTO)) THEN RETURN (-1);	! Parse 'TO'
+		IF (.CC NEQ 0) THEN RETURN (-1);
+		IF ((.C_FLAG AND CM_RPT) NEQ 0) THEN RETURN (0);
+		IF ((.C_FLAG AND CM_NOP) NEQ 0) THEN RETURN (-1);
+		IF (.C_FDB<0,18> EQL FD_RTO) THEN
+		    BEGIN
+
+!+
+! If a '%' was found then try to parse 'TO'
+!-
+
+		    IF (NOT COMMAND (FD_RT1)) THEN RETURN (-1);	! Parse 'TO'
+		    IF (.CC NEQ 0) THEN RETURN (-1);
+		    IF ((.C_FLAG AND CM_RPT) NEQ 0) THEN RETURN (0);
+		    IF ((.C_FLAG AND CM_NOP) NEQ 0) THEN RETURN (-1);
+		    END;
+		STS = EDT$$PA_RANGE (1);		! Parse second range
+		IF (.STS LEQ 0) THEN RETURN (.STS);
+		RETURN (EDT$$PA_SWITCH (
+			    IF (.CMDTYP EQL COM_COPY) THEN
+				FD_COP
+			    ELSE
+				FD_DEL
+			    ));
+		END;
+
+	    [ COM_DEFINE, COM_DEF_MAC ] :
+
+		BEGIN
+		PA_ERRNO = EDT$_MACKEYREQ;
+		IF (NOT COMMAND (FD_DEF)) THEN RETURN (-1);
+		IF (.CC NEQ 0) THEN RETURN (-1);
+		IF ((.C_FLAG AND CM_NOP) NEQ 0) THEN RETURN (-1);
+		IF ((.C_FLAG AND CM_RPT) NEQ 0) THEN RETURN (0);
+		CMDTYP = .(.C_DATA)<0,18>;
+		PA_CURCMD [COM_NUM] = .CMDTYP;
+		SELECTONE .CMDTYP OF
+		    SET
+
+		[ COM_DEFINE ] :
+
+		    BEGIN
+
+!+
+! Get the key number from the command
+!-
+
+		    STS = EDT$$PA_GET_KEY ();
+		    IF (.STS LEQ 0) THEN RETURN (.STS);
+		    PA_ERRNO = EDT$_ASREQ;
+		    DEFKEY = 0;
+
+!+
+! Parse 'AS "string" '
+!-
+
+		    IF (NOT COMMAND (FD_AS)) THEN RETURN (-1);
+		    IF (.CC NEQ 0) THEN RETURN (-1);
+		    IF ((.C_FLAG AND CM_NOP) NEQ 0) THEN RETURN (-1);
+		    IF ((.C_FLAG AND CM_RPT) NEQ 0) THEN RETURN (0);
+		    PA_ERRNO = EDT$_QUOSTRREQ;
+		    IF (NOT COMMAND (FD_QST)) THEN RETURN (-1);
+		    IF (.CC NEQ 0) THEN RETURN (-1);
+		    IF ((.C_FLAG AND CM_NOP) NEQ 0) THEN RETURN (-1);
+		    IF ((.C_FLAG AND CM_RPT) NEQ 0) THEN RETURN (0);
+
+!+
+! Store the length and pointer to the string
+!-
+
+		    EDT$$PA_SCANTOK (1,0);
+		    PA_CURCMD [AS_STR] = .PA_CURTOK;
+		    PA_CURCMD [AS_LEN] = .PA_CURTOKLEN;
+		    END;
+
+		[ COM_DEF_MAC ] :
+
+		    BEGIN
+
+!+
+! Parse a buffer name (same format as macro name)
+!-
+
+		    STS = EDT$$PA_BUFFER ();
+		    IF (.STS LEQ 0) THEN RETURN (.STS);
+		    PA_CURCMD [RANGE1] = .PA_CURRNG;
+		    END;
+
+		    TES;
+		END;
+
+	    [ COM_CLEAR ] :
+
+		BEGIN
+		STS = EDT$$PA_BUFFER ();		! Parse a buffer name
+		IF (.STS LEQ 0) THEN RETURN (.STS);
+		PA_CURCMD [RANGE1] = .PA_CURRNG;
+		END;
+
+	    [ COM_DELETE ] :
+
+		BEGIN
+		STS = EDT$$PA_RANGE (1);		! Parse a range
+		IF (.STS LEQ 0) THEN RETURN (.STS);
+		RETURN (EDT$$PA_SWITCH (FD_DEL));	! Parse /QUERY
+		END;
+
+	    [ COM_EXIT ] :
+
+		BEGIN
+		STS = EDT$$PA_FILE (OUT_NAM, F_EXIT + F_OUTPUT, 0);
+		IF (.STS LEQ 0) THEN RETURN (.STS);
+		RETURN (EDT$$PA_SWITCH (FD_EXI));	! Parse /SAVE or /SEQUENCE
+		END;
+
+	    [ COM_INCLUDE, COM_PRINT, COM_WRITE ] :
+
+		BEGIN
+		STS = (IF (.CMDTYP EQL COM_INCLUDE)
+		    THEN EDT$$PA_FILE (INC_NAM, F_REQD, 0)
+		    ELSE EDT$$PA_FILE (WRT_NAM, F_REQD + F_OUTPUT, 0));
+		IF (.STS LEQ 0) THEN RETURN (.STS);
+		STS = EDT$$PA_RANGE (1);	
+		IF ((.STS LEQ 0) OR (.CMDTYP NEQ COM_WRITE)) THEN RETURN (.STS);
+		RETURN (EDT$$PA_SWITCH (FD_RES));
+		END;
+
+	    [ COM_QUIT ] :
+
+		BEGIN
+		RETURN (EDT$$PA_SWITCH (FD_QIT));	! Only look for /SAVE
+		END;
+
+	    [ COM_RESEQ ] :
+
+		BEGIN
+		STS = EDT$$PA_RANGE (1);
+		IF (.STS LEQ 0) THEN RETURN (.STS);
+		RETURN (EDT$$PA_SWITCH (FD_RES));	! Parse /SEQUENCE
+		END;
+
+	    [ COM_SET ] :
+
+		BEGIN
+		PA_ERRNO = EDT$_INVPARFOR;
+
+!+
+! Clear out PARSED_FILE in case this is SET HELP or SET COMMAND.
+!-
+
+		PARSED_FILE [DSC$A_DEVICE] = 0;
+		PARSED_FILE [DSC$A_DIRECT] = 0;
+		PARSED_FILE [DSC$A_FNAME]  = 0;
+		PARSED_FILE [DSC$A_FEXTN]  = 0;
+
+!+
+! Parse the SET option
+!-
+
+		IF (NOT COMMAND (FD_SET)) THEN RETURN (-1);
+		IF (.CC NEQ 0) THEN RETURN (-1);
+		IF ((.C_FLAG AND CM_RPT) NEQ 0) THEN RETURN (0);
+		IF ((.C_FLAG AND CM_NOP) NEQ 0) THEN RETURN (-1);
+
+!+
+! Save the option number
+!-
+
+		CMDTYP = .(.C_DATA)<0,18>;
+		PA_CURCMD [SET_TYPE] = .CMDTYP;
+
+!+
+! Perform any extra argument parsing that may be required
+!-
+
+		CASE .CMDTYP FROM 1 TO MAX_SET OF
+		    SET
+
+		[ SET_WRAP, SET_SCRN, SET_LINES, SET_TAB ] :
+
+		    BEGIN
+		    PA_ERRNO = EDT$_NUMVALREQ;
+
+!+
+! A decimal number is required
+!-
+
+		    STS = EDT$$PA_NUMBER ();
+		    IF (.STS LSS 0) THEN RETURN (.STS);
+		    PA_ERRNO = EDT$_NUMVALILL;
+		    IF (.STS GEQ 256) THEN RETURN (-1);
+		    PA_CURCMD [SET_VAL] = .STS;
+		    END;
+
+		[ SET_CASE, SET_SRCH, SET_TERM, SET_MODE, SET_NTITY,
+		  SET_TEXT, SET_WORD, SET_PARA, SET_PROMPT ] :
+
+		    BEGIN
+		    PA_ERRNO = EDT$_INVVALSET;
+		    IF (NOT COMMAND (
+				SELECTONE .CMDTYP OF
+				    SET
+				[ SET_CASE ] : FD_CAS;
+				[ SET_SRCH ] : FD_SCH;
+				[ SET_TERM ] : FD_TRM;
+				[ SET_MODE ] : FD_MOD;
+				[ SET_NTITY] : FD_ENT;
+				[ SET_TEXT ] : FD_TEX;
+				[ SET_WORD ] : FD_WRD;
+				[ SET_PARA ] : FD_PAR;
+				[SET_PROMPT] : FD_PRO;
+				    TES)
+					) THEN RETURN (-1);
+		    IF (.CC NEQ 0) THEN RETURN (-1);
+		    IF ((.C_FLAG AND CM_RPT) NEQ 0) THEN RETURN (0);
+		    IF ((.C_FLAG AND CM_NOP) NEQ 0) THEN RETURN (-1);
+		    PA_CURCMD [SET_VAL] = .(.C_DATA)<0,18>;
+		    IF ((.CMDTYP EQL SET_NTITY) OR
+			(.CMDTYP EQL SET_TEXT) OR
+			(.CMDTYP EQL SET_PROMPT) OR
+			((.CMDTYP EQL SET_SRCH) AND (.(.C_DATA)<0,18> EQL SET_SIGN))) THEN
+
+!+
+! SET ENTITY, TEXT, or PROMPT also take a string
+!-
+
+			BEGIN
+			PA_ERRNO = EDT$_QUOSTRREQ;
+			IF (NOT COMMAND (FD_QST)) THEN RETURN (-1);
+			IF (.CC NEQ 0) THEN RETURN (-1);
+			IF ((.C_FLAG AND CM_RPT) NEQ 0) THEN RETURN (0);
+			IF ((.C_FLAG AND CM_NOP) NEQ 0) THEN RETURN (-1);
+
+			EDT$$PA_SCANTOK (1,0);
+			PA_CURCMD [AS_STR] = .PA_CURTOK;
+			PA_CURCMD [AS_LEN] = .PA_CURTOKLEN;
+			END;
+		    END;
+
+		[ SET_HELP ] :
+
+		    BEGIN
+		    STS = EDT$$PA_FILE (PARSED_FILE, F_REQD + F_RELEAS, HELP_DFLT);
+		    IF (.STS LEQ 0) THEN RETURN (.STS);
+		    END;
+
+		[ SET_COMND ] :
+
+		    BEGIN
+		    STS = EDT$$PA_FILE (PARSED_FILE, F_REQD + F_RELEAS, CMD_DFLT);
+		    IF (.STS LEQ 0) THEN RETURN (.STS);
+		    END;
+
+		[ SET_CURSR ] :
+
+		    BEGIN
+		    PA_ERRNO = EDT$_NUMVALREQ;
+		    STS = EDT$$PA_NUMBER ();
+		    IF (.STS LSS 0) THEN RETURN (.STS);
+		    PA_ERRNO = EDT$_NUMVALILL;
+		    IF (.STS GEQ 32768) THEN RETURN (-1);
+		    PA_CURCMD [SET_VAL1] = .STS;
+		    STS = EDT$$PA_COLON (1);
+		    IF (.STS LEQ 0) THEN RETURN (.STS);
+		    PA_ERRNO = EDT$_NUMVALREQ;
+		    STS = EDT$$PA_NUMBER ();
+		    IF (.STS LSS 0) THEN RETURN (-1);
+		    PA_ERRNO = EDT$_NUMVALILL;
+		    IF (.STS GEQ 32768) THEN RETURN (-1);
+		    PA_CURCMD [SET_VAL] = .STS;
+		    END;
+
+		[ INRANGE ] :
+
+		    ;
+
+		TES;
+		RETURN (1);
+		END;
+
+	    [ COM_SHOW ] :
+
+		BEGIN
+		PA_ERRNO = EDT$_INVPARFOR;
+		IF (NOT COMMAND (FD_SHO)) THEN RETURN (-1);
+		IF (.CC NEQ 0) THEN RETURN (-1);
+		IF ((.C_FLAG AND CM_RPT) NEQ 0) THEN RETURN (0);
+		IF ((.C_FLAG AND CM_NOP) NEQ 0) THEN RETURN (-1);
+		CMDTYP = .(.C_DATA)<0,18>;
+		PA_CURCMD [SET_TYPE] = .CMDTYP;
+		SELECTONE .CMDTYP OF
+		    SET
+
+		[ SHO_NTITY, SHO_PROMPT, SHO_TEXT ] :
+
+		    BEGIN
+		    PA_ERRNO = EDT$_ENTMUSTBE;
+		    IF (NOT COMMAND (
+				SELECTONE .CMDTYP OF
+				    SET
+				[ SHO_NTITY ] : FD_ENT;
+				[ SHO_PROMPT] : FD_PRO;
+				[ SHO_TEXT  ] : FD_TEX;
+				    TES)
+					) THEN RETURN (-1);
+		    IF (.CC NEQ 0) THEN RETURN (-1);
+		    IF ((.C_FLAG AND CM_RPT) NEQ 0) THEN RETURN (0);
+		    IF ((.C_FLAG AND CM_NOP) NEQ 0) THEN RETURN (-1);
+		    PA_CURCMD [SET_VAL] = .(.C_DATA)<0,18>;
+		    END;
+
+		[ SHO_KEY ] :
+
+		    BEGIN
+		    RETURN (EDT$$PA_GET_KEY ());
+		    END;
+
+		[ OTHERWISE ] :
+
+		    ;
+
+		    TES;
+		RETURN (1);
+		END;
+
+	    [ COM_SUBS, COM_SUBS_NEXT ] :
+
+		BEGIN
+
+		LOCAL
+		    STRNODE : REF NODE_BLOCK,		! Node pointer
+		    QCHAR;				! Quote character
+
+!+
+! If the command was SUBSTITUTE NEXT, then set CMDTYP and make sure the
+! command node is correctly set.
+!-
+
+		IF (.CMDTYP EQL COM_SUBS) THEN
+		    BEGIN
+		    IF (NOT COMMAND (FD_SNX)) THEN RETURN (-1);
+		    IF (.CC NEQ 0) THEN RETURN (-1);
+		    IF ((.C_FLAG AND CM_RPT) NEQ 0) THEN RETURN (0);
+		    IF ((.C_FLAG AND CM_NOP) EQL 0) THEN CMDTYP = COM_SUBS_NEXT;
+		    PA_CURCMD [COM_NUM] = .CMDTYP;
+		    END;
+
+!+
+! If the command was [SUBSTITUTE] NEXT, then it can be terminated by <CR>
+!-
+
+		IF (.CMDTYP EQL COM_SUBS_NEXT) THEN
+		    IF ((.C_FLAG AND CM_EOC) NEQ 0) THEN RETURN (1);
+
+!+
+! Create a new node
+!-
+
+		IF ((STRNODE = EDT$$PA_NEW_NOD (STR_NODE, 0)) EQL 0) THEN
+		    RETURN (-1);
+		PA_CURCMD [STR_PNT] = .STRNODE;
+
+!+
+! Use the next character as the quote character - unless its alphanumeric
+!-
+
+		QCHAR = EDT$$PA_GET_CHAR ();
+		IF (.QCHAR LEQ 0) THEN RETURN (.QCHAR);
+		PA_ERRNO = EDT$_NONALPNUM;
+		IF (((.QCHAR GEQ %C'0') AND (.QCHAR LEQ %C'9')) OR
+		    ((.QCHAR GEQ %C'A') AND (.QCHAR LEQ %C'Z')) OR
+		    ((.QCHAR GEQ %C'a') AND (.QCHAR LEQ %C'z'))) THEN RETURN (-1);
+
+!+
+! Now set the break mask for the new break character
+!-
+
+		BREAK_MASK [0] = %O'20000000';
+		BREAK_MASK [1] = 0;
+		BREAK_MASK [2] = 0;
+		BREAK_MASK [3] = 0;
+		BREAK_MASK [.QCHAR/32] = 1 ^ (35 - (.QCHAR MOD 32)) OR 
+				.BREAK_MASK [.QCHAR/32];
+
+!+
+! Parse an unquoted string - up to the break or <CR>
+!-
+
+		STRNODE [SRCHADDR] = .CSB [$CMPTR];
+		IF (NOT COMMAND (FD_UQS)) THEN RETURN (-1);
+		IF (.CC NEQ 0) THEN RETURN (-1);
+		IF ((.C_FLAG AND CM_RPT) NEQ 0) THEN RETURN (0);
+
+!+
+! Save the length. Die if <CR> was the terminator
+!-
+
+		STRNODE [SRCHLEN] = CH$DIFF (.CSB [$CMPTR], .STRNODE [SRCHADDR]);
+		CSB [$CMINC] = .CSB [$CMINC] - 1;
+		PA_ERRNO = EDT$_INVSTR;
+		IF (CH$RCHAR_A (CSB [$CMPTR]) EQL ASC_K_CR) THEN RETURN (-1);
+
+!+
+! Parse another unquoted string
+!-
+
+		STRNODE [REPADDR] = .CSB [$CMPTR];
+		IF (NOT COMMAND (FD_UQS)) THEN RETURN (-1);
+		IF (.CC NEQ 0) THEN RETURN (-1);
+		IF ((.C_FLAG AND CM_RPT) NEQ 0) THEN RETURN (-1);
+
+!+
+! Save the length of the replacement and make sure the aren't null
+!-
+
+		STRNODE [REPLEN] = CH$DIFF (.CSB [$CMPTR], .STRNODE [REPADDR]);
+		PA_ERRNO = EDT$_SUBSTRNUL;
+		IF ((.STRNODE [REPLEN] EQL 0) AND (.STRNODE [SRCHLEN] EQL 0))
+		    THEN RETURN (-1);
+		CSB [$CMINC] = .CSB [$CMINC] - 1;
+		CSB [$CMCNT] = .CSB [$CMCNT] - 1;
+		CSB [$CMPTR] = CH$PLUS (.CSB [$CMPTR], 1);
+
+!+
+! For a SUBSTITUTE command, then next atoms can be a range and switches.
+!-
+
+		IF (.CMDTYP EQL COM_SUBS) THEN
+		    BEGIN
+		    QCHAR = EDT$$PA_RANGE (1);
+		    IF (.QCHAR LEQ 0) THEN RETURN (.QCHAR);
+		    RETURN (EDT$$PA_SWITCH (FD_SUB));
+		    END;
+		END;
+
+	    [ COM_TYPE ] :
+
+		BEGIN
+		STS = EDT$$PA_RANGE (1);
+		IF (.STS LEQ 0) THEN RETURN (.STS);
+		RETURN (EDT$$PA_SWITCH (FD_TYP));
+		END;
+
+	    [ COM_HELP ] :
+
+		BEGIN
+		IF (NOT COMMAND (FD_TXT)) THEN RETURN (-1);
+		IF (.CC NEQ 0) THEN RETURN (-1);
+		IF ((.C_FLAG AND CM_RPT) NEQ 0) THEN RETURN (0);
+		IF ((.C_FLAG AND CM_NOP) NEQ 0) THEN
+		    PA_CURCMD [FSPCLEN] = 0
+		ELSE
+		    BEGIN
+		    EDT$$PA_SCANTOK (0,0);
+		    PA_CURCMD [FILSPEC] = .PA_CURTOK;
+		    PA_CURCMD [FSPCLEN] = .PA_CURTOKLEN;
+		    END;
+		END;
+
+	    [ COM_TADJ ] :
+
+		BEGIN
+		PA_ERRNO = EDT$_NUMVALREQ;
+		IF (NOT COMMAND (FD_ADJ)) THEN RETURN (-1);
+		IF (.CC NEQ 0) THEN RETURN (-1);
+		IF ((.C_FLAG AND CM_RPT) NEQ 0) THEN RETURN (0);
+		IF ((.C_FLAG AND CM_NOP) NEQ 0) THEN RETURN (-1);
+		IF (.C_FDB<0,18> EQL FD_ADJ) THEN
+		    BEGIN
+		    IF (NOT COMMAND (FD_VAL)) THEN RETURN (-1);
+		    IF (.CC NEQ 0) THEN RETURN (-1);
+		    IF ((.C_FLAG AND CM_RPT) NEQ 0) THEN RETURN (0);
+		    IF ((.C_FLAG AND CM_NOP) NEQ 0) THEN RETURN (-1);
+		    END;
+		PA_ERRNO = EDT$_NUMVALILL;
+		STS = 1;
+		IF (.C_DATA LSS 0) THEN 
+		    BEGIN
+		    STS = -1;
+		    C_DATA = - .C_DATA;
+		    END;
+		IF ((.C_DATA GEQ 32768) OR (.C_DATA * .TAB_SIZ GEQ 256)) THEN
+		    RETURN (-1);
+		PA_CURCMD [TAB_COUNT] = .STS * .C_DATA;
+		STS = EDT$$PA_RANGE (1);
+		IF (.STS LEQ 0) THEN RETURN (.STS);
+		END;
+
+	    [ COM_TRACE ] :
+
+		BEGIN
+		PA_ERRNO = EDT$_INVPARFOR;
+		IF ( NOT COMMAND (FD_TRC)) THEN RETURN (-1);
+		IF (.CC NEQ 0) THEN RETURN (-1);
+		IF ((.C_FLAG AND CM_RPT) NEQ 0) THEN RETURN (0);
+		IF ((.C_FLAG AND CM_NOP) NEQ 0) THEN RETURN (-1);
+		CMDTYP = .(.C_DATA)<0,18>;
+
+		PA_CURCMD [SET_TYPE] = .CMDTYP;
+		PA_CURCMD [AS_STR] = 0;			! Preset
+
+		IF (((.CMDTYP EQL TRC_ON) OR (.CMDTYP EQL TRC_OFF)) AND
+		    ((.C_FLAG AND CM_EOC) EQL 0))
+		THEN
+		    BEGIN
+		    IF ( NOT COMMAND (FD_TRR)) THEN RETURN (-1);
+		    IF (.CC NEQ 0) THEN RETURN (-1);
+		    IF ((.C_FLAG AND CM_RPT) NEQ 0) THEN RETURN (0);
+		    IF ((.C_FLAG AND CM_NOP) NEQ 0) THEN RETURN (-1);
+		    EDT$$PA_SCANTOK (1, 0);
+		    PA_CURCMD [AS_LEN] = .PA_CURTOKLEN;
+		    PA_CURCMD [AS_STR] = .PA_CURTOK;
+
+		    IF (.CMDTYP EQL TRC_ON) THEN EDT$$PA_SWITCH (FD_TRS);
+		    END;
+
+		END;
+
+	    [ COM_XDDT , COM_MAC_CALL , COM_PUSH ] :
+
+		;
+
+	    TES;
+
+	RETURN (1);
+	END;
+
+    END;
+
+
+END
+ELUDOM

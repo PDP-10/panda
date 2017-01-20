@@ -1,0 +1,3654 @@
+.title mm
+;	Start of Wcc edit history
+;
+;[W1]	Add move, copy, and sort commands. [JGD 20-7-86]
+;
+;[W2]	Add dcl and print commands. [JGD 22-7-86]
+;
+;[W3]	Add move, copy, and dcl to read and send level. [JGD 23-7-86]
+;
+;[W4]	Parse an exec line. [JGD 24-7-86]
+;
+;[W5]	Make command parsing uniform.	[JGD 25-7-86]
+;
+;[W6]	Fix broken init commands from patch 5 [JGD 3-9-86]
+;
+;	End of Wcc edit history
+
+.library	/sys$library:lib.mlb/
+.psect	code,exe,nowrt
+
+	.entry mm,^m<>
+
+.subtitle	initialization
+
+;	Get my user name, local host, and domain name
+
+start:	bsbw	getlcl				;get my host and domain
+	movb	lclhst,lhnasz			;make it useful to address routines
+	movc3	lclhst,lclhst+2,lhna
+	movb	lcldom,lnnasz
+	movc3	lcldom,lcldom+2,lnna
+
+;	Build a pointer to my mail.txt file in my login directory.
+
+	bsbw	getmine
+
+;	Turn off syspriv
+
+	bsbw	prvoff
+
+;	Read the mm.init file.
+
+	bsbw	mminit
+
+;	Do the unique files as well
+
+	movb	lcldirsz,tmpdirsz		;get the size of dev:<dir>mail.txt
+	subb2	mailtxt,tmpdirsz		;remove the size of "mail.txt.1"
+	movzbw	tmpdirsz,r6			;make it a word
+	movc3	r6,lcldir,tmpdir		;store the dev:<dir>
+	movzbw	unim,r7				;get the filename size
+	movc3	r7,unim+1,(r3)			;save the filename
+	movc3	r6,lcldir,tmpdir2		;store the dev:<dir>
+	movzbw	unim2,r7			;get the filename size
+	movc3	r7,unim2+1,(r3)			;save the filename
+	addb2	r7,tmpdirsz			;add the filename size
+	movb	tmpdirsz,tmpfab+fab$b_fns	;save the size
+
+;[W4]	Test for an input parameter.
+
+	bsbw	getinp				;[W4] read the command line
+	tstw	cmdsiz				;[W4] [W5] did we get any
+	beql	20$				;[W4] if not normal entry
+	jmp	55$				;[W4] parse the command
+
+20$:	tstb	f.file				;test for a mail.txt file
+	bneq	30$
+	jmp	50$				;don't execute if not there
+
+;	Display all flagged and new mail messages
+
+30$:	$connect rab = lclrab			;connect to record stream
+	blbs	r0,43$
+	jmp	rmserr				;signal an rms error
+43$:	tstb	f.bnk				;do we blank the screen?
+	beql	46$				;skip if not
+	movzbl	clrcrt,r7			;size of the home/blank sequence
+	movc3	r7,clrcrt+1,mbuf	
+	bsbw	snd				;send the prompt
+46$:	movl	#msg_b_flag,r0			;display flaged msgs
+	bsbw	dirmsg				;display the message
+	cmpl	#ss$_abort,r0			;did we get one
+	bneq	46$				;if not stop
+	$disconnect rab = lclrab		;break from record stream
+	blbs	r0,47$
+	jmp	rmserr				;signal an rms error
+47$:	$connect rab = lclrab			;connect to record stream
+	blbs	r0,48$
+	jmp	rmserr				;signal an rms error
+48$:	movl	#msg_b_new,r0			;display new msgs
+	bsbw	dirmsg				;display the message
+	cmpl	#ss$_abort,r0			;did we get one
+	bneq	48$				;if not stop
+	$disconnect rab = lclrab		;break from record stream
+	blbs	r0,50$
+	jmp	rmserr				;signal an rms error
+
+;	Main loop.  Get a command and execute it.
+
+50$:	bsbw	getcmd				;get a command
+55$:	moval	comands,cmdtbl			;point to the key table
+	bsbw	parcmd				;parse the argument
+	tstl	r0				;valid argument?
+	beql	60$	
+	blss	50$
+	jsb	(r0)				;go execute the routine
+	tstb	f.quit				;are we done
+	beql	50$				;if not get the next command
+
+;	Exit mm
+
+	movl	#ss$_normal,r0			;graceful exit
+	ret					;exit program
+
+;	Send error message
+
+60$:	movzbl	bcmderr,r7			;give an error
+	movc3	r7,bcmderr+1,mbuf
+	bsbw	snd				;send it
+	jmp	50$
+
+	
+.page
+.subtitle	Read routines
+
+;	Read a message.
+
+redmsg:	tstb	f.file				;test for a mail.txt file
+	bneq	5$				;don't execute if not there
+	rsb					;skip the command
+5$:	$connect rab = lclrab			;connect to record stream
+	blbs	r0,10$
+	jmp	rmserr				;signal an rms error
+
+10$:	moval	keys,cmdtbl			;point to the key table
+	bsbw	pararg				;parse the argument
+	tstl	r0				;did we succeed?
+	blss	12$				;less than zero = numeric
+	beql	101$
+	jmp	60$				;greater than zero alpha
+
+;	Here bad argument or no argument
+
+101$:	tstl	(r9)				;check for a negative number
+	bgeq	11$				;if not negative error
+	movl	#msg_b_new,(r9)			;default to new messages
+	jmp	60$
+
+11$:	movzbl	bargerr,r7			;give an error
+	movc3	r7,bargerr+1,mbuf
+	bsbw	snd				;send it
+	jmp	70$
+
+;	Here we have numeric argument(s) stack pointer r9
+
+12$:	movl	-(r9),r2			;get a number
+	cmpl	#unique,r2			;is this the eos?
+	bneq	15$				;if not process the argument
+	jmp	70$				;process the next
+
+;	Process the argument here
+
+15$:	movw	r2,msgnum			;get the number of the message
+	clrl	r0				;signal a specific msg
+	bsbw	getmsg				;get to the message
+	movzbl	clrcrt,r7			;size of the home/blank sequence
+	movc3	r7,clrcrt+1,mbuf	
+	bsbw	snd				;send the prompt
+	bsbw	dspmsg				;display the message
+
+;	Mark the message as being read
+
+	clrb	cbuf+msg_b_new			;Mark message read
+	movb	#82,cbuf+msg_b_read
+	bsbw	redcmd				;wait for the user
+	bsbw	mrkmsg
+	tstb	f.quit				;are we done
+	beql	12$				;if not get the next command
+	clrb	f.quit				;just quit reading
+	jmp	70$				;exit
+
+	;Process the keyword here the key is a longword in stack1
+
+60$:	movl	(r9),r0				;get a flag offset
+	bsbw	getmsg				;get to the message
+	cmpl	#ss$_abort,r0			;did we get one
+	beql	70$				;if not stop
+	movzbl	clrcrt,r7			;size of the home/blank sequence
+	movc3	r7,clrcrt+1,mbuf	
+	bsbw	snd				;send the prompt
+	bsbw	dspmsg				;display the message
+
+;	Mark the message as being read
+
+	clrb	cbuf+msg_b_new			;Mark message read
+	movb	#82,cbuf+msg_b_read
+	bsbw	redcmd				;wait for the user
+	bsbw	mrkmsg
+	tstb	f.quit				;are we done
+	beql	60$				;if not get the next command
+	clrb	f.quit				;just quit reading
+
+70$:	$disconnect rab = lclrab		;break from record stream
+	blbs	r0,80$
+	jmp	rmserr				;signal an rms error
+
+80$:	rsb
+
+
+.page
+redcmd:	movb	#13,mbuf			;store the cr
+	movb	#10,mbuf+1			;add the line feed
+	movl	#2,r7
+	bsbw	snd				;start with a fresh line
+
+10$:	moval	read_prom,r1			;set up for a read level prompt
+	bsbw	read				;read from the tty
+	moval	rcmds,cmdtbl			;point to the key table
+	bsbw	parcmd				;parse the argument
+	tstl	r0				;valid argument?
+	beql	60$	
+	blss	20$
+	jsb	(r0)				;go execute the routine
+	tstb	f.quit				;are we done
+	beql	10$				;if not get the next command
+
+;	Exit read level
+
+20$:	rsb
+
+;	Send error message
+
+60$:	movzbl	bcmderr,r7			;give an error
+	movc3	r7,bcmderr+1,mbuf
+	bsbw	snd				;send it
+	jmp	10$
+
+.page
+
+kilmsg:	movb	#68,cbuf+msg_b_del		;Mark message deleted
+	movl	(sp)+,pc			;return to callers caller
+	rsb
+
+rdmsg:	movb	#68,cbuf+msg_b_del		;Mark message deleted
+	rsb
+
+rudmsg:	clrb	cbuf+msg_b_del			;Mark message undeleted
+	rsb
+
+rfmsg:	movb	#70,cbuf+msg_b_flag		;Mark message flaged
+	rsb
+
+rufmsg:	clrb	cbuf+msg_b_flag			;Mark message unflaged
+	rsb
+
+.page
+;	Provide help at the read level
+
+rhelp:	moval	rhelpd,r0
+	bsbw	help
+	rsb
+
+
+.page
+;	[W3]	Copy/move message(s) to a file.
+
+rmovcpy:pushr	#^m<r1,r2,r3,r4,r5,r6,r7,r8,r9,r10,r11>
+	movb	#1,r11				;[W3] set the move flag
+	jmp	rcm1				;[W3] continue
+rcpymov:pushr	#^m<r1,r2,r3,r4,r5,r6,r7,r8,r9,r10,r11>
+	clrb	r11				;[W3] set the copy flag
+rcm1:	moval	cre_prom,r1			;[W3] set up for file prompt
+	bsbw	read				;[W3] read from the tty
+
+;	Pick up a file name
+
+	decw	cmdsiz				;[W3] [W5] skip the cr
+	movc3	cmdsiz,mbuf,inflnm		;[W3] [W5] store the filename
+	
+;	Try and open/create the file they specififed
+
+20$:	moval	inflnm,crefab+fab$l_fna		;[W3] store the names address
+	movb	cmdsiz,crefab+fab$b_fns		;[W3] [W5] and the size
+	$create	fab = crefab			;[W3] create/open the file
+	blbs	r0,30$
+
+;	Error say file not there and could not create it
+
+	movzbl	crserr,r1			;[W3] get the size of the message
+	moval	crserr+1,r2			;[W3] and the message
+	bsbw	sndtty				;[W3] send it
+	jmp	300$				
+
+30$:	$connect rab = crerab			;[W3] connect to record stream
+	blbs	r0,40$				;[W3] 
+	jmp	rmserr				;[W3] signal an rms error
+
+40$:	bsbw	rsfind				;[W3] find the top of the message
+	movw	#msg_control_siz,crerab+rab$w_rsz ;[W3] size of control record
+	movc3	#msg_control_siz,cbuf,mbuf	;[W3] copy the control buffer
+	$put	rab = crerab			;[W3] write the control record
+	bsbw	copy				;[W3] copy it and get past it
+	tstb	r11				;[W3] is this a copy or move
+	beql	230$				;[W3] copy means done
+
+;	Mark the message ...
+
+	movb	#68,cbuf+msg_b_del		;[W3] Mark message deleted
+
+;	Finished clean up
+
+230$:	$close	fab = crefab			;[W3] close the temporary file
+	blbs	r0,300$
+	jmp	rmserr				;[W3] signal an rms error
+300$:	popr	#^m<r1,r2,r3,r4,r5,r6,r7,r8,r9,r10,r11>
+	rsb
+
+
+.page
+;	Forward this mail message
+
+rfwd:	pushr	#^m<r1,r2,r3,r4,r5,r6,r7,r8,r9,r10,r11>
+	bsbw	rsfind				;[W3] find the record
+	bsbw	fwd				;do the forwarding routine
+	popr	#^m<r1,r2,r3,r4,r5,r6,r7,r8,r9,r10,r11>
+	rsb
+
+.page
+;	Type this mail message
+
+rtype:	pushr	#^m<r1,r2,r3,r4,r5,r6,r7,r8,r9,r10,r11>
+	bsbw	rsfind				;[W3] find the record
+	bsbw	dspmsg				;display the message
+	popr	#^m<r1,r2,r3,r4,r5,r6,r7,r8,r9,r10,r11>
+	rsb
+
+.page
+;[W3]	Make read/send find a subroutine.
+
+rsfind:	movb	lclrab+rab$b_rac,rabrac		;save the original rac
+	movb	#rab$c_rfa,lclrab+rab$b_rac	;set it for random access
+
+;	Point to the control record of the message
+
+	moval	lclrab,r0			;point to the rab block
+	movl	rabrfa1,rab$w_rfa(r0)		;replace the three word address
+	movw	rabrfa1+4,rab$w_rfa4(r0)	;with the control record address
+	$find	rab = lclrab			;point to the record
+	blbs	r0,10$
+	jmp	rmserr
+10$:	movb	rabrac,lclrab+rab$b_rac		;[W3] set it for original access mode
+
+;	Get past the control record and point to the first data record
+
+	$get	rab = lclrab			;get to the address
+	blbs	r0,20$
+	jmp	rmserr
+20$:	rsb
+
+
+.page
+.subtitle	General Routines
+
+;	Get the message specified.
+;	Input:	If r0 = 0 then msgnum contains the message number to search
+;		If r0 = number then r0 = the flag offset to search
+;	Output:	r0 = abort on failure
+;		r0 = normal on success
+;		cbuf contains the current control buffer on success
+;		lclrab points to the first data record on success
+;		rabrfa1 contains the record address of the control record
+
+getmsg:	movzbl	r0,r8				;save the flag/indicator
+5$:	$get	rab = lclrab			;get a control record
+	blbs	r0,10$
+	cmpl	r0,#rms$_eof			;have we hit eof?
+	beql	50$				;if so then error
+	jmp	rmserr				;handle error
+
+;	Save pointer to control record
+
+10$:	moval	lclrab,r0			;point to the rab block
+	movl	rab$w_rfa(r0),rabrfa1		;save the three word address
+	movw	rab$w_rfa4(r0),rabrfa1+4
+
+;	Make sure this is a control record
+
+	tstw	lclrab+rab$w_rsz		;make sure we have a control record
+	beql	5$
+
+;	Make sure this is the message we want.
+
+	tstb	r8				;what are we looking for?
+	beql	15$				;zero means a specific msg
+
+;	Here we want a flaged msg
+
+	tstb	mbuf[r8]			;is this a msg we want?
+	beql	19$				;no skip past this msg
+	jmp	80$				;yes return success
+
+;	Here we want a specific msg
+
+15$:	cmpw	msgnum,mbuf+msg_w_num		;is this the msg we want
+	beql	80$				;if so success
+
+;	Not this message.  Get past this message.
+
+19$:	movl	mbuf+msg_l_siz,r7		;use it as a counter
+20$:	$get	rab = lclrab			;get a data line
+	blbs	r0,30$
+	cmpl	r0,#rms$_eof			;have we hit eof?
+	beql	50$				;if so then error
+30$:	subw	lclrab+rab$w_rsz,r7 		;subtract size of the record
+	blss	50$				;negative means trouble
+	bgtr	20$				;get next line of this msg
+	jmp	5$				;end of this msg try next
+
+;	Error if here
+
+50$:	movl	#ss$_abort,r0
+	rsb
+
+;	Success if here
+
+80$:	movc3	#msg_control_siz,mbuf,cbuf	;store the control record
+	movl	mbuf+msg_l_siz,msgsiz		;get this msgs size
+	movl	#ss$_normal,r0
+	rsb
+
+
+.page
+;Display the message
+
+dspmsg:	movl	msgsiz,r7			;use it as a counter
+	movc5	#0,#0,#32,#80,corg		;clear the mail originator
+	movc5	#0,#0,#32,#80,csub		;clear the mail subject
+	clrw	corg
+	clrw	csub
+20$:	$get	rab = lclrab			;get a data line
+	blbc	r0,50$
+	tstw	lclrab+rab$w_rsz		;blank line means past headers
+	beql	30$
+
+;	Save header information
+
+	pushr	#^m<r7>
+	movzwl	lclrab+rab$w_rsz,r7 		;get size of the record
+	bsbw	savhdr				;get and save a header
+	popr	#^m<r7>
+
+30$:	subw	lclrab+rab$w_rsz,r7 		;subtract size of the record
+	blss	50$				;less than zero error
+
+;	Output the line
+
+	movzwl	lclrab+rab$w_rsz,tty		;fill in the descriptor
+	movc5	tty,mbuf,#0,#page,ttyb		;move the buffer
+	pushal	tty				;push the descriptor
+	calls	#1,g^lib$put_output		;send it
+	tstw	r7				;check if we are done
+	bgtr	20$				;end of this msg try next
+
+;	Successful completion if here
+
+	movl	#ss$_normal,r0			;signal success
+	rsb
+
+;	Error if here
+
+50$:	movl	#ss$_abort,r0			;signal error
+	rsb
+
+.page
+;	Get a command.
+
+getcmd:	moval	top_prom,r1			;set up for a top level prompt
+	bsbw	read				;read from the tty
+	rsb	
+
+
+.page
+;	Read a line from the tty.
+
+read::	pushal	cmdsiz				;[W5] size of input string
+	pushal	(r1)				;prompt
+	pushal	cmdbufd				;[W5] input buffer
+	calls	#3,g^lib$get_input		;read from tty
+
+;	Add a cr to the end of the command
+
+	moval	cmdbuf,r1			;[W5] get the buffer
+	addw2	cmdsiz,r1			;[W5] get to the end of the input
+	movb	#13,(r1)			;add a cr for command processing
+	incw	cmdsiz				;[W5] bump up the input size
+	movc3	cmdsiz,cmdbuf,mbuf		;[W5] copy cmd buffer in general buffer
+	moval	cmdbuf,cmdptr			;[W5] point to the buffer
+	rsb
+
+.page
+;	convert binary to text
+
+conbntx:pushr	#^m<r1,r2,r3,r4,r5,r6,r7>
+	pushaw binlen				;length to output
+	pushaw	text				;push the desc on the stack
+	pushaw	binary				;push the source on the stack
+	calls	#3,g^lib$cvt_dx_dx		;convert binary word to text
+
+;	right justify the text
+
+	movzwl	text,r1				;set up a counter
+	moval	txtout,r2			;point to the buffer
+	clrl	r6				;space counter	
+10$:	cmpb	(r2)+,#32			;count the spaces
+	bneq	20$				
+	incl	r6				;got a space
+20$:	sobgtr	r1,10$				;check next character		
+	tstl	r6				;any spaces
+	beql	90$				;if not we are done
+	moval	txtout,r1			;get the start of the buffer
+	addl2	r6,r1				;offset into buffer
+	subw3	r6,text,r7			;how much to shift
+	movc3	r7,txtout,(r1)			;shift the text
+	moval	txtout,r1			;get the start of the buffer
+30$:	movb	#32,(r1)+			;stick in a space
+	sobgtr	r6,30$				;check again
+90$:	popr	#^m<r1,r2,r3,r4,r5,r6,r7>
+	rsb
+
+
+.page
+quit:	tstb	f.exp				;do we expunge on exit
+	beql	10$				;if not skip it
+	movzbl	msg6,r7				;say we are expunging
+	movc3	r7,msg6+1,mbuf
+	bsbw	snd				;send it
+	bsbw	exp				;expunge deleted messages
+10$:	bsbw	makuni				;make a unique temp file
+	movb	#1,f.quit			;set the flag
+	rsb
+
+.page
+;	Send to th tty.
+;	r7 is the size of the buffer.
+;	mbuf is the buffer to send
+
+snd::	pushr	#^m<r1,r2,r3,r4,r5>
+	movl	r7,tty				;set the size
+	movc3	r7,mbuf,ttyb			;fill in the buffer
+	pushal	tty				;push the descriptor
+	calls	#1,g^lib$put_output		;send it
+	popr	#^m<r1,r2,r3,r4,r5>
+	rsb
+
+.page
+;	Provide top level help
+
+thelp:	moval	helpd,r0			;set the help and fall through
+
+;	Provide help
+
+help:	pushal	g^lib$get_input
+	pushl	#0
+	pushal	(r0)
+	pushl	#0
+	pushl	#0
+	pushal	g^lib$put_output
+	calls	#6,g^lbr$output_help
+	rsb
+
+.page
+;	Display the version of MM
+
+ver:	movzbl	prog,r7				;get the version message size
+	movc3	r7,prog+1,mbuf			;get the message
+	addl2	#vend,r7			;get the size of the version
+	movc3	#vend,vmajor,(r3)		;get the version data
+	bsbw	snd
+	rsb
+
+.page
+;	Write the current flag settings to mbuf
+
+wrtflag:moval	mbuf,r1				;point to buffer
+	tstb	cbuf+msg_b_new			;is this new
+	beql	10$				;if not don't flag it
+	movb	cbuf+msg_b_new,(r1)+		;flag it
+	jmp	15$
+10$:	movb	#32,(r1)+			;skip flag
+15$:	tstb	cbuf+msg_b_read			;is this read
+	beql	20$				;if not don't flag it
+	movb	cbuf+msg_b_read,(r1)+		;flag it
+	jmp	25$
+20$:	movb	#32,(r1)+			;skip flag
+25$:	tstb	cbuf+msg_b_ans			;is this answered
+	beql	30$				;if not don't flag it
+	movb	cbuf+msg_b_ans,(r1)+		;flag it
+	jmp	35$
+30$:	movb	#32,(r1)+			;skip flag
+35$:	tstb	cbuf+msg_b_del			;is this deleted
+	beql	40$				;if not don't flag it
+	movb	cbuf+msg_b_del,(r1)+		;flag it
+	jmp	45$
+40$:	movb	#32,(r1)+			;skip flag
+45$:	tstb	cbuf+msg_b_flag			;is this flaged
+	beql	50$				;if not don't flag it
+	movb	cbuf+msg_b_flag,(r1)+		;flag it
+	jmp	55$
+50$:	movb	#32,(r1)+			;skip flag
+55$:	tstb	cbuf+msg_b_key			;is this keyed
+	beql	60$				;if not don't flag it
+	movb	cbuf+msg_b_key,(r1)+		;flag it
+	jmp	65$
+60$:	movb	#32,(r1)+			;skip flag
+65$:	rsb
+
+
+.page
+;	Convert the ascii number to binary
+;	Input:	r1 pointer to ascii number
+;[W5]		r2 size of the ascii number
+;	Output:	msgnum (binary number)
+
+contxbn:pushal	msgnum				;binary message number
+	pushal	(r1)				;get the ascii number
+	pushl	r2				;[W5] digits in the ascii number
+	calls	#3,g^lib$cvt_dtb		;convert it to binary
+	rsb
+
+
+
+.page
+.subtitle	Directory routines
+
+;	Check for a file then clear the screen
+
+dir:	tstb	f.file				;test for a mail.txt file
+	bneq	5$				;don't execute if not there
+	rsb					;skip the command
+5$:	$connect rab = lclrab			;connect to record stream
+	blbs	r0,8$
+	jmp	rmserr				;signal an rms error
+
+;	Check for an argument
+
+8$:	tstw	cmdsiz				;no arguments are ok
+	bneq	11$				;zero means no argument
+10$:	clrl	r0				;display all messages
+	clrw	msgnum
+	bsbw	dirmsg				;display the message
+	cmpl	#ss$_abort,r0			;did we get one
+	bneq	10$				;if not stop
+	jmp	19$
+
+
+;	Parse the argument
+
+11$:	moval	keys,cmdtbl			;point to the key table
+	bsbw	pararg				;parse the argument
+	tstl	r0				;did we succeed?
+	blss	12$				;less than zero = numeric
+	bgtr	18$				;greater than zero alpha
+
+;	Here bad argument
+
+	movzbl	bargerr,r7			;give an error
+	movc3	r7,bargerr+1,mbuf
+	bsbw	snd				;send it
+	jmp	19$
+
+;	Here we have numeric argument(s) stack pointer r9
+
+12$:	movl	-(r9),r2			;get a number
+	cmpl	#unique,r2			;is this the eos?
+	beql	19$				;no process the next
+
+;	Process the argument here
+
+15$:	movw	r2,msgnum			;get the number of the message
+	clrl	r0				;siganl a specific msg
+	bsbw	dirmsg				;display the message
+	jmp	12$				;get the next
+
+	;Process the keyword here the key is a longword in stack1
+
+18$:	movl	(r9),r0				;get a flag offset
+	bsbw	dirmsg				;display the message
+	cmpl	#ss$_abort,r0			;did we get one
+	bneq	18$				;if not stop
+
+;	Finished clean up
+
+19$:	$disconnect rab = lclrab		;break from record stream
+	blbs	r0,20$
+	jmp	rmserr				;signal an rms error
+20$:	rsb
+
+
+
+.page
+;	Do a directory of the mail.txt file.
+;	Input:	If r0 = 0 then msgnum contains the message number to display
+;		If r0 = = and msgnum = 0 then all msgs
+;		If r0 = number then r0 = the flag offset to display
+;
+;	Output:	r0 = abort on failure
+;		r0 = normal on success
+;		lclrab points to the next control record on success
+
+dirmsg:	pushr	#^m<r1,r2,r3,r4,r5,r6,r7,r8,r9,r9,r10,r11>
+	movl	r0,r11				;save the offset/flag
+2$:	$get	rab = lclrab			;read a control record
+	blbs	r0,10$				;check for an error
+	cmpl	r0,#rms$_eof			;was it the eof?
+	bneq	5$				;if so were done
+	jmp	300$				;success exit
+5$:	jmp	rmserr				;else a bad error
+
+10$:	tstw	lclrab+rab$w_rsz		;make sure we have a control record
+	beql	2$
+	movc3	#msg_control_siz,mbuf,cbuf	;store the control record
+	movl	mbuf+msg_l_siz,r7		;get the msg size
+
+;	Test to see if we output this message
+
+	tstb	r11				;r11 = 0 means specific msg
+	bneq	15$				;do it	
+	tstw	msgnum				;msgnum = 0 means all msgs
+	beql	20$
+	cmpw	msgnum,mbuf+msg_w_num		;is this the msg we want
+	beql	20$				;if so success
+	jmp	17$				;skip this message get next
+15$:	tstb	cbuf[r11]			;tst this flag
+	bneq	20$				;non zero output it
+
+;	If here don't use this message.  Get past it.
+
+17$:	$get	rab = lclrab			;read a data record
+	blbs	r0,18$				;check for an error
+	jmp	rmserr				;else bad error
+18$:	subw	lclrab+rab$w_rsz,r7		;reduce the msg size by line size
+	bgtr	17$				;done with this message?
+	beql	19$
+	jmp	300$				;bad error if less
+19$:	jmp	2$				;get next control buffer
+
+;	If here we have a control record.  Process it and the message.
+
+20$:	movc5	#0,#0,#32,#80,corg		;clear the mail originator
+	movc5	#0,#0,#32,#80,csub		;clear the mail subject
+	clrw	corg
+	clrw	csub
+	movl	#-2,r10				;set up a header counter
+	clrl	r9				;set up a past header flag
+25$:	$get	rab = lclrab			;read a data record
+	blbs	r0,30$				;check for an error
+	jmp	rmserr				;any error is a bad error
+30$:	tstw	lclrab+rab$w_rsz		;blank line means past headers 
+	bneq	35$				;if not zero dont set flag
+	movl	#1,r9				;set the past header flag
+	jmp	50$				;skip the record
+35$:	pushr	#^m<r7>
+	movzwl	lclrab+rab$w_rsz,r7		;size of line
+	bsbw	savhdr				;get and save a header
+	popr	#^m<r7>
+	cmpl	r0,#ss$_abort			;did we get one?
+	beql	50$				;if we did increment counter
+	incl	r10				;got one
+50$:	subw	lclrab+rab$w_rsz,r7		;reduce the msg size by line size
+	beql	75$				;done with this message?
+	bgtr	55$				;bad error if less
+	jmp	300$				;error
+55$:	tstl	r9				;are we past the headers?
+	bneq	60$				;if so get past the msg body
+	tstl	r10				;not past headers do we have both headers?
+	bgeq	60$				;get another line if not
+	jmp	25$				;get the next header
+	
+;	If here we are past the headers or have both headers.  Get past rest
+;	of the msg.
+
+60$:	$get	rab = lclrab			;read a data record
+	blbs	r0,70$				;check for an error
+	jmp	rmserr				;else bad error
+70$:	subw	lclrab+rab$w_rsz,r7		;reduce the msg size by line size
+	bgtr	60$				;done with this message?
+	beql	75$
+	jmp	300$				;bad error if less
+
+;	We are now past this message. Output the data found 
+
+75$:
+;	The format for output is:
+;	msg# flags date_of_msg_delivery originator_of_msg subject_of_msg 
+
+80$:	movc5	#0,#0,#32,#80,mbuf		;start with a clean slate
+	bsbw	wrtflag				;check and write out flags	
+
+;	Convert the message number to ascii and output it.
+
+	pushr	#^m<r1>				;save the buffer pointer
+	movw	#3,binlen			;set the length
+	movw	cbuf+msg_w_num,binin
+	bsbw	conbntx				;convert binary to text
+	popr	#^m<r1>
+	movc3	text,txtout,(r1)		
+	movb	#41,(r3)+			;add a seperator
+
+;	Add the date of the message
+
+	movc3	#dir_date_sz,cbuf+msg_t_date,mbuf+dir_date ;add the date
+
+;	Add the sender "originator of the message.
+
+	movc5	corg,corg+2,#32,#dir_org_sz,mbuf+dir_org ;add the sender
+	addw2	corg,r7				;size of sender
+
+;	Add the subject of the message.
+
+	movc5	csub,csub+2,#32,#dir_sub_sz,mbuf+dir_sub ;add the subject
+
+;	Convert the message size to ascii and output it.
+
+	movw	#4,binlen			;set the length
+	movl	cbuf+msg_l_siz,binin
+	bsbw	conbntx				;convert binary to text
+	moval	mbuf,r3				;point to the input buffer
+	addl2	#dir_siz,r3			;add the offset
+	movb	#40,(r3)+			;add a seperator
+	movc3	text,txtout,(r3)		
+	movb	#41,(r3)+			;add a seperator
+
+	movl	#80,r7				;size of the line
+	bsbw	snd
+
+;	Return success
+
+	movl	#ss$_normal,r0			;signal success
+	popr	#^m<r1,r2,r3,r4,r5,r6,r7,r8,r9,r9,r10,r11>
+	rsb
+
+;	Error return
+
+300$:	movl	#ss$_abort,r0			;signal error
+	popr	#^m<r1,r2,r3,r4,r5,r6,r7,r8,r9,r9,r10,r11>
+	rsb
+
+
+
+.page
+;	Scan input for Subject: and From: headers
+;	Input:	mbuf	string
+;		r7 size of the string
+;	Output:	csub ascic "word" Subject line if found
+;		corg ascic "word" From line if found
+;		r0 = ss$_normal if a header is found ss$_abort if not found
+
+savhdr:	pushr	#^m<r1,r2,r3,r4,r5,r6,r7,r8,r9>
+	movc3	r7,mbuf,gbuf			;put string in a working buffer
+	moval	gbuf,r6				;upper case the buffer
+	bsbw	ucase				;do it	
+	movzbw	rfc2,r6				;get the size
+	matchc	r6,rfc2+1,r6,gbuf		;check for the from: header
+	bneq	10$				;if not found skip
+	movzbw	rfc2,r2
+	moval	mbuf,r8				;point to the input buffer
+	addw2	r2,r8				;get past the from:
+	subw3	r2,r7,r2
+
+;	Remove leading white space and save the sender
+
+	movzwl	r2,r7				;setup for the call
+	movl	r8,r6
+	bsbw	eatwht				;remove the white space
+	movw	r7,corg				;make it .ascic "word"
+	movc3	r7,(r6),corg+2			;process the mail originator
+	movl	#ss$_normal,r1			;flag it
+	jmp	20$				;skip the subject header
+
+;	From line not found look for Subject line
+
+10$:	movzbw	rfc1,r6				;get the size
+	matchc	r6,rfc1+1,r6,gbuf		;check for the subject: header
+	beql	15$				;if not found skip
+	movl	#ss$_abort,r0			;signal failure
+	jmp	20$
+15$:	movzbw	rfc1,r2
+	moval	mbuf,r8				;point to the input buffer
+	addw2	r2,r8				;get past the subject:
+	subw3	r2,r7,r2
+
+;	Remove leading white space and save the subject
+
+	movzwl	r2,r7				;setup for the call
+	movl	r8,r6
+	bsbw	eatwht				;remove the white space
+	movw	r7,csub				;make it ascii "word"
+	movc3	r7,(r6),csub+2			;process the mail subject
+	movl	#ss$_normal,r1			;flag it
+20$:	popr	#^m<r1,r2,r3,r4,r5,r6,r7,r8,r9>
+	rsb
+
+
+
+.page
+.subtitle	Message Marking routines
+
+;	Mark a message deleted
+
+delmsg:	movl	#68,r0				;mark it with a delete
+	movl	#msg_b_del,r1			;set the flag
+	bsbw	mrk				;mark the message(s)
+	rsb
+
+;	Mark a message undeleted
+
+udelmsg:clrl	r0				;mark it with an undelete
+	movl	#msg_b_del,r1			;set the flag
+	bsbw	mrk				;mark the message(s)
+	rsb
+
+.page
+;	Mark a message flaged
+
+flgmsg:	movl	#70,r0				;mark it with a flag
+	movl	#msg_b_flag,r1			;set the flag
+	bsbw	mrk				;mark the message(s)
+	rsb
+
+;	Mark a message unflaged
+
+uflgmsg:clrl	r0				;mark it with an unflag
+	movl	#msg_b_flag,r1			;set the flag
+	bsbw	mrk				;mark the message(s)
+	rsb
+
+
+.page
+;	Mark a series of messages.
+;	Input:	r0  character to mark the message with
+;		r1  offset into the control buffer
+
+mrk:	tstb	f.file				;test for a mail.txt file
+	bneq	5$				;don't execute if not there
+	rsb					;skip the command
+5$:	movl	r0,r10				;save the flag and offset
+	movl	r1,r11
+	$connect rab = lclrab			;connect to record stream
+	blbs	r0,10$
+	jmp	rmserr				;signal an rms error
+
+10$:	moval	keys,cmdtbl			;point to the key table
+	bsbw	pararg				;parse the argument
+	tstl	r0				;did we succeed?
+	blss	12$				;less than zero = numeric
+	bgtr	18$				;greater than zero alpha
+
+;	Here bad argument
+
+	movzbl	bargerr,r7			;give an error
+	movc3	r7,bargerr+1,mbuf
+	bsbw	snd				;send it
+	jmp	19$
+
+;	Here we have numeric argument(s) stack pointer r9
+
+12$:	movl	-(r9),r2			;get a number
+	cmpl	#unique,r2			;is this the eos?
+	beql	19$				;no process the next
+
+;	Process the argument here
+
+15$:	movw	r2,msgnum			;get the number of the message
+	clrl	r0				;signal a specific msg
+	bsbw	getmsg				;get to the message
+	cmpl	#ss$_abort,r0			;did we get one
+	beql	19$				;if not stop
+	bsbw	pstmsg				;and past it
+
+;	Mark the message ...
+
+	movb	r10,cbuf(r11)			;Mark the message
+	bsbw	mrkmsg
+	jmp	12$				;get the next
+
+	;Process the keyword here the key is a longword in stack1
+
+18$:	movl	(r9),r0				;get a flag offset
+	bsbw	getmsg				;get to the message
+	cmpl	#ss$_abort,r0			;did we get one
+	beql	19$				;if not stop
+	bsbw	pstmsg				;and past it
+
+;	Mark the message ...
+
+	movb	r10,cbuf(r11)			;Mark the message
+	bsbw	mrkmsg
+	jmp	18$				;thats all
+
+19$:	$disconnect rab = lclrab		;break from record stream
+	blbs	r0,20$
+	jmp	rmserr				;signal an rms error
+
+20$:	rsb
+
+
+.page
+;	Get past this message
+
+pstmsg:	movl	msgsiz,r7			;use it as a counter
+10$:	$get	rab = lclrab			;get a data line
+	blbc	r0,50$
+	subw	lclrab+rab$w_rsz,r7 		;subtract size of the record
+	blss	50$				;less than zero error
+	bgtr	10$				;end of this msg try next
+
+;	Successful completion if here
+
+	movl	#ss$_normal,r0			;signal success
+	rsb
+
+;	Error if here
+
+50$:	movl	#ss$_abort,r0			;signal error
+	rsb
+
+
+.page
+;	Mark a message
+;	Input:	cbuf contains the new control buffer
+;		rabrfa1 is the address of the record to update
+
+mrkmsg:	pushr	#^m<r1,r2,r3,r4,r5,r6,r7,r8,r9>
+	movl	#ss$_normal,r8			;assume success 
+	movb	lclrab+rab$b_rac,rabrac		;save the original rac
+	movb	#rab$c_rfa,lclrab+rab$b_rac	;set it for random access
+
+;	Save the record that we are currently pointing to
+	
+	moval	lclrab,r0			;point to the rab block
+	movl	rab$w_rfa(r0),rabrfa2		;save the three word address
+	movw	rab$w_rfa4(r0),rabrfa2+4
+
+;	Point to the control record
+
+	moval	lclrab,r0			;point to the rab block
+	movl	rabrfa1,rab$w_rfa(r0)		;replace the three word address
+	movw	rabrfa1+4,rab$w_rfa4(r0)	;with the control record address
+	$find	rab = lclrab			;point to the record
+	blbs	r0,10$
+	movl	#ss$_abort,r8			;signal problem
+
+;	Replace the control record.
+
+10$:	movw	#msg_control_siz,lclrab+rab$w_rsz ;size of the control
+	movc3	#msg_control_siz,cbuf,mbuf	;get the record
+	$update	rab = lclrab			;update the control record
+	blbs	r0,20$
+	movl	#ss$_abort,r8			;signal problem
+
+;	Point to the old current record
+
+20$:	moval	lclrab,r0			;point to the rab block
+	movl	rabrfa2,rab$w_rfa(r0)		;replace the with the old 
+	movw	rabrfa2+4,rab$w_rfa4(r0)	;three word address
+	$get	rab = lclrab			;get to the address
+	blbs	r0,30$
+	movl	#ss$_abort,r8			;signal problem
+30$:	movb	rabrac,lclrab+rab$b_rac		;set it for original access mode
+	movl	r8,r0				;get the flag
+	popr	#^m<r1,r2,r3,r4,r5,r6,r7,r8,r9>
+	rsb
+
+
+.page
+.subtitle	Send Routines
+
+;	Send a mail message.
+;	Build records in gbuf then store them in datbuf .ascic "word"
+
+;	Clear the buffers, pointers, and counters
+
+sndmsg:	bsbw	s.init				;init buffers
+
+;	Get header information
+
+	bsbw	s.date				;get the date
+	bsbw	s.sender			;get the return address
+	bsbw	s.to				;get main recpients
+	bsbw	s.cc				;get other recpients
+	bsbw	s.bcc				;get blind recpients
+	bsbw	s.subject			;get the subject
+
+;	Get the data
+
+	bsbw	snddat				;now get the data
+	cmpl	r0,#ss$_abort			;did we abort
+	beql	300$
+
+;	Write out the data file.
+
+	movb	#1,f.user			;flag a user write.
+	bsbw	prvon				;Turn on syspriv
+	bsbw	wfile				;do it
+	bsbw	prvoff				;Turn off syspriv
+
+;	send user a success message 
+
+	movzbl	msg1,r7		
+	movc3	r7,msg1+1,mbuf
+	bsbw	snd
+300$:	rsb
+
+
+.page
+;	Forward a mail message.
+;	Build records in gbuf then store them in datbuf .ascic "word"
+
+;	Point to the message we are replying to.
+
+fwdmsg:	tstb	f.file				;test for a mail.txt file
+	bneq	10$				;don't execute if not there
+	rsb					;skip the command
+10$:	$connect rab = lclrab			;connect to record stream
+	blbs	r0,20$
+	jmp	rmserr				;signal an rms error
+20$:	moval	nultbl,cmdtbl			;[W5] point to the null table
+	bsbw	pararg				;parse the argument
+	tstl	r0				;did we succeed?
+	blss	30$				;less than zero = numeric
+
+;	Here bad argument
+
+	movzbl	bargerr,r7			;give an error
+	movc3	r7,bargerr+1,mbuf
+	bsbw	snd				;send it
+	jmp	70$
+
+;	Here we have numeric argument(s) stack pointer r9
+
+30$:	movl	-(r9),msgnum			;get a number
+	cmpl	#unique,msgnum			;is this the eos?
+	beql	70$				;no process the next
+
+;	Process the argument here
+
+	clrl	r0				;siganl a specific msg
+	bsbw	getmsg				;get to the message
+	cmpl	r0,#ss$_abort			;does it exist?
+	beql	70$				;quit if not
+	
+	bsbw	fwd				;pointing at msg forward it
+
+70$:	$disconnect rab = lclrab		;break from record stream
+	blbs	r0,80$
+	jmp	rmserr				;signal an rms error
+80$:	rsb
+
+
+
+.page
+;	Forward a message
+;	Input:	Record stream pointing at first record in message
+
+fwd:	bsbw	s.init				;init buffers
+
+;	Get header information
+
+	bsbw	s.date				;get the date
+	bsbw	s.sender			;get the return address
+	bsbw	s.to				;get main recpients
+	bsbw	s.subject			;get the subject
+
+;	Get the data
+
+	bsbw	snddat				;now get the data
+	cmpl	r0,#ss$_abort			;did we abort
+	bneq	30$
+	jmp	300$				;abort this msg
+
+;	Seperate the messages
+
+30$:	movzbw	sepmsg,r1			;get the size
+	addw2	r1,dtbfsz			;add it in
+	movl	datptr,r3			;point to the data
+	movb	#cr,(r3)+			;store a crlf
+	movb	#lf,(r3)+
+	addw2	#2,dtbfsz			;account for the crlf
+	movc3	r1,sepmsg+1,(r3)		;add the seperator
+	movl	r3,datptr			;save the pointer
+
+;	Append the message to the bottom.
+
+	movl	msgsiz,r7			;use it as a counter
+40$:	$get	rab = lclrab			;get a data line
+	blbc	r0,300$
+	subw	lclrab+rab$w_rsz,r7 		;subtract size of the record
+	blss	300$				;less than zero error
+
+;	Copy the line
+
+	addw2	lclrab+rab$w_rsz,dtbfsz		;add the line size
+	movl	datptr,r3			;point to the data
+	movc3	lclrab+rab$w_rsz,mbuf,(r3)	;move the buffer
+	movb	#cr,(r3)+			;store a crlf
+	movb	#lf,(r3)+
+	addw2	#2,dtbfsz			;account for the crlf
+	movl	r3,datptr			;save the pointer
+	tstw	r7				;check if we are done
+	bgtr	40$				;end of this msg try next
+
+;	Write out the data file.
+
+	movb	#1,f.user			;flag a user write.
+	bsbw	prvon				;Turn on syspriv
+	bsbw	wfile				;do it
+	bsbw	prvoff				;Turn off syspriv
+
+;	send user a success message 
+
+	movzbl	msg1,r7		
+	movc3	r7,msg1+1,mbuf
+	bsbw	snd
+
+300$:	rsb
+
+
+.page
+;	Initialize buffers to send a message
+
+s.init:	movc5	#0,#0,#0,#maxdat,datbuf		;zero the data buffer
+	movc5	#0,#0,#0,#160,corg		;zero the originator buffer
+	movc5	#0,#0,#0,#160,ccc		;zero the cc buffer
+	movc5	#0,#0,#0,#160,cto		;zero the to field
+	movc5	#0,#0,#0,#160,csub		;zero the subject field
+	movc5	#0,#0,#0,#160,cdate		;zero the date field
+	movc5	#0,#0,#0,#maxrcp*maxpth,fwdbuf	;zero the forward buffer
+	movc5	#0,#0,#0,#maxrcp*maxpth,rlybuf	;zero the known buffer
+	movc5	#0,#0,#0,#maxrcp*maxpth,kwnbuf	;zero the relay buffer
+	movc5	#0,#0,#0,#80,mbxbuf		;zero the mailbox buffer
+	clrb	f.lcl				;local mail flag
+	clrb	f.kwn				;known site flag
+	clrb	f.rly				;relay site flag
+
+;	Force the mail flag
+
+	movb	#1,f.del			;delivery options flag
+
+	moval	datbuf,datptr			;reset the data pointer
+	clrw	dtbfsz				;clear the data buffer counter
+	moval	fwdbuf,fwdptr			;reset the forward pointer
+	clrw	fwbfsz				;clear the fwd buffer counter
+	moval	revbuf,revptr			;reset the reverse pointer
+	clrw	rebfsz				;clear the rev buffer counter
+	moval	lclbuf,lclptr			;pointer into local buffer
+	moval	kwnbuf,kwnptr			;pointer into known buffer
+	moval	rlybuf,rlyptr			;pointer into relay buffer
+	rsb
+
+
+.page
+;	Store the date/time for sending a message
+
+s.date:	$asctim_s timbuf = dtime		;get the time
+	moval	cdate,r3			;point to cdate
+	movzbw	rf_date,(r3)+			;get the date keyword size
+	movc3	cdate,rf_date+1,(r3)		;get the keyword
+	movb	#32,(r3)+			;space seperator
+	incw	cdate				;space size
+	movc3	dtime,time,(r3)			;store the date/time
+	addw2	dtime,cdate			;size of the date/time
+	movb	#cr,(r3)+			;store a crlf
+	movb	#lf,(r3)+
+	addw2	#2,cdate			;account for the crlf
+	rsb
+
+
+.page
+;	Get the return address to send a message
+;	Build a reverse buffer
+
+s.sender:movc3	itmsiz,itmadd,revbuf+1		;add my username
+	movw	itmsiz,rebfsz			;store the size
+	movb	#64,(r3)+			;a seperator "@"
+	incw	rebfsz
+	movzbw	lhnasz,r1			;get my hostname size
+	addw2	r1,rebfsz			;add it in
+	movc3	r1,lhna,(r3)			;add my host name
+	movb	#46,(r3)+			;add a seperator "."
+	incw	rebfsz
+	movzbw	lnnasz,r1			;get my domain name size
+	addw2	r1,rebfsz			;add it in
+	movc3	r1,lnna,(r3)			;add my host name
+	movb	rebfsz,revbuf			;reverse buffer is ascic 
+
+;	Store the sender
+
+	moval	corg,r3				;point to corg
+	movzbw	rf_from,(r3)+			;get the from keyword size
+	movc3	corg,rf_from+1,(r3)		;get the keyword
+	movb	#32,(r3)+			;space seperator
+	incw	corg				;space size
+
+;	Add a personal name if it exists
+
+	tstw	pnam				;do we have a personal name?
+	beql	10$
+	movc3	pnam,pnam+2,(r3)		;add it in
+	addw2	pnam,corg			;account for the size
+	movb	#32,(r3)+			;space seperator
+	incw	corg				;space size
+
+;	Enclose the address in "<>"
+
+	movb	#60,(r3)+			;seperator
+	incw	corg				;seperator size
+	movc3	rebfsz,revbuf+1,(r3)		;add the reverse buffer
+	addw2	rebfsz,corg			;size of the reverse buffer
+	movb	#62,(r3)+			;seperator
+	incw	corg				;seperator size
+	jmp	20$
+
+10$:	movc3	rebfsz,revbuf+1,(r3)		;add the reverse buffer
+	addw2	rebfsz,corg			;size of the reverse buffer
+
+;	Finish it off
+
+20$:	movb	#cr,(r3)+			;store a crlf
+	movb	#lf,(r3)+
+	addw2	#2,corg				;account for the crlf
+	rsb
+
+
+.page
+;	Store the recpients "To:" for sending a message
+
+s.to:	tstw	cmdsiz				;[W5] any arguments
+	bneq	10$				;[W5] if so skip
+	moval	to_prom,r1			;prompt to recpient
+	bsbw	read				;get the recpients
+	decw	cmdsiz				;[W5] skip the cr
+	beql	s.to				;nothing try again
+10$:	movl	cmdptr,r0			;[W5] get the pointer
+	movc3	cmdsiz,(r0),mbuf		;[W5] store in general buffer
+	bsbw	paradd				;parse the address line
+	tstl	r11				;must have at least one good address
+	bneq	20$				;r11 = zero means failure
+	clrw	cmdsiz				;[W5] start fresh
+	jmp	s.to				;[W5] and try again
+
+;	Add the "to:" line to the message
+
+20$:	moval	cto,r3				;point to cto
+	movzbw	rf_to,(r3)+			;get the to keyword size
+	movc3	cto,rf_to+1,(r3)		;get the keyword
+	movb	#32,(r3)+			;space seperator
+	incw	cto				;space size
+	movc3	cmdsiz,tbuf,(r3)		;[W5] get the recpients
+	addw2	cmdsiz,cto			;[W5] size of the recpients
+	movb	#cr,(r3)+			;store a crlf
+	movb	#lf,(r3)+
+	addw2	#2,cto				;account for the crlf
+300$:	rsb
+
+
+.page
+;	Check for "Cc:" for sending a message
+
+s.cc:	clrw	cmdsiz				;[W5] clear the buffer
+	tstb	f.cc				;do we cc msgs?
+	beql	10$				;skip if not
+	moval	cc_prom,r1			;prompt to recpient
+	bsbw	read				;get the recpients
+	decw	cmdsiz				;[W5] skip the cr
+	movl	cmdptr,r0			;[W5] get the pointer
+	movc3	cmdsiz,(r0),mbuf		;[W5] store in general buffer
+	tstw	cmdsiz				;[W5] if address(s) add a comma
+	beql	10$	
+	movb	#44,(r3)+			;add the comma
+	incw	cmdsiz				;[W5]
+10$:	movc3	dccl,dccl+2,(r3)		;add the default cc list
+	addw2	dccl,cmdsiz			;[W5] size of the list
+
+;	Do we have an address(s) to parse
+
+	tstw	cmdsiz				;[W5] do we have any address(s)
+	beql	200$
+	bsbw	paradd				;parse the address line
+	tstl	r11				;must have at least one good address
+	beql	200$				;r11 = zero means failure
+
+;	Add the "Cc:" line to the message
+
+	moval	ccc,r3				;point to ccc
+	movzbw	rf_cc,(r3)+			;get the cc keyword size
+	movc3	ccc,rf_cc+1,(r3)		;get the keyword
+	movb	#32,(r3)+			;space seperator
+	incw	ccc				;space size
+	movc3	cmdsiz,tbuf,(r3)		;[W5] get the recpients
+	addw2	cmdsiz,ccc			;[W5] size of the recpients
+	movb	#cr,(r3)+			;store a crlf
+	movb	#lf,(r3)+
+	addw2	#2,ccc				;account for the crlf
+200$:	rsb
+
+
+.page
+;	Check for "Bcc:" for sending a message
+
+s.bcc:	clrw	cmdsiz				;[W5] clear the buffer
+	tstb	f.bcc				;do we bcc msgs?
+	beql	10$				;skip if not
+	moval	bcc_prom,r1			;prompt to recpient
+	bsbw	read				;get the recpients
+	decw	cmdsiz				;[w5] skip the cr
+	movl	cmdptr,r0			;[W5] get the pointer
+	movc3	cmdsiz,(r0),mbuf		;[W5] store in general buffer
+	tstw	cmdsiz				;[W5] if address(s) add a comma
+	beql	10$	
+	movb	#44,(r3)+			;add the comma
+	incw	cmdsiz				;[W5]
+10$:	movc3	dbccl,dbccl+2,(r3)		;add the default cc list
+	addw2	dbccl,cmdsiz			;[W5] size of the list
+
+;	Do we have an address(s) to parse
+
+	tstw	cmdsiz				;[W5] do we have any address(s)
+	beql	200$
+	bsbw	paradd				;parse the address line
+200$:	rsb
+
+
+.page
+;	Store the subject for send a message
+
+s.subject:moval	sub_prom,r1			;prompt for subject
+	bsbw	read				;get the subject
+	decw	cmdsiz				;[W5] skip the cr
+	beql	10$
+	moval	csub,r3				;point to csub
+	movzbw	rf_subject,(r3)+		;get the subject keyword size
+	movc3	csub,rf_subject+1,(r3)		;get the keyword
+	movb	#32,(r3)+			;space seperator
+	incw	csub				;space size
+	movc3	cmdsiz,mbuf,(r3)		;[W5] get the subject
+	addw2	cmdsiz,csub			;[W5] size of the subject
+	movb	#cr,(r3)+			;store a crlf
+	movb	#lf,(r3)+
+	addw2	#2,csub				;account for the crlf
+10$:	rsb
+
+
+
+.page
+;	Parse the to line validating individual addresses
+;	If an address is valid add the address to a list
+
+;	Input:	address line stored in mbuf:
+;	Output:	address line stored in t1buf
+;		success flag in r11 (at least one valid address)
+
+
+paradd:	movc3	cmdsiz,mbuf,tbuf		;[W5] store the address(s)
+	movc3	cmdsiz,mbuf,t1buf		;[W5] store the address(s)
+	clrl	r11				;flag for a good address
+	moval	t1buf,r6			;point to the first address
+	movzwl	cmdsiz,r7			;[W5] size of the address	
+	bsbw	ucase				;make it uppercase
+	moval	t1buf,r10			;point to the first address
+	movzwl	cmdsiz,r9			;[W5] size of the address	
+
+10$:	matchc	#1,#44,r9,(r10)			;more than one address here?
+	bneq	20$				;if not send the last address
+	subl3	r10,r3,r7			;compute size of next address
+	decl	r7				;don't include the comma
+	movl	r10,r6				;point to the address
+	movq	r2,r9				;store next pointer and size
+	jmp	30$				;skip last address
+20$:	movzwl	r9,r7				;get size of last address
+	movl	r10,r6				;point to last address
+	clrl	r9				;signal last address
+
+;	Here we have an address isolated check for a host name
+
+30$:	pushr	#^m<r1,r2,r3,r4,r5,r6,r7,r8,r9,r10,r11>
+	movc3	r7,(r6),mbuf			;put the address in mbuf
+	moval	mbuf,r6				;point to mbuf
+	matchc	#1,#64,r7,(r6)			;any hosts?
+	beql	40$				;if a "@" found assume a host
+	matchc	#1,#37,r7,(r6)			;any hosts?
+	bneq	60$				;if a "%" found assume a host
+40$:	tstw	r2				;any text left (must have some)
+	bneq	50$				;text continue
+	decw	r7				;back up one and add local host
+	jmp	60$
+
+;	Check for a domain name
+
+50$:	matchc	#1,#46,r2,(r3)			;is there a domain name
+	bneq	70$				;if "." then yes
+	tstw	r2				;any text left (must have some)
+	bneq	80$				;text continue
+	decw	r7				;back up one and add local host
+	jmp	70$				;add the local domain name
+
+;	No host or domain means it must be local
+
+60$:	movb	#64,(r3)+			;add a user host seperator
+	incw	r7
+	movc3	lclhst,lclhst+2,(r3)		;add my hostname
+	addw2	lclhst,r7
+70$:	movb	#46,(r3)+			;add a host domain seperator
+	incw	r7
+	movc3	lcldom,lcldom+2,(r3)		;add my domain name
+	addw2	lcldom,r7
+
+80$:	bsbw	prvon				;Turn on syspriv
+	bsbw	mapfil				;this must be correct process
+	bsbw	chkadd				;chk and store valid address
+	movl	r0,r10
+	bsbw	prvoff				;Turn off syspriv
+	movl	r10,r0
+	popr	#^m<r1,r2,r3,r4,r5,r6,r7,r8,r9,r10,r11>
+
+;	Test for a good or bad address
+
+	cmpl	#ss$_normal,r0			;was it a good address?
+	bneq	90$				;if not send an error msg
+	movl	#1,r11				;flag at least one good address
+	jmp	100$
+
+;	Flag a bad address.
+	
+90$:	pushr	#^m<r1,r2,r3,r4,r5,r6,r7>
+	movc3	r7,(r6),mbuf			;get the address
+	movzbw	er1,r2				;get the error msg
+	addw2	r2,r7				;save the size
+	movc3	r2,er1+1,(r3)			;save the msg
+	bsbw	snd				;send it
+	popr	#^m<r1,r2,r3,r4,r5,r6,r7>
+
+100$:	tstw	r9				;is this the last address?
+	beql	110$				;if not get another
+	jmp	10$
+110$:	rsb
+
+.page
+insfil:	pushr	#^m<r1,r2,r3,r4,r5,r6,r7>
+	moval	ins_prom,r1			;set up for insert prompt
+	bsbw	read				;read from the tty
+
+;	Pick up a file name
+
+	decw	cmdsiz				;[W5] skip the cr
+	movc3	cmdsiz,mbuf,inflnm		;[W5] store the filename
+	
+;	Try and open the file they specififed
+
+20$:	moval	inflnm,tmpfab+fab$l_fna		;store the names address
+	movb	cmdsiz,tmpfab+fab$b_fns		;[W5] and the size
+	$open	fab = tmpfab			;is it there?
+	blbs	r0,30$
+
+;	error say file not there
+
+	movzbl	inserr,r1			;get the size of the message
+	moval	inserr+1,r2			;and the message
+	bsbw	sndtty				;send it
+	jmp	100$				
+
+;	Copy the file to the data buffer
+
+30$:	$connect rab = tmprab			;connect to record stream
+	blbs	r0,40$
+	jmp	rmserr				;signal an rms error
+40$:	movl	r10,r3				;point to the end of the data
+45$:	$get	rab = tmprab			;get a record
+	blbs	r0,60$			
+	cmpl	r0,#rms$_eof			;is this the end?
+	bneq	50$				;if not die
+	jmp	70$				;hit eof update and exit	
+50$:	jmp	rmserr				;signal an rms error
+60$:	addw2	tmprab+rab$w_rsz,dtbfsz		;add the line size
+	addw2	#2,dtbfsz			;and for a crlf
+	movc3	tmprab+rab$w_rsz,mbuf,(r3)	;add the text
+	movb	#cr,(r3)+			;add the crlf
+	movb	#lf,(r3)+
+	jmp	45$				;get the next line
+
+;	We have the file, close files and update pointers
+	
+70$:	$disconnect rab = tmprab		;break the stream
+	blbs	r0,80$
+	jmp	rmserr				;signal an rms error
+80$:	$close	fab = tmpfab			;close the temporary file
+	blbs	r0,90$
+	jmp	rmserr				;signal an rms error
+90$:	movl	r3,r10				;update the data pointer
+	movl	r3,datptr			;update the data pointer
+100$:	movzbl	eofmsg,r7			;size of the prompt
+	movc3	r7,eofmsg+1,mbuf		;get the prompt
+	bsbw	snd				;send the prompt
+	popr	#^m<r1,r2,r3,r4,r5,r6,r7>
+	rsb
+
+
+.page
+abrt:	movzbl	abrmsg,r1			;get the size of the message
+	moval	abrmsg+1,r2			;and the message
+	bsbw	sndtty				;send it
+
+;	Get a confirmation
+	
+	moval	ttbuf,r2			;get a character
+	bsbw	rdrtty	
+	cmpb	#89,ttbuf			;Is it a "Y:
+	beql	30$
+	cmpb	#121,ttbuf			;Is it a "y"
+	beql	30$
+	movl	#ss$_normal,r0			;forget the abort
+	rsb	
+30$:	movl	#ss$_abort,r0			;abort the send
+	rsb
+
+
+.page
+
+;	Use the editor
+;	Write the current data to a file.
+
+getedt:	pushr	#^m<r1,r2,r3,r4,r5,r6,r7,r8,r9>
+	bsbw	makuni				;make a unique temp file
+	moval	tmpdir,tmpfab+fab$l_fna		;start with one
+	movb	tmpdirsz,tmpfab+fab$b_fns
+	$create	fab = tmpfab			;create a temporary file
+	blbs	r0,10$
+	jmp	rmserr				;signal an rms error
+10$:	$connect rab = tmprab			;connect to it
+	blbs	r0,15$
+	jmp	rmserr				;signal an rms error
+15$:	moval	datbuf,r6			;point to the data buffer
+	movw	dtbfsz,r9			;size of the data buffer
+20$:	matchc	#1,#cr,r9,(r6)			;find an eol
+	beql	30$				;if not found use rest of input
+	movw	r9,tmprab+rab$w_rsz		;store the size
+	movc3	tmprab+rab$w_rsz,(r6),mbuf	;get the text
+	$put	rab = tmprab			;output the text
+	jmp	50$				;and exit
+30$:	subl3	r6,r3,r5			;get the size of this line
+	subw2	r5,r9				;bump the count down
+	decl	r5				;don't count the cr
+	cmpb	#lf,(r3)			;did we get a lf
+	bneq	40$				;if so skip it
+	decw	r9				;bump the count down
+	incl	r3				;skip the lf
+40$:	movw	r5,tmprab+rab$w_rsz		;store the size
+	pushr	#^m<r1,r2,r3,r4,r5>
+	movc3	tmprab+rab$w_rsz,(r6),mbuf	;get the text
+	$put	rab = tmprab			;output the text
+	popr	#^m<r1,r2,r3,r4,r5>	
+	movl	r3,r6				;update the pointer
+	jmp	20$				;get the next line
+50$:	$disconnect rab = tmprab		;break the stream
+	blbs	r0,70$
+	jmp	rmserr				;signal an rms error
+70$:	$close	fab = tmpfab			;close the temporary file
+	blbs	r0,80$
+	jmp	rmserr				;signal an rms error
+
+;	Now invoke the editor.
+
+80$:	moval	edtfil,r1			;build the descriptor
+	movzwl	(r1)+,r0			;get the command size
+	movw	(r1)+,r2			;get to the address
+	movl	(r1),r1				;get the address
+	addl2	r0,r1				;get past the command
+	pushr	#^m<r6>
+	movzbw	tmpdirsz,r6			;get the size of the filename
+	addw2	r6,edtfil			;add the filename size	
+	movc3	r6,tmpdir,(r1)			;add the filename
+	pushal	edtfil
+	calls	#1,g^lib$spawn			;go edit
+	subw2	r6,edtfil			;remove the filename size	
+
+;	Now write the file back to the data buffer and delete the file.
+
+	moval	tmpdir2,tmpfab+fab$l_fna	;pick up two
+	movb	r6,tmpfab+fab$b_fns
+	popr	#^m<r6>
+	$open	fab = tmpfab			;open the temporary file
+	blbs	r0,90$
+
+;	If tmp number two not there forget about it
+
+	jmp	190$
+
+90$:	$connect rab = tmprab			;connect to it
+	blbs	r0,100$
+	jmp	rmserr				;signal an rms error
+100$:	moval	datbuf,r3			;point to the data buffer
+	clrw	dtbfsz				;clear the buffer counter
+110$:	$get	rab = tmprab			;get a text line
+	blbs	r0,130$			
+	cmpl	r0,#rms$_eof			;is this the end?
+	bneq	120$				;if not die
+	movl	r3,datptr			;update the data pointer
+	jmp	170$				;and exit		
+120$:	jmp	rmserr				;signal an rms error
+130$:	addw2	tmprab+rab$w_rsz,dtbfsz		;add the line size
+	addw2	#2,dtbfsz			;and for a crlf
+	movc3	tmprab+rab$w_rsz,mbuf,(r3)	;add the text
+	movb	#cr,(r3)+			;add the crlf
+	movb	#lf,(r3)+
+	jmp	110$				;get the next line
+	
+170$:	$disconnect rab = tmprab		;break the stream
+	blbs	r0,180$
+	jmp	rmserr				;signal an rms error
+180$:	$close	fab = tmpfab			;close the temporary file
+	blbs	r0,185$
+	jmp	rmserr				;signal an rms error
+185$:	movl	r3,r10				;update pointers
+	movl	r3,datptr
+190$:	bsbw	makuni				;make a unique temp file
+
+	popr	#^m<r1,r2,r3,r4,r5,r6,r7,r8,r9>
+	rsb
+
+
+.page	
+snddat:	movzbl	dat_prom,r7			;size of the prompt
+	movc3	r7,dat_prom+1,mbuf		;get the prompt
+	pushr	#^m<r1>
+	bsbw	snd				;send the prompt
+	popr	#^m<r1>
+	movzbl	(r1)+,r7			;get the second line
+	movc3	r7,(r1),mbuf
+	bsbw	snd				;send the prompt
+
+	bsbw	gettty
+	bsbw	newline				;start with a fresh line
+	movl	datptr,r10			;get the data buffer pointer
+	bsbw	getdata				;get the data
+	rsb
+
+.page
+getdata:bsbw	disctl				;disable control characters
+	tstb	f.ed				;do we edit automatically?
+	beql	getdat				;continue if not
+	movb	#5,ttbuf			;force editor use
+	jmp	getda
+
+getdat:	$qiow_s chan = ttchan,-			;Read a packet from the port
+		iosb = ttiosb,-			;Save the status and count
+		func = #io$_readvblk!io$m_trmnoecho,-	;Read function
+		p1   = ttbuf,-			;Store what is read at packet
+		p2   = #ttbufsz,-		;Read up to the maximum size
+		p4   = #eopmsk			;End read if eop
+	blbs	r0,getda
+	jmp	rmserr				;signal an rms error
+
+
+;	Check for control characters
+
+getda:	cmpb	#2,ttbuf			;Ctl B = insert file
+	bneq	20$
+	bsbw	newline
+	bsbw	enactl				;enable control characters
+	bsbw	insfil				;insert a file
+	bsbw	disctl				;disable control characters
+	jmp	getdat
+20$:	cmpb	#3,ttbuf			;Ctl C = exit editor
+	bneq	30$
+	bsbw	enactl
+	bsbw	makuni				;delete tmp files
+	movl	#ss$_normal,r0
+	ret					;exit mm (find a nice exit)
+30$:	cmpb	#5,ttbuf			;Ctl E = use editor
+	bneq	40$
+	bsbw	enactl				;enable control characters
+	bsbw	getedt
+	bsbw	editprom
+	bsbw	disctl				;disable control characters
+	jmp	getdat
+40$:	cmpb	#8,ttbuf			;backspace is necessary
+	bneq	50$
+	bsbw	bckup
+	jmp	getdat
+50$:	cmpb	#12,ttbuf			;Ctl L = redisplay
+	bneq	60$
+	bsbw	enactl				;enable control characters
+	bsbw	redis
+	bsbw	disctl				;disable control characters
+	jmp	getdat
+60$:	cmpb	#13,ttbuf			;carriage return?
+	bneq	70$
+	bsbw	crrt
+	jmp	getdat
+70$:	cmpb	#14,ttbuf			;Ctl N = abort send
+	bneq	80$
+	bsbw	enactl				;enable control characters
+	bsbw	newline
+	bsbw	abrt
+	movl	r0,r6				;save the flag
+	bsbw	newline				;start with a fresh line
+	movl	r6,r0				;restore the flag
+	cmpl	r0,#ss$_abort			;did we get a confirmation?
+	beql	75$
+	bsbw	disctl				;disable control characters
+	jmp	getdat				;don't abort
+75$:	rsb					;return to mm
+80$:	cmpb	#26,ttbuf			;Ctl Z = done adding data
+	bneq	85$	
+	bsbw	enactl				;enable control characters
+	bsbw	newline
+	movl	r10,datptr			;update the data pointer
+	movl	#ss$_normal,r0			;signal success
+	rsb
+85$:	cmpb	#127,ttbuf			;Delete character
+	bneq	90$	
+	bsbw	delch
+	jmp	getdat
+90$:	cmpb	#27,ttbuf			;Escape to send level
+	bneq	200$	
+	bsbw	enactl				;enable control characters
+	bsbw	sndcmd
+	movl	r0,r6				;save the flag
+	bsbw	disctl				;disable control characters
+	movl	r6,r0				;restore the flag
+	jmp	getdat
+
+;	Not a control character so enter it as data
+
+200$:	incw	dtbfsz				;add the character
+	movb	ttbuf,(r10)+			;save the character
+	movl	r10,datptr			;update the data buffer pointer
+	jmp	getdat
+
+
+
+.page
+.subtitle	Send Level Commands
+
+sndcmd:	movb	#13,mbuf			;store the cr
+	movb	#10,mbuf+1			;add the line feed
+	movl	#2,r7
+	bsbw	snd				;start with a fresh line
+
+10$:	moval	send_prom,r1			;set up for a send level prompt
+	bsbw	read				;read from the tty
+	moval	scmds,cmdtbl			;point to the key table
+	bsbw	parcmd				;parse the argument
+	tstl	r0				;valid argument?
+	beql	60$	
+	blss	10$
+	jsb	(r0)				;go execute the routine
+	tstb	f.quit				;are we done
+	beql	10$				;if not get the next command
+
+;	Send error message
+
+60$:	movzbl	bcmderr,r7			;give an error
+	movc3	r7,bcmderr+1,mbuf
+	bsbw	snd				;send it
+	jmp	10$
+
+
+.page
+;	Provide help
+
+shelp:	moval	shelpd,r0
+	bsbw	help
+	rsb
+
+
+;	Return back to top level
+
+squit:	movl	(sp)+,r0			;return to send level
+	movl	(sp)+,r0			;return to top level
+	movl	#ss$_abort,r0			;don't send this
+	rsb
+
+
+;	Exit back to send
+
+sexit:	bsbw	editprom
+	bsbw	newline				;start with a fresh line
+	movl	(sp)+,r0			;return to callers caller
+	rsb
+
+;	Display the message
+
+sdisp:	bsbw	redis
+	rsb
+
+;	Send the message
+
+ssend:	movl	(sp)+,r0			;return to send level
+	movl	(sp)+,r0			;return to top level
+	movl	#ss$_normal,r0			;send this
+	rsb
+
+;	Add carbon copy recpient(s)
+
+scc:	tstw	cmdsiz				;[W5] test the buffer
+	bneq	10$				;[W5] don't prompt if we have data
+	moval	cc_prom,r1			;prompt to recpient
+	bsbw	read				;get the recpients
+	decw	cmdsiz				;[W5] skip the cr
+
+;	Do we have an address(s) to parse
+
+	tstw	cmdsiz				;[W5] do we have any address(s)
+	bneq	10$
+	jmp	200$
+10$:	movl	cmdptr,r0			;[W5] get the pointer
+	movc3	cmdsiz,(r0),mbuf		;[W5] store in general buffer
+	bsbw	paradd				;parse the address line
+	tstl	r11				;must have at least one good address
+	bneq	20$	
+	jmp	200$				;r11 = zero means failure
+
+;	Is there a CC list already?
+
+20$:	tstw	ccc				;is there a list?
+	bneq	30$				;if not start from scratch
+
+;	No CC(s) exist start fresh
+
+	moval	ccc,r3				;point to ccc
+	movzbw	rf_cc,(r3)+			;get the cc keyword size
+	movc3	ccc,rf_cc+1,(r3)		;get the keyword
+	movb	#32,(r3)+			;space seperator
+	incw	ccc				;space size
+	movc3	cmdsiz,tbuf,(r3)		;[W5] get the recpients
+	addw2	cmdsiz,ccc			;[W5] size of the recpients
+	movb	#cr,(r3)+			;store a crlf
+	movb	#lf,(r3)+
+	addw2	#2,ccc				;account for the crlf
+	jmp	200$
+
+;	Append to the end cc list
+
+30$:	moval	ccc,r3				;point to ccc
+	addw2	ccc,r3				;point to the end
+	movb	#44,(r3)+			;add the comma
+	incw	ccc
+	movc3	cmdsiz,tbuf,(r3)		;[W5] get the recpients
+	addw2	cmdsiz,ccc			;[W5] size of the recpients
+	movb	#cr,(r3)+			;store a crlf
+	movb	#lf,(r3)+
+200$:	rsb
+
+
+;	Add blind carbon copy recpient(s)
+
+sbcc:	tstw	cmdsiz				;[W5] test the buffer
+	bneq	10$				;[W5] don't prompt if we have data
+	moval	bcc_prom,r1			;prompt to recpient
+	bsbw	read				;get the recpients
+	decw	cmdsiz				;[W5] skip the cr
+
+;	Do we have an address(s) to parse
+
+	tstw	cmdsiz				;[W5] do we have any address(s)
+	beql	20$
+10$:	movl	cmdptr,r0			;[W5] get the pointer
+	movc3	cmdsiz,(r0),mbuf		;[W5] store in general buffer
+	bsbw	paradd				;parse the address line
+20$:	rsb
+
+
+
+
+.page
+;	Delete any unique files
+
+makuni:	moval	tmpdir,tmpfab+fab$l_fna		;delete number one
+	movb	tmpdirsz,tmpfab+fab$b_fns
+	$erase	fab = tmpfab			;delete the temporary file
+	moval	tmpdir2,tmpfab+fab$l_fna	;delete number two
+	$erase	fab = tmpfab			;delete the temporary file
+	rsb					;ignore errors	
+
+
+.page
+;	Reply to message
+
+repmsg:	tstb	f.file				;test for a mail.txt file
+	bneq	10$				;don't execute if not there
+	rsb					;skip the command
+10$:	$connect rab = lclrab			;connect to record stream
+	blbs	r0,20$
+	jmp	rmserr				;signal an rms error
+20$:	moval	nultbl,cmdtbl			;[W5] point to the null table
+	bsbw	pararg				;parse the argument
+	tstl	r0				;did we succeed?
+	blss	25$				;less than zero = numeric
+
+;	Here bad argument
+
+	movzbl	bargerr,r7			;give an error
+	movc3	r7,bargerr+1,mbuf
+	bsbw	snd				;send it
+	jmp	60$
+
+;	Here we have numeric argument(s) stack pointer r9
+
+25$:	movl	-(r9),msgnum			;get a number
+	cmpl	#unique,msgnum			;is this the eos?
+	beql	60$				;no process the next
+
+;	Process the argument here
+
+	clrl	r0				;siganl a specific msg
+	bsbw	getmsg				;get to the message
+	cmpl	r0,#ss$_abort			;does it exist?
+	bneq	30$				;quit if not
+	jmp	60$
+
+;	Get the sender of this message = recpient of my message
+
+30$:	movl	msgsiz,r9			;use it as a counter
+
+40$:	$get	rab = lclrab			;get a data line
+	blbs	r0,50$
+	jmp	60$				;signal an rms error
+
+;	Save the subject and message originator
+
+50$:	tstw	lclrab+rab$w_rsz		;are we past the headers
+	beql	55$				;if so reply
+	movzwl	lclrab+rab$w_rsz,r7		;get size of the line
+	bsbw	savhdr				;get and save a hedaer
+
+;	Search all the file
+
+	subw	lclrab+rab$w_rsz,r9 		;subtract size of the record
+	tstw	r9				;any left in this message
+	bgtr	40$				;if not reply to sender
+
+;	Reply to the person.
+
+55$:	bsbw	rep				;reply to the message
+
+60$:	$disconnect rab = lclrab		;break from record stream
+	blbs	r0,70$
+	jmp	rmserr				;signal an rms error
+	
+70$:	rsb
+
+
+
+.page
+;	Input:	address to reply to in corg
+;		subject in csub
+
+rep:	pushr	#^m<r1,r2,r3,r4,r5,r6,r7,r8,r9,r10,r11>
+
+;	s.init destroys corg and c sub so save them away
+
+	movc3	corg,corg+2,mbuf+2		;save the originator 
+	movw	corg,mbuf			;size
+	movc3	csub,csub+2,gbuf+2		;save the subject
+	movw	csub,gbuf			;size
+
+	bsbw	s.init				;init buffers
+
+;	Restore csub and corg
+
+	movw	mbuf,corg			;size
+	movc3	mbuf,mbuf+2,corg+2		;buffer
+
+	moval	csub,r3				;point to the subject buffer
+	movzbw	rf_subject,(r3)+		;get the subject keyword size
+	movc3	csub,rf_subject+1,(r3)		;get the keyword
+	movb	#32,(r3)+			;space seperator
+	incw	csub				;space size
+	addw2	gbuf,csub			;size of the subject
+	movc3	gbuf,gbuf+2,(r3)		;store the subject
+	movb	#cr,(r3)+			;store a crlf
+	movb	#lf,(r3)+
+	addw2	#2,csub				;account for the crlf
+
+;	Setup to validate the address
+
+	movc3	corg,corg+2,mbuf		;fill the input buffer
+	moval	mbuf,r6				;point to the buffer
+	movw	corg,r7				;size of the buffer
+
+;	Shift the address to the left of mbuf and store the size in cmdsiz
+
+	matchc	#1,#60,r7,(r6)			;check for a mailbox "<"
+	bneq	58$				;not there use what we have
+	subw3	#1,r2,r7			;get the size
+	movl	r3,r6				;point to the mailbox
+58$:	movc3	r7,(r6),mbuf			;shift to the left
+	movw	r7,cmdsiz			;[W5] bad idea to use cmdsiz this way
+	bsbw	paradd				;parse the address line
+	tstl	r11				;must have at least one good address
+	beql	60$				;r11 = zero means failure
+
+;	Add the "To:" line to the message
+
+	moval	cto,r3				;point to cto
+	movzbw	rf_to,(r3)+			;get the cc keyword size
+	movc3	cto,rf_to+1,(r3)		;get the keyword
+	movb	#32,(r3)+			;space seperator
+	incw	cto				;space size
+	movc3	cmdsiz,mbuf,(r3)		;[W5] get the recpients
+	addw2	cmdsiz,cto			;[W5] size of the recpients
+	movb	#cr,(r3)+			;store a crlf
+	movb	#lf,(r3)+
+	addw2	#2,cto				;account for the crlf
+	jmp	70$
+
+60$:	bsbw	s.to				;bad reply address get one
+
+;	Get header information
+
+70$:	bsbw	s.date				;get the date
+	bsbw	s.sender			;get the return address
+
+;	Get the data
+
+	bsbw	snddat				;now get the data
+	cmpl	r0,#ss$_abort			;did we abort
+	beql	300$				;abort this msg
+
+;	Write out the data file.
+
+	movb	#1,f.user			;flag a user write.
+	bsbw	prvon				;Turn on syspriv
+	bsbw	wfile				;do it
+	bsbw	prvoff				;Turn off syspriv
+
+;	send user a success message 
+
+	movzbl	msg1,r7		
+	movc3	r7,msg1+1,mbuf
+	bsbw	snd
+
+;	Mark the message answered.  
+
+	movb	#65,cbuf+msg_b_ans		;Mark message answered
+	bsbw	mrkmsg				;mark the message
+
+300$:	popr	#^m<r1,r2,r3,r4,r5,r6,r7,r8,r9,r10,r11>
+	rsb
+
+
+
+.page
+.subtitle	Terminal handling routines
+
+gettty:	$assign_s devnam = port,-
+		   chan = ttchan
+	blbs	r0,10$
+	jmp	rmserr				;signal an rms error
+	
+10$:	$qiow_s	chan = ttchan,-			;Get the tty characteristics
+		func = #io$_sensemode,-
+		p1   = pdesc			;description of the character
+	blbs	r0,20$
+	jmp	rmserr				;signal an rms error
+20$:	rsb
+
+.page
+disctl:	movq	pdesc,tdesc			;get the old description
+	bisl2	#tt$m_passall,tdesc1		;or it with the old
+
+	$qiow_s	chan = ttchan,-			;Modify the terminal for the
+		func = #io$_setmode,-		;programs duration
+		p1   = tdesc			;description of the character
+	blbs	r0,10$
+	jmp	rmserr				;signal an rms error
+10$:	rsb
+
+.page
+enactl:	$qiow_s	chan = ttchan,-			;Modify the terminal for the
+		func = #io$_setmode,-		;programs duration
+		p1   = pdesc			;description of the character
+	blbs	r0,10$
+	jmp	rmserr				;signal an rms error
+10$:	rsb
+
+.page
+sndtty:	pushr	#^m<r1,r2>
+	$qiow_s chan = ttchan,-			;write a packet from the port
+		iosb = ttiosb,-			;Save the status and count
+		func = #io$_writevblk,-		;write function
+		p1   = (r2),-			;Store what is read at packet
+		p2   = #1			;Write one ch
+	blbs	r0,10$
+	jmp	rmserr				;signal an rms error
+10$:	popr	#^m<r1,r2>
+	incl	r2
+	sobgtr	r1,sndtty
+	rsb
+
+
+.page
+rdrtty:	$qiow_s chan = ttchan,-			;Read a packet from the port
+		iosb = ttiosb,-			;Save the status and count
+		func = #io$_readvblk,-		;Read function
+		p1   = (r2),-			;Store what is read at packet
+		p2   = #1,-			;Read one ch
+		p4=#eopmsk			;End read if eop
+	blbs	r0,10$
+	jmp	rmserr				;signal an rms error
+10$:	rsb
+
+
+.page
+delch:	movl	#1,r1				;one character
+	movb	#8,ttbuf
+	moval	ttbuf,r2
+	bsbw	sndtty				;send it
+	movzbl	delcr,r1			;get the size of the message
+	moval	delcr+1,r2			;and the message
+	bsbw	sndtty				;send it
+
+bckup:	decw	dtbfsz				;bump down the cnt
+	decl	r10				;back up the pointer
+	decl	datptr				;update the data buffer pointer
+	rsb
+
+.page
+crrt:	movb	#13,(r10)+			;store the cr
+	movb	#10,(r10)+			;add the line feed
+	addw2	#2,dtbfsz
+newline:movl	#1,r1				;one character
+	movb	#13,ttbuf
+	moval	ttbuf,r2
+	bsbw	sndtty				;send it
+	movb	#1,r1
+	movb	#10,ttbuf
+	moval	ttbuf,r2
+	bsbw	sndtty				;send it
+	rsb
+
+.page
+;First blank the screen
+
+redis:	movzbl	clrcrt,r1			;get the size of the message
+	moval	clrcrt+1,r2			;and the message
+	bsbw	sndtty				;send it
+
+;	Now send the data
+
+	movzwl	dtbfsz,r1			;get the data size
+	moval	datbuf,r2			;point to the data
+	bsbw	sndtty
+	rsb
+
+
+
+
+.page
+.subtitle	Expunge routine
+
+;	Expunge deleted messages.
+
+exp:	tstb	f.file				;test for a mail.txt file
+	bneq	5$				;don't execute if not there
+	rsb					;skip the command
+5$:	clrw	msgnum				;renumber the messages
+	$connect rab = lclrab			;connect to record stream
+	blbs	r0,10$
+	jmp	rmserr				;signal an rms error
+10$:	$create	fab = tmpfab			;create a temporary file
+	blbs	r0,20$
+	jmp	rmserr				;signal an rms error
+20$:	$connect rab = tmprab			;connect to it
+	blbs	r0,40$
+	jmp	rmserr				;signal an rms error
+
+;	Read a control record and check to see if the delete flag is set.
+
+40$:	$get	rab = lclrab			;read a control record
+	blbs	r0,50$				;check for an error
+	cmpl	r0,#rms$_eof			;was it the eof?
+	bneq	45$				;if not eof error
+	jmp	200$				;success exit
+45$:	jmp	rmserr				;else a bad error
+
+50$:	tstw	lclrab+rab$w_rsz		;make sure we have a control record
+	beql	40$
+	movl	mbuf+msg_l_siz,r7		;get the msg size
+
+;	Test to see if we delete this message
+
+	tstb	mbuf+msg_b_del			;tst this flag
+	bneq	80$				;non zero save it
+
+;	If here we are to keep this message.
+
+	incw	msgnum				;bump the message number
+	movw	msgnum,mbuf+msg_w_num		;change the number
+	movw	lclrab+rab$w_rsz,tmprab+rab$w_rsz ;size of the control record
+	$put	rab = tmprab			;write the control record
+	blbs	r0,60$				;check for an error
+	jmp	rmserr				;bad error
+60$:	$get	rab = lclrab			;read a data record
+	blbs	r0,65$				;check for an error
+	jmp	rmserr				;else bad error
+65$:	movw	lclrab+rab$w_rsz,tmprab+rab$w_rsz
+	$put	rab = tmprab			;write the data
+	blbs	r0,70$				;check for an error
+	jmp	rmserr				;else bad error
+70$:	subw	lclrab+rab$w_rsz,r7		;reduce the msg size by line size
+	bgtr	60$				;done with this message?
+	jmp	40$
+
+;	If here we are to delete the message.
+
+80$:	$get	rab = lclrab			;read a data record
+	blbs	r0,90$				;check for an error
+	jmp	rmserr				;else bad error
+90$:	subw	lclrab+rab$w_rsz,r7		;reduce the msg size by line size
+	bgtr	80$				;done with this message?
+	jmp	40$				;get the next message
+
+
+;	Hit eof close the files. Delete the old mail.txt file.  Rename the
+;	unique file to be mail.txt
+
+200$:	$disconnect rab = tmprab		;break the stream
+	blbs	r0,210$
+	jmp	rmserr				;signal an rms error
+210$:	$close	fab = tmpfab			;close the temporary file
+	blbs	r0,220$
+	jmp	rmserr				;signal an rms error
+220$:	$disconnect rab = lclrab		;break the stream
+	blbs	r0,230$
+	jmp	rmserr				;signal an rms error
+230$:	$close	fab = lclfab			;close the temporary file
+	blbs	r0,240$
+	jmp	rmserr				;signal an rms error
+240$:	$erase	fab = lclfab			;delete the old mail.txt file
+	blbs	r0,250$
+	jmp	rmserr				;signal an rms error
+
+;	Check for any messages left in file.
+
+250$:	tstw	msgnum				;if zero no messages
+	bneq	255$				;if messages finish up
+	$erase	fab = tmpfab			;delete the tmp file
+	blbs	r0,252$
+	jmp	rmserr				;signal an rms error
+252$:	clrb	f.file				;signal no mail.txt
+	movzbl	msg3,r7				;size of the msg
+	movc3	r7,msg3+1,mbuf			;get the msg
+	bsbw	snd				;send the msg
+	jmp	270$				;and exit
+
+;	Messages left finish up
+
+255$:	$rename	oldfab = tmpfab,-		;rename the tmp to be mail
+		newfab = lclfab
+	blbs	r0,260$
+	jmp	rmserr				;signal an rms error
+260$:	$open	fab = lclfab			;open the new mail.txt file
+	blbs	r0,270$
+	jmp	rmserr
+270$:	rsb
+
+;	Error return
+
+300$:	rsb
+
+
+.page
+;	Get the specified bboard
+
+;	Check for an argument
+
+bbrd:	tstw	cmdsiz				;must have an argument
+	bneq	10$				;no argument just return
+	rsb
+
+;	Close mail.txt file if it exists
+
+10$:	$disconnect rab = lclrab		;break the io stream
+	$close	fab = lclfab			;close the file
+
+;	If the argument is a ? list the available bboards
+
+	movl	cmdptr,r6			;point to the argument
+	cmpb	#63,(r6)			;a question lists bboards
+	bneq	30$				;else use the bboard provided
+	jmp	parbbrd				;parse the sys$bboard directory
+
+;	Build a pointer to the bboard specified.
+
+30$:	moval	bboard,r1			;get start
+	movzbw	(r1)+,r2			;get size
+	movb	r2,lcldirsz			;save the size
+	movc3	r2,(r1),lcldir			;save the text
+
+;	Currently they must type full filename of bboard!
+
+	addb2	cmdsiz,lcldirsz			;size of specified bboard
+	movc3	cmdsiz,(r6),(r3)		;save the bboard
+
+;	Add the file type
+
+	moval	txt,r1				;get ending
+	movzbw	(r1)+,r2			;get size
+	addb2	r2,lcldirsz			;save the size
+	movc3	r2,(r1),(r3)			;save the text
+	movb	lcldirsz,lclfab+fab$b_fns	;store the size
+	movb	#<1@fab$v_get>,lclfab+fab$b_fac	;set to read only access
+	movb	#<1@fab$v_shrget>,lclfab+fab$b_shr	;share the file access
+
+;	Now open the specified bboard and see if its there
+
+	$open 	fab = lclfab			;open the file
+	blbs	r0,40$
+
+;	Say specified bboard file doesn't exist and get back the mail.txt file
+
+	movzbl	msg4,r7				;size of the msg
+	movc3	r7,msg4+1,mbuf			;get the msg
+	bsbw	snd				;send the msg
+	clrb	f.file				;signal no bboard
+	bsbw	getmine				;get back my mail.txt file
+	jmp	50$
+
+40$:	movb	#1,f.file			;signal we have a mail.txt file
+	
+50$:	rsb
+
+
+.page
+
+;	Parse the directory sys$bboard and inform the user of available
+;	bboards to read.
+
+parbbrd:moval	wldbbrd+1,lclfab+fab$l_fna	;set the bboard address
+	movb	wldbbrd,lclfab+fab$b_fns	;and size
+	movc5	#0,#0,#0,#page,gbuf		;clear the general buffer
+	moval	gbuf,r3				;and point to it
+	$parse	fab = lclfab			;parse the directory
+	blbs	r0,10$
+	jmp	rmserr				;signal an rms error
+
+;	Store the names of the bboards (ascic word) in gbuf
+
+10$:	$search	fab = lclfab			;search for a file
+	blbs	r0,20$				;keep going while successful
+	jmp	30$				;when done output the list
+20$:	movzbw	namlcl+nam$b_name,(r3)+		;store the size
+	movzbw	namlcl+nam$b_name,r2		;save the size
+	movl	namlcl+nam$l_name,r1		;pointer to the name
+	movc3	r2,(r1),(r3)			;and the name
+	jmp	10$
+
+;	Searched the entire directory display the available bboards
+
+30$:	moval	gbuf,r1				;point to the buffer
+
+;	Clear the output buffer
+	
+40$:	pushr	#^m<r1>
+	movc5	#0,#0,#32,#80,ttyb		;blank the buffer
+	popr	#^m<r1>
+	moval	ttyb,r3				;pointer to tty buffer
+	clrw	tty				;and start with nothing
+	clrw	r7				;counter
+
+;	Add filenames to buffer until no more or max line size
+
+50$:	tstw	(r1)				;anything to output
+	beql	60$				;no then send rest of line
+	movw	(r1),r8				;save the size
+	addw2	(r1),r7				;add the size in
+	cmpw	#80,r7				;over the buffer size?
+	bleq	60$				;no then add the text
+	addw2	(r1)+,tty			;add the size
+	movc3	r8,(r1),(r3)			;store the name
+	movb	#9,(r3)+			;a seperator
+	incw	tty
+	jmp	50$				;get the next
+
+60$:	pushr	#^m<r1>
+	pushal	tty				;push the descriptor
+	calls	#1,g^lib$put_output		;send it
+	popr	#^m<r1>
+	tstw	(r1)				;anything left?
+	beql	300$				;no then quit
+	jmp	40$
+
+300$:	moval	lcldir,lclfab+fab$l_fna		;replace the old address
+	movb	lcldirsz,lclfab+fab$b_fns	;and size
+	rsb
+
+
+.page
+
+;	Build a pointer to my mail.txt file
+
+getmine:bsbw	getuaf				;get my uaf info
+	bsbw	prvon				;Turn on syspriv
+	bsbw	getdir				;build a pointer to mail.txt
+	bsbw	prvoff				;Turn off syspriv
+	movb	lcldirsz,lclfab+fab$b_fns	;store the size
+	movb	#<1@fab$v_put>!<1@fab$v_get>!<1@fab$v_upd>,lclfab+fab$b_fac
+						;set to read/write/update access
+	movb	#<1@fab$v_nil>,lclfab+fab$b_shr	;don't share the file
+
+;	Open the file and see if its there.
+
+	$open 	fab = lclfab			;open the file
+	blbs	r0,30$
+
+;	Say no mail.txt file exists.
+
+	movzbl	msg2,r7				;size of the msg
+	movc3	r7,msg2+1,mbuf			;get the msg
+	bsbw	snd				;send the msg
+	clrb	f.file				;signal no mail.txt
+	jmp	40$
+
+30$:	movb	#1,f.file			;signal we have a mail.txt file
+40$:	rsb
+
+.page
+;	Get uaf information on myself
+
+getuaf:	$getjpiw_s -
+	itmlst = itmlst
+	clrl	itmsiz				;start with no size
+	moval	itmadd,r1			;compute the size returned
+10$:	cmpb	#32,(r1)+			;getjpi counts spaces
+	beql	20$				;stop on a space
+	incl	itmsiz				;add one to the size
+	jmp	10$				;get the next char
+20$:	moval	itmadd,r6			;point to my username
+	movzwl	itmsiz,r7			;size of my name
+	bsbw	prvon				;Turn on syspriv
+	bsbw	vallcl				;get uaf info
+	bsbw	prvoff				;Turn off syspriv
+	rsb
+
+
+.page
+
+;	Get the specified mail file.
+	
+get:	$close	fab = lclfab			;close the file if any
+	clrb	f.file				;signal no file
+	tstw	cmdsiz				;any argument?
+	bneq	10$				;if not use home mail file
+	bsbw	getmine				;get users mail
+	jmp	200$				;exit
+
+;	Get the file asked for.
+
+10$:	movl	cmdptr,r1			;save the filename
+	movc3	cmdsiz,(r1),lcldir		;save the text
+	movb	cmdsiz,lcldirsz			;and the size
+	movb	lcldirsz,lclfab+fab$b_fns	;store the size
+
+;	Now open the specified file and see if its there
+
+	$open 	fab = lclfab			;open the file
+	blbs	r0,20$
+
+;	Say specified file doesn't exist and get back the mail.txt file
+
+	movzbl	msg7,r7				;size of the msg
+	movc3	r7,msg7+1,mbuf			;get the msg
+	bsbw	snd				;send the msg
+	clrb	f.file				;signal no bboard
+	bsbw	getmine				;get back my mail.txt file
+	jmp	200$
+
+20$:	movb	#1,f.file			;signal a file	
+
+200$:	rsb
+
+
+;	Read the mm.init file and set/initialize flags/buffers
+
+;	Build a pointer to the file.
+
+mminit:	moval	uafbuf+uaf$t_defdev,r5		;point to the login device
+	movzbw	(r5)+,r4			;get its size
+	movw	r4,inifs			;add it in
+	movc3	r4,(r5),inidir			;move the device name
+	moval	uafbuf+uaf$t_defdir,r5		;point to the login directory
+	movzbw	(r5)+,r4			;get its size
+	addw2	r4,inifs			;add it in
+	movc3	r4,(r5),(r3)			;move the directory name
+	moval	initxt,r5			;get the name "mm.init"
+	movzbw	(r5)+,r4			;and its size
+	addw2	r4,inifs			;add the size
+	movc3	r4,(r5),(r3)			;move the name
+	movb	inifs,inifab+fab$b_fns		;fill in the size
+
+;	Initialize the flags and buffers
+
+	movc5	#0,#0,#0,#mminsz,mmins
+
+;	Fill in default prompts
+
+	moval	top_prom+4,r1			;point to the address
+	movl	(r1)+,r2			;get the address
+	movzbw	(r1)+,top_prom			;size of the default
+	movc3	top_prom,(r1),(r2)		;get the prompt
+	moval	read_prom+4,r1			;point to the address
+	movl	(r1)+,r2			;get the address
+	movzbw	(r1)+,read_prom			;size of the default
+	movc3	read_prom,(r1),(r2)		;get the prompt
+	moval	send_prom+4,r1			;point to the address
+	movl	(r1)+,r2			;get the address
+	movzbw	(r1)+,send_prom			;size of the default
+	movc3	send_prom,(r1),(r2)		;get the prompt
+
+;	Open the file and see if its there.
+
+	$open 	fab = inifab			;open the file
+	blbs	r0,10$
+
+;	Say no mm.init exists and use defaults
+
+	movzbl	msg5,r7				;size of the msg
+	movc3	r7,msg5+1,mbuf			;get the msg
+	bsbw	snd				;send the msg
+	jmp	300$
+
+10$:	$connect rab = inirab			;connect to io stream
+	blbs	r0,20$				;end on error
+	jmp	300$
+
+;	Read the file and set the appropiate flags
+
+20$:	$get	rab = inirab			;read a record
+	blbs	r0,25$				;error?
+	jmp	300$				;quit on error
+25$:	cmpb	#33,mbuf			;comment line?
+	beql	20$				;skip comments
+
+;	Isolate the keyword
+
+	matchc	#1,#32,inirab+rab$w_rsz,mbuf	;search for a space
+	bneq	20$				;no space try again
+	movw	r2,r11				;save pointer/size of arguments
+	movl	r3,r12
+	subw3	r2,inirab+rab$w_rsz,r6		;compute size of keyword
+	decw	r6				;don't count the space
+
+;	Check for a known keyword
+
+	moval	inics,r9			;point to start of list
+30$:	movzbl	(r9)+,r10			;size of keyword in list
+	tstl	r10				;list ends with a null
+	beql	20$				;if end skip the line
+	matchc	r6,mbuf,r10,(r9)		;compare key fom list with key
+	beql	40$				;match check for an exact match
+
+;	No match skip past this keyword
+
+35$:	addl2	r10,r9				;point to case byte
+	incl	r9				;skip the case number
+	jmp	30$				;and try again
+
+;	Check for an exact match
+
+40$:	addl2	r10,r9				;point to case byte
+	tstw	r2				;zero = exact
+	beql	45$				;must be exact
+	incl	r9				;skip the case number
+	jmp	30$				;and try again
+
+;	If here we have a match.  Initialize the buffer/flag
+	
+45$:	caseb	(r9),#0,inice			;see what to initialize
+50$:	.word	55$-50$				;zero
+	.word	60$-50$				;one
+	.word	65$-50$				;two
+	.word	70$-50$				;three
+	.word	75$-50$				;four
+	.word	80$-50$				;five
+	.word	85$-50$				;six
+	.word	90$-50$				;seven
+	.word	95$-50$				;eight
+	.word	100$-50$			;nine
+	.word	105$-50$			;ten
+	.word	110$-50$			;eleven
+	.word	115$-50$			;twelve
+
+;	Error if here
+
+	jmp	20$				;ignore it
+
+;	Fill the flag or buffer
+
+55$:						;bboard do nothing
+	jmp	20$				;get the next line
+60$:	incl	r1				;set up for ascii to binary convert
+	movb	#1,r2
+	bsbw	contxbn				;carbon copy flag
+	movb	msgnum,f.cc			;save the flag
+	jmp	20$				;get the next line
+65$:	incl	r1				;set up for ascii to binary convert
+	movb	#1,r2
+	bsbw	contxbn				;blind carbon copy flag
+	movb	msgnum,f.bcc			;save the flag
+	jmp	20$				;get the next line
+70$:	incl	r1				;set up for ascii to binary convert
+	movb	#1,r2
+	bsbw	contxbn				;blank screen flag
+	movb	msgnum,f.bnk			;save the flag
+	jmp	20$				;get the next line
+75$:	incl	r1				;set up for ascii to binary convert
+	movb	#1,r2
+	bsbw	contxbn				;use editor flag
+	movb	msgnum,f.ed			;save the flag
+	jmp	20$				;get the next line
+80$:	movw	r11,pdev			;save the printer device
+	movc3	r11,(r12),pdev+2
+	jmp	20$				;get the next line
+85$:	movw	r11,dccl			;save the default carbon copy
+	movc3	r11,(r12),dccl+2
+	jmp	20$				;get the next line
+90$:	movw	r11,dbccl			;save the default blind cc
+	movc3	r11,(r12),dbccl+2
+	jmp	20$				;get the next line
+95$:	movw	r11,pnam			;save the personal name
+	movc3	r11,(r12),pnam+2
+	jmp	20$				;get the next line
+100$:	incl	r1				;set up for ascii to binary convert
+	movb	#1,r2
+	bsbw	contxbn				;use expunge flag
+	movb	msgnum,f.exp			;save the flag
+	jmp	20$				;get the next line
+
+105$:	movw	r11,top_prom			;save the top prompt
+	moval	top_prom+4,r2			;point to the address
+	movl	(r2),r2
+	movc3	r11,(r12),(r2)
+	jmp	20$				;get the next line
+110$:	movw	r11,read_prom			;save the read prompt
+	moval	read_prom+4,r2			;point to the address
+	movl	(r2),r2
+	movc3	r11,(r12),(r2)
+	jmp	20$				;get the next line
+115$:	movw	r11,send_prom			;save the send prompt
+	moval	send_prom+4,r2			;point to the address
+	movl	(r2),r2
+	movc3	r11,(r12),(r2)
+	jmp	20$				;get the next line
+
+
+
+;	Done if here
+
+300$:	rsb
+
+
+.page
+;	Create an mm.init file.
+
+crini:	$create	fab = inifab			;create the file
+	blbs	r0,5$
+	jmp	300$				;abort on error
+5$:	$connect rab = inirab			;connect to io stream
+	blbs	r0,10$
+	jmp	rmserr
+
+;	Now fill it up
+
+10$:	moval	cini,r1				;point to the contents
+20$:	movzbw	(r1)+,inirab+rab$w_rsz		;fill in the size
+	tstw	inirab+rab$w_rsz		;are we done?
+	beql	200$				;if so stop
+	movc3	inirab+rab$w_rsz,(r1),mbuf	;fill in the buffer
+	pushr	#^m<r1>
+	$put	rab = inirab			;write the record
+	popr	#^m<r1>
+	blbs	r0,20$
+	jmp	rmserr
+	
+200$:	$disconnect rab = inirab
+	$close	fab = inifab
+300$:	rsb	
+
+.page
+;	Prompt  for sending messages.
+;	Clear the screen and reprompt.
+
+editprom:movzbl	clrcrt,r7			;size of the home/blank sequence
+	movc3	r7,clrcrt+1,mbuf	
+	bsbw	snd				;send the prompt
+	movzbl	dat_prom,r7			;size of the prompt
+	movc3	r7,dat_prom+1,mbuf		;get the prompt
+	bsbw	snd				;send the prompt
+	movzbl	(r1)+,r7			;get the second line
+	movc3	r7,(r1),mbuf
+	bsbw	snd				;send the prompt
+	bsbw	newline				;start with a fresh line
+	rsb	
+
+
+.page
+
+;	Turn off unnecessary privileges
+
+prvoff:	$setprv_s prvadr = privs		;turn off sysprv
+	blbs	r0,10$
+	jmp	rmserr
+10$:	rsb
+
+;	Turn off necessary privileges
+
+prvon:	$setprv_s prvadr = privs,-		;turn on sysprv
+		  enbflg = #1
+	blbs	r0,10$
+	jmp	rmserr
+10$:	rsb
+
+.page
+;	[W1]	Copy/move message(s) to a file.
+movcpy:	movb	#1,r11				;[W1] set the move flag
+	jmp	cm1				;[W1] continue
+cpymov:	clrb	r11				;[W1] set the copy flag
+
+;[W5] 	Check for an message(s) argument
+
+cm1:	tstw	cmdsiz				;[W1] no arguments are ok
+	bneq	10$				;[W1] zero means no argument
+	moval	msg_prom,r1			;[W1] set up for msg prompt
+	bsbw	read				;[W1] read from the tty
+	decw	cmdsiz				;[W1] skip the cr
+
+;	Parse the argument
+
+10$:	moval	keys,cmdtbl			;[W1] point to the key table
+	bsbw	pararg				;[W1] parse the argument
+	movl	r0,r10				;[W5] save the flag
+	tstl	r0				;[W1] did we succeed?
+	bneq	20$				;[W5] if so continue	
+
+;	Here bad argument
+
+	movzbl	bargerr,r7			;[W1] give an error
+	movc3	r7,bargerr+1,mbuf
+	bsbw	snd				;[W1] send it
+	jmp	230$
+
+;	Pick up a file name
+
+20$:	tstw	cmdsiz				;[W1] no arguments are ok
+	bneq	30$				;[W1] zero means no argument
+	moval	cre_prom,r1			;[W1] set up for file prompt
+	bsbw	read				;[W1] read from the tty
+	decw	cmdsiz				;[W1] skip the cr
+30$:	movl	cmdptr,r1			;[W5] point to the filename
+	movc3	cmdsiz,(r1),inflnm		;[W1] [W5] store the filename
+	
+;	Try and open/create the file they specififed
+
+	moval	inflnm,crefab+fab$l_fna		;[W1] store the names address
+	movb	cmdsiz,crefab+fab$b_fns		;[W1] [W5] and the size
+	$create	fab = crefab			;[W1] create/open the file
+	blbs	r0,40$
+
+;	Error say file not there and could not create it
+
+	movzbl	crserr,r1			;[W1] get the size of the message
+	moval	crserr+1,r2			;[W1] and the message
+	bsbw	sndtty				;[W1] send it
+	jmp	300$				
+
+40$:	$connect rab = lclrab			;[W1] connect to record stream
+	blbs	r0,50$				;[W1] 
+	jmp	rmserr				;[W1] signal an rms error
+50$:	$connect rab = crerab			;[W1] connect to record stream
+	blbs	r0,60$				;[W1] 
+	jmp	rmserr				;[W1] signal an rms error
+
+60$:	tstl	r10				;[W1] [W5] did we succeed?
+	blss	70$				;[W1] less than zero = numeric
+	bgtr	90$				;[W1] greater than zero alpha
+
+;	Here we have numeric argument(s) stack pointer r9
+
+70$:	movl	-(r9),r2			;[W1] get a number
+	cmpl	#unique,r2			;[W1] is this the eos?
+	beql	230$				;[W1] no process the next
+
+;	Process the argument here
+
+	movw	r2,msgnum			;[W1] get the number of the message
+	clrl	r0				;[W1] signal a specific msg
+	bsbw	getmsg				;[W1] get to the message
+	cmpl	#ss$_abort,r0			;[W1] did we get one
+	beql	230$				;[W1] if not stop
+	movw	#msg_control_siz,crerab+rab$w_rsz ;[W1] size of control record
+	$put	rab = crerab			;[W1] write the control record
+	bsbw	copy				;[W1] copy it and get past it
+	tstb	r11				;[W1] is this a copy or move
+	beql	70$				;[W1] copy get next message
+
+;	Mark the message ...
+
+	movb	#68,cbuf+msg_b_del		;[W1] Mark message deleted
+	bsbw	mrkmsg
+	jmp	70$				;[W1] get the next
+
+	;Process the keyword here the key is a longword in stack1
+
+90$:	movl	(r9),r0				;[W1] get a flag offset
+	bsbw	getmsg				;[W1] get to the message
+	cmpl	#ss$_abort,r0			;[W1] did we get one
+	beql	230$				;[W1] if not stop
+	movw	#msg_control_siz,crerab+rab$w_rsz ;[W1] size of control record
+	$put	rab = crerab			;[W1] write the control record
+	bsbw	copy				;[W1] copy it and get past it
+	tstb	r11				;[W1] is this a copy or move
+	beql	90$				;[W1] copy get next message
+
+;	Mark the message ...
+
+	movb	#68,cbuf+msg_b_del		;[W1] Mark message deleted
+	bsbw	mrkmsg
+	jmp	90$				;[W1] thats all
+
+;	Finished clean up
+
+230$:	$disconnect rab = lclrab		;[W1] break from record stream
+	blbs	r0,240$
+	jmp	rmserr				;[W1] signal an rms error
+240$:	$close	fab = crefab			;[W1] close the temporary file
+	blbs	r0,300$
+	jmp	rmserr				;[W1] signal an rms error
+300$:	rsb
+
+.page
+;[W1]	Copy this message
+
+copy:	movl	msgsiz,r7			;[W1] use it as a counter
+10$:	$get	rab = lclrab			;[W1] get a data line
+	blbc	r0,50$
+	movw	lclrab+rab$w_rsz,crerab+rab$w_rsz ;[W1] 
+	$put	rab = crerab			;[W1] write the record
+	blbc	r0,50$				;[W1] if error indicate it
+	subw	lclrab+rab$w_rsz,r7 		;[W1] subtract size of the record
+	blss	50$				;[W1] less than zero error
+	bgtr	10$				;[W1] end of this msg try next
+
+;	Successful completion if here
+
+	movl	#ss$_normal,r0			;[W1] signal success
+	rsb
+
+;	Error if here
+
+50$:	movl	#ss$_abort,r0			;[W1] signal error
+	rsb
+
+
+.page
+;	[W1]	Sort current mail file.
+
+srtfil:	tstb	f.file				;[W1] test for a mail.txt file
+	bneq	10$				;[W1] don't execute if not there
+	jmp	300$				;[W1] skip the command
+10$:	movw	#1,msgnum
+	$connect rab = lclrab			;[W1] connect to record stream
+	blbs	r0,20$				;[W1] 
+	jmp	rmserr				;[W1] signal an rms error
+
+
+20$:	$get	rab = lclrab			;[W1] get a control record
+	blbs	r0,30$
+	cmpl	r0,#rms$_eof			;[W1] have we hit eof?
+	beql	200$				;[W1] if so then done
+	jmp	rmserr				;[W1] else error
+30$:	moval	lclrab,r0			;[W1] point to the rab block
+	movl	rab$w_rfa(r0),rabrfa1		;[W1] save the three word address
+	movw	rab$w_rfa4(r0),rabrfa1+4
+	movc3	#msg_control_siz,mbuf,cbuf	;[W1] store the control record
+	movl	mbuf+msg_l_siz,msgsiz		;[W1] get this msgs size
+40$:	movw	msgnum,cbuf+msg_w_num		;[W1] set a new message number
+	bsbw	pstmsg				;[W1] get past this message
+	bsbw	mrkmsg				;[W1] ignore errors
+	incw	msgnum				;[W1] next number
+	jmp	20$				;[W1] do the next
+
+200$:	$disconnect rab = lclrab		;[W1] break from record stream
+	blbs	r0,300$				;[W1] 
+	jmp	rmserr				;[W1] signal an rms error
+300$:	rsb
+
+;[W2]  Execute the command provided.
+	
+dcl:	movl	cmdptr,r1			;[W2] point to the command
+	movc3	cmdsiz,(r1),mbuf		;[W2] store the command
+	movl	mbufd,r9			;[W2] preserve the old descriptor
+	movzwl	cmdsiz,mbufd			;[W2] and its size
+	pushal	mbufd				;[W2] push the descriptor
+	calls	#1,g^lib$spawn			;[W2] go do it
+	movl	r9,mbufd			;[W2] restore the old d
+	rsb					;[W2]
+
+;[W2] Print message(s)
+
+print:	movl	cmdptr,r1			;[W2] save the command buffer
+	movc3	cmdsiz,(r1),gbuf		;[W2] do it in gbuf
+	moval	gbuf,cmdptr			;[W2] and point to it
+	tstb	f.file				;[W2] test for a mail.txt file
+	bneq	10$				;[W2] don't execute if not there
+	jmp	300$				;[W2] skip the command
+
+	
+;	Create a unique file 
+
+10$:	moval	unim+1,crefab+fab$l_fna		;[W2] store the names address
+	movb	unim,crefab+fab$b_fns		;[W2] and the size
+	$create	fab = crefab			;[W2] create/open the file
+	blbs	r0,30$
+	jmp	300$				
+
+30$:	$connect rab = lclrab			;[W2] connect to record stream
+	blbs	r0,35$				;[W2] 
+	jmp	rmserr				;[W2] signal an rms error
+35$:	$connect rab = crerab			;[W2] connect to record stream
+	blbs	r0,40$				;[W2] 
+	jmp	rmserr				;[W2] signal an rms error
+
+;	Check for an argument
+
+40$:	tstw	cmdsiz				;[W2] no arguments are ok
+	bneq	60$				;[W2] zero means no argument
+	jmp	230$				;[W2] exit
+
+;	Parse the argument
+
+60$:	moval	keys,cmdtbl			;[W2] point to the key table
+	bsbw	pararg				;[W2] parse the argument
+	tstl	r0				;[W2] did we succeed?
+	blss	70$				;[W2] less than zero = numeric
+	bgtr	90$				;[W2] greater than zero alpha
+
+;	Here bad argument
+
+	movzbl	bargerr,r7			;[W2] give an error
+	movc3	r7,bargerr+1,mbuf
+	bsbw	snd				;[W2] send it
+	jmp	230$
+
+;	Here we have numeric argument(s) stack pointer r9
+
+70$:	movl	-(r9),r2			;[W2] get a number
+	cmpl	#unique,r2			;[W2] is this the eos?
+	beql	230$				;[W2] no process the next
+
+;	Process the argument here
+
+	movw	r2,msgnum			;[W2] get the number of the message
+	clrl	r0				;[W2] signal a specific msg
+	bsbw	getmsg				;[W2] get to the message
+	cmpl	#ss$_abort,r0			;[W2] did we get one
+	beql	230$				;[W2] if not stop
+	movw	#1,crerab+rab$w_rsz 		;[W2] size of a form feed
+	movb	#12,mbuf			;[W2] store the form feed
+	$put	rab = crerab			;[W2] write the form feed
+	bsbw	copy				;[W2] copy it and get past it
+	jmp	70$				;[W2] get the next
+
+	;Process the keyword here the key is a longword in stack1
+
+90$:	movl	(r9),r0				;[W2] get a flag offset
+	bsbw	getmsg				;[W2] get to the message
+	cmpl	#ss$_abort,r0			;[W2] did we get one
+	beql	230$				;[W2] if not stop
+	movw	#1,crerab+rab$w_rsz 		;[W2] size of a form feed
+	movb	#12,mbuf			;[W2] store the form feed
+	$put	rab = crerab			;[W2] write the form feed
+	bsbw	copy				;[W2] copy it and get past it
+	jmp	90$				;[W2] thats all
+
+;	Close the file
+
+230$:	$disconnect rab = lclrab		;[W2] break from record stream
+	blbs	r0,240$
+	jmp	rmserr				;[W2] signal an rms error
+240$:	$close	fab = crefab			;[W2] close the temporary file
+	blbs	r0,250$
+	jmp	rmserr				;[W2] signal an rms error
+
+;	Execute the print command.
+
+250$:	pushal	prind				;[W2] push the descriptor
+	calls	#1,g^lib$spawn			;[W2] go do it
+300$:	rsb
+
+
+.page
+;[W4]	Read the command line and store it in mbuf and size in cmdsiz
+
+getinp:	clrw	cmdsiz				;[W4] [W5] zero input
+	pushaq	cmdd				;[W4] Push the buffer descriptor
+	pushaq	p1				;[W4] and the label
+	calls	#2,g^cli$get_value		;[W4] get it
+	tstw	cmdd				;[W4] did they pass one?
+	bneq	5$				;[W4] if we did not get anything exit
+	jmp	20$				;[W4] if not normal entry
+5$:	movw	cmdd,cmdsiz			;[W4] [W5] move the size
+	movl	cmda,r1				;[W4] get the address of the parameter
+	movc3	cmdd,(r1),cmdbuf		;[W4] [W5] get the parameter
+	movb	#cr,(r3)+			;[W4] add a crlf
+	movb	#lf,(r3)+			;[W4]
+	addw2	#2,cmdsiz			;[W4] [W5] account for the crlf
+	movc3	cmdsiz,cmdbuf,mbuf		;[W5] copy cmd buffer in general buffer
+20$:	moval	cmdbuf,cmdptr			;[W5] point to the buffer
+	rsb
+
+
+.page
+.psect	dat	noexe,rd,wrt
+
+$rmsdef
+$uafdef
+$prvdef
+
+;	Version Information
+
+vmajor::.ascii	/1/				;major version 1
+	.byte	46				;period
+vminor::.ascii	/0/				;minor version 0
+vend	==	.-vmajor
+
+;	End of version information
+;	Start of general values
+
+page	==	512
+cr	==	13
+lf	==	10
+
+;	End of general values
+;	Terminal buffer
+
+tty:	.blkl	1
+	.address ttyb
+ttyb:	.blkb	page
+
+;	End of Terminal buffer
+;[W4]	Input command descriptors
+
+p1:	.ascid	/command/			;[W4] command label
+p2:	.ascid	/p2/				;[W4] parameter
+p3:	.ascid	/p3/				;[W4] parameter
+cmdd:	.blkw	1				;[W4] descriptor
+	.byte	dsc$k_dtype_t,dsc$k_class_d	;[W4]
+cmda:	.blkl	1				;[W4]
+
+;[W4]	End of Input command descriptors
+;	Start of ascii to binary and binary to ascii buffers
+
+text:	.word	4
+	.byte	dsc$k_dtype_t
+	.byte	dsc$k_class_s
+	.address txtout
+txtout:	.blkb	4
+binlen:	.word	0
+binary:	.word 	4
+	.byte	dsc$k_dtype_l
+	.byte	dsc$k_class_s
+	.address binin
+binin:	.blkb	4
+
+;	End of ascii to binary and binary to ascii buffers
+;	Priv mask
+
+privs:	.quad	<1@prv$v_sysprv>
+
+;	End of Priv mask
+;	Start of help
+
+$hlpdef
+helpd:	.ascid	/sys$mail:mm.hlb/
+rhelpd:	.ascid	/sys$mail:rmm.hlb/
+shelpd:	.ascid	/sys$mail:smm.hlb/
+
+;	End of help
+;	Start of gneeral flags
+
+f.file:	.blkb	1				;mail.txt file flag
+
+;	End of general flags
+;	MM.INIT buffers and flags
+
+mmins	=.
+f.cc:	.blkb	1				;carbon copy flag
+f.bcc:	.blkb	1				;blind carbon copy flag
+f.bnk:	.blkb	1				;blank screen flag
+f.ed:	.blkb	1				;edit flag
+f.exp:	.blkb	1				;expunge flag
+pdev:	.blkb	20				;printer device
+dccl:	.blkb	80				;default cc list
+dbccl:	.blkb	80				;default bcc list
+pnam:	.blkb	80				;personal name
+top_promb:.blkb	30				;top prompt
+read_promb:.blkb 30				;read prompt
+send_promb:.blkb 30				;send prompt
+mminsz	=.-mmins				;size of the buffers and flags
+
+;	End MM.INIT buffers and flags
+;	Case statement arguments for mm init
+
+inics:
+.ascic	/BBOARD/
+.byte	0
+.ascic	/CARBON-COPY/
+.byte	1
+.ascic	/BLIND-CARBON-COPY/
+.byte	2
+.ascic	/BLANK-SCREEN-STARTUP/
+.byte	3
+.ascic	/USE-EDITOR-AUTOMATICALLY/
+.byte	4
+.ascic	/PRINT-DEVICE/
+.byte	5
+.ascic	/DEFAULT-CC-LIST/
+.byte	6
+.ascic	/DEFAULT-BCC-LIST/
+.byte	7
+.ascic	/PERSONAL-NAME/
+.byte	8
+.ascic	/EXPUNGE-DELETED-MESSAGES-ON-EXIT/
+.byte	9
+.ascic	/TOP-PROMPT/
+.byte	10
+.ascic	/READ-PROMPT/
+.byte	11
+.ascic	/SEND-PROMPT/
+.byte	12
+.byte	0				;terminating byte must be zero
+inice:	.byte 12			;THIS BYTE IS = TO MAXIMUM BYTE
+
+;	End of Case statement arguments for mm init
+;	Start of default mm.init file for create command
+
+cini:
+.ascic	/!	MM.INIT file format:/
+.ascic	/!/
+.ascic	/! Lines starting with a ! are comments and ignored./
+.ascic	/!/
+.ascic	/! BBoards are handled differently than a normal mail file./
+.ascic	/! The delivery date of the message (in the bboard.txt file) is compared /
+.ascic	/!  to the last read date stamp in the MM.INIT file.  Messages with dates/
+.ascic	/!  preceeding the date stamp are considered new./
+.ascic	/!/
+.ascic	/! The number following a command indicates whether or not to/
+.ascic	/!  execute the command/
+.ascic	/CARBON-COPY 0/
+.ascic	/BLIND-CARBON-COPY 0/
+.ascic	/BLANK-SCREEN-STARTUP 1/
+.ascic	/USE-EDITOR-AUTOMATICALLY 0/
+.ascic	/EXPUNGE-DELETED-MESSAGES-ON-EXIT 1/
+.ascic	/!/
+.ascic	/! The device following the command indicates which device to /
+.ascic	/!  use for that command/
+.ascic	/PRINT-DEVICE LPA0:/
+.ascic	/!/
+.ascic	/! The text following a command is the arguments used for that command/
+.ascic	/DEFAULT-CC-LIST/
+.ascic	/DEFAULT-BCC-LIST/
+.ascic	/PERSONAL-NAME/
+.ascic	/!/
+.ascic	/TOP-PROMPT MM> /
+.ascic	/READ-PROMPT READ> /
+.ascic	/SEND-PROMPT SEND> /
+.byte	0				;THIS MUST TERMINATE WITH A ZERO BYTE
+
+;	End of default mm.init file for create command
+;	Start of the directory command format
+
+dir_num		= 7
+dir_date	= 12
+dir_date_sz	= 6
+dir_org		= 19
+dir_org_sz	= 25
+dir_sub		= 46
+dir_sub_sz	= 26
+dir_siz		= 74
+msg_control_siz	= 250
+
+;	End of the directory command format
+;	Start of the RFC822 headers
+
+rf_to:	.ascic	/To:/
+rf_cc:	.ascic	/Cc:/
+rf_bcc:	.ascic	/Bcc:/
+rf_re_to:.ascic	/Resent-to:/
+rf_re_cc:.ascic	/Resent-cc:/
+rf_re_bcc:.ascic /Resent-bcc:/
+rf_date: .ascic	/Date:/
+rf_from: .ascic /From:/
+rf_sender: .ascic /Sender:/
+rf_subject: .ascic /Subject:/
+
+;	End of the RFC822 headers
+;	Getjpi buffer descriptor
+
+itmlst:	.word	12
+	.word	jpi$_username
+	.address itmadd
+	.address itmsiz
+	.long	0
+itmadd:	.blkb	12
+itmsiz:	.blkl	1
+
+;	End of Getjpi buffer descriptor
+;	Start BBoard pointer
+
+bboard:	.ascic	/sys$bboard:/
+txt:	.ascic	/.txt/
+
+;	End BBoard pointer
+;	Local mail message control information offsets
+
+msg_w_num	== 1
+msg_l_siz	== 3
+msg_b_new	== 7
+msg_b_read	== 8
+msg_b_ans	== 9
+msg_b_del	== 10
+msg_b_flag	== 11
+msg_b_key	== 12
+msg_t_date	== 226
+msg_control_siz	== 250
+
+;	End local mail message control information offsets
+;	MM prompts
+
+top_prom:	.blkl	1
+		.address top_promb
+		.ascic	/MM> /
+read_prom:	.blkl	1
+		.address read_promb
+		.ascic	/READ> /
+send_prom:	.blkl	1
+		.address send_promb
+		.ascic	/SEND> /
+to_prom:	.ascid	/To: /
+cc_prom:	.ascid	/Cc: /
+bcc_prom:	.ascid	/Bcc: /
+sub_prom:	.ascid	/Subject: /
+dat_prom:	.ascic	/Enter the message.  Ctl Z to send, Ctl L to redisplay, ESC for send level/
+
+		.ascic	/Ctl B to insert file, Ctl N to abort, Ctl E to use editor./
+
+ins_prom:	.ascid	/Insert file: /
+cre_prom:	.ascid	/File: /		;[W1]
+msg_prom:	.ascid	/Msg(s): /		;[W5]
+
+;	End of MM prompts
+;	Start of current message information
+
+cbuf:	.blkb	msg_control_siz			;control information
+
+msgnum:	.blkw	1				;message number
+msgsiz:	.blkl	1				;message size
+
+;	End of current message information
+;	Start of the special terminal handling section
+
+eopmsk:	.long	<0>				;Mask of the eop for qio read
+	.long	<1@2>!<1@3>!<1@5>!<1@8>!<1@12>!<1@13>!<1@14>!<1@26>!<1@127>
+port:	.ascid	/sys$input:/			;Name of the tty to use
+ttbuf:	.blkb	1				;Port buffer
+ttbufsz	= .-ttbuf
+ttchan:	.blkw	1				;Storage for the port channel
+ttiosb:	.blkw	1				;Storage for the port status
+ttiolen: .blkw	1				;PIOSB is a quadword containing
+	.blkl	1				;31 count 16,15 status 0
+pdesc:	.blkl	1				;tty char buffer (class,type,width)
+pdesc1:	.blkl	1				; characteristics, length
+tdesc:	.blkl	1
+tdesc1:	.blkl	1
+clrcrt:	.byte	6,27,91,72,27,91,74
+delcr::	.byte	4,27,91,1,80
+
+;	End of the special terminal handling section
+
+
+
+.page
+
+tbuf:	.blkb	page
+t1buf:	.blkb	page
+
+mbufd:	.long	page
+	.address mbuf
+
+inflnm:	.blkb	80				;input file buffer
+edtfil:	.ascid	?edit/command=sys$mail:edtini.edt ?
+	.blkb	80				;input file buffer
+prind:	.ascid	?prin/delete mail_unique.tmp.1? ;[W2] dcl print command
+
+rfc1:	.ascic	/SUBJECT:/
+rfc2:	.ascic	/FROM:/
+
+rabrac:	.blkb	1				;record access
+rabrfa1:.blkq	3				;record address pointer
+rabrfa2:.blkw	3
+
+.page
+.psect	dat_pure	noexe,rd,nowrt
+
+;	General help and error messages
+
+prog:	.ascic	/Program is MM version /
+er1:	.ascic	/ is not a valid address/
+er2:	.ascic	/Message too large for data buffer./
+msg1:	.ascic	/Message queued for delivery./
+msg2:	.ascic	/You have no mail.txt file./
+msg3:	.ascic	/No messages left, deleting file/
+msg4:	.ascic	/BBoard does not exist./
+msg5:	.ascic	/MM.INIT file does not exist... Using defaults./
+msg6:	.ascic	/Expunging deleted messages./
+msg7:	.ascic	/File does not exist or insufficient privleges to access file./
+abrmsg:	.ascic	/Abort? /
+inserr:	.ascic	/Could not open file. /
+sepmsg:	.ascic	/		-------------------------/<cr><lf>
+eofmsg:	.ascic	/. . . . . . eof/<cr><lf>
+crserr:	.ascic	/Could not open or create file. /		;[W1]
+bcmderr:.ascic	/Invalid or incomplete command/<cr><lf>
+bargerr:.ascic	/Invalid or incomplete argument(s)/<cr><lf>
+
+;	End of general help and error messages
+
+
+.page
+;	Start of top level commands for parsing table
+
+comands::.byte	24				;[W2] 24 cmds supported
+	.ascic	/CREATE/			;create an mm.init file
+	.address crini
+	.ascic	/GET/				;get a specified mail file
+	.address get
+	.ascic	/BBOARD/			;get a bboard
+	.address bbrd
+	.ascic	/READ/				;read a msg
+	.address redmsg
+	.ascic	/DELETE/			;delete a msg
+	.address delmsg
+	.ascic	/UNDELETE/			;undelete a msg
+	.address udelmsg
+	.ascic	/FLAG/				;flag a msg
+	.address flgmsg
+	.ascic	/UNFLAG/			;unflag a msg
+	.address uflgmsg
+	.ascic	/DIRECTORY/			;directory of msgs
+	.address dir
+	.ascic	/HEADERS/			;directory of msgs (20 MM)
+	.address dir
+	.ascic	/EXPUNGE/			;expunge mail file
+	.address exp
+	.ascic	/EXIT/				;exit program
+	.address quit
+	.ascic	/QUIT/				;same as exit
+	.address quit
+	.ascic	/SEND/				;send a msg
+	.address sndmsg
+	.ascic	/HELP/
+	.address thelp
+	.ascic	/?/
+	.address thelp
+	.ascic	/VERSION/			;version of mm
+	.address ver
+	.ascic	/FORWARD/			;Forward a mail message
+	.address fwdmsg
+	.ascic	/REPLY/				;Reply to a mail message
+	.address repmsg
+	.ascic	/COPY/				;[W1] Copy command
+	.address cpymov				;[W1]
+	.ascic	/MOVE/				;[W1] Move command
+	.address movcpy				;[W1]
+	.ascic	/SORT/				;[W1] Sort command
+	.address srtfil				;[W1]
+	.ascic	/DCL/				;[W2] DCL command
+	.address dcl				;[W2]
+	.ascic	/PRINT/				;[W2] Print command
+	.address print				;[W2]
+
+;	End of top level commands for parsing table
+
+.page
+;	Start of read level commands for parsing table
+
+rcmds::	.byte	16				;16 [W3] cmds supported
+	.ascic	/TYPE/				;type current message
+	.address rtype
+	.ascic	/KILL/				;kill = delete and next
+	.address kilmsg
+	.ascic	/DELETE/			;delete a msg
+	.address rdmsg
+	.ascic	/UNDELETE/			;undelete a msg
+	.address rudmsg
+	.ascic	/FLAG/				;flag a msg
+	.address rfmsg
+	.ascic	/UNFLAG/			;unflag a msg
+	.address rufmsg
+	.ascic	/EXIT/				;exit program
+	.address quit
+	.ascic	/QUIT/				;same as exit
+	.address quit
+	.ascic	/HELP/
+	.address rhelp
+	.ascic	/?/
+	.address rhelp
+	.ascic	/NEXT/				;get next msg
+	.long	-1				;just return to cmd level
+	.ascic	/REPLY/				;reply to sender
+	.address rep
+	.ascic	/FORWARD/			;forward this msg
+	.address rfwd
+	.ascic	/DCL/				;[W3]	
+	.address dcl				;[W3]
+	.ascic	/COPY/				;[W3]
+	.address rcpymov			;[W3]	
+	.ascic	/MOVE/				;[W3]
+	.address rmovcpy			;[W3]	
+
+;	End of read level commands for parsing table
+
+.page
+;	Start of send level commands for parsing table
+
+scmds::	.byte	12				;12 [W3] cmds supported
+	.ascic	/BCC/
+	.address sbcc
+	.ascic	/CC/
+	.address scc
+	.ascic	/SEND/
+	.address ssend
+	.ascic	/SUBJECT/
+	.address s.subject
+	.ascic	/HELP/
+	.address shelp
+	.ascic	/?/
+	.address shelp
+	.ascic	/EXIT/
+	.address sexit
+	.ascic	/QUIT/
+	.address squit
+	.ascic	/EDIT/
+	.address getedt
+	.ascic	/INSERT/
+	.address insfil
+	.ascic	/DISPLAY/
+	.address sdisp
+	.ascic	/DCL/				;[W3]	
+	.address dcl
+
+;	End of send level commands for parsing table
+
+.page
+;	Start of arguments for parsing table
+
+keys:	.byte	6
+	.ascic	/NEW/
+	.long	msg_b_new
+	.ascic	/READ/
+	.long	msg_b_read
+	.ascic	/ANSWERED/
+	.long	msg_b_ans
+	.ascic	/DELETED/
+	.long	msg_b_del
+	.ascic	/FLAGGED/
+	.long	msg_b_flag
+	.ascic	/KEYED/
+	.long	msg_b_key
+
+;	End of arguments for parsing table
+
+nultbl:	.byte	0				;null keyword table
+
+
+.page
+.psect	datfil	pic,usr,con,rel,lcl,noshr,noexe,rd,wrt
+
+
+lclfab:$fab	fna = lcldir,-			;address of the file name
+		fac = <get,upd,put>,-		;read/write access to te file
+		rfm = var,-			;variable length records
+		nam = namlcl,-			;name block for parse/search
+		rat = cr,-			;use crlf
+		shr = nil,-			;allow no shared access
+		mrs = page,-			;maximum record one page
+		fop = cif			;create if file does not exist
+lclrab:$rab	fab = lclfab,-			;address of the fab
+		ubf = mbuf,-			;buffer
+		usz = page,-			;buffer size
+		rbf = mbuf			;address of the output buffer
+
+inifab:$fab	fna = inidir,-			;address of the file name
+		fac = <get,put>,-		;read/write access to the file
+		rfm = var,-			;variable length records
+		rat = cr,-			;use crlf
+		mrs = page			;maximum record one page
+inirab:$rab	fab = inifab,-			;address of the fab
+		ubf = mbuf,-			;buffer
+		rbf = mbuf,-
+		usz = page			;buffer size
+
+tmpfab:$fab	fna = tmpdir,-			;address of the file name
+		fac = <get,put>,-		;read/write access to te file
+		rfm = var,-			;variable length records
+		rat = cr,-			;use crlf
+		mrs = page,-			;maximum record one page
+		fop = sup			;superceed existing files
+tmprab:$rab	fab = tmpfab,-			;address of the fab
+		ubf = mbuf,-			;buffer
+		usz = page,-			;buffer size
+		rbf = mbuf			;address of the output buffer
+
+crefab:$fab	fac = <get,put>,-		;[W1] read/write access to te file
+		rfm = var,-			;[W1] variable length records
+		rat = cr,-			;[W1] use crlf
+		mrs = page,-			;[W1] maximum record one page
+		fop = cif			;[W1] create if not exitant
+crerab:$rab	fab = crefab,-			;[W1] address of the fab
+		ubf = mbuf,-			;[W1] buffer
+		usz = page,-			;[W1] buffer size
+		rbf = mbuf,-			;[W1] address of the output buffer
+		rop = eof			;[W1] append to bottom
+
+namlcl:	$nam	rsa = res_str,-			;result buffer
+		rss = nam$c_maxrss,-		;result buffer size
+		esa = esa_str,-			;expanded buffer
+		ess = nam$c_maxrss		;expanded buffer size
+	
+res_str:.blkb	nam$c_maxrss			;result buffer
+esa_str:.blkb	nam$c_maxrss			;expanded buffer
+
+
+tmpdir:	.blkb	80
+tmpdirsz:.blkb	1
+tmpdir2:.blkb	80
+unim:	.ascic	/mail_unique.tmp.1/
+unim2:	.ascic	/mail_unique.tmp.2/
+inidir:	.blkb	80				;address of the mm.init file
+inifs:	.blkw	1				;size of the mm.init file
+initxt:	.ascic	/mm.init/
+wldbbrd:.ascic	/sys$bboard:*.txt/		;wildcard bboard files
+.end mm
+

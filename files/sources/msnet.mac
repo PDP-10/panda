@@ -1,0 +1,852 @@
+;This software is furnished under a license and may only be used
+;  or copied in accordance with the terms of such license.
+;
+;Copyright (C) 1979,1980,1981,1982 by Digital Equipment Corporation
+;	       1983,1984,1985,1986    Maynard, Massachusetts, USA
+
+
+	TITLE MSNET - Netmail sending routines for MS
+
+	SEARCH GLXMAC,MSUNV
+	PROLOG (MSNET)
+
+	CPYRYT
+	MSINIT
+
+	.DIRECTIVE FLBLST
+	SALL
+
+;Define globals
+
+	GLOBS			; Storage
+	GLOBRS			; Routines
+
+;Routines defined herein
+
+	INTERNAL SNDNET
+TOPS10<	INTERNAL SEND >
+TOPS20<	INTERNAL MAIFLG >
+
+;Routines defined elsewhere
+
+;MSDLVR.MAC
+	EXTERNAL BLDHDR
+
+;MSHOST.MAC
+	EXTERNAL VALID8
+;MSTXT.MAC
+	EXTERNAL TXTOUT
+
+;MSUTL.MAC
+	EXTERNAL MOVST0, MOVSTR
+
+;Global data items defined elsewhere
+
+;MSCNFG.MAC
+	EXTERNAL RJ.VMA, RJ.AMA
+;MS.MAC
+	EXTERNAL MYHSPT, MYHDPT, NETFLG
+TOPS20<	EXTERNAL MYSTR>
+
+TOPS10<
+repeat 0,<
+	EXTERNAL FILBLK,FILERR,IPCBLK,LKEBLK,MYPPN,OBUF,NETMPD,SENBLK
+>
+	EXTERNAL FILBLK,OBUF
+>;End TOPS10
+
+
+	SUBTTL	TOPS-10 Netmail Support - SNDNET
+
+
+   TOPS10<
+
+;This routine is called when we have a message ready to be sent and we
+;believe that one or more addressees are network addresses.  Our task
+;is to handle the network portion of the job.  If the other system is
+;a TEN, we may succeed in mailing the message immediately.  Otherwise,
+;the message will be queued for the MAIL DAEMON (NETMAI).  Unlike
+;The OTHER operating system, once the message is queued, it is gone
+;- The TOPS-20 crock of telling DMAILR to hurry up is not present.
+;Thus, note that .MAILR is called ONLY by SNDNET; there is no NETMAIL command
+;
+;U is pointing to either a TO or a CC list.  The end of the list is
+;pointed to by W.  We are going to do one giant loop over each
+;entry in the list, and send to the maildaemon at the node.  But
+;since the maildaemons will accept the message once, and then
+;forward to multiple receipients, we only send to each maildaemon once.
+
+;F%NSP=1B16
+
+; Here to stuff the header out
+SEND:	ILDB	A,B			; Get the character
+	JUMPE	A,[RET]			; Return to caller when done
+SEND1:	SOSGE	OBUF+.BFCTR		; Room for this character
+	 JRST	SEND2			; Nope, then output buffer and proceed
+	IDPB	A,OBUF+.BFPTR		; Place it into buffer
+	JRST	SEND			; and get the next one
+SEND2:	MOVEI	C,.FOOUT		;
+	HRRM	C,FILBLK+.FOFNC		; Setup for output
+	MOVE	C,[XWD .FOFNC+1,FILBLK]	;
+	FILOP.	C,			; Output buffer
+	 HALT	.			; Fix this later
+	JRST	SEND1			; Continue on with it
+
+SNDNET:	SETO	C,
+	AOS	(P)		;ASSUME SKIP RETURN FOR STARTERS
+SNDNE1:	CAILE	U,(W)		;ANYTHING TO (MORE) DO?
+	RET			;THIS MIGHT RET +2
+	MOVE	B,(U)		;FETCH RECEIPIENT BITS
+	TXNE	B,AD%PFX!AD%SFX!AD%PRN!AD%DEL!AD%DON ;REASONS NOT TO DO THIS
+	 AOJA	U,SNDNE1	;FINE, SOMEONE ELSE DID IT
+	AOSN	C		;FIRST TIME HERE?
+	SOS	(P)		;CANCEL THAT SKIP RETURN!
+	CITYPE	<%Mail not queued for >
+	MOVEI	A,(B)
+	HRLI	A,(POINT 7)
+	$CALL	KBFTOR
+	AOJA	U,SNDNE1	; try next
+
+
+REPEAT 0,< ;"Speak" to NETMAI
+SNDNET:	TRVAR <QJFN,HPTR0,QOFF,QBSZ,QBAD>
+
+;Here must do what is necessary to properly fake GLXLIB mem management
+
+	MOVE A,.JBFF		;Get current (GLXLIB) .JBFF
+	MOVEM A,QOFF		;Save for exit time
+	MOVEI A,.IOASC		;Use this mode
+	MOVX B,SIXBIT .SYS.	;PMR uses SYS, we use UPS
+	MOVEI C,A		;Point to block
+	DEVSIZ C,		;See shat we need.
+	 HALT .			;This snh
+	HLRZ S1,C		;Get number of buffers monitor builds
+	IMULI S1,(C)		;Compute total words required for same
+	$CALL M%GMEM		;Have GLXLIB allocate some for us.
+	$RETIF			;Shouldn't happen, but not much we can do.
+	MOVEM S1,QBSZ		;Save size of core
+	MOVEM S2,QBAD		;and its address
+
+SNDNT0:	MOVE B,(U)		; Get this addressee
+	TXNE B,AD%PFX!AD%SFX	; If mailing list ID,
+	 JRST SNDNT6		;  This is not an addressee
+	CALL GETUNM		; Yes, get code for this entry
+	CAME B,[-1]		; Net address?
+	JRST SNDNT6		; No, don't send via net then
+;We think this is a net address, find the host name string in it
+
+	MOVE B,(U)		; Yes, reform string pointer
+	HRLI B,(POINT 7,)
+SNDNT1:	ILDB C,B		; Get host name
+	JUMPE C,[MOVE B,[POINT 7,MYHNAM,27]
+		   JRST SNDNT6]		; Local user
+	CAIN C,42		; Quoted string?
+	JRST [	ILDB C,B		; Yes, scan to close quote
+		JUMPE C,[CMERR (Unterminated quoted string)]
+		CAIN C,42		; Close quote?
+		JRST .+1		; Yes, go on then
+		JRST .]			; No, keep looking
+	CAIE C,"@"		; Hostname?
+	JRST SNDNT1		; Not yet
+
+SNDNT2:	MOVEM B,HPTR0		; Save pointer to host name
+SNDN20:	MOVE A,HPTR0		; Get pointer to host name back
+	CALL VALID8		; Validate host name
+	 FATAL (Confusion in host name table)
+	HRRZ A,(B)		; Get ptr to node block
+	HRRZ B,N.FLGS(A)	;Get the flags
+	TXOE B,NT%DON		;Done this node already
+	 JRST SNDNT6		; Yes, do the next addressee
+	HRRM B,N.FLGS(A)	;put the flags back
+	TXO F,F%QDEC		;Pretend we queued mail (so NT%DON cleared)
+;Here, we have found a new node to send to.  Start serious work
+
+	SETZM LKEBLK		; Start by making sure that
+	MOVE B,[XWD LKEBLK,LKEBLK+1] ; any un-initialized locations
+	BLT B,LKEBLK+.RBAUT	; are wiped clean
+	HRRZ A,N.NAME(A)	; Get the pointer to the name
+	MOVE B,(A)		; Get first word of string block
+	TLNN B,(177B6)		; Is this a flag word or text?
+	TXNN B,CM%FW		;  ..
+	SKIPA			; Not flags, must be text
+	ADDI A,1		; Flags, skip it
+	HRLI A,(POINT 7,)	; Get the byte pointer
+	CALL ASCSIX		; Convert to SIXBIT
+	MOVEM B,SENBLK		; Name of File (Also known as NODNAM later...)
+	MOVEM B,LKEBLK+.RBNAM	; Save the File name
+	SETZM LKEBLK+.RBPPN	; Allow PPN to default to that of device
+	MOVSI B,(SIXBIT |001|)	; Extension
+	MOVEM B,LKEBLK+.RBEXT	; And the extension
+	MOVEM B,SENBLK+1	; SAVE THE EXTENSION
+	MOVE B,MYPPN		; PPN I am working in
+	MOVEM B,LKEBLK+.RBAUT	; Make sure we are the author. (Nesc for [1,2])
+	MOVEM B,SENBLK+2	; Send it to the NETMAI spooler too
+	MOVX B,INSVL.(077,RB.PRV) ;Get a reasonable protection
+	MOVEM B,LKEBLK+.RBPRV	; Make sure file can't be read by random folks
+	MOVEI B,.RBAUT		; Number of arguments that mean any thing
+	MOVEM B,LKEBLK+.RBCNT	; Count of arguments
+
+	MOVEI A,.IOASC		; Write the file in ASCII mode
+	MOVEM A,FILBLK+.FOIOS	; Save the I/O mode
+	MOVEI A,LKEBLK		; Get address of LKE block
+	MOVEM A,FILBLK+.FOLEB	; Save it
+	MOVSI A,-1		; Get the number of output buffers
+	MOVEM A,FILBLK+.FONBF	; Save it
+	MOVSI A,OBUF		; And the header
+	MOVEM A,FILBLK+.FOBRH	; And the buffer header
+	TXO F,F%DNNM		; This is DECnet, use right host name
+	TXZ F,F%XMTO		; This can't be set, but...
+	CALL BLDHDR		; Build a header for this message
+	TXZ F,F%DNNM		; Not DECnet any more
+
+;Here, we put it on UPS for NETMAI
+
+SNDNR0:	$TEXT(KBFTOR,<Filing Mail for later transmission>)
+	$CALL K%FLSH		;FLUSH IT
+	$CALL F%FCHN		; Get a channel from GLXLIB
+	$RETIF			; If can't, give up!
+	MOVEM S1,QJFN		; Save assigned channel
+SNDR1:	MOVEI A,.FOCRE		; We want to create a new file
+	HRL A,QJFN		; on our assigned channel
+	TXO A,FO.PRV		; Ensure that we bypass protections
+	MOVEM A,FILBLK+.FOFNC	; Save it
+	MOVX A,<SIXBIT |UPS|>	;PLACE TO PUT IT
+	MOVEM A,FILBLK+.FODEV	;DEVICE
+	MOVE A,QBAD		;Get address for buffers
+	MOVEM A,.JBFF		;Tell monitor where to put em
+	SETZM OBUF		; Make sure no stray pointers
+	MOVE A,[XWD .FOLEB+1,FILBLK] ; Get the argument pointer
+	FILOP. A,		; Create it
+	 JRST FILCKE		; Check the error code to see if real
+
+	MOVE B,[POINT 7,HDRPAG] ; OUTPUT THE HEADER PAGE
+	PUSHJ P,SNDNR1		;TO THE FILE
+	TXO F,F%UUO		;THIS IS A UUO FLAG ALSO
+	PUSHJ P,TXTOUT		;OUTPUT TEXT TO FILE ON CHANNEL 6
+	TXZ F,F%UUO		;CLEAR THE UUO FLAG
+	JRST SNDNR4		; CLOSE AND RELEASE THE CHANNEL NOW
+
+;Helper routine to do string output to MAIL daemon file
+
+SNDNR1:	ILDB A,B		;GET THE CHARACTER
+	JUMPE A,[RET]		;RETURN TO CALLER WHEN DONE
+
+SNDNR2:	SOSGE OBUF+.BFCTR	;ROOM FOR THIS CHARACTER
+	 JRST SNDNR3		;NOPE, THEN OUTPUT BUFFER AND PROCEED
+	IDPB A,OBUF+.BFPTR	;PLACE IT INTO BUFFER
+	JRST SNDNR1		;AND GET THE NEXT ONE
+
+SNDNR3:	PUSHJ P,QJFUUO		;Do this UUO
+	 OUT 0,
+	JRST SNDNR2		;OK
+	HALT	.		;GIVE ERROR MESSAGE
+;Here Flush last file buffer, and close file
+
+SNDNR4:	PUSHJ P,QJFUUO		;Do this
+	 OUT 0,
+	  TXZA F,F%UUO		;Success
+	TXO F,F%UUO		;Failed
+	PUSHJ P,QJFUUO
+	 CLOSE 0,
+	PUSHJ P,QJFUUO
+	 RELEAS 0,
+	TXZE F,F%UUO		;Unless i/o error, proceed
+	 JRST SNDNT6		;DON'T TELL MAIL SPOOLER ABOUT IT THEN
+
+;Here, we have successfully written the message to a MAILdaemon file.
+;Tell the maildaemon it has work to do
+
+	MOVX A,<XWD ^D8,SENBLK> ; GET POINTER TO SEND BLOCK
+	MOVEM A,IPCBLK+.IPCFP	;SAVE IT
+	SKIPN A,NETMPD		;HAVE A PID FOR HIM
+	 JRST [$TEXT (KBFTOR,<No Network Mail Spooler>)
+	       JRST SNDNT6]	;AND GO ON TO THE NEXT ONE
+	MOVEM A,IPCBLK+.IPCFR	; Recievers PID
+	SETZM IPCBLK+.IPCFS	; Clear senders PID
+	SETZM IPCBLK+.IPCFL	;CLEAR OUT THE FLAG WORD
+	MOVX A,<XWD ^D4,IPCBLK>	;GET THE POINTER TO THE BLOCK
+	IPCFS. A,		;SEND IT OFF
+	 JFCL
+
+;Here to advance to the next known user, and try to send
+
+SNDNT6:	TXZ F,F%NSP		;CLEAR THE NSP FLAG
+	CAIE U,(W)		; Got them all
+	 AOJA U,SNDNT0		; Nope
+
+;End of list.  Return to SNDMSG
+
+SNDNTX:	MOVE A,QOFF		; Get the GLXLIB .JBFF
+	MOVEM A,.JBFF		; Restore it
+	MOVE S1,QBSZ		; Get size of allocated buffer space
+	MOVE S2,QBAD		; And where it is
+	$CALL M%RMEM		; Give it back to GLXLIB
+	SKIPT			; Unless successful
+	 HALT .			; We screwed up
+	RETSKP
+;Here with a FILOP. error queueing for NETMAI.  If serious,
+;return, else go try next extension.
+
+FILCKE:	CAIE A,ERAEF%		; Already exist
+	 JRST [	CALL FILERR	; Report failed file operation
+		SOS (P)		; Prevent skip, so end up at SEND level
+		JRST SNDNTX]	; Now release core, and stop trying
+	MOVS B,LKEBLK+.RBEXT	; Get the extension
+	ADDI B,1		; Increment it
+	HRLZS B			; Swap it back
+	MOVEM B,SENBLK+1	; Save in message too
+	MOVEM B,LKEBLK+.RBEXT	; Save it
+	JRST SNDR1		; Recheck this file now
+
+;Helper routine to do various UUOs for QJFN
+
+QJFUUO:	PUSH P,A		;Get an ac
+	MOVE A,@-1(P)		;Get UUO caller wants xctd
+	PUSH P,A		;Save a copy
+	HRLZ A,QJFN		;Get channel number
+	LSH A,^D<17-12>		;Shift to AC field
+	IORM A,(P)		;Put into our copy of UUO
+	MOVE A,-1(P)		;Get A back
+	XCT (P)			;Do the UUO
+	 CAIA
+	AOS -2(P)		;Inc rtn for skip
+	POP P,(P)		;Toss UUO
+	POP P,(P)		;Toss old A
+	RETSKP			;Skip over user copy of UUO
+
+MAIFLG:				;TOPS-10 has no kludgy bits file...
+	RETSKP
+   >;End TOPS10
+>;End "Speak" to NETMAI
+ SUBTTL Netmail routines - SNDNET - queue DECNET and/or ARPANET mail
+
+   TOPS20<
+
+;Queue mail for MMAILR (ARPAnet mail)
+; Any other mail should have been done before this is called
+; This writes one file (or none) per call
+; Call with U pointing to beginning of list, and W pointing
+; at last element to do.
+
+;Stack space is
+; QJFN/ jfn of queued mail file to write, for ARPA mail
+; DJFN/ jfn for queued mail for old decnet
+; HPTR0/ pointer to nodename in address string (points to "@")
+; TEMP0/ quick temporary storage
+; REJCNT/ -1 if no mail was rejected
+; HOSSTR/ holds last nodename done (also a flag: nonzero if any nodes done)
+; JBINF/ storage for job information (to create a semi-unique filename)
+; FILSTR/ for created filename for queued mail for ARPA
+; DECFIL/ for created filename for old decnet
+
+SNDNET: TRVAR <QJFN,HPTR0,DJFN,REJCNT,TEMP0,<HOSSTR,20>,<JBINF,10>,<FILSTR,20>,<HNTMP,10>,<DECFIL,20>>
+	SETOM	REJCNT		;NOTHING REJECTED YET
+	SETZM	HOSSTR		;NO LAST NODENAME SEEN YET FOR ARPA
+	TXZA	F,F%QARP!F%QDEC	;NO QUEUED MAIL YET; START PROCESSING LIST
+SNDENI:	ADDI	U,1
+SNDENL:	CAILE	U,(W)		;ANYTHING TO (MORE) DO?
+	 JRST	SNDNT5		;NO, LEAVE NOW
+	MOVE	B,(U)		;FETCH RECEIPIENT BITS
+	TXNE	B,AD%PFX!AD%SFX!AD%PRN!AD%DEL!AD%DON ;REASONS NOT TO DO THIS
+	 AOJA	U,SNDENL	;FINE, SOMEONE ELSE DID IT
+	HRLI	B,(POINT 7)	;BYTE POINTER TO STRING, PLEASE
+	CALL	GETUNM		;GET CODE FOR ENTRY
+	AOJN	B,SNDENI	;SKIP ENTRY IF NOT -1 (IE, NOT NET)
+	HRRZ	B,(U)		;BUILD BYTE POINTER AGAIN
+	HRLI	B,(POINT 7)	;..
+	CALL	GETATS		;MAKE A POINTER TO TNE NODENAME
+	CAIE	C,"@"		;GET ONE?
+	 JRST	NOLCL		; NO, THIS IS LOCAL MAIL
+	MOVEM	B,HPTR0
+SNDN20:	MOVE	A,HPTR0		; Get pointer to host name back
+	CALL	VALID8		; Validate host name
+	 FATAL (Confusion in host name table)
+	HRRZ	A,(B)		; Get ptr to node block
+	MOVE	B,N.FLGS(A)	; Get flags
+	TXNE	B,NT%ARP	; ARPANET host?
+	JRST	SNDN21		; Yes, do it
+	;..
+	MOVE	A,NETFLG	; Get the network flags
+	TXZE	A,RJ.VMA	; Is the old way allowed?
+	JRST	REJECM		; Despised and rejected
+;IT HAS A NODENAME, AND IT ISN'T ARPA. IT MUST BE DECNET MAIL THAT MX
+; DECIDED NOT TO TAKE. DO IT THE OLD WAY, FOR DMAILR/VMAILR ETC.
+	MOVEI A,DECFIL	; POINT TO WHERE FILESPEC IS BUILT
+	HRLI A,(POINT 7)	; MUST USE MOVEI SINCE DECFIL IS STACK RELATIVE
+	MOVEI B,MYSTR		; Get STR:
+	CALL MOVSTR		; Put it in string
+	MOVEI B,[ASCIZ "<"]	; Don't forget the delimiter for dir
+	CALL MOVSTR		; Insert delimiter
+	MOVEI B,MYDIRS		; OURSTR:<ourdir>[--DECNET-MAIL--].nodename
+	CALL MOVSTR
+	MOVEI B,[ASCIZ />[--DECNET-MAIL--]./]
+	CALL MOVSTR		; Finish filename
+	MOVEM A,TEMP0		; Save ptr to it again
+	MOVE B,HPTR0		; Point to host part of this address
+	TXZ F,F%F1		; Translate always
+	CALL TRANSH		; Translate to real name if necessary
+	MOVEI A,HNTMP		; Safer place for translation to sit
+	HRLI A,(POINT 7,)	;  ..
+	CALL MOVST0		; Get it out of harm's way
+	MOVEI A,HNTMP		; Point to safe copy
+	HRLI A,(POINT 7,)	;  ..
+	MOVEM A,HPTR0		; Save ptr to real name
+	CALL VALID8		; Validate host name
+	 FATAL (Confusion in host name table)
+	HRRZ A,(B)		; Get ptr to node block
+	MOVE B,N.FLGS(A)	; Get flags
+	TXNE B,NT%KWL		; HAKMAIL host?
+	JRST [	HRRZ A,(U)		; Yes, write entire address into
+		HRLI A,(POINT 7,)	;  ..
+		MOVEM A,HPTR0		;  extension of queued mail
+		JRST SNDN2A]		; And do one file per recipient
+	TXOE B,NT%DON		; Done this host yet?
+	AOJA U,SNDENL		; Yes, don't do it again
+	MOVEM B,N.FLGS(A)	; Remember we've done it
+SNDN2A:	TXO F,F%DNNM		; Use DECNET name for this host
+	CALL BLDHDR		; Build header text
+	MOVE A,TEMP0		; Restore ptr to partial filespec
+	MOVE B,HPTR0		; Point to host name
+	MOVEI D,"V"-100		; In case anything needs quoting
+SNDN4A:	ILDB C,B		; Insert rest of string
+	CAIN C,"."
+	JRST SNDN4B		; Stop on "."
+	JUMPE C,SNDN4B		; Stop on null
+	CAIN C,"@"		; This needs quoting
+	IDPB D,A		;  ..
+	IDPB C,A		; Move the char
+	JRST SNDN4A		; Repeat
+SNDN4B:	MOVEI B,[ASCIZ /;P770000/]
+	CALL MOVST0		; Security please
+	MOVSI A,(GJ%NEW!GJ%FOU!GJ%SHT)
+	HRROI B,DECFIL
+	GTJFN
+	 ERJMP [JRETER (Cannot get queue file)
+		RET]
+	HRLI A,.FBBYV		; Specify 0 retention count
+	TXO A,CF%NUD		; Hold update till close
+	MOVX B,77B5
+	SETZ C,
+	CHFDB			; ...
+	 JFCL			; Tough darts.
+	TLZ A,-1		; JFN only
+	MOVE B,[7B5+OF%WR]
+	OPENF
+	 ERJMP [JRETER (Cannot open queue file)
+		RET]
+	MOVEM A,DJFN		; Remember the JFN
+	HRROI B,HDRPAG		; Start of headers
+	SETZ C,
+	SOUT
+	 ERJMP DERROR		; Error writing queue file
+	TXO F,F%JSYS		; Use SOUT, not TSOUT
+	CALL TXTOUT		; Move text of message
+	TXZ F,F%JSYS		; Don't leave stray bits around
+	JUMPF DERROR		; Check for errors
+	HRROI B,TRAILR		; Add the dashes
+	SOUT			;  ..
+	 ERJMP DERROR
+	CLOSF			; All there is to it
+	 ERJMP DERROR
+	TXO F,F%QDEC		; Note existence of queued DECNET mail
+	JRST FINNET		;mark as done and loop for next
+
+NOLCL:	WARN	(Local mail seen in SNDNET, ignoring)
+	AOJA	U,SNDENL
+
+;STILL IN TOPS20
+SNDN21:	MOVE	A,NETFLG	;TEST ARPA-ALLOWED flag
+	TXZE	A,RJ.AMA	;OK ARPA MAIL?
+	JRST	REJECM		;REJECTION FLAGGED, SO SORRY...
+
+	SKIPE	HOSSTR		;FIRST TIME HERE?
+	 JRST	SNDNT3		;NO, ALREADY SET UP THINGS
+	MOVEI	A,FILSTR	; POINT TO WHERE FILESPEC IS BUILT
+	HRLI	A,(POINT 7)	; MUST USE MOVEI SINCE FILSTR IS STACK RELATIVE
+;**;[3093] Replace 5 lines with 3 lines at SNDN21:+8L	MDR	15-JUL-87
+	MOVEI	B,[ASCIZ "MAIL:[--QUEUED-MAIL--].NEW-"] ;[3093]
+	CALL	MOVSTR		;[3093] ALL THIS TO BUILD
+				;[3093] MAIL:[--QUEUED-MAIL--].NEW-unique
+	MOVE	B,A		;SAVE POINTER IN B FOR A MOMENT
+	GTAD%			;GET DATE AND TIME
+	EXCH	B,A		;DATE/TIME INTO B, POINTER INTO A
+	CALL	RAD36		;WRITE AS A NUMBER/LETTER STRING
+	MOVEM	A,TEMP0		;SAVE POINTER FOR A MOMENT
+	SETO	A,
+	MOVSI	B,-.JIRT-1	;WE WANT JOB NUMBER THROUGH JOB RUNTIME
+	HRRI	B,JBINF
+	SETZ	C,		;FROM FIRST ENTRY
+	GETJI%
+	 JFCL			;NO FAILURE
+	MOVE	B,.JIRT+JBINF	;GET RUNTIME
+	LSH	B,^D10		;MAKE ROOM FOR A JOB NUMBER
+	OR	B,.JIJNO+JBINF	;INCLUDE JOB NUMBER
+	MOVE	A,TEMP0		;POINTER BACK INTO A
+	CALL	RAD36N		;SEMI-UNIQUE STRING ADDED TO EXTENSION
+	MOVEI	B,[ASCIZ "-MS;P770000"] ;ADD THE CORRECT PROTECTION
+	CALL	MOVST0		;AND THAT'S IT
+
+;STILL IN TOPS-20
+	MOVSI	A,(GJ%NEW!GJ%FOU!GJ%SHT)
+	HRROI	B,FILSTR
+	GTJFN%
+	 ERJMP [JRETER (Cannot get queue file)
+		RET]
+	HRLI	A,.FBBYV		; Specify 0 retention count
+	TXO	A,CF%NUD		; Hold update till close
+	MOVX	B,77B5
+	SETZ	C,
+	CHFDB%			; ...
+	 JFCL			; Tough darts.
+	HRRZS	A		; JFN ONLY
+	MOVEM	A,QJFN		; Remember the JFN
+	MOVE	B,[7B5+OF%WR]
+	OPENF%
+	 ERJMP QERROR
+	MOVEI	B,.CHFFD	;WRITE A FORMFEED
+	BOUT%
+	 ERJMP	QERROR
+	HRROI	B,[ASCIZ/=DELIVERY-OPTIONS:MAIL
+/]
+	SETZ	C,
+	SOUT%			;WRITE PROPER HEADER FOR MMAILR
+	 ERJMP	QERROR
+
+;STILL IN TOPS-20
+SNDNT3:	MOVE	B,HPTR0
+	MOVEI	A,HOSSTR
+	HRLI	A,(POINT 7)
+	STCMP%			;SAME NODE AS LAST TIME??
+	JUMPE	A,SNDNT4	;0 IF YES, DON'T NEED TO ADD A NEW NODE LINE
+	MOVE	B,HPTR0
+	HRROI	A,HOSSTR
+	CALL	CSTRBA		;COPY NEW NODENAME INTO PLACE
+	MOVEI	B,.CHFFD	;FIRST, A FORMFEED
+	MOVE	A,QJFN
+	BOUT%
+	 ERJMP	QERROR
+	MOVE	B,HPTR0		;WRITE NODENAME. C IS 0 FROM CSTRBA.
+	SOUT%
+	 ERJMP	QERROR		;..
+	HRROI	B,CRLF
+	SOUT%
+	 ERJMP	QERROR
+SNDNT4:	SETZ	C,
+	DPB	C,HPTR0		;OK, NULL SEPERATION BETWEEN NAME AND HOST
+	MOVE	A,QJFN		;SET UP TO WRITE USERNAME
+	HRRO	B,(U)		;POINT TO RECEIPIENT YET AGAIN
+	SOUT%
+	 ERJMP	QERROR		;THIS TIME WRITE HIS NAME TO ENVELOPE
+	MOVEI	B,"@"
+	DPB	B,HPTR0		;REPAIR THE RECEPIENT STRING
+	HRROI	B,CRLF
+	SOUT%
+	 ERJMP	QERROR		;OK, END USERNAME WITH CRLF
+FINNET:	MOVX	A,AD%DON	;MAKE AS DONE FOR EVERYONE ELSE
+	IORM	A,(U)		;..
+	AOJA	U,SNDENL	;NEXT ENTRY...
+
+;HERE WHEN WE HAVE EXAMINED ALL THE ENTRIES FROM U TO W.
+SNDNT5:	SKIPN	HOSSTR		;GET ANYTHING?
+	 RETSKP			;NO, GIVE OK RET WITH NOTHING TO DO
+	TXZ	F,F%DNNM	;No DECNET NAMES HERE
+	CALL	BLDHDR		;BUILD HEADERS
+	TXO	F,F%DNNM
+	MOVE	A,QJFN
+	HRROI	B,[BYTE(7) .CHFFD, .CHCRT, .CHLFD]
+	SETZ	C,
+	SOUT%
+	 ERJMP	QERROR		; END ENVELOPE PORTION
+	HRROI	B,HDRPAG	; Start of headers
+	SOUT%
+	 ERJMP	QERROR		; Error writing queue file
+	TXO	F,F%JSYS	; Use SOUT, not TSOUT
+	CALL	TXTOUT		; Move text of message
+	TXZ	F,F%JSYS	; Don't leave stray bits around
+	JUMPF	QERROR		; Check for errors
+	HRROI	B,TRAILR	; Add the dashes
+	SETZ	C,
+	SOUT%			;  ..
+	 ERJMP	QERROR
+	CLOSF%			; All there is to it
+	 ERJMP	QERROR
+	TXO	F,F%QARP	; WE HAVE ARPA MAIL
+	RETSKP			; GIVE "OK" RETURN
+
+REJECM:	AOSN	REJCNT
+	$TEXT	(KBFTOR,<
+ [MX  has  rejected some or all of the mail, as it requires access
+  to a node that MX does not service, or speaks  a  mail  protocol
+  that  MX  does  not  support. MS is NOT posting the mail for any
+  other potential mailers that might handle the required  protocol
+  -  it  has been prohibited from trying. The unsent mail text can
+  be retrieved with RETRIEVE LAST-DRAFT at the MS prompt.]
+>)
+	XOR	A,NETFLG	;see which we rejected
+	TXNE	A,RJ.VMA	; and type approprate message
+	CITYPE	<%VMAIL or DMAIL mail not queued for >
+	TXNE	A,RJ.AMA
+	CITYPE	<%TCP mail not queued for >
+	HRRZ	A,(U)
+	HRLI	A,(POINT 7)
+	$CALL	KBFTOR
+	AOJA	U,SNDENL	; try next
+
+;Byte pointer in B. Find the "@" that preceeds a nodename and return
+; the pointer to it in B and "@" in C.
+; If not found, something other than "@" in C.
+;This only handles () and "", not <>
+GETATS:	ILDB	C,B		;FIND INTERESTING CHARACTER
+	CAIE	C,0
+	CAIN	C,"@"		;STOP ON "@" OR NULL
+	RET
+	CAIN	C,"\"		;MAGIC QUOTE CHARACTER?
+	JRST	[ILDB	C,B	;FINE, GET NEXT CHAR
+		 JUMPN	C,GETATS;AND IGNORE IF NOT NULL
+		 RET]		;NO, DON'T QUOTE NULLS, JUST STOP
+	CAIN	C,"("		;COMMENT COMING?
+	JRST	[MOVEI	C,")"
+		 CALL	SCANC	;FINE, FIND CLOSE
+		 JUMPN	A,GETATS
+		 RET]		;CAN'T FIND? NOT GOOD..
+	CAIE	C,""""		;QUOTED STRING?
+	JRST	GETATS
+	CALL	SCANC
+	JUMPN	A,GETATS
+	RET
+
+SCANC:	ILDB	A,B
+	CAIE	A,(C)
+	CAIN	A,0
+	RET
+	JRST	SCANC
+
+;Copy string ref'd by B to A. Returns C/ 0.
+CSTRBA:	TLCE	A,-1
+	TLCN	A,-1
+	HRLI	A,(POINT 7)
+CSTRB1:	ILDB	C,B
+	IDPB	C,A
+	JUMPN	C,CSTRB1
+	RET
+
+CRLF:	ASCIZ/
+/
+
+;Here to write a string comprised of letters and numbers only, representing
+;the number given in B. Leading dash is appended if quantity is negative.
+; String written to bype pointer in A
+RAD36:	JUMPGE	B,RAD36A	;NEGATIVE REQUIRES SPECIAL TREATMENT
+	MOVNS	B		;NOW MAKE VALUE POSITIVE (FAILS FOR 1B0)
+RAD36N:	TXZ	B,1B0		;FORCE POSITIVE (IN CASE IT WAS 1B0)
+	MOVEI	C,"-"		;PUT IN A LEADING "-" SIGN
+	IDPB	C,A		;..
+RAD36A:	SETO	C,
+RAD36P:	PUSH	P,C		;MARK END WITH A -1
+	IDIVI	B,^D36		;USUAL NUMBER WRITER LOOP
+	CAILE	C,9		;WILL IT WORK AS A DIGIT?
+	ADDI	C,"A"-"0"-^D10	;THIS AND NEXT CONVERTS TO A LETTER
+	ADDI	C,"0"		;CONVERT TO DIGIT
+	JUMPG	B,RAD36P	;IF MORE TO DO, GO DO IT
+RAD36L:	IDPB	C,A		;WRITE LAST CHARACTER BUILT ONTO STRING
+	POP	P,C		;POP OFF CHARACTER OR END-OF-LIST VALUE
+	JUMPG	C,RAD36L	;REAL CHARACTER?
+	RET			;NO, LEAVE
+
+;Here on any error writing queue file
+
+DERROR:	SKIPA	A,DJFN
+QERROR:	MOVE	A,QJFN
+	PUSH	P,A
+	CLOSF			; Close it
+	 JFCL			; Ignore problems
+	POP	P,A
+	RLJFN
+	 JFCL
+	JRETER (Error writing queued mail)
+	RET
+
+;Still in TOPS20
+
+ SUBTTL MAIFLG - set flags for network mailers
+
+;Still in TOPS20
+
+; Set the MAILER flags
+
+MAIFLG:	TXNN F,F%QARP		; Any ARPANET mail going out?
+	JRST MAIFL1		; No, skip this
+	HRROI A,[ASCIZ /SYSTEM:MAILER.FLAGS/]
+	CALL MAIFL0		; Yes, light mailer flag
+	 RET			; Pass failure on up
+	CALL WAKEMM		; Tell MMAILR we have mail to send
+	CITYPE	<TCP mail posted>
+MAIFL1:	TXNN F,F%QDEC		; Any DECNET mail?
+	JRST MAIFL2		; No, type reassurance and quit
+	HRROI A,[ASCIZ /SYSTEM:DECNET-MAILER.FLAGS.1/]
+	CALL MAIFL0		; Yes, notify mailer
+	 RET			; Pass failure return on up
+	CITYPE	<DECnet mail posted>
+MAIFL2:	RETSKP			; OK
+
+;Still in TOPS20
+
+;Still in TOPS20
+IPCBLN==20
+WAKEMM:	STKVAR	<OURPID,<IPCBLK,.IPCFP+1>,<IPCBUF,IPCBLN>>
+	MOVX	A,IP%CPD
+	MOVEM	A,.IPCFL+IPCBLK
+	SETZM	.IPCFS+IPCBLK
+	SETZM	.IPCFR+IPCBLK
+	MOVSI	A,.IPCI2+3
+	HRRI	A,IPCBUF
+	MOVEM	A,.IPCFP+IPCBLK
+	MOVX	A,.IPCIW
+	MOVEM	A,.IPCI0+IPCBUF
+	SETZM	.IPCI1+IPCBUF
+	MOVE	B,[POINT 7,[ASCIZ/[SYSTEM]MMAILR/]]
+	HRROI	A,.IPCI2+IPCBUF
+	CALL	CSTRBA
+	MOVEI	A,.IPCFP+1
+	MOVEI	B,IPCBLK
+	MSEND%
+	 ERJMP	[RET]		;CAN'T DO THIS??
+	MOVE	A,.IPCFS+IPCBLK
+	MOVEM	A,OURPID
+WAKSIR:	SETZM	.IPCFL+IPCBLK
+	SETZM	.IPCFS+IPCBLK
+	MOVE	A,OURPID
+	MOVEM	A,.IPCFR+IPCBLK
+	MOVSI	A,IPCBLN
+	HRRI	A,IPCBUF
+	MOVEM	A,.IPCFP+IPCBLK
+	MOVEI	A,.IPCFP+1
+	MOVEI	B,IPCBLK
+	MRECV%
+	 ERJMP	[RET]
+	LDB	A,[POINT 3,.IPCFL+IPCBLK,32]
+	JUMPE	A,WAKSIR
+	MOVE	A,.IPCFL+IPCBLK
+;	LOAD	A,IP%CFC,.IPCFL+IPCBLK
+;	CAIE	A,.IPCCC
+;	CAIN	A,.IPCCF
+;	SKIPA	A,.IPCFL+IPCBLK	;OK, GET FLAGS
+;	JRST	WAKSIR		;FROM SOMEONE ELSE; IGNORE
+	TXNE	A,IP%CFE+IP%CFM
+	RET			;OH, WELL
+	SETZM	.IPCFL+IPCBLK
+	MOVE	A,OURPID
+	MOVEM	A,.IPCFS+IPCBLK
+	MOVE	A,.IPCI1+IPCBUF	;FETCH MAILR PID
+	MOVEM	A,.IPCFR+IPCBLK	;SET UP TO SEND TO IT
+	MOVEI	A,IPCBUF
+	HRLI	A,1		;SENDING ONE WORD
+	MOVEM	A,.IPCFP+IPCBLK
+	MOVE	A,['WAKEUP']	;THIS IS THE WORD
+	MOVEM	A,0+IPCBUF
+	MOVEI	C,^D20
+WAKMMR:	MOVEI	A,.IPCFP+1
+	MOVEI	B,IPCBLK
+	MSEND%
+	 ERJMP	[SOJL	C,[RET]
+		 MOVEI	A,^D1200
+		 DISMS%
+		 JRST	WAKMMR]
+	MOVX	A,.MUDES
+	MOVEM	A,IPCBUF
+	MOVE	A,OURPID
+	MOVEM	A,1+IPCBUF
+	MOVEI	A,2
+	MOVEI	B,IPCBUF
+	MUTIL%
+	 ERJMP	.+1
+	RET
+
+;Still in TOPS20
+
+
+;Still in TOPS20
+
+;Light bit in flags file for mailer
+;A/ pointer to name string for file
+
+MAIFL0:	STKVAR <FJFN,FLGPAG,FLGADR> ; Flags file JFN, buffer page, address
+	MOVEM A,FJFN		; Save pointer to name string
+	$CALL M%NXPG		; Get a page for flags
+	JUMPF [	WARN <Can't acquire page to map mailer flags>
+		RET]
+	MOVEM A,FLGPAG		; Save page number
+	LSH A,^D9		; Compute address
+	MOVEM A,FLGADR
+	MOVE A,FLGPAG		; Get page no. back
+	$CALL M%IPRC		; Tell GLXLIB the page exists now
+;	TXNE F,F%XMLR		; XMAILR support?
+;	JRST [	MOVE A,FJFN		; Yes, get JFN back
+;		JRST MAIFL3]		; Skip the GTJFN
+	MOVE B,FJFN		; Pointer to name of file
+	MOVSI A,(GJ%OLD!GJ%SHT!GJ%PHY)
+	GTJFN
+	 ERJMP [JRETER (Cannot find mailer flags)
+		JRST MAIFLX]
+	MOVEM A,FJFN
+MAIFL3:	MOVEI B,OF%THW!OF%WR!OF%RD
+	OPENF
+	 JRST [	JRETER (Cannot open mailer flags)
+		MOVE A,FJFN		; Get JFN back
+		RLJFN
+		 JFCL
+		JRST MAIFLX]
+	HRLZ A,A		; Page 0
+	MOVE B,FLGPAG		; Flags page
+	HRLI B,.FHSLF		; This fork
+	MOVSI C,(PM%RD!PM%WR)
+	PMAP
+	HRRZ C,MYDIR		; Logged in directory
+	IDIVI C,^D36
+	MOVSI A,400000
+	MOVN D,D
+	ROT A,(D)
+	ADD C,FLGADR		; Index into flags page
+	IORM A,(C)		; Set my bit
+	SETO A,
+	SETZ C,
+	PMAP			; Unmap the page
+	MOVE A,FJFN		; Get JFN back
+	TXNE F,F%XMLR		; If XMAILR support,
+	TXO A,CO%NRJ		; Keep the JFN
+	CLOSF
+	 JFCL
+MAIFLX:	MOVE A,FLGPAG		; Inform GLXLIB that the page is now
+	$CALL M%IPSN		;  available again
+	RETSKP
+
+   >;End TOPS20
+
+	END
+
+; Edit 2462 to MSNET.MAC by PRATT on 1-Nov-85
+; Merge many changes in -10, -20, and common code.
+
+
+; *** Edit 2485 to MSNET.MAC by MAYO on 21-Nov-85
+;
+; *** Edit 2486 to MSNET.MAC by PRATT on 22-Nov-85
+; Copyright statements
+; *** Edit 2607 to MSNET.MAC by SANTEE on 10-Dec-85
+; Make MS/MX get along well together. Have MS write dashes at the end of
+; messages. While we're there remove some of the NETMAI code.
+; *** Edit 2613 to MSNET.MAC by JROSSELL on 14-Dec-85
+; Repair the REPAIR command
+; *** Edit 2651 to MSNET.MAC by SANTEE on 2-Feb-86
+; Eliminate the need for MSUTAB at all. Move the few useful lines elsewhere. 
+; *** Edit 2657 to MSNET.MAC by MAYO on 18-Feb-86
+; Teach MS to type recipient names that aren't receiving mail (when rejected by
+; MX).
+; *** Edit 2705 to MSNET.MAC by PRATT on 27-May-86
+; Change mention of ARPA mail to TCP since a site isn't necessarily on Arpanet.
+; 
+; *** Edit 2706 to MSNET.MAC by RASPUZZI on 27-May-86
+; Teach MS not to use POBOX: when writing files. Instead, find out what STR: is
+; being used (saved in MYSTR) and go from there. 
+; *** Edit 3093 to MSNET.MAC by RASPUZZI on 15-Jul-87
+; Make MS queue up ARPAnet mail in MAIL: so that MMAILR can deliver it. 

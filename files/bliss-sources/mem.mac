@@ -1,0 +1,446 @@
+TITLE MEM -- Memory allocator for the RTL
+
+;
+;	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1984, 1986.
+;	ALL RIGHTS RESERVED.
+;
+;	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+;	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+;	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+;	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+;	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+;	SOFTWARE IS HEREBY TRANSFERRED.
+;
+;	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+;	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+;	EQUIPMENT CORPORATION.
+;
+;	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+;	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+;
+SUBTTL Edit History
+
+; Version 1.0
+
+; Version 1.1
+
+;.EDIT 50	Formally go to version 1.1, update copyright, insert V1.1
+;			development changes (formally V2)
+;		DDB,15-Jan-85,SPR:NONE
+
+SALL
+
+SEARCH DDBSYM, DYNSYM, MONSYM, MACSYM
+
+EXTERNAL RTLERR
+
+SEGMENT DATA
+
+; Memory management concepts
+
+; This memory manager manages several contiguous chunks of memory.  Each
+; request for allocation must specify which chunk it wishes to allocate from.
+; Chunks may be bigger or smaller than sections, and may (obviously) cross
+; section boundaries.  Pieces allocated may reside anywhere within the chunk.
+
+; On deallocation, adjacent free blocks are merged together using Kunth's
+; algorithm as liberally interpreted by several people.
+
+; A block of memory is a structured entity.  It has a header, a body, and
+; a trailer.  Only the body is available to users.  The "address" of the 
+; block is the address of the first word of the body.
+
+; Chunks are identified by their index into the chunk tables below.
+; No real chunk may start at 0,,0; this is used to identify an empty slot.
+
+CNKMAX==:50			;How many chunks can we manage?
+
+RT.CKS:: BLOCK CNKMAX		;Table of chunk start information
+RT.CKE:: BLOCK CNKMAX		;Table of chunk end information
+
+
+SUBTTL Chunks
+
+; Error chunk -- used for allocating error-processing blocks only, in hopes
+; that we won't run out while processing an error
+ERCNKS:: BLOCK 500
+ERCNKE==:.-1
+
+; RTL chunk -- eventually this should be figured out from the LINK memory
+; map, but for now it's a static allocation at compile time.
+RTCNKS:: BLOCK 200K
+RTCNKE==:.-1
+
+
+SUBTTL ME$ALM -- Allocate memory
+
+; This will allocate a block of memory from the specified chunk and return
+; its address, or return an error indicating that this is not possible.
+
+; Arguments:
+;	1/	Chunk number
+;	2/	Size of block desired
+
+; Return values:
+;	1/	Chunk number
+;	2/	Address of block allocated.
+
+; Preserves registers 6-17
+
+; Register usage:
+;	P1/	ID of chunk requested
+;	P2/	Current block address
+
+SEGMENT CODE
+
+ME$ALM::
+	PUSH P, P1
+	PUSH P, P2
+	PUSH P, T1		;Save chunk number too
+
+	MOVE P1, T1
+
+	MOVE P2, RT.CKS(P1)	;Address of chunk
+	ADDI P2, .MBHLN		;Address of first block in chunk
+
+ALM001:	MOVE T1, .MBDES(P2)	;Get the descriptor word from header
+	TXNE T1, MB%ALO		;Skip if not allocated
+	    JRST ALMNXB		;Go on to next block, than
+
+; We are now looking at a free block.  Decide if it suits us.
+	TXZ T1, ^-MB%LEN	;Extract length (must be at LO end of word!)
+	CAMGE T1, T2		;Skip if this block at least big enough
+	    JRST ALMNXB		;Go on to next block
+
+; Timing window here.  We mark whole block as allocated, but something
+; could happen between the MOVE at ALM001 and now.  Any ideas?
+	MOVX T0, MB%ALO
+	IORM T0, .MBDES(P2)	;Set whole block allocated
+
+; The block we are looking at (P2) is big enough (length in T1).
+; Time to get out the big knives!  Or is it?
+	MOVE T3, T1
+	SUB T3, T2		;Compute what's left of block
+	CAIG T3, .MBOVH		;Will there be a body to what's left?
+	  JRST ALMDON		;Give caller full block
+
+; Split the free block.  Results will be used block and residual block.
+; P2 holds free block address.
+; T1 holds free block length.  
+; T2 holds length requested for used block.
+
+	MOVE T3, P2
+	ADD T3, T1		;T3 holds free block trailer address
+	MOVE T4, P2
+	ADD T4, T2		;T4 holds used block trailer address
+	MOVE T5, T4
+	ADDI T5, .MBOVH		;T5 holds free block address
+
+	; The order of this is critical to minimize timing windows.  Note
+	; that memory will often be allocated and freed at interrupt level,
+	; so this can be kind of interesting.  In fact, this has windows in
+	; it if you allocate and then free a small block at interrupt level
+	; fast enough (it could get the residual block and then return it
+	; before the trailer on the used block is set up).
+
+	MOVEM P2, .MBADR(T4)	;Set trailer on what will be used block
+	MOVE T4, .MBDES(P2)	;Get header on original block
+
+	MOVE T0, T1
+	SUB T0, T2
+	SUBI T0, .MBOVH		;Compute length left for residual block
+;	TXZ T0, MB%ALO		;Residual block is not allocated (word was
+				;clear, so don't bother to clear it again)
+	TXNE T4, MB%END		;Skip if end bit clear
+	  TXO T0, MB%END	;Set end bit
+	MOVEM T0, .MBDES(T5)	;Set header on what will be residual block
+
+	MOVEM T5, .MBADR(T3)	;Set trailer on residual block
+
+	TXO T2, MB%ALO		;Used block is allocated
+	TXNE T4, MB%BEG		;Skip if begin bit clear
+	  TXO T2, MB%BEG	;Set begin bit
+	MOVEM T2, .MBDES(P2)	;Set header on used block
+
+	JRST ALMDON		;Done.  Address of block is in P2
+
+; No luck so far.  Look at next block.
+ALMNXB:	MOVE T1, .MBDES(P2)
+	TXZ T1, ^-MB%LEN	;Mask to get length
+	ADD P2, T1
+	ADDI P2, .MBOVH		;Now have address of next block
+	CAMGE P2, RT.CKE(P1)	;Skip if this hypothetical block is past
+				;end of chunk
+	    JRST ALM001		;Go see if maybe we can allocate this
+
+; If we fall through to here, caller loses: no such block available.
+	POP P, T0		;Restore chunk number
+	POP P, P2
+	POP P, P1		;Restore preserved registers
+	PUSH P, T0		;Chunk requested
+	PUSH P, T2		;Length requested
+	PUSH P, [2]		;Arg count
+	PUSH P, [ME$IMC]	;Condition
+	JRST RTLERR		;Standard RTL error handling
+
+; Successful completion
+ALMDON:	
+; Zero what will become body of used block
+	MOVE T0, .MBDES(P2)
+	TXZ T0, ^-MB%LEN
+	MOVE T4, P2
+	ADD T4, T0		;Calculate address of trailer
+	SETZM 0(P2)		;Zero first word of body of used block
+	XMOVEI T0, 0(P2)
+	HRL T0, T0
+	AOS T0			;Now have first,,second in T1
+	BLT T0, -.MBTLN(T4)	;ZERO THE BLOCK
+
+
+	MOVE T2, P2		;Return block address in T2
+	POP P, T1		;Restore chunk number
+	POP P, P2
+	POP P, P1		;Restore preserved registers
+	RET
+
+SUBTTL ME$DLM -- Deallocate a block of memory
+
+; This frees a block allocated with ME$ALM
+
+; Arguments:
+;	1/	Address of the block
+
+; Preserves registers 6-17
+
+; Register usage:
+;	T4/	Address of the block we are freeing
+
+ME$DLM::
+	MOVE T4, T1		;Address of the block of memory
+	MOVE T0, .MBDES(T4)	;Get descriptor for this block
+	TXNN T0, MB%ALO		;Skip if it's marked as allocated
+	    JRST DLMNAL		;Invalid -- block not allocated!
+
+; Try to merge this block with a possible previous free block
+	TXNE T0, MB%BEG		;Skip if this block not the beginning
+	    JRST DLMNXT		;Well, go try to merge with following block
+
+	XMOVEI T2, -.MBOVH(T4)	;Get address of previous trailer in T2
+	MOVE T1, .MBADR(T2)	;Get address of header in T1
+	MOVE T3, .MBDES(T1)	;Get descriptor of this block
+	TXNE T3, MB%ALO		;Skip if this block also free
+	    JRST DLMNXT		;Previous not free, try next
+
+; T1 points to header of previous free block.  T2 points to trailer.
+; T4 points to header of new free block.
+; T0 contains descriptor of new free block.
+; Merge these two together
+
+	TXZ T0, ^-MB%LEN	;Mask to extract length (already rjust)
+	MOVE T2, T4		;Adress of header of new free block
+	ADD T2, T0		;Address of new free block trailer in T2
+	MOVEM T1, .MBADR(T2)	;Trailer of combined block points to header of
+	ADDI T0, .MBOVH		;Total size of new free block (including ovh)
+	ADDM T0, .MBDES(T1)	;Update total size of block
+	; Previous free block must already be free
+	MOVE T0, .MBDES(T4)	;Get new free block descriptor
+	TXZ T0, ^-MB%END	;Mask to just END bit
+	IORM T0, .MBDES(T1)	;Set end bit in previous free if set in new
+	MOVE T4, T1		;Now the "new free block" is the merged blocks
+	; Fall through to DLMNXT and try to merge with following block
+
+; Attempt to merge new free block with following block (if any)
+; T4 holds address of new free block
+DLMNXT:	MOVE T0, .MBDES(T4)	;Get descriptor of new free block
+	TXZ T0, MB%ALO		;This block will now be free
+	MOVEM T0, .MBDES(T4)
+	TXNE T0, MB%END		;Skip if new block not last block
+	  JRST DLMDON		;Done, no next block
+
+; There is a following block we can consider merging with...
+	MOVE T1, T4		;Address of new block
+	TXZ T0, ^-MB%LEN	;Get block size (already rjust)
+	ADD T1, T0		;Address of new block trailer
+	MOVE T2, T1
+	ADDI T2, .MBOVH		;Address of next block
+	MOVE T3, .MBDES(T2)	;Get next block descriptor
+	TXNE T3, MB%ALO		;Skip if next block is free
+	  JRST DLMDON		;Done, next block isn't free
+
+; There is a free next block to merge with.  Do it.
+; T4 is address of new block.  
+; T2 is address of next block
+; T3 is descriptor of next block
+	MOVE T1, .MBDES(T4)	;Get descriptor of new block
+	TXNE T3, MB%END		;Skip if next block not last
+	  TXO T1, MB%END	;Combined block will be last
+	TXZ T1, MB%ALO		;Combined block won't be allocated
+	TXZ T3, ^-MB%LEN	;Get length of next block
+	ADD T1, T3		;Increase length of combined block
+	ADDI T1, .MBOVH		;Include overhead words
+	MOVEM T1, .MBDES(T4)	;Put back descriptor of combined block
+	ADD T2, T3		;Get address of next block trailer
+	MOVEM T4, .MBADR(T2)	;Put combined block trailer at end
+
+; Done!!!
+DLMDON:	RET			;No register save was necessary
+
+; Serious error -- block to return wasn't flagged as allocated
+DLMNAL:	PUSH P, T4		;Block being returned
+	PUSH P, [1]		;Arg count
+	PUSH P, [ME$NAL]	;Condition
+	JRST RTLERR		;Standard RTL error handling (no return)
+
+
+SUBTTL ME$MEM -- Chunk initialization
+
+; Call this routine to initialize a chunk.  This is particularly for
+; use by MASTER INIT.
+
+; Arguments:
+;	T1/	Chunk start address
+;	T2/	Chunk end address
+
+; Returns:
+;	T3/	Chunk ID
+
+; Errors:
+;	ME$NCA	No chunk available
+
+; Trashes T0-T3
+
+ME$MEM::
+	MOVX T3, 0
+MEM001:	CAIL T3, CNKMAX
+	  JRST MEMLOS		;No chunk ID available
+	SKIPE RT.CKS(T3)	;Skip if chunk is free
+	  AOJA T3, MEM001	;Loop
+	
+	MOVEM T1, RT.CKS(T3)
+	MOVEM T2, RT.CKE(T3)
+
+; Now initialize one free block which fills the chunk
+	ADDI T1, .MBHLN		;Get block address given chunk address
+	MOVE T0, T2
+	SUB T0, T1
+	SUBI T0, .MBTLN-1	;Compute block length
+	TXO T0, MB%BEG!MB%END	;Both first and last block in chunk
+	;TXZ T0, MB%ALO		;It's already not allocated, no work to do
+	MOVEM T0, .MBDES(T1)	;Put away descriptor word
+	MOVEM T1, .MBADR(T2)	;Put away trailer word
+	MOVE T1, T3		;Return chunk ID
+	RET
+
+; Lose big -- no chunk ID's available
+MEMLOS:
+	PUSH P, T1
+	PUSH P, T2
+	PUSH P, [2]		;Arg count
+	PUSH P, [ME$NCA]
+	JRST RTLERR
+
+SUBTTL ME$DMC -- Dump a chunk of memory
+
+; This is intended for use during debugging of user programs, or of
+; the memory allocator itself.
+
+; Arguments:
+;	T1/	Chunk number
+
+; Preserves registers 6-17
+
+ME$DMC::
+	PUSH P, P1
+	PUSH P, P2
+
+	MOVE P1, RT.CKS(T1)
+	MOVE P2, RT.CKE(T1)
+
+	TMSG <
+********** Dumping chunk from >
+	MOVX T1, .PRIOU
+	MOVE T2, P1
+	MOVX T3, <NO%MAG!FLD(^D8,NO%RDX)>
+	NOUT%
+	  ERJMP .+1
+
+	TMSG < to >
+	MOVX T1, .PRIOU
+	MOVE T2, P2
+	MOVX T3, <NO%MAG!FLD(^D8,NO%RDX)>
+	NOUT%
+	  ERJMP .+1
+	TMSG <
+>
+	ADDI P1, .MBHLN		;Address of first block in chunk
+
+DMC001:	TMSG <Block at >
+	MOVX T1, .PRIOU
+	MOVE T2, P1
+	MOVX T3, <NO%MAG!FLD(^D8,NO%RDX)>
+	NOUT%
+	  ERJMP .+1		;No finesse in debugging routines
+	TMSG < length >
+	MOVX T1, .PRIOU
+	MOVE T2, .MBDES(P1)
+	TXZ T2, ^-MB%LEN
+	MOVX T3, <NO%MAG!FLD(^D8,NO%RDX)>
+	NOUT%
+	  ERJMP .+1
+	MOVE T2, .MBDES(P1)
+	MOVX T1, <-1,,[ASCIZ / is FREE/]>
+	TXNN T2, MB%ALO
+	  PSOUT%
+	TMSG <
+>
+	MOVX T1, <-1,,[ASCIZ /    FIRST block in chunk
+/]>
+	TXNE T2, MB%BEG
+	  PSOUT%
+	MOVX T1, <-1,,[ASCIZ /    LAST block in chunk
+/]>
+	TXNE T2, MB%END
+	  PSOUT%
+	MOVE T4, P1
+	MOVE T0, .MBDES(P1)
+	TXZ T0, ^-MB%LEN
+	ADD T4, T0		;Trailer address in T4
+	CAMN P1, .MBADR(T4)	;Skip if trailer doesn't point at block
+	  JRST DMCNXT		;OK
+	TMSG <   *TRAILER address INCORRECT: >
+	MOVX T1, .PRIOU
+	MOVE T2, .MBADR(T4)
+	MOVX T3, <NO%MAG!FLD(^D8,NO%RDX)>
+	NOUT%
+	  ERJMP .+1
+	TMSG <
+>
+
+DMCNXT:	ADDI T4, .MBOVH		;Address of next block
+	MOVE P1, T4
+	CAMG P1, P2		;Skip if this block past end of chunk
+	  JRST DMC001		;Loop to dump all blocks in chunk
+
+; Done
+	TMSG <********** End of chunk dump
+
+>
+	POP P, P2
+	POP P, P1
+	RET
+
+SUBTTL Routine stubs for routines not yet implemented
+
+SEGMENT CODE
+
+ME$ALS::
+ME$ALP::
+ME$DLS::
+ME$DLP::
+	PUSH P, 0(P)		;Duplicate return address
+	PUSH P, [1]		;Arg count
+	PUSH P, [DY$NYI]	;Condition
+	JRST RTLERR
+
+	END
+ 

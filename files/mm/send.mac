@@ -1,0 +1,572 @@
+	TITLE SEND - Send Local and Network TTY messages
+	SUBTTL Kirk Lougheed/KSL/DE/MRC/WHP4
+
+; Version information
+
+	VMAJOR==7		;Major version (matches monitor's)
+	VMINOR==1		;Minor version
+	VEDIT==^D61		;Edit number
+	VWHO==0			;Who last edited (0 = developers)
+
+	SEARCH MONSYM,MACSYM,SNDDEF
+	.TEXT "SEND/SAVE"
+	.TEXT "/SYMSEG:PSECT:CODE"
+	.REQUIRE SNDMSG		;Message delivery routines
+	.REQUIRE HSTNAM		;Host name and protocol lookup routines
+	.REQUIRE WAKEUP		;MMailr wakeup routine
+	.REQUIRE BLANKT		;Routine $BLANK to clear the screen
+	.REQUIRE SYS:MACREL
+	EXTERN $GTPRO,$SEND,$WTRCP,$BLANK
+	ASUPPRESS
+	SALL
+
+; Definitions and Storage
+
+A=:1				;Temporary AC's for JSYS use etc
+B=:2
+C=:3
+D=:4
+
+ADR=:10				;Pointer to current address block
+
+FP=:15				;TRVAR frame pointer
+CX=:16				;Scratch for MACREL
+P=:17				;Main stack pointer
+
+	BUFLEN==MAXCHR/5	;Length of command buffers (for long msgs)
+	PDLEN==500		;Length of pushdown stack
+	MAISKT==^D25		;Get socket for SMTP
+
+; PSECT start definitions
+	IFNDEF INIORG,<INIORG==600>   ;Initialized impure (avoid MACREL)
+	IFNDEF DATORG,<DATORG==1000>  ;Uninitialized impure data
+	IFNDEF PAGORG,<PAGORG==10000> ;Paged data
+	IFNDEF CODORG,<CODORG==20000> ;Code
+
+SUBTTL Macros
+
+DEFINE EMSG (STR) <		;;Pretty print a general error message
+	JRST [	HRROI A,[ASCIZ\STR\]
+	 	ESOUT%
+		JRST DONE ]
+>
+
+DEFINE JMSG (STR<JSYS error>) <	;;Error messages for JSYS failure returns
+	ERJMP [	HRROI A,[ASCIZ\STR\]
+		JRST PERR ]
+>
+
+DEFINE TXMSG (STR) <		;;TMSG from within .TEXTI
+	JRST [	CALL PCRIF
+		IFNB <STR>,<TMSG <STR
+>>
+		JRST .TEXTI ]
+>
+
+; Initialized storage
+
+	.PSECT DATPAG,PAGORG	;Set up paged data (nothing here for it)
+	.ENDPS
+
+	.PSECT INIDAT,INIORG
+
+; COMND% argument block
+
+CBLOCK:	0			;.CMFLG - reparse address, flags
+	0			;.CMIOJ - I/O jfns
+	0			;.CMRTY - pointer to prompt
+	-1,,CMDBUF		;.CMBFP - holds whole command being assembled
+	-1,,CMDBUF		;.CMPTR - pointer to next field
+	BUFLEN*5-1		;.CMCNT - number of bytes in CMDBUF
+	0			;.CMINC - count of unparsed characters
+	-1,,ATMBUF		;.CMABP - pointer to atom buffer
+	BUFLEN*5-1		;.CMABC - number of bytes in ATMBUF
+	JFNBLK			;.CMGJB - address of GTJFN% block
+
+; TEXTI% argument block
+
+TXTARG:	10			;.RDCWD - count of words in argument block
+	RD%BRK!RD%JFN		;.RDFLG - flag bits
+	.PRIIN,,.PRIOU		;.RDIOJ - I/O jfns
+	-1,,TMPBUF		;.RDDBP - destination pointer
+	BUFLEN*5-1		;.RDDBC - bytes in destination buffer
+	-1,,TMPBUF		;.RDBFP - beginning of destination buffer
+	0			;.RDRTY - no special CTRL-R buffer
+	TXTBRK			;.RDBRK - address of break mask
+	-1,,TMPBUF		;.RDBKL - backup limit for editting
+
+
+; Initialize TEXTI% break words
+
+	BRINI.			;Initialize break mask to zero
+	BRKCH. (.CHCNB)		;CTRL-B
+	BRKCH. (.CHVTB)		;CTRL-K
+	BRKCH. (.CHFFD)		;CTRL-L
+	BRKCH. (.CHCNN)		;CTRL-N
+
+; Define TEXTI% break mask
+
+TXTBRK:	BRMSK. (W0.,W1.,W2.,W3.)
+
+; $SEND data block
+
+SDBLOK:	0			;.SDPID - No PID yet
+	T%RSYS!T%USER		;.SDFLG - Obey REFUSE SYS, type mult status
+
+	.ENDPS
+
+SUBTTL Uninitialized storage
+
+	.PSECT DATA,DATORG
+
+PDLIST:	BLOCK PDLEN		;Pushdown stack
+TMPBUF:	BLOCK BUFLEN		;Temporary storage buffer
+ATMBUF:	BLOCK BUFLEN		;Atom buffer for COMND%
+CMDBUF:	BLOCK BUFLEN		;Command buffer for COMND%
+ADRBLK:	BLOCK 40		;Place to make lists of addresses
+JFNBLK:	BLOCK 16		;GTJFN% block for COMND%
+SERRCT:	BLOCK 1			;How many errors we encountered this message
+PARDAT:	BLOCK 1			;Data from parse
+INJFN:	BLOCK 1			;JFN of file we are inserting via CTRL-B
+
+	.ENDPS
+
+SUBTTL Startup and Parsing Routines
+
+	.PSECT CODE,CODORG
+
+EVEC:	JRST START		;START address
+	JRST REENT		;REENTER address
+	BYTE (3)VWHO (9)VMAJOR (6)VMINOR (18)VEDIT
+EVECL==.-EVEC
+
+
+; Table of names we expect when invoked from the EXEC
+
+XECTAB:	XECLEN,,XECLEN
+	[ASCIZ/NSEND/],,0
+	[ASCIZ/QSEND/],,0
+	[ASCIZ/SEND/],,0
+	[ASCIZ/TO/],,0
+XECLEN==.-XECTAB-1
+
+
+START:	RESET%			;Clean up the world
+	MOVE P,[IOWD PDLEN, PDLIST] ;Set up stack
+	SETZM SDBLOK+.SDPID	;No PID yet
+	MOVEI A,.RSINI		;A/initialize RSCAN buffer
+	RSCAN%			;Make RSCAN buffer available
+	 JMSG <Could not obtain JCL from EXEC>
+	JUMPE A,REENT		;Nothing in RSCAN buffer, try REENTER point
+	MOVE A,[.PRIIN,,.NULIO] ;JFNs for reading from RSCAN buffer
+	MOVEM A,CBLOCK+.CMIOJ	;Set them in the command state block
+	HRROI A,[ASCIZ//]	;Null prompt
+	CALL INICM0		;Set up for command processing
+	MOVEI A,CBLOCK
+	MOVEI B,[FLDDB. .CMKEY,,XECTAB]
+	COMND%			;Parse whatever invoked us
+	JXN A,CM%NOP,REENT	;If lost, try reentry
+	MOVEI B,[FLDDB. .CMNOI,,<-1,,[ASCIZ/TO/]>]
+	COMND%			;Parse any noise words
+;	JRST PARSE		;Join common code
+
+; PARSE - common parsing code shared by normal startup and reentry
+
+PARSE:	MOVE P,[IOWD PDLEN, PDLIST] ;Reset stack in case of reparse
+	MOVEI ADR,ADRBLK	;Point to address block
+	DO.
+	  MOVEI A,CBLOCK
+	  MOVEI B,[FLDDB. .CMUSR,,,,,[
+		   FLDDB. .CMNUM,CM%SDH,10,<Local terminal number>,,[
+		   FLDDB. .CMTOK,CM%SDH,<-1,,[ASCIZ/*/]>,,,[
+		   FLDBK. .CMFLD,,,<Network address>,,UNMMSK]]]]
+	  COMND%		;Parse a destination
+	  TXNE A,CM%NOP
+	   EMSG <No such user>
+	  MOVEM B,PARDAT	;Save any data returned by first parse
+	  LOAD D,CM%FNC,(C)	;Fetch type of field we just parsed for later
+	  HRROI A,TMPBUF
+	  HRROI B,ATMBUF
+	  CALL MOVSTR		;Copy net user name just in case
+	  MOVX A,CM%XIF
+	  IORM A,CBLOCK+.CMFLG	;Turn off special meaning of @
+	  MOVEI A,CBLOCK
+	  MOVEI B,[FLDDB. .CMCMA,CM%SDH,,<comma and another address>,,[
+		   FLDDB. .CMCFM,,,,,[
+		   FLDDB. .CMTOK,,<-1,,[ASCIZ/@/]>,,,[
+		   FLDDB. .CMTOK,CM%SDH,<-1,,[ASCIZ/%/]>,,,[
+		   FLDDB. .CMTXT,CM%SDH,,<one line text message>]]]]]
+	  CAIN D,.CMFLD		;If field, must parse net site
+	   MOVEI B,[FLDDB. .CMTOK,,<-1,,[ASCIZ/@/]>,,,[
+		    FLDDB. .CMTOK,CM%SDH,<-1,,[ASCIZ/%/]>]]
+	  COMND%		;Parse complicated line
+	  TXNE A,CM%NOP
+	   EMSG <No such user>
+	  MOVX A,CM%XIF
+	  ANDCAM A,CBLOCK+.CMFLG ;Turn back on special meaning of @
+	  LOAD C,CM%FNC,(C)	;Get what we parsed
+	  CAIE C,.CMTOK		;Atsign?
+	  IFSKP.
+	    GJINF%
+	    SKIPN A
+	     EMSG <Login please to do network sends>
+	    MOVEI A,CBLOCK
+	    MOVEI B,[FLDBK. .CMFLD,,,<Host name>,,UNMMSK]
+	    COMND%
+	    TXNE A,CM%NOP
+	     EMSG <Invalid host name>
+	    HRROI A,ATMBUF	;Validate host name
+	    SETO C,		;All protocols
+	    CALL $GTPRO
+	     EMSG <No such host name>
+	    HRROI A,1(ADR)	;Get place to stuff things
+	    HRROI B,TMPBUF	;Copy user name
+	    CALL MOVSTR		;Into address block
+	    HRROI A,1(A)	;Now point to next free word
+	    HRROI B,ATMBUF	;From atom buffer
+	    CALL MOVSTR		;Copy host name string
+	    MOVEI A,1(A)	;Point to next word
+	    HRLI A,RC.NET	;This is a net recipient
+	    MOVEM A,(ADR)	;Save as address block header word
+	    MOVEI A,CBLOCK
+	    MOVEI B,[FLDDB. .CMCMA,CM%SDH,,<comma and another address>,,[
+		     FLDDB. .CMCFM,,,,,[
+		     FLDDB. .CMTXT,CM%SDH,,<one line text message>]]]
+	    COMND%		;Parse a return or a line of text
+	    TXNE A,CM%NOP
+	     EMSG <Not confirmed>
+	    LOAD C,CM%FNC,(C)	;Get last field parsed
+	  ELSE.
+	    CAIE D,.CMTOK	;Star?
+	    IFSKP.
+	      MOVEI A,1(ADR)	;Get next location
+	      HRLI A,RC.ALL	;Sending to all
+	    ELSE.
+	      MOVE A,PARDAT	;Get parsed data back
+	      MOVEM A,1(ADR)	;Save as data for this recipient
+	      MOVEI A,2(ADR)	;Now point to next free space
+	      CAIN D,.CMUSR	;RC.TTY = 0, already set.  If user,
+	       HRLI A,RC.USR	;Set that instead
+	    ENDIF.
+	    MOVEM A,(ADR)	;Save address block
+	  ENDIF.
+	  CAIE C,.CMCMA		;Comma?
+	   EXIT.		;No, done parsing
+	  LOAD ADR,RC%NXT,(ADR) ;Point to next free block
+	  LOOP.			;Back for another
+	ENDDO.
+	HLLZS (ADR)		;Clear out last link in recipient chain
+	CAIN C,.CMCFM		;Got a confirm?
+	 JRST PARPRM		;Yes, prompt user for the message
+	HRROI A,TMPBUF		;To temporary buffer
+	HRROI B,ATMBUF		;From atom buffer
+	CALL MOVSTR		;Move the message
+;	JRST SENDIT		;Go send it off
+
+SENDIT:	SETZM SERRCT		;No errors yet
+	MOVX A,T%RSYS!T%USER	;Obey REFUSE SYS initially
+	MOVEM A,SDBLOK+.SDFLG	;Set it in argument block word
+	MOVEI B,ADRBLK		;Point to address block
+	DO.
+	  HRROI A,TMPBUF	;Point to message text
+	  MOVEI C,SDBLOK	;And to send argument block
+	  CALL $SEND		;Send message off
+	   IFSKP. <EXIT.>	;If succeeded, done with loop
+
+	  ;; Some error.  Process, maybe try again (being careful with adr ptr)
+	  MOVE ADR,B		;Save pointer
+	  MOVE D,A		;Save error string pointer
+	  CAIE C,TTXREF		;Refusing messages?
+	  IFSKP.
+	    MOVX A,.FHSLF	;On ourself
+	    RPCAP%		;Read process caps
+	  ANDXN. B,SC%WHL!SC%OPR ;We must be WOPR
+	    MOVE C,B		;Copy into caps to enable
+	    EPCAP%		;Enable ourself
+	    HRROI A,ATMBUF	;Use atom buffer since not munged by parse
+	    MOVE B,ADR		;With failing recipient block
+	    CALL $WTRCP		;Write recipient name
+	    HRROI B,[ASCIZ/ refusing messages [Confirm] /]
+	    CALL MOVSTR		;Finish prompt
+	    HRROI A,ATMBUF	;Point to it again
+	    CALL INICMD		;Initialize command block
+	    MOVEI A,CBLOCK	;A/command block
+	    MOVEI B,[FLDDB. .CMCFM] ;B/confirmation fdb
+	    COMND%		;Parse it
+	    TXNE A,CM%NOP	;Parsed?
+	  ANSKP.
+	    MOVX A,T%RAFT!T%USER ;Yes, get flag (will be reset by $SEND)
+	    MOVEM A,SDBLOK+.SDFLG ;Set to not refuse for this one only
+	    MOVE B,ADR		;Get address block back
+	    LOOP.		;Back for another try
+	  ENDIF.
+
+	  ;; Refusing and not confirmed or some other error.  Type message
+	  AOS SERRCT		;Remember we had a bad one
+	  MOVEI A,ADRBLK	;Point to first block
+	  LOAD A,RC%NXT,(A)	;Second block
+	  SKIPE (A)		;If nothing there, i.e. only one address
+	  IFSKP.
+	    HRROI A,[ASCIZ//]	;Point to null string
+	    ESOUT%		;To start error message
+	  ELSE.
+	    CALL PCRIF		;Make sure we have a new line
+	    TMSG <%>		;Start message
+	    MOVEI A,.PRIOU	;To the terminal
+	    MOVE B,ADR		;With failing recipient block
+	    CALL $WTRCP		;Write recipient string
+	    TMSG <: >		;Colon to finish up with
+	  ENDIF.
+	  MOVE A,D		;Get error string back
+	  PSOUT%		;Type string we were given
+	  TMSG <
+>				;CRLF for pretty
+	  LOAD B,RC%NXT,(ADR)	;Get next address pointer from saved pointer
+	  JUMPN B,TOP.		;Back for more
+	ENDDO.
+
+	;; Here when finished with recipient list.  Maybe write SENDS.FAILED
+	SKIPE SERRCT		;If got any errors
+	 CALL SNDFIL		;Make a SENDS.FAILED file
+DONE:	HALTF%			;All done
+	JRST REENT		;Continue at REENTER point
+
+; Here on reentry or no JCL
+; Don't do a RESET% so as to preserve our PID between reentries
+
+REENT:	MOVE P,[IOWD PDLEN, PDLIST] ;Set up stack
+	HRROI A,[ASCIZ/SEND (TO) /] ;Get prompt
+	CALL INICMD		;Set up command processing
+	JRST PARSE		;Join common code
+
+
+; Set up for COMND% parsing
+
+INICMD:	MOVE B,[.PRIIN,,.PRIOU] ;JFNS for reading from the TTY
+	MOVEM B,CBLOCK+.CMIOJ	;Set them in the command state block
+INICM0:	MOVEM A,CBLOCK+.CMRTY	;Set prompt
+	POP P,A			;Get return address
+	HRRZM A,CBLOCK+.CMFLG	;Set it up
+	MOVEI A,CBLOCK
+	MOVEI B,[FLDDB. .CMINI]
+	COMND%			;Initialize COMND% jsys
+	JRST @CBLOCK+.CMFLG	;join common code
+
+
+; Here to prompt the user for a message
+
+PARPRM:	TMSG < Message (end with ESCAPE or CTRL/Z):
+>
+	CALL .TEXTI		;Read in text, process certain CTRL characters
+	TMSG <
+>				;CRLF to reassure the user
+	JRST SENDIT		;Rejoin main code
+
+SUBTTL TEXTI% Routines
+
+; .TEXTI - read in text, handle special control characters
+; provides MM like interface for users who type SEND FOO <return>
+
+.TEXTI:	MOVEI A,TXTARG		;A/address of argument block
+	TEXTI%			;Read in text
+	 JMSG
+	TXNN A,RD%BTM		;Terminated because of a break character?
+	IFSKP.
+	  HRROI A,[ASCIZ/Message much too long/]
+	  ESOUT%
+	  CALL SNDFIL		;Make SENDS.FAILED so he doesn't lose it all
+	  JRST DONE
+	ENDIF.
+	LDB A,TXTARG+.RDDBP	;Fetch terminating byte
+	MOVEI B,.CHNUL
+	DPB B,TXTARG+.RDDBP	;Drop a null on the terminator
+	SETO B,			;Want to readjust pointer
+	ADJBP B,TXTARG+.RDDBP	;Back up pointer once
+	MOVEM B,TXTARG+.RDDBP	;Restore updated pointer
+	CAIE A,.CHCNZ		;Control Z
+	 CAIN A,.CHESC		;Or escape?
+	  RET			;Yes, we're all done
+	CAIN A,.CHCNB		;Control B?
+	 JRST .CTRLB		;Yes, ask for file to insert
+	CAIN A,.CHCNN		;Control N?
+	 JRST .CTRLN		;Yes, ask if user wants to abort
+	CAIN A,.CHVTB		;Control K?
+	 JRST .CTRLK		;Yes, retype the message
+	CAIN A,.CHFFD		;Control L?
+	 JRST .CTRLL		;Yes, blank screen and retype
+	HRROI A,[ASCIZ/Unexpected error: Unrecognized termination character/]
+	ESOUT%			;Report programmer error
+	CALL SNDFIL		;Write SENDS.FAILED
+	JRST DONE
+
+; Here on Control N to abort
+
+.CTRLN:	MOVEI A,.PRIOU
+	CFIBF%			;Clear typeahead
+	TMSG <
+Abort? >			;Prompt user
+	PBIN%			;Wait for a character to be typed
+	ANDI A,137		;Strip parity and capitalize
+	CAIN A,"Y"		;Yes?
+	 HALTF%			;Just shut us down, but continuable
+	TXMSG			;Type CRLF and go back for more
+
+
+; Here on Control K and Control L to retype
+
+.CTRLK:	CALL PCRIF		;CTRL/K makes sure we are on a new line
+	CAIA
+.CTRLL:	 CALL $BLANK		;CTRL/L clears the screen
+	TMSG < Message:
+>				;Initial display
+	HRROI A,TMPBUF		;A/pointer into message buffer
+	PSOUT%			;Type message again
+	JRST .TEXTI		;Get more input
+
+; Here on Control B to enter a file
+
+.CTRLB:	TMSG <
+>				;Blank line for pretty
+	GJINF%			;Get job information
+	SKIPN A
+	 TXMSG <%You must be logged in to include files>
+	SETZM JFNBLK		;Clear start of GTJFN block
+	MOVE A,[JFNBLK,,JFNBLK+1] ;Make BLT word
+	BLT A,JFNBLK+16-1	;Clear out the whole thing
+	HRROI A,[ASCIZ/(Insert file: /]
+	CALL INICMD		;Set up for command parsing
+	MOVEI A,CBLOCK
+	MOVEI B,[FLDDB. .CMIFI]	;FDB for an input file
+	COMND%			;Parse it
+	TXNE A,CM%NOP		;Parsed?
+	 TXMSG <%Can't find file>
+	MOVEM B,INJFN		;Save JFN in safe place
+	MOVEI A,CBLOCK
+	MOVEI B,[FLDDB. .CMCFM]	;FDB to finish parse
+	COMND%			;Do it
+	TXNE A,CM%NOP		;Parsed?
+	 TXMSG <%Not confirmed>
+	MOVE A,INJFN		;Get JFN back
+	MOVX B,FLD(7,OF%BSZ)!OF%RD ;Text file for read access
+	OPENF%			;Open the file
+	IFJER.
+	  MOVE A,INJFN		;Failed, get JFN back
+	  RLJFN%		;And flush it
+	  TXMSG <%Can't open file>
+	ENDIF.
+	MOVE B,TXTARG+.RDDBP	;B/pointer to buffer
+	MOVE C,TXTARG+.RDDBC	;C/bytes left in buffer
+	MOVEI D,.CHNUL		;D/end on a null
+	SIN%			;Read from the file
+	 ERJMP .+1		;Ignore errors
+	SKIPE C			;Check if we still have room in buffer
+	IFSKP.
+	  HRROI A,[ASCIZ/File too large for internal buffer/]
+	  ESOUT%
+	  CALL SNDFIL		;Write what we have
+	  JRST DONE
+	ENDIF.
+	MOVEM B,TXTARG+.RDDBP	;Restore byte pointer
+	MOVEM C,TXTARG+.RDDBC	;Update byte count
+	MOVE A,INJFN		;A/file JFN
+	CLOSF%			;Close the file
+	 NOP			;Ignore an error here
+	TXMSG <...EOF)>		;Finish message and go back to top
+
+SUBTTL SNDFIL - Writing the SENDS.FAILED file
+
+SNDFIL:	GJINF%			;Get job information
+	JUMPE A,R		;Quietly return if not logged in
+	SETO A,			;this job
+	HRROI B,D		;one word to D
+	MOVEI C,.JILNO		;get job's logged in directory number
+	GETJI%			;look it up
+	 ERJMP R		;failed, give up
+	MOVE B,D		;Get directory number into place
+	HRROI A,ATMBUF		;A/pointer to buffer
+	DIRST%			;Write the directory string
+	 ERJMP R		;Some error, give up
+	HRROI B,[ASCIZ/SENDS.FAILED;P770202;T/]
+	CALL MOVSTR		;Finish writing name
+	MOVX A,GJ%SHT!GJ%NEW!GJ%TMP!.GJNHG ;A/flags: new file, short form
+	HRROI B,ATMBUF		;B/pointer to file spec
+	GTJFN%			;Look for the file
+	 ERJMP R		;Failed?? non-skip return
+	MOVE D,A		;Save JFN in D
+	MOVX B,FLD(7,OF%BSZ)!OF%WR ;Write access to text file
+	OPENF%			;Open the file
+	IFJER.
+	  MOVE A,D		;Failed, get JFN back
+	  RLJFN%		;Flush it
+	   NOP
+	  RET
+	ENDIF.
+	MOVE A,D		;A/JFN of file
+	HRROI B,TMPBUF		;B/pointer to message
+	SETZ C,			;C/end on a null
+	SOUT%			;Write it to the file
+	 ERJMP .+1		;Error, probably disk quota exceeded
+	CLOSF%			;Close the file
+	 NOP			;Ignore an error here
+	CALL PCRIF		;Make sure we have a new line
+	TMSG <%Failing message written to SENDS.FAILED>
+	RET
+
+PCRIF:	SAVEAC <A,B>		;Don't mung caller registers
+	MOVEI A,.PRIOU		;A/reading from the tty
+	RFPOS%			;Get cursor position
+	HRROI A,[ASCIZ/
+/]				;Get ready with a CRLF
+	TRNE B,-1		;If not against the left margin
+	 PSOUT%			;Then make it that way
+	RET
+
+SUBTTL Miscellaneous Utility Subroutines
+
+; PERR - Print most recent error message (call with A/error string)
+
+PERR:	ESOUT%			;Print the string
+	TMSG < - >		;Print the separator
+	CALL .ERSTR		;Print JSYS error
+	JRST DONE
+
+.ERSTR:	MOVEI A,.PRIOU		;A/to the terminal
+	HRLOI B,.FHSLF		;B/most recent error for this process
+	SETZ C,			;C/no string length limit
+	ERSTR%			;Print the error string
+	 NOP			;Ignore errors
+	 NOP
+	RET
+
+;MOVSTR - move an asciz string from source to destination - includes the null
+;call with A/destination string pointer, B/source string pointer
+
+MOVSTR:	MKPTR (A)
+	MKPTR (B)
+	DO.
+	  ILDB C,B
+	  IDPB C,A
+	  JUMPN C,TOP.
+	ENDDO.
+	RET
+
+
+; CPYSTR - copy an asciz string from source to destination without the null
+
+CPYSTR:	MKPTR (A)
+	MKPTR (B)
+	DO.
+	  ILDB C,B
+	  JUMPE C,R
+	  IDPB C,A
+	  LOOP.
+	ENDDO.
+
+; Break mask for slurping up a user name
+
+UNMMSK:	777777777760		;No controls
+	737744001760		;#, *, -, .. numerics
+	400000000260		;Upper case alphabetics, brackets
+	400000000760		;Lower case alphabetics
+
+	END <EVECL,,EVEC>

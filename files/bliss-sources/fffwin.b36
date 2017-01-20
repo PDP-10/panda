@@ -1,0 +1,1275 @@
+%TITLE 'FFFWIN'
+%SBTTL 'COMPILE With VARIANT=3 for DIU-10'
+MODULE FFFWIN =
+BEGIN
+!
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1985, 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+!
+! 572 - Add TOPS-10 conditionals
+!
+REQUIRE 'fffreq';
+
+REQUIRE 'rmsosd';
+
+COMPILETIME                                                              !a572
+    Load_with_RMS = ((%Variant AND 1) NEQ 0),
+    Section_Zero = ((%Variant AND 2) NEQ 0);
+
+FORWARD ROUTINE
+    checkeof,					!   End-of-file check
+    RAddr,					!   Globalize RMS-local address
+    ebc_new_block,				! Skip remainder of block
+    six_rd_hdr,					! Read SIXBIT record header
+    ebc_rd_hdr,					! Read EBCDIC block/rec header
+    rd_rec,					! Move a record
+    rd_wrd,					! RD_REC for binary data
+    rd_buf,					! Get next buffer
+    g_byte;					! Put specified byte in window
+
+%IF NOT Section_Zero                                                      !a572
+%THEN
+FORWARD ROUTINE
+    gptr,					! Turn 2-word GBP to OWGBP
+    ea_ch$move,					! CH$MOVE for OWGBPs
+    getwindow,					!   File/process handler
+    pagexist,					!   Does this page exist?
+    MoveRec;					!   Move a record to/from user buffer
+%FI
+
+!
+! Externals
+!
+
+EXTERNAL
+    stksec,					! Stack's section
+    BlkSec,					! User's section
+    FFFSec,					! Our section
+    RmsSec;					! RMS's section
+
+LITERAL
+    page_size = %O'1000';
+
+%IF Section_Zero                                                          !a572
+%THEN
+
+!+
+! Since one word global byte pointers do not work in section 0
+! (at least not on a 2020), change each occurance of ea_ch$ptr and
+! ea_ch$move to the normal BLISS defined ones
+!-
+
+UNDECLARE
+    %Quote ea_ch$ptr;
+
+MACRO
+    ea_ch$ptr = ch$ptr %,
+    ea_ch$move = ch$move %;
+
+%FI
+
+%SBTTL 'GETWINDOW - position page in window'
+
+%IF NOT Load_with_RMS
+%THEN
+
+GLOBAL ROUTINE getwindow (fpage, abortf) =
+    BEGIN
+
+    LOCAL
+	bpage,
+	bfdadr,
+	incore,
+	bktsiz;
+
+    !+
+    !    If there is a page in the window, release it
+    !-
+
+    IF .cbd [bkt$a_address] NEQ 0
+    THEN 					! There is a current bucket
+	Put_Bucket (Rab = .Rab, Update = false, Desc = .cbd);
+
+    !+
+    !    Check if specified file page exists (if caller wants us to)
+    !-
+
+    IF .abortf NEQ false
+    THEN
+	BEGIN
+
+	!+
+	!    Read the page's accessibility
+	!-
+
+	IF NOT pagexist (.fst [fst$h_jfn], .fpage)
+	THEN
+	    BEGIN
+	    SIGNAL (ff$_page_not_exist);
+	    RETURN ss$_error;
+	    END;				! Page non-existent
+
+	END;
+
+    !+
+    !    We can now fetch the new bucket and make it "current"
+    !-
+
+    bktsiz = .cbd [bkt$v_size];			! Get the bucket size
+
+    IF Get_Bucket (Rab = .Rab, Desc = cbd, Bucket = .fpage, Bucket_Size = .bktsiz) EQL false
+    THEN
+	BEGIN
+	SIGNAL (ff$_bkt_get_failed);
+	RETURN false
+	END;
+
+    RETURN true;
+    END;					! End routine GETWINDOW
+%FI
+
+%SBTTL 'CHECKEOF - check if at end of file'
+
+GLOBAL ROUTINE checkeof =
+    BEGIN
+
+    LOCAL
+	hybyte,
+	next_hybyte;
+
+    !+
+    !   SEQUENTIAL access:  Have we already read the maximum
+    !                       number of bytes in this file?
+    !
+    !   RFA access:  Is the user's RFA less than 0 or greater
+    !                than the maximum record number?
+    !                (not yet implemented --- 8/16/84)
+    !-
+
+    hybyte = .Rst [Rst$g_highest_byte];
+    next_hybyte = MIN (.fst [fst$g_sof],
+	.rst [rst$g_highest_byte] + $size_in_bytes (rms$k_bin_size,
+	    rms$k_page_size));
+
+    IF (.next_hybyte - .hybyte) LEQ 0		! No more bytes in file
+    THEN 					! We are at end of file
+	RETURN true;
+
+    RETURN false;				! End of file not encountered
+    END;					! End routine CHECKEOF
+
+%SBTTL 'PAGEXIST - check if file page exists'
+
+%IF NOT Load_with_RMS
+%THEN
+
+GLOBAL ROUTINE pagexist (file_id, p_to_chk) : =
+    BEGIN
+
+    LOCAL
+	page_access : BLOCK [1];
+
+    IF NOT rpacs (xwd (.file_id, .p_to_chk); page_access) THEN SIGNAL (ff$_rpacs_failed);
+
+    IF .POINTR (page_access, pa_pex) THEN RETURN true ELSE RETURN false;
+
+    END;					! End PAGEXIST
+
+%FI
+
+GLOBAL ROUTINE RAddr (Rms_Local_Address) =
+! Globalize possibly RMS-local address
+    BEGIN
+
+    IF (.Rms_Local_Address NEQ 0) AND ((.Rms_Local_Address AND FFF$M_Left_Half) EQL 0)
+    THEN
+	(.Rms_Local_Address OR .RmsSec)
+    ELSE
+	.Rms_Local_Address
+
+    END;
+
+%SBTTL 'MOVEREC - move a record around'
+
+%IF NOT Load_with_RMS
+%THEN
+
+GLOBAL ROUTINE moverec (windowptr, useradr, putflag, bytes, bytesize) : =
+    BEGIN
+
+    LOCAL
+	wordcount,				! COUNT OF WORDS TO MOVE
+	bytesword,
+	room,					! ROOM LEFT ON CURRENT PAGE
+	extrabytes,
+	SOURCE,
+	dest,
+	buf2ptr : VECTOR [2];			!TWO-WORD BP IF NEEDED
+
+    REGISTER
+	temp;
+
+    IF (.bytes LSS 0) OR (.bytesize LEQ 0) OR (.bytesize GTR 36) THEN RETURN false;
+
+    bytesword = 36/.bytesize;			! FIND # OF BYTES IN WORD
+    wordcount = .bytes/.bytesword;		! # OF WORDS TO MOVE
+    extrabytes = .bytes - (.wordcount*.bytesword);
+!+
+!    FOR A $PUT OPERATION, WE WILL MOVE THE RECORD BY USING
+!    A BLT INSTEAD OF A ILDB-IDPB LOOP. WHEN WE ARE LATER
+!    READING THE RECORD, WE MUST INSURE THAT WE DON'T MOVE
+!    THE EXTRA GARBAGE BYTES IN THE RECORD
+!-
+
+    IF (.putflag)
+    THEN
+
+	IF (.extrabytes NEQ 0)
+	THEN
+	    BEGIN
+	    wordcount = .wordcount + 1;		! BUMP THE WORDCOUNT
+	    extrabytes = 0			! NO EXTRA BYTES
+	    END;
+
+    WHILE .wordcount NEQ 0 DO
+	BEGIN
+
+	!+
+	!    COMPUTE HOW MUCH SPACE WE HAVE LEFT ON THIS PAGE
+	!-
+
+	room = (.curentbufferadr + rms$k_page_size) - .windowptr;
+
+	!+
+	!    WE MUST NOW CHECK TO SEE IF THE FILE PAGE IS COMPLETELY FULL
+	!-
+
+	IF .room EQL 0
+	THEN
+	    BEGIN
+	    temp = .currentfilepage + 1;	! GET # OF NEXT PAGE IN FILE
+
+	    !+
+	    !    LOAD THE PAGE WE WANT RIGHT NOW.
+	    !-
+
+	    getwindow (.temp, false);
+	    windowptr = .curentbufferadr;	! RESET PTR TO START OF FILE
+	    					!  BUFFER
+	    room = rms$k_page_size		! AND AMOUNT LEFT
+	    END;
+
+	IF .wordcount LSS .room THEN room = .wordcount;
+
+	!+
+	!    ASSUME THAT THIS IS A $GET AND SET UP OUT POINTERS
+	!-
+
+	SOURCE = .windowptr;			! MOVE FROM FILE PAGE...
+	dest = .useradr;			! ...TO USER BUFFER
+
+%IF 0
+%THEN
+
+	IF .putflag NEQ false %( MOVE FROM USER TO WINDOW )%
+	THEN
+	    BEGIN
+	    setbfdupd (cbd [bkdbfdadr]);	!INDIC FILE PAGE UPD
+	    SOURCE = .useradr;			! GET ADDRESS
+	    dest = .windowptr			! AND DESTINATION
+	    END;%( OF IF PUTFLAG IS TRUE )%
+
+%FI
+
+	!+
+	!    NOW, MOVE THIS RECORD SEGMENT FROM/TO USER BUFFER
+	!    This will always be running in a nonzero section.
+        !    unless it isn't
+	!-
+
+    %IF Section_Zero                                                      !a572
+    %THEN
+	IF .rmssec NEQ 0
+	THEN
+	    $rms$xcopy (.SOURCE, .dest, .room)
+	ELSE
+	    $move_words (.SOURCE, .dest, .room);
+    %ELSE
+	$rms$xcopy (.SOURCE, .dest, .room);
+    %FI
+
+	useradr = .useradr + .room;		! BUMP USER BUFFER POINTER
+	windowptr = .windowptr + .room;		! AND WINDOW POINTER
+	wordcount = .wordcount - .room
+	END;					! OF WHILE WORDCOUNT NEQ ZERO
+
+!+
+!    WE HAVE NOW MOVED ALL FULL WORDS IN THE RECORD. WE MUST
+!    THEN SEE IF THERE WERE ANY BYTES LEFT OVER TO MOVE ])%
+
+    IF .extrabytes EQL 0 THEN RETURN true;	! No extra bytes to move
+
+!+
+!    FIRST, WE MUST CHECK TO SEE IF THESE LAST FEW BYTES
+!    WILL OVERLAP INTO THE NEXT PAGE OF THE FILE. IF SO,
+!    WE MUST MAP IN THE NEXT FILE PAGE AND MOVE THE BYTES
+!    IN THE NEW PAGE
+!-
+
+    IF ((.curentbufferadr + rms$k_page_size) EQL .windowptr)
+    THEN
+	BEGIN
+	temp = (.currentfilepage + 1);		! GET # OF NEXT FILE PAGE
+
+	IF NOT getwindow (.temp, false) THEN SIGNAL (ff$_window_failed);
+
+	windowptr = .curentbufferadr		! RESET ADDRESS
+	END;					! OF IF WINDOW IS EXHAUSTED
+
+    !+
+    !    SET UP AN APPROPRIATE BYTE POINTER
+    !-
+
+    temp = .bytesize*.extrabytes;		! # OF BITS TO MOVE
+    temp = (.temp^6) + nullbp;			! FORM LH OF PTR
+    windowptr<lh> = .temp;			!GET LOCAL BP TO WINDOW
+
+    !+
+    !   Move the last few bytes, using a 2-word global
+    !   This code always runs in a nonzero section
+    !-
+
+    BEGIN
+    buf2ptr [1] = .useradr;
+    buf2ptr<lh> = .temp OR %O'40';		!2-WORD BP
+    buf2ptr<rh> = 0;
+    $ildb (temp, windowptr);
+    $idpb (temp, buf2ptr)
+    END;
+    RETURN ss$_normal;
+    END;					! End routine MOVEREC
+
+%FI
+
+%SBTTL 'EBC_NEW_BLOCK - skip remainder of EBCDIC block'
+
+GLOBAL ROUTINE ebc_new_block =
+    BEGIN
+
+    STACKLOCAL
+	block_length;				! Must be on stack
+
+    LOCAL
+	nrp,					! Current NRP
+	bytes_to_skip;				! Amount to add to it
+
+    nrp = .rst [rst$g_next_record_pointer];
+    bytes_to_skip = rms$k_ebc_b_p_bl - 		!
+    ((.nrp + rms$k_ebc_b_p_bl) MOD rms$k_ebc_b_p_bl);
+
+    IF .bytes_to_skip EQL rms$k_ebc_b_p_bl	! Fix if on boundary
+    THEN
+	bytes_to_skip = 0;
+
+    nrp = .nrp + .bytes_to_skip;		! Point at next block
+    rst [rst$g_next_record_pointer] = .nrp;	! Set RST
+
+    !+
+    !	Handle variable and fixed blocks differently.
+    !	Variable blocks must be read in and then have
+    !	the block size read from them.  The size of
+    !	fixed blocks may be calculated.
+    !-
+
+    if .fst [fst$h_rfm] eql fst$k_var		! Variable
+    then
+	begin
+
+	!+
+	!   Get the block in
+	!-
+
+	IF NOT g_byte (.nrp)			!
+	THEN
+	    RETURN false;
+
+	!
+	!   Reset block size count (header size accounted for
+	!   by EBC_RD_HDR).
+	!
+
+	IF NOT ebc_rd_hdr (.stksec or block_length)	! Get block size
+	THEN
+	    RETURN false;
+
+	rst [rst$g_blkbyt] = .block_length;
+	rst [rst$g_next_record_pointer] = 	! Skip block header
+	.rst [rst$g_next_record_pointer] + rms$k_header_ebc;
+	end
+    else
+	rst [rst$g_blkbyt] = .fst [fst$h_mrs]*.fab [fab$v_bls];
+
+    RETURN true;
+    END;					! End EBC_NEW_BLOCK
+
+
+%IF NOT Section_zero                                                      !a572
+%THEN
+
+%SBTTL 'EA_CH$MOVE -- CH$MOVE for OWGBPs'
+
+GLOBAL ROUTINE ea_ch$move (len, sptr, dptr) =
+    BEGIN
+
+    BUILTIN
+	machskip;
+
+    STACKLOCAL
+	newdptr : VECTOR [2];
+
+    REGISTER
+	R1 = 1,
+	R2 = 2,
+	R3 = 3,
+	R4 = 4,
+	R5 = 5,
+	R6 = 6;
+
+    R1 = R4 = .len;
+    R2 = .sptr;
+    R5 = .dptr;
+    R3 = R6 = 0;
+    machskip (%O'123', R1, UPLIT (%O'016'^27, 0));
+    newdptr [0] = .R5;
+    newdptr [1] = .R6;
+    RETURN gptr (.stksec or newdptr);
+    END;					! End EA_CH$MOVE
+
+%SBTTL 'GPTR -- transform 2-word BP to OWGBP'
+ROUTINE gptr (twoptr : REF $byte_pointer) =
+!+
+!   GPTR takes a two-word global byte pointer
+!   and returns a one-word global byte pointer.
+!   It uses the B36%SZ table of the BLISS run-time
+!   library.
+!-
+    BEGIN
+
+    EXTERNAL
+	b36_sz : VECTOR;
+
+    LOCAL
+	bytesize,
+	bytepos,
+	transptr,				! Pointer for transform
+	newptr;
+
+    IF .twoptr [ptr$v_global_flag]		! Is argument global pointer?
+    THEN
+	BEGIN					! Process global pointer
+	newptr<0, 30> = .twoptr [ptr$a_global_address];
+	END
+    ELSE
+	BEGIN					! Process local pointer
+
+	LOCAL
+	    ptr_sec;
+
+	ptr_sec = .twoptr AND %O'007777000000';	! Get the section number
+	newptr<0, 30> = .ptr_sec OR .twoptr [ptr$a_local_address];
+	END;
+
+    bytesize = .twoptr [ptr$v_byte_size];
+    bytepos = .twoptr [ptr$v_byte_position];
+    transptr = .b36_sz [.bytesize];
+    transptr<lh> = .twoptr [ptr$h_lh] AND NOT %O'000040';
+    newptr<30, 6> = CH$RCHAR (.transptr);
+    RETURN .newptr;
+    END;					! End GPTR
+%FI
+
+%SBTTL 'SIX_RD_HDR -- read SIXBIT block/record header'
+
+GLOBAL ROUTINE six_rd_hdr (p_hdr_contents) =
+!+
+!   Return the length of an SIXBIT record.
+!
+!   Read the next four bytes of an SIXBIT file into a word.
+!   Return the value from the right half of the word, which
+!   will be the length of a variable record (if we are pointing
+!   at the wrong thing, of course, it will be garbage).
+!-
+    BEGIN
+
+    BIND
+	hdr_contents = .p_hdr_contents;		! Refer to argument
+
+    LOCAL
+	bytes_to_move,				! Bytes for this move
+	bytes_moved,				! Bytes we did move
+	hdr_pointer;				! Point at header buffer
+
+    STACKLOCAL
+	hdr_buf;				! Receive header bytes
+
+    !+
+    !	Get a buffer if we need it
+    !-
+
+    IF .rst [rst$h_byte_count] EQL 0		! Do we need bytes?
+    THEN
+	BEGIN					! Get next buffer
+	rd_buf ();				! Get the next buffer
+
+	IF .rst [rst$v_eof]			! EOF?
+	THEN
+	    BEGIN
+	    rab [rab$h_sts] = rms$_eof;		! Set EOF
+	    RETURN false;			! ...
+	    END;
+
+	END;
+
+    !
+    !	Set up a pointer to the record header
+    !
+    hdr_pointer = ea_ch$ptr (			! Make a pointer
+	.stksec OR hdr_buf, 			!   to a buffer
+	0, rms$k_six_size);			!   for the record length
+    !
+    !	Get the length of the record to get by moving
+    !	the four-byte header to a buffer and extracting
+    !	the record length from the header.
+    !
+    bytes_to_move = MIN (			! How much to move
+	rms$k_header_six, 			!   Length of header
+	.rst [rst$h_byte_count]);		!   Length of file buffer?
+    hdr_pointer = ea_ch$move (			! Move the record
+	.bytes_to_move, 			!   This many bytes
+	.rst [rst$g_page_pointer], 		!   From here
+	.hdr_pointer);				!   To here
+    rst [rst$g_page_pointer] = CH$PLUS (	! Bump the page pointer
+	.rst [rst$g_page_pointer], 		!   ...
+	.bytes_to_move);			!   by the amount read
+    !
+    !	Adjust counters
+    !
+    bytes_moved = .bytes_to_move;		! This much was moved
+    rst [rst$h_byte_count] = .rst [rst$h_byte_count] - .bytes_to_move;
+
+    !+
+    !	If the header crosses page boundaries, then we
+    !	have not got the whole header, and must get
+    !	another buffer and get the rest.
+    !-
+
+    IF .bytes_moved NEQ rms$k_header_six	! Not enough?
+    THEN
+	BEGIN
+	rd_buf ();				! Get a buffer
+
+	IF .rst [rst$v_eof]			! EOF?
+	THEN
+	    BEGIN
+	    rab [rab$h_sts] = rms$_eof;		! Set EOF
+	    RETURN false;			! ...
+	    END;
+
+	bytes_to_move = rms$k_header_six - .bytes_moved;
+	!
+	!   Get the rest of the header
+	!
+	hdr_pointer = ea_ch$move (		! Move the rest of header
+	    .bytes_to_move, 			!   This many bytes
+	    .rst [rst$g_page_pointer], 		!   From here
+	    .hdr_pointer);			!   To here
+	rst [rst$g_page_pointer] = CH$PLUS (	! Bump the page pointer
+	    .rst [rst$g_page_pointer], 		!   ...
+	    .bytes_to_move);			!   by the amount read
+	!
+	!	Adjust counters
+	!
+	rst [rst$h_byte_count] = .rst [rst$h_byte_count] - .bytes_to_move;
+	END;					! Done
+
+    IF .hdr_buf<0, 18, 1> LSS 0			! Don't return negative length
+    THEN
+	hdr_contents = 0			! So return 0
+    ELSE
+	hdr_contents = .hdr_buf<rh>;		! Get right halfword
+
+    RETURN true;
+    END;					! End SIX_RD_HDR
+
+%SBTTL 'RD_REC -- move a record'
+
+GLOBAL ROUTINE rd_rec =
+    BEGIN
+
+    LOCAL
+	bytes_per_word,				! Bytes in a word
+	bytes_to_get,				! Length of record
+	users_buffer,				! Address of user's buffer
+	bytes_to_move,				! Length to move
+	bytes_moved,				! Bytes moved so far
+	bytes_left,				! Space in buffer
+	user_pointer;				! User buffer pointer
+
+    bytes_per_word = %BPVAL/.fst [fst$h_bsz];	! Get bytes in a word
+    bytes_to_get = .rst [rst$h_record_size];	! Length to read
+    bytes_moved = 0;				! Initialize this
+
+    !+
+    !	Set up the address of the user's buffer
+    !-
+
+    users_buffer = .rab [rab$a_ubf];
+
+    IF .users_buffer<lh> EQL 0			! No section number?
+    THEN
+	users_buffer = .users_buffer OR .blksec;
+
+    !
+    !	Get the size of the user's buffer
+    !
+    bytes_left = .rab [rab$h_usz]*.bytes_per_word;
+    !
+    !	Set up the pointer to user's buffer
+    !
+    user_pointer = ea_ch$ptr (.users_buffer, 0, .fst [fst$h_bsz]);
+
+    !+
+    !	Get a buffer if we need it
+    !-
+
+    IF .rst [rst$h_byte_count] EQL 0		! Do we need bytes?
+    THEN
+	BEGIN					! Get next buffer
+	rd_buf ();				! Get a buffer
+
+	IF .rst [rst$v_eof]			! EOF?
+	THEN
+	    BEGIN
+	    rab [rab$h_sts] = rms$_eof;		! Set EOF
+	    rab [rab$h_rsz] = .bytes_moved;	! Just in case
+	    RETURN false;			! ...
+	    END;
+
+	END;
+
+    !
+    !   Move as much as we need, as will fit,
+    !   or as is available, whichever is smaller.
+    !
+    bytes_to_move = MIN (			! How much to move
+	.bytes_to_get, 				! Length of record?
+	.bytes_left, 				! Length of user buffer?
+	.rst [rst$h_byte_count]);		! Length of file buffer?
+    !
+    !   Move the data
+    !
+    user_pointer = ea_ch$move (			! Move the record
+	.bytes_to_move, 			! This many bytes
+	.rst [rst$g_page_pointer], 		! From here
+	.user_pointer);				! To here
+    bytes_left = .bytes_left - .bytes_to_move;	! Adjust space left
+
+    !+
+    !	Adjust the pointers and counters, etc.
+    !-
+
+    rst [rst$g_page_pointer] = CH$PLUS (	! Bump the page pointer
+	.rst [rst$g_page_pointer], 		!   ...
+	.bytes_to_move);			!   by the amount read
+    bytes_moved = .bytes_to_move;		! We moved these
+    rst [rst$h_byte_count] = .rst [rst$h_byte_count] - .bytes_to_move;
+
+    !+
+    !	Now check to see where we are
+    !-
+
+    IF .bytes_moved NEQ .bytes_to_get		! Done?
+    THEN
+	BEGIN					! Not done yet
+
+	!+
+	!   To get here, we either exceeded our user
+	!   buffer space or exhausted our file buffer.
+	!   Therefore, let's assume that the problem
+	!   is not the user, but in ourselves, and so
+	!   start a loop to get the rest of the record.
+	!   Check for "Record Too Big" error in the loop.
+	!-
+
+	DO
+	    BEGIN
+
+	    !+
+	    !	Check for RTB error
+	    !-
+
+	    IF .bytes_left EQL 0		! End of user buffer?
+	    THEN
+		BEGIN				! Return RTB error
+		rab [rab$h_sts] = rms$_rtb;	! Record is too big!
+		rab [rab$h_stv] = .bytes_to_get;	! Actual length
+		rab [rab$h_rsz] = .bytes_moved;	! Size we got
+		rab [rab$a_rbf] = .users_buffer;	! Where we put it
+		RETURN false;			! Say this is buggy return
+		END;
+
+	    !
+	    !	Get a buffer
+	    !
+	    rd_buf ();				! Get a buffer
+
+	    IF .rst [rst$v_eof]			! EOF?
+	    THEN
+		BEGIN
+		rab [rab$h_sts] = rms$_eof;	! Set EOF
+		rab [rab$h_rsz] = .bytes_moved;	! Just in case
+		RETURN false;			! ...
+		END;
+
+	    !
+	    !   Again, move what we still need, what
+	    !   fits, or what we have available.
+	    !
+	    bytes_to_move = MIN (		! How much to move
+		.bytes_to_get - .bytes_moved, 	! Remainder of record
+		.bytes_left, 			! Length of user buffer?
+		.rst [rst$h_byte_count]);	! Length of file buffer?
+	    user_pointer = ea_ch$move (		! Move the record
+		.bytes_to_move, 		! This many bytes
+		.rst [rst$g_page_pointer], 	! Source
+		.user_pointer);			! Destination
+	    bytes_left = .bytes_left - .bytes_to_move;	! Adjust space
+
+	    !+
+	    !	Adjust pointers and counters
+	    !-
+
+	    rst [rst$g_page_pointer] = CH$PLUS (	! Bump the page pointer
+		.rst [rst$g_page_pointer], 	!   ...
+		.bytes_to_move);		!   by the amount read
+	    bytes_moved = .bytes_moved + .bytes_to_move;	! Moved these
+	    rst [rst$h_byte_count] = .rst [rst$h_byte_count] - .bytes_to_move;
+	    END
+	UNTIL .bytes_moved EQL .bytes_to_get;
+
+	END;
+
+!   rst [rst$h_record_size] = .bytes_moved;	! Size we got
+    RETURN true;
+    END;					! End RD_REC
+
+%SBTTL 'RD_WRD -- move a record'
+
+GLOBAL ROUTINE rd_wrd (words_to_get, users_buffer) =
+    BEGIN
+
+    LOCAL
+	words_to_move,				! Length to move
+	words_moved;				! Words moved so far
+
+    words_moved = 0;				! Initialize this
+
+    !+
+    !	Get a buffer if we need it
+    !-
+
+    IF .rst [rst$h_byte_count] EQL 0		! Do we need words?
+    THEN
+	BEGIN					! Get next buffer
+	rd_buf ();				! Get a buffer
+
+	IF .rst [rst$v_eof]			! EOF?
+	THEN
+	    BEGIN
+	    rab [rab$h_sts] = rms$_eof;		! Set EOF
+	    rab [rab$h_rsz] = .words_moved;	! Just in case
+	    RETURN false;			! ...
+	    END;
+
+	END;
+
+    !
+    !   Move as much as we need, as will fit,
+    !   or as is available, whichever is smaller.
+    !
+    words_to_move = MIN (			! How much to move
+	.words_to_get, 				! Length of record?
+	.rst [rst$h_byte_count]);		! Length of file buffer?
+    !
+    !   Move the data
+    !
+%IF Section_Zero                                                        !a572
+%THEN
+    IF .rmssec NEQ 0
+    THEN
+    $RMS$XCOPY (.rst [rst$g_page_pointer], 	! From here
+	.users_buffer, 				! To here
+	.words_to_move)				! How much
+    ELSE
+    $MOVE_WORDS (.rst [rst$g_page_pointer], 	! From here
+	.users_buffer, 				! To here
+	.words_to_move);			! How much
+%ELSE
+    $RMS$XCOPY (.rst [rst$g_page_pointer], 	! From here
+	.users_buffer, 				! To here
+	.words_to_move);			! How much
+%FI
+    !
+    !	Adjust the pointers and counters, etc.
+    !
+    rst [rst$g_page_pointer] = .rst [rst$g_page_pointer] + .words_to_move;
+    users_buffer = .users_buffer + .words_to_move;	!
+    rst [rst$h_byte_count] = .rst [rst$h_byte_count] - .words_to_move;
+    words_moved = .words_to_move;		! We moved these
+
+    !+
+    !	Now check to see where we are
+    !-
+
+    IF .words_moved NEQ .words_to_get		! Done?
+    THEN
+	BEGIN					! Not done yet
+
+	!+
+	!   To get here, we exhausted our file buffer.
+	!   Therefore, let's assume that the problem
+	!   is not the user, but in ourselves, and so
+	!   start a loop to get the rest of the record.
+	!-
+
+	DO
+	    BEGIN
+	    !
+	    !	Get a buffer
+	    !
+	    rd_buf ();				! Get a buffer
+
+	    IF .rst [rst$v_eof]			! EOF?
+	    THEN
+		BEGIN
+		rab [rab$h_sts] = rms$_eof;	! Set EOF
+		rab [rab$h_rsz] = .words_moved;	! Just in case
+		RETURN false;			! ...
+		END;
+
+	    !
+	    !   Again, move what we still need, what
+	    !   fits, or what we have available.
+	    !
+	    words_to_move = MIN (		! How much to move
+		.words_to_get - .words_moved, 	! Remainder of record
+		.rst [rst$h_byte_count]);	! Length of file buffer?
+
+        %IF Section_Zero                                                !a572
+        %THEN
+	    IF .rmssec NEQ 0
+	    THEN
+	    $RMS$XCOPY (.rst [rst$g_page_pointer], 	! From here
+		.users_buffer, 			! To here
+		.words_to_move)			! How much
+	    ELSE
+	    $MOVE_WORDS (.rst [rst$g_page_pointer], 	! From here
+		.users_buffer, 			! To here
+		.words_to_move);		! How much
+        %ELSE
+	    $RMS$XCOPY (.rst [rst$g_page_pointer], 	! From here
+		.users_buffer, 			! To here
+		.words_to_move);		! How much
+        %FI
+	    !+
+	    !	Adjust pointers and counters
+	    !-
+
+	    rst [rst$g_page_pointer] = .rst [rst$g_page_pointer] + 	!
+	    .words_to_move;
+	    users_buffer = .users_buffer + .words_to_move;
+	    rst [rst$h_byte_count] = .rst [rst$h_byte_count] - .words_to_move;
+	    words_moved = .words_moved + .words_to_move;	! Moved these
+	    END
+	UNTIL .words_moved EQL .words_to_get;
+
+	END;
+
+    RETURN true;
+    END;					! End RD_WRD
+
+%SBTTL 'RD_BUF -- read next buffer'
+
+GLOBAL ROUTINE rd_buf =
+    BEGIN
+
+    LOCAL
+	bytes_per_word,				! Bytes in a word
+	new_bkt_no,				! New bucket to get
+	new_bucket,				! Address of new bucket
+	bucket_words,				! Number of words in bucket
+	bucket_bytes;				! Number of bytes in bucket
+
+    bytes_per_word = %BPVAL/.fst [fst$h_bsz];	! Get bytes in a word
+
+    !+
+    !	If there is no current bucket, then
+    !	let us get ourselves the first bucket
+    !	in the file.  Otherwise, we will get
+    !	that bucket which follows the current bucket.
+    !-
+
+    IF .cbd [bkt$a_address] EQL 0		! No bucket?
+    THEN
+	new_bkt_no = 0				! Bucket 0
+    ELSE
+	BEGIN
+	new_bkt_no = .cbd [bkt$h_number] + 1;	! Next bucket
+	!
+	!   Get rid of old bucket
+	!
+
+	if not free_bucket (rab = .rab, desc = .cbd)	!
+	then
+	    return false;
+
+	END;
+
+    !+
+    !	Check to see if this bucket is beyond EOF.  If
+    !	the first byte in the bucket is greater than or
+    !	equal to the size of the file, return EOF.
+    !-
+
+    IF (.new_bkt_no*.bytes_per_word*rms$k_w_p_bkt) GEQ .fst [fst$g_sof]	!
+    THEN
+	BEGIN
+	rst [rst$v_eof] = 1;
+	RETURN false;
+	END;
+
+    !+
+    !	We now know we have a bucket there, so we can
+    !	read it in with no fears.
+    !-
+
+    IF Get_Bucket (Rab = .Rab, 			! Get a bucket
+	    Desc = .cbd, 			! Put it here
+	    Bucket = .new_bkt_no, 		! This one
+	    Bucket_Size = rms$k_buffer_size	! This big
+	) EQL false
+    THEN
+	BEGIN
+	SIGNAL (ff$_bkt_get_failed);
+	RETURN false
+	END;
+
+    new_bucket = .rmssec OR .cbd [bkt$a_address];	! Point at bucket
+
+    !+
+    !	Create a byte pointer to the beginning of the bucket
+    !-
+
+    SELECTONE .fst [fst$h_bsz] OF
+	SET
+
+	[6, 7, 8, 9, 18] :
+	    rst [rst$g_page_pointer] = 		!
+	    ea_ch$ptr (.new_bucket, 0, .fst [fst$h_bsz]);
+
+	[OTHERWISE] :
+	    rst [rst$g_page_pointer] = 		!
+	    .new_bucket;			! Point at the word itself
+	TES;
+
+    bucket_words = .fst [fst$g_sof]/.bytes_per_word - 	!
+    .new_bkt_no*rms$k_w_p_bkt;
+
+    IF .bucket_words GEQ rms$k_w_p_bkt		! Full bucket?
+    THEN
+	rst [rst$h_byte_count] = rms$k_w_p_bkt*.bytes_per_word	! Yes - full
+    ELSE
+	rst [rst$h_byte_count] = .bucket_words*.bytes_per_word;	! No - partial
+
+    RETURN true;
+    END;					! End RD_BUF
+
+%SBTTL 'EBC_RD_HDR -- read EBCDIC block/record header'
+
+GLOBAL ROUTINE ebc_rd_hdr (p_hdr_contents) =
+!+
+!   Return the length of an EBCDIC variable block or record.
+!
+!   Read the next four bytes of an EBCDIC file into a word.
+!   Return the value from the left half of the word,which
+!   will be the length of either a block of variable records
+!   or a variable record itself (if we are pointing at the
+!   wrong thing, of course, it will be garbage).
+!-
+    BEGIN
+
+    BIND
+	hdr_contents = .p_hdr_contents;		! Refer to argument
+
+    LOCAL
+	bytes_to_move,				! Bytes for this move
+	bytes_moved,				! Bytes we did move
+	hdr_pointer;				! Point at header buffer
+
+    STACKLOCAL
+	hdr_buf;				! Receive header bytes
+
+    !+
+    !	Get a buffer if we need it
+    !-
+
+    IF .rst [rst$h_byte_count] EQL 0		! Do we need bytes?
+    THEN
+	BEGIN					! Get next buffer
+	rd_buf ();				! Get an EBCDIC buffer
+
+	IF .rst [rst$v_eof]			! EOF?
+	THEN
+	    BEGIN
+	    rab [rab$h_sts] = rms$_eof;		! Set EOF
+	    RETURN false;			! ...
+	    END;
+
+	END;
+
+    !
+    !	Set up a pointer to the record header
+    !
+    hdr_pointer = ea_ch$ptr (			! Make a pointer
+	.stksec OR hdr_buf, 			!   to a buffer
+	0, rms$k_ebc_size);			!   for the record length
+    !
+    !	Get the length of the record to get by moving
+    !	the four-byte header to a buffer and extracting
+    !	the record length from the header.
+    !
+    bytes_to_move = MIN (			! How much to move
+	rms$k_header_ebc, 			!   Length of header
+	.rst [rst$h_byte_count]);		!   Length of file buffer?
+    hdr_pointer = ea_ch$move (			! Move the record
+	.bytes_to_move, 			!   This many bytes
+	.rst [rst$g_page_pointer], 		!   From here
+	.hdr_pointer);				!   To here
+    rst [rst$g_page_pointer] = CH$PLUS (	! Bump the page pointer
+	.rst [rst$g_page_pointer], 		!   ...
+	.bytes_to_move);			!   by the amount read
+    !
+    !	Adjust counters
+    !
+    bytes_moved = .bytes_to_move;		! This much was moved
+    rst [rst$h_byte_count] = .rst [rst$h_byte_count] - .bytes_to_move;
+
+    !+
+    !	If the header crosses page boundaries, then we
+    !	have not got the whole header, and must get
+    !	another buffer and get the rest.
+    !-
+
+    IF .bytes_moved NEQ rms$k_header_ebc	! Not enough?
+    THEN
+	BEGIN
+	rd_buf ();				! Get an EBCDIC buffer
+
+	IF .rst [rst$v_eof]			! EOF?
+	THEN
+	    BEGIN
+	    rab [rab$h_sts] = rms$_eof;		! Set EOF
+	    RETURN false;			! ...
+	    END;
+
+	bytes_to_move = rms$k_header_ebc - .bytes_moved;
+	!
+	!   Get the rest of the header
+	!
+	hdr_pointer = ea_ch$move (		! Move the rest of header
+	    .bytes_to_move, 			!   This many bytes
+	    .rst [rst$g_page_pointer], 		!   From here
+	    .hdr_pointer);			!   To here
+	rst [rst$g_page_pointer] = CH$PLUS (	! Bump the page pointer
+	    .rst [rst$g_page_pointer], 		!   ...
+	    .bytes_to_move);			!   by the amount read
+	!
+	!	Adjust counters
+	!
+	rst [rst$h_byte_count] = .rst [rst$h_byte_count] - .bytes_to_move;
+	END;					! Done
+
+    IF .hdr_buf<lh> LSS rms$k_header_ebc	! Don't return negative length
+    THEN
+	hdr_contents = 0			! So return 0
+    ELSE
+	hdr_contents = .hdr_buf<lh> - rms$k_header_ebc;	! Get left halfword
+
+    RETURN true;
+    END;					! End EBC_RD_HDR
+
+%SBTTL 'G_BYTE -- set up window to given byte'
+
+GLOBAL ROUTINE g_byte (byte_number) =
+    BEGIN
+
+    LOCAL
+	bytes_per_word,				! File bytes per word
+	new_bucket,				! Address of new bucket
+	byte_offset,				! Character offset in page
+	file_word,				! Word containing first byte
+	page_number;				! Page containing first byte
+
+    !+
+    !	Check for EOF
+    !-
+
+    IF .byte_number GEQ .fst [fst$g_sof]	! Past EOF?
+    THEN
+	BEGIN
+	!
+	!   Free the current bucket and return EOF
+	!
+
+	if not free_bucket (rab = .rab, desc = .cbd)	!
+	then
+	    return false;
+
+	rab [rab$h_sts] = rms$_eof;		! Return EOF
+	RETURN false;				! Return an error
+	END;
+
+    bytes_per_word = %BPVAL/.fst [fst$h_bsz];
+    !
+    !	Calculate byte offset in the page
+    !
+    byte_offset = .byte_number MOD (rms$k_w_p_pg*.bytes_per_word);
+    !
+    !	What page interests us?
+    !
+    page_number = .byte_number/(rms$k_w_p_pg*.bytes_per_word);	! Shift it a little
+
+    !+
+    !	If a current bucket exists, then we have to get
+    !	rid of it unless the bucket happens to be the one
+    !	we are interested in (which would be convenient).
+    !-
+
+    IF .cbd [bkt$a_address] NEQ 0		! Bucket exists?
+    THEN
+	BEGIN
+
+	!+
+	!   A bucket is already current.  If it
+	!   is not the bucket we want, then we
+	!   rid ourselves of the old bucket and
+	!   get the one we desire.
+	!-
+
+	IF .cbd [bkt$h_number] NEQ .page_number	! Do we want it?
+	THEN
+	    BEGIN
+
+	    if not free_bucket (rab = .rab, desc = .cbd)	!
+	    then
+		return false;
+
+	    IF Get_Bucket (Rab = .Rab, 		! Get a bucket
+		    Desc = .cbd, 		! Put it here
+		    Bucket = .page_number, 	! This one
+		    Bucket_Size = rms$k_buffer_size	! This big
+		) EQL false
+	    THEN
+		BEGIN
+		SIGNAL (ff$_bkt_get_failed);
+		RETURN false
+		END;
+
+	    END;
+
+	END
+    ELSE
+	BEGIN					! No current bucket
+
+	IF Get_Bucket (Rab = .Rab, 		! Get a bucket
+		Desc = .cbd, 			! Put it here
+		Bucket = .page_number, 		! This one
+		Bucket_Size = rms$k_buffer_size	! This big
+	    ) EQL false
+	THEN
+	    BEGIN
+	    SIGNAL (ff$_bkt_get_failed);
+	    RETURN false
+	    END;
+
+	END;
+
+    !+
+    !	Figure the bytes left in this bucket.
+    !-
+
+    BEGIN
+
+    LOCAL
+	beg_of_bucket;
+
+    beg_of_bucket = .page_number*rms$k_w_p_bkt;
+
+    !+
+    !	If EOF is somewhere in this bucket then
+    !	set the byte count to represent a partial
+    !	bucket; otherwise, we have a full bucket.
+    !-
+
+    IF (.fst [fst$g_sof] - .beg_of_bucket) GEQ rms$k_w_p_bkt	!
+    THEN
+	rst [rst$h_byte_count] = .fst [fst$g_sof] - .beg_of_bucket
+    ELSE
+	rst [rst$h_byte_count] = rms$k_w_p_bkt;	! Full bucket
+
+    !
+    !	Decrement the number of bytes in this
+    !	bucket by the offset (the amount "already
+    !	used").
+    !
+    rst [rst$h_byte_count] = .rst [rst$h_byte_count] - .byte_offset;
+    END;
+    !
+    !	Set the page pointer to look at
+    !	the correct byte in the page.
+    !
+    new_bucket = .rmssec OR .cbd [bkt$a_address];
+
+    SELECTONE .fst [fst$h_bsz] OF
+	SET
+
+	[6, 7, 8, 9, 18] :
+	    rst [rst$g_page_pointer] = 		!
+	    ea_ch$ptr (.new_bucket, .byte_offset, .fst [fst$h_bsz]);
+
+	[OTHERWISE] :
+	    rst [rst$g_page_pointer] = 		!
+	    .new_bucket + .byte_offset;		! Point at the word itself
+	TES;
+
+    RETURN true;
+    END;					! End G_BYTE
+
+END
+ELUDOM
+  

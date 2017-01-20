@@ -1,0 +1,376 @@
+;UDP routines (not specifically generalized)
+
+;Calls:
+;  UDP"GetIQ:  Gets an internet queue, takes port number in ac1
+;              Returns +2 on success
+;  UDP"SndPkt: Sends a packet from SndBuf.  Takes arg block pointer in ac1.
+;  UDP"RcvPkt: Receives a packet into RcvBuf.  Takes arg block pointer in ac1.
+;  UDP"RlsIQ:  Releases an internet queue.
+
+;The routines assume you only need one queue per program, and therefore
+;they keep the queue handle internally so you don't need to specify it.
+
+ifndef PPKT,[PPKT==0]		;non-zero to print packets for debugging
+
+;arg block format
+U%SHST==0			;source host
+U%DHST==1			;destination host
+U%SPRT==2			;source port
+U%DPRT==3			;destination port
+U%LEN==4			;length in bytes
+U%DATA==5			;pointer to data (rcvpkt only)
+
+MaxSiz=1000.			;the main buffers
+RcvBuf:	Block MaxSiz
+SndBuf:	Block MaxSiz
+
+
+.BEGIN UDP
+
+Define RetSkp
+	Jrst Popj1
+Termin
+
+L16==<777774,,0>		;Mask for left 16-bit byte in word
+R16==<3,,777760>		;and for right 16-bit byte.
+B32==L16\R16			;Full 32-bit byte
+
+;IP packet description
+P.LEN==0
+P.VRTY==1			;version,type of service,length
+P.SINF==2			;segmentation info
+P.PRTM==3			;protocol, time to live, etc.
+P.SHST==4			;source host
+P.DHST==5			;destination
+;UDP packet description
+P.PRTS==6			;port destinations
+P.LCHK==7			;length,,checksum
+P.DATA==10			;data
+$DATA==P.DATA			;UDP data offset in buffers
+
+IQH:	0			;Queue handle
+HstBuf:	Block 40
+
+UDPPRN=17.
+
+;Stuff for assigning a queue
+QDBBLK:	.BYTE 8. ? 0 ? 0 ? 0 ? UDPPRN ? .BYTE	;UDP protocol number
+	0					;Wild foreign host
+	0					;Wild source host
+QDBPRT:	0					;Our local port number
+	.BYTE 8. ? 0 ? 0 ? 0 ? 377 ? .BYTE	;Protocol number mask
+	0					;Foreign host mask
+	0					;Source host mask
+	.BYTE 16. ? -1 ? 0 ? .BYTE		;Local port mask
+	NQDB					;length of block
+NQDB==.-QDBBLK					;Length of one of these
+
+
+;This routine assigns the internet queue for datagrams.
+;It takes the port number in ac1, rets max packet size in ac2 (words)
+GetIQ:	Dpb 1,[.BP L16,QDBPRT]
+	Movei 1,QDBBLK		;point at qdb
+	Setzb 2,3		;mbz ac's
+	ASNIQ%			;try for it
+	 Erjmp GetIQE		;failed
+	Movem 1,IQH		;save handle
+	Retskp
+
+GetIQE:	Caie 1,ASNSX2		;conflict?
+	 Jrst GetIQX		;no, something else
+	Push P,2		;save other job number
+	Type "% Internet Q busy, by job "
+	Pop P,2			;job number again
+	Movei 1,.PRIOU
+	Movei 3,10.
+	NOUT%
+	 Erjmp .+1
+	Hrroi 2,[Asciz /
+/]
+	Setz 3,
+	SOUT%
+	Ret
+
+GetIQX:	Movei 1,.PRIOU
+	Hrroi 2,[ASCIZ /? ASNIQ% Failed.
+/]
+	Setz 3,
+	SOUT%
+	Ret
+
+
+RlsIQ:	Move 1,IQH
+	RELIQ%
+	 Erjmp .+1
+	Ret
+
+
+;Send a packet
+;takes source host, destination host, source port, destination port
+; and length in bytes of data (already in sndbuf)
+;Address of arg block in ac1
+SndPkt:	Move 2,[.BYTE 4,4,8.,16. ? 4 ? 5 ? 0 ? 0 ? .BYTE]
+	Movem 2,SndBuf+P.VRTY
+	Setzm SndBuf+P.SINF
+	Move 2,[.BYTE 8.,8.,16. ? 60. ? UDPPRN ? 0 ? .BYTE]
+	Movem 2,SndBuf+P.PRTM
+
+	Move 2,U%SHST(1)
+	Dpb 2,[.BP B32,SndBuf+P.SHST]
+	Move 2,U%DHST(1)
+	Dpb 2,[.BP B32,SndBuf+P.DHST]
+	Move 2,U%SPRT(1)
+	Dpb 2,[.BP L16,SndBuf+P.PRTS]
+	Move 2,U%DPRT(1)
+	Dpb 2,[.BP R16,SndBuf+P.PRTS]
+	Move 2,U%LEN(1)
+	Addi 2,8.		;add on UDP header length
+	Dpb 2,[.BP L16,SndBuf+P.LCHK]	;save UDP length
+	Addi 2,20.
+	Dpb 2,[.BP R16,SndBuf+P.VRTY]	;save IP length
+	Lsh 2,-2		;words
+	Addi 2,1		;fudge
+	Movem 2,SndBuf+P.LEN
+
+	Movei 1,SndBuf
+	Call Checks		;add in checksum
+	Dpb 1,[.BP R16,SndBuf+P.LCHK]
+
+IFN PPKT,[
+	Movei 1,SndBuf
+	Call PrtPkt
+]
+
+	Hrrz 1,IQH		;On This Q
+	Movei 2,SndBuf		;From this buffer
+	Setz 3,			;MBZ bits
+	SNDIN%			;Send it
+	 Erjmp [TypeCR "[UDP] SNDIN% failure"
+		Jrst .+1]	;Failed
+	Ret
+
+
+;Receive a packet
+;returns source host, destination host, source port, destination port
+; pointer to data, and length in bytes of data
+;Address of arg block in ac1
+GetPkt:	Push P,1
+GetPk1:	Movei 1,MaxSiz		;Length we'll accept
+	Movem 1,RcvBuf 		; ..
+	Hrrz 1,IQH		;Get the Q handle
+	Movei 2,RcvBuf		;Point at buffer
+	Setz 3,			;MBZ bits
+	RCVIN%			;Wait for a datagram
+	 Erjmp GetPk1		;Junk?
+
+	Ldb 2,[.BP R16,RcvBuf+P.LCHK]
+	Jumpe 2,GetPk2		;if checksum zero, don't check it
+	Movei 1,RcvBuf
+	Call Checks		;compute checksum
+	Ldb 2,[.BP R16,RcvBuf+P.LCHK]
+	Came 1,2		;checksums ok?
+	 Jrst GetPk1		;no, ignore this packet then
+GetPk2:	Pop P,1
+
+IFN PPKT,[
+	push p,1
+	Movei 1,RcvBuf
+	Call PrtPkt
+	pop p,1
+]
+
+	Ldb 2,[.BP B32,RcvBuf+P.SHST]
+	Movem 2,U%SHST(1)
+	Ldb 2,[.BP B32,RcvBuf+P.DHST]
+	Movem 2,U%DHST(1)
+	Ldb 2,[.BP L16,RcvBuf+P.PRTS]
+	Movem 2,U%SPRT(1)
+	Ldb 2,[.BP R16,RcvBuf+P.PRTS]
+	Movem 2,U%DPRT(1)
+	Ldb 2,[.BP L16,RcvBuf+P.LCHK]
+	Subi 2,8.		;minus header length
+	Movem 2,U%LEN(1)
+	Movei 2,RcvBuf+$DATA
+	Movem 2,U%DATA(1)	
+	Ret
+
+
+T=5
+TT=6
+Q1=7
+CarMsk==<-1,,600000>		;Mask of non-lower-16-bits
+;Compute UDP checksum
+;takes buffer address in t1, returns checksum in t1
+Checks:	Push P,T
+	Push P,TT
+	Push P,Q1
+	Setz T,			;Accumulate checksum here.
+	Move 3,[442000,,P.SHST(1)]
+REPEAT 4,[			;Get Source/Destination addresses
+	Ildb 2,3		;in 4 16-bit chunks.
+	Add T,2
+];Repeat
+	Addi T,UDPPRN		;protocol
+	Ldb 2,[.BP L16,P.PRTS(1)]
+	Add T,2			;source port
+	Ldb 2,[.BP R16,P.PRTS(1)]
+	Add T,2			;destination port
+	Ldb 2,[.BP L16,P.LCHK(1)]
+	Add T,2			;length
+		
+	Add T,2			;Add in UDP length again.
+	Subi 2,8.		;Subtract # UDP header bytes giving # data.
+	Lsh 2,-1		;# bytes / 2 = # 16-bit bytes.
+	Move Q1,[442000,,P.DATA(1)]
+	Jumple 2,Check1		;No data bytes.
+	Move 3,2
+Check0:	Ildb TT,Q1
+	Add T,TT
+	Sojg 3,Check0
+Check1:	Trne 2,1		;Even # of 16-bit bytes?
+	  Jrst [Ildb TT,Q1	;No, so get 16-bits with high 8 being
+		Trz TT,377	;significant, and clobber low 8
+		Add T,TT	;and sum it in.
+		Jrst .+1]
+Check2:	Tdne T,[CarMsk]		;Any carries beyond 16 bits?
+	  Jrst [Ldb 1,[.BP CarMsk,T]
+		Tdz T,[CarMsk]	;Yes so add them in and loop
+		Add T,1		;until it all fits in 16 bits.
+		Jrst Check2]
+	Setca T,		;1's complement the sum
+	Andi T,177777		;and keep only the lower 16 bits.
+	Move 1,T
+	Pop P,Q1
+	Pop P,TT
+	Pop P,T
+	Return
+
+
+;packet printer for debugging, takes packet address in ac1
+PrtPkt:	Push p,1
+	Push p,2
+	Push p,3
+	Push p,4
+	Move TT,1
+
+	Move	1,[.FHSLF,,.TIMAL]
+	Setz	2,
+	TIMER%			;YOW!  HACK! KLUDGE! GROSS!
+	 Erjmp	Die		
+
+	Type "==========================================
+From: "
+	Ldb T,[.BP B32,P.SHST(TT)]
+	Call ShoHst
+	Type " ("
+	Ldb 2,[.BP L16,P.PRTS(TT)]
+	Call DecOut
+	Type ")
+To: "
+	Ldb T,[.BP B32,P.DHST(TT)]
+	Call ShoHst
+	Type " ("
+	Ldb 2,[.BP R16,P.PRTS(TT)]
+	Call DecOut
+	TypeCR ")"
+	TypeCR "Data: "
+	Ldb Q1,[.BP L16,P.LCHK(TT)]
+	Subi Q1,8.		;minus header length
+	Lsh Q1,-2		;div by 4
+	Move 4,[444400,,P.DATA(TT)]
+	Movei 1,.PRIOU
+DatLop:	Ildb T,4
+	Call ShoDat
+	Sojg Q1,DatLop
+	Pop p,4
+	Pop p,3
+	Pop p,2
+	Pop p,1
+	Ret
+
+
+
+ShoDat:	Movei 1,.PRIOU
+	Ldb 2,[.BP B32,T]
+	Move 3,[100014,,10]
+	NOUT%
+	 jfcl
+	Type ": "
+	Ldb T,[.BP B32,T]
+	Movei 1,.PRIOU
+	Ldb 2,[.BP <037700,,0>,T]
+	Movei 3,8.
+	NOUT
+	  Nop
+	Movei 2,.CHSPC
+	BOUT
+	Ldb 2,[.BP <77,,600000>,T]
+	NOUT
+	  Nop
+	Movei 2,.CHSPC
+	BOUT
+	Ldb 2,[.BP <0,,177400>,T]
+	NOUT
+	  Nop
+	Movei 2,.CHSPC
+	BOUT
+	Ldb 2,[.BP <0,,377>,T]
+	NOUT
+	  Nop
+	Type " -- "
+	Movei 1,.PRIOU
+	Ldb 2,[.BP <037700,,0>,T]
+	Call ShoChr
+	Ldb 2,[.BP <77,,600000>,T]
+	Call ShoChr
+	Ldb 2,[.BP <0,,177400>,T]
+	Call ShoChr
+	Ldb 2,[.BP <0,,377>,T]
+	Call ShoChr
+	TypeCR "."
+	Return
+
+
+ShoChr:	Caige 2,.CHSPC
+	 Ret
+	BOUT%
+	Ret
+
+ShoHst:	Movei 1,.PRIOU
+	Ldb 2,[.BP <037700,,0>,T]
+	Movei 3,10.
+	NOUT%
+	  Nop
+	Movei 2,".
+	BOUT%
+	Ldb 2,[.BP <77,,600000>,T]
+	NOUT%
+	  Nop
+	Movei 2,".
+	BOUT%
+	Ldb 2,[.BP <0,,177400>,T]
+	NOUT%
+	  Nop
+	Movei 2,".
+	BOUT%
+	Ldb 2,[.BP <0,,377>,T]
+	NOUT%
+	  Nop
+	Type " ("
+	Movei 1,.GTHNS
+	Hrroi 2,HstBuf
+	Move 3,T
+	GTHST%
+	  Skipa 1,[-1,,[Asciz "???"]]
+	    Hrroi 1,HstBuf
+	PSOUT%
+	CType ")
+	Return
+
+DecOut:	Movei 1,.PRIOU
+	Movei 3,10.
+	NOUT%
+	 Erjmp .+1
+	Ret
+
+.END UDP

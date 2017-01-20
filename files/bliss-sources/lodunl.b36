@@ -1,0 +1,450 @@
+%TITLE 'U N L O A D -- Unload and copy routines'
+!<BLF/REQUIRE 'RMSBLF.REQ'>
+MODULE unload (IDENT = '1'
+		) =
+BEGIN
+!
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1984, 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+!++
+! FACILITY:	RMSLOD
+!
+! ABSTRACT:
+!
+!	UNLOAD unloads the RMS index file specified by INFAB into
+!	the sequential file specified by OUTFAB.  The key for unloading,
+!	if the input file is multi-key, is passed to UNLOAD in the CTX
+!	field of INFAB.  The sequential file created by the UNLOAD
+!	operation has all the characteristics of the indexed file
+!	except for being sequential organization.
+!
+! ENVIRONMENT:	Used by RMSLOD, user mode
+!
+! AUTHOR: Ron Lusk , CREATION DATE: 25-Jul-84
+!
+! MODIFIED BY:
+!
+!	, : VERSION
+! 01	-
+!       20-Sep-85 asp - Add Joe Martin mod to Ron Lusk's pieces.
+!
+!        5-May-86 asp - Make lodcpy use move mode, and let it load
+!                       RMS relative files
+!--
+
+!
+! TABLE OF CONTENTS
+!
+
+FORWARD ROUTINE
+    lodunl,					! Unload indexed file
+    ustats : NOVALUE,				! Print unload stats
+    lodcpy,					! Load non-indexed file
+    cpystats : NOVALUE;				! Print LODCPY stats
+
+!
+! INCLUDE FILES:
+!
+
+LIBRARY 'rmsint';				! RMS symbols
+LIBRARY 'bli:xport';				! For string descriptors
+LIBRARY 'bli:fao';				! FAOL stuff
+!
+! MACROS:
+!
+!   None
+!
+! EQUATED SYMBOLS:
+!
+
+LITERAL
+    lod$_success = 1,
+    lod$_bug = 0,
+    unload_buffer_length = 300;
+
+!
+! OWN STORAGE:
+!
+
+OWN
+    faoprm : vector [15],
+    control,
+    unload_buffer : VECTOR [unload_buffer_length],
+    inp_count,					! Records read
+    cpy_count,					! Records copied
+    unl_count,					! Records unloaded
+    infab : REF $fab_decl,			! Point to input FAB
+    inrab : $rab_decl,				! Real input RAB
+    outfab : REF $fab_decl,			! Point at output FAB
+    outrab : $rab_decl;				! Real output RAB
+
+!
+! EXTERNAL REFERENCES:
+!
+!   None
+%SBTTL 'LODUNL - unload indexed file into sequential file'
+
+GLOBAL ROUTINE lodunl (p_infab, p_outfab) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!
+! FORMAL PARAMETERS
+!
+!	NONE.
+!
+! IMPLICIT INPUTS
+!
+!	NONE.
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NONE.
+!
+! SIDE EFFECTS:
+!
+!	NONE.
+!
+!--
+
+    BEGIN
+    !
+    !	Copy the parameters around
+    !
+    infab = .p_infab;
+    outfab = .p_outfab;
+    !
+    !	Set up the output FAB
+    !
+    outfab [fab$v_org] = fab$k_seq;		! Sequential
+    outfab [fab$v_bsz] = .infab [fab$v_bsz];	! Use same byte size
+    outfab [fab$h_mrs] = .infab [fab$h_mrs];	! Record length
+    outfab [fab$v_rfm] = .infab [fab$v_rfm];	! Same record format
+    !
+    !	Set up the input RAB.  The key we will read the file
+    !	with is stored in the CTX field of the input FAB.
+    !
+    $rab_init (rab = inrab, fab = .infab, 	!
+	rac = seq, krf = .infab [fab$g_ctx], 	!rop = loc,!JM 25JUL85
+        ubf = unload_buffer,                    !
+	usz = unload_buffer_length);		!
+
+    !+
+    !	If we are reading on the primary key, we can
+    !	fly a bit faster with Read-Ahead set.
+    !-
+
+    IF .inrab [rab$b_krf] EQL 0			! Primary key?
+    THEN
+	inrab [rab$v_rah] = 1;			! Fill the buffers
+
+    !
+    !	Set up the output RAB.
+    !
+    $rab_init (rab = outrab, fab = .outfab, 	!
+	rac = seq, ubf = unload_buffer, 	!
+	usz = unload_buffer_length);		!
+    !
+    !	Open the input file
+    !
+
+    IF $open (fab = .infab)			! Open file
+    THEN
+	BEGIN
+
+	IF NOT $connect (rab = inrab)		! Connect
+	THEN
+	    RETURN lod$_bug;			! Problem
+
+	END
+    ELSE
+	RETURN lod$_bug;
+
+    !
+    !	Create the output file
+    !
+
+    IF $create (fab = .outfab)			! Create file
+    THEN
+	BEGIN
+
+	IF NOT $connect (rab = outrab)		! Connect
+	THEN
+	    RETURN lod$_bug;			! Problem
+
+	END
+    ELSE
+	RETURN lod$_bug;			! Problem
+
+    inp_count = unl_count = 0;			! Zero counters
+
+    !+
+    !	Copy the file
+    !-
+
+    WHILE ($get (rab = inrab)) DO
+	BEGIN
+	inp_count = .inp_count + 1;
+	outrab [rab$a_rbf] = .inrab [rab$a_rbf];	! Find record
+	outrab [rab$h_rsz] = .inrab [rab$h_rsz];	!   and its length
+
+	IF $put (rab = outrab)			!
+	THEN
+	    unl_count = .unl_count + 1;		!
+
+	END;
+
+    !
+    !	Close the files
+    !
+    $close (fab = .infab);
+    $close (fab = .outfab);
+    !
+    !   Write out the final statistics
+    !
+    ustats ();
+
+    IF .inp_count EQL .unl_count		! OK?
+    THEN
+	RETURN lod$_success
+    ELSE
+	RETURN lod$_bug;
+
+    END;					!End of LODUNL
+
+%SBTTL 'USTATS - print UNLOAD results'
+ROUTINE ustats : NOVALUE =
+    BEGIN
+
+    LITERAL
+	tty_buffer_length = 200/5;		! Two-hundred characters
+
+    LOCAL
+	ttyfab : $fab_decl,			! TTY output FAB
+	ttyrab : $rab_decl,			!  "    "    RAB
+	ttylen,					! Length of output
+	ttybuf : VECTOR [tty_buffer_length],	! TTY: buffer
+	ttydsc : $str_descriptor (		! Buffer descriptor for
+		string = (tty_buffer_length*5, 	! TTY:
+		CH$PTR (ttybuf)));		!
+
+    !
+    !	Initialize blocks
+    !
+    $fab_init (fab = ttyfab, fac = put, fna = 'TTY:');
+    $rab_init (rab = ttyrab, fab = ttyfab);
+    $open (fab = ttyfab);
+    $connect (rab = ttyrab);
+    !
+    !	Write the results
+    !
+
+    IF .inp_count EQL .unl_count		! All OK?
+    THEN
+	BEGIN
+	control = $fao_ctl ('!/!7SL record!%S unloaded!/');
+	faoprm [0] = .unl_count;
+	END
+    ELSE
+	BEGIN
+	control = $fao_ctl ('!/% !7SL record!%S read,', 	!
+	    ' but only !SL record!%S unloaded!/');	!
+	faoprm [0] = .inp_count;
+	faoprm [1] = .unl_count;
+	END;
+
+    $faol (ctrstr = .control, outbuf = ttydsc, 	!
+	prmlst = faoprm, outlen = ttylen);
+    ttyrab [rab$h_rsz] = .ttylen;		! Length of output
+    ttyrab [rab$a_rbf] = ttybuf;		! Address of data
+    $put (rab = ttyrab);
+    $close (fab = ttyfab);			! Close the TTY
+    END;					! End routine USTATS
+%SBTTL 'LODCPY'
+
+GLOBAL ROUTINE lodcpy (p_infab, p_outfab) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!
+! FORMAL PARAMETERS
+!
+!	NONE.
+!
+! IMPLICIT INPUTS
+!
+!	NONE.
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NONE.
+!
+! SIDE EFFECTS:
+!
+!	NONE.
+!
+!--
+
+    BEGIN
+    !
+    !	Copy the parameters around
+    !
+    infab = .p_infab;
+    outfab = .p_outfab;
+    !
+    !	Set up the RABs
+    !
+    $rab_init (rab = inrab, fab = .infab, 	!
+	rac = seq,                              !
+	ubf = unload_buffer, 			!
+	usz = unload_buffer_length);		!
+    $rab_init (rab = outrab, fab = .outfab, 	!
+	rac = seq, ubf = unload_buffer, 	!
+	usz = unload_buffer_length);		!
+
+    IF .outfab [fab$v_org] = fab$k_rel           ! Relative file?
+    THEN
+        BEGIN
+        outrab [rab$b_rac] = rab$k_key;
+        outrab [rab$a_kbf] = inp_count;
+        END;
+
+    !
+    !	Open the input file
+    !
+
+    IF $open (fab = .infab)			! Open file
+    THEN
+	BEGIN
+
+	IF NOT $connect (rab = inrab)		! Connect
+	THEN
+	    RETURN lod$_bug;			! Problem
+
+	END
+    ELSE
+	RETURN lod$_bug;
+
+    !
+    !	Create the output file
+    !
+
+    IF $create (fab = .outfab)			! Create file
+    THEN
+	BEGIN
+
+	IF NOT $connect (rab = outrab)		! Connect
+	THEN
+	    RETURN lod$_bug;			! Problem
+
+	END
+    ELSE
+	RETURN lod$_bug;			! Problem
+
+    inp_count = cpy_count = 0;			! Zero counters
+
+    !+
+    !	Copy the file
+    !-
+
+    WHILE ($get (rab = inrab)) DO
+	BEGIN
+	inp_count = .inp_count + 1;
+	outrab [rab$a_rbf] = .inrab [rab$a_rbf];	! Find record
+	outrab [rab$h_rsz] = .inrab [rab$h_rsz];	!   and its length
+
+        IF $put (rab = outrab)			! Write it
+	THEN
+	    cpy_count = .cpy_count + 1;		! OK
+
+	END;
+
+    !
+    !	Close the files
+    !
+    $close (fab = .infab);
+    $close (fab = .outfab);
+    !
+    !   Write out the final statistics
+    !
+    cpystats ();
+
+    IF .inp_count EQL .cpy_count		! OK?
+    THEN
+	RETURN lod$_success
+    ELSE
+	RETURN lod$_bug;
+
+    END;					!End of LODCPY
+
+%SBTTL 'CPYSTATS - print UNLOAD results'
+ROUTINE cpystats : NOVALUE =
+    BEGIN
+
+    LITERAL
+	tty_buffer_length = 200/5;		! Two-hundred characters
+
+    LOCAL
+	ttyfab : $fab_decl,			! TTY output FAB
+	ttyrab : $rab_decl,			!  "    "    RAB
+	ttylen,					! Length of output
+	ttybuf : VECTOR [tty_buffer_length],	! TTY: buffer
+	ttydsc : $str_descriptor (		! Buffer descriptor for
+		string = (tty_buffer_length*5, 	! TTY:
+		CH$PTR (ttybuf)));		!
+
+    !
+    !	Initialize blocks
+    !
+    $fab_init (fab = ttyfab, fac = put, fna = 'TTY:');
+    $rab_init (rab = ttyrab, fab = ttyfab);
+    $open (fab = ttyfab);
+    $connect (rab = ttyrab);
+    !
+    !	Write the results
+    !
+
+    IF .inp_count EQL .cpy_count		! All OK?
+    THEN
+	BEGIN
+	control = $fao_ctl ('!/!7SL record!%S loaded!/');
+	faoprm [0] = .cpy_count;
+	END
+    ELSE
+	BEGIN
+	control = $fao_ctl ('!/% !7SL record!%S read,', 	!
+	    ' but only !SL record!%S loaded!/');	!
+	faoprm [0] = .inp_count;
+	faoprm [1] = .cpy_count;
+	END;
+
+    $faol (ctrstr = .control, outbuf = ttydsc, 	!
+	prmlst = faoprm, outlen = ttylen);
+    ttyrab [rab$h_rsz] = .ttylen;		! Length of output
+    ttyrab [rab$a_rbf] = ttybuf;		! Address of data
+    $put (rab = ttyrab);
+    $close (fab = ttyfab);			! Close the TTY
+    END;					! End routine CPYSTATS
+END						!End of Module UNLOAD
+
+ELUDOM
+    

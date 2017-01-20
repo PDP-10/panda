@@ -1,0 +1,1584 @@
+.title	Maiser
+;	Start of Wcc Edit history
+;
+;[W1]	Add transaction file to keep track of all messages sent and
+;	received.  Variant on existing log file.  [DHB 31-Mar-86]
+;
+;[W2]	Remove code that adds my host.domain to the end of a smtp from
+;	command.  In Smail.	[JGD 22-7-86]
+;
+;[W3]	Have maiser hibernate when not processing a message. [JGD 11-9-86]
+;
+;	End of Wcc Edit history
+
+.subtitle	main body
+.library	/sys$library:lib.mlb/
+.psect	code,exe,nowrt
+
+	.entry maiser,^m<>
+.page
+start:	movb	#quewild,quefab+fab$b_fns	;use a wild card search
+	$parse	fab = quefab			;parse the mailq: fab
+	blbs	r0,5$				;if successful
+	jmp	70$				;not sleep
+
+;	Start loging
+
+5$:	bsbw	getlcl				;get the local host name
+	$create	fab = maiserfab			;create the file
+	$connect rab = maiserrab		;connect to record stream
+
+;	Get a mailq file
+
+10$:	$search	fab = quefab			;parse the mailq: fab
+	blbs	r0,30$
+	cmpl	r0,#rms$_nmf			;was it no more files?
+	beql	20$				;if so close down orderly
+	jmp	70$				;sleep
+
+20$:	$disconnect rab = maiserrab		;disconnect from log record
+	$close fab = maiserfab			;close the log file
+    	jmp	70$				;done sleep for a while
+
+;	We have a mailq: file process it.
+
+30$:	$open	fab = quefab			;open the file
+	blbs	r0,40$
+	jmp	rmserr				;signal an rms error
+40$:	$connect rab = querab			;connect to record stream
+	blbs	r0,50$
+	jmp	rmserr				;signal an rms error
+50$:	movc5	#0,#0,#0,#page,errbuf		;clear the error buffer
+	bsbw	parfil				;parse the header fields
+	cmpl	#ss$_abort,r0			;was this a badfile?
+	bneq	55$				;get the next if bad
+	jmp	start				;reparse the directory
+55$:	tstb	f.oldmail			;has this message expired?
+	beql	60$				;is so return it
+	bsbw	retold				;return this message
+	jmp	10$				;get the next file
+60$:	bsbw	chkwhr				;process this message
+		
+;	Loop getting all files in mailq:
+
+	jmp	10$				;get the next file
+
+;[W3]	Done processing sleep
+
+70$:	ret
+	$bintim_s timbuf=ahiber,-		;[W3] ascii time to sleep
+		  timadr=bhiber			;[W3] binary time to sleep
+	$schdwk_s daytim=bhiber			;[W3] wake me in x time
+	$hiber_s				;[W3] sleep until x time
+	jmp	start				;[W3] start again
+
+
+
+.page
+;	Check to see where (how) to send this message.
+
+;	First isolate the recpients host and domain.
+
+chkwhr:	moval	fwdbuf,r6			;uppercase for the match
+	movzwl	(r6)+,r7			
+	bsbw	ucase				;uppercase the address
+	matchc	#1,#64,fwdbuf,fwdbuf+2		;get past the username
+	beql	2$				;if not a @ check for a %
+	matchc	#1,#37,fwdbuf,fwdbuf+2		;get past the username
+	beql	2$				;have a host check for a domain
+	jmp	sndlcl				;no host/domain must be local
+2$:	movzwl	r2,r6				;save current size
+	movl	r3,r7				;save pointer 
+	matchc	#1,#46,r2,(r3)			;isolate the domain
+	bneq	5$				;if no domain its mail for my users
+	subl3	r7,r3,r6			;compute size of the host
+	decl	r6				;don't count the period
+	movq	r2,r8				;save the domain pointer and size
+
+;	Check to see if its is for my local domain
+
+	matchc	lcldom,lcldom+2,r8,(r9)		;is this for my domain?
+	bneq	8$				;r0=zero means yes
+
+;	Its for the local domain.  Check my for hostname
+
+5$:	matchc	r6,(r7),lclhst,lclhst+2		;is this for my users?
+	bneq	10$				;if not check other hosts
+	jmp	sndlcl				;send local mail
+
+;	Mail was not for the local domain.  Check known foreign domains.
+
+8$:	moval	bitdom,r1			;point to the domain name
+	movzbw	(r1)+,r2			;get the size
+	matchc	r2,(r1),r8,(r9)			;is this for bitnet domain?
+	bneq	9$				;only known external domain
+	jmp	sndbit				;send to the bitnet domain
+9$:	jmp	badfile				;unknown domain name
+
+;	Not for my users.  Check for other local network hosts. (tcp/ip) 
+
+10$:	$open	fab = hofab			;open the file
+	blbs	r0,20$
+	jmp	rmserr				;signal an rms error
+20$:	$connect rab = horab			;connect to record stream
+	blbs	r0,30$
+	jmp	rmserr				;signal an rms error
+
+;	Search the file for the hostname.
+
+30$:	$get 	rab = horab			;get the local host info
+	blbs	r0,40$
+	cmpl	r0,#rms$_eof			;have we hit eof?
+	bneq	35$				;if so then its a bad host
+	jmp	badfile				;bad host name
+35$:	jmp	rmserr				;signal an rms error
+
+40$:	matchc	r6,(r7),horab+rab$w_rsz,mbuf	;this host?
+	bneq	30$				;no check next host
+
+50$:	$disconnect rab = horab			;disconnect from record stream
+	blbs	r0,60$
+	jmp	rmserr				;signal an rms error
+60$:	$close	fab = hofab			;close the hosts.txt file
+	blbs	r0,70$
+	jmp	rmserr				;signal an rms error
+70$:	jmp	sndtcp
+	
+
+.page
+;	Validate the bitnet address and then send the mail off across the
+;	Bitnet network.
+
+sndbit:	bsbw	mapfil				;map the domain.txt file
+	moval	fwdbuf,r6			;point to the recpient
+	movzwl	(r6)+,r7			;get the size of the recpient
+	bsbw	valadd				;validate the bitnet address
+	tstb	r0				;is the address ok?
+	beql	70$				;if so send it
+	$deltva_s	inadr=domst
+	bsbw	wrtbit				;write a tmp file then send it
+	tstb	r0				;did we send it?
+	bneq	90$				;if so delete the queue fil
+	jmp	80$
+
+;	Return any undeliverable mail.
+
+70$:	moval	unkwnhst,r1			;say we don't know this host/domaub
+	movzbw	(r1)+,errbuf			;size of the msg
+	movc3	errbuf,(r1),errbuf+2		;store the message
+	bsbw	retmail				;yes return the mail
+	tstb	r0				;did we return it?
+	bneq	90$				;if not don't delete the queue file
+
+;	Delete the queue file and return.
+
+80$:	bsbw	delfil
+90$:	rsb
+
+
+.page
+retold:rsb
+
+.page
+;	Write out the queued_mail file to a temporary file.  Ship 
+;	it off via rscs.  Then delete the temporary file.
+;	Output:	r0 0 = success
+;
+;	Create a temp file and dump the text of the message into it.
+;
+wrtbit:	$create	fab = tmpfab			;create the file
+	blbs	r0,20$			
+	jmp	70$
+20$:	$connect rab = tmprab			;connect to record stream
+	blbs	r0,30$			
+	jmp	70$
+30$:	$get	rab = querab			;read a record
+	blbs	r0,40$
+	cmpl	r0,#rms$_eof			;have we hit eof?
+	beql	50$				;if so then were done with data
+	jmp	rmserr				;signal an rms error
+40$:	movw	querab+rab$w_rsz,tmprab+rab$w_rsz ;size of the record
+	$put	rab = tmprab			;send the record
+	jmp	30$				;get the next record
+50$:	$disconnect rab = tmprab
+	blbs	r0,55$			
+	jmp	70$
+55$:	$close	fab = tmpfab
+	blbs	r0,60$			
+	jmp	70$
+
+;	Build the rscs send file descriptor and send the file.
+
+60$:	movzbl	send,msgd			;size of the send argument
+	movc3	msgd,send+1,msg			;save the send argument
+	movzbw	bitopt,r1			;size of the bitnet options
+	addw2	r1,msgd				;add the size
+	movc3	r1,bitopt+1,(r3)		;save the options
+	movb	#32,(r3)+			;a space seperator
+	incw	msgd				;size of the seperator
+	movzbw	namtmp+nam$b_rsl,r1		;size of the tmp filename
+	addw2	r1,msgd				;save the size
+	movl	namtmp+nam$l_rsa,r2		;get the filenames address
+	movc3	r1,(r2),(r3)			;save the filename
+
+;	Isolate the recpient and node
+
+	pushr	#^m<r3>
+	moval	fwdbuf,r6			;point to the recpient
+	movzwl	(r6)+,r7			;get the size of the recpient
+	matchc	#1,#64,r7,(r6)			;find the start of the node	
+	movq	r2,r8				;save the start of the node
+	subl3	r6,r3,r7			;compute the size of the name
+	decl	r7				;don't count the "@"
+	matchc	#1,#46,r2,(r3)			;find the end of the node
+	subl3	r9,r3,r8			;compute the size of the node
+	decl	r8				;don't count the "."
+	popr	#^m<r3>
+
+;	Build the rest of the rscs msg
+
+	movb	#32,(r3)+			;a space seperator
+	incw	msgd				;size of the seperator
+	addw2	r8,msgd				;add the recpient size
+	movc3	r8,(r9),(r3)			;add the recpients name
+	movb	#32,(r3)+			;a space seperator
+	incw	msgd				;size of the seperator
+	addw2	r7,msgd				;add the node size
+	movc3	r7,(r6),(r3)			;add the node
+
+	bsbw	spawn				;do it
+	cmpl	r0,#ss$_normal			;did we send it
+	beql	80$				;signal success if so
+
+;	Check for error or success and save the flag
+
+70$:	movl	#1,r9				;signal an error
+	jmp	90$
+80$:	clrl	r9				;signal success
+
+;	Delete the temp file
+
+90$:	$erase fab = tmpfab			;delete the tmp file (ignore error)
+	movl	r9,r0				;get the flag
+	rsb
+
+
+.page
+;	Write out the current message to the users mail.txt file.
+;	The local mail.txt format is that the first line of each
+;	mail message starts and ends with a form feed.  This line
+;	is not displayed to the user but contains control information.
+;
+;	Output:	r0 = 0 onsuccess
+;		r0 = abort on error
+
+
+;	Copy the mailq: file to a temp file and compute size of message
+
+wrtlcl:	clrl	r6				;counter for the file size
+	$create	fab = tmpfab			;open the file
+	blbs	r0,10$
+	jmp	rmserr				;signal an rms error
+10$:	$connect rab = tmprab			;connect to record stream
+	blbs	r0,20$
+	jmp	300$				;error close and exit
+20$:	$get	rab = querab			;read a record
+	blbs	r0,30$
+	cmpl	r0,#rms$_eof			;have we hit eof?
+	beql	40$				;if so then were done with data
+	jmp	300$				;error close and exit
+30$:	movw	querab+rab$w_rsz,tmprab+rab$w_rsz ;size of the record
+	addw2	querab+rab$w_rsz,r6		;update the counter
+	$put	rab = tmprab			;send the record
+	blbs	r0,20$				;get the next record
+	jmp	300$				;error close and exit
+
+;	Finished counting characters and writing tmp file.
+
+40$:	$disconnect rab = tmprab		;break the stream
+	blbs	r0,50$
+	jmp	300$				;error close and exit
+50$:	$connect rab = tmprab			;start at the top of the file
+	blbs	r0,80$
+	jmp	300$				;error close and exit
+
+;	Determine the message number from the users mail.txt file
+
+80$:	clrl	r7				;start with no messages
+	$open	fab = lclfab			;open the file
+	blbs	r0,90$
+	jmp	150$				;can't open how about create
+90$:	$connect rab = lclrab			;connect to record stream
+	blbs	r0,100$
+	jmp	300$				;error close and exit
+100$:	$get	rab = lclrab			;get a control record
+	blbs	r0,110$
+	cmpl	r0,#rms$_eof			;have we hit eof?
+	beql	170$				;if so then done
+	jmp	300$				;error close and exit
+110$:	tstw	lclrab+rab$w_rsz		;be sure we have control record
+	beql	100$				;blank line means get another
+	incw	r7				;bump the message number
+
+;	Get past this message.
+
+	movl	mbuf+msg_l_siz,r8		;use the size as a counter
+120$:	$get	rab = lclrab			;get a data line
+	blbs	r0,130$
+	jmp	300$				;error close and exit
+130$:	subw	lclrab+rab$w_rsz,r8 		;subtract size of the record
+	beql	100$				;end of this msg get next msg
+	bgtr	120$				;get next line of this msg
+	jmp	300$				;error close and exit
+
+;	Open/create the users mail.txt file
+
+150$:	$create	fab = lclfab			;create new mail.txt file
+	blbs	r0,160$
+	jmp	300$				;error close and exit
+160$:	$connect rab = lclrab			;connect to record stream
+	blbs	r0,170$
+	jmp	300$				;error close and exit
+
+;	Add the msg in tmp file to mail.txt
+;	We initialize the first line to zero's except for the message
+;	number, the new mail flag, and the date.
+
+170$:	incw	r7				;msgnumber = last number plus 1
+	movb	#12,mbuf			;start with a form feed
+	movc5	#0,#0,#0,#225,mbuf+1		;225 characters to play with
+	movw	r7,mbuf+msg_w_num		;store the mesage number
+	movl	r6,mbuf+msg_l_siz		;store the message size
+	movb	#78,mbuf+msg_b_new		;set the new flag
+	$asctim_s timbuf = dtime		;get the current time
+	movc3	#23,time,(r3)			;store the time	
+	movb	#12,(r3)+			;end record with a form feed
+	movw	#250,lclrab+rab$w_rsz 		;size of the record
+	$put	rab = lclrab			;write the record
+	blbs	r0,180$
+	jmp	300$				;error close and exit
+
+;	Copy the the tmp file to the mail file
+
+180$:	$get	rab = tmprab			;read a record
+	blbs	r0,190$
+	cmpl	r0,#rms$_eof			;have we hit eof?
+	beql	200$				;if so then were done with data
+	jmp	300$				;error close and exit
+190$:	movw	tmprab+rab$w_rsz,lclrab+rab$w_rsz ;size of the record
+	$put	rab = lclrab			;send the record
+	blbs	r0,180$				;get the next record
+	jmp	300$				;error close and exit
+
+200$:	$disconnect rab = lclrab		;disconnect the record stream
+	$close fab = lclfab			;close the file
+	$disconnect rab = tmprab		;disconnect the record stream
+	$close fab = tmpfab			;close the file
+	$erase fab = tmpfab			;erase the file
+	clrl	r0				;signal success
+	rsb
+
+;	Here on errors
+
+300$:	$disconnect rab = lclrab		;disconnect the record stream
+	$close fab = lclfab			;close the file
+	$disconnect rab = tmprab		;disconnect the record stream
+	$close fab = tmpfab			;close the file
+	$erase fab = tmpfab			;erase the file
+	$disconnect rab = querab		;disconnect the record stream
+	$close fab = quefab			;close the file
+	movl	#ss$_abort,r0			;signal error
+	rsb
+
+.page
+;	Send mail to a local user.
+
+;	Isolate the user name.
+
+sndlcl:	movzwl	fwdbuf,r7			;assume only a username
+	matchc	#1,#64,fwdbuf,fwdbuf+2		;find the end of the user name
+	bneq	10$
+	subl3	r2,fwdbuf,r7			;compute the size of the username
+	decl	r7				;don't count the "@"
+10$:	movw	r7,mbxbuf			;set up for a mailbox call
+	movc3	r7,fwdbuf+2,mbxbuf+2		
+	moval	mbxbuf+2,r6			;point to the name
+	bsbw	mailbox				;do it continue regardless of success
+	cmpl	#ss$_normal,r0			;success?
+	bneq	15$				;if not continue
+	matchc	#1,#64,r7,(r6)			;strip off node if there
+	bneq	15$
+	subw2	r2,r7				;use only username
+	decw	r7
+
+;	Make sure the user is local.
+
+15$:	bsbw	vallcl				;Make sure it is a valid user.
+	tstb	r0				;check for errors
+	bgtr	30$				;r0 > 0 success
+	beql	80$				;r0 = 0 user not found	
+	ret					;r0 < 0 could not get uaf file
+
+;	Point to the users mail.txt file
+
+30$:	pushr	#^m<r6,r7>			;save pointer and size of user
+	bsbw	getdir				;Get the users home directory.
+	movb	lcldirsz,lclfab+fab$b_fns	;store the spec size
+60$:	bsbw	wrtlcl				;write to the local mail.txt
+	tstb	r0				;test for error
+	bneq	70$				;r0 = 0 is success
+	popr	#^m<r6,r7>
+	bsbw	notusr				;notify the user
+	bsbw	delfil				;delete the queue file
+	rsb
+70$:	popr	#^m<r6,r7>
+	rsb
+
+;	User was not local check for a bboard
+
+80$:	bsbw	mailbox				;check for a bboard match
+	cmpl	#-1,r0				;did we get a match?
+	bneq	90$				;if not return message
+	matchc	#1,#42,mlstrab+rab$w_rsz,mlstbuf ;get to the file spec
+	movb	r2,lclfab+fab$b_fns		;store the size
+	movc3	r2,(r3),lcldir			;and the text
+	pushr	#^m<r6,r7>			;dummy push
+	jmp	60$				;deliver to this file
+
+;	Return the mail with an error
+
+90$:	moval	unkwn,r1			;say we don't know this person
+	movzbw	(r1)+,errbuf			;size of the msg
+	movc3	errbuf,(r1),errbuf+2		;store the message
+	bsbw	retmail				;return the mail
+	tstb	r0				;test for error
+	bneq	100$				;r0 = 0 is success
+	bsbw	delfil				;delete the queue file
+100$:	rsb
+
+
+.page
+;	Notify the user he/she has mail
+
+;	Build the message buffer
+
+notusr:	movb	#7,mbuf				;send a bell
+	movl	#1,mbufd			;account for the bell
+	movzbl	delmsg,r2			;get the mail delivery message
+	addl2	r2,mbufd			;add the msg size
+	movc3	r2,delmsg+1,mbuf+1		;store the msg
+	addw2	sndr,mbufd			;add size of user name
+	movc3	sndr,sndr+2,(r3)		;add the username
+	movb	#cr,(r3)+			;add a crlf
+	movb	#lf,(r3)+
+	addw2	#2,mbufd			;one for the cr,lf
+
+;	Build the username buffer
+
+	movzwl	r7,msgd				;save the size
+	movc3	r7,(r6),msg			;save the username
+
+;	Send the message
+	
+	$brkthruw_s,-				;send a tty msg
+		msgbuf = mbufd,-
+		sendto = msgd,-			;send it to this user
+		flags  = #brk$m_bottom!brk$m_screen,-
+		reqid  = #brk$c_mail,-
+		sndtyp = #brk$c_username		
+	rsb
+
+
+.page
+;	Delete the old queue file.
+
+delfil:	$close	fab = quefab			;close the queue file
+	$erase	fab = quefab			;delete the queue file
+	rsb
+
+
+.page
+;	Create a mail message for the sender of the original mail message.
+;	Give the reason why the message could not be delivered.
+
+;	Create a new queue file and write in the header info.
+
+retmail:bsbw	w1retmsg			;[W1] show message returned
+	$create	fab = retfab			;create the file
+	blbs	r0,10$
+	jmp	rmserr
+10$:	$connect rab = retrab			;connect to the record stream
+	blbs	r0,20$
+	jmp	rmserr
+20$:	moval	sysnam,r1			;pointer to mail system name
+	movzbw	(r1)+,r2			;size of system name
+	movb	r2,revbuf			;size of mail system name
+	movc3	r2,sysnam+1,revbuf+1		;store the mail systems name
+	movb	#64,(r3)+			;store a seperator
+	incw	revbuf				;size of the seperator
+	movc3	lclhst,lclhst+2,(r3)		;add my host name
+	movb	#46,(r3)+			;add a period
+	incw	revbuf				;size of the period
+	movc3	lcldom,lcldom+2,(r3)		;add my domain name
+	addw2	lclhst,revbuf			;host name size
+	addw2	lcldom,revbuf			;domain name size
+	movb	#1,f.del			;send mail
+	movzwl	sndr,r7				;size of the recpients name	
+	moval	sndr+2,r6			;pointer to recpients name
+	bsbw	whdr				;write the header info
+
+;	Write the reasons(s) for failure.
+	
+	moval	e1,r1				;point to the general error message
+	movzbw	(r1)+,retrab+rab$w_rsz		;size of the error
+	movc3	retrab+rab$w_rsz,(r1),mbuf	;the error
+	$put	rab = retrab			;write the general message
+
+	moval	errbuf,r3			;point to the error buffer
+25$:	tstw	(r3)				;any error to send?
+	beql	30$				; no then tack on the file
+	movw	(r3)+,retrab+rab$w_rsz		;size of the error
+	movc3	retrab+rab$w_rsz,(r3),mbuf	;the error
+	$put	rab = retrab			;write the error
+	jmp	25$				;get another	
+
+30$:	clrw	retrab+rab$w_rsz		;zero output
+	$put	rab = retrab			;write a blank line
+
+;	Now get to the top of the users mail message and tack it on to the
+;	returned mail.
+
+	$disconnect rab = querab		;disconnect from record stream
+	$connect rab = querab			;reconnect to the record stream
+
+40$:	$get rab = querab			;read until we hit a blank line
+	tstw	querab+rab$w_rsz		;blank line?
+	bneq	40$				;if not read again
+
+45$:	$get rab = querab			;read a line of the file
+	blbs	r0,50$
+	cmpl	r0,#rms$_eof			;have we hit eof?
+	bneq	45$				;ignore read errors
+	jmp	60$				;done close the file
+50$:	movw	querab+rab$w_rsz,retrab+rab$w_rsz ;move the record size
+	$put rab = retrab			;write to the new file
+	jmp	45$				;get another line
+60$:	$disconnect rab = retrab		;disconnect
+	$close fab = retfab			;and close
+	clrl	r0				;signal success
+	rsb
+
+
+.page
+;	Check the reply from the foreign TCP/IP host.  The reply is in
+;	mbuf.
+;	Input: 1st character in mbuf
+;	Output: r0 will contain: -1 for positive done, 0 positive intermediate,
+;		1 for transient negative, 2 for permanent negative
+
+chkrply:movl	#-1,r0				;start with positive completion
+	cmpb	#50,mbuf			;2 = positive completion?
+	beql	10$				;if yes done
+	incl	r0				;not 2 assume positive intermediate
+	cmpb	#51,mbuf			;3 = positive intermediate?
+	beql	10$				;if yes done
+	incl	r0				;not 3 assume positive intermediate
+	cmpb	#52,mbuf			;4 = transient negative?
+	beql	10$				;if yes done
+	incl	r0				;not 4 assume permanent negative
+10$:	rsb
+
+.page
+;	Send this mail message to a tcp host.
+;	Input:	r6 size of recpients host
+;		r7 pointer to recpients host
+
+;	Open an smtp connection to the host specified in r6/r7
+
+sndtcp:	addw3	r6,#1,r8			;make the host name asciz
+	movc5	r6,(r7),#0,r8,mbuf		;do it
+	moval	mbuf,r7				;point at the name
+	bsbw	opna				;open a active connection
+	tstb	r0				;did we do it?
+	bneq	70$				;if not stop
+	bsbw	getban				;get the welcome banner
+	tstb	r0				;did we do it?
+	beql	10$				;if not stop
+	jmp	stop
+10$:	bsbw	shelo				;send a hello message
+	tstb	r0				;did we do it?
+	beql	20$				;if not stop
+	jmp	stop
+20$:	bsbw	smail				;send the delivery option
+	tstb	r0				;did we do it?
+	beql	30$				;if not stop
+	jmp	stop
+30$:	bsbw	srcpt				;send the list of recpients
+	tstb	f.rcpt				;did we do it?
+	beql	55$
+40$:	bsbw	sdata				;send the data
+	tstb	r0				;did we do it?
+	beql	50$				;if not stop
+	jmp	stop
+
+;	The data has been delivered successfully quit and close the connection.
+
+50$:	bsbw	squit				;close the connection
+	bsbw	close				;close the tcp/ip connection
+
+;	Return any undeliverably mail.
+
+55$:	tstw	errbuf				;returning any mail?
+	beql	60$
+	bsbw	retmail				;chk for mail and send it
+	tstb	r0				;did we do it?
+	bneq	70$				;if not don't delete the file
+
+;	Almost done.  Delete the file and return.
+
+60$:	bsbw	delfil				;delete the old queue file
+70$:	rsb
+
+
+.page
+;	Send the quit.
+
+squit:	moval	quit,r1				;get the quit command
+	movzbw	(r1)+,r7			;its size
+	movc3	r7,(r1),mbuf			;store it
+	movb	#cr,(r3)+			;add a crlf
+	movb	#lf,(r3)+
+	addw2	#2,r7				;one for the cr,lf
+
+;	Send the data message.
+
+	bsbw	snd				;send the message
+
+;	Get the response.
+
+	moval	mbuf,r8				;prepare for the read
+	bsbw	read				;get the reply
+
+;	Ignore the response.
+	
+	rsb
+
+
+.page
+;	Send the data.
+
+sdata:	moval	data,r1				;get the data command
+	movzbl	(r1)+,r7			;its size
+	movc3	r7,(r1),mbuf			;store it
+	movb	#cr,(r3)+			;add a crlf
+	movb	#lf,(r3)+
+	addw2	#2,r7				;one for the cr,lf
+
+;	Send the data message.
+
+	bsbw	snd				;send the message
+
+;	Get the response.
+
+	moval	mbuf,r8				;prepare for the read
+	bsbw	read				;get the reply
+
+;	Analyze the response.
+
+	bsbw	chkrply				;check the response
+	tstb	r0				;r0=0 success
+	beql	10$				;zero continue
+	movb	#1,r0				;signal error
+	rsb
+
+;	Send all of the data.
+
+10$:	$get	rab = querab			;read a record
+	blbs	r0,20$
+	cmpl	r0,#rms$_eof			;have we hit eof?
+	beql	30$				;if so then were done with data
+	jmp	rmserr				;signal an rms error
+
+;	We have a record.  If first line of the record is a period double it.
+
+20$:	movzwl	querab+rab$w_rsz,r7		;size of the record
+	cmpb	#46,mbuf			;a period "."?
+	bneq	25$				;no continue
+	movc3	querab+rab$w_rsz,mbuf,mbuf+1	;shift to the right
+	movb	#46,mbuf			;add the period
+	incw	r7				;size of a period
+25$:	moval	mbuf,r1				;point to the buffer
+	addl2	r7,r1				;get to the end of the buffer
+	movb	#cr,(r1)+			;add a crlf
+	movb	#lf,(r1)+
+	addw2	#2,r7				;one for the cr,lf
+	bsbw	snd				;send the record
+	jmp	10$				;get the next record	
+
+;	Build and send a terminating sequence.
+
+30$:	movl	#5,r7				;size of terminator	
+	movc3	r7,term,mbuf			;the TERMINATOR
+	bsbw	snd				;send the sequence
+
+;	Get the response.
+
+	moval	mbuf,r8				;prepare for the read
+	bsbw	read				;get the reply
+
+;	Analyze the response.
+
+	bsbw	chkrply				;check the response
+	tstb	r0				;r0 = -1 success
+	blss	40$				;negative continue
+	movb	#1,r0				;signal error
+	rsb
+
+;	Close the transaction 
+
+40$:	clrb	r0				;signal success
+	rsb
+
+
+.page
+;	Send the list of recpients on that host.
+
+srcpt:	moval	fwdbuf,fwdptr			;initialize the forward pointer
+	moval	errbuf,errptr			;initialize the error pointer
+	clrb	f.rcpt				;assume failure
+10$:	movl	fwdptr,r9			;get the pointer
+	tstw	(r9)				;check for a recpient
+	bgtr	20$				;if one there send the name
+	rsb
+
+;	We have a recpients name.  Process it.
+
+20$:	moval	rcpt,r1				;get the rcpt command
+	movzbl	(r1)+,r7			;its size
+	movc3	r7,(r1),mbuf			;store it
+	movb	#32,(r3)+			;add a space " "
+	incl	r7				;account for the space
+	moval	h5,r1				;get the "to" parameter
+	movzbl	(r1)+,r2			;get the size
+	addl2	r2,r7				;add the size in
+	movc3	r2,(r1),(r3)			;add the from parameter
+
+;	Add the sender enclosed in braces.
+
+	movb	#60,(r3)+			;add a brace "<"
+	incl	r7				;account for the brace
+	addl3	#2,r9,r10			;point to the name
+	movc3	(r9),(r10),(r3)			;add the recpient
+	movl	r1,fwdptr			;update the pointer
+	addw2	(r9),r7				;size of the recpient
+	movb	#62,(r3)+			;add a brace ">"
+	incl	r7				;account for the brace
+	movb	#cr,(r3)+			;add a crlf
+	movb	#lf,(r3)+
+	addw2	#2,r7				;one for the cr,lf
+
+;	Send the recpient message.
+
+	bsbw	snd				;send the message
+
+;	Get the response.
+
+	moval	mbuf,r8				;prepare for the read
+	bsbw	read				;get the reply
+
+;	Analyze the response.
+
+	bsbw	chkrply				;check the response
+	tstb	r0				;r0 = zero success
+	blss	40$				;zero continue
+	movl	errptr,r9			;get the error pointer
+	subw3	#2,piolen,r1			;skip the crlf
+	movw	r1,(r9)+			;size of the error msg
+	movc3	r1,mbuf,(r9)			;save the error	
+	jmp	10$				;check for another recpient
+
+;	Loop through all recpients
+
+40$:	movb	#1,f.rcpt			;signal success
+	jmp	10$				;check for another recpient
+
+
+.page
+;	Send the mail delivery option and senders name.
+
+smail:	caseb	f.del,#1,#4			;get the delivery option
+1$:	.word	10$-1$				;mail option
+	.word	20$-1$				;send option
+	.word	30$-1$				;soml option
+	.word	40$-1$				;saml option
+
+10$:	moval	mail,r1				;get the mail option
+	movzbl	(r1)+,r7			;its size
+	movc3	r7,(r1),mbuf			;store it
+	jmp	50$				;continue
+20$:	moval	send,r1				;get the send option
+	movzbl	(r1)+,r7			;its size
+	movc3	r7,(r1),mbuf			;store it
+	jmp	50$				;continue
+30$:	moval	soml,r1				;get the soml option
+	movzbl	(r1)+,r7			;its size
+	movc3	r7,(r1),mbuf			;store it
+	jmp	50$				;continue
+40$:	moval	saml,r1				;get the saml option
+	movzbl	(r1)+,r7			;its size
+	movc3	r7,(r1),mbuf			;store it
+
+;	We have the delivery option add the parameter.
+
+50$:	movb	#32,(r3)+			;add a space " "
+	incl	r7				;account for the space
+	moval	h4,r1				;get the "from" parameter
+	movzbl	(r1)+,r2			;get the size
+	addl2	r2,r7				;add the size in
+	movc3	r2,(r1),(r3)			;add the from parameter
+
+;	Add the sender enclosed in braces.
+
+	movb	#60,(r3)+			;add a brace "<"
+	incl	r7				;account for the brace
+
+;	Don't pass a blank username or a username with spaces.
+
+	cmpb	#64,sndr+2			;if no username 
+	bneq	51$				
+	jmp	55$				;blank the from
+51$:	pushr	#^m<r3>
+	matchc	#1,#32,sndr,sndr+2		;check for a space
+	popr	#^m<r3>
+	bneq	52$				
+	jmp	55$				;blank the from
+52$:	movc3	sndr,sndr+2,(r3)		;add the sender
+	addw2	sndr,r7				;size of the sender
+
+;	Check to see if this is mail from one of my users or a relay msg.
+
+	pushr	#^m<r3>				;save the pointer
+	matchc	#1,#64,r7,mbuf			;find the start of the hostname
+	matchc	lclhst,lclhst+2,lclhst,(r3)	;check for my hostname
+	bneq	53$				;if not add my host.domain
+	cmpb	(r3)+,#46			;check for a host.domain seperator
+	bneq	53$				;if not add my host.domain
+	matchc	lcldom,lcldom+2,lcldom,(r3)	;check for my domain name
+	bneq	53$				;if not add my host.domain
+	popr	#^m<r3>				;restore pointer
+	jmp	55$				;and continue	
+
+;	Add my host.domain so that the delivery message is real.
+
+53$:	popr	#^m<r3>				;restore pointer
+
+;[W2]	Jump around this code.  Remove it later if unnecessary.
+	jmp	55$				;[W2] do it
+
+	pushr	#^m<r3>				;save the pointer
+	matchc	#1,#64,r7,mbuf			;replace the @ with a percent
+	decl	r3				;point to the @
+	movb	#37,(r3)			;do it	
+	popr	#^m<r3>
+	movb	#64,(r3)+			;add a seperator "@"
+	incw	r7				;account for the seperator
+	movc3	lclhst,lclhst+2,(r3)		;store my hostname
+	addw2	lclhst,r7			;size
+	movb	#46,(r3)+			;a seperator
+	incw	r7				;size
+	movc3	lcldom,lcldom+2,(r3)		;store my domainname
+	addw2	lcldom,r7			;size
+55$:	movb	#62,(r3)+			;add a brace ">"
+	incl	r7				;account for the brace
+	movb	#cr,(r3)+			;add a crlf
+	movb	#lf,(r3)+
+	addw2	#2,r7				;one for the cr,lf
+
+;	Send the delivery message.
+
+	bsbw	snd				;send the message
+
+;	Get the response.
+
+	moval	mbuf,r8				;prepare for the read
+	bsbw	read				;get the reply
+
+;	Analyze the response.
+
+	bsbw	chkrply				;check the response
+	tstb	r0				;r0 =-1 success
+	blss	60$				;negative continue
+	movb	#1,r0				;signal error
+	rsb
+60$:	clrb	r0				;signal success
+	rsb					;return	
+	
+
+.page
+;	Get the welcome banner
+
+getban:	moval	mbuf,r8				;prepare for the read
+	bsbw	read				;get the banner
+
+;	Check for errors
+
+	bsbw	chkrply				;check the response
+	tstb	r0				;r0 =-1 success
+	blss	10$				;negative continue
+	movb	#1,r0				;signal error
+	rsb
+10$:	clrb	r0				;signal success
+	rsb
+
+.page
+;	Build and then send a hello message to the foreign host.
+
+shelo:	moval	helo,r1				;get the hello msg
+	movzbl	(r1)+,r7			;and its size
+	movc3	r7,(r1),mbuf			;start the hello msg
+	movc3	lclhst,lclhst+2,(r3)		;add my host name
+	movb	#46,(r3)+			;add a period
+	movc3	lcldom,lcldom+2,(r3)		;add my domain name
+	addw2	lclhst,r7			;host name size
+	addw2	lcldom,r7			;domain name size
+	movb	#cr,(r3)+			;add a crlf
+	movb	#lf,(r3)+
+	addw2	#3,r7				;one for the period,cr,lf
+
+;	Send the helo message.
+
+	bsbw	snd				;send the message
+
+;	Get the response.
+
+	moval	mbuf,r8				;prepare for the read
+	bsbw	read				;get the reply
+
+;	Analyze the response.
+
+	bsbw	chkrply				;check the response
+	tstb	r0				;r0 =-1 success
+	blss	10$				;negative continue
+	movb	#1,r0				;signal error
+	rsb
+10$:	clrb	r0				;signal success
+	rsb					;return	
+
+
+.page
+;	Parse the header fields.
+;	Input:	file pointed to by previous RMS search
+;	Outut:	f.del= mail delivery option (1=mail,2=send,3=soml,4=saml)	
+
+;	First record is the mail delivery option.
+
+parfil:	$get	rab = querab			;read a record
+	blbs	r0,5$
+	jmp	rmserr				;signal an rms error
+5$:	moval	h1,r1				;point to deliver options
+	movzbw	(r1)+,r2			;get its size
+	matchc	r2,(r1),querab+rab$w_rsz,mbuf	;get to the option
+	beql	10$				;not found bad error
+	jmp	badfile				;handle error
+10$:	movq	r2,r6				;put it somewhere safe
+	movb	#1,f.del			;assume mail delivery
+	moval	mail,r4				;get mail msg
+	movzbw	(r4)+,r5			;get its size
+	matchc	r5,(r4),r6,(r7)			;is this mail option
+	beql	20$				;correct option continue
+	addb	#1,f.del			;assume send delivery
+	moval	send,r4				;get send msg
+	movzbw	(r4)+,r5			;get its size
+	matchc	r5,(r4),r6,(r7)			;is this send option
+	beql	20$				;correct option continue
+	addb	#1,f.del			;assume soml delivery
+	moval	soml,r4				;get soml msg
+	movzbw	(r4)+,r5			;get its size
+	matchc	r5,(r4),r6,(r7)			;is this saml option
+	beql	20$				;correct option continue
+	addb	#1,f.del			;assume saml delivery
+	moval	saml,r4				;get saml msg
+	movzbw	(r4)+,r5			;get its size
+	matchc	r5,(r4),r6,(r7)			;is this saml option
+	beql	20$				;correct option continue
+	jmp	badfile				;unknown option handle error
+
+;	Second record is notify.  Informational only.  Ignore record.
+
+20$:	$get	rab = querab			;read a record
+	blbs	r0,25$
+	jmp	rmserr				;signal an rms error
+25$:
+;	Third record is dequeue.  If past time return mail to sender.
+
+	$get	rab = querab			;read a record
+	blbs	r0,30$
+	jmp	rmserr				;signal an rms error
+30$:	moval	h3,r1				;get the dequeue msg
+	movzbw	(r1)+,r2			;size of msg
+	matchc	r2,(r1),querab+rab$w_rsz,mbuf	;get to the time
+	movzbl	r2,dtime			;convert dequeue to sys format
+	movc3	r2,(r3),time			;build a descriptor
+	$bintim_s timbuf = dtime,-		;ascii descriptor
+		  timadr = time			;system format
+	$numtim_s timbuf = Atime,-		;ascii descriptor
+		  timadr = time			;system format
+	$numtim_s timbuf = Btime		;current time (system format)
+XX:
+;	$bintim_s timbuf = dtime,-		;ascii descriptor
+;		  timadr = time			;system format
+;	$gettim_s timadr = stime		;current time (system format)
+;	cmpl	qtime,stime			;should we dequeue the message
+;	bgtr	40$				;if greater than dequeue it
+;	cmpl	qtime+4,stime+4			;1st long word ok check 2nd
+;	bleq	50$
+;40$:	movb	#1,f.oldmail			;old mail return it
+;	rsb
+50$:	clrb	f.oldmail			;mail still valid	
+
+;	Forth record is from. Get the sender.
+
+;[W1]	First write the time to the log file
+	bsbw	w1time				;[W1] Write a timestamp
+
+	$get	rab = querab			;read a record
+	blbs	r0,60$
+	jmp	rmserr				;signal an rms error
+60$:	bsbw	w1copy				;[W1] copy this line
+	moval	h4,r1				;get the from msg
+	movzbw	(r1)+,r2			;size of msg
+	matchc	r2,(r1),querab+rab$w_rsz,mbuf	;get to the sender
+	movzbw	r2,sndr				;make it ascic
+	movc3	r2,(r3),sndr+2			;get the sender
+
+;	The following records (until a blank line) are recpients)
+;	Store them in a linked list. (ascic format)
+
+	movc5	#0,#0,#0,#maxrcp*maxpth,fwdbuf	;clear the forward buffer
+	moval	fwdbuf,r9			;start the to list
+70$:	$get	rab = querab			;read a record
+	blbs	r0,80$
+	jmp	rmserr				;signal an rms error
+80$:	tstw	querab+rab$w_rsz		;blank line?
+	beql	90$				;yes then return
+	bsbw	w1copy				;[W1] copy this line
+	moval	h5,r1				;get the to msg
+	movzbw	(r1)+,r2			;size of msg
+	matchc	r2,(r1),querab+rab$w_rsz,mbuf	;get to the recpient
+	movw	r2,(r9)+			;make it ascic
+	pushr	#^m<r2>				;save the length
+	movc3	r2,(r3),(r9)			;store the name
+	popr	#^m<r2>
+	addl2	r2,r9				;point past the name
+	jmp	70$				;get the next line
+90$:	rsb					;return	
+	
+.page
+;	Assign a TCP/IP channel.  Open a active TCP/IP connection.
+
+opna:	$assign_s devnam = port,-		;assign the network device
+		  chan	 = pchan
+	blbs	r0,10$				;did we get the assignment?
+	movb	#1,r0				;signal error
+	rsb
+10$:	$qiow_s chan	= pchan,-		;execute a network command
+		iosb	= piosb,-		;Save the status and para
+		func	= #tcp$open,-		;Open a connection
+		p1	= (r7),-		;host
+		p2	= #smtp,-		;foreign smtp port
+		p3	= #wild,- 		;local port 
+		p4	= #active,- 		;connection mode 
+		p5	= #mbufsz,-		;buffer size
+		p6	= #timout		;time out after x seconds
+	blbs	r0,20$				;check if we queued the call
+	movb	#1,r0				;signal error
+	rsb
+20$:	blbs	piosb,30$			;check the success of the call	
+	movzwl	piosb,r0			;show the problem
+	movb	#1,r0				;signal error
+	rsb
+30$:	movl	pioex,lcid			;save the local connection
+	clrb	r0				;signal success
+	rsb
+
+
+.page
+;	Send some information to the TCP/IP connection.
+;	The information is in mbuf
+;	R7 is the size of the buffer
+
+snd:	$qiow_s chan	= pchan,-		;Send a packet to the port
+		iosb	= piosb,-		;Save the status and count
+		func	= #tcp$send,-		;send to the foreign host
+		p1	= mbuf	,-		;buffer for the info
+		p2	= r7,-			;size of the buffer
+		p3	= lcid,-		;local port
+		p4	= #7,-			;local tag
+		p5	= #1,-			;eol flag
+		p6	= #1			;urgent flag
+	blbs	r0,10$				;check if we queued the call
+	jmp	rmserr				;die on error
+10$:	blbs	piosb,20$			;check the success of the call	
+	jmp	tcperr				;die on error
+20$:	rsb
+
+
+
+.page
+;	Read data from the tcp/ip connection.  Remove any parity bits.
+;	R8 is the pointer to the location to store the information read.
+
+read:	movc5	#0,#0,#0,#page,mbuf		;clear the buffer
+	clrl	r9				;clear the buffer counter
+	
+5$:	$qiow_s chan	= pchan,-		;Read a packet from the port
+		iosb	= piosb,-		;Save the status and count
+		func	= #tcp$receive,-	;receive from the foreign host
+		p1	= (r8),-		;buffer for the info
+		p2	= #mbufsz,-		;size of the buffer
+		p3	= lcid			;local port
+	blbs	r0,10$				;check if we queued the call
+	jmp	rmserr				;die on error
+10$:	blbs	piosb,20$			;check the success of the call	
+	movzwl	piosb,r0			;show the problem
+	jmp	tcperr				;die on error
+
+;	Remove any existing parity.
+
+20$:	movzwl	piolen,r3			;set up a counter
+	movl	r8,r2				;start with what we just read in
+30$:	mcomb	#parity,r1			;set up the parity complement
+	bicb2	r1,(r2)+			;do it and point to the next ch
+	sobgtr	r3,30$				;get the next if any
+
+;	Only terminate on a crlf
+
+	movl	r2,r8				;update the buffer pointer
+	addw2	piolen,r9			;update the buffer counter
+	matchc	#1,#cr,r9,mbuf			;search for a cr to stop
+	bneq	5$				;if not found do another read
+	movw	r9,piolen			;save the actual size
+	rsb
+
+.page
+;	Stop the tcp/ip transaction and close the connection.
+
+stop:	bsbw	squit				;stop the transaction
+	bsbw	close				;close the connection
+	rsb
+
+.page
+;	Close the tcp/ip connection.  This currently fails. (I don't
+;	know why.)  So ignore tcp/ip error.
+
+close:	$qiow_s chan	= pchan,-		;execute a network command
+		iosb	= piosb,-		;Save the status and para
+		func	= #tcp$close,-		;Close a connection
+		p1	= lcid			;local port id
+	blbs	r0,10$				;check if we queued the call
+	jmp	rmserr				;die on error
+10$:	rsb					;ignore the tcp/ip status
+
+
+.page
+;	Rename the current queued_mail.txt to bad_mail.txt
+;	Output:	r0 = ss$_abort
+
+badfile:$close	fab = quefab			;close the file ignore errors
+	movb	namque+nam$b_rsl,quefab+fab$b_fns
+	movl	namque+nam$l_rsa,quefab+fab$l_fna
+	$rename oldfab = quefab,-		;old filename
+		newfab = badfab			;new filename
+	movb	#quenamsz,quefab+fab$b_fns
+	moval	quenam,quefab+fab$l_fna
+	movl	#ss$_abort,r0			;signal that we had a bad file
+	rsb
+
+.page
+;[W1]	Special routines to write log file entries.
+
+;Write a note indicating the following message was a return
+
+W1Retmsg:
+	pushr	#^m<r1,r2,r3,r4,r5,r6,r7,r8,r9>
+	moval	w1r,r1				;[W1] get return note
+	movzbw	(r1)+,maiserrab+rab$w_rsz	;[W1] message size
+	movc3	maiserrab+rab$w_rsz,(r1),mbuf	;[W1] Store the message
+	$put	rab = maiserrab			;output the text
+	popr	#^m<r1,r2,r3,r4,r5,r6,r7,r8,r9>
+	rsb
+
+
+;Copy a from/to line into log file
+
+W1Copy:	pushr	#^m<r1,r2,r3,r4,r5,r6,r7,r8,r9>
+	movw	querab+rab$w_rsz,maiserrab+rab$w_rsz ;[W1] move size
+	$put	rab = maiserrab			;output the text
+	popr	#^m<r1,r2,r3,r4,r5,r6,r7,r8,r9>
+	rsb
+
+
+;Put a timestamp in the log file
+
+W1Time:	pushr	#^m<r1,r2,r3,r4,r5,r6,r7,r8,r9>
+    	clrw	maiserrab+rab$w_rsz	
+	$put	rab = maiserrab			;[W1]
+	moval	w1t,r1				;[W1] get time message
+ 	movzbw	(r1)+,maiserrab+rab$w_rsz	;[W1] message size
+	movc3	maiserrab+rab$w_rsz,(r1),mbuf	;[W1] Store the message
+	$asctim_s timbuf = dtime		;[W1] get the current time
+	movc3	dtime,time,(r3)			;[W1] save the time
+    	addw2	dtime,maiserrab+rab$w_rsz	
+	$put	rab = maiserrab			;[W1] output the text
+	popr	#^m<r1,r2,r3,r4,r5,r6,r7,r8,r9>
+	rsb
+
+
+.page
+;	Validate the address passed.
+;	Input:	r6 pointer to address
+;		r7 length of address
+;	Output:	r0 1=success 0=address invalid 
+;		On success either:
+;		the singe site flag will be set
+;		or
+;		the relay flag will be set
+
+valadd:	pushr	#^m<r1,r2,r3,r4,r5,r6,r7,r8,r9>
+	bsbw	ucase				;uppercase the address
+	subl3	domst,domed,domsz		;compute size of the file
+	matchc	#1,#64,r7,(r6)			;isolate the host.domain
+	bneq	10$				;already done continue
+	movzwl	r2,r7				;get the size
+	movl	r3,r6				;update the pointer
+	
+;	First search for a known host site.  The format is:
+;	host host_name.domain_name
+
+10$:	moval	host,r1				;point to the word "host"
+	movzbw	(r1)+,r2			;get the size of the word
+	addw3	r2,r7,r9			;save the word and domain size
+	movc3	r2,(r1),mbuf			;get the word into  buffer
+	movc3	r7,(r6),(r3)			;get the host.domain into the buffer
+	movl	domst,r1			;point to the start of the section
+	matchc	r9,mbuf,domsz,(r1)		;search the domains.txt file
+	bneq	20$				;if found return success
+	jmp	80$				;return success
+
+;	We did not mmatch an individual site.  Search for a known
+;	gateway.  The format is domain domain_name
+
+20$:	moval	domain,r1			;point to the word "domain"
+	movzbw	(r1)+,r9			;get the size of the word
+	movc3	r9,(r1),mbuf			;store the keyword
+	movl	r3,r8				;save the buffer pointer
+	matchc	#1,#46,r7,(r6)			;isolate the domain name
+	beql	30$				;if no domain signal error
+	jmp	90$				;error	
+30$:	addw2	r2,r9				;save the size of the string
+	movc3	r2,(r3),(r8)			;save the domain name
+	movl	domst,r1			;point to the start of the section
+	matchc	r9,mbuf,domsz,(r1)		;search the domains.txt file
+	bneq	90$				;if not found error	
+80$:	movl	#1,r0				;signal success
+	jmp	100$
+90$:	clrl	r0				;signal error
+100$:	popr	#^m<r1,r2,r3,r4,r5,r6,r7,r8,r9>
+	rsb	
+
+.page
+;	Create a subprocess and send a dcl command to it to execute.
+;	Communication to the subprocess is through mailboxes
+
+;	Input:	msgd descriptor of dcl command to execute
+;	Output:	r0 = abort on error and normal on success
+
+;	Make sure the process and mbxs are unique
+
+spawn:	bsbw	killprc				;do it
+
+;	Create an input and output mailbox for a subprocess
+
+	$crembx_s-				;create a mailbox
+		prmflg=#1,-			;temporary mailbox
+		chan=mchin,-			;channel number
+		maxmsg=#mboxsz,-		;max size of mail
+		lognam=min			;name of the mailbox
+	blbs	r0,10$				;Check for a successful code
+	movl	#ss$_abort,r0			;signal error
+	jmp	100$				;exit on error
+10$:	$crembx_s-				;create a mailbox
+		prmflg=#1,-			;temporary mailbox
+		chan=mchout,-			;channel number
+		maxmsg=#mboxsz,-		;max size of mail
+		lognam=mout			;name of the mailbox
+	blbs	r0,20$				;Check for a successful code
+	movl	#ss$_abort,r0			;signal error
+	jmp	100$				;exit on error
+
+;	Create the subprocess to execute the dcl commands
+
+20$:	$creprc_s,-
+	image = image,-				;program to execute
+	input = min,-				;input mbx
+	output = mout,-				;ouput mbx
+	prcnam = name,-				;name of subprocess
+	stsflg = #prc$m_detach			;detached process
+	blbs	r0,30$				;Check for a successful code
+	movl	#ss$_abort,r0			;signal error
+	jmp	100$				;exit on error
+
+;	Write dcl commands to the subprocesses input mailbox
+;	Send the command to execute
+
+30$: 	bsbw	sndmbx				;send a command to mbx
+	cmpl	r0,#ss$_abort			;did we do it?
+	beql	60$				
+
+;	Send the command to logout the subprocess
+
+	movw	#logoutsz,msgd			;get the "logout/brief" command
+	movc3	#logoutsz,logout,msg
+	bsbw	sndmbx				;send a command to mbx
+
+;	Make sure we killed off the mailboxes and porcess
+	
+60$:	movl	r0,r10				;save the success/failure
+	bsbw	killprc				;make sure we did it
+	movl	r10,r0				;return success/failure
+
+100$:	rsb
+
+
+.page
+sndmbx:	$qiow_s	chan=mchin,-			;output to the mail box
+		func=#io$_writevblk!io$m_now,-
+		p1=msg,-			;the text stored in msg
+		p2=msgd,-			;size of the msgd
+		iosb=miosb			;iosb for the mailbox
+	blbs	r0,10$				;Check for a successful code
+	movl	#ss$_abort,r0			;signal error
+	jmp	50$				;exit on error
+
+;	Get the echo of the command we sent
+
+10$:	movl	#100,r9				;loop 100 
+	$bintim_s timbuf=aslep,-		;ascii time to sleep
+		  timadr=bslep			;binary time to sleep
+
+20$:	$qiow_s	chan=mchout,-			;read from the mail box
+		func=#io$_readvblk,-
+		p1=mbuf,-			;the text stored in mbuf
+		p2=#mboxsz,-			;size of the mboxbuf
+		iosb=miosb			;iosb for the mailbox
+	blbs	r0,30$				;Check for a successful code
+	movl	#ss$_abort,r0			;signal error
+	jmp	50$				;exit on error
+30$:   	matchc	msgd,msg,msgd,mbuf		;echo?
+	beql	40$				;found then done	
+	$schdwk_s daytim=bslep			;wake me in x time
+	$hiber_s				;sleep until x time
+	sobgtr	r9,20$				;try again
+	movl	#ss$_abort,r0			;signal error
+	jmp	50$				;exit on error
+40$:	movl	#ss$_normal,r0			;signal success
+50$:	rsb
+
+
+.page
+;	Attempt to kill the detached subprocess
+
+killprc:$delprc_s prcnam = name			;only one process
+	$assign_s devnam = min,-		;remove the input mailbox
+		  chan   = mchin
+	$assign_s devnam = mout,-		;remove the output mailbox
+		  chan   = mchout
+	$delmbx_s chan = mchin			;input
+	$delmbx_s chan = mchout			;output
+	$dassgn_s chan = mchin
+	$dassgn_s chan = mchout
+	rsb
+
+.page
+.psect dat,noexe,wrt,long
+
+	;	Version information
+
+vmajor::.ascii	/1/				;major version 1
+	.byte	46				;period
+vminor::.ascii	/0/				;minor version 0
+vend	==	.-vmajor
+
+$PRVDEF
+$SSDEF
+$uafdef
+$brkdef
+$prcdef
+
+;	Various maximum sizes
+
+line	=	80
+page	=	512
+maxdom	=	64
+maxpth	=	256
+
+;	End of Various maximum sizes
+;	Start of Flags
+
+f.oldmail:.blkb	1				;flag do signal old mail
+
+;	End of Flags
+;	Start of special names
+
+bitdom:	.ascic	/BITNET/			;Bitnet domain name
+
+;	End of special names
+;	Start of message descriptor for sending messages
+
+msgd:	.blkl	1				;descriptor
+	.address msg
+msg:	.blkb	80
+
+;	End of message descriptor for sending messages
+;	Start of general messages
+
+W1r:	.ascic	/% This message was returned to sender./
+W1t:	.ascic	/* Message processed at /
+
+bitopt:	.ascic	'/FILE/PUNCH/CLASS=M'		;RSCS options
+
+e1:	.ascic	/Your mail failed for the following reason(s)./
+unkwn:	.ascic	/Recpient unknown./
+unkwnhst:.ascic	/Unknown host or domain/
+delmsg:	.ascic	/You have a message from /
+
+;	End of general messages
+;	Time to sleep
+
+bslep:	.blkq	1				;binary of time to sleep
+aslep:	.ascid	/0 00:00:30.00/			;hibernate for awhile
+bhiber:	.blkq	1				;[W3] binray of time to sleep
+ahiber:	.ascid	/0 00:01:00.00/			;[W3] hibernate for awhile
+
+;	End of Time to sleep
+
+;	End of Time to sleep
+;	Start of storage
+
+atime:	.blkq	1				;timer storage
+btime:	.blkq	1				;timer storage
+
+sndr:	.blkb	maxpth				;sender of the mail message
+
+errptr:	.blkl	1				;error buffer pointer
+errbuf:	.blkb	page 				;error buffer
+
+space:	.byte	32				;space
+period:	.byte	46				;period
+
+mbufd:	.blkl					;m buffer descriptor
+	.address mbuf
+
+;	End of storage
+;	Start of Subprocess creation information
+
+image:	.ascid	/sys$system:loginout.exe/
+name:	.ascid	/MaiserGram/
+
+logout:	.ascii	?logout/brief?
+logoutsz =	.-logout
+logomsg: .ascic	/terminated at/
+
+;	End of Subprocess creation information
+;	Start of Mailbox creation information
+
+min:	.ascid	/MaiserIn/			;send to subprocess mbx
+mchin:	.blkw	1				;mail box channel
+mout:	.ascid	/MaiserOut/			;receive from subporcess mbx
+mchout:	.blkw	1				;mail box channel
+
+mboxsz	=	200				;max mbx size
+
+miosb:	.blkw	1				;status blocks for mbx
+miolen:	.blkw	1
+	.blkl	1
+
+;	End of Mailbox creation information
+
+.page
+.psect	datfil	pic,usr,con,rel,lcl,noshr,noexe,rd,wrt
+
+badfab:	$fab	fna = badnam,-			;address of the file name
+		fns = badnamsz,-		;size of the filename
+		fac = <get,put>,-		;read/write access to the file
+		fop = sup			;superceed existing files
+
+retfab:	$fab	fna = retnam,-			;address of the file name
+		fns = retnamsz,-		;size of the filename
+		fac = <get,put>,-		;read/write access to the file
+		rfm = var,-			;variable length records
+		rat = cr,-			;use crlf
+		mrs = page,-			;maximum record one page
+		fop = sup			;superceed existing files
+retrab:	$rab	fab = retfab,-			;address of the fab
+		ubf = mbuf,-			;buffer
+		usz = page,-			;buffer size
+		rbf = mbuf			;address of the output buffer
+
+lclfab:	$fab	fna = lcldir,-			;address of the file name
+		fac = <get,put>,-		;read/write access to the file
+		rfm = var,-			;variable length records
+		rat = cr,-			;use crlf
+		mrs = page,-			;maximum record one page
+		fop = cif			;create if file does not exist
+lclrab:	$rab	fab = lclfab,-			;address of the fab
+		ubf = mbuf,-			;buffer
+		usz = page,-			;buffer size
+		rbf = mbuf			;address of the output buffer
+
+tmpfab:	$fab	fna = tmpnam,-			;address of the file name
+		fns = tmpnamsz,-		;size of the filename
+		nam = namtmp,-			;name block for parse/search
+		fac = <get,put>,-		;read/write access to the file
+		rfm = var,-			;variable length records
+		rat = cr,-			;use crlf
+		mrs = page,-			;maximum record one page
+		fop = <sup,nam>			;superceed existing files
+
+tmprab:	$rab	fab = tmpfab,-			;address of the fab
+		ubf = mbuf,-			;buffer
+		usz = page,-			;buffer size
+		rbf = mbuf			;address of the output buffer
+
+maiserfab:$fab	fna = maisernam,-		;address of the file name
+		fns = maisernamsz,-		;size of the file name
+		fac = put,-			;write to the file
+		rfm = var,-			;variable length records
+		rat = cr,-			;use crlf
+		mrs = page,-			;maximum record one page
+		fop = cif			;create nonexisting file
+maiserrab:$rab	fab = maiserfab,-		;address of the fab
+		rop = eof,-			;append to the log
+		rbf = mbuf			;address of the output buffer
+
+namtmp:	$nam	rsa = res_str1,-		;result buffer
+		rss = nam$c_maxrss,-		;result buffer size
+		esa = esa_str1,-		;expanded buffer
+		ess = nam$c_maxrss		;expanded buffer size
+	
+res_str:.blkb	nam$c_maxrss			;result buffer
+esa_str:.blkb	nam$c_maxrss			;expanded buffer
+
+res_str1:.blkb	nam$c_maxrss			;result buffer
+esa_str1:.blkb	nam$c_maxrss			;expanded buffer
+
+retnam:	.ascii	/sys$mailq:queued_mail.txt/
+retnamsz	= .-retnam
+badnam:	.ascii	/sys$mailq:bad_mail.txt/
+badnamsz	= .-badnam
+tmpnam:	.ascii	/sys$mailq:mail.tmp/
+tmpnamsz	= .-tmpnam
+maisernam:.ascii /sys$mailq:maiser.log/
+maisernamsz	= .-maisernam
+
+.end maiser

@@ -1,0 +1,556 @@
+.psect	code	exe,nowrt
+.library	/sys$library:lib.mlb/
+.entry	smtp_bsmtp_lib	^m<>
+.title smtp-bsmtp library
+
+.subtitle command parser
+
+;	Command parsing routine.  The routine depends on the assumption
+;	that all smtp commands end with a space if the command has arguments
+;	or a crlf if the command does not have any arguments.  Exiting this
+;	routine is done with a jump.  So that the ret at the end of the routine
+;	that we jump to here returns to parse's caller.
+
+parse::	moval	mbuf,r8				;point to the cmd line
+	cmpb	#cr,(r8)			;test for a blank line
+	bneq	3$				;if blank return
+	rsb					;blank:	return
+3$:	movw	piolen,cmdsiz			;get the size of the cmd line
+	matchc	#1,#space,cmdsiz,(r8)		;any arguments to the cmd?
+	bneq	5$				;if not no parameter
+	subl3	r8,r3,r7			;size of the cmd passed
+	decl	r7				;don't count the space
+	movl	r3,cmdptr			;save the cmd ptr
+	movl	r3,r8				;start of parameter
+	matchc	#1,#cr,cmdsiz,(r8)		;valid terminator?
+	bneq	10$				;bad terminator
+	subw3	r8,r3,cmdsiz			;size of the parameter passed
+	decw	cmdsiz				;account for the cr
+	jmp	12$				;parse the cmd
+
+;	No parameter passed.
+
+5$:	matchc	#1,#cr,cmdsiz,(r8)		;valid terminator?
+	bneq	10$				;bad terminator
+	subl3	r8,r3,r7			;size of the cmd passed
+	decl	r7				;don't count the cr
+	clrw	cmdsiz				;no argument
+	jmp	12$				;parse the cmd
+
+10$:	moval	r500,r1				;get the cmd error msg
+	jmp	smtperr				;bad term pass back error
+
+12$:	moval	mbuf,r6				;pointer to cmd passed
+	bsbw	ucase				;upper case the cmd passed
+	moval	cmdtbl,r3			;get the start to the cmd table
+	movb	(r3)+,cmdcnt			;how many cmds to ckeck
+15$:	movzbw	(r3)+,r1			;get the length of this cmd
+	cmpb	r1,r7				;is cmd passed and cmd same length	
+	bneq	18$				;if not skip the check
+	matchc	r1,(r6),r1,(r3)			;check cmd passed to cmd from tbl
+	bneq	20$				;no match check next cmd in tbl
+	movl	(r3),r3				;get the address of the routine
+	jmp	(r3)				;go execute the routine
+18$:	movzbl	r1,r1				;make it long
+	addl2	r1,r3				;get past this cmd
+20$:	decb	cmdcnt				;not this cmd any left?
+	bgtr	30$				;if so get the next cmd in table
+	moval	r500,r1				;get the cmd error msg
+	jmp	smtperr				;pass back an error
+30$:	addl2	#4,r3				;point to length of next cmd in tbl
+	jmp	15$				;try this cmd
+
+
+.subtitle bsmtp/smtp server routines
+
+;	Build a greeting message. Send it. 
+;	R7 is the size of the buffer to send.
+;	Mbuf is the buffer address.
+
+setup::	moval	r220,r1				;get start of greeting
+	movzbl	(r1)+,r7			;size of 1st part
+	movc3	r7,(r1),mbuf			;save 1st part
+	movl	r1,r6				;keep this pointer
+	movzbw	lhnasz,r2			;get the size
+	addw2	r2,r7				;r7 size of buffer to ouput
+	movc3	r2,lhna,(r3)			;save our name
+	addw2	#1,r7				;one for the period
+	movb	#period,(r3)+			;a period
+	movzbw	lnnasz,r2			;get the size
+	addw2	r2,r7				;size of domain name
+	movc3	r2,lnna,(r3)			;save our domain
+	movzbw	(r6)+,r2			;size of 2nd part
+	addw2	r2,r7				;size of 2nd part
+	movc3	r2,(r6),(r3)			;save 2nd part
+	movl	r1,r6				;keep this pointer
+	addw2	#vend,r7			;size of version info
+	movc3	#vend,vmajor,(r3)		;save the version
+	addw2	#1,r7				;one for the space
+	movb	#space,(r3)+			;a space
+	$asctim_s timbuf = dtime		;get the current ascii time
+	addw2	dtime,r7			;size of the name
+	movc3	dtime,time,(r3)			;save the time
+	addw2	#2,r7				;size of a crlf
+	movb	#cr,(r3)+			;save a cr
+	movb	#lf,(r3)+			;save a line feed
+	movzbw	(r6)+,r2			;size of 3rd part
+	addw2	r2,r7				;size of 3rd part
+	movc3	r2,(r6),(r3)			;save 3rd part
+	movzwl	r7,r7				;must be long
+	bsbw	snd				;send the buffer
+
+;	Set up the data pointers and clear the buffers.
+
+	clrb	f.mail				;mail cmd flag
+	clrb	f.rcpt				;rcpt cmd flag
+	clrb	f.lcl				;local mail flag
+	clrb	f.del				;delivery options flag
+	clrb	f.kwn				;known site flag
+	clrb	f.rly				;relay site flag
+	clrb	f.data				;data cmd flag
+	clrb	f.quit				;quit cmd flag
+	clrb	f.err				;processing error flag
+	moval	datbuf,datptr			;reset the data pointer
+	clrw	dtbfsz				;clear the data buffer counter
+	moval	fwdbuf,fwdptr			;reset the forward pointer
+	clrw	fwbfsz				;clear the fwd buffer counter
+	moval	lclbuf,lclptr			;reset the local mail pointer
+	clrw	lclsz				;clear the local mail buffer counter
+	moval	revbuf,revptr			;reset the reverse pointer
+	clrw	rebfsz				;clear the rev buffer counter
+	rsb
+
+.page
+;	Build a help message. Send it.  Then return to caller.
+;	R7 is the size of the buffer to send.
+;	Mbuf is the buffer address.
+
+rhelp::	moval	r214,r1				;point to start of help
+	movzbl	(r1)+,r7			;size of 1st part
+	movc3	r7,(r1),mbuf			;save 1st part
+	movzbw	(r1)+,r6			;size of 2nd part
+	addw2	r6,r7				;add it in
+	movc3	r6,(r1),(r3)			;save 2nd part
+	bsbw	snd				;send it
+	rsb
+
+
+.page
+;	If any parameter is passed send back a ok message.  If the parameter
+;	passed is not the host we are talking too.  Use the parameter as
+;	a nickname and let them know we know.
+;	nickname is an ascic buffer
+;	cmdsiz is the size of the parameter passed
+;	cmdptr is the pointer to the parameter passed
+
+rhelo::	tstb	cmdsiz				;any parameter passed
+	bneq	10$				;if not return an error
+	moval	r500m,r1			;missing parameter message
+	movzbl	(r1)+,r7			;size of the mesage
+	movc3	r7,(r1),mbuf			;save 1st part
+	jmp	50$				;send the message
+
+;	We have a parameter.
+
+10$:	movzbw	fhnasz,r1			;size of foreign host name
+	movl	cmdptr,r6			;retreive the cmd pointer
+	movzwl	cmdsiz,r7			;length of the parameter
+	bsbw	ucase				;uppercase the parameter
+	matchc	r1,fhna,cmdsiz,(r6)		;correct host name?
+	bneq	20$				;if not chide them
+	jmp	30$				;else say okey dokey
+
+;	Use the name they passed as a nickname.
+
+20$:	movb	#1,f.nic			;signal using a nic name
+
+;	Save the nickname.
+
+	moval	ncknam,r3			;point to the nickname buffer
+	movb	r7,(r3)+			;make is an ascic buffer
+	movc3	r7,(r6),(r3)			;save the nickname
+
+;	Build a message.
+
+	moval	badnam,r1			;nicname parameter message
+	movzbl	(r1)+,r7			;size of the mesage
+	movc3	r7,(r1),mbuf			;save 1st part
+	movl	r1,r6				;keep this pointer
+	movzbw	lhnasz,r2			;get the size
+	addw2	r2,r7				;size of hostname
+	movc3	r2,lhna,(r3)			;save our name
+	addw2	#1,r7				;one for the period
+	movb	#period,(r3)+			;a period
+	movzbw	lnnasz,r2			;get the size
+	addw2	r2,r7				;size of domain name
+	movc3	r2,lnna,(r3)			;save our domain
+	movl	r6,r1				;restore the pointer
+	movzbw	(r1)+,r6			;size of 2nd part
+	addw2	r6,r7				;add it in
+	movc3	r6,(r1),(r3)			;save 2nd part
+	movzbw	fhnasz,r2			;get the their size
+	addw2	r2,r7				;size of hostname
+	movc3	r2,fhna,(r3)			;save their name
+	addw2	#1,r7				;one for the period
+	movb	#period,(r3)+			;a period
+	movzbw	fnnasz,r2			;get the size
+	addw2	r2,r7				;size of domain name
+	movc3	r2,fnna,(r3)			;save our domain
+	addw2	#2,r7				;add the size of a crlf
+	movb	#cr,(r3)+			;then add the crlf
+	movb	#lf,(r3)+
+	jmp	50$				;go send the chiding msg
+
+;	The name they passed was their own.
+
+30$:	clrb	f.nic				;signal not using nicname
+	moval	oknam,r1			;good name parameter message
+	movzbl	(r1)+,r7			;size of the mesage
+	movc3	r7,(r1),mbuf			;save 1st part
+	movl	r1,r6				;keep this pointer
+	movzbw	lhnasz,r2			;get the size
+	addw2	r2,r7				;size of hostname
+	movc3	r2,lhna,(r3)			;save our name
+	addw2	#1,r7				;one for the period
+	movb	#period,(r3)+			;a period
+	movzbw	lnnasz,r2			;get the size
+	addw2	r2,r7				;size of domain name
+	movc3	r2,lnna,(r3)			;save our domain
+	movl	r6,r1				;restore the pointer
+	movzbw	(r1)+,r6			;size of 2nd part
+	addw2	r6,r7				;add it in
+	movc3	r6,(r1),(r3)			;save 2nd part
+	movzbw	fhnasz,r2			;get the their size
+	addw2	r2,r7				;size of hostname
+	movc3	r2,fhna,(r3)			;save their name
+	addw2	#1,r7				;one for the period
+	movb	#period,(r3)+			;a period
+	movzbw	fnnasz,r2			;get the size
+	addw2	r2,r7				;size of domain name
+	movc3	r2,fnna,(r3)			;save our domain
+	addw2	#2,r7				;add the size of a crlf
+	movb	#cr,(r3)+			;then add the crlf
+	movb	#lf,(r3)+
+50$:	bsbw	snd				;send it
+	movb	#1,f.helo			;set the hello flag
+	rsb
+		
+.page
+;	This is the second command in mail transaction.  This command
+;	must succeed the mail from command.  However, this command
+;	may be repeated.  The argument to this command is a forward
+;	path.  
+;	cmdsiz is the size of the parameter passed
+;	cmdptr is the pointer to the parameter passed
+
+;	Make sure we have a reverse path first (i.e. mail from cmd).
+
+rrcpt::	tstb	f.mail				;have gotten a mail from cmd?
+	bneq	12$				;if not return an error
+	moval	r503m,r1			;get the mail cmd first error
+	jmp	200$				;go send the msg
+
+;	Check for a parameter.
+
+12$:	tstb	cmdsiz				;any parameter passed
+	bneq	15$				;if not return an error
+	moval	r500m,r1			;missing parameter message
+	jmp	200$				;go send the msg
+
+;	Parse the parameter. Uppercase the first part of the argument, but
+;	do not uppercase the forward path.
+
+15$:	movl	cmdptr,r6			;get the pointer
+	matchc	#1,#60,cmdsiz,(r6)		;find the "<"
+	subl3	r6,r3,r7			;get the length
+	bsbw	ucase				;uppercase the 1st part of par
+	moval	tpar,r1				;point to the parameter
+	movzbw	(r1)+,r2			;get its size
+	matchc	r2,(r1),cmdsiz,(r6)		;par must start with "to:"
+	beql	20$				;else bad parameter
+	moval	r501t,r1			;to parameter error
+	jmp	200$				;go send the msg
+20$:	cmpb	(r3)+,#60			;is next character "<"
+	beql	25$				;if it is continue
+	moval	r501t,r1			;to parameter error
+	jmp	200$				;go send the msg
+25$:	movl	r3,r9				;save the start of the fwd list
+	matchc	#1,#62,cmdsiz,(r6)		;do we end with a ">"
+	beql	30$				;if not parameter syntax error
+	moval	r501t,r1			;to parameter error
+	jmp	200$				;go send the msg
+30$:	subl3	r9,r3,r6			;size of the this forward path
+	decw	r6				;don't cnt the ">" but cnt the ascic
+	movzwl	r6,r7				;r7 size of path
+	movl	r9,r6				;r9 pointer to path
+
+;	We have a forward path.  Check out validty of the address.
+;	If the address is valid store it in the appropiate list.
+	
+	bsbw	chkadd				;chkout and store valid address
+
+;	Tell what we did.
+
+200$:	movzbl	(r1)+,r7			;get msg siz
+	movc3	r7,(r1),mbuf			;save msg
+	bsbw	snd				;send it
+	rsb
+
+
+.page
+;	Make sure we have received a valid rcpt command.  If so build 
+;	a ready to receive data message.  Send it.  Then do reads until
+;	a <crlf> . <crlf> is received or we have gone over the maximum
+;	allowable data size.
+
+rdata::	tstb	f.rcpt				;have we receive a valid rcpt
+	bneq	10$				;is so send the rdy to receive msg
+	moval	r503r,r1			;point to rcpt error msg
+	movzbl	(r1)+,r7			;get the size of the msg
+	movc3	r7,(r1),mbuf			;save the msg
+	bsbw	snd				;send it
+	rsb					
+
+;	Build the ready to receive data msg and send it.
+
+10$:	moval	r254,r1				;point to the start of rdy msg
+	movzbl	(r1)+,r7			;get the size of the msg
+	movc3	r7,(r1),mbuf			;save the msg
+	bsbw	snd				;send it
+
+;	Loop: reading a buffer of data.  End the loop when a <crlf>.<crlf>
+;	has been received (success) or when we have gone over the maximum
+;	size allowed for data (error).  On a successful exit send the mail
+;	out and get the next command.
+
+	moval	datbuf,r8			;point to the start of the buffer
+	clrw	dtbfsz				;initialize the size of the buffer
+20$:	bsbw	read				;read some data from the tcp/ip cn
+	cmpl	r0,#rms$_eof			;check for an unexpected eof
+	bneq	25$				;exit if hit
+	rsb
+25$:	addw2	piolen,dtbfsz			;store how much we read
+	addw2	piolen,r8			;bump the buffer pointer
+	cmpw	#maxdat,dtbfsz			;have we read more than the max?
+	bgequ	30$				;if so give an error
+	moval	r552,r1				;point to over storage error
+	movzbl	(r1)+,r7			;get the size of the msg
+	movc3	r7,(r1),mbuf			;save the msg
+	bsbw	snd				;send it
+	rsb					;and return
+30$:	matchc	#termsz,term,dtbfsz,datbuf	;must scan entire buffer for end
+	beql	40$				;if found we have all of the data
+	jmp	20$				;not found get more data
+
+;	We now have all of the data.  Write it out to a file for now.
+
+40$:	subw2	#termsz,dtbfsz			;don't include the term
+	clrb	f.user				;signal a server
+	bsbw	wfile				;write to a mailq file
+	clrb	f.mail				;clear the mail flag
+	moval	r250d,r1			;mail sent "success"
+	movzbl	(r1)+,r7			;get msg siz
+	movc3	r7,(r1),mbuf			;save msg
+	bsbw	snd				;send it
+	movb	#1,f.data			;set the data cmd flag
+	rsb
+
+.page
+;	Build an ok message.  Send it.  Return to caller.
+;	R7 is the size of the buffer to send.
+;	Mbuf is the buffer address.
+
+rnoop::	moval	r250n,r1			;point to start of help
+	movzbl	(r1)+,r7			;size of 1st part
+	movc3	r7,(r1),mbuf			;save 1st part
+	bsbw	snd				;send it
+	rsb
+
+
+.page
+;	Build an error message.  Send it.  Return to caller.
+;	R7 is the size of the buffer to send.
+;	Mbuf is the buffer address.
+
+unsup::	moval	r502,r1				;point to start of message
+	movzbl	(r1)+,r7			;size of 1st part
+	movc3	r7,(r1),mbuf			;save 1st part
+	bsbw	snd				;send it
+	rsb
+
+
+.page
+;	This is the first command in mail transaction.  Therefore, clear
+;	the reverse path, the forward path, and the data buffer.  The
+;	argument to this command is the reverse path.
+;	cmdsiz is the size of the parameter passed
+;	cmdptr is the pointer to the parameter passed
+	
+;	Make sure a mail transaction is not already in progress.
+
+rmail::	tstb	f.mail				;is mail already in progress?
+	bneq	mail.1				;if so return an error
+	movb	#1,f.del			;signal mail delivery
+	jmp	mail.2				;continue
+rsend::	tstb	f.mail				;is mail already in progress?
+	bneq	mail.1				;if so return an error
+	movb	#2,f.del			;signal send delivery
+	jmp	mail.2				;continue
+rsoml::	tstb	f.mail				;is mail already in progress?
+	bneq	mail.1				;if so return an error
+	movb	#3,f.del			;signal send or mail delivery
+	jmp	mail.2				;continue
+rsaml::	tstb	f.mail				;is mail already in progress?
+	bneq	mail.1				;if so return an error
+	movb	#4,f.del			;signal send and mail delivery
+	jmp	mail.2				;continue
+
+;	Mail in progress error
+
+mail.1:	moval	r503p,r1			;get the mail in progress error
+	movzbl	(r1)+,r7			;get msg siz
+	movc3	r7,(r1),mbuf			;save msg
+	bsbw	snd				;send it
+	rsb
+
+;	Mail is not in progress.  Make sure we say helo first.
+
+mail.2:	tstb	f.helo				;have we said hello yet?
+	bneq	12$				;if not return an error
+	moval	r503h,r1			;get the must say hello error
+	jmp	60$				;go send the msg
+
+;	Check for a parameter.
+
+12$:	tstb	cmdsiz				;any parameter passed
+	bneq	15$				;if not return an error
+	moval	r500m,r1			;missing parameter message
+	jmp	60$				;go send the msg
+
+;	Initialize pointers and buffers.
+
+15$:	clrw	dtbfsz				;zero the data buffer size
+	clrw	lclsz				;zero the local mail buffer size
+	clrw	fwbfsz				;zero the forward buffer size
+	clrw	rebfsz				;zero the reverse buffer size
+	movc5	#0,#0,#0,#maxrcp*maxpth,fwdbuf	;zero the forward buffer
+	movc5	#0,#0,#0,#maxrcp*maxpth,rlybuf	;zero the known buffer
+	movc5	#0,#0,#0,#maxrcp*maxpth,kwnbuf	;zero the relay buffer
+	movc5	#0,#0,#0,#80,mbxbuf		;zero the mailbox buffer
+	moval	fwdbuf,fwdptr			;init the forward pointer	
+	moval	lclbuf,lclptr			;init the local mail pointer	
+	moval	revbuf,revptr			;init the reverse pointer	
+
+;	Parse the parameter. Uppercase the first part of the argument, but
+;	do not uppercase the reverse path.
+
+	movl	cmdptr,r6			;get the pointer
+	matchc	#1,#60,cmdsiz,(r6)		;find the "<"
+	subl3	r6,r3,r7			;get the length
+	bsbw	ucase				;uppercase the 1st part of par
+	moval	fpar,r1				;point to the parameter
+	movzbw	(r1)+,r2			;get its size
+	matchc	r2,(r1),cmdsiz,(r6)		;par must start with "from:"
+	beql	20$				;else bad parameter
+	moval	r501f,r1			;from parameter error
+	jmp	60$				;go send the msg
+20$:	cmpb	(r3)+,#60			;is next character "<"
+	beql	25$				;if it is continue
+	moval	r501f,r1			;from parameter error
+	jmp	60$				;go send the msg
+25$:	movl	r3,r9				;save the start of the rev list
+	matchc	#1,#62,cmdsiz,(r6)		;do we end with a ">"
+	beql	30$				;if not parameter syntax error
+	moval	r501f,r1			;from parameter error
+	jmp	60$				;go send the msg
+30$:	subl3	r9,r3,r2			;size of the reverse path
+	subw3	#1,r2,rebfsz			;don't cnt the ">" but cnt the byte for the ascic
+	moval	revbuf,r3			;point to the reverse path
+	movb	rebfsz,(r3)+			;make it an ascic string
+	movc3	rebfsz,(r9),(r3)		;store the reverse path
+
+;	We have the reverse path.  Set the flag and send a success message.
+
+	movb	#1,f.mail			;set the mail flag
+	moval	r250m,r1			;mail cmd success
+60$:	movzbl	(r1)+,r7			;get msg siz
+	movc3	r7,(r1),mbuf			;save msg
+	bsbw	snd				;send it
+	rsb
+
+
+.page
+;	Reset the data pointers and clear the buffers and flags.
+;	Send a message saying we did it.
+
+rrset::	clrb	f.mail				;mail cmd flag
+	clrb	f.rcpt				;rcpt cmd flag
+	clrb	f.lcl				;local mail flag
+	clrb	f.del				;delivery options flag
+	clrb	f.kwn				;known site flag
+	clrb	f.rly				;relay site flag
+	clrb	f.data				;data cmd flag
+	clrb	f.quit				;quit cmd flag
+	clrb	f.err				;processing error flag
+	movc5	#0,#0,#0,#maxrcp*maxpth,fwdbuf	;zero the forward buffer
+	movc5	#0,#0,#0,#maxrcp*maxpth,rlybuf	;zero the known buffer
+	movc5	#0,#0,#0,#maxrcp*maxpth,kwnbuf	;zero the relay buffer
+	movc5	#0,#0,#0,#80,mbxbuf		;zero the mailbox buffer
+	moval	datbuf,datptr			;reset the data pointer
+	clrw	dtbfsz				;clear the data buffer counter
+	moval	fwdbuf,fwdptr			;reset the forward pointer
+	clrw	fwbfsz				;clear the fwd buffer counter
+	moval	revbuf,revptr			;reset the reverse pointer
+	clrw	rebfsz				;clear the rev buffer counter
+	moval	r250s,r1			;point to start of help
+	movzbl	(r1)+,r7			;size of 1st part
+	movc3	r7,(r1),mbuf			;save 1st part
+	bsbw	snd				;send it
+	rsb
+
+
+.page
+;	Build a close message. Send it.  Close the channel .  Then 
+;	return to caller.
+;	R7 is the size of the buffer to send.
+;	Mbuf is the buffer address.
+
+rquit::	moval	r221,r1				;point to start of message
+	movzbl	(r1)+,r7			;size of 1st part
+	movc3	r7,(r1),mbuf			;save 1st part
+	movl	r1,r6				;keep this pointer
+	movzbw	lhnasz,r2			;get the size
+	addw2	r2,r7				;size of hostname
+	movc3	r2,lhna,(r3)			;save our name
+	addw2	#1,r7				;one for the period
+	movb	#period,(r3)+			;a period
+	movzbw	lnnasz,r2			;get the size
+	addw2	r2,r7				;size of domain name
+	movc3	r2,lnna,(r3)			;save our domain
+	movl	r6,r1				;restore the pointer
+	movzbw	(r1)+,r6			;size of 2nd part
+	addw2	r6,r7				;add it in
+	movc3	r6,(r1),(r3)			;save 2nd part
+	bsbw	snd				;send it
+	bsbw	close				;close the tcp/ip connection
+	movb	#1,f.quit			;set the quit cmd flag
+	tstb	f.data				;dont set quit unless we sent data
+	bneq	10$				
+	movb	#1,f.err			;set the error flag
+10$:	rsb					;return
+
+
+.subtitle error routines
+;	Build an error message.  Send it.  Return to caller.
+;	R1 is a pointer to the message	
+;	R7 is the size of the buffer to send.
+;	Mbuf is the buffer address.
+
+smtperr::movzbl	(r1)+,r7			;size of 1st part
+	movc3	r7,(r1),mbuf			;save 1st part
+	bsbw	snd				;send it
+	movb	#1,f.err			;set error flag
+	rsb
+
+.end
+

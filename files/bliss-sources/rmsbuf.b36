@@ -1,0 +1,441 @@
+%TITLE 'B U F F E R   -- file buffer routines'
+!<BLF/REQUIRE 'RMSBLF.REQ'>
+MODULE buffer (IDENT = '2.0'
+		) =
+BEGIN
+!
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1984, 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+
+!++
+! FACILITY:	RMS
+!
+! ABSTRACT:
+!
+!	BUFFER contains all routines which process
+!	file buffers within RMS-20.
+!
+! ENVIRONMENT:	Deep within RMS, interrupts deferred until JSYS return.
+!
+! AUTHOR: Ron Lusk , CREATION DATE: 15-Mar-83
+!
+! MODIFIED BY:
+!
+!	, : VERSION
+! 01	-
+!--
+
+!
+! TABLE OF CONTENTS
+!
+!
+!	GETBUF	-- allocate a file buffer
+!	PUTBUF	-- Deallocate a file buffer
+!
+!
+! INCLUDE FILES:
+!
+
+REQUIRE 'rmsreq';
+
+!
+! MACROS:
+!
+!<BLF/MACRO>
+
+MACRO
+    !
+    !	SETLRU (buffer) sets the buffer's Least Recently
+    !	Used count to the current buffer access count.
+    !	This count is incremented each time a buffer is
+    !	allocated and is never decremented, thus giving
+    !	a "timestamp" of sorts for determining age of
+    !	a given buffer.
+    !
+    setlru (a) =
+	a [0, wrd] = .bufacc %;
+
+!
+! EQUATED SYMBOLS:
+!
+
+GLOBAL BIND
+    bufrv = 2^24 + 0^18 + 400;			! Current edit level
+
+!
+! OWN STORAGE:
+!
+!   None.
+!
+! EXTERNAL REFERENCES:
+!
+!   None.
+!
+%SBTTL 'GETBUF -- allocate a file buffer'
+
+GLOBAL ROUTINE getbuf (fpage, bsize, contigflag, p_bpage, p_incore, p_bfdadr) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	GETBUF allocates a buffer for a specified number of
+!	file pages beginning with the specified file page.
+!	There are four cases which may occur (listed here in
+!	decreasing priority):
+!
+!	1)  Specified file page is still mapped into our
+!	    process;
+!	2)  A buffer is available (use one with smallest LRU
+!	    count, which is the least recently used, except
+!	    that empty buffers will be used before the file
+!	    pages in unused buffers are flushed);
+!	3)  A buffer must be allocated from free storage;
+!	4)  No buffer is available (give failure return).
+!
+!
+! FORMAL PARAMETERS
+!
+!	FPAGE	    -   File page number
+!	BSIZE	    -   Bucket/buffer size in pages
+!	CONTIGFLAG  -	Buffers should be allocated
+!			contiguously (see note below)
+!	BPAGE	    -	Buffer page number (returned to
+!			caller)
+!	INCORE	    -	if page is in core (if false, caller
+!			must map it) (returned to caller)
+!	BFDADR	    -	adress of buffer descriptor (if 0,
+!			then called by Free Storage Manager
+!			(returned to caller)
+!
+! IMPLICIT INPUTS
+!
+!	?
+!
+! COMPLETION CODES:
+!
+!	TRUE	    -	Got buffer, (BPAGE, INCORE, and
+!			BFDADR will be set)
+!	FALSE	    -	could not get buffer, no free
+!			storage
+!
+! SIDE EFFECTS:
+!
+!	?
+!
+! NOTES:
+!
+!	1)  If the page was not found in any of the core
+!	    buffers, then INCORE will be false and it is
+!	    then the caller's responsibility to map the file
+!	    page into the buffer returned by this routine.
+!
+!	2)  If CONTIGFLAG is non-zero (not TRUE, just merely
+!	    non-zero), then it means that if we don't find
+!	    the page in our buffers, we should completely
+!	    fill up our buffer pool by mapping all pages
+!	    that will fit.  Currently, this facility is used
+!	    only for Sequential/Relative files which use
+!	    Read-ahead.
+!--
+
+    BEGIN
+
+    BIND
+	bpage = .p_bpage,
+	incore = .p_incore,
+	bfdadr = .p_bfdadr : REF BLOCK;
+
+    EXTERNAL
+	bfound,					! # buffers found in chain
+	bfault,					! # buffers not found in chain
+	bfcore;					! # buffers allocated
+
+    						!   from free core
+
+    LOCAL
+	usecount,				! # Of users of this buffer
+	bfdptr : REF BLOCK,
+	lruptr : REF BLOCK,			! Ptr to LRU word for BFDPTR
+	lrumin;
+
+    TRACE ('GETBUF');
+
+!+
+!   Increment counter of calls to GETBUF
+!   (this is used to fill in the LRU count
+!   for a buffer).
+!-
+
+    bufacc = .bufacc + 1;			! Incr count of buffer accesses
+
+%IF dbug
+%THEN
+    !
+    !   Check our input
+    !
+
+    IF .contigflag AND idxfile THEN rmsbug (msgflags);
+
+%FI
+
+!+
+!   Search for a buffer to return to caller
+!-
+
+    bfdadr = 0;					! Reset ptr to available buffer
+    lrumin = plusinfinity;			! Preset smallest LRU
+
+    INCR j FROM bfdoffset			!
+	TO bfdoffset + .rst [rstbfdcount] - 1	!
+	BY 1					!
+	DO
+	BEGIN
+	bfdptr = .j;				! Setup ptr to this
+						!   buffer descriptor
+	lruptr = .j + .rst [rstbfdcount];	! Point at its LRU word
+
+!+
+!   1.	Check if the specified file
+!	page is in this buffer.
+!-
+
+	IF .bfdptr [bfdfpage] EQL .fpage	!
+	    AND .bfdptr [bfdbktsiz] NEQ 0	!
+	THEN
+	    BEGIN				! Return file page
+	    					!   already in core
+	    setlru (lruptr);			! Set LRU count
+	    bfdptr [bfdusecount] = .bfdptr [bfdusecount] + 1;	! Incr users
+	    bpage = .bfdptr [bfdbpage];		! Return buffer page no.
+	    incore = true;			! Return "file page is in core"
+	    bfdadr = .bfdptr;			! Pointer to buffer descriptor
+	    bfound = .bfound + 1;		! Bump count of found buffs
+	    RETURN true;			! Give good return to caller
+	    END;
+
+!+
+!   2. Check if this buffer is empty or
+!      available with has smaller LRU count.
+!-
+
+	IF .bfdptr [bfdbktsiz] EQL 0 OR 	!
+	    (.bfdptr [bfdusecount] EQL 0 AND 	!
+	    .lruptr [0, wrd] LSS .lrumin)	!
+	THEN
+	    BEGIN				! Save pointer to LRU buffer
+	    bfdadr = .bfdptr;			! Tentatively set LRU buffer
+
+	    IF .bfdptr [bfdbktsiz] EQL 0 THEN EXITLOOP;	! Use 1st empty buffer
+
+	    lrumin = .lruptr [0, wrd]		! Reset lowest LRU seen
+	    END
+
+	END;					! Search iteration
+
+!+
+!   If contiguous allocation is needed,
+!   assume we found the first buffer.
+!-
+
+    IF .contigflag NEQ false			!
+    THEN
+	bfdadr = bfdoffset;
+
+!+
+!   Check if we found a buffer to use (empty or LRU)
+!-
+
+    IF (.bfdadr NEQ 0)
+    THEN
+	BEGIN					! Return this buffer to caller
+	usecount = 1;				! this buffer is busy
+	bfdptr = .bfdadr;			! Set up moving pointer
+	bpage = .bfdptr [bfdbpage];		! Return buffer page
+						!   number to caller
+	incore = false;				! Return "page must be
+						!   mapped from file" to caller
+	bfault = .bfault + 1;			! Bump # of faults
+
+!+
+!   Do this loop once for each buffer if
+!   contiguous allocation, only once otherwise.
+!-
+
+	INCR j FROM 1 TO .rst [rstbfdcount] DO
+	    BEGIN
+	    lruptr = .bfdptr + .rst [rstbfdcount];	! Point at chosen LRU
+
+	    IF bfdupd (bfdptr)			! Do old contents
+						!   need putting out?
+	    THEN
+		pagout (.fst [fstjfn], 		! JFN
+		    .bfdptr [bfdfpage], 	! File page number
+		    .bfdptr [bfdbpage], 	! Page number of buffer
+		    .bfdptr [bfdbktsiz]);	! Number of pages to write
+
+	    clearbfdupd (bfdptr);		! Reset flag
+	    setlru (lruptr);			! Set LRU count for buffer
+	    bfdptr [bfdusecount] = .usecount;	! Set initial use count
+	    					!   for buffer
+	    bfdptr [bfdfpage] = .fpage;		! Set file page number
+	    					!   that is in buffer
+	    bfdptr [bfdbktsiz] = .bsize;	! For demand flush
+	    					!   in later GETBUF
+
+%IF dbug
+%THEN
+	    begindebug (dbio);
+	    printvalue ('	PAGE FAULT FOR PAGE:  ', fpage);
+	    enddebug;
+%FI
+
+!+
+!   We can exit in the normal case.
+!-
+
+	    IF .contigflag EQL false THEN RETURN true;
+
+	    bfdptr = .bfdptr + 1;		! Bump pointer
+	    lruptr = .lruptr + 1;		! Bump pointer
+	    fpage = .fpage + .bsize;		! And page number
+	    usecount = 0			! Other buffers are free
+	    END;
+
+!+
+!   We have set up all buffer descriptors
+!   for contiguous allocation.
+!-
+
+	RETURN true
+	END;
+
+!+
+!   Didn't find buffer. ask free storage manager for buffer.
+!-
+
+    IF (bpage = gpage (.bsize			! Page count
+	)) NEQ false
+    THEN
+	BEGIN					! Got buffer from FSM
+	incore = false;				! Return "Page Must
+						!   Be Mapped" to caller
+	bfcore = .bfcore + 1;			! Bump count of free core buffs
+	RETURN true				! Successful return
+	END
+    ELSE
+	returnstatus (er$dme)			! Return "Can't get buffer"
+    END;					! End of GETBUF
+
+%SBTTL 'PUTBUF -- Deallocate a file buffer'
+
+GLOBAL ROUTINE putbuf (bsize, bpage, incore, bfdadr : REF BLOCK) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	PUTBUF deallocates a buffer.  If the buffer was
+!	allocated from free storage, then the Free Storage
+!	Manager is called to release the pages composing the
+!	buffer.  Otherwise, the buffer is "returned" to the
+!	buffer pool (note that if there is more than one
+!	user of the buffer then the buffer becomes free only
+!	after the last user calls this routine.
+!
+! FORMAL PARAMETERS
+!
+!	BSIZE	    -	bucket/buffer size in pages
+!	BPAGE	    -	buffer page number
+!	INCORE	    -	if page is in core (if FALSE, it was
+!			pmapped to file; FALSE also means
+!			that the buffer is now empty)
+!	BFDADR	    -	address of buffer descriptor
+!
+! IMPLICIT INPUTS
+!
+!	NONE.
+!
+! COMPLETION CODES:
+!
+!	TRUE	    -	always.
+!
+! SIDE EFFECTS:
+!
+!	?
+!
+! NOTES:
+!	1)  If the address of the buffer descriptor (BFDADR)
+!	    in the bucket descriptor is null, this indicates
+!	    that the buffer was not allocated from the
+!	    buffer pool in the Record Status Table.
+!	    Instead, it was allocated from the Free Storage
+!	    Manager because all other buffers were already
+!	    in use (this situation should not happen
+!	    currently since a minimum of 3 buffers is
+!	    allocated when a record stream is initiated).
+!--
+
+    BEGIN
+    TRACE ('PUTBUF');
+
+!+
+!   If buffer came from free storage, return it to the FSM.
+!-
+
+    IF (.bfdadr EQL 0)
+    THEN 					! Return buffer to FSM
+	BEGIN
+	ppage (.bpage, 				! Page number
+	    .bsize, 				! Count
+	    true);				! Kill Flag
+	RETURN true
+	END;
+
+!+
+!   Decrement use count for buffer.
+!-
+
+    BEGIN
+
+    REGISTER
+	tempac;
+
+    tempac = .bfdadr [bfdusecount];
+
+    IF .tempac EQL 0 THEN rmsbug (msgbna);
+
+    bfdadr [bfdusecount] = .tempac - 1;		! Decrement use count
+    END;
+
+!+
+!   If buffer is now empty, and if there are
+!   no more users of the buffer, then make the
+!   Buffer Descriptor indicate that condition.
+!-
+
+    IF (.incore EQL false)			!
+	AND (.bfdadr [bfdusecount] EQL 0)	!
+    THEN
+	bfdadr [bfdbktsiz] = 0;			! Indicate no data in buffer
+
+    RETURN true;				! Give "good" return to caller
+    END;					! End of PUTBUF
+
+END						! End of Module BUFFER
+
+ELUDOM
+    

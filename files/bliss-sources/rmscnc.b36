@@ -1,0 +1,524 @@
+
+%TITLE 'C O N E C T   -- $CONNECT, $DISCONNECT routines'
+!<BLF/REQUIRE 'RMSBLF.REQ'>
+MODULE conect (IDENT = '3.0(572)'
+		) =
+BEGIN
+!
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1984, 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+
+!++
+! FACILITY:	RMS
+!
+! ABSTRACT:
+!
+!	CONECT contains all routinew which process the
+!	$CONNECT and $DISCONNECT macros in RMS-20.
+!
+! ENVIRONMENT:	User mode, interrupts deferred until JSYS return.
+!
+! AUTHOR: Ron Lusk , CREATION DATE: 15-Mar-83
+!
+! MODIFIED BY:
+!
+!	Ron Lusk, 9-May-83 : VERSION 2
+! 401	-   $CONNECT - don't worry about multiple RABs when
+!	    FB$SMU is set in FAC field (RMS edit 404).
+!       Andrew Nourse - May 84 : Version 3
+! 501	- Put in code for remote $Connect and $Disconnect
+! 502   - Change over to new standard names
+! 524   - Call dynamic library for funny files
+! 565	- (RL) Return STV from FFF call
+! 572   - (DR) Set BSZ and TYP in FST (in case changed since open)
+!--
+
+!
+! TABLE OF CONTENTS
+!
+!
+!	$CONNECT	- processor for $CONNECT macro
+!	$DISCONNECT	- processor for $DISCONNECT macro
+!	DCNTRAB		- disconnect a single RAB stream
+!
+!
+! INCLUDE FILES:
+!
+
+REQUIRE 'rmsreq';
+
+!
+! MACROS:
+!
+!   None.
+!
+! EQUATED SYMBOLS:
+!
+
+GLOBAL BIND
+    cnctv = 3^24 + 0^18 + 560;			! Module edit number
+
+!
+! OWN STORAGE:
+!
+!   None.
+!
+! EXTERNAL REFERENCES:
+!
+!
+EXTERNAL ROUTINE
+    F$Connect,
+    F$Disconnect,
+    CncM11: NOVALUE,
+    DscM11: NOVALUE;
+
+%SBTTL '$CONNECT -- establish a record stream'
+
+GLOBAL ROUTINE $connect (rablock, errorreturn) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine processes the $CONNECT macro.
+!
+! FORMAL PARAMETERS
+!
+!	RABLOCK	    -	User's Record Access Block
+!	    FAB	    -	Associated File Access Block
+!	    KRF	    -	Key of Reference (Indexed files
+!			only)
+!	    MBF	    -	Multi-buffer count
+!	    RAC	    -	Record access
+!	    ROP	    -	Record options
+!		EOF -	$CONNECT to End-of-file
+!	    STS	    -	Status code (returned)
+!	    ISI	    -	Internal stream identifier
+!			(address of Record Status Table)
+!
+!	ERRORRETURN -	Address of user's error routine
+!
+! IMPLICIT INPUTS
+!
+!	?
+!
+! ROUTINE VALUE:
+!
+!	None, yet not NOVALUE.
+!
+! SIDE EFFECTS:
+!
+!	?
+!
+!--
+
+    BEGIN
+!+
+!   **** Flow of $CONNECT routine ****
+!
+!   1. Get FAB address from RAB and check it;
+!   2. Check for errors
+!   3. Set up RST
+!   4. If remote, call Dap$Connect to do the connect on the remote system
+!   5. Return Stream-ID to user
+!-
+
+    LOCAL
+	fileid;
+
+    rmsentry ($connect);
+!+
+!   Fetch the address of the user's RAB
+!   and error address.
+!-
+    rab = .rablock;				! Get address of RAB
+    erradr = .errorreturn;			! And user error address
+    errorblock (rab);				! Errors go to RAB
+!+
+!   Check for valid RAB code and size.
+!-
+
+    IF .rab [blocktype] NEQ rabcode THEN usererror (er$rab);
+
+    IF .rab [blocklength] NEQ v1rabsize THEN usererror (er$bln);
+
+!+
+!   Fetch file-id from RAB.
+!-
+    fab = .rab [rabfab, 0];			! Get FAB address
+
+    IF .fab EQL 0 THEN usererror (er$ifi);	! Bad FAB pointer
+
+    fab = .fab OR .blksec;			! Get address in section
+    fst = .fab [fabifi, 0];			! Convert IFI to FST address
+
+    IF .fst EQL 0				! File open?
+    THEN
+	usererror (er$ifi);			! No
+
+    IF (.fst [blocktype] NEQ fstcode)		! Is FST a real FST?
+    THEN
+	usererror (er$ifi);
+
+
+!+
+! In case user wants to change the bytesize, move it to the FST from the FAB.
+! The remote system will not see this change!!!
+!-
+
+    Fst[Fst$h_Bsz] = .Fab[Fab$v_Bsz];                                !m572
+
+!+
+! In case the user wants to change the TYPE declaration of the file,
+! move it to the FST from the TYP block
+! The remote system will not see this change!!!
+!-
+        BEGIN                                                             !m577
+        BIND Nclass=UClass( .fab );
+
+        IF NClass NEQ 0
+        THEN Fst[Fst$h_File_Class] = NClass
+        ELSE IF .Fst[Fst$h_File_Class] EQL 0
+             THEN Fst[Fst$h_File_Class] = Typ$k_Ascii
+        END;
+
+!+
+!   Check now to be sure that the RB$EOF option
+!   bit is being used correctly. This option is
+!   valid only for Sequential files (including ASCII/LSA).
+!-
+
+    IF (appendoption NEQ 0)			!
+    THEN 					!
+
+	IF (fileorg GTR orgseq)			!
+	THEN 					! There is an error
+	    usererror (er$pef);			!
+
+!+
+!   Note that there is no check here for a zero ISI
+!   field in the user's RAB.  Although this may seem
+!   like a logical thing to check for, it would mean
+!   that RMS-20 would have to clear the ISI field
+!   whenever the RAB was disconnected.  This is fine
+!   for a $DISCONNECT macro, but it couldn't be done
+!   on a $CLOSE. Therefore, the ISI field is
+!   overwritten if non-zero on a $CONNECT.
+!-
+
+!+
+!   Check for remoteness,
+!   If file is remote, do a remote connect with DAP
+!-
+    IF .fst [fst$v_remote]						!a501 
+    THEN                                                                !a501 
+        BEGIN                                                           !a501 
+        !+
+        !   Allocate core for the RST.
+        !-
+        IF (rst = gmem (rstsize)) EQL false		     ! Get core !a501
+        THEN                                                            !a501 
+            returnstatus (er$dme);                                      !a501
+        rst[rst$h_bid]=rst$k_bid;                                       !a501 
+        rst[rst$h_bln]=rst$k_bln;                                       !a501
+        rst[rst$v_remote] = 1;                                          !a501
+        rst[rst$a_fst]=.fst;						!a501
+        Dap$Connect ( .rab, .erradr );                                  !M557
+        END                                                             !a501
+    ELSE                                                                !a501
+        BEGIN
+        !+
+        !   If we are connecting multiple streams, then we
+        !   must insure that write access is not being used
+        !   if the file is only for exclusive access. This
+        !   is because multiple streams must be interlocked
+        !   from each other just as different processes are
+        !   also interlocked.  Thus, if we are not locking
+        !   (i.e., FAC=SHR=FB$GET or SHR=FB$NIL), then we
+        !   must check that we are only reading the file.
+        !-
+
+        IF (.fst [flink] NEQ .fst) AND 		   ! If stream active	!M404
+            ((.fab [fabfac, 0] AND fb$smu) EQL 0)  !  and not doing SMU !A404
+        THEN
+            BEGIN
+            IF (( NOT locking) AND iomode) OR 	!  Read/Write without locking
+                (asciifile) OR (mta)            !  or non-rms file or tape
+            THEN
+                usererror (er$ccr)		! Only one stream is allowed
+            END;
+
+        !+
+        !   Set up a record status table.
+        !-
+
+        setrst ();
+        END;  ! Local file setup
+
+!+
+!   Place the address of the user's buffer into
+!   the "record-buffer address" field so that the
+!   first record insertion will operate correctly.
+!-
+    rab [rabrbf, 0] = .rab [rabubf, 0];
+    rab [rabisi, 0] = .rst;			! Return stream-id
+    setsuccess;					! We were successful
+
+!+
+!   Do file-type specific processing, if any
+!-
+    IF .Fst[Fst$h_File_Class] LSS 0                                     !a524vv
+    THEN
+        BEGIN
+        F$Connect( .Rab );
+
+	usrstv = .rab [rab$h_stv];		! Return STV value	!A565
+        IF NOT $Rms_Status_Ok( .Rab )
+        THEN Usererror( .Rab[Rab$h_Sts] );
+        END                                                             !a524^^
+    ELSE
+        IF .Fst[Fst$h_File_Class] EQL Typ$k_Macy11      ! Check for MACY11
+        THEN
+            CncM11();                                                   !a567
+
+    usrret ()					! Return to user
+    END;					! End of $CONNECT
+
+%SBTTL '$DISCONNECT -- end a record stream'
+
+GLOBAL ROUTINE $disconnect (rablock, errorreturn) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	$DISCONNECT processes the $DISCONNECT macro.
+!
+! FORMAL PARAMETERS
+!
+!	RABLOCK	    -	Address of user's Record Access Block
+!	    ISI	    -	Internal stream identifier (the address
+!			of the related Record Status Table)
+!	    STS	    -	Status code returned by routine
+!
+!	ERRORRETURN -	Address of user's error routine
+!
+! IMPLICIT INPUTS
+!
+!	?
+!
+! ROUTINE VALUE:
+!
+!	None, yet not NOVALUE.
+!
+! SIDE EFFECTS:
+!
+!	?
+!
+!--
+
+    BEGIN
+    rmsentry ($disconnect);
+    rab = .rablock;				! Fetch RAB address
+    erradr = .errorreturn;			! And user error address
+    errorblock (rab);				! Status goes to RAB
+!+
+!   Perform normal set-up operations just like any
+!   other record operation. However, pass RSETUP a
+!   value of TRUE so that the FAC access check
+!   will always succeed.
+!-
+    rsetup (true);				! Set up RST, FST, etc.
+    !
+    !   Disconnect a single record stream.
+    !
+    IF .fst [fst$v_remote]              				!a501 
+    THEN                                                                !a501 
+        BEGIN
+        LOCAL rstlen;
+
+        !+
+        !   Disconnect on the remote system
+        !-
+        dap$disconnect ( .rab, .erradr );				!a501 
+
+        !+
+        !   Remove RST from FST chain.
+        !-
+        delink (rst);				! Unlink RST
+        !+
+        !   Release core used by RST
+        !-
+        rstlen = .rst [blocklength];
+        pmem (.rstlen,                  ! Block size
+               rst);                    ! Block pointer
+        END
+    ELSE                                                                !a501 
+        dcntrab ();                             ! Process the RAB
+    usrret ()					! Return to user
+    END;					! End of $DISCONNECT
+
+%SBTTL 'DCNTRAB -- disconnect a record stream'
+
+GLOBAL ROUTINE dcntrab =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	DCNTRAB $DISCONNECTs a single RAB from a file.  This
+!	routine is called once by the $DISCONNECT processor
+!	and possibly several times by the $CLOSE processor,
+!	one for each defined record stream.
+!
+! FORMAL PARAMETERS
+!
+!	None.
+!
+! IMPLICIT INPUTS
+!
+!	?
+!
+! ROUTINE VALUE:
+!
+!	None, yet not NOVALUE.
+!
+! SIDE EFFECTS:
+!
+!	?
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	temp,
+	oureofbyte,				! The EOF as we know it
+	bfdptr : REF BLOCK,			!
+	bufferpage,				! First page of
+						!   contiguous buffers
+	buffersize,				! Size (in pages) of
+						!   each record buffer
+	keybuffsize,				! Size of key buffer
+	keybuffadr;				! Address of key buffer
+
+    						!   (indexed only)
+    TRACE ('DCNCTRAB');
+
+    !+
+    ! If this is a foreign file type (i.e. handled by FFF)
+    ! Then call the FFF
+    !-
+
+    IF .fst[fst$h_file_class] LSS 0                                     !a524
+    THEN 
+	BEGIN					! 			!A565
+	F$Disconnect( .Rab );			!			!A524
+	usrstv = .rab [rab$h_stv];		! Return STV value	!A565
+	END 					! 			!A565
+    ELSE
+        BEGIN
+        IF .fst[fst$h_file_class] EQL Typ$k_Macy11      ! Check macy11
+        THEN DscM11();                                                  !a567 
+        END;
+!+
+!   We now must insure that all locked records for the stream
+!   have been unlocked.  There is a very easy way of doing
+!   this...issue a DEQ JSYS to unlock all records for the
+!   stream.  However, if there are no locked records, this is an
+!   unnecessary overhead.  Therefore, for Sequential/Relative
+!   files, we will check the DLOCKED bit in the RST; for
+!   Indexed files, we will check to see if there is a current
+!   bucket.  In either case, all locked records will be unlocked.
+!-
+    !
+    !   Unlock any locked record.
+    !
+
+    IF datalocked
+    THEN
+    !
+    !	We must unlock all locked records/buckets in the file.
+    !
+	$callos (er$edq, (loffall (.rst)));	! Unlock everything
+
+    !
+    !   Set up the current buffer descriptor pointer.
+    !
+    cbd = .rst + rstcbdoffset;			! Get pointer to current bucket
+!+
+!   For indexed files, flush the current bucket and the key buffer.
+!-
+
+    IF idxfile
+    THEN 					! We must flush the key buffer
+	BEGIN
+	releascurentbkt;
+	keybuffsize = .fst [fstkbfsize];	! Get size of buffer
+	keybuffadr = .rst [rstkeybuff];		! And its address
+
+	IF .keybuffsize NEQ 0			! Free buffer space if non-zero
+	THEN
+	    pmem (.keybuffsize, keybuffadr)
+
+	END;
+
+    flubuf ();					! Put out all updated buffers
+!+
+!   Release all buffers used by record stream.
+!-
+    buffersize = 				! Get size of each buffer
+    .fst [fstbufsiz]*.rst [rstbfdcount];
+    bfdptr = bfdoffset;				! Get pointer to first buffer
+    bufferpage = .bfdptr [bfdbpage];		! And page number of first one
+    ppage (.bufferpage, 			! Page number
+	.buffersize, 				! Page count
+	true);					! Destroy page
+!+
+!   Fetch our EOF byte number and start to compare it.
+!
+!   NOTE: For LSA files,  HYBYTE and EOFBYTE are in
+!   words, not chars.
+!-
+    oureofbyte = .rst [rsthybyte];
+
+    IF sequenced THEN oureofbyte = (.oureofbyte + 4)/5;
+
+    temp = (.rst [rstflags] AND flgtrunc);	! Truncate flag for ADJEOF
+
+    IF (rmsfile) AND 				! RMS file (only PMAPs done)
+	(.oureofbyte NEQ 0) OR 			! Been updated?
+	(.temp NEQ 0)				! Or ...we did a $TRUNCATE
+    THEN 					! We may have to update
+    						!   the EOF pointer
+	adjeof (.fst [fstjfn], .oureofbyte, .temp);
+
+!+
+!   Remove RST from FST chain.
+!-
+    delink (rst);				! Unlink RST
+!+
+!   Release core used by RST
+!-
+    temp = .rst [blocklength];
+    pmem (.temp, 				! Block size
+	rst);					! Block pointer
+    RETURN true;
+    END;					! End of DCNTRAB
+
+END						! End of Module CONECT
+
+ELUDOM
+ 

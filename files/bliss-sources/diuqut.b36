@@ -1,0 +1,804 @@
+%TITLE 'DIU Queue Request Block Maniupuation'
+
+MODULE DIUQUT (IDENT = '224',
+               LANGUAGE(BLISS36),
+               ENTRY(q$req_block_init,     ! Init a request block
+                     q$copy_req_block,     ! Copy a request block
+                     q$release_chain,      ! Free chain of blocks
+                     q$extract_filespecs,  ! Extract filespecs from reqblk
+                     move_without_password,! Strip password from filespec
+                     q$valid_req_block,    ! Validate new request
+                     q$fnode,              ! Find node in filespec buffer
+                     q$options_extract     ! Get options from request blk
+                    )
+               )=
+BEGIN
+
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+! FACILITY:     DIU-20 (Data Interchange Utility for TOPS-20)
+!
+! ABSTRACT:     This module contains some simple utility routines for 
+!               dealing with request blocks.
+!
+! ENVIRONMENT:  TOPS-20 V6.1   RMS V3
+!               BLISS-36 V4    XPORT
+!
+! AUTHOR:       Rick Fricchione (DIU version)        CREATION DATE: Aug 10,1984
+!               Larry Campbell  (FTS Version)        CREATION DATE: May 6,1982
+
+! HISTORY:
+!
+!  234  Change library of RMSUSR to RMSINT.
+!       Gregory A. Scott 17-Jul-86
+!
+!  174  Remove library of TOPS20, use wild_match routine instead of wild  jsys.
+!       Fix Q$FNOD bug with embedded access strings.
+!       Gregory A. Scott 20-May-86
+!
+!  156  Remove  DIU$V_CHECKPOINT  reference,  set  DIU$H_WARNING_MAX  to  1  in
+!       Q$REQ_BLOCK_INIT.
+!       Gregory A. Scott 13-May-86
+!
+!  152  Q$REQ_BLOCK_INIT didn't default the priority to 10 in a new block.
+!       Gregory A. Scott 11-May-86
+!
+!  150  Q$REQ_BLOCK_INIT very stupidly cleared the  request block a field at  a
+!       time.  Now we just clear the whole thing and then reset the version and
+!       length.
+!       Gregory A. Scott 9-May-86
+!
+!  122  Routine Q$EXTRACT_FILESPECS had (yet) another bug having to do with 
+!       output of multiple source filespecs.
+!       Gregory A. Scott 22-Mar-86
+!
+!  121  Routine Q$EXTRACT_FILESPECS didn't have a prayer of moving the 
+!       destination filespecs correctly.  It does now.
+!       Gregory A. Scott 19-Mar-86
+!
+!  102  Change routine name Q$FIND_NODE to Q$FNODE so that LINK doesn't 
+!       grab Q$FIND.  Also rewrite it.
+!       Gregory A. Scott 28-Mar-86
+!
+!            40  Put the REQUIRE/LIBRARY of 'TOPS20' into a TOPS-20 only
+!                conditional.
+!                Sandy Clemens  7-Oct-85
+!
+!      V01-001  DPR0001        Doug Rayner		 14-Aug-85
+!		Minor modifications for TOPS-10.  Support for [P,Pn]'s
+!		in request block.  Replace WILD% JSYS with call to routine
+!		to emulate it.
+!
+!      V01-000  RDF0001        Rick Fricchione           10-Aug-1984
+!               Original DIU version.  Change for new request block format,
+!               rewrite output routines, and modify for new filespec format.
+!--
+
+!******************************************************************************
+!**              L I B R A R Y   A N D   R E Q U I R E   F I L E S
+!******************************************************************************
+
+LIBRARY 'DIU';                          ! DIU Data structures
+LIBRARY 'RMSINT';                       ! RMS structures and macros
+LIBRARY 'BLI:XPORT';                    ! XPORT of course
+
+!******************************************************************************
+!**                 F O R W A R D   R O U T I N E
+!******************************************************************************
+FORWARD ROUTINE
+    q$req_block_init           : NOVALUE, ! Init a request block
+    q$release_chain            : NOVALUE, ! Release chain of blocks in heap 
+    q$copy_req_block           : NOVALUE, ! Copy a request block
+    q$extract_filespecs        : NOVALUE, ! Extract filespecs from request 
+
+    move_without_password      : NOVALUE, ! Move filespec minus password
+    move_access_control_string : NOVALUE, ! Move access string sans pswd
+    q$valid_req_block,                    ! Validate new request
+    q$fnode,                              ! Find node in filespec buffer
+    q$options_extract          : NOVALUE; ! Extract options from req blk
+
+!****************************************************************************
+!                   E X T E R N A L   R O U T I N E S 
+!****************************************************************************
+EXTERNAL ROUTINE
+    wild_match,				! Do a WILD% JSYS or a simulation
+    s$time,                             ! Return current time of day
+    s$dtstr : NOVALUE,                  ! Convert date/time to string
+    s$ttyno;                            ! Return TTY number
+
+
+!****************************************************************************
+!                 Q $ R E Q _ B L O C K _ I N I T 
+!****************************************************************************
+GLOBAL ROUTINE q$req_block_init (p_req_block) : NOVALUE =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Initializes a request block.
+!
+! FORMAL PARAMETERS:
+!   p_req_block         - pointer to the request block
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   NONE
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+
+BIND req_block = .p_req_block : $DIU_BLOCK;
+
+CH$FILL(0,DIU$K_LEN,CH$PTR(req_block,0,%BPUNIT));       ! Zero the entire block
+
+req_block[DIU$H_VERSION] = DIU$K_VERSION;       ! Set the block version
+req_block[DIU$H_TERMINAL] = s$ttyno();          ! Set the terminal number
+req_block[DIU$H_LENGTH] = DIU$K_LEN;            ! Set the length of the block
+req_block[DIU$B_PRIORITY] = 10;                 ! Set /PRIORITY to 10
+req_block[DIU$H_WARNING_MAX] = 1;               ! Reset /WARNINGS to 1
+
+END;                                ! End of q$req_block_init
+
+!***********************************************************************
+!**               Q $ C O P Y _ R E Q _ B L O C K 
+!***********************************************************************
+GLOBAL ROUTINE q$copy_req_block (p_src_block, p_dst_block) : NOVALUE =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Copy a request block.  On 36-bit machines, we emit a BLT instruction.
+!   On other machines we use CH$MOVE.
+!
+! FORMAL PARAMETERS:
+!   p_src_block         - pointer to source request block
+!   p_dst_block         - pointer to destination request block
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   NONE
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+
+BIND
+        src_block = .p_src_block : $DIU_BLOCK,
+        dst_block = .p_dst_block : $DIU_BLOCK;
+
+%BLISS32(
+    CH$MOVE (DIU$K_LEN, CH$PTR (src_block, 0, %BPUNIT),
+             CH$PTR (dst_block, 0, %BPUNIT));
+)
+
+%BLISS36(
+
+    REGISTER
+        blt_reg,
+        end_reg;
+
+    BUILTIN
+        MACHOP;
+
+    blt_reg<18, 18> = src_block;
+    blt_reg< 0, 18> = dst_block;
+    end_reg = dst_block + DIU$K_LEN;
+    MACHOP (%O'251', blt_reg, -1, end_reg, 0);
+
+)
+
+END;                                ! End of q$copy_req_block
+
+!******************************************************************
+!**               Q $ R E L E A S E _ C H A I N 
+!******************************************************************
+GLOBAL ROUTINE q$release_chain (head) : NOVALUE =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Release a chain of request blocks in heap space.  Each block is
+!   preceded by one overhead word which points to the next block.
+!
+! FORMAL PARAMETERS:
+!   head        - pointer to first block in chain
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   NONE
+!
+! SIDE EFFECTS:
+!   Heap space is freed.
+!
+!--
+
+LOCAL
+        current,
+        next,
+        req_block : REF $DIU_BLOCK;
+
+IF (current = .head) EQL 0 THEN RETURN;
+! Empty chain, return
+
+DO BEGIN
+     req_block = .current + 1;
+     IF .req_block[DIU$H_LENGTH] NEQ DIU$K_LEN
+        THEN SIGNAL (DIU$_BUG, DIU$_INV_BLK_LEN);
+     ! If the block isn't what we expect, signal an error
+
+     next = ..current;
+     $XPO_FREE_MEM(BINARY_DATA=(DIU$K_LEN+%UPVAL,.current,UNITS));
+     current = .next;
+END UNTIL .current EQL 0;
+! Release all the members of the chain..
+
+END;                                ! End of q$release_chain
+
+!*************************************************************************
+!**                Q $ E X T R A C T _ F I L E S P E C S 
+!*************************************************************************
+GLOBAL ROUTINE q$extract_filespecs (p_req_block, p_src, p_dst) : NOVALUE =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Extract the filespecs from  a request block, with  the password of  the
+!       access control  informatio  replaced  by the  string  "password".   The
+!       filespecs  are  copied   to  caller-supplied   descriptors.   All   tag
+!       information will be OMITTED.  Since there can be multiple source  files
+!       in the request, we loop through those, and extract the filespecs  only,
+!       comma listing them  if necessary.   Destination files  are much  easier
+!       since we only have one to deal with.
+!
+! FORMAL PARAMETERS
+!
+!       p_req_block: pointer to request block
+!       p_src_desc: pointer to descriptor for source filespec
+!       p_dst_desc: pointer to descriptor for destination filespec
+!
+!--
+
+BIND
+        req       = .p_req_block : $DIU_BLOCK,
+        src_desc  = .p_src       : $STR_DESCRIPTOR (CLASS=DYNAMIC),
+        dst_desc  = .p_dst       : $STR_DESCRIPTOR (CLASS=DYNAMIC);
+ 
+BIND
+        dlen      = req[DIU$H_DESTINATION_FILESPEC],
+        dbuf      = req[DIU$T_DESTINATION_FILESPEC],
+        slen      = req[DIU$H_SOURCE_FILESPEC],
+        sbuf      = req[DIU$T_SOURCE_FILESPEC];
+LOCAL
+        next_ptr,
+        remaining,
+        file_ptr,
+        file_len,
+        temp        : $STR_DESCRIPTOR(CLASS=DYNAMIC),
+        current     : $STR_DESCRIPTOR(CLASS=BOUNDED);
+
+! If there are no filespecs just return...
+
+IF (.slen EQL 0) AND (.dlen EQL 0) THEN RETURN;
+
+! Init the number of charactes in the buffer and start a pointer to the spec.
+
+remaining  = .slen;                     ! Init the number of chars in fs buf
+file_ptr = CH$PTR(sbuf);                ! Init a pointer to the buffer
+ 
+DO BEGIN
+   ! Get the length of the filespec, and point at it.  Then move the filespec
+   ! to current.  Call routine to replace the password with "password".
+
+   next_ptr = CH$FIND_CH(.remaining,.file_ptr,$ETG);    ! Look for tag
+   IF CH$FAIL(.next_ptr) THEN EXITLOOP; ! Exit if it wasn't found
+
+   file_len = CH$A_RCHAR(next_ptr);     ! Load the length byte
+   IF .file_len EQL 0 THEN EXITLOOP;    ! Done if zero length filespec seen
+
+   remaining = .remaining-(2+.file_len); ! Compute bytes left in the spec
+   file_ptr = CH$PLUS(.next_ptr,1);     ! Get past the length
+
+   ! Copy the spec into a string descr, then move it changing the password
+   ! string into "password".
+
+   $STR_DESC_INIT(DESC=current,STRING=(.file_len,.file_ptr),CLASS=BOUNDED);
+   $STR_DESC_INIT(DESCRIPTOR=temp,CLASS=DYNAMIC);
+   MOVE_WITHOUT_PASSWORD(current, temp);
+ 
+   ! Copy the resulting string to source file descr that we are returning.  If
+   ! we are doing the 2nd through nth files then put in a seperator string.
+
+   IF .src_desc[STR$H_LENGTH] EQL 0 
+   THEN $STR_COPY(STRING=temp,TARGET=src_desc)
+   ELSE $STR_APPEND(STRING=$STR_CONCAT(%CHAR(%C',',13,10,%C'-',9,' '),temp),
+                    TARGET=src_desc);
+
+   ! List all the filespecs until we have reached the end of the sources
+
+   END WHILE .remaining NEQ 0;
+
+! Now do the destination side, there being only one filespec there I hope.
+ 
+file_ptr = CH$FIND_CH(.dlen,CH$PTR(dbuf),$ETG); ! Find the tag
+IF CH$FAIL(.file_ptr) THEN RETURN;      ! None there?  Quit now
+
+! There is a dest file there, so copy it back to the caller's desc.
+
+file_len = CH$A_RCHAR(file_ptr);        ! Get the length of the filespec
+file_ptr = CH$PLUS(.file_ptr,1);        ! Point to the filespec itself
+$STR_DESC_INIT(DESC=current,CLASS=BOUNDED,STRING=(.file_len,.file_ptr));
+MOVE_WITHOUT_PASSWORD(current, dst_desc);  ! actually its move with "password"
+ 
+END;                                ! End of q$extract_filespecs
+
+!******************************************************************************
+!                M O V E _ W I T H O U T _ P A S S W O R D
+!******************************************************************************
+GLOBAL ROUTINE move_without_password (p_bounded_descr, p_dest_descr): NOVALUE =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION
+!
+!   Copy a filespec string, changing the password in it to the string
+!   "password".
+!
+! FORMAL PARAMETERS
+!
+!   p_bounded_descr     - bounded descriptor whose remainder string contains
+!                         the filespec to scan.
+!   p_dest_descr        - output descriptor in which the string scanned goes.
+!
+! IMPLICIT INPUTS
+!
+!   None
+!
+! IMPLICIT OUTPUTS
+!
+!   None
+!
+! ROUTINE VALUE and SIGNALS
+!
+!   None
+!--
+
+BIND
+        bounded_descr = .p_bounded_descr : $STR_DESCRIPTOR(CLASS=BOUNDED),
+        dest_descr    = .p_dest_descr    : $STR_DESCRIPTOR();
+
+LOCAL
+	delim;
+
+! We scan through the remainder string, moving the piece scanned
+! to the output string, except for the password.  First we try
+! for the node name, which will always be terminated by either
+! a double quote or a colon.  (Two colons, actually, but if we hit
+! a single colon, it's a device name and there's  no access string.)
+
+IF $STR_SCAN(REMAINDER=bounded_descr,STOP='":',
+             DELIMITER=delim,SUBSTRING=bounded_descr)
+   THEN BEGIN
+          $STR_APPEND(TARGET=dest_descr,STRING=bounded_descr);
+          IF .delim EQL %C'"'
+             THEN move_access_control_string (bounded_descr, dest_descr);
+          ! There is either a node spec or a device name.  If delimiter
+          ! was double quote, we have an access string to parse.
+        END;
+
+! OK, we've scanned (and moved) node spec and access control if
+! present.  Now move the remainder string and return.
+
+$STR_APPEND(TARGET=dest_descr,
+            STRING=((.bounded_descr[STR$H_MAXLEN]
+                   -(.bounded_descr[STR$H_LENGTH]+.bounded_descr[STR$H_PFXLEN])
+                   ),
+                   CH$PLUS (.bounded_descr[STR$A_POINTER],
+                            .bounded_descr[STR$H_LENGTH])
+                   ));
+
+END;                                ! End of move_without_password
+
+!***********************************************************************
+!**       M O V E _ A C C E S S _ C O N T R O L _ S T R I N G
+!***********************************************************************
+ROUTINE move_access_control_string (p_bounded_descr, p_dest_descr) : NOVALUE =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Move the access control string of a filespec, replacing the password
+!   with the literal "password".
+!
+! FORMAL PARAMETERS:
+!   p_bounded_descr     - pointer to bounded descriptor whose remainder
+!                         string contains that part of the filespec
+!                         beginning at the access control string (including
+!                         the initial double quote).
+!   p_dest_descr        - pointer to descriptor of destination for altered
+!                         string.
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   NONE
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+
+BIND
+        bounded_descr = .p_bounded_descr : $STR_DESCRIPTOR(CLASS=BOUNDED),
+        dest_descr = .p_dest_descr       : $STR_DESCRIPTOR ();
+
+LOCAL
+        delim;
+
+IF NOT $STR_SCAN(REMAINDER=bounded_descr,SPAN='"',SUBSTRING=bounded_descr)
+   THEN SIGNAL (DIU$_BUG);
+! Scan and move the inital quote
+
+$STR_APPEND(TARGET=dest_descr,STRING=bounded_descr);
+
+! Now move the four fields of the access control string
+! (user-ID, password, account, optional data)
+
+INCR index FROM 1 TO 4 DO
+   BEGIN
+        $STR_SCAN (REMAINDER = bounded_descr,
+                   STOP = '" ', DELIMITER = delim,
+                   SUBSTRING = bounded_descr);
+        ! Each field will be terminated by either a quote or a space
+
+        IF .bounded_descr[STR$H_LENGTH] NEQ 0
+        THEN IF .index EQL 2
+                  THEN $STR_APPEND(TARGET=dest_descr,STRING='password')
+                  ELSE $STR_APPEND(TARGET=dest_descr,STRING=bounded_descr);
+        ! If we found a nonempty field, copy it, but fake the password
+
+        bounded_descr[STR$A_POINTER] =  CH$PLUS (.bounded_descr[STR$A_POINTER],
+                                                 .bounded_descr[STR$H_LENGTH]);
+        bounded_descr[STR$H_PFXLEN] = .bounded_descr[STR$H_PFXLEN]
+                                    + .bounded_descr[STR$H_LENGTH];
+        ! Skip over the field we just copied
+
+        bounded_descr[STR$H_LENGTH] = 1;
+
+        $STR_APPEND(TARGET=dest_descr,STRING=bounded_descr);
+        bounded_descr[STR$A_POINTER] =CH$PLUS(.bounded_descr[STR$A_POINTER],1);
+        bounded_descr[STR$H_PFXLEN] = .bounded_descr[STR$H_PFXLEN] + 1;
+        bounded_descr[STR$H_LENGTH] = 0;
+        ! Copy the delimiter and skip over it
+
+        IF .delim EQL %C'"' THEN RETURN;
+        ! If the delimiter was double quote, we're done
+
+    END;
+
+    SIGNAL (DIU$_SPACE_NOT_ALLOWED);    
+    ![3] More than four fields???
+    
+END;                                ! End of move_access_control_string
+
+!**********************************************************************
+!                Q $ V A L I D _ R E Q _ B L O C K 
+!**********************************************************************
+GLOBAL ROUTINE q$valid_req_block (p_req_block) =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Validate a request being entered in the queue.
+!
+! FORMAL PARAMETERS:
+!   p_req_block         - pointer to request block to check.
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   DIU$_INVALID_REQUEST        - general purpose badness
+!   DIU$_INV_FUNCTION_CODE      - invalid DIU function code
+!   DIU$_INV_BLK_LEN            - invalid request block length
+!   DIU$_INV_FLAGS              - inconsistent or invalid flags settings
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+
+BIND req_block = .p_req_block : $DIU_BLOCK;
+
+! Make sure it is the right version and length
+
+IF .req_block[DIU$H_VERSION] NEQ DIU$K_VERSION
+THEN RETURN (DIU$_INV_REQ_BLK_VER);
+
+IF .req_block[DIU$H_LENGTH] NEQ DIU$K_LEN
+THEN RETURN (DIU$_INV_BLK_LEN);
+
+! Validate the function code in an interesting way
+
+SELECTONE .req_block[DIU$H_FUNCTION] OF
+SET
+[DIU$K_COPY, DIU$K_APPEND, DIU$K_DELETE, DIU$K_RENAME,
+ DIU$K_PRINT, DIU$K_SUBMIT, DIU$K_DIRECTORY] : ;
+
+[OTHERWISE] : RETURN (DIU$_INV_FUN_CODE);
+TES;
+
+IF.req_block[DIU$H_SOURCE_FILESPEC] EQL 0       ! Validate the filespec
+THEN RETURN (DIU$_INV_STR_LENGTH);
+
+! Can't specify the following bit
+
+IF .req_block[DIU$V_DELETED]
+THEN RETURN (DIU$_INV_FLAGS);
+
+! Check for /AFTER is later than /DEADLINE 
+
+IF (.req_block[DIU$G_AFTER] NEQ 0) AND (.req_block[DIU$G_DEADLINE] NEQ 0)
+THEN IF .req_block[DIU$G_AFTER] GEQ .req_block[DIU$G_DEADLINE]
+     THEN RETURN (DIU$_DEADLINE_CONFLICT);
+
+! /DEADLINE has already gone by
+
+IF (.req_block[DIU$G_DEADLINE] NEQ 0) AND 
+   (.req_block[DIU$G_DEADLINE] LEQ s$time ())
+THEN RETURN (DIU$_DEADLINE_PAST);
+
+RETURN (DIU$_NORMAL);
+
+END;                                ! End of q$valid_req_block
+
+
+!********************************************************************
+!                         Q $ F N O D E 
+!********************************************************************
+GLOBAL ROUTINE q$fnode (p_buff,p_buff_len,p_node,p_node_len) =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+
+!       This routine will attempt to find  the given node name in the  filespec
+!       buffer given.  It will skip over  the tag information and only look  at
+!       the file specifications.   We take  the node  name and  run a  wildcard
+!       match against it. If  any of the filespecs  match, we return TRUE.   If
+!       none do, we return FALSE.
+!
+!       Note that all filespecs with the global  tags (if any) and an ETG,  and
+!       end (either they or their tag streams) with one.  Therefore to find the
+!       filespecs, we simply  find the  ETG bytes.  The  ETG is  followed by  a
+!       character count including the null at  the end of the filespec.   After
+!       the null is another count byte.
+!
+!       globaltags,$ETG,filespeclength,filespec,tags,$ETG,null
+!
+! FORMAL PARAMETERS:
+!
+!       buff: Address of a CH$PTR to filespec buffer we are to search.
+!       buff_len: Length of filespec buffer
+!       node: Address of an CH$PTR to node name to search for.
+!             This must not contain colons (::).
+!       node_len: Length of node name
+!
+! ROUTINE VALUE
+!
+!       TRUE: match
+!       FALSE: no match
+!--
+
+LITERAL node_max = 6;
+
+BIND buff     = .p_buff,
+     buff_len = .p_buff_len,
+     node     = .p_node,
+     node_len = .p_node_len;
+
+LOCAL match,
+      buff_node_len,
+      buff_node_end,
+      file_ptr,
+      file_len,
+      next_ptr,     
+      remaining,
+      source_buf  : VECTOR[CH$ALLOCATION(node_max+1)];
+
+! Point file_ptr to the buffer.
+
+file_ptr = CH$PTR(buff);                ! Point to start of buffer
+remaining = buff_len;                   ! Get max characters left to look at
+
+DO BEGIN
+
+! Find the next tag in the buffer and point to the filespec after it
+
+    next_ptr = CH$FIND_CH(.remaining,.file_ptr,$ETG);   ! Find the ETG
+    IF CH$FAIL(.next_ptr) THEN RETURN FALSE;    ! Return if no ETG found
+    file_len = CH$A_RCHAR(next_ptr);            ! Get length of this file spec
+    next_ptr = CH$PLUS(.next_ptr,1);            ! Skip over the count byte
+    IF .file_len EQL 0 THEN RETURN FALSE;       ! Return if end
+    remaining = .remaining-(2+.file_len);       ! Compute chars remaining
+    file_ptr = .next_ptr;               ! Point to start of current filespec
+
+! Find the end of the node by locating the colons or the beginning of the
+! embedded access string, and get length of it.  Then copy it to the source_buf
+! and see if it matches.  If it matches, return true.
+
+    buff_node_end = CH$FIND_SUB(.file_len,.file_ptr,    ! Look for access str
+                                1,CH$PTR(UPLIT('"')));  ! (end of node name)
+    IF CH$FAIL(.buff_node_end)          ! If no embedded access try for ::.
+    THEN buff_node_end = CH$FIND_SUB(.file_len,.file_ptr,
+                                     2,CH$PTR(UPLIT('::')));
+
+    IF NOT CH$FAIL(.buff_node_end)      ! If we found the end of a node
+    THEN BEGIN                          ! Then see if it matches
+         buff_node_len = CH$DIFF(.buff_node_end,.file_ptr);
+         CH$COPY(.buff_node_len,.file_ptr,      ! Copy node to source buf
+                 0,node_max+1,CH$PTR(source_buf));
+         IF wild_match(CH$PTR(source_buf),CH$PTR(node)) ! Does it match?
+         THEN RETURN TRUE;              ! Yes, return true if match 
+         END;                           ! IF NOT CH$FAIL(.buff_node_end)
+
+! Keep searching until we get a null in the buffer.
+
+END UNTIL CH$RCHAR(.file_ptr) EQL $NUL;
+
+! If we get here nothing matched
+
+RETURN FALSE;
+
+END;                                    ! q$fnode
+
+GLOBAL ROUTINE q$options_extract (p_req_block, p_descr) : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Create a textual representation of request options and copy it to
+!   descriptor specified.
+!
+! FORMAL PARAMETERS:
+!   p_req_block         - pointer to request block
+!   p_descr             - pointer to descriptor of string to put text in
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   NONE
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+    BEGIN
+
+    BIND
+        req_block = .p_req_block : $DIU_BLOCK,
+        descr = .p_descr : $STR_DESCRIPTOR ();
+
+    SELECT 1
+    OF
+        SET
+        [.req_block[DIU$V_NOTIFY_MAIL]] :
+            $STR_COPY (TARGET = descr, STRING = '/NOTIFY:MAIL ');
+        [.req_block[DIU$V_NOTIFY_TERMINAL]] :
+            $STR_COPY (TARGET = descr, STRING = '/NOTIFY:TERMINAL ');
+        [.req_block[DIU$V_NOTIFY_IPCF]] :
+            $STR_COPY (TARGET = descr, STRING = '/NOTIFY:IPCF ');
+        TES;
+    IF .req_block[DIU$B_PRIORITY] NEQ 10
+    THEN
+        $STR_APPEND (TARGET = descr,
+                     STRING =
+                         $STR_CONCAT ('/PRIORITY:',
+                                      $STR_ASCII (.req_block[DIU$B_PRIORITY],
+                                                  BASE10),
+                                      ' '));
+    !
+    ! If /DEADLINE exists, cons up a string to represent it
+    !
+    IF .req_block[DIU$G_DEADLINE] NEQ 0
+    THEN
+        BEGIN
+        LOCAL
+            time_descr : $STR_DESCRIPTOR ();
+        $STR_DESC_INIT (DESCRIPTOR = time_descr, CLASS = DYNAMIC);
+        s$dtstr (.req_block[DIU$G_DEADLINE], time_descr);
+        $STR_APPEND (TARGET = descr,
+                     STRING = $STR_CONCAT ('/DEADLINE:',
+                                           time_descr,
+                                           ' '));
+        $XPO_FREE_MEM (STRING = time_descr);
+        END;
+    !
+    ! If /AFTER exists, cons up a string to represent it
+    !
+    IF .req_block[DIU$G_AFTER] NEQ 0
+        AND .req_block[DIU$G_AFTER] GTR s$time ()
+    THEN
+        BEGIN
+        LOCAL
+            time_descr : $STR_DESCRIPTOR ();
+        $STR_DESC_INIT (DESCRIPTOR = time_descr, CLASS = DYNAMIC);
+        s$dtstr (.req_block[DIU$G_AFTER], time_descr);
+        $STR_APPEND (TARGET = descr,
+                     STRING = $STR_CONCAT ('/AFTER:',
+                                           time_descr,
+                                           ' '));
+        $XPO_FREE_MEM (STRING = time_descr);
+        END;
+    !
+    ! Append /LOG and /NOTIFY switches to options line
+    !
+    IF .req_block[DIU$H_LOG_FILESPEC] NEQ 0
+    THEN
+        $STR_APPEND (TARGET = descr,
+                     STRING = $STR_CONCAT ('/LOG:',
+                                           (.req_block[DIU$H_LOG_FILESPEC],
+                                            CH$PTR (req_block[DIU$T_LOG_FILESPEC]))));
+    !
+    ! If prerequisite exists, append that and value of /SEQUENCE switch
+    !
+    IF .req_block[DIU$H_PREREQUISITE_ID] NEQ 0
+    THEN
+        BEGIN
+        $STR_APPEND (TARGET = descr,
+                     STRING = $STR_CONCAT ('/PREREQUISITE:',
+                                           $STR_ASCII (.req_block[DIU$H_PREREQUISITE_ID]),
+                                           '/SEQUENCE:'));
+        IF .req_block[DIU$V_SEQ_CONTINUE]
+        THEN
+            $STR_APPEND (TARGET = descr,
+                         STRING = 'CONTINUE-ON-ERROR')
+        ELSE
+            $STR_APPEND (TARGET = descr,
+                         STRING = 'ABORT-ON-ERROR');
+        END;
+    END;                                ! End of q$options_extract
+
+
+END
+ELUDOM

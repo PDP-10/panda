@@ -1,0 +1,794 @@
+;;; This is a -*-Lisp-*- file.
+;;;
+;;; **********************************************************************
+;;; This code was written as part of the Spice Lisp project at
+;;; Carnegie-Mellon University, and has been placed in the public domain.
+;;; If you want to use this code or any part of Spice Lisp, please contact
+;;; Scott Fahlman (FAHLMAN@CMUC). 
+;;; **********************************************************************
+;;;
+;;; The package system.
+;;; Written by Lee Schumacher.
+;;; Bug fixes, iteration macros, and stuff like that courtesy Skef Wholey.
+;;; See package chapter of the Common Lisp Reference Manual.
+;;;
+;;; Package print function.  Describe can be used to get other information
+;;; about packages.
+
+(in-package 'lisp)
+
+(export '(package *package* make-package in-package find-package rename-package
+	  list-all-packages unintern export unexport import shadowing-import
+	  shadow use-package unuse-package find-all-symbols do-symbols
+	  do-external-symbols do-all-symbols apropos apropos-list
+	  *keyword-package* *lisp-package*))
+
+(defun %sp-get-package (sym) (%sp-svref sym 4))
+(defun %sp-set-package (sym pack) (%sp-svset sym 4 pack))
+
+(defun print-package (package stream print-level)
+  (declare (ignore print-level))
+  (write-string "#<The " stream)
+  (write-string (package-name package) stream)
+  (write-string " package>" stream))
+
+(defstruct (package
+	    (:constructor internal-make-package)
+	    (:predicate packagep)
+	    (:print-function print-package))
+  (name "" :type string)		; The string name of the package
+  (nicknames () :type list)		; List of nickname strings
+  (use-list () :type list)		; List of packages we use
+  (used-by-list () :type list)		; List of packages that use this one
+  (internal-symbols (make-hash-table :test #'equal));Hashtable of internal syms
+  (external-symbols (make-hash-table :test #'equal));Hashtable of external syms
+  (shadowing-symbols () :type list))	; List of shadowing symbols
+
+
+;;; Global variables.
+
+(defvar *package-obarray* ()
+  "Table of all package symbols.")
+
+(defvar *package* () "The current package.")
+
+;;; Lots of people want the keyword package and Lisp package without a lot
+;;; of fuss, so we give them their own variables.
+
+(defvar *lisp-package* ()
+  "Holds the package name for the lisp package.")
+(defvar *keyword-package* ()
+  "Holds the package name for the keyword package.")
+
+;;;; Test functions and utilities.
+
+;;;[Victor] Parse a valid package name
+(defun parse-package (name)
+  (cond ((find-package name))
+	((symbolp name) (symbol-name name))
+	(t (string name))))		; Kludge-P
+
+;;; Calls cerror and handles the patch if the luser continues.
+;;; Only returns when the new name is not in conflict with anything.
+
+(defun handle-package-name-conflicts (name)
+  (cerror "a new package name will be prompted for."
+	  "Package name conflict with ~S." name)
+  (write-string "Name: ")
+  (do ((name (string (read)) (string (read))))
+      (())
+    (if (find-package name)
+	(format t "There is already a package named ~S.~%Name: " name)
+	(return name))))
+
+;;; Check name checks for package-name conflicts, and replaces symbols with
+;;; strings.
+
+(defun check-name (string-or-symbol)
+  (cond ((find-package string-or-symbol)
+	 (handle-package-name-conflicts string-or-symbol))
+	(t (parse-package string-or-symbol))))
+
+;;; This fun handles name conflicts were uninterning a shadowing symbol
+;;; leaves multiple choices for the replacement.
+
+(defun handle-revealed-name-conflict (symbol conflict-list package)
+  (let ((package-list (mapcar #'%sp-get-package conflict-list)))
+    (cerror "Pick the package whose symbol you wish to import ~
+	    from ~S."
+	    "Uninterning shadowing symbol ~S leaves ~
+	    more than one symbol with that name available."
+	    symbol (mapcar #'package-name package-list))
+    (do* ((new-package (find-package (read)))
+	   (new-symbol (find-symbol (symbol-name symbol)
+					     new-package)))
+	 ((member new-package package-list)
+	  (shadowing-import new-symbol package))
+	 (format t "That package is not one of the choices, try again."))))
+;;; 
+;;;; Functions for handling packages.
+;;; Provides error checking for the defstruct constructor function.
+
+(defun make-package (name &key
+			  (nicknames ())
+			  (use (list (find-package 'lisp))))
+  "Return a package object with the given name, assuming that no
+  package already uses the name."
+  (let* ((new-name (check-name name))
+	 (new-nick-names (mapcar #'check-name nicknames))
+	 (package-list (mapcar
+			#'(lambda (x)
+			    (if (packagep x)
+				x (find-package x)))
+			use))
+	 (package
+	  (internal-make-package :name new-name
+				 :nicknames new-nick-names
+				 :use-list package-list)))
+    ;; enter the nick-names in the *Package-Obarray*
+    (dolist (x (cons new-name new-nick-names))
+      (setf (gethash x *Package-Obarray*) package))
+    ;; set the use by's 
+    (dolist (x package-list)
+      (setf (package-used-by-list x)
+	    (push package (package-used-by-list x))))
+    ;; return the new package object
+    package))
+
+;;; This function is substantially similar to make-package.
+
+(defun in-package (name &rest keys &key
+			(nicknames ())
+			(use ()))
+  "Sets *package* to package with given name, nicknames, and use-list,
+  modifying appropriate fields if the package already exists."
+  (setq *package*
+	(let* ((old-package (find-package name)))
+	  (if old-package 
+	      (let ((new-nicknames (nset-difference
+				    (mapcar 
+				     #'(lambda (x) (if (symbolp x)
+						       (symbol-name x)
+						       (the string x)))
+				     nicknames)
+				    (package-nicknames old-package)))
+		    (new-use-list
+		     (nset-difference
+		      (mapcar
+		       #'(lambda (x) (if (packagep x) x (find-package x)))
+		       use)
+		      (package-use-list old-package)))
+		    (*package* old-package))
+		(mapcar #'use-package new-use-list)
+		(dolist (x new-nicknames)
+		  (if (and (find-package x)
+			   (not (eq (find-package x) old-package)))
+		      (progn
+		       (cerror "Prompt for new nickname."
+			       "Illegal nickname ~S for ~S, ~
+			       name is already used for ~S."
+			       x old-package (find-package x))
+		       (do ((y))
+			   (y
+			    (setf (package-nicknames old-package)
+				  (push y
+					(package-nicknames
+					 old-package))))
+			 (format t "Enter a different nickname.")
+			 (let ((answer (read)))
+			   (if (or (not (find-package answer))
+				   (eq (find-package answer)
+				       old-package))
+			       (setq y answer)))))
+		      (or (find-package x)
+			  (progn
+			    (setf (gethash (if (symbolp x)
+					       (symbol-name x)
+					       (the string x))
+					   *package-obarray*)
+				  old-package)
+			    (setf (package-nicknames old-package)
+				  (push x
+				      (package-nicknames
+				       old-package)))))))
+		old-package)
+	      (apply #'make-package name keys)))))
+
+;; Gethash returns the correct value.
+
+(defun find-package (name)
+  "Find a package whose name is the string given, or the print name if it's a
+  symbol."
+  (values (gethash (if (symbolp name) (symbol-name name) (the string name))
+		   *package-obarray*)))
+
+;;; Does the same checking as make-package, using check-name.
+
+(defun rename-package (package name &optional (nicknames ()))
+  "Substitute the args for the appropriate fields in the given package."
+  (let ((new-name (check-name name))
+	(new-nicknames (mapcar #'check-name nicknames)))
+    (remhash (package-name package) *package-obarray*)
+    (dolist (nick (package-nicknames package))
+      (remhash nick *package-obarray*))
+    (setf (gethash new-name *package-obarray*) package)
+    (dolist (nick new-nicknames)
+      (setf (gethash new-name *package-obarray*) package))
+    (setf (package-name package) new-name)
+    (setf (package-nicknames package) new-nicknames)))
+
+(proclaim '(special %lap-result))
+
+;;; list-all-packages uses maphash and conses up a list from *package-obarray*
+
+(defun list-all-packages ()
+  "Return a list of all the packages in extent."
+  (let ((%lap-result ()))
+    (maphash #'(lambda (x y)
+		 x
+		 (pushnew y %lap-result))
+	     *package-obarray*)
+    %lap-result))
+;;; 
+;;;; Functions for handling symbols in packages.
+;;; Looks for a symbol with name name using find-symbol,
+;;; if its there, then the symbol is returned, o/w a new
+;;; symbol with that name is created and returned.
+;;; notes: name changed to intern when read knows not to send symbols.
+
+;;; 
+;;;; Functions that have to do name conflict checking. (and there inverses)
+;;; unintern checks to see if the symbol shadows anything. If it doesn't
+;;; then the symbol is remhash'ed.
+;;; Otherwise name conflicts are looked for and resolved if found,
+;;; the symbol is removed the shadowing-symbols list and then 
+;;; recurses.
+
+(defun unintern (symbol &optional (package *package*))
+  "Removes the symbol from the given package."
+  (if (member (the symbol symbol)
+	      (package-shadowing-symbols (the package package)))
+      (let
+       ;; The lambda returns nil if symbol was found in the package x,
+       ;; under the assumption that the luser doesn't want that symbol
+       ;; any more.
+       ((symbol-list (delete-duplicates
+		      (mapcar #'(lambda (x)
+				  (multiple-value-bind
+				   (new-symbol test)
+				   (find-symbol (symbol-name symbol) x)
+				   (if (eq test :external) new-symbol symbol)))
+			      (package-use-list
+			       package)))))
+       ;; If there is only 1 element in symbol-list\symbol
+       ;; then there is no conflict, and we go 
+       ;; our merry way.
+       (if (cdr (delete symbol symbol-list))
+	   ;; handles the conflict, and calls unintern again.
+	   (handle-revealed-name-conflict symbol symbol-list package)
+	   (progn 
+	    (setf (package-shadowing-symbols package)
+		  (delete symbol (package-shadowing-symbols package)))
+	    (unintern symbol package))))
+      (let* ((name (symbol-name symbol))
+	     (internal (multiple-value-list
+			(gethash name (package-internal-symbols package)))))
+	(if (eq (%sp-get-package symbol) package)
+	    (%sp-set-package symbol nil))
+	;; Remhash returns the proper value for the function.
+	(if (second internal)(remhash name (package-internal-symbols package))
+	    (remhash name (package-external-symbols package))))))
+
+;;; Export does a find-symbol on each symbol in symbol list and
+;;; for each package in the use-list of package. If a distinct symbol
+;;; is found with the same name, a cerror is signaled.
+
+(defun export (symbol-list &optional (package *package*))
+  "Export makes it args external symbols in the given package,
+  after checking for name conflicts in the used-by-list."
+ (if (atom symbol-list) (setq symbol-list (list symbol-list)))
+ (dolist (symbol symbol-list t)
+   ;; If the thing is already external in the specified package, let it go.
+   (multiple-value-bind (sym there)
+			(gethash (symbol-name symbol)
+				 (package-external-symbols package))
+     (declare (ignore sym))
+     (unless there
+       (let* ((name (symbol-name (the symbol symbol)))
+	      ;; Find all symbols with the same name that are accessible
+	      ;; from packages using the given package.
+	  (conflict-list (do ((x (package-used-by-list
+				  (the package package))(cdr x))
+			      (result))
+			     ((null x) result)
+			   (multiple-value-bind (conflict test)
+						(find-symbol name (car x))
+			     (if (and test
+				      (not (member conflict
+						   (package-shadowing-symbols
+						    (car x)))))
+				 (push (car x) result))))))
+     (cond ((multiple-value-bind (x y) (find-symbol name package)
+	      (declare (ignore x))
+	      (not y))
+	    (cerror "prompt for importing the symbol."
+		    "Symbol ~S not available in ~S." symbol package)
+	    (if (y-or-n-p "Should the symbol be imported ?")
+		(progn (import symbol package)
+		       (export symbol package))))
+	    ((null conflict-list)
+	     (progn
+	      (remhash name
+		       (package-internal-symbols package))
+	      (setf (gethash name (package-external-symbols package))
+		    symbol)))
+	    (t (progn
+		(cerror	"prompt for choice between symbol present and ~
+			inherited symbol on a symbol by symbol, or ~
+			package basis."
+			"Exporting symbol ~S causes name conflict in  ~
+			the package~P ~S."
+			symbol (length conflict-list) conflict-list)
+		(cond ((y-or-n-p
+			(format nil "Do you want the symbol already present ~
+				    to always take precedence ?"))
+		       (dolist (x conflict-list)
+			 (setf (package-shadowing-symbols x)
+			       (push (find-symbol name x)
+				     (package-shadowing-symbols x)))))
+		      ((y-or-n-p
+			(format nil "Do you want the symbol being exported to ~
+				 always take precedence ?"))
+		       (dolist (x conflict-list)
+			 (unintern (find-symbol name x) x)
+			 (let ((old (find-symbol name x)))
+			   (if (second old) 
+			       (shadowing-import symbol x)))))
+		      (t (dolist (x conflict-list)
+			   (if (y-or-n-p (format nil "Should the symbol ~
+						 already present in package ~
+						 ~S take precedence ?"
+						 (package-name x)))
+			       (push (find-symbol name x)
+				     (package-shadowing-symbols x))
+			       (unintern (find-symbol name x) x)))))
+		(remhash name (package-internal-symbols package))
+		(setf (gethash name (package-external-symbols package))
+		      symbol)))))))))
+
+;;; Needs no name conlict checking.
+
+(defun unexport (symbol-list &optional (package *package*))
+  "Makes the symbols unavailable to using packages. The inverse of export."
+  (if (atom symbol-list) (setq symbol-list (list symbol-list)))
+  (dolist (symbol symbol-list t)
+    (let ((name (symbol-name (the symbol symbol))))
+      (remhash name (package-external-symbols (the package package)))
+      (setf (gethash name (package-internal-symbols package)) symbol))))
+
+;;; Import does all sorts of name checking.  Allows conflict resolution
+;;; only on a symbol by symbol basis.
+
+(defun import (symbol-list &optional (package *package*))
+  "Make the symbols in symbol-list available as internal symbols
+  to using packages."
+  (if (atom symbol-list) (setq symbol-list (list symbol-list)))
+  (dolist (symbol symbol-list t)
+    (multiple-value-bind (conflict test)
+			 (find-symbol (symbol-name (the symbol symbol))
+				      package)
+      (if (and test (not (eq conflict symbol)))
+	  (progn
+	   (cerror "prompt for choice between old and new symbols."
+		   "Symbol named ~S already available in ~S."
+		   symbol package)
+	   (if (y-or-n-p "Should the new symbol take precedence ?")
+	       (shadowing-import symbol)))
+	  (setf (gethash (symbol-name symbol)
+			 (package-internal-symbols  package)) symbol)))))
+;;; 
+;;;; Functions that have no name conflicts.
+;;; Does import without worrying about name conflicts. All symbols in 
+;;; symbol-list are put on the shadowing-symbols-list.
+
+(defun shadowing-import (symbol-list &optional (package *package*))
+  "Imports symbols in symbol-list and adds them to the 
+  shadowing-symbols list of package. "
+  ;; take care of atoms so iteration works on boundary case
+  ;; I do this in a number of other places.
+  (if (atom symbol-list) (setq symbol-list (list symbol-list)))
+  (dolist (symbol symbol-list t)
+     (multiple-value-bind (old-symbol test)
+		       (find-symbol (symbol-name (the symbol symbol))
+				    package)
+      (if (or (eq test :internal)
+	      (eq test :external))
+	  (progn 
+	   ;; So unintern doesn't worry about name-conflicts.
+	   (setf (package-shadowing-symbols package)
+		 (delete old-symbol (package-shadowing-symbols package)))
+	   (unintern old-symbol package)))
+      (setf (package-shadowing-symbols package)
+	    (push symbol (package-shadowing-symbols package)))
+      (setf (gethash (symbol-name symbol)
+		     (package-internal-symbols package)) symbol))))
+
+;;; Puts symbols in symbol-list on the shadowing-symbols-list of the package.
+
+(defun shadow (symbol-list &optional (package *package*))
+  "Creates a shadow for the arguments, does nothing if the symbol
+  is directly present already."
+  (if (symbolp symbol-list) (setq symbol-list (list symbol-list)))
+  (dolist (symbol symbol-list t)
+    (multiple-value-bind (old-symbol test)
+			 (find-symbol (symbol-name (the symbol symbol))
+				      package)
+      (declare (ignore old-symbol))
+      (if (or (null test) (eq test :inherited))
+	  (let* ((name (symbol-name symbol))
+		 (new-symbol (make-symbol name)))
+	    (%sp-set-package new-symbol package)	    
+	    (setf (package-shadowing-symbols package)
+		   (push new-symbol (package-shadowing-symbols package)))
+	    (setf (gethash name (package-internal-symbols package))
+		  new-symbol))))))
+
+;;; Use-package does all sorts of name conflict checking. For each symbol
+;;; in each package in package-list a find-symbol is done in
+;;; %spec-package, and if a symbol is found, then an error is signalled.
+;;; Allows conflict resolution on a package or symbol by symbol basis.
+
+(defun use-package (package-list &optional (%spec-package *package*))
+  "Put packages in package-list on the package use list of the given package." 
+  (declare (special %spec-package))
+  (setq package-list
+	(mapcar
+	 #'(lambda (x) (cond ((packagep x) x)
+			     ((or (and x (symbolp x)) (stringp x))
+			      (or (find-package x) (error
+"Unknown package ~S in call to use-package" x)))
+			     (t (error "Illegal arg ~S to use-package" x))))
+	 (if (atom package-list) (list package-list) package-list)))
+  (dolist (current package-list t)		
+    (let ((%conflict-list ()))
+      ;; the following gross hack due to maphash lossage. and no-lex eval.
+      (declare (special %conflict-list))
+      (maphash #'(lambda (x y)
+		   (multiple-value-bind (symbol test)
+					(find-symbol x %spec-package)
+		     (if (and test
+			      (not (member symbol
+					   (package-shadowing-symbols
+					    %spec-package)))
+			      (not (eq symbol y)))
+			 (pushnew symbol %conflict-list))))
+	       (package-external-symbols current))
+      (if (null %conflict-list)
+	  (progn
+	   (setf (package-use-list %spec-package)
+		 (pushnew current (package-use-list %spec-package)))
+	   (setf (package-used-by-list current)
+		 (pushnew %spec-package (package-used-by-list current))))
+	  (progn
+	   (cerror "Prompt for which symbols take precedence."
+		   "The symbol~P in ~S conflict with ~
+		   one~P already present in ~S."
+		   (length %conflict-list)
+		   current (length %conflict-list) %spec-package)
+	   (cond
+	    ((y-or-n-p (format nil "Do you want the symbols currently present ~
+			       in ~S to take precedence ? " %spec-package))
+	     (dolist (x %conflict-list)(shadowing-import x %spec-package)))
+	    ((y-or-n-p (format nil "Do you want the symbols in ~S ~
+			       to take precedence ? " current))
+	     (dolist (x %conflict-list)
+	       (shadowing-import (find-symbol (symbol-name x) current)
+				 %spec-package)))
+	    (t (dolist (x %conflict-list)
+		 (if (y-or-n-p (format nil "Should the symbol ~S currently ~
+				       in ~S take precedence ? " x
+				       %spec-package))
+		     (shadowing-import x %spec-package)
+		     (shadowing-import (find-symbol (symbol-name x)
+						    current)
+				       %spec-package)))))
+	    (setf (package-use-list %spec-package)
+		  (pushnew current (package-use-list %spec-package)))
+	    (setf (package-used-by-list current)
+		  (pushnew %spec-package (package-used-by-list current))))))))
+
+;;; Unuse-package does no name conflict checking, it merely removes 
+;;; the args from the given package.
+
+(defun unuse-package (package-list &optional (package *package*))
+  "Removes the packages in the first arg from the use-list of the second."
+  (if (atom package-list)(setq package-list (list package-list)))
+  (setq package-list
+	(mapcar
+	 #'(lambda (x) (cond ((packagep x) x)
+			     ((or (symbolp x) (stringp x))
+			      (find-package x))
+			     (t
+			      (error "Illegal arg to unuse-package ~S." x))))
+	 package-list))  
+  (dolist (x package-list)
+    (setf (package-used-by-list x) (delete package (package-used-by-list x))))
+  (setf (package-use-list package)
+	(nset-difference  (package-use-list package) package-list))
+  t)
+
+
+(proclaim '(special %fas-string %fas-result))
+
+(defun find-all-symbols (string-or-symbol)
+  "Looks for symbol name string in all packages."
+  (let ((%fas-string (if (stringp string-or-symbol) string-or-symbol
+		    (symbol-name string-or-symbol)))
+	(%fas-result ()))
+    (maphash #'(lambda (x y)
+		 (declare (ignore x))
+		 (multiple-value-bind (new test) (find-symbol %fas-string y)
+		   (if (and test (not (eq test :inherited)))
+		       (pushnew new %fas-result))))
+	     *package-obarray*)
+    %fas-result))
+
+;;; Initialization.
+
+(defun package-init ()
+
+  ;; Common Lisp says that there's a System package, so here it is:
+  (make-package "SYSTEM" :nicknames '("SYS"))
+
+  ;; Lastly and leastly, the luser's package:
+  (make-package "USER")
+
+  (setq *package* (find-package "USER")))
+
+;;; gctwa [garbage collect totally worthless atoms]
+;;; Because we load first interpreted then compiled code, we will end
+;;; up with variable names that are no longer being used.  In the
+;;; compiled version, we want to get rid of them.  An atom is
+;;; considered to be totally worthless if it has neither a function
+;;; definition nor any properties.  Of course we do this only for
+;;; internal symbols.
+
+(defun gctwa (package)
+  (maphash #'(lambda (ignore symbol)
+	       (if (not (or (fboundp symbol)
+			    (symbol-plist symbol)))
+		   (unintern symbol package)))
+	   (package-internal-symbols package)))
+
+
+;;; Iteration macros:
+
+;;; Instead of using slow, silly successor functions, we make the iteration
+;;; guys be big PROG's.  Yea!
+
+(eval-when (compile load eval)
+
+(defun make-do-symbols-code (var str-var hash-table exit-form forms)
+    `((maphash (function (lambda (,str-var ,var)
+			  ,@forms))
+	       ,hash-table)
+      ,exit-form))
+
+)
+
+(defmacro do-symbols ((var &optional (package '*package*) result-form)
+			  &rest forms)
+  "Executes the Forms once for each symbol in accessible from the given 
+   Package with Var bound to the current symbol."
+  (let* ((PACKAGE-LOOP (gensym))
+	 (package-list (gensym))
+	 (hashtable-list (gensym))
+	 (pname (gensym))
+	 (internal-code (make-do-symbols-code
+			 var pname `(package-internal-symbols ,package)
+			 `(progn (setq ,hashtable-list
+				       (cons (package-internal-symbols
+					      ,package)
+					,hashtable-list))
+			         (go ,PACKAGE-LOOP))
+			 `((when (oksymbol ,pname ,hashtable-list)
+			        ,@forms))))
+	 (external-code (make-do-symbols-code
+			 var pname `(package-external-symbols
+				     (car ,package-list))
+			 `(progn
+				 (setq ,hashtable-list
+				       (cons (package-internal-symbols
+					      (car ,package-list))
+					,hashtable-list))
+				 (setq ,package-list (cdr ,package-list))
+				 (go ,PACKAGE-LOOP))
+			 `((when (oksymbol ,pname ,hashtable-list)
+			         ,@forms)))))
+    `(prog (,package-list ,hashtable-list)
+	   (setq ,package-list (cons ,package (package-use-list ,package)))
+	   ,@internal-code	   
+           ,PACKAGE-LOOP
+           (if (null ,package-list)
+	       (return ,result-form))
+	   ,@external-code)))
+
+;;OKsymbol checks whether a symbol has already been seen
+
+(defun oksymbol (pname hashlist)
+   (cond ((null hashlist) t)
+	 ((gethash pname (car hashlist)) nil)
+	 (t (oksymbol pname (cdr hashlist)))))
+
+(defmacro do-external-symbols ((var &optional (package '*package*) result-form)
+			       &rest forms)
+  "Executes the Forms once for each external symbol in the given Package with
+  Var bound to the current symbol."
+    `(prog nil
+	   ,@(make-do-symbols-code
+	      var 'ignore `(package-external-symbols ,package)
+	      `(return ,result-form)
+	      forms)))
+
+(defmacro do-all-symbols ((var &optional result-form)
+			  &rest forms)
+  "Executes the Forms once for each symbol in each package with Var bound
+  to the current symbol."
+  (let* ((PACKAGE-LOOP (gensym))
+	 (TAG (gensym))
+	 (package-list (gensym))
+	 (internal-code (make-do-symbols-code
+			 var 'ignore `(package-internal-symbols
+				       (car ,package-list))
+			 `(go ,TAG)
+			 forms))
+	 (external-code (make-do-symbols-code
+			 var 'ignore `(package-external-symbols
+				       (car ,package-list))
+			 `(progn (setq ,package-list (cdr ,package-list))
+				 (go ,PACKAGE-LOOP))
+			 forms)))
+    `(prog (,package-list)
+	   (setq ,package-list (list-all-packages))
+           ,PACKAGE-LOOP
+           (if (null ,package-list)
+	       (return ,result-form))
+	   ,@internal-code
+	   ,TAG
+	   ,@external-code)))
+
+(defmacro do-most-symbols ((var &optional result-form)
+			  &rest forms)
+  "Executes the Forms once for each symbol in each package with Var bound
+  to the current symbol.  This is like DO-ALL-SYMBOLS except that it
+  ignores internal symbols in the LISP and COMPILER package."
+  (let* ((PACKAGE-LOOP (gensym))
+	 (TAG (gensym))
+	 (package-list (gensym))
+	 (internal-code (make-do-symbols-code
+			 var 'ignore `(package-internal-symbols
+				       (car ,package-list))
+			 `(go ,TAG)
+			 forms))
+	 (external-code (make-do-symbols-code
+			 var 'ignore `(package-external-symbols
+				       (car ,package-list))
+			 `(progn (setq ,package-list (cdr ,package-list))
+				 (go ,PACKAGE-LOOP))
+			 forms)))
+    `(prog (,package-list)
+	   (setq ,package-list (list-all-packages))
+           ,PACKAGE-LOOP
+           (if (null ,package-list)
+	       (return ,result-form))
+	   (unless (or (eq (car ,package-list) *lisp-package*)
+		       (eq (car ,package-list) (find-package "CLC")))
+	       ,@internal-code)
+	   ,TAG
+	   ,@external-code)))
+
+
+
+;;; Apropos and Apropos-List.
+
+(defun briefly-describe-symbol (symbol)
+  (fresh-line)
+  (prin1 symbol)
+  (when (boundp symbol)
+    (write-string ", value: ")
+    (prin1 (symbol-value symbol)))
+  (when (fboundp symbol)
+    (write-string (cond ((special-form-p symbol) ", special form: ")
+			((macro-function symbol) ", macro: ")
+			(t ", function: ")))
+    (let ((*package* (symbol-package symbol)))
+      (prin1 (desc-arglist symbol))))
+  (write-char #\.))
+
+(defun apropos (string &optional package &key predicate)
+  "Briefly describe all symbols wich contain the specified String.
+  If Package is supplied then only describe symbols present in that
+  package.  If no package is given (or is NIL) then search all
+  packages (except internal symbols of LISP and COMPILER package).  If
+  Package is T then search all symbols.
+  If Predicate is specified, only symbols for which the predicate
+  (given one argument, the symbol) returns non-nil are described."
+  (let ((string (coerce (if (stringp string) string (string string))
+			'simple-string))
+	(package (cond ((null package) nil)
+		       ((eq package t) t)
+		       (t
+			(typecase package
+			  ((or symbol string) (find-package package))
+			  (package package)
+			  (t (error "~s isn't a package" package)))))))
+    (declare (simple-string string))
+    (cond ((null package)
+	   (do-most-symbols (symbol)
+	      (if (and (str-search string (symbol-name symbol))
+		       (or (not predicate)
+			   (funcall predicate symbol)))
+		  (briefly-describe-symbol symbol))))
+	  ((eq package t)
+	   (do-all-symbols (symbol)
+	      (if (and (str-search string (symbol-name symbol))
+		       (or (not predicate)
+			   (funcall predicate symbol)))
+		  (briefly-describe-symbol symbol))))
+	  (t
+	   (do-symbols (symbol package)
+	      (if (and (str-search string (symbol-name symbol))
+		       (or (not predicate)
+			   (funcall predicate symbol)))
+		  (briefly-describe-symbol symbol)))))
+    (values)))
+
+(defun apropos-list (string &optional package)
+  "Identical to Apropos, except that it returns a list of the symbols
+  found instead of describing them.
+  If Predicate is specified, only symbols for which the predicate
+  (given one argument, the symbol) returns non-nil are returned."
+  (let ((string (coerce (if (stringp string) string (string string))
+			'simple-string))
+	(package (cond ((null package) nil)
+		       ((eq package t) t)
+		       (t (typecase package
+		            ((or symbol string) (find-package package))
+			    (package package)
+			    (t (error "~s isn't a package" package))))))
+	(list '()))
+    (declare (simple-string string))
+    (cond ((null package)
+	   (do-most-symbols (symbol)
+	      (if (and (str-search string (symbol-name symbol))
+		       (or (not predicate)
+			   (funcall predicate symbol)))
+	          (push symbol list))))
+    	  ((eq package t)
+	   (do-all-symbols (symbol)
+	      (if (and (str-search string (symbol-name symbol))
+		       (or (not predicate)
+			   (funcall predicate symbol)))
+	          (push symbol list))))
+	  (t
+	   (do-symbols (symbol package)
+	      (if (and (str-search string (symbol-name symbol))
+		       (or (not predicate)
+			   (funcall predicate symbol)))
+	          (push symbol list)))))
+    list))
+
+(defun str-search (sequence1 sequence2)
+  (let ((start1 0) (end1 (length sequence1))
+	(start2 0) (end2 (length sequence2)))
+   (do ((index2 start2 (1+ index2))
+	(terminus (- end2 (- end1 start1)))
+	(last-match ()))
+       ((> index2 terminus) last-match)
+     (if (do ((index index2 (1+ index))
+	      (sub-index start1 (1+ sub-index)))
+             ((= sub-index end1) t)
+           (if (not (eq (equal-char-int (schar sequence2 index))
+			(equal-char-int (schar sequence1 sub-index))))
+	       (return nil)))
+	 (return t)))))

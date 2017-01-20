@@ -1,0 +1,1220 @@
+MODULE mxfil    (
+		IDENT = 'X03.09'
+		) =
+BEGIN
+!	COPYRIGHT (c) DIGITAL EQUIPMENT CORPORATION 1985, 1989.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A  LICENSE AND MAY BE USED AND  COPIED
+!	ONLY IN  ACCORDANCE  WITH  THE  TERMS OF  SUCH  LICENSE  AND  WITH  THE
+!	INCLUSION OF THE ABOVE  COPYRIGHT NOTICE.  THIS  SOFTWARE OR ANY  OTHER
+!	COPIES THEREOF MAY NOT BE PROVIDED  OR OTHERWISE MADE AVAILABLE TO  ANY
+!	OTHER PERSON.  NO  TITLE TO  AND OWNERSHIP  OF THE  SOFTWARE IS  HEREBY
+!	TRANSFERRED.
+!
+!	THE INFORMATION IN THIS  SOFTWARE IS SUBJECT  TO CHANGE WITHOUT  NOTICE
+!	AND SHOULD  NOT  BE CONSTRUED  AS  A COMMITMENT  BY  DIGITAL  EQUIPMENT
+!	CORPORATION.
+!
+!	DIGITAL ASSUMES NO  RESPONSIBILITY FOR  THE USE OR  RELIABILITY OF  ITS
+!	SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+
+
+!++
+! Facility: MX file system interface.
+!
+! Abstract:
+!
+!	This module provides a common interface for file system access.
+!
+! Environment:	User Mode on TOPS-20, TOPS-10
+!
+! Author: Richard B. Waddington   October 3, 1984
+!
+!--
+!
+! Include files:
+!
+%IF %SWITCHES(TOPS20) %THEN
+    LIBRARY 'monsym';
+    LIBRARY 'mxjlnk';
+%FI
+LIBRARY 'mxnlib';                       ! Get all required definitions
+LIBRARY 'mxlib';
+!
+! Table of contents
+!
+
+SWITCHES LIST (REQUIRE);                ! Allow listing of specific code
+
+FORWARD ROUTINE
+        mx$file_initialize : NOVALUE,  ! Initialize file interface
+	mx$file_open,                  ! open file for access
+        mx$file_read,
+	mx$file_write,
+	mx$file_seek,
+        mx$file_size,
+	seek_file,
+	mx$file_close,
+        sljerr : ercalr_linkage NOVALUE,
+%IF $tops10 %THEN
+	mx$file_build_buffers,
+	mx$file_kill_buffers: NOVALUE,
+        filpar,
+%FI
+        !
+        ! System specific routines.
+        !
+        alloc_buffer,
+        dealloc_buffer : NOVALUE,
+        open_file,
+        map_page,
+%IF $tops20 %THEN
+        unmap_page,
+%FI
+        close_file;
+
+%module_name ('MXFIL');
+
+!
+! Own storage:
+!
+
+OWN
+   glerr: INITIAL (0),                  ! Error code from failing MOVSLJ
+   file_table: INITIAL (0) ;            ! Base address of file table data base
+
+!
+! External references:
+!
+
+EXTERNAL
+        %debug_data_base;
+
+EXTERNAL ROUTINE
+         mx$error_processor,
+         nmu$text,
+         nmu$table_routines,
+         nmu$memory_manager;
+
+%global_routine ('MX$FILE_DELETE', spec) =
+    BEGIN
+%IF %SWITCHES(TOPS20) %THEN
+    declare_jsys(gtjfn,delf);
+    REGISTER
+        t = 1;
+
+    IF .spec EQL 0
+    THEN
+        RETURN 0;
+
+    IF .spec<18,18,0> EQL 0
+    THEN
+        spec = CH$PTR(.spec);
+
+    RETURN (
+        IF $$gtjfn(gj_sht OR gj_old, .spec;t)
+        THEN
+            $$delf(df_exp OR .t<0,18,0>)
+        ELSE
+            0)
+%ELSE
+
+    STACKLOCAL
+        flpblk: BLOCK[$fofsp+1] FIELD (filop_block_fields)
+                                INITIAL(REP $fofsp+1 OF (0)),
+        lkpblk: BLOCK[$rbtim+1] FIELD (lookup_block_fields)
+                                INITIAL (REP $rbtim+1 OF (0)),
+        pthblk: BLOCK[$ptmax]   FIELD (path_block_fields)
+                                INITIAL (REP $ptmax OF (0));
+    IF .spec EQL 0
+    THEN
+        RETURN 0;
+
+    IF .spec<18,18,0> EQL 0
+    THEN
+        spec = CH$PTR(.spec);
+
+    flpblk [filop_flags] = fo$prv OR fo$asc OR $fodlt;
+    flpblk [filop_open_flags] = $ioasc;
+    flpblk [filop_device] = %SIXBIT'DSK   ';
+    flpblk [filop_lookup_pointer] = lkpblk;
+    lkpblk [lookup_path] = pthblk;
+
+    IF NOT filpar(.spec,flpblk,lkpblk,pthblk)
+    THEN
+	RETURN $false;
+
+    BEGIN
+    BUILTIN UUO;
+    REGISTER t;
+    LOCAL
+        scratch,
+        value;
+
+    set_in_your_behalf(flpblk,lkpblk);
+    t = ($fofsp+1)^18 + flpblk;                     !Do the delete...
+    value = UUO(1,filop$(t));
+
+    scratch = .flpblk[filop_channel]^18 + $forel;   !Release the channel
+    t = 1^18 + scratch;
+    UUO(1,filop$(t));
+
+    RETURN .value
+    END
+
+    %FI
+    END;
+
+%global_routine('MX$FILE_SET_WRITER', spcptr, namptr): NOVALUE =
+    BEGIN
+    %IF %SWITCHES(TOPS20) %THEN
+
+    LOCAL
+        jfn;
+
+    declare_jsys(gtjfn,sfust,rljfn);
+
+    IF $$gtjfn(gj_old OR gj_sht, .spcptr; jfn)
+    THEN
+        BEGIN
+        $$sfust($sflwr^18 OR .jfn, .namptr);
+        $$rljfn(.jfn);
+        RETURN 0
+        END;
+    RETURN -2;
+    %ELSE
+!	Not needed on TOPS-10 (?)
+
+    RETURN -2 %FI
+    END;
+
+
+%global_routine('MX$FILE_SIZE', spec_, pages_, bytes_) =
+    BEGIN
+    BIND
+        pages = .pages_,
+        bytes = .bytes_;
+
+    %IF %SWITCHES(TOPS20) %THEN
+    LOCAL
+        jfn;
+
+    declare_jsys(gtjfn,sizef,rljfn);
+
+    IF $$gtjfn(gj_old OR gj_sht, CH$PTR(.spec_);jfn)
+    THEN
+        BEGIN
+        $$sizef(;,bytes);
+        $$rljfn(.jfn);
+	pages = .bytes/(512*5) + 1;
+	RETURN 0
+        END;
+    RETURN -2;
+    %ELSE
+    LOCAL
+	error,
+	eop,
+	buffer: REF VECTOR;
+    STACKLOCAL
+        flpblk: BLOCK[$fofsp+1] FIELD (filop_block_fields)
+                                INITIAL(REP $fofsp+1 OF (0)),
+        tmpblk: BLOCK[4]        FIELD (lookup_block_fields)
+                                INITIAL (REP 4 OF (0)),
+        lkpblk: BLOCK[$rbtim+1] FIELD (extended_lookup_block_fields)
+                                INITIAL (REP $rbtim+1 OF (0)),
+        pthblk: BLOCK[$ptmax]   FIELD (path_block_fields)
+                                INITIAL (REP $ptmax OF (0));
+
+    flpblk [filop_flags] = fo$prv OR fo$asc OR $fored;
+    flpblk [filop_open_flags] = $iodmp;
+    flpblk [filop_device] = %SIXBIT'DSK   ';
+    flpblk [filop_lookup_pointer] = lkpblk;
+    lkpblk [exlookup_count] = $rbtim+1;
+    tmpblk [lookup_path] = pthblk;
+    IF .spec_ EQL 0
+    THEN
+        RETURN 0;
+
+    IF .spec_<18,18,0> EQL 0
+    THEN
+        spec_ = CH$PTR(.spec_);
+
+    IF NOT filpar(.spec_,flpblk,tmpblk,pthblk)
+    THEN
+	RETURN $false;
+
+    lkpblk[exlookup_name] = .tmpblk[lookup_name];
+    lkpblk[exlookup_ext] = .tmpblk[lookup_ext];
+    lkpblk[exlookup_ppn] = .tmpblk[lookup_ppn];
+
+    BEGIN
+    BUILTIN UUO;
+    REGISTER t;
+    LOCAL
+        scratch,
+        value,
+	last_word,
+	iolist: vector[2];
+
+    error = -1;
+    set_in_your_behalf(flpblk,lkpblk);
+    t = ($fofsp+1)^18 + flpblk;                     !Do the lookup
+    IF (value = UUO(1,filop$(t)))
+    THEN
+	BEGIN
+	scratch = .lkpblk[$rbsiz,wrd] - 1; !zero based address of last word 
+	flpblk[filop_function] = $fousi;	!set file to last block number
+        flpblk[1,wrd] = .scratch<7,28,0> + 1;		
+	t = 2^18 + flpblk;
+	value = .value OR UUO(1,filop$(t));	!do the USETI
+	buffer = nmu$memory_get(128);		!allocate a buffer
+	iolist[0] = (-128)^18 OR (.buffer-1);
+	iolist[1] = 0;
+	flpblk[filop_function] = $foinp;
+	flpblk[1,wrd] = iolist;
+	t = 2^18 OR flpblk;
+	value - .value OR UUO(1,filop$(t));
+	last_word = .buffer[.scratch<0,7,0>] AND (NOT 1);
+	nmu$memory_release(.buffer,128);
+	eop = 0;
+	WHILE (.last_word NEQ 0) DO
+	BEGIN
+	  last_word = .last_word ^ 7;
+	  eop = .eop + 1;
+	END;
+	bytes = .eop + (5*.scratch);
+	pages = (.bytes+(128*5)-1)/(128*5);
+    END
+    ELSE
+        error = .t;
+        
+    IF NOT .value
+    THEN
+	BEGIN
+        .value = .value + (.error ^ 18);
+        $error(FACILITY=$err,           !Oh well, try again later
+               SEVERITY=STS$K_WARNING,
+               CODE=uf$len,
+               MESSAGE_DATA=.spec_,
+               OPTIONAL_MESSAGE=(FAC=$mon),
+               OPTIONAL_DATA=.error);
+	END;
+    scratch = .flpblk[filop_channel]^18 + $forel;   !Release the channel
+    t = 1^18 + scratch;
+    UUO(1,filop$(t));
+    RETURN .value
+
+    END %FI
+    END;
+
+%global_routine('MX$FILE_EXISTS', ptr) =
+    BEGIN
+    %IF %SWITCHES(TOPS20) %THEN
+    LOCAL
+        jfn;
+
+    declare_jsys(gtjfn,rljfn);
+
+    $TRACE('MX$FILE_EXISTS called');
+    IF $$gtjfn(gj_old OR gj_sht, .ptr)
+    THEN
+        BEGIN
+        $$rljfn();
+        RETURN 1
+        END;
+    RETURN 0;
+    %ELSE
+    STACKLOCAL
+        flpblk: BLOCK[$fofsp+1] FIELD (filop_block_fields)
+                                INITIAL(REP $fofsp+1 OF (0)),
+        lkpblk: BLOCK[$rbtim+1] FIELD (lookup_block_fields)
+                                INITIAL (REP $rbtim+1 OF (0)),
+        pthblk: BLOCK[$ptmax]   FIELD (path_block_fields)
+                                INITIAL (REP $ptmax OF (0));
+    IF .ptr EQL 0
+    THEN
+        RETURN 0;
+
+    IF .ptr<18,18,0> EQL 0
+    THEN
+        ptr = CH$PTR(.ptr);
+
+    flpblk [filop_flags] = fo$prv OR fo$asc OR $fored;
+    flpblk [filop_open_flags] = $ioasc;
+    flpblk [filop_device] = %SIXBIT'DSK   ';
+    flpblk [filop_lookup_pointer] = lkpblk;
+    lkpblk [lookup_path] = pthblk;
+
+    IF NOT filpar(.ptr,flpblk,lkpblk,pthblk)
+    THEN
+	RETURN $false;
+
+    BEGIN
+    BUILTIN UUO;
+    REGISTER t;
+    LOCAL
+        scratch,
+        value;
+
+    set_in_your_behalf(flpblk,lkpblk);
+    t = ($fofsp+1)^18 + flpblk;                     !Do the delete...
+    value = UUO(1,filop$(t));
+
+    scratch = .flpblk[filop_channel]^18 + $forel;   !Release the channel
+    t = 1^18 + scratch;
+    UUO(1,filop$(t));
+
+    RETURN .value
+    END
+
+
+    %FI
+    END;
+
+%global_routine('MX$FILE_COPY',src,dst)=
+    BEGIN
+    STACKLOCAL
+        buffer: VECTOR[CH$ALLOCATION(132)];
+
+    LOCAL
+        ifil,
+        ofil,
+        len,
+        error;
+
+    ifil = mx$file_open(.src, FILE_ACCESS_READ_ONLY, error);
+    IF .ifil LEQ 0
+    THEN
+        BEGIN
+%(318)% $error(FACILITY=$err,
+%(318)%        SEVERITY=STS$K_WARNING,
+               CODE=uf$fof,
+               MESSAGE_DATA=.src,
+%(318)%        OPTIONAL_MESSAGE=(FAC=$mon),
+               OPTIONAL_DATA=.error);
+        RETURN $false;
+        END;
+
+    ofil = mx$file_open(.dst, FILE_ACCESS_WRITE_ONLY, error);
+    IF .ofil LEQ 0
+    THEN
+        BEGIN
+%(318)% $error(FACILITY=$err,
+%(318)%        SEVERITY=STS$K_WARNING,
+               CODE=uf$fof,
+               MESSAGE_DATA=.dst,
+%(318)%        OPTIONAL_MESSAGE=(FAC=$mon),
+               OPTIONAL_DATA=.error);
+
+        mx$file_close(.ifil, file_abort, error);
+        RETURN $false;
+        END;
+
+    WHILE (len = mx$file_read(.ifil, CH$PTR(buffer), 132, error)) GTR 0 DO
+        BEGIN
+        IF NOT mx$file_write(.ofil, CH$PTR(buffer), .len, error)
+        THEN
+            BEGIN
+%(318)%     $error(FACILITY=$err,
+%(318)%            SEVERITY=STS$K_WARNING,
+                   CODE=uf$fwf,
+                   MESSAGE_DATA=.dst,
+%(318)%            OPTIONAL_MESSAGE=(FAC=$mon),
+                   OPTIONAL_DATA=.error);
+
+            mx$file_close(.ifil, file_abort, error);
+            RETURN $false;
+            END;
+        END;
+
+    IF .len NEQ 0
+    THEN
+        BEGIN
+%(318)% $error(FACILITY=$err,
+%(318)%        SEVERITY=STS$K_WARNING,
+               CODE=uf$frf,
+               MESSAGE_DATA=.dst,
+%(318)%        OPTIONAL_MESSAGE=(FAC=$mon),
+               OPTIONAL_DATA=.error);
+
+        mx$file_close(.ofil, file_abort, error);
+        RETURN $false;
+        END;
+
+    IF NOT mx$file_close(.ofil, file_keep, error)
+    THEN
+        BEGIN
+%(318)% $error(FACILITY=$err,
+%(318)%        SEVERITY=STS$K_WARNING,
+               CODE=uf$fcf,
+               MESSAGE_DATA=.dst,
+%(318)%        OPTIONAL_MESSAGE=(FAC=$mon),
+               OPTIONAL_DATA=.error);
+
+        mx$file_close(.ifil, file_abort, error);
+        RETURN $false;
+        END;
+
+    mx$file_close(.ifil, file_abort, error);
+    RETURN $true
+    END;
+
+%global_routine('MX$FILE_WRITTEN_DATE', ptr) =
+    BEGIN
+    %IF %SWITCHES(TOPS20) %THEN
+    DECLARE_JSYS(gtjfn,gtfdb,rljfn);
+
+    LOCAL
+        date;
+
+    date = 0;
+    IF mx$file_exists(.ptr)
+    THEN
+        BEGIN
+        REGISTER
+            jfn;
+
+        $$gtjfn(gj_old OR gj_sht, .ptr; jfn);
+        $$gtfdb(.jfn, 1^18 + $fbcre, date);
+        $$rljfn(.jfn);
+        END;
+
+    RETURN .date;
+    %ELSE
+    STACKLOCAL
+        flpblk: BLOCK[$fofsp+1] FIELD (filop_block_fields)
+                                INITIAL(REP $fofsp+1 OF (0)),
+        tmpblk: BLOCK[4]        FIELD (lookup_block_fields)
+                                INITIAL (REP 4 OF (0)),
+        lkpblk: BLOCK[$rbtim+1] FIELD (extended_lookup_block_fields)
+                                INITIAL (REP $rbtim+1 OF (0)),
+        pthblk: BLOCK[$ptmax]   FIELD (path_block_fields)
+                                INITIAL (REP $ptmax OF (0));
+
+    flpblk [filop_flags] = fo$prv OR fo$asc OR $fored;
+    flpblk [filop_open_flags] = $ioasc;
+    flpblk [filop_device] = %SIXBIT'DSK   ';
+    flpblk [filop_lookup_pointer] = lkpblk;
+    lkpblk [exlookup_count] = $rbtim+1;
+    tmpblk [lookup_path] = pthblk;
+
+    IF NOT filpar(.ptr,flpblk,tmpblk,pthblk)
+    THEN
+	RETURN $false;
+
+    lkpblk[exlookup_name] = .tmpblk[lookup_name];
+    lkpblk[exlookup_ext] = .tmpblk[lookup_ext];
+    lkpblk[exlookup_ppn] = .tmpblk[lookup_ppn];
+
+    BEGIN
+    BUILTIN UUO;
+    REGISTER t;
+    LOCAL
+        scratch,
+        value;
+
+    set_in_your_behalf(flpblk,lkpblk);
+    t = ($fofsp+1)^18 + flpblk;                     !Do the lookup
+    value = UUO(1,filop$(t));
+
+    scratch = .flpblk[filop_channel]^18 + $forel;   !Release the channel
+    t = 1^18 + scratch;
+    UUO(1,filop$(t));
+
+    RETURN (IF .value THEN .lkpblk[exlookup_create_udt]
+                      ELSE $false)
+
+    END
+    %FI
+    END;
+%global_routine('MX$FILE_RENAME', ptr1, ptr2) =
+    BEGIN
+    %IF %SWITCHES(TOPS20) %THEN
+    declare_jsys(gtjfn,rnamf,rljfn);
+    REGISTER
+        jfn1,
+        jfn2;
+
+    $$gtjfn(gj_old OR gj_sht, .ptr1; jfn1);
+    $$gtjfn(gj_fou OR gj_sht, .ptr2; jfn2);
+    IF $$rnamf(.jfn1,.jfn2)
+    THEN
+        BEGIN
+        $$rljfn(.jfn2);
+        RETURN 1
+        END
+    ELSE
+        BEGIN
+        $$rljfn(.jfn1);
+        $$rljfn(.jfn2);
+        RETURN 0
+        END
+    %ELSE
+    BUILTIN UUO;
+
+    STACKLOCAL
+        flpblk: BLOCK[$fofsp+1] FIELD (filop_block_fields)
+                                INITIAL(REP $fofsp+1 OF (0)),
+        lkpblk: BLOCK[4]        FIELD (lookup_block_fields)
+                                INITIAL (REP 4 OF (0)),
+        renblk: BLOCK[4]        FIELD (lookup_block_fields)
+                                INITIAL (REP 4 OF (0)),
+        ptlblk: BLOCK[$ptmax]   FIELD (path_block_fields)
+                                INITIAL (REP $ptmax OF (0)),
+        ptrblk: BLOCK[$ptmax]   FIELD (path_block_fields)
+                                INITIAL (REP $ptmax OF (0));
+
+    flpblk [filop_flags] = fo$prv OR fo$asc OR $fornm;
+    flpblk [filop_open_flags] = $ioasc;
+    flpblk [filop_device] = %SIXBIT'DSK   ';
+    flpblk [filop_lookup_pointer] = lkpblk;
+    flpblk [filop_rename_pointer] = renblk;
+    lkpblk [lookup_path] = ptlblk;
+    renblk [lookup_path] = ptrblk;
+
+    IF NOT filpar(.ptr1,flpblk,lkpblk,ptlblk)
+    THEN
+	RETURN $false;
+
+    IF NOT filpar(.ptr2,flpblk,renblk,ptrblk)
+    THEN
+	RETURN $false;
+
+    BEGIN
+    REGISTER t;
+    LOCAL 
+        scratch,
+        value;
+
+    WHILE $true DO
+        BEGIN
+	set_in_your_behalf(flpblk,lkpblk);
+	t = ($fofsp+1)^18 + flpblk;
+        IF (value = UUO(1,filop$(t)))
+        THEN
+            EXITLOOP
+        ELSE
+            IF .t EQL eraef_
+            THEN
+                (IF NOT mx$file_delete(.ptr2)
+                THEN
+                    EXITLOOP)
+            ELSE
+                RETURN $false;
+        END;
+
+    scratch = .flpblk[filop_channel]^18 + $forel;
+    t = 1^18 + scratch;
+    UUO(1,filop$(t));
+    RETURN .value
+
+    END
+!    mx$file_copy(.ptr1,.ptr2);
+!    mx$file_delete(.ptr1)
+    %FI
+    END;
+%global_routine ('MX$FILE_INITIALIZE') : NOVALUE =
+
+!++
+! Functional description:
+!
+!	Initializes the file system at start up or restart time.
+!       The internal file table data base is cleared and reset to
+!       an initial state.
+!
+! Formal parameters: none
+! Implicit inputs: none
+!
+! Routine value: none
+! Side effects: none
+!
+!--
+
+    BEGIN
+
+    nmu$table_clear (file_table) ;
+
+    %debug (FILE_TRACE,
+            (TRACE_INFO ('File system interface initialized')));
+
+    END;				! END of MX$FILE_INITIALIZE
+
+
+%global_routine ('MX$FILE_OPEN', FILE_NAME, ACCESS, ERROR) =
+
+!++
+! Functional description:
+!
+!	This routine opens a local file.  The ACCESS specifies
+!	the accessing technique.  The file is assumed to be a 7-bit
+!	ASCII stream file.  If the file can not be opened, an error
+!	code is returned in ERROR.
+!
+! Formal parameters:
+!
+!       .FILE_NAME    Pointer to file spec string (ASCIZ)
+!	.ACCESS	      READ_ACCESS
+!		      WRITE_ACCESS
+!		      APPEND_ACCESS
+!       .ERROR	      Address to return error code in
+!
+! Implicit inputs: none
+!
+! Routine value:
+!
+!       gtr 0   File identifier to be used on any future reference
+!       leq 0   Error occured while opening file
+!
+! Side effects: none
+!
+!--
+
+    BEGIN
+    LOCAL
+         fn: file_name_block,
+         file : REF file_data_block,
+         file_id;
+
+    $TRACE('Opening %A',.file_name);
+    !
+    ! Allocate a file block and fill it in with known information.
+    !
+
+    file = nmu$memory_get (file_data_block_allocation);
+    file [fd_access] = .access ;
+    file [fd_byte_size] = 7;
+    file [fd_error] = 0;
+
+    fn[fn_pointer] =.file_name;
+    fn[fn_length] = CH$LENGTH(.file_name);
+
+    %IF $tops20
+    %THEN
+    CH$COPY (.fn[fn_length], .fn[fn_pointer], 0,
+             MIN ((.fn[fn_length] + 1), (max_file_name_length + 1)),
+             CH$PTR (file [fd_name]));
+    %FI
+
+    !
+    ! Initialize the buffer ring. It is now a ring of 1 item.
+    !
+
+    file [fd_current_buffer] = 0;
+    alloc_buffer (.file);
+
+    !
+    ! Open the file
+    !
+
+    file [fd_length] = 0;
+
+    IF NOT open_file (.file, fn)
+    THEN
+        BEGIN
+        dealloc_buffer (.file);
+        nmu$memory_release (.file, file_data_block_allocation);
+        .error = .file [fd_error];
+        file_id = 0;
+        RETURN .file_id;
+        END;
+
+    !
+    ! Initialize the user's position in the file.
+    ! Initialize MX$FILE's position in the file.
+    ! Indicate that no seeks have been done yet.
+    !
+
+    file [fd_current_position] = 0;
+    file [fd_file_position] = 0;
+
+    %IF $tops20 %THEN		! I have to roll my own APPEND on TOPS-20...
+
+    IF .access EQL file_access_append_only
+    THEN
+        IF NOT seek_file( .file, .file [fd_length], .error)
+        THEN
+            RETURN 0;
+
+    %FI
+    !
+    ! Insert file block into the file table data base and return the
+    ! index into the data base
+    !
+
+    file_id = nmu$table_insert (file_table, .file);
+
+    %debug (FILE_TRACE,
+            (TRACE_INFO ('File id %O assigned to FD block at %O',
+                         .FILE_ID,
+                         .FILE)));
+
+    RETURN .file_id
+
+    END;				! End of MX$FILE_OPEN
+
+%global_routine ('MX$FILE_READ', FILE_ID, DEST_PTR, MAX_BYTES, ERROR) =
+
+!++
+! Functional description:
+!
+!        This routine reads a line of text, of maximum length specified
+!        by caller, from a file into callers buffer. The actual number
+!        of bytes read is returned to caller.
+!
+! Formal parameters:
+!
+!       .FILE_ID      File identifier
+!       .DEST_PTR     Pointer to buffer to receive the file data
+!       .MAX_BYTES    The maximum number of bytes to transfer
+!       .ERROR	      Pointer to error message buffer
+!
+! Implicit inputs: none
+!
+! Routine value:
+!
+!        gtr 0    Number of bytes actually read from file
+!        eql 0    End of file encountered
+!        lss 0    Error occured while reading file:
+!                 -1    Fatal I/O error of some sort
+!
+! Side effects: none
+!
+!--
+
+    BEGIN
+    OWN
+       file : REF file_data_block,
+       xfr_count,
+       eol_pointer,
+       done,
+       move_count;
+
+
+    %debug (FILE_TRACE,
+            (TRACE_INFO ('File id %O read request for %D bytes',
+                         .FILE_ID,
+                         .MAX_BYTES)));
+
+    !
+    ! Setup the file data base pointer
+    !
+
+    IF NOT nmu$table_fetch (file_table, .file_id, file)
+    THEN
+        BEGIN
+        %debug (FILE_TRACE,
+                (TRACE_INFO ('Table lookup of FD for FILE_ID %O failed',
+                             .FILE_ID)));
+        .error = uf$tlf;
+        RETURN -1
+        END;
+
+    done = $false;
+    xfr_count = 0;
+    DO
+      BEGIN
+      BIND
+          buffer = (file [fd_current_buffer]): REF buffer_data_block;
+
+      IF NOT .buffer [bd_valid]
+      THEN
+          IF NOT map_page (.file)
+          THEN
+              BEGIN
+              .error = .file [fd_error];
+              RETURN -1;
+              END;
+
+      move_count = MIN( .buffer [bd_remaining_count], .max_bytes );
+
+      eol_pointer = CH$FIND_SUB( .move_count, .buffer [bd_pointer],
+                                 2, crlf_pointer);
+
+      IF CH$FAIL (.eol_pointer)
+      THEN
+          BEGIN
+          IF .file [fd_length] EQL 0
+          THEN
+              move_count = 0
+          ELSE
+              IF CH$RCHAR(.buffer [bd_pointer]) EQL 0
+	      THEN
+	          move_count = 0;
+
+          IF (.buffer [bd_end_of_file] OR
+              (.buffer [bd_remaining_count] GEQ .max_bytes))
+          THEN
+              done = $true
+          ELSE
+              buffer [bd_valid] = $false;
+          END
+      ELSE
+          BEGIN
+          move_count = CH$DIFF(.eol_pointer, .buffer [bd_pointer]) + 2 ;
+          done = $true;
+          END;
+
+      transfer_bytes(.move_count, buffer [bd_pointer], dest_ptr);
+      IF .glerr NEQ 0
+      THEN
+          BEGIN
+          .error = .file[fd_error] = .glerr;
+          RETURN -1
+          END;
+
+      xfr_count = .xfr_count + .move_count;
+      max_bytes = .max_bytes - .move_count;
+
+      END
+    UNTIL .done;
+
+    RETURN .xfr_count
+    END;				! End of MX$FILE_READ
+
+%global_routine ('MX$FILE_WRITE', FILE_ID, SOURCE_PTR, WRITE_COUNT, ERROR) =
+
+!++
+! Functional description:
+!
+!	Writes a byte stream, of length specified by caller, into a file.
+!
+! Formal parameters:
+!
+!	.FILE_ID       File identifier
+!       .WRITE_COUNT   Number of bytes to write to the file
+!       .SOURCE_PTR    Pointer to byte string to be written to file
+!       .ERROR         The address to return the error code in.
+!
+! Implicit inputs: none
+!
+! Routine value:
+!
+!	$true    if data was written successfully to file
+!       $false   otherwise
+!
+! Side effects: none
+!
+!--
+
+    BEGIN
+
+    LOCAL
+         file : REF file_data_block,
+         move_count,
+         space_in_buffer;
+
+    %debug (FILE_TRACE,
+            (TRACE_INFO ('Write request on file id %O, %D bytes',
+                         .FILE_ID,
+                         .WRITE_COUNT)));
+
+    !
+    ! Setup pointer to file data base
+    !
+
+    IF NOT nmu$table_fetch (file_table, .file_id, file)
+    THEN
+        BEGIN
+        %debug (FILE_TRACE,
+                (TRACE_INFO ('Table lookup of FD for FILE_ID %O failed',
+                             .FILE_ID)));
+        .error = uf$tlf;
+        RETURN $false
+        END;
+
+    DO
+      BEGIN
+      BIND
+          buffer = (file [fd_current_buffer]): REF buffer_data_block;
+
+      IF NOT .buffer [bd_valid]
+      THEN
+          IF NOT map_page (.file)
+          THEN
+              BEGIN
+              .error = .file [fd_error];
+              RETURN $false;
+              END;
+
+      space_in_buffer =
+      %IF $tops20 %THEN
+          bytes_per_page - .buffer [bd_current_position];
+      %ELSE
+          .buffer [bd_remaining_count];
+      %FI
+
+      IF .space_in_buffer LSS .write_count
+      THEN
+          buffer [bd_valid] = $false;
+
+      move_count = MIN(.space_in_buffer, .write_count);
+      write_count = .write_count - .move_count;
+
+      transfer_bytes(.move_count, source_ptr, buffer [bd_pointer]);
+      IF .glerr NEQ 0
+      THEN
+          BEGIN
+          .error = .file[fd_error] = .glerr;
+          RETURN -1
+          END;
+      END
+    UNTIL .write_count LEQ 0;
+
+    file [fd_length] = MAX( .file [fd_length], .file [fd_current_position]);
+
+    RETURN $true
+
+    END;				! End of MX$FILE_WRITE
+
+%global_routine ('MX$FILE_SEEK', FILE_ID, BYTE_POSITION, ERROR) =
+
+!++
+! Functional description:
+!
+!	Sets the current position within a file to an arbitrary
+!       byte position. Subsequent reads or writes will begin at
+!       the new byte position within the file.
+!
+! Formal parameters:
+!
+!	.FILE_ID         File identifier
+!	.BYTE_POSITION   The byte offset at which the file is to positioned
+!
+! Implicit inputs: none
+!
+! Routine value:
+!
+!	$true     File positioned successfully
+!       $false    Invalid ID or failure during seek
+!
+! Side effects: none
+!
+!--
+
+    BEGIN
+    LOCAL
+         file : REF file_data_block;
+
+    %debug (FILE_TRACE,
+            (TRACE_INFO ('File id %O seek request to byte position %D',
+                         .FILE_ID,
+                         .BYTE_POSITION)));
+
+    !
+    ! Setup pointer to file data base
+    !
+
+    IF NOT nmu$table_fetch (file_table, .file_id, file)
+    THEN
+        BEGIN
+        %debug (FILE_TRACE,
+                (TRACE_INFO ('Table lookup of FD for FILE_ID %O failed',
+                             .FILE_ID)));
+        .error = uf$tlf;
+        RETURN -1
+        END;
+
+    IF NOT seek_file (.file, .byte_position, .error)
+    THEN
+        RETURN $false;
+
+    RETURN $true
+
+    END;				! End of MX$FILE_SEEK
+
+%routine ('SEEK_FILE', FILE: ref FILE_DATA_BLOCK, BYTE_POSITION, ERROR) =
+
+!++
+! Functional Description:
+!
+!     Sets the current position within a file to an arbitrary
+!     byte position.  Subsequent reads or writes will begin at
+!     the new byte position within the file.
+!
+! Formal Parameters:
+!
+!     .FILE            File Data Block
+!     .BYTE_POSITION   The byte offset at which the file is to be positioned.
+!     .ERROR           The address to return the error code in.
+!
+! Implicit Imputs: none
+!
+! Routine Value:
+!
+!     $TRUE     File positioned successfully.
+!     $FALSE    Invalid ID or failure during seek.
+!
+! Side effects: none
+!
+!--
+
+    BEGIN
+    !
+    ! Set current byte position within file.
+    !
+
+    file [fd_current_position] = .byte_position;
+
+%IF $tops20 %THEN
+
+    BEGIN
+    BIND
+        buffer = (.file [fd_current_buffer]): REF buffer_data_block;
+
+    IF .file [fd_access] EQL file_access_append_only
+    THEN
+        IF .file [fd_append_in_progress]
+        THEN
+            BEGIN
+            .error = uf$ifa;
+            RETURN $false;
+            END
+        ELSE
+            file [fd_append_in_progress] = $true;
+
+    IF .buffer [bd_valid]
+    THEN
+        IF NOT ((.byte_position GEQ .buffer [bd_file_position]) AND
+               (.byte_position LSS
+                 (.buffer [bd_file_position] + .buffer [bd_length])))
+        THEN
+            buffer [bd_valid] = $false;
+    END;
+
+%FI
+
+    %debug (FILE_TRACE,
+            (local
+                  CP;
+             CP = .FILE [FD_CURRENT_POSITION];
+             TRACE_INFO ('File at byte position %D',
+                         .CP)));
+
+   RETURN $true;
+   END;                               ! End of SEEK_FILE
+
+%global_routine ('MX$FILE_CLOSE', FILE_ID, ABORT, ERROR) =
+
+!++
+! Functional description:
+!
+!	Closes a file and invalidates further access. Resources are
+!       released and any buffered data is written to file.  If ABORT
+!	is set to 1, then the file is not updated.  *** WARNING ***
+!	ABORT = 1 does not work on TOPS-10 for APPEND mode access!
+!	If ABORT is set to 2, then the file is deleted...
+!
+! Formal parameters:
+!
+!	.FILE_ID    File identifier
+!       .ABORT      0 to keep, 1 to abort any changes
+!       .RSP_PTR    Pointer to NICE response buffer
+!
+! Implicit inputs: none
+!
+! Routine value:
+!
+!       $true     File closed successfully
+!       $false    Invalid file id or unable to close file
+!
+! Side effects: none
+!
+!--
+
+    BEGIN
+
+    LOCAL
+         file : REF file_data_block;
+
+    %debug (FILE_TRACE,
+            (TRACE_INFO ('File id %O close requested',
+                         .FILE_ID,)));
+
+    !
+    ! Setup pointer to file data base
+    !
+
+    IF NOT nmu$table_fetch (file_table, .file_id, file)
+    THEN
+        BEGIN
+        %debug (FILE_TRACE,
+                (TRACE_INFO ('Table lookup of FD for FILE_ID %O failed',
+                             .FILE_ID)));
+        .error = uf$tlf;
+        RETURN $false
+        END;
+
+    !
+    ! Set up and maintain the address of the current BD block
+    ! for the file.
+    !
+
+    BEGIN
+    !
+    ! Perform actions necessary to close the file.
+    !
+    $TRACE('Closing %A',CH$PTR(file[fd_name]));
+%IF $tops20 %THEN
+
+    unmap_page (.file);
+
+%FI
+
+    IF .abort EQL file_abort
+    THEN
+        file [fd_abort] = 1;
+
+    IF .abort EQL file_delete
+    THEN
+	file [fd_delete] = 1;
+
+    IF NOT close_file (.file)
+    THEN
+        BEGIN
+        .error = .file [fd_error];
+        RETURN $false;
+        END;
+
+    !
+    ! Deallocate all storage associated with the file.
+    ! Delete FD from table. Release storage for FD.
+    !
+
+    nmu$table_delete (file_table, .file_id);
+
+    dealloc_buffer (.file);
+
+    nmu$memory_release (.file, file_data_block_allocation);
+
+    %IF NOT $tops10 %THEN
+    %debug (FILE_TRACE,
+            (TRACE_INFO ('File on JFN %O closed',
+                         .FILE [FD_JFN])));
+
+    %FI
+
+    %IF $tops10 %THEN
+    %debug (FILE_TRACE,
+	    (TRACE_INFO ('File on channel %O closed',
+			 .FILE [FD_CHANNEL])));
+    %FI
+    END;                                ! End buffer context
+
+    RETURN $true
+
+    END;				! End of MX$FILE_CLOSE
+
+ROUTINE sljerr(ec): ercalr_linkage NOVALUE =
+    BEGIN
+    glerr = .ec;
+    END;
+
+%IF $tops20 %THEN
+REQUIRE 'newt20'
+%ELSE
+REQUIRE 'newt10'
+        %FI ;
+
+END
+ELUDOM

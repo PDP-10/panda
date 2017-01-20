@@ -1,0 +1,792 @@
+%TITLE 'U D 2  -- RMSUDR utilities'
+!<BLF/REQUIRE 'RMSBLF.REQ'>
+MODULE ud2 (IDENT = '2.0'
+		) =
+BEGIN
+
+GLOBAL BIND
+    ud2v = 2^24 + 0^18 + 400;			! Edit date: 22-Apr-83
+
+!+
+!
+!
+!    PURPOSE:     UTILITIES FOR RMSUDR.
+!
+!
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1977, 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+!
+!
+!    AUTHOR:	S. BLOUNT
+!
+!
+!    **********	TABLE OF CONTENTS	**************
+!
+!
+!
+!
+!    ROUTINE			FUNCTION
+!    =======			========
+!
+!    ALCRFA			ALLOCATE A NEW RFA FOR A RECORD
+!
+!    SHUFFLEIDS		SHUFFLE THE ID'S IN A DATA BUCKET
+!
+!    FBYRFA			FIND A RECORD GIVEN ITS RFA
+!
+!    FBYRRV			FOLLOW RRV RECORD TO RECORD GIVEN ITS RFA
+!
+!    SKIPRECORD		SKIP A DATA RECORD
+!
+!
+!
+!
+!    REVISION HISTORY:
+!
+!    EDIT	DATE		WHO	PURPOSE
+!    ====	====		===	========
+!
+!    1	24-AUG-76	JK	ADD 'UPDRRVS' ROUTINE.
+!    2	1-SEP-76	JK	REPLACE REFS TO ZERO ID BY 'NULLID'.
+!    3	1-SEP-76	JK	FIX 'UPDRRVS'.
+!    4	1-SEP-76	JK	FIX 'UPDRRVS' -- 'UPDBKD' SHOULD BE MAPPED 'FORMAT'.
+!    5	2-SEP-76	JK	REMOVE EDIT 3 (EDIT 4 FOUND REAL CULPRIT).
+!    6	2-SEP-76	JK	REMOVE EDIT 5, REINSTATE EDIT 3, UPDATE RRV REC. CORRECTLY.
+!    7	2-SEP-76	JK	'UPDRRVS' NOW HANDLES "RRV NOT FOUND" CORRECTLY.
+!    8	3-SEP-76	JK	SPLIT RMSUDR INTO RMSUDR, RMSUD2, RMSSPT.
+!    9	8-SEP-76	JK	SIMPLIFY 'FBYRFA'.
+!    10	19-OCT-76	SB	MAKE SKIPRECORD PROCESS SIDR'S
+!    11	28-OCT-76	SB	EDIT LOOKATFIELD, CLEAR RECPTR IN FBYRRV
+!    12	5-NOV-76	SB	FIX FBYRRV TO SET UP RRV FIELD IN RD
+!    13	11-NOV-76	SB	MAKE FBYRRV USE PRIMARY KDB ALWAYS
+!    14	30-DEC-76	SB	ADD LOCK-FLAG TO SKIPRECORD
+!    15	7-JAN-77	SB	ADD FLGREO TO SHUFFLEIDS
+!
+!    *************************************************
+!    *						*
+!    *		NEW REVISION HISTORY		*
+!    *						*
+!    *************************************************
+!
+!    PRODUCT	MODULE	 SPR
+!    EDIT	 EDIT	 QAR		DESCRIPTION
+!    ======	======	=====		===========
+!
+!	**  Begin RMS v2 Development **
+!
+!	400	400	xxxxx	    Clean up BLISS code (RL,22-Apr-83)
+!
+!    ***** END OF REVISION HISTORY *****
+!
+!
+!
+!
+!-
+
+REQUIRE 'rmsreq';
+
+%SBTTL 'ALCRFA - Allocate new RFA'
+
+GLOBAL ROUTINE alcrfa (bktdesc) =
+! ALCRFA
+! ======
+!
+! THIS ROUTINE ALLOCATES A NEW RFA FOR A RECORD WHICH IS BEING
+!	INSERTED INTO THE FILE. FOR MOST CASES, THIS ROUTINE IS
+!	TRIVIAL. BUT, IN SOME CASES WE MUST GARBAGE COLLECT THE
+!	RECORD ID'S IN THE BUCKET HEADER TO LOOK FOR A SPARE ONE.
+!
+! INPUT:
+!	BKTDESC		BUCKET DESCRIPTOR OF BUCKET WHERE RECORD IS TO GO
+!
+! OUTPUT:
+!	NOT FALSE:	RFA OF NEW RECORD
+!	FALSE:		ERROR
+!			ID'S RAN OUT (SHOULD NOT HAPPEN)
+!
+! INPUT ARGUMENTS MODIFIED:
+!	<NONE>
+!
+! BUCKET HEADER FIELDS MODIFIED:
+!	NEXTID
+!	LASTID (IF ID'S MUST BE SHUFFLED)
+!
+    BEGIN
+
+    REGISTER
+	newrfa : BLOCK [1],			! THE RFA OF RECORD
+	bktptr : REF BLOCK,
+	tempac;
+
+    MAP
+	bktdesc : REF BLOCK;
+
+    TRACE ('ALCRFA');
+
+    !+
+    !    SET UP A BUCKET POINTER
+    !-
+
+    bktptr = .bktdesc [bkdbktadr];
+
+    !+
+    !    PUT THE BUCKET NUMBER INTO THE NEW RFA
+    !-
+
+    newrfa<rh> = .bktdesc [bkdbktno];		! 'RH' STANDS FOR RFABUCKET IN BUCKET.REQ
+    newrfa<lh> = (tempac = .bktptr [bhnextid]);	! GET NEXT ID.'LH' STANDS FOR RFAID
+
+    !+
+    !    BUMP THE NEXT ID IN THE BUCKET HEADER AND CHECK IF IT'S TOO HIGH
+    !-
+
+    IF (bktptr [bhnextid] = .tempac + 1) GTR .bktptr [bhlastid]
+    THEN 					! Garbage collect on the IDs
+	BEGIN
+	rtrace (%STRING ('**	No ID found in bucket', 	!
+		%CHAR (13), %CHAR (10)));
+
+	IF (newrfa<lh> = shuffleids (.bktdesc)) EQL false	! LH stands for RFAID
+	THEN
+	    RETURN false
+
+	END;
+
+    !+
+    !    WE NOW HAVE OUR ID
+    !-
+
+    lookat ('	NEW RFA FOR RECORD: ', newrfa);
+    RETURN .newrfa
+    END;					! End ALCRFA
+
+%SBTTL 'SHUFFLEIDS - coalesce unused IDs'
+
+GLOBAL ROUTINE shuffleids (bktdesc) =
+! SHUFFLEIDS
+! ==========
+!
+! ROUTINE TO SCAN A DATA BUCKET IN SEARCH OF A "HOLE" OF UNUSED
+!	RECORD ID'S. THIS ROUTINE IS CALLED WHENEVER "NEXTID"
+!	IS GREATER THAN "LASTID" IN THE BUCKET HEADER. SUCH A
+!	SITUATION MEANS THAT WE MUST SCAN THE BUCKET TO SEE IF
+!	WE CAN COALESCE SOME OF THE UNUSED RECORD ID'S.
+!
+!	THERE ARE SEVERAL WAYS IN WHICH THIS COULD BE DONE. THE FULL
+!	BUCKET SCAN TO FIND THE LARGEST HOLE IS A VERY EXPENSIVE
+!	OPERATION (IT IS AN O(N**2) ALGORITHM....THAT MEANS THAT AS
+!	THE NUMBER (N) OF RECORDS IN THE BUCKET INCREASES, THE TIME
+!	TO SEARCH FOR THE LARGEST ID GOES UP AT A RATE OF N SQUARED).
+!	THEREFORE, WE WOULD LIKE TO SOMETHING WHICH WOULD SPEED UP
+!	THE SEARCH.  THE TECHNIQUE USED IN THIS ROUTINE IS TO SEARCH
+!	FOR ANY HOLE WHICH IS NON-EMPTY AND TO USE THE FIRST SUCH
+!	HOLE WHICH IS FOUND. THIS MEANS THAT THIS ROUTINE MAY
+!	HAVE TO BE CALLED A LITTLE MORE THAN WOULD OTHERWISE BE THE
+!	CASE, BUT EACH OPERATION WILL BE FAIRLY QUICK. ALSO, SINCE
+!	RECORDS AT THE TOP OF THE BUCKET WILL TEND TO BE OLDER, IT
+!	SEEMS REASONABLE THAT THEY ALSO WILL HAVE LOWER ID'S AND THUS
+!	WILL LIKELY GIVE RISE TO LARGER ID HOLES.
+!
+!	IF THIS ROUTINE IS CALLED, THEN THE FILE SHOULD BE RE-ORGANIZED.
+!	THIS IS BECAUSE THE RECORD SEARCH ALGORITHMS ASSUME THAT RECORD
+!	ID'S CANNOT BE RE-USED. IF THIS IS NOT TRUE, THEN A KEY
+!	COMPARISON MUST BE MADE WHENEVER THE CURRENT RECORD IS BEING
+!	LOCATED. THUS, TO AVOID THIS OVERHEAD, WE WILL TELL THE USER
+!	IF HIS ID'S RUN OUT THAT HE SHOULD RE-ORGANIZE THE FILE.
+!
+! INPUT:
+!	BKTDESC		BUCKET DESCRIPTOR OF BUCKET
+!
+! OUTPUT:
+!	NOT FALSE:	NEW ID TO USE
+!	FALSE:		NO ID'S LEFT IN BUCKET (SHOULD NOT HAPPEN)
+!
+! ROUTINES CALLED:
+!	<NONE>
+!
+    BEGIN
+
+    MAP
+	bktdesc : REF BLOCK;
+
+    LITERAL
+	minholesize = 2;			! HOLE MUST BE THIS BIG
+
+    REGISTER
+	lowid,					! CURRENT BASE LEVEL ID
+	tempac,					! TEMP
+	movingptr : REF BLOCK;			! USED TO SCAN THE BUCKET
+
+    LOCAL
+	bktptr : REF BLOCK,			! PTR TO TOP OF BUCKET
+	highid,					! CURRENT TOP OF HOLE ID
+	currentid,				! ID OF CURRENT RECORD
+	endptr : REF BLOCK,			! PTR TO END OF BUCKET
+	fixedptr : REF BLOCK;			! PTR TO CURRENT "LOWID" RECORD
+
+    TRACE ('SHUFFLEIDS');
+
+    !+
+    !    TELL HIM TO RE-ORGANIZE THE FILE
+    !-
+
+    setflag (fst [fstflags], flgreo);
+    usrsts = su$reo;				! SET UP SUCCESS CODE
+
+    !+
+    !    SET UP SOME POINTERS
+    !-
+
+    bktptr = .bktdesc [bkdbktadr];
+    fixedptr = .bktptr + bhhdrsize;		! POINT TO FIRST RECORD
+    endptr = .bktptr + .bktptr [bhnextbyte];	! END OF BUCKET
+
+    !+
+    !    SET UP SOME ID VALUES
+    !-
+
+    lowid = 0;					! LOWEST ID
+!+
+!    THIS IS THE MAIN LOOP. THIS WILL BE EXECUTED ONCE
+!    FOR EACH SCAN OF THE BUCKET. ONLY IF THE FIRST RECORD
+!    HAS AN ID WHICH IS 1 LESS THAN SOME OTHER RECORD
+!    WILL IT BE EXECUTED MORE THAN ONCE.
+!-
+    repeat
+
+    						! Find big enough hole
+	BEGIN
+	highid = highestid + 1;			! ASSUME BUCKET IS EMPTY
+	movingptr = .bktptr + bhhdrsize;	! START AT TOP
+
+	!+
+	!    SCAN THE BUCKET LOOP
+	!-
+
+	UNTIL .movingptr GEQ .endptr DO
+	    BEGIN
+	    lowid = .fixedptr [drrecordid] + 1;	! GET CURRENTID
+	    currentid = .movingptr [drrecordid];	! GET THIS ONE
+
+	    !+
+	    !    IS THIS A SMALLER HOLE?
+	    !-
+
+	    IF (.currentid LSS .highid) AND 	!
+		(.currentid GEQ .lowid)		!
+	    THEN 				! We have found a smaller hole
+		highid = .currentid;
+
+	    !+
+	    !    BUMP THE MOVING POINTER
+	    !-
+
+	    movingptr = .movingptr + sizeofanyrecord (movingptr)
+	    END;
+
+!+
+!    WE HAVE NOW SCANNED THE BUCKET ONCE LOOKING FOR HOLES.
+!    DID WE FIND ANY?
+!-
+	lookat ('	HIGHID: ', highid);
+	lookat ('	LOWID: ', lowid);
+
+	IF (.highid - .lowid) GEQ minholesize
+	THEN 					! Our hole is OK
+	    BEGIN
+	    rtrace (%STRING ('	FOUND NEW HOLE', %CHAR (13), %CHAR (10)));
+	    bktptr [bhnextid] = .lowid + 1;	! STORE NEXT ID
+	    bktptr [bhlastid] = .highid - 1;
+	    RETURN .lowid			! VALUE IS THIS ID
+	    END;
+
+	rtrace (%STRING ('**	Hole is not big enough', 	!
+		%CHAR (13), %CHAR (10)));
+
+	!+
+	!    BUMP THE FIXED PTR TO THE NEXT RECORD
+	!-
+
+	fixedptr = .fixedptr + sizeofanyrecord (fixedptr);
+
+	!+
+	!    IS WE ARE PAST THE END OF THE BUCKET...WE HAVE PROBLEMS
+	!-
+
+	IF .fixedptr GEQ .endptr THEN rmsbug (msgptr)
+
+	END;
+
+    rmsbug (msgcantgethere);
+    0
+    END;					! End SHUFFLEIDS
+
+%SBTTL 'FBYRFA - find record using RFA'
+
+GLOBAL ROUTINE fbyrfa (recdesc, bktdesc, p_lockflag) =
+! FBYRFA
+! ======
+!
+!	     THIS ROUTINE WILL FIND A RECORD GIVEN ITS RFA ( THIS
+!	INCLUDES MAPPING THE OBJECT BUCKET).
+!
+! INPUT:
+!	RECDESC = BASE ADDRESS OF RECORD DESCRIPTOR CONTAINING RFA
+!		RFA = RFA TO SEARCH FOR
+!	BKTDESC = BASE ADDRESS OF BUCKET DESCRIPTOR (EMPTY)
+!	LOCKFLAG = FLAG FOR LOCKING OF BUCKET
+!
+! OUTPUT:
+!	TRUE = FOUND RECORD
+!	FALSE = RECORD NOT FOUND,
+!	        CAN'T GET BUCKET
+!
+! ARGUMENTS MODIFIED:
+!	RECDESC [ RECPTR ] = ADDRESS OF RECORD
+!	BKTDESC = ALL FIELD VALUES WILL BE FILLED IN
+!
+! NOTES:
+!
+!	1.	IF THIS ROUTINE FAILS IN ANY WAY, THE BUCKET
+!		WHICH WAS USED WILL BE RETURNED TO THE BUCKET
+!		MANAGER. THUS, IF THIS ROUTINE RETURNS "TRUE",
+!		THE CALLER MUST DISPOSE OF THE BUCKET, IF IT
+!		RETURNS "FALSE", THERE IS NO BUCKET TO DISPOSE OF.
+    BEGIN
+
+    BIND
+	lockflag = .p_lockflag;
+
+    LOCAL
+	bktno,					! A BUCKET NUMBER
+	bktsize,				! A BUCKET SIZE
+	rfa : BLOCK [1];			! AN RFA
+
+    MAP
+	recdesc : REF BLOCK,
+	bktdesc : REF BLOCK;
+
+    TRACE ('FBYRFA');
+
+    !+
+    !    GET THE BUCKET CONTAINING THE SPECIFIED RFA
+    !-
+
+    rfa = .recdesc [rdrfa];			! GET RFA
+    lookat ('	TRY TO FIND RFA: ', rfa);
+    bktno = .rfa [rfabucket];			! GET BUCKET NUMBER
+    bktsize = .kdb [kdbdbkz];			! GET BUCKET SIZE
+!+
+!    DO A SPECIAL CHECK HERE TO INSURE BUCKET NUMBER IS
+!    WITHIN THE SPACE OF THE FILE
+!-
+
+    IF .bktno LSS lowestbktnum THEN returnstatus (er$rfa);	! BAD RFA
+
+    !+
+    !    GET A BUFFER AND MAP BUCKET
+    !-
+
+    IF getbkt (.bktno, 				! Bucket number
+	    .bktsize, 				! Bucket size
+	    .lockflag, 				! Lock flag
+	    .bktdesc) EQL false			! Bucket
+    THEN
+	RETURN false;
+
+    lookat ('	GOT BKT: ', bktno);
+
+    !+
+    !    FIND THE RECORD(RFA) IN THE BUCKET
+    !-
+
+    lookat ('	START SEARCH AT: ', recdesc [rdrecptr]);
+
+    IF sdatabkt (.recdesc, .bktdesc) EQL false
+    THEN
+	BEGIN					! Return bucket if search fails
+	putbkt (false, .bktdesc);
+	RETURN false
+	END;
+
+    lookat ('	FOUND RECORD AT: ', recdesc [rdrecptr]);
+
+    !+
+    !    DONE
+    !-
+
+    RETURN true
+    END;					! End FBYRFA
+
+%SBTTL 'FBYRRV - find record using RRV'
+
+GLOBAL ROUTINE fbyrrv (recdesc, databd) =
+! FBYRRV
+! ======
+!
+! ROUTINE TO LOCATE A USER DATA RECORD IN AN INDEXED FILE
+!	THRU ITS RRV ADDRESS. IF THERE IS NO RRV RECORD
+!	ASSOCIATED WITH THE DATA RECORD, THEN THIS ROUTINE
+!	PERFORMS IDENTICALLY TO FBYRFA. HOWEVER, IF THERE
+!	IS A LEVEL OF INDIRECTION (I.E., THERE IS AN RRV
+!	RECORD), THEN THIS ROUTINE MUST LOCATE BOTH THE
+!	RRV AND THE DATA RECORD.
+!
+! INPUT:
+!	RECDESC		RECORD DESCRIPTOR PACKET
+!		RFA		RFA TO SEARCH FOR
+!		RECPTR		<IGNORED>
+!
+!	DATABD		BUCKET DESCRIPTOR OF DATA (RETURNED)
+!
+! OUTPUT:
+!	TRUE:	RECORD FOUND
+!	FALSE:	ERROR
+!		BUCKET BUSY
+!		RECORD NOT FOUND
+!
+! ARGUMENTS MODIFIED:
+!	RECDESC:
+!		RECPTR		ADDRESS OF DATA RECORD
+!		RRV		RFA OF THE RRV RECORD FOUND
+!
+! NOTES:
+!
+!	1.	IF THE DATA RECORD IS FOUND, THE RRV BUCKET WILL
+!		BE UNLOCKED.
+!
+!	2.	THE BUCKET SEARCH IS ALWAYS FROM THE TOP OF THE BUCKET.
+!
+!	3.	NOTE THAT THE RRV ADDRESS IS RETURNED IN THE RRV
+!		FIELD OF THE RECORD DESCRIPTOR.
+    BEGIN
+
+    MAP
+	recdesc : REF BLOCK,
+	databd : REF BLOCK;
+
+    LOCAL
+	rrvbd : BLOCK [bdsize],
+	savedkdb,				! SAVE THE KDB ON ENTRANCE
+	savedstatus;				! WE MUST REMEMBER THE STATUS
+
+    LABEL
+	loop;					! USE A LOOP TO JUMP OUT OF
+
+    REGISTER
+	recordptr : REF BLOCK;
+
+    TRACE ('FBYRRV');
+    lookat ('	TRYING TO FIND RRV: ', recdesc [rdrfa]);
+
+    !+
+    !    INSURE THAT THE SEARCH WILL START AT TOP OF BUCKET
+    !-
+
+    recdesc [rdrecptr] = 0;
+!+
+!    SINCE THIS ROUTINE CAN OPERATE ONLY ON THE PRIMARY
+!    DATA RECORDS, WE CAN SAVE THE CALLER SOME TROUBLE BY
+!    ALWAYS USING THE PRIMARY KEY DESCRIPTOR BLOCK.
+!    HOWEVER, THIS MEANS THAT WE MUST CREATE A DUMMY LOOP
+!    TO EXIT FROM SO WE CAN RESTORE THE OLD KDB.
+!-
+    savedkdb = .kdb;				! SAVE THIS ONE
+    kdb = .fst [fstkdb];			! SET UP PRIMARY
+
+    !+
+    !    DUMMY LOOP
+    !-
+
+loop :
+    BEGIN
+
+    !+
+    !    TRY TO LOCATE THE DATA RECORD
+    !-
+
+    IF (savedstatus = fbyrfa (.recdesc, .databd, false)) EQL false
+
+	!+
+	!    COULD WE FIND IT?
+	!-
+
+    THEN
+	LEAVE loop WITH .savedstatus;
+
+!+
+!    WE FOUND A RECORD. WE MUST SEE IF IT IS A DATA RECORD
+!    OR AN RRV RECORD
+!-
+    recordptr = .recdesc [rdrecptr];
+
+    !+
+    !    STORE THE ADDRESS OF THE RRV IN THE RECORD DESCRIPTOR
+    !-
+
+    recdesc [rdrrv] = .recdesc [rdrfa];		! GET RRV ADDRESS
+
+    IF rrvflag (recordptr) EQL 0
+    THEN 					! This is the data record
+	LEAVE loop WITH (savedstatus = true);
+
+    !+
+    !    THIS IS AN RRV RECORD. WE MUST GO ONE MORE LEVEL
+    !-
+
+    rtrace (%STRING ('	RRV RECORD FOUND...', %CHAR (13), %CHAR (10)));
+    recdesc [rdrfa] = .recordptr [drrrvaddress];
+    movebktdesc (databd, rrvbd);
+    recdesc [rdrecptr] = 0;			! START AT TOP
+    savedstatus = fbyrfa (.recdesc, .databd, false);
+
+    !+
+    !    SAVE THE CURRENT STATUS
+    !-
+
+!+
+!    RELEASE THE RRV BUCKET, REGARDLESS OF WHETHER WE MADE
+!    AN ERROR OR NOT
+!-
+    putbkt (false, 				! No update
+	rrvbd)					! RRV bucket
+    END;					! OF THE DUMMY LOOP
+    kdb = .savedkdb;
+    RETURN .savedstatus
+    END;					! End FBYRRV
+
+%SBTTL 'SKIPRECORD - get next data record'
+
+GLOBAL ROUTINE skiprecord (recdesc, databd, p_lockflag) =
+! SKIPRECORD
+! ==========
+!
+! ROUTINE TO ADVANCE TO THE NEXT DATA RECORD ( UDR OR SIDR )
+!	IN AN INDEXED FILE. THIS ROUTINE WILL NOT SKIP OVER
+!	DELETED RECORDS BUT WILL IGNORE EMPTY BUCKETS AND
+!	RRV RECORDS.
+!
+! INPUT:
+!	RECDESC		RECORD DESCRIPTOR PACKET
+!		RECPTR		ADDRESS OF CURRENT RECORD
+!
+!	DATABD		BUCKET DESCRIPTOR OF DATA BUCKET
+!	LOCKFLAG	FLAG FOR LOCKING OF BUCKET
+!		TRUE		LOCK THE BUCKET
+!		FALSE		DONT LOCK THE BUCKET
+!
+! OUTPUT:
+!	TRUE:	NEXT RECORD FOUND
+!	FALSE:	COULD NOT GET NEXT RECORD
+!			BUCKET BUSY (BUSY FLAG WILL BE SET)
+!			NO NEXT BUCKET (END OF CHAIN)
+!
+! NOTES:
+!	1.	THIS ROUTINE WILL UNLOCK EACH BUCKET
+!		THAT IT PROCESSES WHEN IT MOVES TO THE
+!		NEXT BUCKET. HOWEVER, IT WILL ALWAYS
+!		RETURN A VALID BUCKET (I.E., IT WILL NEVER
+!		RELEASE ALL BUCKETS).
+!
+!
+!
+! INPUT ARGS MODIFIED:
+!	RECORD DESCRIPTOR:
+!		RECPTR		ADDRESS OF NEW RECORD
+!		LASTRECPTR	SAME AS RECPTR ON INPUT
+    BEGIN
+
+    BIND
+	lockflag = .p_lockflag;
+
+    MAP
+	recdesc : REF BLOCK,
+	databd : REF BLOCK;
+
+    LABEL
+	loop;
+
+    LOCAL
+	nextbd : BLOCK [bdsize],		! BKT DESC OF NEXT BKT IN CHAIN
+	endptr : REF BLOCK,			! PTR TO END OF BUCKET
+	bktptr : REF BLOCK,			! PTR TO THIS BUCKET
+	datarecordptr : REF BLOCK;		! PTR TO DATA RECORD
+
+    REGISTER
+	movingptr : REF BLOCK,
+	tempac;
+
+    TRACE ('SKIPRECORD');
+
+    !+
+    !    FETCH THE BEGINNING POINTER
+    !-
+
+    recdesc [rdlastrecptr] = (movingptr = .recdesc [rdrecptr]);
+!+
+!    ADVANCE TO THE NEXT RECORD...BUT FIRST, SOME
+!    RANDOM CONSISTENCY CHECKS
+!-
+
+%IF dbug
+%THEN
+
+    IF (rrvflag (movingptr) NEQ 0) THEN rmsbug (msgptr);
+
+%FI
+
+    !+
+    !    BUMP THE POINTER PAST THIS RECORD
+    !-
+
+    movingptr = .movingptr + sizeofdatarecrd (movingptr);
+!+
+!    WE ARE NOW AT THE RECORD PAST THE ONE WE ENTERED
+!    WITH. WE WILL DO THIS LOOP UNTIL ONE OF THE FOLLOWING:
+!
+!    1.	END OF CHAIN IS FOUND
+!    2.	A DATA RECORD IS FOUND
+!    3.	NEXT BUCKET IS LOCKED
+!
+!
+!-
+loop :
+    BEGIN
+    repeat
+
+	BEGIN
+
+	!+
+	!    GET THE ADDRESS OF CURRENT RECORD
+	!-
+
+	recdesc [rdrecptr] = .movingptr;	! STORE IN CASE THIS IS END OF BKT
+	rtrace (%STRING ('	STARTING ITERATION...', %CHAR (13), %CHAR (10)));
+	bktptr = .databd [bkdbktadr];
+	endptr = .bktptr + .bktptr [bhnextbyte];
+	lookat ('	END OF BKT AT: ', endptr);
+	lookat ('	MOVINGPTR: ', movingptr);
+
+	!+
+	!    **CONSISTENCY CHECK**
+	!-
+
+	IF ((.movingptr LEQ .bktptr) OR (.movingptr GTR .endptr)) THEN rmsbug (msgptr);
+
+!+
+!    NOW, DO THE BIG CHECK. ARE WE NOT AT THE END,
+!    AND IS THIS A DATA RECORD ?
+!-
+
+	IF ((.movingptr LSS .endptr) AND (rrvflag (movingptr) EQL 0)) THEN LEAVE loop;	! FOUND IT
+
+!+
+!    WE ARE EITHER AT THE END OF THE BUCKET, OR WE
+!    ARE AT AN RRV. CHECK TO SEE IF THERE IS ANOUTHER
+!    BUCKET IN THE CHAIN
+!-
+	rtrace (%STRING ('	REACHED END OF BUCKET...', %CHAR (13), %CHAR (10)));
+
+	!+
+	!    IS THIS THE END OF THE CHAIN?
+	!-
+
+	IF chkflag (bktptr [bhflags], bhflgend) NEQ 0
+	THEN 					! End of chain
+	    BEGIN
+	    rtrace (%STRING ('	End of chain found...', 	!
+		    %CHAR (13), %CHAR (10)));
+	    setpastlastflag (recdesc);
+	    returnstatus (er$eof)		! RETURN ERROR CODE
+	    END;
+
+!+
+!    THERE IS ANOTHER BUCKET. WE MUST LOCK IT BEFORE
+!    WE UNLOCK THIS ONE
+!-
+
+	IF gtnbkt (.databd, 			! This bucket
+		nextbd, 			! Next one
+		.lockflag) EQL false		! Lock
+	THEN
+	    RETURN false;
+
+!+
+!    WE CAN NOW UNLOCK THE CURRENT BUCKET SINCE
+!    WE HAVE GOTTEN THE NEXT BUCKET
+!-
+	putbkt (false, .databd);
+
+	!+
+	!    MAKE THE NEXT BUCKET OUR CURRENT BUCKET
+	!-
+
+	movebktdesc (nextbd, databd);
+!+
+!    SET THE POINTER BACK TO THE START OF THIS
+!    BUCKET
+!-
+	movingptr = .databd [bkdbktadr] + bhhdrsize
+	END;
+
+    END;					! Of REPEAT loop
+!+
+!    AT THIS POINT, WE HAVE REACHED A DATA RECORD. WE NOW MUST
+!    COMPARE THE KEY OF THIS RECORD TO THE SEARCH KEY SO AS
+!    TO SET THE COMPARISON BITS. ALSO, WE NEED TO SET THE
+!    DELETED FLAG IF THIS RECORD IS DELETED.
+!-
+
+    !+
+    !    SET OR CLEAR THE DELETED FLAG
+    !-
+
+    tempac = .recdesc [rdstatus];
+    clrflag (tempac, rdflgdelete);
+
+    IF (chkflag (movingptr [drflags], flgdelete) NEQ 0) THEN setflag (tempac, rdflgdelete);
+
+    recdesc [rdstatus] = .tempac;
+
+    !+
+    !    MOVE THE RFA OF THIS RECORD INTO THE RECORD DESCRIPTOR
+    !-
+
+    recdesc [rdrfa] = makerfa (.databd [bkdbktno], .movingptr [drrecordid]);
+
+    !+
+    !    COMPARE THE KEYS
+    !-
+
+    datarecordptr = .movingptr + .kdb [kdbhsz];	! USE LOCAL TO PASS IT
+
+    IF .kdb [kdbref] EQL refprimary
+    THEN
+	ckeyku (.recdesc, 			! Search key
+	    .datarecordptr)			! Target
+    ELSE 					! This is a secondary record
+	ckeykk (.recdesc, 			! Search key
+	    .datarecordptr);			! Target
+
+    RETURN true
+    END;					! End SKIPRECORD
+
+END
+
+ELUDOM
+ 

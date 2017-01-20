@@ -1,0 +1,183 @@
+;;; This is a -*-Lisp-*- file.
+
+(in-package 'lisp)
+
+(export '(*evalhook* *applyhook* proclaim unproclaim prog prog* *prompt*
+	  ++ +++ ** *** // /// ))
+;;+, *, and / are exported already (as functions).
+
+;Selected functions from Spice Lisp EVAL.SLISP.  The rest of the functions
+;from that file are BOOT.MID in assembly language.  Two functions are
+;commented out because they invoke DEFMACRO.
+
+;;; The lexical environment is represented by four a-lists, stored in four
+;;; internal special variables.  (The user should never mess with these.)
+
+;;; %VENV% is the current lexical environment for variables.  An entry
+;;; of the form (var . value) indicates a lexical variable and its value.
+;;; An entry whose value is %INTERNAL-SPECIAL-MARKER% says to use the
+;;; symbol's special value instead.
+
+(defvar %venv% nil
+  "The interpreter's lexical environment for variables -- hands off!")
+
+
+;;; %FENV% is the current lexical environment for functions and macros.
+;;; The format of each entry is (name type . fn), where type is either
+;;; FUNCTION or MACRO and fn is the actual definition to be used.
+;;; Entries of type function are created by FLET and LABELS.  Entries of
+;;; type macro are created by MACROLET.
+
+(defvar %fenv% nil
+  "The interpreter's lexical environment for functions -- hands off!")
+
+
+;;; %BENV% is the current lexical environment for block names.  Each entry
+;;; is (name).  The cons cell is used as a catch tag by return-from.  If
+;;; the entry has been clobbered to look like (NAME . INVALID), then the
+;;; block has been exited and a return from that block is in error.
+
+(defvar %benv% nil
+  "The interpreter's lexical environment for block names -- hands off!")
+
+
+;;; %GENV% is the current lexical environment for Go-tags.  Each entry 
+;;; looks like (tag marker . body) where tag is the Go tag, marker is a
+;;; unique cons cell used as a catch tag, and body is the statement sequence
+;;; that follows the GO tag.
+
+(defvar %genv% nil
+  "The interpreter's lexical environment for go tags -- hands off!")
+
+
+
+
+(defvar *evalhook* nil
+  "Used to substitute another function for EVAL, for use by STEP, etc.
+  If *EVALHOOK* is not NIL, its value must be a function of the same
+  form as *EVAL.  This function does the evaluation instead of EVAL.")
+
+(defvar *applyhook* nil
+  "Used to substitute another function for the implicit APPLY normally done
+  within EVAL.  If *APPLYHOOK* is not NIL, its value must be a function 
+  which takes as arguments the function to be applied, the list of arguments
+  it is to be applied to, and additional environment arguments suitable for
+  passing to *EVAL.  This function does the application instead of EVAL.")
+
+(defvar *skip-evalhook* nil
+  "Used with non-null *EVALHOOK* to suppress the use of the hook-function
+  for one level of eval.")
+
+(defvar *skip-applyhook* nil
+  "Used with non-null *APPLYHOOK* to suppress the use of the hook function
+  for one level of eval.")
+
+
+;;;; TOP-LEVEL loop.
+
+(defvar / nil
+  "Holds a list of all the values returned by the most recent top-level EVAL.")
+(defvar // nil "Gets the previous value of / when a new value is computed.")
+(defvar /// nil "Gets the previous value of // when a new value is computed.")
+(defvar * nil "Holds the value of the most recent top-level EVAL.")
+(defvar ** nil "Gets the previous value of * when a new value is computed.")
+(defvar *** nil "Gets the previous value of ** when a new value is computed.")
+(defvar + nil "Holds the value of the most recent top-level READ.")
+(defvar ++ nil "Gets the previous value of + when a new value is read.")
+(defvar +++ nil "Gets the previous value of ++ when a new value is read.")
+(defvar - nil "Holds the form curently being evaluated.")
+(defvar *prompt* "CL>" "The top-level prompt string.")
+(defvar %temp% nil "Random temporary, clobbered by top level loop.")
+
+(defun %top-level ()
+  "Top-level READ-EVAL-PRINT loop.  Do not call this."
+  (let  ((this-eval nil) (* nil) (** nil) (*** nil)
+	 (- nil) (+ nil) (++ nil) (+++ nil)
+	 (/// nil) (// nil) (/ nil) (%temp% nil))
+    (prog ()
+      OUTER-LOOP
+      (catch 'top-level-catcher
+       (catch 'break-loop-catcher
+	(progn
+	 ;; Prevent the user from irrevocably wedging the hooks.
+	 (setq *evalhook* nil)
+	 (setq *applyhook* nil)
+	   (prog ()
+	    INNER-LOOP
+	    (fresh-line)
+	    (let ((*print-circle* nil)
+		  (*print-pretty* nil))
+	      (declare (special *print-circle* *print-pretty*))
+	      (princ *prompt*))
+	    (setq +++ ++ ++ + + - - (read))
+	    (setq this-eval (multiple-value-list (eval -)))
+	    (setq /// // // / / this-eval)
+	    (setq %temp% (car this-eval))
+	    ;; Make sure nobody passes back an unbound marker.
+	    (unless (boundp '%temp%)
+		    (setq %temp% nil)
+		    (cerror "Go on, but set * to NIL."
+			    "Eval returned an unbound marker."))
+	    (setq *** ** ** * * %temp%)
+	    (dolist (x this-eval)
+	      (fresh-line)
+	      (prin1 x))
+	    (terpri)
+	    (go inner-loop)))))
+      (go outer-loop))))
+
+
+;;;; Random special forms.
+
+;;; Assorted functions open-coded by the compiler but needed by the
+;;; interpreter. 
+
+(defun proclaim (proclamation)
+  "PROCLAIM is a top-level form used to pass assorted information to the
+  compiler.  This interpreter ignores proclamations except for those
+  declaring variables to be SPECIAL."
+  (if (and (listp proclamation) (eq (car proclamation) 'special))
+      (do ((vars (cdr proclamation) (cdr vars)))
+	  ((atom vars))
+	  (and (symbolp (car vars))
+	       (%put (car vars) 'globally-special t)))))
+
+(defun unproclaim (proclamation)
+  "Undoes the effect of certain proclamations."
+  (if (and (listp proclamation) (eq (car proclamation) 'special))
+      (do ((vars (cdr proclamation) (cdr vars)))
+	  ((atom vars))
+	  (and (symbolp (car vars))
+	       (remprop (car vars) 'globally-special)))))
+
+
+
+;;;  PROG and friends
+
+
+(defun parse-bodye (body)
+  (do ((b body (cdr b))
+       (decls nil)
+       (temp nil))
+      ((null b) (list (nreverse decls) nil))
+    (cond ((not (listp (setq temp (car b))))
+	   (return (list (nreverse decls) b)))
+	  ((eq (car temp) 'declare)
+	   (dolist (x (cdr temp)) (push x decls)))
+	  (t (return (list (nreverse decls) b))))))
+
+(macro prog* (l)
+  (let* ((pb (parse-bodye (cddr l)))
+	 (decls (car pb))
+	 (body (cadr pb)))
+    `(let* ,(cadr l)
+       (declare ,@decls)
+       (block nil (tagbody ,@body)))))
+
+(macro prog (l)
+  (let* ((pb (parse-bodye (cddr l)))
+	 (decls (car pb))
+	 (body (cadr pb)))
+    `(let ,(cadr l)
+       (declare ,@decls)
+       (block nil (tagbody ,@body)))))

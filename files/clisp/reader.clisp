@@ -1,0 +1,393 @@
+;;; This is a -*-Lisp-*- file.
+
+;;; **********************************************************************
+;;; This code was written as part of the Spice Lisp project at
+;;; Carnegie-Mellon University, and has been placed in the public domain.
+;;; If you want to use this code or any part of Spice Lisp, please contact
+;;; Scott Fahlman (FAHLMAN@CMUC). 
+;;; **********************************************************************
+
+;;; Spice Lisp Reader 
+;;; Written by David Dill
+;;; Package system interface by Lee Schumacher.
+;;; Runs in the standard Spice Lisp environment.
+
+;;; ****************************************************************
+
+(in-package 'lisp)
+
+(export '(*readtable* copy-readtable set-syntax-from-char set-macro-character
+	  get-macro-character make-dispatch-macro-character
+	  set-dispatch-macro-character get-dispatch-macro-character
+	  *read-default-float-format* parse-integer read-from-string))
+
+
+;;; Spice Lisp specific hacks.
+;;; This macro can be replaced by the obvious system function.
+
+(defmacro reader-fast-int-char (char)
+  ;;no type checking.  Assumes no funny font, bits.
+  `(%sp-make-immediate-type ,char %character-type))
+
+;;;Random global variables
+
+(defvar *read-default-float-format* 'single-float "Float format for 1.0E1")
+
+(defvar *readtable* () "Variable bound to current readtable.")
+
+;;;Readtable implementation: the readtable is a structure with three
+;;;components: the CHARACTER-ATTRIBUTE-TABLE is a vector of 128 integers
+;;;for describing the character type.  Conceptually, there are 6 distinct
+;;;"primary" character attributes (WHITESPACE, CONSTITUENT, SINGLE ESCAPE,
+;;;MULTIPLE ESCAPE, TERMINATING MACRO, NON-TERMINATING MACRO),
+;;;and a number of "secondary" attributes that are used by the
+;;;function READ-QUALIFIED-TOKEN, which apply only when the primary
+;;;attribute is CONSTITUENT.  In order to make the READ-QUALIFIED-TOKEN
+;;;fast, all this information is stored in the character attribute table by
+;;;having different varieties of constituents.  In order to conform with
+;;;the white pages, the primary attributes should be moved by
+;;;SET-SYNTAX-FROM-CHARACTER and SET-MACRO-CHARACTER, while the secondary
+;;;attributes are constant properties of the characters (as long as they
+;;;are constituents).
+
+
+;;;The CHARACTER-MACRO-TABLE is a vector of 128 functions.  One of these
+;;;functions called with appropriate arguments whenever any non-WHITESPACE
+;;;character is encountered inside READ-PRESERVING-WHITESPACE.  These
+;;;functions are used to implement user-defined read-macros, system
+;;;read-macros, and the number-symbol reader.  Note that any character
+;;;that does not have a read macro definition gets READ-TOKEN as its
+;;;macro definition.  Finally, there is a
+;;;DISPATCH-TABLES entry, which is an alist from dispatch characters to
+;;;vectors of 128 functions, for use in defining dispatching macros (like
+;;;#-macro).
+
+(defvar std-lisp-readtable ()
+  "Standard lisp readtable. This is for recovery from broken
+   read-tables, and should not normally be user-visible.")
+
+(defstruct (readtable
+	    (:conc-name nil)
+	    (:predicate readtablep))
+  (character-attribute-table (make-character-attribute-table)
+			     :type simple-vector)
+  (character-macro-table (make-character-macro-table)
+			 :type simple-vector)
+  (dispatch-tables () :type list))
+
+;;;Constants for character attributes.  These are all as in the manual.
+(eval-when (compile load eval)
+
+  (defconstant whitespace 0)
+  (defconstant terminating-macro 1)
+  (defconstant non-terminating-macro 2)
+  (defconstant escape 3)
+  (defconstant multiple-escape 4)
+  (defconstant constituent 5)
+  (defconstant constituent-dot 6)
+  (defconstant constituent-expt 7)
+  (defconstant constituent-slash 8)
+  (defconstant constituent-digit 9)
+  (defconstant constituent-letter-digit 10)
+  (defconstant constituent-decimal-digit 11)
+  (defconstant constituent-sign 12)
+  (defconstant package-delimiter 13)
+  (defconstant illegal 14))
+
+(defvar *old-package* ()
+  "Value of *package* at the start of the last read or Nil.")
+
+;;; In case we get an error trying to parse a symbol, we want to rebind the
+;;; above stuff so it's cool.
+
+
+
+(proclaim '(special *package* *keyword-package* *read-base*))
+
+;;;macros and functions for character tables.
+
+(defmacro get-cat-entry (char rt)
+  ;;only give this side-effect-free args.
+  `(elt (the simple-vector (character-attribute-table ,rt))
+	(char-int ,char)))
+
+(defun set-cat-entry (char newvalue &optional (rt *readtable*))
+  (setf (elt (the simple-vector (character-attribute-table rt))
+	     (char-int char))
+	newvalue))
+
+(defmacro get-cmt-entry (char rt)
+  `(elt (the simple-vector (character-macro-table ,rt))
+	(char-int ,char)))
+
+(defun set-cmt-entry (char newvalue &optional (rt *readtable*))
+  (setf (elt (the simple-vector (character-macro-table rt))
+	     (char-int char))
+	newvalue))
+
+(defun make-character-attribute-table ()
+  (make-array 128 :element-type t :initial-element #.constituent))
+
+(defun make-character-macro-table ()
+  (make-array 128 :element-type t
+		      :initial-element #'undefined-macro-char))
+
+(defun undefined-macro-char (ignore char)
+  (error "Undefined read-macro character ~S" char))
+
+
+;;;The character attribute table is a 128-long vector of integers. 
+
+(defmacro test-attribute (char whichclass rt)
+  `(= (get-cat-entry ,char ,rt) ,whichclass)))
+
+;;;Predicates for testing character attributes
+
+(defmacro whitespacep (char &optional (rt '*readtable*))
+  `(test-attribute ,char #.whitespace ,rt))
+
+(defmacro constituentp (char &optional (rt '*readtable*))
+  `(>= (get-cat-entry ,char ,rt) #.constituent))
+
+(defmacro terminating-macrop (char &optional (rt '*readtable*))
+  `(test-attribute ,char #.terminating-macro ,rt))
+
+(defmacro non-terminating-macrop (char &optional (rt '*readtable*))
+  `(test-attribute ,char #.non-terminating-macro ,rt))
+
+(defmacro escapep (char &optional (rt '*readtable*))
+  `(test-attribute ,char #.escape ,rt))
+
+(defmacro multiple-escape-p (char &optional (rt '*readtable*))
+  `(test-attribute ,char #.multiple-escape ,rt))
+
+(defmacro token-delimiterp (char &optional (rt '*readtable*))
+  ;;depends on actual attribute numbering above.
+  `(<= (get-cat-entry ,char ,rt) #.terminating-macro))
+
+(defvar secondary-attribute-table ())
+
+(defun set-secondary-attribute (char attribute)
+  (setf (elt (the simple-vector secondary-attribute-table) (char-int char))
+	attribute))
+
+
+(defmacro get-secondary-attribute (char)
+  `(elt (the simple-vector secondary-attribute-table)
+	(char-int ,char)))
+
+(defun copy-readtable (&optional (from-readtable *readtable*) to-readtable)
+  "A copy is made of FROM-READTABLE, which defaults to the current readtable.
+  If FROM-READTABLE is NIL, then a copy of a standard Common Lisp readtable
+  is made.  If TO-READTABLE is unsupplied or NIL, a fresh copy is made.
+  Otherwise, TO-READTABLE must be a readtable, which is destructively copied
+  into."
+  (if (null from-readtable) (setq from-readtable std-lisp-readtable))
+  (if (null to-readtable) (setq to-readtable (make-readtable)))
+  ;;physically clobber contents of internal tables.
+  (replace (character-attribute-table to-readtable)
+	   (character-attribute-table from-readtable))
+  (replace (character-macro-table to-readtable)
+	   (character-macro-table from-readtable))
+  (setf (dispatch-tables to-readtable)
+	(mapcar #'(lambda (pair) (cons (car pair)
+				       (copy-seq (cdr pair))))
+		(dispatch-tables from-readtable)))
+  to-readtable)
+
+(defun set-syntax-from-char (to-char from-char &optional
+				     (to-readtable *readtable*)
+				     (from-readtable ()))
+  "This makes the syntax of TO-CHAR in TO-READTABLE be the same as the syntax
+  of FROM-CHAR in FROM-READTABLE."
+  (if (null from-readtable) (setq from-readtable std-lisp-readtable))
+  ;;copy from-char entries to to-char entries, but make sure that if
+  ;;from char is a constituent you don't copy non-movable secondary
+  ;;attributes (constituent types), and that said attributes magically
+  ;;appear if you transform a non-constituent to a constituent.
+  (let ((att (get-cat-entry from-char from-readtable)))
+    (if (constituentp from-char from-readtable)
+	(setq att (get-secondary-attribute to-char)))
+    (set-cat-entry to-char att to-readtable)
+    (set-cmt-entry to-char
+		   (get-cmt-entry from-char from-readtable)
+		   to-readtable)))
+
+(defun set-macro-character (char function &optional
+				 (non-terminatingp nil) (rt *readtable*))
+  (if non-terminatingp
+      (set-cat-entry char #.non-terminating-macro rt)
+      (set-cat-entry char #.terminating-macro rt))
+  (set-cmt-entry char function rt))
+
+(defun get-macro-character (char &optional (rt *readtable*))
+  "Returns the function associated with CHAR and, as a second value, returns
+  the NON-TERMINATING-P flag; it returns NIL of CHAR does not have
+  macro-character syntax."
+  ;;check macro syntax, return associated function if it's there.
+  ;;returns a value for all constituents.
+  (cond ((non-terminating-macrop char)
+	 (values (get-cmt-entry char rt) t))
+	((terminating-macrop char)
+	 (values (get-cmt-entry char rt) nil))
+	(t nil)))
+
+;;;These definitions support internal programming conventions.
+
+(defconstant eof-object '(*eof*))
+
+(defmacro eofp (char) `(eq ,char eof-object))
+
+
+;;;Actual reader.
+(defvar *real-eof-errorp* ()
+  "Value checked by reader if recursivep is true.")
+(defvar *real-eof-value* ()
+  "Eof-value used for eof-value if recursivep is true.")
+
+;; Alist for sharp-equal. Used to keep track of objects with labels assigned
+;; that have been completly read.
+(defvar sharp-equal-alist ())
+
+;; Alist for sharp-sharp. Assoc's a number with a symbol produced by gensym.
+;; Used by sharp-sharp as an unforgeable label, instead of the number.
+(defvar sharp-sharp-alist ())
+
+(proclaim '(special *standard-input*))
+ 
+
+(defvar *read-suppress* nil)
+
+
+;;;dispatching macro cruft
+
+(defun make-char-dispatch-table ()
+  (make-array 128 :initial-element #'dispatch-char-error))
+
+(defun dispatch-char-error (ignore sub-char ignore)
+  (error "No dispatch function defined for ~S."	sub-char))
+
+(defun make-dispatch-macro-character (char &optional
+					   (non-terminating-p nil)
+					   (rt *readtable*))
+  "Causes the character CHAR to be a dispatching macro character in READTABLE.
+  If NON-TERMINATING-P is not NIL, then it will be a non-terminating macro
+  character: it may be embedded within extended tokens.  Returns T."
+  (set-macro-character char #'read-dispatch-char non-terminating-p rt)
+  (let* ((dalist (dispatch-tables rt))
+	 (dtable (cdr (find char dalist :test #'char= :key #'car))))
+    (cond (dtable
+	   (error "Dispatch character already exists"))
+	  (t
+	   (setf (dispatch-tables rt)
+	    (push (cons char (make-char-dispatch-table)) dalist))))))
+
+(defun set-dispatch-macro-character
+       (disp-char sub-char function &optional (rt *readtable*))
+  "Causes FUNCTION to be called when the DISP-CHAR followed by SUB-CHAR is
+  read.  The READTABLE defaults to the current readtable."
+  ;;get the dispatch char for macro (error if not there), diddle
+  ;;entry for sub-char.
+  (let ((dpair (find disp-char (dispatch-tables rt)
+		     :test #'char= :key #'car)))
+    (if dpair
+	(setf (elt (the simple-vector (cdr dpair))
+		   (char-int sub-char))
+	      function)
+	(error "~S is not a dispatch char." disp-char))))
+
+(defun get-dispatch-macro-character (disp-char sub-char
+					       &optional (rt *readtable*))
+  "Returns the macro-character frunction for SUB-CHAR under DISP-CHAR, or
+  NIL if there is no function associated with SUB-CHAR."
+  (let ((dpair (find disp-char (dispatch-tables rt)
+		     :test #'char= :key #'car)))
+    (if dpair
+	(elt (the simple-vector (cdr dpair))
+	     (char-int sub-char))
+	(error "~S is not a dispatch char." disp-char))))
+
+(defun read-dispatch-char (stream char)
+  ;;read some digits
+  (let ((numargp nil)
+	(numarg 0)
+	(sub-char ()))
+    (do* ((ch (read-char stream nil eof-object)
+	      (read-char stream nil eof-object))
+	  (dig ()))
+	 ((or (eofp ch)
+	      (not (setq dig (digit-char-p ch))))
+	  ;;take care of the extra char.
+	  (if (eofp ch)
+	      (error "End-of-file inside dispatch character.")
+	      (setq sub-char ch)))
+	 (setq numargp t)
+	 (setq numarg (+ (* numarg 10) dig)))
+    ;;look up the function and call it.
+    (let ((dpair (find char (dispatch-tables *readtable*)
+		       :test #'char= :key #'car)))
+      (if dpair
+	  (funcall (elt (the simple-vector (cdr dpair))
+			(char-int sub-char))
+		   stream sub-char (if numargp numarg nil))
+	  (error "No dispatch table for dispatch char.")))))
+
+;20; 
+
+(defun read-from-string (string &optional eof-error-p
+	eof-value &key start end preserve-whitespace)
+  "The characters of STRING are given successively to the Lisp reader, and
+  the Lisp object built by the reader is returned.  Macro characters and so on
+  will all take effect."
+  (%sp-read-from-string string eof-error-p eof-value start end 
+       preserve-whitespace))
+
+(defun parse-integer (string &key (start 0) (end (length string))
+			     (radix 10) junk-allowed)
+  "This function examines the substring of STRING delimited by :START
+  and :END (which default to the beginning and the end of the string).  It
+  skips over whitespace characters and then attempts to parse an integer.
+  The :RADIX parameter defaults to 10 and must be an integer between 
+  2 and 36."
+  ;; Skip over whitespace.
+  (let ((index (do ((i start (1+ i)))
+		   ((= i end)
+		    (if junk-allowed
+			(return-from parse-integer (values nil end))
+			(error "No non-whitespace characters in number."))) 
+		 (unless (whitespacep (char string i)) (return i))))
+	(minusp nil)
+	(found-digit nil)
+	(result 0))
+    (let ((char (char string index)))
+      ;; Record the sign, if any.
+      (cond ((char= char #\-)
+	     (setq minusp t)
+	     (incf index))
+	    ((char= char #\+)
+	     (incf index))))
+    ;; Zoom through the string, parsing an integer.
+    (loop
+     (when (= index end) (return nil))
+     (let* ((char (char string index))
+	    (weight (digit-char-p char radix)))
+       (cond (weight
+	      (setq result (+ weight (* result radix))
+		    found-digit t))
+	     (junk-allowed (return nil))
+	     ((whitespacep char)
+	      (do ((jndex (1+ index) (1+ jndex)))
+		  ((= jndex end))
+		(unless (whitespacep (char string jndex))
+		  (error "There's junk in this string: ~S." string)))
+	      (return nil))
+	     (t
+	      (error "There's junk in this string: ~S." string))))
+     (incf index))
+    (values
+     (if found-digit
+	 (if minusp (- result) result)
+	 (if junk-allowed
+	     nil
+	     (error "There's no digits in this string: ~S" string)))
+     index)))

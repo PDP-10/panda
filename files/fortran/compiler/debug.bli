@@ -1,0 +1,445 @@
+
+!COPYRIGHT (c) DIGITAL EQUIPMENT CORPORATION 1974, 1987
+!ALL RIGHTS RESERVED.
+!
+!THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED
+!ONLY  IN  ACCORDANCE  WITH  THE  TERMS  OF  SUCH LICENSE AND WITH THE
+!INCLUSION OF THE ABOVE COPYRIGHT NOTICE.  THIS SOFTWARE OR ANY  OTHER
+!COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY
+!OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF THE  SOFTWARE  IS  HEREBY
+!TRANSFERRED.
+!
+!THE INFORMATION IN THIS SOFTWARE IS SUBJECT TO CHANGE WITHOUT  NOTICE
+!AND  SHOULD  NOT  BE  CONSTRUED  AS A COMMITMENT BY DIGITAL EQUIPMENT
+!CORPORATION.
+!
+!DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR RELIABILITY  OF  ITS
+!SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.
+
+!AUTHOR: S. MURPHY/TFV/AHM/AlB/CDM/MEM
+
+MODULE DEBUG(RESERVE(0,1,2,3),SREG=#17,FREG=#16,VREG=#15,DREGS=4)=
+BEGIN
+
+	SWITCHES NOLIST;
+	REQUIRE FIRST.BLI;
+	REQUIRE TABLES.BLI;
+	REQUIRE 'REQREL.BLI';
+	SWITCHES LIST;
+
+GLOBAL BIND DEBUGV = #11^24 + 0^18+ #4532;	! Version Date: 19-Feb-86
+
+%(
+
+***** Begin Revision History *****
+
+34	-----	-----	MOVE THE ROUTINE "DMPRLBLOCK" OUT OF THIS
+			MODULE INTO THE MODULE "RELBUF"
+35	-----	-----	CHECK THE FLAG "DBGDIMN" TO DETERMINE WHETHER
+			TO DUMP ARRAY DIMENSIONS FOR FORDDT
+36	-----	-----	ADD THE ROUTINES "INIFDDT" AND "XCTFDDT" TO GENERATE
+			"XCT FDDT." WHEN THE "TRACE" OPTION OF THE 
+			DEBUG SWITCH WAS SPECIFIED BY THE USER
+
+***** Begin Version 6 *****
+
+37	761	TFV	1-Mar-80	-----
+	Choose arg type based on /GFLOATING
+
+40	1002	TFV	1-Jul-80	------
+	MAP EVALU onto EVALTAB to get the argtype for argblock entries
+
+***** Begin Version 7 *****
+
+1503	AHM	26-Feb-82
+	Change the format of dimension information blocks for extended
+	addressing support.  Rejustify some routines.
+
+1505	AHM	12-Mar-82
+	Have INIFDDT set the psect index of the symbol table entry for
+	"FDDT." to PSDATA to relocate those references by .DATA.
+
+1506	AHM	14-Mar-82
+	Make DEFISN  use  ZOUTBLOCK  to  output  line  number  labels,
+	instead of using its own buffers.
+
+1512	AHM	26-Mar-82
+	Convert to using ZSYMBOL in DEFISN to output symbols.
+
+
+***** Begin Version 10 *****
+
+2210	AHM	27-Jul-83
+	Rename DUMPDIM to DMPDIM to reserve DUMP?? for SIX12.
+
+2317	AHM	4-Mar-84
+	Make CGDIMBLOCK use IOPTR to construct memory references to
+	array bases and offsets instead of doing it by itself.  Use
+	ARGGEN instead of OUTPTR for dimension bound and factor
+	references, and delete OUTPTR which is now unused.
+
+2444	AlB	6-Aug-84
+	Make INIFDDT generate an EFIW entry for FDDT. whenever /EXTEND:CODE
+	is in effect.
+
+***** End V10 Development *****
+
+***** End Revision History *****
+
+***** Begin Version 11 *****
+
+4515	CDM	20-Sep-85
+	Phase I for VMS long symbols.  Create routine ONEWPTR for Sixbit
+	symbols.  For now, return what is passed it.  For phase II, return
+	[1,,pointer to symbol].
+
+4524	CDM	21-Nov-85
+	Make "FDDT." a library function.
+
+4527	CDM	1-Jan-86
+	VMS Long symbols phase II.  Convert all internal symbols from
+	one word of Sixbit to [length,,pointer].
+
+4532	MEM	19-Feb-86
+	Add long symbol support: When outputting calls to Proar., instead
+	of outputting a sixbit array name we must output a pointer to a
+	sixbitz array name.
+
+ENDV11
+)%
+
+!++
+! This module contains routines  for outputing debugging information  to
+! the REL file.  This includes routines to output:
+! 
+! 1. A label for each source line.
+! 2. Dimension information for arrays.
+! 3. Bounds information for substrings.
+!--
+
+FORWARD
+	INIFDDT,
+	XCTFDDT,
+	DEFISN,
+	INIISNRLBLK,
+	ZOUDLB,
+	DMPDIM,
+	CGDIMBLOCK;	! Outputs an argument block specifying
+			!  dimension information for a given array
+
+EXTERNAL
+%2317%	ARGGEN,			! Builds arguments without key fields
+	DEFLAB,			! Associates the current location with
+				!  a given label
+	ENTRY,
+%4532%	GENLAB,			!Generate label table entry
+	HEADCHK,
+	HILOC,			! Address of instruction currently being
+				!  output to the REL file
+%2317%	IOPTR,			! Builds arguments with key fields
+	ISN,			! Internal sequence number for statement
+	LSTOUT,
+%2444%	MAKEFIW,		! Create an EFIW entry
+	NAME,
+	OBUFF,
+	OBUFFA,			! Places data in the peephole buffer
+	OBJECTCODE PBOPWD,	! Global in which word of code to be
+				!  output is set up and passed to the
+				!  output buffering routine ("OBUFFA")
+%4515%	ONEWPTR,		! Returns [1,,pointer] from Sixbit argument
+	BASE PSYMPTR,		! Global pointing to the symbol table
+				!  entry for the address field of the
+				!  word of code being output
+	RDATWD,			! Holds the word that ZOUTBLOCK buffers
+	SYMTBL,			! The hashed symbol table.
+	TBLSEARCH,
+	ZOUDECIMAL,
+%1512%	ZSYMBOL;		! Buffers a symbol to the REL file
+
+
+OWN
+	PRVISNX,		! The last ISN for which we generated
+				!  the code "XCT FDDT."
+	BASE FDDTSYM,		! Pointer to STE for "FDDT."
+	PREVISN,		! The last ISN for which we made a label
+	LPRVISN;		! The last ISN for which we listed a label
+				!  in the assembly language listing
+
+
+GLOBAL ROUTINE INIFDDT=
+BEGIN
+
+! Initializes for generation of "XCT FDDT." at the start of each stmnt
+! that starts  a line.   Called if  the "TRACE"  option of  the  DEBUG
+! switch was specified by the user
+
+
+	!ISN OF THE LAST STMNT FOR WHICH "XCT FORDDT" WAS GENERATED
+	PRVISNX_0;
+
+	! Make symbol table entry for "FDDT."
+
+	NAME_IDTAB;
+%4515%	ENTRY[0] = ONEWPTR(SIXBIT'FDDT.');
+	FDDTSYM_TBLSEARCH();
+
+%4524%	IF NOT .FLAG
+%4524%	THEN
+%4524%	BEGIN	! Did not exist before
+
+		FDDTSYM[OPERSP] = FNNAME;	! Is a function
+%1505%		FDDTSYM[IDPSECT] = PSDATA;	! Use .DATA.
+%4524%		FDDTSYM[IDLIBFNFLG] = 1;	! Is library function
+%4524%
+%4524%	END;	! Did not exist before
+
+%2444%	! If compilation is being done under "/EXTEND:CODE", create an
+%2444%	! EFIW entry for FDDT. and point to it instead of the STE
+%2444%	IF EXTENDCODE THEN FDDTSYM=MAKEFIW(0,0,0,.FDDTSYM)
+
+END;	!End of "INIFDDT"
+
+GLOBAL ROUTINE XCTFDDT=
+BEGIN
+
+! Generates "XCT FDDT." in front of each source program statement that
+! is the 1st statement on a line.  Called before code is generated for
+! each statement if the flag "DBGTRAC" is set.
+
+	BIND XCTOCD=#256;
+
+	IF .ISN EQL 0 THEN RETURN;	!IF THIS STMNT WAS INSERTED BY THE COMPILER
+
+	IF .ISN EQL .PRVISNX THEN RETURN;	!IF THIS IS NOT THE 1ST STMNT ON THE LINE
+
+	%(**GENERATE "XCT FDDT."**)%
+	PBOPWD_XCTOCD^27;
+	PSYMPTR_.FDDTSYM;
+	OBUFF();	!OUTPUT XCT FDDT. TO THE PEEPHOLE BUFFER
+			! (THESE MUST BE GENERATED PRIOR TO PEEPHOLING)
+
+	PRVISNX_.ISN;
+END;	!Of "XCTFDDT"
+
+GLOBAL ROUTINE DEFISN(ISN)=
+BEGIN
+
+! Defines a label for the internal seq number (ie line number) ISN and
+! associates that label with the location of the instruction currently
+! being written  to the  REL  file.  The  global HILOC  indicates  the
+! location to be used.
+
+REGISTER
+	LABL,			! Used to build SIXBIT for the seq number
+				!  followed by "L" (the label)
+	T1;			! Holds the ISN as it is being
+				!  decomposed for output
+
+	IF .ISN EQL 0		! Do not generate a label for
+	THEN RETURN;		!  statements inserted by the compiler
+
+	IF .ISN EQL .PREVISN	! If there are multiple statements on a line,
+	THEN RETURN;		!  only generate a label for the first one
+
+	T1 = PREVISN = .ISN;	! Remember our ISN
+
+! Make the left justified SIXBIT for the ISN followed by "L" (nnnnnL)
+
+	LABL=SIXBIT 'L';	! Put in the L
+
+	DO			! Loop for each digit
+	BEGIN
+		LABL = .LABL^(-6);		! Shift label built so far
+						!  to the right by 1 char
+		LABL<30,6> = (.T1 MOD 10)+#20;	! Get the rightmost digit into
+						! leftmost character of label
+		T1 = .T1/10;			! Discard digit from number
+	END
+	UNTIL .T1 EQL 0;
+
+%4527%	ZSYMBOL(LOCDEF,ONEWPTR(.LABL),.HILOC,PSCODE)	! Output the symbol
+
+END;	! Of DEFISN
+
+GLOBAL ROUTINE INIISNRLBLK=
+BEGIN
+
+! Sets up for defining labels corresponding to each line.
+
+	PREVISN = 0;		! The last ISN for which a label was made
+	LPRVISN = 0		! The last ISN for which a label was listed
+				!  in the assembly language listing
+END;
+
+GLOBAL ROUTINE ZOUDLB=
+BEGIN
+
+! Inserts into the  macro-expanded listing an  "L" label inserted  for
+! the first  instruction of  a given  source line.   These labels  are
+! inserted when the user specifies the "DEBUG" switch.  Call with  the
+! global (register) "R1"  set to  the ISN  of the  statement that  the
+! instruction currently being listed begins.
+
+	IF .R1 EQL .LPRVISN
+	THEN RETURN;			!If the previous statement for which we
+					! listed a label had the same ISN as
+ 					! this one, don't make a new label
+
+	LPRVISN_.R1;
+
+	ZOUDECIMAL();	!LIST THE ISN IN DECIMAL
+	CHR_"L"; LSTOUT();	! FOLLOWED BY "L"
+	CHR_":"; LSTOUT();	! FOLLOWED BY ":"
+	CRLF;
+	HEADCHK();	!CHECK FOR HEADING
+	CHR_#11; LSTOUT(); LSTOUT();	! <TAB> <TAB>
+END;
+
+GLOBAL ROUTINE DMPDIM=		![2210]
+BEGIN
+
+! Output dimension information  for all arrays  if the user  specified
+! either the "BOUNDS" switch  (indicating that bounds checking  should
+! be performed on all arrays)  or the "DEBUG" switch (indicating  that
+! debugging  information  should  be   passed  to  FORDDT)  with   the
+! "DIMENSIONS" option.
+
+	REGISTER BASE SYMPTR;	! Points to the current STE under examiniation
+
+! Unless the user specified either the "DEBUG" switch or the  "BOUNDS"
+! switch, do not output dimension information.
+
+	IF NOT (.FLGREG<DBGDIMN> OR .FLGREG<BOUNDS>)
+	THEN RETURN;
+
+! Walk through the  symbol table  and output dimension  info for  each
+! array name found.  Must do this since there is no way to directly go
+! through the dimension table.
+
+	DECR I FROM SSIZ-1 TO 0
+	DO
+	BEGIN
+		SYMPTR_.SYMTBL[.I];
+		UNTIL .SYMPTR EQL 0	! Look at each symbol that hashes to
+		DO			!  this entry
+		BEGIN
+			IF .SYMPTR[OPRSP1] EQL ARRAYNM1	! If this is an entry
+							!  for an array name,
+			THEN CGDIMBLOCK(.SYMPTR);	! Output the arg block
+							!  specifying dimension
+							!  info for this array
+
+			SYMPTR_.SYMPTR[CLINK]		! Look at the next STE
+							!  in this bucket
+		END
+	END;
+END;	! of DMPDIM	![2210]
+GLOBAL ROUTINE CGDIMBLOCK(SYMPTR)=	![1503] Routine reworked by AHM
+
+! Outputs an arg block for PROAR. FORLIB calls generated by  PROARRXPN
+! in ARRXPN.  The  arg block specifies  the dimension information  for
+! the array whose STE is pointed to by "SYMPTR".  The format for these
+! arg blocks is:
+
+!                             PROAR. argument list
+
+!  !=========================================================================!
+!  !                                    !      Ptr to array name             !
+!  !-------------------------------------------------------------------------!
+!  !1!0!  Dim count  ! Type  !I!        !            Base address            !
+!  !-------------------------------------------------------------------------!
+!V6!A!F!0!0!         ! Type  !          !      Ptr to offset (in words)      !
+!V7!1!0!A!F!         ! Type  !          !      Ptr to offset (in words)      !
+!  !=========================================================================!
+!  !1!0!             ! Type  !          ! Ptr to first lower bound (in items)!
+!  !-------------------------------------------------------------------------!
+!  !1!0!             ! Type  !          ! Ptr to first upper bound (in items)!
+!  !-------------------------------------------------------------------------!
+!  !1!0!             ! Type  !          !   Ptr to first factor (in words)   !
+!  !=========================================================================!
+!  \                                                                         \
+!  \               More triples for the rest of the dimensions               \
+!  \                                                                         \
+!  !=========================================================================!
+
+!Where:
+! A - Is flag for "Array is adjustably dimensioned"
+! F - Is flag for "Array is a formal parameter"
+! Base address - Is the base address of the array unless the array is
+!	a formal parameter, in which case "i" is set, and base address
+!	points to the variable that contains the base address
+
+BEGIN
+MAP
+	BASE SYMPTR;			!This formal points to array whose
+					! bounds are to be checked
+REGISTER
+	BASE DIMPTR,			!Ptr to dimension table entry for the
+					! array for which dimension information
+					! is being output
+	DIMSUBENTRY DIMLSTPTR;		!Ptr to the subentry for the dimension
+
+LOCAL
+%4532%	LAB;				!Label ptr = start of array name
+					! being output
+
+MACRO					!Define flag fields
+%1503%	AFLAG=0,33,1$,			!Flag for "ADJUSTABLY DIMENSIONED"
+%1503%	FFLAG=0,32,1$;			!Flag for "FORMAL ARRAY"
+
+	DIMPTR=.SYMPTR[IDDIM];		!Point to the dimension table
+
+%4532%	DEFLAB(LAB = GENLAB());		!Generate label for array name
+	PSYMPTR=PBF2NOSYM;		! Tell output module to not relocate
+					! either half of the word
+%4532%	INCR I FROM 0 TO .SYMPTR[IDSYMLENGTH]-1  !Output array name
+%4532%	DO
+%4532%	BEGIN
+%4532%		PBOPWD = @(.SYMPTR[IDSYMPOINTER] + .I);	
+		OBUFFA();			!Write the word out		
+%4532%	END;
+%4532%	PBOPWD = 0;			!We want SIXBITZ so output null word
+%4532%	OBUFFA();
+
+	DEFLAB(.DIMPTR[ARADLBL]);	!Associate the current loc with the
+					! label to be used on this arg block
+%4532%	PBOPWD = .LAB;		!Output address of name
+%4532%	PSYMPTR = PBFLABREF;	!PBOPWD contains label table entry
+%4532%	OBUFFA();
+
+! Output 2nd word of arg block
+
+	PBOPWD=0;			!Init word to be output to 0
+	PBOPWD[OTSCNT]=.DIMPTR[DIMNUM];	!Set up dim count field
+
+%2317%	IOPTR(.SYMPTR);			! Construct memory reference and output
+					!  the word to the peephole buffer.
+
+! Output 3rd word of arg block
+
+	PBOPWD = 0;			!Init data word
+%2317%	PBOPWD[AFLAG] = .DIMPTR[ADJDIMFLG];	!Copy adjustable dimension flag
+%2317%	PBOPWD[FFLAG] = .SYMPTR[FORMLFLG];	!Copy formal flag
+%2317%	IOPTR(.DIMPTR[ARAOFFSET]);	!Construct reference to STE for temp
+					! holding calculated offset or constant
+					! table entry for the offset (if array
+					! is not adjustably dimensioned)
+
+! Output bounds and factor for each dimension
+
+	DIMLSTPTR=DIMPTR[FIRSTDIM];	!Ptr to subentry for 1st dimension
+
+	DECR CT FROM .DIMPTR[DIMNUM] TO 1	!Loop for all the dimensions
+	DO
+	BEGIN
+%2317%		ARGGEN(.DIMLSTPTR[DIMLB]);	!Output the lower bound
+%2317%		ARGGEN(.DIMLSTPTR[DIMUB]);	!Output the upper bound
+%2317%		ARGGEN(.DIMLSTPTR[DIMFACTOR]);	!Output the factor
+
+		DIMLSTPTR=.DIMLSTPTR+DIMSUBSIZE	!Point to the next entry
+	END
+END;
+
+END
+ELUDOM
+ 

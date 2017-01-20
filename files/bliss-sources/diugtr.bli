@@ -1,0 +1,533 @@
+%TITLE 'Traverse A Record Definition Tree & Generate Transform'
+MODULE DIUGTR(
+       IDENT='253'
+       %BLISS32 (,
+                 ADDRESSING_MODE(EXTERNAL=GENERAL,NONEXTERNAL=LONG_RELATIVE)
+                )
+       %BLISS36 (,
+                 ENTRY (subtrv, tretrv, copdim, copfqn)
+                )
+                    ) = 
+BEGIN
+!++
+! COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1985.
+! ALL RIGHTS RESERVED.
+!
+! THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND  COPIED
+! ONLY  IN  ACCORDANCE  WITH  THE  TERMS  OF  SUCH  LICENSE AND WITH THE
+! INCLUSION OF THE ABOVE COPYRIGHT NOTICE.  THIS SOFTWARE OR  ANY  OTHER
+! COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY
+! OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE  IS  HEREBY
+! TRANSFERRED.
+!
+! THE INFORMATION IN THIS SOFTWARE IS SUBJECT TO CHANGE  WITHOUT  NOTICE
+! AND  SHOULD  NOT  BE  CONSTRUED  AS  A COMMITMENT BY DIGITAL EQUIPMENT
+! CORPORATION.
+!
+! DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF  ITS
+! SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.
+!
+! FACILITY:	DIU    Data Interchange Utility  V01-000
+!
+! ABSTRACT:	Routines to generate a default move_matching or
+!		move_others_matching transform structure based on
+!		the information found in the record definition
+!		tree specified.
+!
+! AUTHOR:	Sandy Clemens, Creation Date:  25-Oct-84
+!
+! EDIT HISTORY:
+!
+!  253  Change libraries to new names.
+!       Gregory A. Scott 1-Jul-86
+!
+!  236  Change library of DIXLIB to DIUDIX.
+!       Sandy Clemens  19-Jun-86
+!
+!       3	Clean up copyright notices.  Change LIBRARY 'DIUMSG'
+!		to 'DIU';  clean up some of the condition handling. 
+!		Sandy Clemens	14-Jun-85
+!--
+!********************************************************************
+!           L I B R A R Y   A N D   R E Q U I R E    F I L E S
+!********************************************************************
+%IF %BLISS (BLISS32)
+%THEN
+     LIBRARY 'SYS$LIBRARY:XPORT';       ! XPORT definitions
+     UNDECLARE %QUOTE $STRING;
+     LIBRARY 'SYS$LIBRARY:STARLET';     ! VMS System Services
+     LIBRARY 'DIU$SOURCE_LIB:DIUVMS';	! DIU VMS Specifics
+     LIBRARY 'DIU$SOURCE_LIB:DIUMSG';	! DIU MESSAGE Literals
+%FI
+
+%IF %BLISS (BLISS36)
+%THEN
+     LIBRARY 'BLI:XPORT';               ! XPORT definitions
+     LIBRARY 'FAOPUT';                  ! Defines $FAO_PUT macro
+     LIBRARY 'FAO';
+     LIBRARY 'DIU';
+     LIBRARY 'DIUACTION';
+%FI
+         
+UNDECLARE %QUOTE $DESCRIPTOR;
+LIBRARY 'DIUCRX';                       ! CRX data structures
+UNDECLARE %QUOTE $DESCRIPTOR;
+LIBRARY 'DIUTLB';			! DIU Transform structure
+UNDECLARE %QUOTE $DESCRIPTOR;
+UNDECLARE %QUOTE STS$K_SEVERE, %QUOTE STS$K_ERROR, %QUOTE STS$K_WARNING,
+          %QUOTE STS$K_SUCCESS, %QUOTE SS$_NORMAL, %QUOTE STS$K_INFO;
+LIBRARY 'DIUDIX';			! DIX/DIL specific things
+LIBRARY 'DIUMLB';			! DIU Mapping routines library
+
+EXTERNAL ROUTINE DIU$DEL_DIMS,
+                 FREE_STRINGLIST,
+                 MAKE_DIMS,
+                 MAKE_FQN,
+                 MAKE_TRANSFORM;
+
+!******************************************************************
+!	              C O P Y _ D I M S
+!******************************************************************
+GLOBAL ROUTINE DIU$COPY_DIMS (p_dimlst) =
+!++
+! FUNCTIONAL DESCRIPTION
+!
+!       This routine is used to make a permenant copy of the current
+!       DIMS node structure;  the address of the permenant copy is to
+!       be saved with the transform node.  The current structure cannot
+!       be used as the permenant copy, because the current structure
+!       changes as we change levels of the record description tree
+!       during traversal.
+!
+! FORMAL PARAMETERS
+!
+!       p_dimlst        The address of the last (latest) node of the
+!                       current DIMS structure
+!
+! ROUTINE VALUE
+!
+!       address of the new DIMS structure
+!--
+BEGIN
+
+LOCAL dimlst : REF dims,
+      tmpdim : REF dims,
+      first_dim : INITIAL (0);
+
+tmpdim = .p_dimlst;
+
+IF .tmpdim EQL 0 THEN RETURN (0);       ! deal with empty DIMS list passed...
+
+!++
+! First read back thru dims list to first node (the node which has
+! dims$a_previous equal to zero)...
+!--
+WHILE .tmpdim [dims$a_previous] NEQ 0
+     DO tmpdim = .tmpdim [dims$a_previous];
+
+IF .tmpdim NEQ 0
+THEN DO BEGIN
+        IF .first_dim EQL 0
+        THEN BEGIN
+             make_dims (dimlst, .tmpdim);
+             first_dim = .dimlst;       ! save addr of 1st node in new DIMS
+             END
+        ELSE BEGIN
+             LOCAL xdims : REF dims;
+             make_dims (xdims, .tmpdim);
+             dimlst [dims$a_next] = .xdims;     ! make the link
+             xdims [dims$a_previous] = .dimlst;
+             dimlst = .xdims;
+             END;
+        tmpdim = .tmpdim [dims$a_next]  ! look at next node to copy
+        END
+     UNTIL .tmpdim EQL 0;
+
+.first_dim                              ! return first dims node address
+
+END;
+
+!******************************************************************
+!	              C O P Y _ F Q N
+!******************************************************************
+GLOBAL ROUTINE DIU$COPY_FQN (fqn) =
+
+!++
+! FUNCTIONAL DESCRIPTION
+!
+!       This routine is used to make a permenant copy of the current fqn
+!       stringlist structure;  the address of the permenant copy is to
+!       be saved with the transform node.  The current structure cannot
+!       be used as the permenant copy, because the current structure
+!       changes as we change levels of the record description tree
+!       during traversal.
+!
+! FORMAL PARAMETERS
+!
+!       fqn             The address of the last (latest) node of the
+!                       current fqn stringlist structure
+!
+! ROUTINE VALUE
+!
+!       address of the new fqn stringlist structure
+!--
+BEGIN
+
+LOCAL trans_nam : REF crx_stringlist,
+      fqnx : REF crx_stringlist,
+      first_fqn : INITIAL (0),
+      prev : INITIAL (0),
+      tmp_fqn : REF crx_stringlist;
+
+fqnx = .fqn;
+
+!++
+! First read back thru fqn list to first node (the node
+! which has crs$a_previous equal to zero)...
+!--
+WHILE .fqnx [crs$a_previous] NEQ 0
+     DO fqnx = .fqnx [crs$a_previous];
+
+IF .fqnx NEQ 0
+THEN DO BEGIN
+	IF .first_fqn EQL 0
+	    THEN BEGIN
+                 make_fqn (trans_nam, .fqnx);
+                 first_fqn = .trans_nam;        ! save addr of 1st new node
+                 END
+            ELSE BEGIN
+                 make_fqn (tmp_fqn, .fqnx);
+                 trans_nam [crs$a_next] = .tmp_fqn;
+                 trans_nam = .trans_nam [crs$a_next];
+                 END;
+        trans_nam [crs$a_previous] = .prev;     ! make the link
+	prev = .trans_nam;
+	fqnx = .fqnx [CRS$A_NEXT];      ! look at next node to copy...
+	END
+     UNTIL .fqnx EQL 0;
+
+.first_fqn			! return first fqn_node address
+
+END;
+
+!******************************************************************
+!	      D I U $ T R A V E R S E _ S U B T R E E 
+!******************************************************************
+GLOBAL ROUTINE DIU$TRAVERSE_SUBTREE (p_tree, trans, p_fqn, p_dimens,
+                                     mm_flg, depth) = 
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION
+!
+!	This routine will recursively traverse the CDD record 
+!	description subtree and generate transform nodes when
+!       appropriate.
+!	
+! FORMAL PARAMETERS
+!
+!	p_tree          The address of the record description subtree.
+!
+!	trans		The address where the transform node will be
+!			dynamically allocated with $XPO_GET_MEM.
+!
+!	p_fqn		Address of local stringlist which contains fully
+!                       qualified name.
+!
+!	depth		Value used to keep track of "level" within a tree
+!                       or subtree.  Keeps us from traversing siblings when
+!                       we aren't supposed to!!  Also used to indent the
+!                       messages from $FAO_PUT, (used for debugging).
+!
+!       p_dimens        is the address of the current DIMS node which
+!                       applies to the record description subtree or
+!                       0 if none
+!                       
+!       mm_flg          If set to DIU$K_MOV_OTHERS, indicates this is a
+!                       move-others-matching case, if set to DIU$K_MOV_MAT
+!                       then this is a move-matching case.
+!                       
+! IMPLICIT PARAMETERS
+!
+!	None
+!
+! ROUTINE VALUE
+!
+!	DIU$_NORMAL	Normal successful completion
+!
+!--
+
+LOCAL
+	cdd_record	: REF crx_record,
+	member		: REF crx_member,
+	overlay		: REF crx_overlay,
+	dimension	: REF crx_dimension,
+	status		: INITIAL(0);
+
+IF .p_tree EQL 0		! Sub-tree traversal finished,
+  THEN RETURN(DIU$_NORMAL);	!    head for the mountains.....
+
+cdd_record  = .p_tree;		! Get field addressibility via REF's
+member      = .p_tree;
+overlay     = .p_tree;
+dimension   = .p_tree;
+
+SELECTONE .cdd_record[CRX$B_ID] OF
+SET 
+[CRX$K_RECORD] :  
+     BEGIN
+        %IF diu$k_tra_debug
+        %THEN
+             $FAO_PUT (.depth,'** RECORD **');
+        %FI
+
+	! Later may want to add code to save .cdd_record [CRX$L_FORMAT]
+	! which is a [$LONG_INTEGER] set to either CDD$K_REC_FIXED or
+	! CDD$K_REC_VARIABLE...  might want this info later... ???
+
+        ! Dump all subaggregates or fields...
+	DIU$TRAVERSE_SUBTREE(.cdd_record[CRX$A_ROOT], .trans,
+                             .p_fqn, .p_dimens, .mm_flg, .depth+1);
+     END; 
+
+[CRX$K_MEMBER] :
+        DO BEGIN
+        !++
+        ! If move-others-matching is indicated and the CRM$V_FACILITY_USE_2
+	! flag is set (indicating that this field has already been 'moved')
+	! then skip this field (and any subfields) and go to NEXT member node.
+	! NOTE: if mm_flg is not set to move-others-matching, then assume its
+	! a move-matching case.
+        !--
+
+        IF (.mm_flg EQL diu$k_mov_mat) AND (.member [CRM$V_FACILITY_USE_2])
+        THEN SIGNAL (DIU$_MOVPREV);     ! give informational to user...
+
+        IF (.mm_flg EQL diu$k_mov_others) AND (.member [CRM$V_FACILITY_USE_2])
+        THEN member = .member [CRM$A_NEXT]      ! get next sibling
+        ELSE
+           BEGIN
+
+	   LOCAL fqn_loc : REF crx_stringlist,
+                 dim_list : REF dims,
+                 temp_dims : REF dims,
+                 temp_fqn : REF crx_stringlist;
+
+           %IF diu$k_tra_debug
+           %THEN
+                $FAO_PUT (.depth,'** MEMBER **');
+           %FI
+
+	   !++
+           ! Save member name want to keep a fully qualified name (fqn
+           ! stringlist) for each record definition tree terminal node &
+           ! store it in the transform node for that field.
+	   !--
+
+	   fqn_loc = .p_fqn;
+
+	   IF .fqn_loc EQL 0	! This is first name in FQN list
+	   THEN make_fqn (fqn_loc, .member)
+	   ELSE BEGIN                   ! This is not the 1st name in FQN list
+                make_fqn (temp_fqn, .member);
+                fqn_loc [crs$a_next] = .temp_fqn;       ! make link
+                temp_fqn [crs$a_previous] = .fqn_loc;
+		fqn_loc = .fqn_loc [CRS$A_NEXT];
+		END;
+
+	   p_fqn = .fqn_loc;
+
+           !++
+           ! If any dimension information occurs (ie, if there are any
+           ! CRX dimension nodes, then save a copy of the dimension node
+           ! information in a DIMS node.
+           !--
+           dim_list = .p_dimens;
+           IF .member [CRM$A_DIMENSIONS] NEQ 0
+           THEN IF .dim_list EQL 0      ! This is the first DIMS node
+                THEN make_dims (dim_list, .member)
+                ELSE BEGIN              ! This is not the first DIMS node
+                     make_dims (temp_dims, .member);
+                     dim_list [dims$a_next] = .temp_dims;       ! make link
+                     temp_dims [dims$a_previous] = .dim_list;
+                     dim_list = .temp_dims;
+                     END;
+                
+	   !++
+           ! If this is a record definition tree terminal node then make
+           ! a transform node and link it to the existing transform list.
+           ! If this is the first node then save its address...
+	   !--
+
+	   IF .member [CRM$A_CHILDREN] EQL 0    ! this is a terminal node
+           THEN BEGIN
+                LOCAL trans_local : REF transform_str,
+                      fqn_cpy : REF crx_stringlist,
+                      dim_cpy : REF DIMS,
+                      tra_tmp : REF transform_str;
+
+                !++
+                ! make a permenant copy of the fqn and DIMS structures
+                ! to save with the transform node we are about to make
+                !--
+                fqn_cpy = diu$copy_fqn (.p_fqn);
+                dim_cpy = diu$copy_dims (.dim_list);
+                IF ..trans NEQ 0        ! if this is NOT the 1st node
+                THEN BEGIN
+                     trans_local = ..trans;     ! set trans_local
+                     ! Read to the end of the transform list...
+                     WHILE .trans_local [tra_next] NEQ 0 DO
+                           trans_local = .trans_local [tra_next];
+                     MAKE_TRANSFORM (.fqn_cpy, 0, .member, 0,
+                                     .dim_cpy, 0, tra_tmp);
+                     trans_local [tra_next] = .tra_tmp;
+                     trans_local = .trans_local [tra_next];
+                     END
+                ELSE BEGIN              ! this IS the 1st node in the list
+                     MAKE_TRANSFORM (.fqn_cpy, 0, .member, 0,
+                                     .dim_cpy, 0, .trans);
+                     trans_local = ..trans;
+                     END;
+
+                trans_local [tra_next] = 0;	! set to null for now
+
+                END
+
+           ELSE
+                ! If not a terminal node, walk the childern...
+                DIU$TRAVERSE_SUBTREE(.member[CRM$A_CHILDREN], .trans,
+                                     .p_fqn, .dim_list, .mm_flg,
+                                     .depth+1);
+
+           !++
+           ! Delete part of fqn which we are now done with so that
+           ! when we pop up from this recursion we don't have an extra
+           ! name in this fqn...
+           !--
+	   IF .fqn_loc NEQ 0
+	   THEN BEGIN
+                temp_fqn = .fqn_loc [crs$a_previous];
+                FREE_STRINGLIST (.fqn_loc);
+		fqn_loc = .temp_fqn;
+		IF .fqn_loc NEQ 0		! if next node exists, clear
+		THEN fqn_loc [CRS$A_NEXT] = 0;	! the pointer to it since the
+		p_fqn = .fqn_loc                ! NEXT node was just deleted
+		END;
+
+           !++
+           ! Delete part of DIMS which we are now done with so that
+           ! when we pop up from this recursion we don't have an extra
+           ! node in this DIMS structure...
+           !--
+	   IF .member [CRM$A_DIMENSIONS] NEQ 0
+	   THEN BEGIN
+                temp_dims = .dim_list [dims$a_previous];
+                DIU$DEL_DIMS (.dim_list);
+                dim_list = .temp_dims;
+                IF .dim_list NEQ 0
+                THEN dim_list [dims$a_next] = 0;
+                END;
+
+	   ! Process next sibling...
+	   member = .member[CRM$A_NEXT];
+           END;
+           END
+
+        !++
+        ! Stop when we have reached the last sibling OR when we are back
+        ! up to the depth we started at.  If we are traversing a SUBTREE,
+        ! starting at a MEMBER node rather than a RECORD node, we don't
+        ! want to traverse the siblings of the MEMBER we started at.  We
+        ! must STOP when we get back to the initial depth (which is always
+        ! zero!)
+        !--
+
+        UNTIL (.member EQL 0) OR (.depth EQL 0);
+
+[CRX$K_OVERLAY] :
+        BEGIN
+
+        %IF diu$k_tra_debug
+        %THEN
+             $FAO_PUT (.depth,'** OVERLAY **');
+        %FI
+
+        !++
+        ! Skip OVERLAY fields.  According to the DIU functional
+        ! specification "You cannot use a TRANSFORM contaning a
+        ! MOVE-MATCHING of a field which is a VARIANT field."
+        ! Don't bother to process the 'next' overlay fields, since
+        ! overlays are not legal here there is no sense in wasting
+        ! the time to look at all of them.
+        !--
+
+        SIGNAL (DIU$_VARFLDSKP);        ! give informational to user
+
+        END;
+
+[OTHERWISE] : 
+
+        SIGNAL (DIU$_BUG);              ! if we got something unexpected
+                                        ! then it is a bug...
+TES;
+
+RETURN DIU$_NORMAL;
+
+END;
+!**********************************************************************
+!                 D I U $ T R A V E R S E _ T R E E 
+!**********************************************************************
+GLOBAL ROUTINE DIU$TRAVERSE_TREE (p_tree, trans_ptr, mm_flg, dims_str) = 
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION
+!
+!	This routine will traverse the record description tree
+!       passed and will generate a transform for it.  This is
+!	simply an entry point for the outside world.  The real
+!	work is done in DIU$TRAVERSE_SUBTREE.
+!
+!
+! FORMAL PARAMETERS
+!
+!	p_tree          root addr of the record description tree or subtree
+!
+!	trans	        location where the address of the first transform
+!			node should be returned
+!
+!       mm_flg          flag indicating, if ON, that this is a
+!                       move-others-matching case
+!
+!       dims_str        addr of the current DIMS node which applies to the
+!                       record description subtree or 0 if none...
+!
+! IMPLICIT PARAMETERS
+!
+!	None
+!
+! ROUTINE VALUE
+!
+!	DIU$_NORMAL	Normal successful completion
+!	SS$_		Any error status returned by $FAO via 
+!			DIU$TRAVERSE_SUBTREE.
+!--
+LOCAL
+	status : INITIAL(0);
+
+BIND
+	tree = .p_tree;
+
+!++
+! DIU$TRAVERSE_SUBTREE does the grunt work -- it makes recursive
+! calls on itself to search each subtree for fully qualified names
+! and build transform nodes as appropriate.
+!--
+status = DIU$TRAVERSE_SUBTREE(.tree, .trans_ptr, 0, .dims_str, .mm_flg, 0);
+
+IF NOT .status then RETURN(.status);
+
+RETURN DIU$_NORMAL;
+
+END;
+
+END
+ELUDOM

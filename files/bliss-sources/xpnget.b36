@@ -1,0 +1,388 @@
+%TITLE 'XPNGET - Get data from a DECNET link'
+MODULE xpnget (
+               ENTRY ( XPN$GET )
+              ) =
+BEGIN
+!
+!
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1981, 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+!
+
+!++
+! FACILITY:
+!   Transportable BLISS interface to DECNET for TOPS-20.
+!
+! ABSTRACT:
+!   This module implements the $XPN_GET macro.
+!
+! ENVIRONMENT:
+!   TOPS-20 user mode.
+!
+! AUTHOR:  Larry Campbell, CREATION DATE:  January 8, 1982
+!
+! MODIFIED BY:
+!
+!--
+
+!
+! TABLE OF CONTENTS:
+!
+FORWARD ROUTINE
+    xpn$get,                            ! Top-level routine
+    xpn$$get,                           ! Actual work routine
+    xpn$$get_data;                      ! Get data
+!
+! INCLUDE FILES:
+!
+LIBRARY 'BLI:XPORT';
+LIBRARY 'BLISSNET';                     ! Transportable BLISSnet definitions
+LIBRARY 'BLI:MONSYM';                   ! Monitor symbols
+LIBRARY 'BLISSNET20';                   ! TOPS-20-specific definitions
+REQUIRE 'JSYSDEF';                      ! JSYS linkage definitions
+!
+! MACROS:
+!
+
+!
+! EQUATED SYMBOLS:
+!
+
+!
+! THERE IS NO OWN STORAGE:
+! THERE IS, HOWEVER PURE DATA CREATED BY XPORT
+!
+PSECT OWN=$HIGH$;
+
+!
+! EXTERNAL REFERENCES:
+!
+EXTERNAL ROUTINE
+    xpn$$new_buffer,                    ! Sets new buffer in NLB
+    xpn$$valid_nlb,                     ! Validate an NLB
+    xpn$$link_status,                   ! Get link status
+    xpn$$jsys_error;                    ! Report JSYS error
+
+GLOBAL ROUTINE xpn$get (nlb, success_routine, failure_routine ) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   This routine is the top-level routine called by the $XPN_GET macro.
+!   It validates the NLB, calls xpn$$get to do the work, and calls
+!   optional caller-supplied success or failure routines.
+!
+! FORMAL PARAMETERS:
+!   nlb         - address of the Network Link Block
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   NLB$T_DATA  - old descriptor released and new one assigned to hold input.
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   NONE
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+    BEGIN
+
+    MAP
+        nlb : REF $XPN_NLB();
+
+    LOCAL
+        original_primary_code,
+        primary_code,
+        secondary_code,
+        retcode;
+
+    nlb_binds;                          ! create nice names for NLB fields
+    !
+    ! validate the NLB
+    !
+    retcode = xpn$$valid_nlb (.nlb);
+    IF NOT .retcode THEN
+        BEGIN
+        original_primary_code = XPN$_BAD_NLB;
+        secondary_code = .retcode
+        END
+    ELSE
+        BEGIN
+	original_primary_code = xpn$$get (.nlb);
+        nlb[NLB$G_COMP_CODE] = .original_primary_code;
+        secondary_code = .nlb[NLB$G_2ND_CODE]
+        END;
+    !
+    ! Check completion code and call success or failure routine as required
+    !
+    IF .original_primary_code THEN
+        IF .success_routine NEQ 0 THEN
+            primary_code =
+                (.success_routine) (XPN$K_GET, .original_primary_code,
+                    .secondary_code, .nlb)
+        ELSE
+            primary_code = .original_primary_code
+    ELSE
+        IF .failure_routine NEQ 0 THEN
+            primary_code =
+                (.failure_routine) (XPN$K_GET, .original_primary_code,
+                    .secondary_code, .nlb)
+        ELSE
+            primary_code = .original_primary_code;
+    !
+    ! Unless the NLB was bad, store the completion code there
+    !
+    IF .original_primary_code NEQ XPN$_BAD_NLB
+    THEN
+        nlb[NLB$G_COMP_CODE] = .primary_code;
+    RETURN (.primary_code);
+
+    END;			!End of xpn$get
+
+ROUTINE xpn$$get (nlb) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   This routine does the actual work for $XPN_GET.
+!
+! FORMAL PARAMETERS:
+!   nlb         - address of the Network Link Block.
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   XPN$_NORMAL         - normal, data has been read
+!   XPN$_INCOMPLETE     - read posted but incomplete (WAIT not specified)
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+    BEGIN
+
+    MAP
+        nlb : REF $XPN_NLB();
+
+    IF NOT .nlb[NLB$V_OPEN]
+    THEN
+        RETURN (XPN$_NOT_OPEN);
+    CASE .nlb[NLB$B_SUBFUNC] FROM NLB$K_DATA TO NLB$K_REJECT OF
+        SET
+        [NLB$K_DATA] : RETURN (xpn$$get_data (.nlb));
+        [NLB$K_INTERRUPT] :
+            BEGIN
+            LOCAL
+                small_buffer : VECTOR [CH$ALLOCATION (16, 8)],
+                byte_count;
+            !
+            ! If we're asked for interrupt msg but none pending, complain
+            !
+            IF (xpn$$link_status (.nlb) AND MO_INT) EQL 0
+            THEN
+                RETURN (XPN$_ILLOGIC);
+            IF NOT JSYS_MTOPR (.nlb[NLB$H_JFN],
+                               $MORIM,
+                               CH$PTR (small_buffer, 0, 8);
+                               ,,,byte_count)
+            THEN
+                RETURN (xpn$$jsys_error (.nlb, MTOPR_));
+            xpn$$new_buffer (nlb[NLB$T_INTERRUPT], .byte_count);
+            CH$MOVE (.byte_count,
+                     CH$PTR (small_buffer, 0, 8),
+                     .nlb[NLB$A_INTERRUPT]);
+            nlb[NLB$V_IRPT_MSG] = (xpn$$link_status (.nlb) AND MO_INT) NEQ 0;
+            RETURN (XPN$_INTERRUPT)
+            END;
+        [NLB$K_DISCONNECT] :
+            BEGIN
+            LOCAL
+                small_buffer : VECTOR [CH$ALLOCATION (16, 8)],
+                byte_count,
+                link_status;
+            !
+            ! If disconnect info requested but link is connected, complain
+            !
+            IF ((link_status = xpn$$link_status (.nlb)) AND MO_CON) NEQ 0
+            THEN
+                BEGIN
+                nlb[NLB$G_2ND_CODE] = .link_status<rh>;
+                RETURN (XPN$_ILLOGIC)
+                END;
+            nlb[NLB$G_DISC_CODE] = .link_status<rh>;
+            IF (.link_status AND MO_ABT) NEQ 0
+            THEN nlb[NLB$V_ABORTED] = 1;        ! *** NLB$V_DISCONN undefined
+!           ELSE nlb[NLB$V_DISCONN] = 1;        ! ***
+            nlb[NLB$V_CONNECTED] = 0;
+            !
+            ! Get optional disconnect data, if any
+            !
+            IF NOT JSYS_MTOPR (.nlb[NLB$H_JFN],
+                               $MORDA,
+                               CH$PTR (small_buffer, 0, 8);
+                               ,,,byte_count)
+            THEN
+                RETURN (xpn$$jsys_error (.nlb, MTOPR_));
+            IF .byte_count NEQ 0
+            THEN
+                BEGIN
+                xpn$$new_buffer (nlb[NLB$T_DISCONNECT], .byte_count);
+                CH$MOVE (.byte_count, CH$PTR (small_buffer, 0, 8),
+                         .nlb[NLB$A_DISCONNECT])
+                END;
+            RETURN (XPN$_DISCONN)
+            END;
+        [INRANGE, OUTRANGE] : xpn$$bug ('Invalid subfunction in xpn$$get');
+        TES;
+    xpn$$bug ('No subfunction selected in xpn$$get')
+    END;			!End of xpn$$get
+
+ROUTINE xpn$$get_data (nlb) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   This routine reads data from a network link.
+!
+! FORMAL PARAMETERS:
+!   nlb         - address of the Network Link Block
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   XPN$_NORMAL         - read OK
+!   XPN$_INCOMPLETE     - read posted, caller didn't specify WAIT
+!   XPN$_ABORT          - link aborted
+!   XPN$_DISCONN        - link disconnected
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+    BEGIN
+
+    MAP
+        nlb : REF $XPN_NLB();
+
+    LOCAL
+        request_count;
+    !
+    ! If WAIT not specified, just return ($XPN_EVENT_INFO will
+    ! do the read when data arrives)
+    !
+    IF NOT .nlb[NLB$V_WAIT]
+    THEN
+        BEGIN
+        LOCAL
+            link_status;
+        !
+        ! Make sure the link is still there.
+        !
+        IF ((link_status =xpn$$link_status (.nlb)) AND MO_ABT) NEQ 0
+        THEN
+            RETURN (XPN$_ABORT);
+        IF (.link_status AND MO_CON) EQL 0
+        THEN
+            RETURN (XPN$_DISCONN);
+        nlb[NLB$V_DATA_REQ] = 1;        ! Flag that read has been posted
+        RETURN (XPN$_INCOMPLETE)
+        END;
+    !
+    ! Caller is willing to wait.  If no count is specified (NLB$H_REQ_SIZE),
+    ! assume user wants to read exactly one message.
+    !
+    IF (request_count = .nlb[NLB$H_REQ_SIZE]) EQL 0
+    THEN
+	BEGIN
+        LOCAL
+            retcode,
+            byte_count,
+            buffer_count,
+            buffer_address;
+        !
+        ! Allocate buffer according to user's request, or default maximum.
+        !
+        IF (buffer_count = .nlb[NLB$H_RECEIVE_MAX]) EQL 0
+        THEN
+            buffer_count = XPN$K_MAX_MSG;
+        IF NOT (retcode = $XPO_GET_MEM (FULLWORDS = ((.buffer_count + 3)/4),
+                                        RESULT = buffer_address))
+        THEN
+            RETURN (.retcode);
+        !
+        ! Do the input.
+        !
+        IF NOT JSYS_SINR (.nlb[NLB$H_JFN],
+                          CH$PTR (.buffer_address, 0, 8),
+                          -.buffer_count,
+                          0; ,, byte_count)
+        THEN
+            BEGIN
+            $XPO_FREE_MEM (BINARY_DATA = (((.buffer_count + 3)/4),
+                                          .buffer_address,
+                                          FULLWORDS));
+            RETURN (xpn$$jsys_error (.nlb, SINR_))
+            END;
+        byte_count = .buffer_count - (ABS (.byte_count));
+        IF .byte_count LSS 0 THEN xpn$$bug ('Bogus byte count in xpn$$get');
+        !
+        ! Release old buffer, allocate a new one, and copy data to it.
+        !
+        xpn$$new_buffer (nlb[NLB$T_DATA], .byte_count);
+        !
+        ! *** Right here we reference NLB$A_DATA as NLB$A_STRING, because
+        !     NLB$A_DATA is defined as an ADDRESS and BLISS generates
+        !     a HRRZ instruction.  NLB$A_STRING (which overlays NLB$A_DATA)
+        !     is defined as a POINTER so the right things happen.
+        !
+        CH$MOVE (.byte_count, CH$PTR (.buffer_address, 0, 8),
+                 .nlb[NLB$A_STRING]);
+        $XPO_FREE_MEM (BINARY_DATA = (((.buffer_count + 3)/4),
+                                      .buffer_address,
+                                      FULLWORDS));
+        RETURN (XPN$_NORMAL)
+	END
+    ELSE
+	!
+	! User specified a count, read exactly that many bytes
+	! ignoring message boundaries.
+	!
+	BEGIN
+        xpn$$new_buffer (nlb[NLB$T_DATA], .request_count);
+        IF NOT JSYS_SIN (.nlb[NLB$H_JFN],
+                         .nlb[NLB$A_DATA],
+                         .request_count,
+                         0)
+        THEN
+            RETURN (xpn$$jsys_error (.nlb, SIN_))
+        ELSE
+            RETURN (XPN$_NORMAL)
+	END;
+    END;
+
+END
+ELUDOM
+   

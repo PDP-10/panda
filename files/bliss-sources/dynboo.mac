@@ -1,0 +1,367 @@
+TITLE DY$BOO -- Bootstrap RTL into calling program
+
+;
+;	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1984, 1986.
+;	ALL RIGHTS RESERVED.
+;
+;	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+;	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+;	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+;	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+;	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+;	SOFTWARE IS HEREBY TRANSFERRED.
+;
+;	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+;	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+;	EQUIPMENT CORPORATION.
+;
+;	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+;	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+;
+
+SEARCH DDBSYM, MONSYM, MACSYM
+SEARCH DYNSYM
+
+SALL
+SUBTTL Edit History
+
+; Version 1.0
+
+;.EDIT 5	Don't type to terminal from DYNBOO if detached.
+;		Don't output from LDH if SG.OUT is 0
+;		DDB,10-MAY-84,SPR:NONE
+
+; Version 1.1
+
+;.EDIT 50	Formally go to version 1.1, update copyright, insert V1.1
+;			development changes (formally V2)
+;		DDB,15-Jan-85,SPR:NONE
+
+	REGDEF CX, LLB		;EFIW LDLBLK is overwhelmingly important
+
+SUBTTL DY$BOO -- Bootstrap RTL call through LTVEC
+
+; This is just like calling FAKDYN, only RTL-specific
+
+DY$BOO::
+	;Save registers 0-16 in format FAKDYN expects to restore from
+	ADJSP P, 17		;Allocate save block on stack
+	MOVEM 2, -14(P)		;Put AC2 in save block
+	XMOVEI 2, 1(P)		;Adr of block end + 1
+	DMOVEM 0, -16(P)	;Put AC0 and AC1 in save block
+	DMOVE 0, [EXP -14, 17]	;Set up 0,1 for reverxe XBLT (2 already set)
+	EXTEND 0, [XBLT]	;Save 3-16 in save block
+FAKSAV==17
+
+; Local temp storage:
+FAKTMP==23
+LCL1==-FAKTMP+1
+LCL2==-FAKTMP+2
+LCL6==-FAKTMP+4			;6-word local storage block
+LCL12==-FAKTMP+12		;12-word local storage block
+	ADJSP P, FAKTMP		;Allocate local work space
+
+; Names for stuff left on stack while calling us:
+CLDLBK==-<FAKSAV+FAKTMP>	;Address of local dynamic library block
+UCIP1==CLDLBK-1			;Address of user call instruction + 1
+
+	MOVE LLB, CLDLBK(P)	;Address of LDLBLK
+
+; no check of ldlblk version number on DY$BOO
+
+; no check for bad offset (library already initialized)
+
+; Special to DY$BOO -- change the contents of .LDFAK to point to RTL
+; entry vector
+	MOVX T2, <PUSHJ P, @RL.CTV##+.RLDYN>
+	MOVEM T2, .LDFAK(LLB)
+
+; Look for existing providers of the requested service class
+
+	XMOVEI T2, LCL6(P)	;Use LCL6 as PDV argument block
+	MOVX T0, 6
+	MOVEM T0, .POCT1(T2)
+	MOVX T0, .FHSLF
+	MOVEM T0, .POPHD(T2)
+	MOVX T0, 12
+	MOVEM T0, .POCT2(T2)
+	XMOVEI T0, LCL12(P)	;Use LCL12 as PDV data block
+	MOVEM T0, .PODAT(T2)
+	SETZM .POADR(T2)
+	MOVX T1, <777,,-1>	;Max possible memory address
+	MOVEM T1, .POADE(T2)	;0, 0 doesn't work to mean all of memory
+	MOVX T1, .POLOC		;Function code
+	GETBP T3, .LDCLS(LLB), T4 ;Byte pointer to class-name string
+	; .POLOC is not documented to respect .POADR-.POADE in the arg
+	; block, but it does.  
+	PDVOP%
+	    ERCAL DY$FJE
+
+; There can be no more than 1 copy of the RTL in memory at any moment.
+
+	HRRZ T0, .POCT2(T2)	;Count of words returned
+	JUMPE T0, FAKNPR	;No RTL in memory
+
+; The RTL is already in.
+	MOVE T3, LCL12(P)	;Get RTL PDVA
+	XMOVEI T1, @.PVSTR(T3)	;Get DLBLK adr from RTL PDV
+
+; The RTL can always accept another stream (it's non-streaming)
+	SETZ P2,		;clear flag, indicating library found
+	JRST FAKFND
+
+; If no RTL found, make one
+
+FAKNPR:	SETO P2,		;Set flag indicating library just mapped in
+; If this process is execute-only, ignore job-wide logical names on GTJFN%
+; to give the process at least some hope of maintaining security (with help
+; from the system manager, of course).
+; [RFSTS WORKAROUND] ;	XMOVEI T2, LCL12(P) ;Address of status block
+	XMOVEI T2, RFSHCK	;[RFSTS WORKAROUND] Address of status block
+	MOVX T1, .RFSFL+1	;length to at least include status flags
+	MOVEM T1, .RFCNT(T2)
+	MOVX T1, <RF%LNG+.FHSLF>
+	RFSTS%
+	  ERCAL DY$FJE
+	MOVE T0, .RFSFL(T2)	;Recover status flags returned
+	MOVX T1, GJ%OLD!GJ%SHT
+	TXNE T0, RF%EXO		;Skip if process is not execute-only
+	  TXO T1, GJ%PHY	;Ignore job logical names if execute-only
+	GETBP T2, .LDSPC(LLB), T4
+	GTJFN%
+	    ERCAL [
+		CALL SKPATT	;Skip if we have a terminal to print to
+		  JRST NOCONT	;Nope
+		TMSG <? FAKDYN -- Can't load RTL >
+		GETBP T1, .LDSPC(LLB), T4 ;Pointer to name of library
+		PSOUT
+		TMSG <
+    because:
+    >
+		JRST ERATPC
+	    ]
+
+; JFN is now sitting in T1.  Don't break it!
+; Address of LDLBLK is sitting in LLB. 
+
+; Get the file into the process
+
+; First, save entry vector
+	MOVEM T1, LCL1(P)	;Save JFN temporarily
+	MOVX T1, .FHSLF
+	XGVEC%
+	    ERCAL DY$FJE
+
+	DMOVEM T2, LCL2(P)	;Use as temp hold area
+	MOVE T1, LCL1(P)	;Restore JFN
+
+; Magically allocate a section.  Leave section number in T3.
+
+	CALL SECTIO		;Allocate a section, leaving result in T3
+	    CALL [
+		CALL SKPATT	;Skip if we have a terminal to type on
+		  JRST NOCONT
+		TMSG <? FAKDYN -- Can't allocate section to load dynamic library
+>
+		JRST NOCONT]
+
+; Get the file into the chosen section
+; JFN still sitting in T1; Section number in T3
+
+	XMOVEI T2, LCL12(P)	;Use LCL12 block for data block
+	MOVEM T3, .GBASE(T2)
+	MOVX T0, GT%BAS
+	MOVEM T0, .GFLAG(T2)
+	TXZ T1, <^-GT%JFN>	;Clear out all non-JFN bits
+	TXO T1, GT%NOV!GT%ARG	;Set flags
+	HRLI T1, .FHSLF
+	GET%
+	    ERCAL DY$FJE
+
+; Restore entry vector
+	MOVX T1, .FHSLF
+	DMOVE T2, LCL2(P)	;Get length and address from temp hold
+	XSVEC%
+	    ERCAL DY$FJE
+
+; Do a PDVOP% over just the new section to find the dynamic library PDV,
+; and thus the DLBLK.  We do this rather than looping back to the initial 
+; search because that search, over the full address space, might find a
+; previously-loaded copy of this service provider which has become free
+; due to asynchronous activity since we last looked.  If that were to happen,
+; the copy we just loaded would not get initialized, which could cause
+; disaster if a later call for service happened to choose it to call.
+
+; Also, if there is no provider PDV in this section we just loaded,
+; then looping back would put us into a loop that allocated another
+; section each time through and eventually died miserably.  No fun.
+
+FAK004:	XMOVEI T2, LCL6(P)	;Use LCL6 for PDV arg block
+				;again.  This was its last use.
+	MOVX T0, 12
+	MOVEM .POCT2(T2)
+	XMOVEI T1, LCL12(P)	;Use LCL12 for PDV data block
+	MOVEM T1, .PODAT(T2)
+	MOVE T1, .GBASE(T1)	;Still contains GET% args, including section
+	HRLZM T1, .POADR(T2)	;section,,0 -- start of range to search
+	HRLOM T1, .POADE(T2)	;section,,-1 -- end of range to search
+	MOVX T1, .POLOC		;Function -- locate PDV by name
+	; .POLOC isn't documented to respect .POADR .POADE, but it does
+	GETBP T3, .LDCLS(LLB), T4 ;Pointer to class name string
+				;(By searching for class name instead of for
+				;the Dynamic Library PDV, we are performing
+				;a check to make sure the file specified in
+				;the LDLBLK actually provides the service
+				;specified in the LDLBLK.)
+
+	PDVOP%
+	    ERCAL DY$FJE
+
+	HRRZ T1, .POCT2(T2)	;Get number of providers found (better be 1!)
+	CAIE T1, 1		;Should be exactly one provider PDV in a single
+				;dynamic library
+	    CALL [		;Invalid dynamic library format???
+		CALL SKPATT	;Do we have a terminal to type on?
+		  JRST NOCONT	;Nope
+		TMSG <? FAKDYN -- Class name not provided in library specified
+    Class name: >
+		GETBP T1, .LDCLS(LLB), T4
+		PSOUT
+		TMSG <
+    File spec: >
+		GETBP T1, .LDSPC(LLB), T4
+		PSOUT
+		TMSG <
+>
+		JRST ATPC
+	    ]
+
+	MOVE T1, LCL12(P)	;Get the single PDVA
+	XMOVEI T1, @.PVSTR(T1)	;Get DLBLK from PDV
+
+; no check on dlblk version number
+
+; No call to master init -- that's handled in RTL
+
+; Expects DLBLK address in T1, P2 non-zero if library mapped in by DY$BOO,
+; LDLBLK address in P1 (called LLB around these parts)
+
+FAKFND:
+	XMOVEI T2, @.DYCTV(T1)	;EFIW master transfer vector
+	JRST @.RLBOO(T2)	;Call special entry point
+
+SUBTTL DY$FJE -- Fatal Error Routine
+
+; Routine should be CALL'd -- it will want address of error on stack for
+; its use.
+
+DY$FJE::
+	CALL SKPATT		;Do we have a terminal to type on?
+	  JRST NOCONT		;No.
+	TMSG <? FAKDYN -- Fatal JSYS error loading dynamic library:
+    >
+ERATPC:	CALL SKPATT		;Do we have a terminal to type on?
+	  JRST NOCONT		;No.
+	MOVX T1, .PRIOU
+	MOVX T2, <.FHSLF,,-1>
+	SETZ T3,
+	ERSTR%
+	  JFCL
+	  JFCL
+	TMSG <
+>
+ATPC:	CALL SKPATT		;Do we have a terminal to type on?
+	  JRST NOCONT		;No.
+	TMSG <[At PC >
+	MOVX T1, .PRIOU
+	POP P, T2		;Return address of "call" to us
+	MOVX T3, <NO%OOV+^D8>
+	NOUT%
+	    ERJMP .+1		;Ignore errors in fatal error handler!!!
+	TMSG <]
+>
+
+USERPC:	CALL SKPATT		;Do we have a terminal to type on?
+	  JRST NOCONT		;No.
+	TMSG <[At user PC >
+	MOVX T1, .PRIOU
+	MOVE T2, UCIP1(P)	;Get address of user call plus 1
+	SOS T2
+	MOVX T3, <NO%OOV+^D8>
+	NOUT%
+	    ERJMP .+1		;Ignore errors in fatal error handler!!!
+	TMSG <]
+>
+
+NOCONT:	HALTF%
+	TMSG <? Cannot continue from fatal error
+>
+	JRST NOCONT
+
+SUBTTL SECTIO -- Allocate a section
+
+; This routine allocates a free section to map a library into.
+
+; This interim version uses Pete Mierswa's "section sniffer".  In the future,
+; a more complete algorithm including the possibility of user rules for
+; controlling section allocation should be employed.
+
+; Call:
+;	PUSHJ P, SECTIO
+;    Returns +1 if error (no more sections available!!)
+;    Returns +2 if no error, with
+;	T3/	Number of section allocated
+
+SECTIO:	PUSH P, T1		;Need elbow room
+	PUSH P, T2
+
+	MOVEI T3,1		;Start looking in section 2
+
+NEXTSC:	ADDI T3,1		;Look at the next section
+	CAIN T3,^D32		;No free sections on a KL?
+	  JRST SECFAL
+
+	MOVE T1, T3		;Next section to check
+	HRLI T1,.FHSLF		;For this process
+	RSMAP%			;Status of this section
+	  ERCAL DY$FJE		;Error?
+
+	TXNE T2,PA%PEX		;Does the page exist?
+	JRST NEXTSC		;Yes, look for a free section
+
+; Section number is in T3
+
+; Success -- skip return
+	AOS -2(P)		;Two saved registers on stack!
+
+SECFAL:
+
+SECOK:	POP P, T2
+	POP P, T1
+
+SECEX:	RET
+
+SUBTTL SKPATT -- Skip if we are running attached
+
+; If we are detached, we don't want to blast stuff out to the "terminal",
+; because doing so will cause us to hang until somebody attaches to us.
+; This routine is called from error-printing places to check if error printing
+; is appropriate.
+
+; Preserves registers 5-17
+
+SKPATT:	MOVX T1, -1
+	MOVX T2, <-1,,4>	;Use register 4 as "block"
+	MOVX T3, .JITNO		;Get terminal number, -1 if detached
+	GETJI%
+	    SETO T4,		;Assume detached if jsys fails
+	SKIPL T4
+	  AOS 0(P)		;Skip return
+	RET
+
+
+; Static block for RFSTS% JSYS (which, as of 16-dec-83, couldn't handle a
+; non-local address for its status block)
+RFSHCK:	BLOCK 5			;[RFSTS WORKAROUND]
+
+	END

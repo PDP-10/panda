@@ -1,0 +1,4682 @@
+	TITLE	TMODEM	File transfer program for MICROS <-> TOPS-20
+	SUBTTL	by Frank J. Wancho
+
+; Version components
+
+MODWHO== 7			; who last edited TMODEM (7=FJW)
+MODVER== 6			; TMODEM's release version (matches monitor's)
+MODMIN== 1			; TMODEM's minor version
+MODEDT== ^D402			; TMODEM's edit version
+
+
+; This is the TOPS-20 implementation of the TMODEM program,
+; based on the TOPS-20 MODEM program originally written by Bill
+; Westfield for SRI International Networks Group and subsequently
+; maintained by Frank J. Wancho, WANCHO@SIMTEL20.
+
+; TMODEM contains major pieces of TELNET code by Mark Crispin,
+; with his permission, heavily modified to operate in a TTY-only
+; connection.
+
+; Bugs/suggestions/questions to BUG-TMODEM@SIMTEL20
+
+; This program is a TOPS-20 implementation of the de-facto standard
+; MODEM2 File Transfer Protocol as devised by Ward Christensen.  This
+; program has been augmented to include the CRC and BATCH mode options
+; of MODEM7, and the 1K blocking option of YMODEM.
+
+; The basic protocol itself is documented in:
+
+; [SIMTEL20]PD:<CPM.MODEM2>MODEM2.PROTO
+
+	SUBTTL	Definitions
+
+	SEARCH	MACSYM,MONSYM	; system definitions
+	SALL			; Supress macro expansions
+
+	.DIRECTIVE FLBLST	; sane listings for ASCIZ, etc.
+	.TEXT "/NOINITIAL"	; suppress loading of JOBDAT
+	.TEXT "TMODEM/SAVE"	; save as TMODEM.EXE
+	.TEXT "/SYMSEG:PSECT:CODE" ; put symbol table and patch area in CODE
+	.REQUIRE SYS:MACREL	; MACSYM support routines
+
+; Assembly switches and other defaults
+
+IFNDEF PANDASW,<PANDASW==0>
+IFNDEF TIMFAC,<TIMFAC==<4.0>>	; N times the transmission time
+IFNDEF DEFESC,<DEFESC==.CHCCF>	; default escape character
+IFNDEF PDLLEN,<PDLLEN==^D200>	; stack length
+IFNDEF TIMTCK,<TIMTCK==^D6>	; # of 5 second ticks before timeout
+IFNDEF TTIBSZ,<TTIBSZ==^D50>	; size of TTY input buffer in words
+IFNDEF TTOBSZ,<TTOBSZ==^D100>	; size of TTY output buffer in words
+IFNDEF NTIBSZ,<NTIBSZ==^D100>	; size of NET input buffer in words
+			; ^^ ** can't be less than ^D32, see DECnet ICP
+IFNDEF NTOBSZ,<NTOBSZ==^D50>	; size of NET output buffer in words
+IFNDEF CMDBSZ,<CMDBSZ==^D30>	; size of command text buffer
+IFNDEF ATMBSZ,<ATMBSZ==^D10>	; size of atom buffer
+IFNDEF PURBEG,<PURBEG==100000>	; origin of pure code
+IFNDEF DDTADR,<DDTADR=770000>	; well known entry address of DDT
+IFNDEF HSTNML,<HSTNML==^D64>	; length of a host name (64 required minimum)
+ HSTNMW==<HSTNML/5>+1		; host name length in words
+IFNDEF .RFTTY,<.RFTTY==10>	; RFSTS% waiting for TTY I/O
+
+; DTR control definitions (in case assembling with a vanilla MONSYM)
+
+IFNDEF .MOHUP,.MOHUP==:400003	; drop DTR (hang up phone)
+IFNDEF .MODUP,.MODUP==:400004	; raise DTR (pick up phone)
+
+
+; AC's
+
+F=:0				; Flags
+A=:1				; JSYS, temporary AC's
+B=:2
+C=:3
+D=:4
+E=:5				; non-JSYS temporary AC's
+T=:6
+U=:7
+V=:10
+TIMCNT=:11
+CRCC=:12			; 16 bit CRC  (x^16+x^12+x^5+1)
+CHKSUM=:13
+PKTNUM=:14
+O=:15
+;CX=:16
+P=:17				; stack pointer
+
+
+; Miscellaneous definitions
+
+CH%PAR==200			; parity bit
+CH%CHR==^--CH%PAR		; character sans parity
+
+SOH==	"A"-100
+STX==	"B"-100
+EOT==	"D"-100
+ACK==	"F"-100
+TAB==	"I"-100
+NAK==	"U"-100
+CAN==	"X"-100
+SUB==	"Z"-100
+BDNM==	"u"
+
+IFE PANDASW,<
+IAC==	377			; TELNET IAC
+WILL==	373			; TELNET WILL <option>
+WONT==  374			; TELNET WONT <option>
+DO==	375			; TELNET DO <option>
+DONT==	376			; TELNET DONT <option>
+TRNBIN== 0			; TELNET Transmit Binary option
+>
+
+KBUF==	^D1024			; 1024 character buffer
+BUFSIZ==^D128			; 128 character buffers
+SUCNUM==^D8			; Number of successful packets sent
+				; needed to reset K flag
+
+
+; Option flags (left half)
+
+F%A==:1B0			; ASCII mode
+F%B==:1B1			; BINARY mode
+F%C==:1B2			; CHECKSUM mode
+F%D==:1B3			; DISCONNECT when done
+F%K==:1B4			; KILOBYTE buffer flag
+F%Q==:1B5			; QUIET transfer (without messages)
+F%R==:1B6			; view RECEIVED characters
+F%S==:1B7			; view SENT characters
+F%V==:1B8			; VIEW data only
+;;;;;==:1B9
+;;;;;==:1B10
+;;;;;==:1B11
+;;;;;==:1B12
+F%HLP==:1B13			; HELP command in progress
+F%TAC==:1B14			; TAC user
+F%TTYI==:1B15			; Terminal TTYINI'd
+F%TFLG==:1B16			; Transient flag
+F%EOF==:1B17			; File EOF reached
+
+; Internal flags (right half)
+
+F%ITS==:1B18			; use ITS style binary file
+F%CRC==:1B19			; use CRC instead of checksum
+F%WCF==:1B20			; wildcard files being transferred
+F%EOT==:1B21			; EOT seen flag
+F%SND==:1B22			; SEND/RECEIVE flag
+F%KSV==:1B23			; Kept K flag for wildcard sends
+F%RCH==:1B24			; Received character (vs timeout) flag
+F%SPD==:1B25			; TTY line speed explicitly set
+F%MONC==:1B26			; saw a monitor command, exit when done
+F%LINE==:1B27			; use line editor
+F%EXTN==:1B28			; enter extended command mode on ESCCHR
+F%ECHO==:1B29			; local host is echoing
+F%OPAQ==:1B30			; use stupid OPAQUE mode
+F%PAGE==:1B31			; use local page mode
+F%TAKE==:1B32			; TAKE file in progress
+F%HOER==:1B33			; Halt on error
+F%RSCN==:1B34			; Called by command line
+F%RSCC==:1B35			; Original parse of RSCAN% line
+
+F%KEEP==F%MONC!F%ECHO!F%OPAQ!F%PAGE!F%EXTN!F%LINE!F%SPD!F%TTYI!F%TAKE!F%TAC
+
+	SUBTTL Macro definitions
+
+; Fatal assembly error macro
+
+DEFINE .FATAL (MESSAGE) <
+	PASS2
+	PRINTX ?'MESSAGE
+	END
+>;DEFINE .FATAL
+
+; CMD command-name
+; Generates an entry in a keyword table
+
+DEFINE CMD (COMMAND) <[ASCIZ/COMMAND/],,.'COMMAND>
+DEFINE KEY (KEYSTRING,ADDRESS) <[ASCIZ/KEYSTRING/],,ADDRESS>
+
+; PARSE FLDDB.-list
+; Parses the specified FLDDB., skip returns if successful parse.
+
+DEFINE PARSE (DATA) <
+	PARSEA <[FLDDB. DATA]>
+>;DEFINE PARSE
+
+; PARSEA address
+;  Parses an FLDDB. item found at the specified address.
+; Skip returns if successful parse.
+
+DEFINE PARSEA (ADDR) <
+	MOVEI	B,ADDR		;; load function block
+	COMND%			;; this is the only COMND% in the source!
+	 ERJMP	ERROR		;; some cases legitimately fail
+	TXNE	A,CM%NOP	;; skip if success
+>;DEFINE PARSEA
+
+; NOISE noise-word-string
+; Outputs a noise word string if appropriate
+
+DEFINE NOISE (STRING) <
+	PARSE <.CMNOI,,<-1,,[ASCIZ/STRING/]>>
+	 JRST ERROR
+>;DEFINE NOISE
+
+; CONFIRM
+; Requires carriage return confirmation, finishes up command parse
+
+DEFINE CONFIRM <
+	PARSE <.CMCFM>
+	JRST ERROR
+>;DEFINE CONFIRM
+
+
+; EMSG string
+; Types out an error message
+
+DEFINE EMSG (STRING) <
+	HRROI	A,[ASCIZ/'STRING'/]
+	ESOUT%
+	TXNE	F,F%TAKE
+	 CALL	UNTAKE
+>;DEFINE EMSG
+
+; ERMSG string
+; Types out an error message and RETs
+
+DEFINE ERMSG (STRING) <
+	IFNSK.
+	 EMSG <STRING>
+	 RET
+	ENDIF.
+>;DEFINE ERMSG
+
+; ERNOP
+; Ignores a JSYS error
+
+DEFINE ERNOP <ERJMP .+1>
+
+; REPORT flag,false-string,true-string
+; Prints appropriate string depending upon status of flag
+
+DEFINE REPORT (FLAG,FSTR,TSTR) <
+	TXNN	F,FLAG
+	 SKIPA	A,[-1,,[ASCIZ/
+'FSTR'/]]
+	HRROI	A,[ASCIZ/
+'TSTR'/]
+	PSOUT%
+>;DEFINE REPORT
+
+; Prints help string for command or settable parameter and
+; optionally displays the status of the parameter if available.
+
+DEFINE PHELP (STRPTR,STASTR) <
+	TXZN	F,F%HLP
+	IFSKP.
+	 CONFIRM
+	 HRROI	A,STRPTR
+	 PSOUT%
+IFB <STASTR>,<
+	 RET>
+IFNB <STASTR>,<
+	 CALL	STASTR
+	 TMSG <
+
+>>
+	 RET
+	ENDIF.
+>; DEFINE PHELP
+
+
+; Macros for initializing and disabling timer
+
+TMRTCK==^D1			;Timer tick interval in seconds
+
+MIN2==	^D120/TMRTCK		; 2 minutes
+MIN3==	^D180/TMRTCK		; 3 minutes
+SEC15==	^D15/TMRTCK		; 15 seconds
+CNT192==^D192/TMRTCK		; 192 seconds
+
+;The following are the timeouts used by GZ's MMODEM (not here yet):
+
+;TIMEH==	^D30/TMRTCK	;Initial SOH timeout
+;TIMES==	^D20/TMRTCK	;Character timeout
+;TIMEC==	^D10/TMRTCK	;Line flush on error
+;TIMEQ==	^D20/TMRTCK	;Line flush on abort
+;TIMEI==	^D160/TMRTCK	;Initial NAK timeout
+;TIMEA==	^D80/TMRTCK	;Inter-sector ACK/NAK timeout
+
+; intvl = time-out interval in seconds
+; retad = time-out error return address
+
+; Set the time-out interval in timer ticks
+
+DEFINE	SETTMO	(INTVL) <
+	MOVNI	A,<INTVL/TMRTCK>
+>;DEFINE SETTMO
+
+	SUBTTL	Data area
+
+	LOC	20		; low core for PC/AC storage
+
+FATACS:	BLOCK	20		; AC save area for FATAL routine
+IF1,<IFN <.-40>,<.FATAL .JBUUO in wrong location>>
+.JBUUO:	BLOCK	1		; instruction stored here on UUO execution
+.JB41:	JSR	UUOPC		; instruction executed on LUUO
+IN1ACS:	BLOCK	20		; PSI level 1 AC save area
+LEV1PC:	BLOCK	1		; PSI level 1 PC
+LEV2PC:	BLOCK	1		; PSI level 2 PC
+LEV3PC:	BLOCK	1		; PSI level 3 PC
+REENTP:	BLOCK	1		; -1 => invoked by REENTER command
+ESCCHR:	BLOCK	1		; escape character
+TTYMOD:	BLOCK	1		; virgin TTY mode
+TTYCOC:	BLOCK	2		; virgin TTY COC words
+TTYTIW:	BLOCK	1		; virgin TTY interrupt word
+UUOPC:	BLOCK	1		; PC of LUUO
+	MOVEM	17,FATACS+17	; save AC's in FATACS for debugging
+	MOVEI	17,FATACS	; save from 0 => FATACS
+	BLT	17,FATACS+16	; ...to 16 => FATACS+16
+	MOVE	17,FATACS+17	; restore AC17
+	EMSG <Invalid instruction >
+	MOVE	B,.JBUUO
+	CALL	OUT8
+	TMSG < at >
+	HRRZ	T,UUOPC
+	CALL	SYMOUT
+	JRST	DEATH		; now die
+	BLOCK	<116-.>		; free space here
+.JBSYM:	BLOCK	1		; symbol table from LINK
+.JBUSY:	BLOCK	1		; undefined symbol table from LINK
+IN2ACS:	BLOCK	20		; PSI level 2 AC save area
+
+	RELOC			; .LOW. PSECT
+
+	.PSECT	DATA,1000	; enter data PSECT
+
+PDLPTR:	IOWD	PDLLEN,PDL
+	BLOCK	2
+PDL:	BLOCK	PDLLEN		; main program stack
+
+RDLPTR:	IOWD	PDLLEN,RPDL
+	BLOCK	2
+RPDL:	BLOCK	PDLLEN		; receive fork stack
+
+CORBEG==.			; first loc zeroed in main loop
+
+; I/O buffers.  They must be in order PTR, CTR, BFR.
+
+TTIPTR:	BLOCK	1		; TTY input buffer pointer
+TTICTR:	BLOCK	1		; TTY input buffer counter
+TTIBFR:	BLOCK	TTIBSZ		; TTY input buffer
+TTOPTR:	BLOCK	1		; TTY output buffer pointer
+TTOCTR:	BLOCK	1		; TTY output buffer counter
+TTOBFR:	BLOCK	TTOBSZ		; TTY output buffer
+NTIPTR:	BLOCK	1		; NET input buffer pointer
+NTICTR:	BLOCK	1		; NET input buffer counter
+NTIBFR:	BLOCK	NTIBSZ		; NET input buffer
+NTOPTR:	BLOCK	1		; NET output buffer pointer
+NTOCTR:	BLOCK	1		; NET output buffer counter
+NTOBFR:	BLOCK	NTOBSZ		; NET output buffer
+
+; JFNs
+
+NETJFN:	BLOCK	1		; network JFN
+TMPJFN:	BLOCK	1		; temporary file JFN
+
+
+; Other stuff
+
+REPARP:	BLOCK	1		; reparse P
+OREPAP:	BLOCK	1		; connection open reparse P
+RCVFRH:	BLOCK	1		; receive fork handle
+FILBUF:	BLOCK	^D20		; buffer for net GTJFN% filename
+GTJBLK:	BLOCK	.GJATR+1	; GTJFN% block
+LRFSTS:	BLOCK	.RFSFL+1	; Long RFSTS block
+
+COREND==.-1			; last loc zeroed in main loop
+
+; Connection parameters
+
+HOST:	BLOCK 1			; host to connect to
+PARITY:	0
+TTYSYS:	BLOCK	1		; virgin TTY sys message status word
+TTYCAP:	BLOCK	1		; virgin TTY capabilities word
+NETSPD:	BLOCK	1		; virgin NET (TTY line) speed
+NEWSPD:	BLOCK	1		; Requested NET speed
+BRKSPD:	BLOCK	1		; Current NET speed
+DEFBRK==3			; Default number of NULLs used to
+BRKCNT:	DEFBRK			; send a simulated BREAK on a TTY port
+MAXNUL==^D100			; Maximum number of NULLs allowed
+NULLS:	REPEAT <MAXNUL/5>+1,<0>	; String of NULLs
+
+
+; Not sure yet where the following goes: preserved or what
+
+BUFFER:	BLOCK	KBUF/4 + 2	; TMODEM data packet buffer
+
+HSTNUM:	BLOCK	1		; Host number for CHKTAC
+RNBLKS:	0			; Number of records read
+NBLKS:	0			; Number of records left to send
+NBYTES:	0			; Number of bytes to send
+ERRCNT:	0			; Error counter
+SUCCNT:	0			; Success counter
+FILPOS:	0			; File position used by SEND
+PKTSAV:	0			; Saved packet number
+BYTSIZ:	0			; Byte size of file
+MODDEV:	0			; TMODEM Device (either console or some TTY)
+FILJFN:	0			; Current File JFN
+MULJFN:	0			; Wildcard file JFN
+LSTPKT:	0			; Last packet number received
+OLDLTS:	0
+TIMTIM:	0			; Timeout for data packet string read
+TIM128:	0			; As above for 128-byte data packets
+TIM1K:	0			; As above for 1,024-byte data packets
+TIMKIL:	BLOCK	1		; -1 if clock should be killed
+TIMLOC:	BLOCK	1		; PC to go to on time-out
+TIMRTP:	BLOCK	1		; Stack ptr for time-out return
+INTOK:	BLOCK	1		; Neg if time-out interrupt active
+SAVE2:	BLOCK	2		; Miscellaneous temporary storage
+
+
+; Cells preserved across commands
+
+INICBG==.			; first location cleared at once-only init
+EXCFRH:	BLOCK	1		; inferior EXEC's fork handle
+LOGJFN:	BLOCK	1		; log file JFN
+OLGJFN:	BLOCK	1		; Previous log file JFN
+LOGSTR:	BLOCK	50		; Log filename string
+LOGFLG:	BLOCK	1		; LOG recording flag
+CMDBUF:	BLOCK	CMDBSZ		; command buffer
+ATMBUF:	BLOCK	ATMBSZ		; atom buffer
+
+INICEN==.-1			; last location cleared at once-only init time
+
+	.ENDPS			; back to .LOW. PSECT
+
+	SUBTTL Command parser data
+
+; COMND% JSYS block
+
+CMDBLK:	REPARS			; reparse address
+	.PRIIN,,.PRIOU		; using the TTY
+	-1,,[ASCIZ ""]		; ^R buffer
+	440700,,CMDBUF		; start of text buffer
+	440700,,CMDBUF		; next input
+	CMDBSZ*5		; size of command buffer
+	0			; # of unparsed characters
+	440700,,ATMBUF		; start of atom buffer
+	ATMBSZ*5		; size of atom buffer
+	0			; GTJFN% block
+
+; GTJFN% block used for RECEIVEd files
+
+GJRBLK:	GJ%SHT!GJ%IFG!GJ%FOU!GJ%OFG!GJ%XTN!GJ%MSG
+	.NULIO,,.NULIO
+	0			; dev
+	0			; dir
+	0			; name
+	0			; ext
+	BLOCK	.GJATR-.GJEXT
+
+; GTJFN% block used for SEND or TRANSMIT files
+
+GJSBLK:	GJ%SHT!GJ%OLD!GJ%IFG!GJ%XTN
+	.NULIO,,.NULIO
+	0			; dev
+	0			; dir
+	440700,,[ASCIZ/*/]	; name
+	0			; ext
+	BLOCK	.GJATR-.GJEXT
+
+	.PSECT	CODE,PURBEG	; pure code begins here
+
+; Top-level command parser
+
+CMDCMD:	FLDDB.	.CMKEY,,CMDTAB,<command,>
+
+; Top-level command table
+
+CMDTAB:	CMDTBL,,CMDTBL		; TBLUK% table
+	CMD	CONNECT		; connect to a remote host
+	[CM%FW!CM%INV
+	 ASCIZ/DDT/],,.DDT	; enter DDT
+	[CM%FW!CM%INV!CM%ABR
+	 ASCIZ/EX/],,.EX	; make EX mean EXIT
+.EX:!	CMD	EXIT		; return to superior
+	CMD	HELP		; print HLP:<name>.HLP
+	CMD	PUSH		; push to inferior EXEC
+	CMD	QUIT		; quit out of TELNET
+	[CM%FW!CM%INV!CM%ABR
+	 ASCIZ/R/],,.R
+	[CM%FW!CM%INV
+	 ASCIZ/RA/],,.RA	; Same as RECEIVE filespec/ASCII
+	[CM%FW!CM%INV
+	 ASCIZ/RAC/],,.RAC	; Same as RECEIVE filespec/ASCII/CHECKSUM
+	[CM%FW!CM%INV
+	 ASCIZ/RC/],,.RC	; Same as RECEIVE filespec/CHECKSUM
+.R:!	CMD	RECEIVE		; RECEIVE a file
+	[CM%FW!CM%INV!CM%ABR
+	 ASCIZ/S/],,.S
+.S:!	CMD	SEND		; SEND a file
+	CMD	SET		; SET a parameter
+	[CM%FW!CM%INV
+	 ASCIZ/SK/],,.SK	; Same as SEND filespec/KILOBYTE
+	CMD	STATUS		; where am I
+	CMD	SWITCHES	; Switch description
+	CMD	TAKE		; take command file
+	CMD	TTY
+CMDTBL==<.-CMDTAB>-1		; number of entries
+
+
+; Connection open command table
+
+CMOTAB:	CMOTBL,,CMOTBL
+	CMD	CLOSE		; close connection
+	CMD	CONTROL		; send control character
+	CMD	EXIT		; return to superior
+	CMD	HELP		; print HLP:<name>.HLP
+	CMD	PUSH		; push to inferior EXEC
+	CMD	QUIT		; quit out of TELNET
+	[CM%FW!CM%INV!CM%ABR
+	 ASCIZ/R/],,.RN
+	[CM%FW!CM%INV
+	 ASCIZ/RA/],,.RA	; Same as RECEIVE filespec/ASCII
+	[CM%FW!CM%INV
+	 ASCIZ/RAC/],,.RAC	; Same as RECEIVE filespec/ASCII/CHECKSUM
+	[CM%FW!CM%INV
+	 ASCIZ/RC/],,.RC	; Same as RECEIVE filespec/CHECKSUM
+.RN:!	CMD	RECEIVE		; RECEIVE a file
+	[CM%FW!CM%INV!CM%ABR
+	 ASCIZ/S/],,.SN
+.SN:!	CMD	SEND		; SEND a file
+	CMD	SET		; SET a parameter
+	[CM%FW!CM%INV
+	 ASCIZ/SK/],,.SK	; Same as SEND filespec/KILOBYTE
+	CMD	STATUS		; are you there signal
+	CMD	SWITCHES	; Switch description
+	CMD	TAKE		; take command file
+	CMD	TRANSMIT	; Blind SEND
+CMOTBL==<.-CMOTAB>-1
+
+
+
+; SET parameter table with no open connection
+
+STNTAB:	STNTBL,,STNTBL
+	CMD	ECHO		; remote host echos (yay!)
+	CMD	ESCAPE		; set escape character
+	CMD	EXTENDED	; automatic entry to extended command mode
+	CMD	LINE		; enable line editor
+	CMD	LOG		; open typescript file
+	CMD	NULLS		; Number of NULLs to use for BREAK simulation
+	CMD	OPAQUE		; use local padding, etc.
+	CMD	PAGE		; use local page mode
+	CMD	PARITY		; SET parity
+	CMD	PORT		; TTY line
+STNTBL==<.-STNTAB>-1
+
+; SET parameter table for an active connection
+
+STOTAB:	STOTBL,,STOTBL
+	CMD	ECHO		; remote host echos (yay!)
+	CMD	ESCAPE		; set escape character
+	CMD	EXTENDED	; automatic entry to extended command mode
+	CMD	LINE		; enable line editor
+	CMD	LOG		; open typescript file
+	CMD	NULLS		; Number of NULLs to use for BREAK simulation
+	CMD	OPAQUE		; use local padding, etc.
+	CMD	PAGE		; use local page mode
+	CMD	PARITY		; SET parity
+STOTBL==<.-STOTAB>-1
+
+
+DEFINE SMD (SWITCH,S) <[ASCIZ/SWITCH/],,[TXO F,F%'S
+	RET]
+>;DEFINE SMD
+
+; Switch table for SEND and RECEIVE commands
+
+SWITAB:	SWITBL,,SWITBL
+	SMD	ASCII-MODE,A	; Receive-only (if SEND, then means TRANSMIT)
+	SMD	BINARY-MODE,B	; Receive-only (forced if BATCH mode)
+	SMD	CHECKSUM-MODE,C	; Used to override CRC preferred on RECEIVE
+	SMD	DISCONNECT,D	; Not implemented
+	SMD	KILOBYTE-MODE,K	; Use 1,024-byte data packets
+	SMD	QUIET-MODE,Q	; No messages during transfer
+	SMD	RECEIVED,R	; View Received characters
+	SMD	SENT,S		; View Sent Characters
+	SMD	VIEW,V		; View Data Packets only
+SWITBL==<.-SWITAB>-1
+
+SWIFDB:	FLDDB. .CMSWI,,SWITAB
+
+; Switch Help table
+
+HSWTAB:	HSWTBL,,HSWTBL
+	KEY	ASCII-MODE,HSWA
+	KEY	BINARY-MODE,HSWB
+	KEY	CHECKSUM-MODE,HSWC
+	KEY	DISCONNECT,HSWD
+	KEY	KILOBYTE-MODE,HSWK
+	KEY	QUIET-MODE,HSWQ
+	KEY	RECEIVED,HSWR
+	KEY	SENT,HSWS
+	KEY	VIEW,HSWV
+HSWTBL==<.-HSWTAB>-1
+
+; Speed table for TTY, CONNECT, and SET PORT commands
+
+DEFINE SPDKEY (SPEED) <[ASCIZ/SPEED/],,^D'SPEED>
+
+SPDTAB:	SPDTBL,,SPDTBL
+	SPDKEY	0
+	SPDKEY	110
+	SPDKEY	1200
+	SPDKEY	134
+	SPDKEY	150
+	SPDKEY	1800
+	SPDKEY	200
+	SPDKEY	2400
+	SPDKEY	300
+	SPDKEY	4800
+	SPDKEY	50
+	SPDKEY	600
+	SPDKEY	75
+	SPDKEY	9600
+SPDTBL==<.-SPDTAB>-1
+
+; Toggle table for SET parameters which may be toggled ON or OFF
+
+TOGTAB:	TOGTBL,,TOGTBL
+	KEY	OFF,0
+	KEY	ON,1
+TOGTBL==<.-TOGTAB>-1
+
+; SET ECHO table
+
+ECHTAB:	ECHTBL,,ECHTBL
+	KEY	LOCAL,1
+	KEY	REMOTE,0
+ECHTBL==<.-ECHTAB>-1
+
+; SET PARITY table
+
+PARTAB:	PARTBL,,PARTBL
+	KEY	EVEN,2
+	KEY	MARK,1
+	KEY	NONE,0
+	KEY	ODD,3
+	KEY	SPACE,4
+PARTBL==<.-PARTAB>-1
+
+	SUBTTL Start of program
+
+; Entry vector
+
+IFNDEF VI%DEC,<			; in case MACSYM is prior to release 6
+ VI%DEC==1B18
+>;IFNDEC VI%DEC
+
+EVEC:	JRST	TMODEM		; START address
+	JRST	MODREE		; REENTER address
+	VI%DEC!<FLD MODWHO,VI%WHO>!<FLD MODVER,VI%MAJ>!<FLD MODMIN,VI%MIN>!<FLD MODEDT,VI%EDN>
+EVECL==.-EVEC
+
+	SUBTTL	Main routine - Initialize setup
+
+TMODEM:	TDZA	A,A		; normal entry
+MODREE:	 SETO	A,		; REENTER address
+	MOVEM	A,REENTP	; remember whether START or REENTER
+	setz	F,		; zero all flags
+	RESET%			; flush all I/O, etc.
+	MOVE	P,PDLPTR	; init stack context
+	SETZM	INICBG		; clear once-only area
+	MOVE	A,[INICBG,,INICBG+1]
+	BLT	A,INICEN
+	CALL	CAPINI		; initialize capabilities
+	CALL	SETPSI		; Set up interrupts
+	MOVX	B,<1B<.ICIFT>>	; Only fork termination now
+	AIC%
+	 ERCAL	FATAL
+	TXZ	F,F%TAC		; Clear flag word
+	GJINF%			; Get job info
+	move	A,D		; Get terminal number into A
+	TXO	A,TCP%TV	; Argument is a TVT
+	HRROI	B,7		; Want host number (should have a symbol!)
+	HRROI	C,HSTNUM
+	STAT%			; Get it
+	 ERJMP	NOTTAC		; Must not be a TVT
+	MOVX	A,.GTHHN	; Get status of host
+	MOVE	C,HSTNUM	;  given host number
+	GTHST%
+	IFJER.
+	 setz	D,		; If failed, just clear D
+	ENDIF.
+	ANDI	D,HS%STY	; Get system type
+	CAIE	D,.HSTIP	; Is it a TIP?
+	 CAIN	D,.HSTAC	; Is it a TAC?
+	  TXO	F,F%TAC		; It is
+NOTTAC:	MOVX	A,.PRIOU	; get current TTY modes
+	RFMOD%
+	 ERCAL	FATAL
+	MOVEM	B,TTYMOD	; Save modes
+	RFCOC%			; get COC words
+	 ERCAL	FATAL
+	DMOVEM	B,TTYCOC	; Save both COCC words
+	MOVX	A,.FHJOB	; get terminal interrupt word
+	RTIW%
+	 ERCAL	FATAL
+	MOVEM	B,TTYTIW	; save TIW
+	movx	A,.CTTRM	; Get current refuse
+	movx	B,.MORNT	; setting.
+	MTOPR%
+	 ERCAL	FATAL
+	movem	C,TTYSYS	; save old sys message status.
+	MOVX	A,.FHSLF
+	RPCAP%
+	 ERCAL	FATAL
+	movem	C,TTYCAP	; save old capabilities
+	MOVX	A,DEFESC	; set up escape character
+	MOVEM	A,ESCCHR
+	MOVX	A,.PRIOU	; Get console designator
+	movem	A,MODDEV	; and save as MODDEV for file transfers
+
+
+; Process RSCAN% buffer and TMODEM.CMD
+
+	MOVX	A,.RSINI	; get RSCAN% buffer if any
+	RSCAN%
+	 ERCAL	FATAL
+	IFN.	A		; RSCAN% buffer seen
+	 DO.
+	  PBIN%			; flush leading whitespace
+	  CAIE	A,.CHTAB
+	   CAIN	A,.CHSPC
+	    LOOP.
+	  CAIE	A,.CHFFD
+	   CAIN	A,.CHLFD	; this shouldn't happen, but...
+	    EXIT.
+	  CAIE	A,"N"		; allow NTMODEM, etc.
+	   CAIN	A,"n"
+	    MOVX A,"T"
+	  CAIE	A,"T"		; look like a TMODEM command?
+	   CAIN	A,"t"
+	    TDZA B,B		; yes, alright to scan for delimiters
+	  SETO	B,		; no, just flush command line
+	  DO.
+	   PBIN%		; flush to LF or delimiter
+	   CAIE A,.CHFFD
+	    CAIN A,.CHLFD
+	     EXIT.		; obviously no command
+	   JUMPN B,TOP.
+	   CAIN	A,.CHTAB
+	   IFSKP.
+	    CAIE A,.CHSPC
+	     LOOP.
+	   ENDIF.
+	   TXO F,F%MONC		; flag a command seen
+	  ENDDO.
+	 ENDDO.
+	ENDIF.
+	GJINF%			; get user number
+	MOVE	B,A		; convert to login directory
+	SETZ	A,
+	RCDIR%			; get login directory number
+	 ERCAL	FATAL
+	HRROI	A,FILBUF	; create filename string
+	MOVE	B,C		; using login directory
+	DIRST%
+	 ERCAL	FATAL
+	HRROI	B,[ASCIZ/TMODEM.CMD/] ; copy in rest of file name
+	SETZ	C,
+	SOUT%
+	MOVX	A,GJ%OLD!GJ%SHT	; see if TMODEM.CMD exists
+	HRROI	B,FILBUF
+	GTJFN%
+	IFNJE.
+	 CALL	TAKE1		; it does, TAKE it
+	 TXNE	F,F%MONC	; saw a monitor command?
+	  TXZ	F,F%MONC	; yes, fool the AOSN first time in
+	ENDIF.
+
+	SUBTTL Main program
+
+	DO.			; here's the top-level loop
+	 MOVE	P,PDLPTR	; re-init stack in case timeout
+	 SETZM	CORBEG		; init data area
+	 MOVE	A,[CORBEG,,CORBEG+1]
+	 BLT	A,COREND
+	 CALL	PARSER		; parse and execute command
+CLSRET:	 TXNE	F,F%TAKE	; TAKE in progress?
+	  LOOP.			; yes, continue as if part of same command
+	 SKIPE	LOGJFN		; no, log file JFN open?
+	 IFSKP.
+	  SETO	A,		; no, flush all JFN's
+	  CLOSF%
+	   ERNOP		; don't die, DECnet CLOSF% can fail...
+	 ENDIF.
+TIMRET:	 TXZE	F,F%MONC	; coming back from a monitor command?
+	  CALL	EXIT		; yes, return to EXEC
+	 LOOP.
+	ENDDO.
+
+	SUBTTL	SEND a file using the Christensen Protocol
+
+; SEND is a top-level command which may be invoked for a direct
+; file transfer with the controlling terminal or via an extended
+; command while in talk mode with a remote host.  In the latter
+; case, the file transfer dialog takes place with the remote host.
+;
+; SEND calls PARFIL to get the filespec and switches from the
+; controlling terminal, then conditionally sends the Ready message, 
+; and either passes control to MSND if a wildcard filespec is given,
+; or calls SNDFIL directly in the single file case.
+
+.SK:	TXO	F,F%SND!F%K
+	jrst	PARFIL
+
+.SEND:	PHELP	HSEND		; Check if HELP command
+	TXO	F,F%SND		; Flag as SEND for PARFIL to come back here
+	jrst	PARFIL		; Parse output filename and any switches
+SND0:	TXZ	F,F%ITS!F%B!F%KSV!F%EOF	; Clear certain flags
+	TXNE	F,F%K		; If K flag is set,
+	 TXO	F,F%KSV		; set the multi-file K flag
+	SKIPE	NETJFN		; Display message only if transfer
+	IFSKP.			; is to controlling terminal
+	 TXNN	F,F%WCF		; and wildcard
+	 IFSKP.
+	  TMSG <
+SEND: Ready
+>
+	 ENDIF.
+	ENDIF.
+	move	A,FILJFN
+	TXNE	F,F%WCF		; Is it a wildcard JFN?
+	 jrst	MSND		; Yes, send filename, etc.
+	CALL	IPNFIL		; No, go get info on type
+	CALL	CHKFIL		; Get size and NBLKS
+	CALL	TYPFL1		; type name
+	CALL	SNDFIL		; Do a single file transfer
+	jrst	RCVER1		; and wrap it up
+
+
+; SNDFIL sends the contents of a single file to the remote
+; according to the Christensen Protocol.  Called by SEND directly
+; if only a single file is requested to be sent, or by MSND when
+; a wildcard filespec is requested.  The first character received
+; from the remote determines whether the old CHECKSUM- or CRC-
+; terminated packet mode is to be used.  Packets are numbered
+; sequentially, beginning with 1 and rolling over to 0 after
+; packet 255.  Packet numbers are the same as record numbers,
+; modulo 255, if 128-byte data packets are used, and are multiples
+; of 8 when 1K data packets are used.  The sending end controls
+; whether 1K data packets or 128-byte data packets are sent.
+
+SNDFIL:	TXZ	F,F%CRC		; Clear CRC flag
+	TXNE	F,F%KSV		; If the multi-file K flag is set,
+	 TXO	F,F%K		; set the transient K flag
+	setz	PKTNUM,		; zero record number
+	setzm	RNBLKS		; Zero received block count
+	movni	A,SUCNUM	; reset success counter
+	movem	A,SUCCNT
+	movei	TIMCNT,MIN2	; set up for total of 2 min
+INIWAI:	SETTMO (TMRTCK)		; set timeout
+	CALL	GETCHR		; wait for a character
+	 jrst	INIWA2		; timed out
+	cain	B,"C"		; CRC option requested?
+	 jrst	RCRC		; yes
+	cain	B,NAK		; Got initial NAK?
+	 jrst	NEXT		; yes
+	cain	B,CAN		; If ^X,
+	 jrst	[hrroi	A,[ASCIZ/
+SEND: Cancelled by remote host./]
+		jrst	RCVERX]
+INIWA2:	sojg	TIMCNT,INIWAI	; Decrement timeout counter and wait, or
+	hrroi	A,[ASCIZ/
+SEND: Timeout on start of packet./]	; Maybe display error message
+	jrst	RCVERX		; and clean up
+
+RCRC:	TXO	F,F%CRC		; set flag to use CRC
+NEXT:	move	A,MODDEV
+	CFIBF%			; Clear any pending input
+	movei	A,^D10		; Set up error counter
+	movem	A,ERRCNT
+	TXNN	F,F%EOF		; have we reached the end of the file ?
+	 jrst	NOTEOF		; No, skip
+DOEOF:	movei	TIMCNT,^D10	; Set timeout count
+DOEOF1:	movei	B,EOT		; Get EOF and
+	CALL	SNDCHR		; send it
+DOEOF2:	SETTMO (^D16)		; set 16 second timeout
+	CALL	GETCHR		; wait for a character
+	 jrst	GETAC2		; timed out
+	cain	B,ACK		; If ACK,
+	 jrst	GETAC1		; see if more files
+	cain	B,NAK		; If NAK,
+	 jrst	GETAC2		; skip to alternate loop
+	sojg	TIMCNT,DOEOF2	; If neither, decrement and wait, or
+	jrst	GETAC1		; if counter exhausted, give up
+GETAC2:	sojg	TIMCNT,DOEOF1	; Decrement counter on NAK and send EOF again
+				; or fall through if exhausted.
+GETAC1:	TXNE	F,F%WCF		; Wildcard?
+	 RET			; Yes, get next file
+	CALL	CLSFIL		; No, close this file and return
+	TXNE	F,F%Q		; If QUIET mode
+	IFSKP.			; is OFF, display completion message
+	 TMSG < [OK]
+>
+	ENDIF.
+	RET			; Done.
+
+; Since EOF hasn't been reached yet, send the next packet with
+; either 1K of data or 128 bytes of data.  If K mode originally
+; was requested, and there are less than 8 records remaining to
+; be sent, unconditionally revert to 128-byte data packet mode.
+
+NOTEOF:	move	A,NBLKS		; Get number of records (left)
+	caige	A,^D8		; If less than 8 records remain,
+	 TXZ	F,F%K		; turn off K mode.
+	move	B,RNBLKS	; Get records sent (for display)
+	TXNN	F,F%K		; K mode?
+	IFSKP.			; Yes
+	 subi	A,^D8		; 8 records at a time
+	 addi	B,^D8
+	ELSE.			; No, 128-byte block mode
+	 subi	A,1		; one record at a time
+	 addi	B,1
+	ENDIF.
+	movem	A,NBLKS		; Save both
+	movem	B,RNBLKS
+	CALL	GETBUF		; get a buffers worth from file
+	jumpe	C,DOEOF		; if 0 bytes read, send EOF
+	addi	PKTNUM,1	; Increment packet counter
+	movei	TIMCNT,^D10	; reset timeout count
+
+; Come here to send or resend the packet.
+
+AGAIN:	setzb	CHKSUM,CRCC	; clear registers
+	CALL	SNDHDR		; Send header according to mode
+	move	B,[POINT 8,BUFFER]	; Get pointer
+	movni	C,BUFSIZ	; Set 128
+	TXNE	F,F%K		; But if K mode,
+	 movni	C,KBUF		; set 1024
+	CALL	SNDSTR		; transmit the data packet
+	TXNE	F,F%CRC		; If not CRC mode,
+	IFSKP.			; Do checksum mode
+	 CALL	CSUM		; Compute checksum
+	 move	B,CHKSUM
+	 CALL	SNDCHR		; and send it
+	ELSE.			; Or do CRC mode
+	 CALL	CALCRC		; Compute 16-bit CRC value
+	 movei	B,(CRCC)
+	 lsh	B,-8		; Get high order 8 bits first
+	 CALL	SNDCHR		; and send it
+	 movei	B,(CRCC)	; Get the low order 8 bits
+	 CALL	SNDCHR		; and send it
+	ENDIF.
+
+; Now ready to see if remote end accepted the packet correctly,
+; got an error and wants a retransmission, or packet got lost.
+; A packet is lost if neither an ACK or a NAK is received in
+; the timeout window.  While waiting, any other character received
+; is ignored, and the timeout counter is bumped.  Allows for only
+; 10 packet retransmissions before giving up.  If K mode is on,
+; and the packet has been retransmitted twice, revert to sending
+; 128-byte packets.
+
+	movei	TIMCNT,CNT192	; Now, wait for ACK or NAK
+	TXZ	F,F%RCH		; Clear received character flag
+ACKWAIT:SETTMO (TMRTCK)
+	CALL	GETCHR		; Get response
+	 jrst	NOTNAK		; Got a timeout
+	TXO	F,F%RCH		; Set character received
+	cain	B,ACK		; If an ACK,
+	 jrst	NEXT1		; go transmit next packet
+	caie	B,NAK		; If a not a NAK,
+	 jrst	NOTNAK
+CNTERR:	sosle	ERRCNT		; If a NAK, count as error
+	IFSKP.			; if error counter exhausted, abort.
+	 hrroi	A,[ASCIZ/
+SEND: Ten consecutive errors.  SEND aborted.
+/]
+	 jrst	RCVERX
+	ENDIF.
+	movni	A,SUCNUM	; reset success counter
+	movem	A,SUCCNT
+	move	A,ERRCNT	; Check error count value
+	cain	A,^D9		; If first NAK error
+	 jrst	AGAIN		; don't report it
+	caie	A,^D8		; If second error,
+	IFSKP.
+	 TXZN	F,F%K		; Clear and skip if was set
+	 IFSKP.
+	  movem	B,SAVE2		; Save B
+	  move	A,FILJFN
+	  move	B,FILPOS	; Reposition file pointer to pretend
+	  addi	B,^D128		; we got a small buffer last time
+	  SFPTR%
+	   ERCAL FATAL
+	  move	A,NBLKS		; Number of records left
+	  addi	A,^D7		; Adjust back
+	  movem	A,NBLKS
+	  move	A,RNBLKS	; Number of records sent
+	  subi	A,^D7		; Adjust back
+	  movem	A,RNBLKS
+	  move	B,SAVE2		; Restore B
+	 ENDIF.
+	ENDIF.
+	TXNE	F,F%Q		; If QUIET mode is
+	IFSKP.			; OFF, display error message
+	 CALL	RETURN		; First a CRLF
+	 caie	B,NAK		; if char was a NAK
+	 IFSKP.			; type the word
+	  TMSG <NAK>
+	 ELSE.
+	  CALL	OUT16		; or display the HEX representation
+	  TMSG <H>
+	 ENDIF.
+	 TMSG < received, not ACK #>	; and rest of message
+	 movei	B,^D10
+	 sub	B,ERRCNT	; using 10-ERRCNT
+	 CALL	DECOUT		; and display it in decimal with a CRLF
+	ENDIF.
+	jrst	AGAIN		; and try again if count not exhausted
+
+
+; Just display B in decimal and follow with a CRLF.
+
+DECOUT:	CALL	OUT10		; Display B as decimal
+RETURN:	TMSG <
+>
+	RET
+
+; The following consolidated routines are used throughout TMODEM
+; to display a number in B to the controlling terminal
+
+OUT16:	movei	C,^D16		; Display B as HEX
+	SKIPA
+OUT10:	movei	C,^D10		; Display B as decimal
+	SKIPA
+OUT8:	movei	C,^D8		; Display B as octal
+OUTNUM:	MOVX	A,.PRIOU
+	NOUT%
+	 ERNOP
+	RET
+
+
+; No NAK has been received in the timeout.  Conditionally
+; display the error message and go bump the error counter.
+
+NOTNAK:	sojg	TIMCNT,ACKWAIT	; Decrement counter.  If not 0, wait some more
+	TXNN	F,F%RCH		; Else, if no char received
+	 jrst	CNTERR		; count as error
+	TXNE	F,F%Q		; Timed out waiting for ACK
+	IFSKP.			; If QUIET is OFF, display error message
+	 TMSG <
+SEND: Timeout on ACK #>
+	 movei	B,^D11		; Use 11 beause counter not decremented yet
+	 SUB	B,ERRCNT
+	 CALL	DECOUT
+	ENDIF.
+	jrst	CNTERR		; and count as error
+
+; Control comes here after a packet has been successfully sent
+; to the remote and a status message is conditionally displayed.
+
+NEXT1:	AOSE	SUCCNT		; Increment success counter
+	IFSKP.			; If zero, i.e., 8 successes,
+	 movni	A,SUCNUM	; reset success counter
+	 movem	A,SUCCNT
+	 TXNE	F,F%KSV		; If K flag was ever set,
+	  TXO	F,F%K		; turn K flag on
+	ENDIF.
+	TXNE	F,F%Q!F%V	; Is Quiet or View set?
+	 jrst	NEXT		; yes, skip
+	MOVX	A,.PRIOU
+	movei	B,.CHCRT	; Get a CR
+	BOUT%			; Output it
+	TXNN	F,F%R!F%S	; If viewing,
+	IFSKP.			; need to put status message
+	 movei	B,.CHLFD	; on its own line
+	 BOUT%
+	ENDIF.
+	TMSG <Sent record >
+	move	B,RNBLKS	; Display sector number received
+	CALL	OUT10
+	TXNE	F,F%R!F%S	; If viewing,
+	 CALL	RETURN		; start display on next line
+	jrst	NEXT		; Go do next packet
+
+	SUBTTL	Send filename
+
+; Control passes here from .SEND when "batch" mode (wildcard) files
+; are to be sent instead of just a single named file.  This routine
+; sends the filename, character at a time, and then calls SNDFIL to
+; send the file itself.  The process repeats until all files in the
+; group have been sent and then returns to the previous mode.
+
+; MSND starts with a blank-filled filename buffer and fills it with
+; no more than the first eight characters of the filename and first
+; three characters of the filetype.
+;
+;                         1234567890
+MSND:	dmove	A,[ASCII "          "]
+	dmovem	A,BUFFER	; Stuff a total of 15 spaces into buffer
+	movem	A,BUFFER+2	; for filename to send
+	hrrz	B,MULJFN	; Get current JFN
+	hrroi	A,BUFFER	; Want string in BUFFER
+	movx	C,<1B8>		; just filename
+	JFNS%
+	movei	C,.CHSPC	; Get a blank
+	idpb	C,A
+	move	A,[POINT 7,BUFFER+1,20]	; Point to filetype area
+	movx	C,<1B11>	; get just filetype
+	JFNS%
+	movei	C,.CHSPC	; pad the rest with blanks (again)
+	idpb	C,A
+	idpb	C,A
+	idpb	C,A
+	setz	C,
+	idpb	C,A
+	TXZ	F,F%ITS!F%B	; ignore previous flags
+	hrrz	A,MULJFN
+	CALL	IPNFIL		; Get current file type
+	CALL	CHKFIL		; Get NBLKS, etc.
+	CALL	TYPFIL		; maybe display filename
+SNDNAM:	CALL	GETNAK		; wait up to 2 mins for a NAK
+	 jrst	[hrroi	A,[ASCIZ/
+SEND: Timeout on initial filename NAK./]
+		CALL	TYPCHK	; Maybe type error message
+		jrst	MSND.F]	; and give up
+	CALL	SNDACK		; Got a NAK, now send ACK
+	movei	E,^D11		; 11 characters in filename total
+	move	T,[POINT 7,BUFFER]	; Set up pointer
+	setz	CHKSUM,		; Zero filename checksum
+FNLOOP:	ildb	B,T		; Get a character
+	cain	B,.CHCNV	; Is it a ^V?
+	 jrst	FNLOOP		; yes, ignore it
+	addi	CHKSUM,(B)	; add to running checksum
+	CALL	SNDCHR		; and send it
+	CALL	GETACK		; wait for ACK
+	 jrst	[hrroi	A,[ASCIZ/
+SEND: Timeout waiting for filename ACK./]
+		jrst	SNDNAX]
+	sojg	E,FNLOOP	; repeat for all chars in name
+	movei	B,SUB		; Get a ^Z indicating end of filename
+	CALL	SNDCHR		; and send it
+	SETTMO (^D16)
+	CALL	GETCHR		; Wait for checksum computed by remote
+	 jrst	[hrroi	A,[ASCIZ/
+SEND: Timeout waiting for remote checksum./]
+		jrst	SNDNAX]
+	addi	CHKSUM,SUB	; Add in ^Z to our checksum
+	andi	CHKSUM,377	; mask off high bits
+	caie	B,(CHKSUM)	; do they match ?
+	 jrst	[hrroi	A,[ASCIZ/
+SEND: Filename checksum mismatched./]
+		jrst	SNDNAX]
+	CALL	SNDACK		; say OK
+	move	A,FILJFN	; Get the current JFN
+	CALL	SNDFIL		; and send the file itself
+	move	A,FILJFN	; Get that JFN again
+	TXO	A,CO%NRJ	; Do not release the JFN
+	CLOSF%			; Just close the file
+	 trn			; and ignore any errors
+	TXZ	F,F%EOF		; Clear EOF flag
+	TXNE	F,F%Q
+	IFSKP.
+	 TMSG < [OK]
+>
+	ENDIF.
+	move	A,MULJFN	; Get the original JFN
+	GNJFN%			; Get the next file
+	 jrst	MSND.F		; No more
+	jrst	MSND		; Send it
+
+SNDNAX:	CALL	TYPCHK		; Maybe display error message, then
+	movei 	B,BDNM		; get a "u"
+	CALL	SNDCHR		; and send it
+	jrst	SNDNAM		; and try again.
+
+MSND.F:	CALL	GETNAK		; wait 2 mins for a NAK
+	 trn			; Ignore timeout
+	CALL	SNDACK		; always send ACK after NAK
+	movei	B,EOT		; Get an EOT to indicate no more files,
+	CALL	SNDCHR		; and send it
+	hrrz	A,MULJFN	; Get the JFN
+	RLJFN%			; and release it altogether
+	 trn			; Ignore any errors
+	TXZ	F,F%WCF		; Turn off the wildcard flag
+	SETZM	FILJFN
+BATDON:	SETZM	MULJFN		; Batch RECEIVE ends up here too
+	TXNE	F,F%Q
+	IFSKP.
+	 TMSG <
+TMODEM: Batch transfer complete
+>
+	ENDIF.
+	jrst	RCVER1		; Go wrap up normally
+
+
+; GETNAK waits up to 2 minutes for the remote end to send a NAK.
+; Any other character received bumps the timeout counter.
+;
+; RETURNS: +1 if timeout counter exhausted
+;	   +2 if NAK received within timeout
+
+GETNAK:	movei	TIMCNT,MIN2	; Wait up to 2 mins
+GETNK1:	SETTMO (TMRTCK)
+	CALL	GETCHR		; Wait for a character
+	 jrst	GETNK2		; timed out
+	cain	B,NAK		; Is it a NAK?
+	 jrst	RSKP		; Yes, do RETSKP
+GETNK2:	sojg	TIMCNT,GETNK1	; else decrement timeout counter
+	RET			; and return if exhausted
+
+; GETACK waits up to 15 seconds for an ACK to be received.
+; Any other received character bumps the timeout counter.
+;
+; RETURNS: +1 if timeout exhausted.
+;	   +2 if an ACK is received within the timeout
+
+GETACK:	movei	TIMCNT,SEC15	; Wait up to 15 secs
+GETAK1:	SETTMO (TMRTCK)
+	CALL	GETCHR		; Wait for a character
+	 jrst	GETAK2		; timed out
+	cain	B,ACK		; Is it an ACK?
+	 jrst	RSKP		; Yes, do a RETSKP
+GETAK2:	sojg	TIMCNT,GETAK1	; else decrement timeout counter
+	RET			; and return if exhausted
+
+; SNDHDR sends the three-byte packet header.  The first byte is
+; either an SOH if a 128-byte data packet is to be sent or an
+; STX if a 1K data packet is to be sent.  The second byte is the
+; packet number, and the third is the one's complement of the
+; packet number.
+
+SNDHDR:	movei	B,SOH		; Get SOH
+	TXNE	F,F%K		; but, if K mode,
+	 movei	B,STX		; get STX instead
+	CALL	SNDCHR		; and send it
+	movei	B,(PKTNUM)	; Get packet number
+	CALL	SNDCHR		; and send it
+	setca	B,		; Get complement of packet number
+	jrst	SNDCHR		; send it and return
+
+
+; TYPFIL displays a file's name and its size.
+
+; Called only by SND0 or MSND and assumes CHKFIL has been
+; previously called to fill in the values displayed
+; by TYPFIL.  No arguments are needed and returns +1 always.
+
+TYPFIL:	TXNE	F,F%Q
+	 RET
+TYPFL1:	TMSG <
+SEND: Ready to send >
+	MOVX	A,.PRIOU	; Set up to output to console
+	move	B,FILJFN	; Get the JFN
+	setz	C,
+	JFNS%			; Get the filename string
+	CALL	TYPTYP
+	move	B,NBYTES	; get NBYTES from CHKFIL
+	CALL	OUT10
+	TMSG < bytes, >
+	move	B,NBLKS		; Get NBLKS from CHKFIL
+	CALL	OUT10
+	TMSG < (>
+	move	B,NBLKS		; Get NBLKS again
+	CALL	OUT16
+	TMSG <H) records.
+>
+	RET
+
+; TYPTYP displays the type of file determined by IPNFIL.
+; TYPTYP is called after TYPFIL, or by the RCV0 or MRCV
+; routines.  TYPTPX is an alternate entry point for RCV0
+; and MRCV.  TYPTYP returns through RETURN, +1 always
+
+TYPTYP:	TXNN	F,F%ITS		; Is it ITS Binary?
+	IFSKP.			; Yes...
+	 TMSG < (ITS Binary)>
+	 jrst	RETURN
+	ENDIF.
+TYPTPX:	TXNN	F,F%B		; Is it Binary?
+	IFSKP.			; Yes...
+	 TMSG < (TOPS-20 Binary)>
+	 jrst	RETURN
+	ENDIF.
+	TMSG < (ASCII)>
+	jrst	RETURN
+
+
+; CHKFIL determines NBYTES and NBLKS, used by TYPFIL.  NBLKS is used
+; by SNDFIL to determine when to switch from K mode to normal when
+; less than 8 records (1K) remain to be sent.  Returns +1 always.
+
+CHKFIL:	hrrz	A,FILJFN	; Get output JFN
+	SIZEF%			; and get its size
+	 setz	B,		; if fail, set to zero
+	move	A,BYTSIZ	; Get BYTSIZ from IPNFIL
+	caie	A,^D36		; byte count in 36 bit words ?
+	IFSKP.			; Yes,
+	 TXNE	F,F%ITS		; ITS files have 1 word header
+	  subi	B,1		; Adjust for header word
+	 TXNN	F,F%B		; Is it binary?
+	 IFSKP.			; yes,
+	  imuli	B,4		; 4 8-bit bytes/word
+	 ELSE.			; otherwise,
+	  imuli	B,5		; 5 7-bit bytes/word
+	 ENDIF.
+	ENDIF.
+	caie	A,^D8		; byte count in 8-bit words?
+	IFSKP.
+	 TXNE	F,F%ITS		; ITS files have a four-byte header
+	  subi	B,4		; Adjust size to account for header
+	ENDIF.
+	movem	B,NBYTES	; Save result
+	idivi	B,^D128		; Compute number of 128-byte records
+	skipe	C		; remainder?
+	 addi	B,1		; yes, add one
+	movem	B,NBLKS		; Save result
+	RET
+
+	SUBTTL	Receive a file using the Christensen Protocol
+
+; RECEIVE is a top-level command which may be invoked for a direct
+; file transfer with the controlling terminal or via an extended
+; command while in talk mode with a remote host.  In the latter
+; case, the file transfer dialog takes place with the remote host.
+;
+; RECEIVE calls PARFIL to get the filespec and switches from the
+; controlling terminal, then conditionally sends the Ready message, 
+; and either passes control to MRCV if a wildcard filespec is given,
+; or calls RCVFIL directly in the single file case.
+
+.RA:	TXO	F,F%A
+	jrst	PARFIL
+.RC:	TXO	F,F%C
+	jrst	PARFIL
+.RAC:	TXO	F,F%A!F%C
+	jrst	PARFIL
+
+.RECEI:	PHELP	HRECEI		; Maybe do help typeout instead
+	jrst	PARFIL		; Parse filespec and switches
+RCV0:	TXZ	F,F%EOT		; clear EOT flag
+	CALL	GETTIM		; Compute timeout for data block
+	SKIPE	NETJFN		; Only display ready message if
+	IFSKP.			; this is a direct transfer
+	 TXNN	F,F%WCF		; and wildcard
+	 IFSKP.
+	  TMSG <
+RECEIVE: Ready
+>
+	 ENDIF.
+	ENDIF.
+	TXNE	F,F%WCF		; Wild card?
+	 jrst	MRCV		; yes, get filename from remote
+	move	A,FILJFN	; no...
+	CALL	OPNFIL		; Open the file
+	CALL	RCVON1		; type the name
+	CALL	RCVFIL		; send the one file
+	jrst	RCVER1		; go wrap it up
+
+SET128:	TXZ	F,F%K		; Clear K mode flag
+	move	B,TIM128	; Assume 128-byte timeout
+	movem	B,TIMTIM
+	RET
+
+; RCVFIL receives the contents of a single file from the remote
+; according to the Christensen Protocol.  Called by RECEIVE directly
+; if only a single file is requested to be sent, or by MRCV when
+; a wildcard filespec is requested.  If CHECKSUM mode is not requested
+; by the user, then RCVFIL sends six "C" characters at ten-second
+; intervals while waiting for an ACK.  If an ACK is not received, then
+; RCVFIL reverts to sending 10 NAKs at ten-second intervals while
+; waiting for an ACK.  If an ACK is received in response to a "C" then
+; CRC mode is used, otherwise, CHECKSUM mode is used.  If no response
+; is received within all the timeouts for an ACK, the transfer is
+; aborted, even if a wildcard transfer is in progress.
+
+RCVFIL:	setz	CHKSUM,		; Clear checksum
+	setz	PKTNUM,		; zero record number
+	setzm	NBLKS		; zero sector count (for display only)
+	setzm	LSTPKT		; pretend already received block 0
+	movei	TIMCNT,^D7	; reset timeout count
+	TXO	F,F%CRC		; Initially assume CRC mode
+	CALL	SET128		; and 128-byte data packets
+	TXNE	F,F%C		; Checksum mode requested?
+	 jrst	NOCRC		; Yes, skip CRC mode
+NOCRC1:	sojle	TIMCNT,NOCRC	; Decrement counter and skip if exhausted
+	movei	B,"C"		; Get a C for CRC mode
+	CALL	SNDCHR		; and send it
+	SETTMO (^D10)		; 10-second wait
+	CALL	GETCHR		; wait for reply
+	 jrst	NOCRC1		; timed out, loop
+	cain	B,SOH		; If SOH, use CRC mode and
+	 jrst	WAITX		; go process rest
+	cain	B,STX		; If STX, use CRC mode and
+	 jrst	WAITK		; go handle it
+	cain	B,EOT		; If EOT, transfer complete
+	 jrst	RCVDONE		; do closeout for this file
+	cain	B,CAN		; If ^X, abort the transfer
+CANEXT:	 jrst	[hrroi	A,[ASCIZ/
+RECEIVE: Cancelled by remote host./]
+		jrst	RCVERX]	; maybe display message and clean up
+	jrst	NOCRC1		; go decrement timeout counter
+
+; Here when attempts to get an ACK for a "C" has been exhausted.
+; Now assuming CHECKSUM mode.  Also come here directly if user
+; has explicitly requested CHECKSUM mode.
+
+NOCRC:	hrroi	A,[ASCIZ/
+RECEIVE: Switching to CHECKSUM Mode.
+/]
+	CALL	TYPCHK		; Maybe display message
+	TXZ	F,F%CRC		; Clear CRC mode
+	movei	TIMCNT,^D11	; Set up timeout counter
+
+; Start receiving each packet here
+
+SNDNAK:	sojg	TIMCNT,SNDNK0	; Decrement counter and abort if exhausted
+	hrroi	A,[ASCIZ/
+RECEIVE: Timeout on start of packet./]
+	jrst	RCVERX
+
+SNDNK0:	movei	B,NAK		; Get a NAK
+	CALL	SNDCHR		; and send it
+RCVLP:	setz	CHKSUM,		; Clear checksum
+	CALL	SET128		; Assume 128 mode unless STX received
+WAIT:	SETTMO (^D16)		; Set wait timeout to 16 seconds
+	CALL	GETCHR		; Wait for character
+	 jrst	SNDNAK		; timed out
+	cain	B,SOH		; Was it an SOH
+	 jrst	WAITX		; yes, process as 128-byte data packets
+	cain	B,STX		; Was it an STX
+	 jrst	WAITK		; yes, process as 1K data packets
+	cain	B,EOT		; Was it an EOT?
+	 jrst	RCVDONE		; yes, do closeout
+	TXNN	F,F%C		; If CHECKSUM mode and first time,
+	 jrst	WAIT		; no, loop
+	cain	B,CAN		; else, is it ^X?
+	 jrst	CANEXT		; Yes, go abort
+	jrst	WAIT		; No, loop
+
+WAITK:	movei	B,SOH		; make it an SOH for checksum
+	TXO	F,F%K		; Set K mode flag
+	move	A,TIM1K		; Get 1K timeout value
+	movem	A,TIMTIM
+WAITX:	TXZ	F,F%C		; Clear CHECKSUM-First-time flag
+	movei	TIMCNT,^D11
+	TXZ	F,F%EOT		; clear EOT flag
+	addi	CHKSUM,(B)	; accumulate checksum
+	SETTMO (^D16)		; set up wait for character timeout
+	CALL	GETCHR		; wait for a character (packet number)
+	 jrst	[hrroi	A,[ASCIZ/
+RECEIVE: Timeout receiving header packet number.
+/]
+		jrst	WAITQ1]	; timed out
+	movem	B,PKTSAV	; save packet number
+	addi	CHKSUM,(B)	; add it to checksum
+	SETTMO (^D16)		; set up timeout again
+	CALL	GETCHR		; wait for complemented packet number
+	 jrst	[hrroi	A,[ASCIZ/
+RECEIVE: Timeout receiving complemented header packet number.
+/]
+		jrst	WAITQ1]	; timed out
+	addi	CHKSUM,(B)	; add to checksum
+	andi	CHKSUM,377	; mask off high bits
+	jumpn	CHKSUM,WAITQC	; SOH + CHKSUM + ^-CHKSUM should be 0
+	move	A,TIMTIM	; Get string timeout
+	CALL	GETSTR		; get the data block
+	 jrst	[hrroi	A,[ASCIZ/
+RECEIVE: Timeout receiving data packet.
+/]
+		jrst	WAITQ1]	; timed out
+	SETTMO (^D16)
+	CALL	GETCHR		; wait for remote checksum or CRC high byte
+	 jrst	[hrroi	A,[ASCIZ/
+RECEIVE: Timeout receiving checksum or CRC high byte.
+/]
+		jrst	WAITQ1]	; timed out
+	TXNE	F,F%CRC		; CRC mode?
+	IFSKP.			; no, do checksum
+	 CALL	CSUM		; compute Check sum
+	 caie	B,(CHKSUM)	; see if they match...
+	  jrst	[hrroi	A,[ASCIZ/
+RECEIVE: Mismatched checksums.
+/]
+		jrst	WAITQ1]
+	ELSE.			; else do CRC
+	 movei	CRCC,(B)	; save it
+	 lsh	CRCC,^D8	; shift saved value over 8 bits
+	 SETTMO (^D16)
+	 CALL	GETCHR		; wait for low byte of remote CRC
+	 jrst	[hrroi	A,[ASCIZ/
+RECEIVE: Timeout receiving CRC low byte.
+/]
+		jrst	WAITQ1]	; timed out
+	 addi	CRCC,(B)	; merge into preshifted saved value
+	 push	P,CRCC		; save it on stack
+	 CALL	CALCRC		; calculate our CRC
+	 sub	CRCC,(P)	; subtract from pushed (remote) value
+	 pop	P,(P)		; restore stack
+	 jumpn	CRCC,WAITQX	; if result not zero, try again
+	ENDIF.
+
+
+; OK, we now have a valid block of data. Check if it is an "extra copy"
+
+	move	B,PKTSAV	; get back saved packet number
+	camn	B,LSTPKT	; same as just previous packet number?
+	 jrst	RCV001		; Yes, skip
+	exch	B,LSTPKT	; swap values
+	addi	B,1		; increment
+	andi	B,377		; mask to 8-bit value
+	exch	B,LSTPKT	; put updated value back in LSTPKT
+	came	B,LSTPKT	; compare (LSTPKT now expected value)
+	IFSKP.			; if same, then
+	 CALL	PUTBUF		; write data block to disk
+	ELSE.
+	 hrroi	A,[ASCIZ/
+RECEIVE: Packet synchronization lost.
+/]
+	 jrst	RCVERX		; and give up
+	ENDIF.
+RCV001:	addi	PKTNUM,1	; increment packet number
+	movem	B,LSTPKT	; save old packet number
+	TXNE	F,F%Q!F%V	; Is Quiet or View set?
+	 jrst	RCV002		; yes, skip
+	MOVX	A,.PRIOU
+	movei	B,.CHCRT	; Get a CR
+	BOUT%			; Output it
+	TXNN	F,F%R!F%S
+	IFSKP.
+	 movei	B,.CHLFD
+	 BOUT%
+	ENDIF.
+	TMSG <Received record >
+	move	B,NBLKS		; get record number
+	TXNN	F,F%K		; K mode?
+	IFSKP.			; yes, then
+	 addi	B,8		; increment by 8 records
+	ELSE.			; otherwise
+	 addi	B,1		; regular mode, increment by a record
+	ENDIF.
+	movem	B,NBLKS		; save result and
+	CALL	OUT10
+	TXNE	F,F%R!F%S
+	 CALL	RETURN
+RCV002:	CALL	SNDACK		; send ACK
+	movei	TIMCNT,^D10	; reset counter
+	jrst	RCVLP		; and get next block
+
+RCVDONE:
+	TXCN	F,F%EOT		; if already rec'd EOT
+	 jrst	WAITQN		; Flush possible noise and send NAK
+	CALL	SNDACK		; Either more garbage or for real
+	CALL	CLSFIL		; close the file
+	TXNE	F,F%Q
+	IFSKP.
+	 TMSG < [OK]
+>
+	ENDIF.
+	RET
+
+RCVERX:	CALL	TYPCHK
+	jrst	ABORT
+
+FILERX:	CALL	ERROUT		; output last error message
+	CALL	RETURN		; output newline and
+ABORT:	CALL	ABORTX
+RCVER1:	MOVX	A,.FHSLF
+	MOVX	B,<1B<TIMCHN>>	; Disable timer interrupts
+	DIC%
+	SKIPN	NETJFN		; if TTY connection is open
+	IFSKP.
+	 MOVX	B,<1B<ABTCHN>>	; Disable abort interupts
+	 DIC%
+	 setzm	TTIPTR		; Clear buffer areas
+	 move	A,[TTIPTR,,TTIPTR+1]
+	 BLT	A,NETJFN-1
+	 DMOVE	A,[POINT 8,NTOBFR
+		 4*NTOBSZ]
+	 DMOVEM	A,NTOPTR	; init NET output buffer pointer/counter
+	 DMOVE	A,[POINT 8,TTOBFR
+		 4*TTOBSZ]
+	 DMOVEM	A,TTOPTR	; init TTY output buffer pointer/counter
+	 move	P,RDLPTR	; Reset receive fork stack
+	 jrst	RCVFRX		; resume receive mode
+	ENDIF.
+	CALL	TTYRST		; reset terminal
+	jrst	PARERX
+
+ABORTX:	SKIPN	FILJFN
+	 jrst	ABORTY
+	TXNN	F,F%SND		; Is a SEND in progress?
+	IFSKP.
+	 CALL	CLSFIL		; just close the file
+	ELSE.
+	 CALL	CLSFLX
+	ENDIF.
+ABORTY:	hrroi	A,[ASCIZ/
+TMODEM: File transfer aborted.
+/]
+	CALL	TYPCHK
+	jrst	WAITQ
+
+TYPCHK:	TXNN	F,F%Q
+	 PSOUT%
+	RET
+
+WAITQC:	hrroi	A,[ASCIZ/
+RECEIVE: Header checksum failure.
+/]
+	jrst	WAITQ1
+
+WAITQX:	hrroi	A,[ASCIZ/
+RECEIVE: Mismatched CRCs.
+/]
+WAITQ1:	CALL	TYPCHK
+WAITQN:	CALL	WAITQ		; wait for a quiet line
+	jrst	SNDNAK		; send a NAK and return
+
+WAITQ:	SETTMO (TMRTCK)		; Wait for line to go quiet for 1 sec
+	CALL	GETCHR		; wait for a character
+	 RET			; timed out (good) - return
+	jrst	WAITQ		; else wait some more
+
+	SUBTTL	RECEIVE a filename for multiple file transfer
+
+MRCVX:	hrroi	A,[ASCIZ/
+RECEIVE: Timeout receiving filename./]
+MRCVY:	CALL	TYPCHK
+MRCV:	setz	CHKSUM,		; clear checksum register
+	movei	TIMCNT,MIN3	; set timeout for 3 mins
+HSNAK1:	movei	B,NAK		; get a NAK and
+	CALL	SNDCHR		; send it to start other end
+	SETTMO (TMRTCK)
+	CALL	GETCHR		; wait for a character
+	 jrst	HSNAK2		; timed out, decrement and loop
+	cain	B,ACK		; is it an ACK?
+	 jrst	HSNAK3		; yes, go on
+HSNAK2:	sojg	TIMCNT,HSNAK1	; no, decrement counter and loop or
+	hrroi	A,[ASCIZ/
+RECEIVE: Timeout on initial filename ACK./]
+	CALL	TYPCHK
+	jrst	RCVER1
+
+HSNAK3:	move	E,[POINT 7,BUFFER]	; set up buffer pointer
+	movei	T,^D11		; 11 chars in file name
+	setz	U,		; clear period-inserted flag
+MRCVLP:	SETTMO (^D16)		; set timeout for 16 secs
+	CALL	GETCHR		; wait for character
+	 jrst	MRCVX		; timed out, start over
+	cain	B,EOT		; is it an EOT?
+	 jrst	[CALL	SNDACK	; yes, EOT means no more files.  Send an ACK
+		jrst	BATDON]	; Wrap it up.
+	add	CHKSUM,B	; accumulate in checksum register
+	caie	B," "		; is it a space
+	 cain	B,0		; or nul?
+	IFSKP.			; neither,
+	 cain	T,^D3		; is it the 9th char?
+	  caie	U,0		; and no "." yet ?
+	 IFSKP.			; yes,
+	  movei U,"."		; get a period
+	  idpb  U,E		; insert it and bump pointer
+	 ENDIF.
+	 push	P,B		; hold character
+	 movei	B,.CHCNV	; stuff a ^V
+	 idpb	B,E		; bump pointer
+	 pop	P,B		; get held character
+	 idpb	B,E		; and stuff it
+	ELSE.			; if either a space or null
+	 jumpn	U,MRCVP1	; and count is exhausted
+	 movei	U,"."		; then get a period
+	 idpb	U,E		; insert it and bump pointer
+	ENDIF.
+MRCVP1:	CALL	SNDACK		; send an ACK
+	sojg	T,MRCVLP	; decrement and loop
+	SETTMO (^D16)		; fall thru if exhausted
+	CALL	GETCHR		; wait for next character
+	 jrst	MRCVX		; timed out, then start over
+	caie	B,SUB		; is it ^Z?
+	 jrst	MRCVX		; no, start over
+	add	CHKSUM,B	; yes, add to checksum
+	setz	B,		; get a null
+	idpb	B,E		; stuff in filename string
+	hrroi	B,BUFFER	; point to start of string
+	MOVX	A,GJ%SHT!GJ%FOU
+	GTJFN%			; get a JFN with that name
+	IFJER.
+	 EMSG <
+GTJFN% error: >
+	 jrst	FILERX
+	ENDIF.
+	TXO	F,F%ITS!F%B	; set ITS and binary flags
+	movem	A,FILJFN	; save the JFN
+	CALL	RCVOPN
+	move	B,CHKSUM	; Now, get the checksum
+	CALL	SNDCHR		; and send back to remote
+	CALL	GETACK		; wait for ACK
+	 jrst	MRCVER		; timed out, start over
+	CALL	RCVFIL
+	jrst	MRCV		; Loop for maybe more
+
+MRCVER:	CALL	CLSFLX
+	hrroi	A,[ASCIZ/
+RECEIVE: Mismatched filename checksums./]
+	jrst	MRCVY
+
+RCVOPN:	CALL	OPNFIL		; open file depending on mode
+	TXNE	F,F%Q
+	 RET
+RCVON1:	TMSG <
+RECEIVE: Ready to receive >
+	MOVX	A,.PRIOU	; Use user terminal
+	move	B,FILJFN	; to display filename
+	setz	C,
+	JFNS%
+	TXNE	F,F%WCF
+	 jrst	TYPTPX
+	jrst	TYPTYP
+
+	SUBTTL	Network binary negotiations
+
+NETBOF:	TXNN	F,F%TAC		; TAC user?
+	 RET			; No
+				; Turn net binary off
+	
+IFE PANDASW,<
+	MOVX	A,.PRIOU
+	dmove	B,[EXP <POINT 8,[BYTE(8) IAC,WONT,TRNBIN]>,-3]
+	SOUT%
+	movei	A,^D4000	; set to wait 4 seconds
+	DISMS%			; and wait
+	MOVX	A,.PRIOU
+	dmove	B,[EXP <POINT 8,[BYTE(8) IAC,DONT,TRNBIN]>,-3]
+	SOUT%
+>; IFE PANDASW
+IFN PANDASW,<
+	movx	A,.CTTRM	; restore modes
+	movx	B,.MOSLT
+	move	C,OLDLTS	; get former status
+	MTOPR%
+ 	 ERJMP	FATAL
+>; IFN PANDASW
+	RET
+
+
+NETBON:	TXNN	F,F%TAC		; TAC user?
+	 RET			; No
+				; Turn net binary on
+IFE PANDASW,<
+	MOVX	A,.PRIOU
+	dmove	B,[EXP <POINT 8,[BYTE(8) IAC,DO,TRNBIN]>,-3]
+	SOUT%
+	movei	A,^D4000	; wait 4 seconds
+	DISMS%
+	MOVX	A,.PRIOU
+	dmove	B,[EXP <POINT 8,[BYTE(8) IAC,WILL,TRNBIN]>,-3]
+	SOUT%
+	movei	A,^D4000	; wait 4 seconds
+	DISMS%
+>; IFE PANDASW
+IFN PANDASW,<
+	movx	A,.CTTRM	; read present local status
+	movx	B,.MORLT
+	MTOPR%
+; 	 ERJMP	NIM		; not a Panda monitor
+	movem	C,OLDLTS	; save old terminal status
+	TXO	C,MO%NBI!MO%NBO	; want network binary mode
+	movx	B,.MOSLT	; want to set it
+	MTOPR%
+ 	 ERJMP	FATAL
+	movx	B,.MORLT	; now see what actually happened
+	MTOPR%
+ 	 ERJMP	FATAL
+	TXC	C,MO%NBI!MO%NBO	; make mask ones if either bit zero
+	IFXN.	C,MO%NBI!MO%NBO
+	 TMSG <
+Network Binary Mode could not be negotiated with your TAC port.
+Check to make sure your port has Flow Control turned off
+by giving the TAC commands: "@F O E<cr>" and "@F I E<cr>",
+and try again.
+>
+	ENDIF.
+>; IFN PANDASW
+	RET
+
+	SUBTTL	Character and String I/O
+
+SNDACK:	movei	B,ACK		; Get an ACK
+SNDCHR:	move	A,MODDEV	; get remote JFN
+	andi	B,377		; Mask off any high bits
+	BOUT%			; send to output channel
+IFE PANDASW,<			; FFs must be sent twice on DDN connections
+	caie	B,377		; Is it a FFH?
+	IFSKP.			; yes
+	 TXNE	F,F%TAC		; and a net connection?
+	  BOUT%			; yes, then send it again
+	ENDIF.
+>; IFE PANDASW
+	TXNE	F,F%S		; show Sent characters ?
+	 jrst	HEXOUT		;  yes, send to controlling terminal too
+	RET
+
+SNDSTR:	move	A,MODDEV	; Get transfer JFN
+	push	P,C		; Save registers
+	push	P,B
+	TXNN	F,F%TAC		; output to console on net?
+	IFSKP.			; Yes, then
+ 	 movn	C,3		; quote FFs,
+	 movei	D,377		; so use + length, and FF as EOS
+	ENDIF.
+SNDBAR:	SOUT%			; send block to remote
+	 ERJMP	SNDFOO		; strictly for PTY debug mode
+	cain	C,0		; sent the whole string ?
+	IFSKP.
+IFE PANDASW,<
+	 push	p,B		; if not, must be because string
+	 movei	B,377		; contains an FF that must be
+	 BOUT%			; quoted with itself.  So do it.
+	 pop	p,B
+>; IFE PANDASW
+	 jrst	SNDBAR		; and send rest
+	ENDIF.
+IFE PANDASW,<
+	TXNN	F,F%TAC		; now check the last character in the
+	IFSKP.			; buffer.  If it is an FF, then the
+	 ldb	B,B		; previous test won't quote it properly,
+	 cain	B,377		; so we must do it here instead!
+	 BOUT%
+	ENDIF.
+>; IFE PANDASW
+	pop	P,B		; restore registers
+	pop	P,C
+	MOVX	A,.PRIOU	; Get controlling terminal JFN
+	TXNE	F,F%S!F%V	; show Sent characters or view file ?
+	 jrst	HEXSTR		; yes, send string to console
+	RET
+
+SNDFOO:	movei	A,^D300		; set for .3 seconds
+	DISMS%			; wait for other process to read
+	move	A,MODDEV	; characters out of buffer
+	jrst	SNDBAR		; send rest of string
+	
+
+GETCHR:	setzm	INTOK		; An interrupt here could be embarrassing
+	movem	P,TIMRTP	; Save the stack ptr for return
+	move	B,[PC%USR+CLRTIM]	; Set the return address
+	movem	B,TIMLOC
+	movem	A,INTOK
+	jsp	D,SETTIM
+	move	A,MODDEV	; set to remote device
+	setzm	TIMKIL		; turn on timer
+	BIN%			; wait for character
+	movem	B,SAVE2		; save the received character
+	CALL	CLRTIM
+	move	B,SAVE2		; restore the received character
+	TXNE	F,F%R		; show Received characters?
+	 CALL	HEXOUT		; yes
+	RETSKP
+
+GETSTR:	setzm	INTOK		; An interrupt here could be embarrassing
+	movem	P,TIMRTP	; Save the stack ptr for return
+	move	B,[PC%USR+CLRTIM]	; Set the return address
+	movem	B,TIMLOC
+	movem	A,INTOK
+	jsp	D,SETTIM
+	move	A,MODDEV	; set to remote device
+	move	B,[POINT 8,BUFFER]	; point to string
+	movni	C,BUFSIZ	; set size 128
+	TXNE	F,F%K		; unless K mode,
+	 movni	C,KBUF		; then set to 1024
+	setzm	TIMKIL		; turn on timer
+	SIN%			; get string
+	CALL	CLRTIM
+	TXNE	F,F%R!F%V	; view received characters?
+	 CALL	HEXSTR
+	RETSKP
+
+HEXOUT:	cain	B,.CHCRT
+	 jrst	NOTHEX
+	cain	B,.CHLFD
+	 jrst	NOTHEX
+	cain	B,.CHTAB
+	 jrst	NOTHEX
+	caig	B,"~"		; Is greater than TILDE?
+	 caige	B," "		; or less than SPACE?
+	  jrst	HEXPRT		; Yes, display it in HEX notation
+NOTHEX:	MOVX	A,.PRIOU
+	BOUT%			; Otherwise, display as-is and
+	RET
+HEXPRT:	movei	A,"("
+	PBOUT%
+	MOVX	A,.PRIOU
+	MOVX	C,<NO%LFL!NO%ZRO!2B17!^D16>
+	NOUT%
+	 ERNOP
+	movei	A,")"
+	PBOUT%
+	RET
+
+HEXSTR:	move	D,[POINT 8,BUFFER]
+	movei	E,BUFSIZ	; set size to 128
+	TXNE	F,F%K		; unless K mode,
+	 movei	E,KBUF		; then set to 1024
+HEXLP:	ildb	B,D		; get a byte
+	CALL	HEXOUT
+	sojg	E,HEXLP
+	RET
+
+	SUBTTL	CRC	CRC generator subroutine
+
+CHR==3
+;C==4
+
+; POLY==^B10100000000000011B36	; x^16+x^15+x^2+1 (low order bits on left)
+				; (note that x^16 is shifted out of word)
+;POLY==^B10000100000010001B36	; x^16+x^12+x^5+1
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;								;;
+;;		Subroutine to compute new crc			;;
+;;								;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+CALCRC:	move	A,[POINT 8,BUFFER]
+	movei	B,BUFSIZ
+	TXNE	F,F%K
+	 movei	B,KBUF
+	setz	CRCC,
+CRCLP:	ildb	CHR,A
+	pushj	p,CRC2
+	sojg	B,CRCLP
+	setz	CHR,
+	CALL	CRC2
+CRC2:	push	P,CHR
+	movei	E,10
+CRC2LP:	lsh	CHR,1
+	TXZE	CHR,400
+	 TXO	CHR,1		; rotate 8 bit byte 1 bit
+	lsh	CRCC,1
+	TXNE	CHR,1
+	 TXO	CRCC,1		; rotate bit from chr into CRC
+	TXZE	CRCC,200000	; check whether bit is set
+	 xori	CRCC,10041	; X^16 + x^15 + x^2 + 1
+	sojg	E,CRC2LP
+	pop	P,CHR
+	RET
+
+	SUBTTL	CSUM
+
+CSUM:	push	P,B
+	move	A,[POINT 8,BUFFER]
+	movei	B,BUFSIZ
+	TXNE	F,F%K
+	 movei	B,KBUF
+CSUM1:	ildb	C,A
+	addi	CHKSUM,(C)
+	sojg	B,CSUM1
+	andi	CHKSUM,377	; only 8 bits
+	pop	P,B
+	RET
+
+	SUBTTL	File I/O
+
+GETBUF:	move	A,[BYTE(8) 32,32,32,32]	; fill buffer with ^Zs
+	movem	A,BUFFER
+	move	A,[BUFFER,,BUFFER+1]
+	blt	A,BUFFER+<KBUF/4+1>
+	move	A,FILJFN
+	RFPTR%			; Get current file position
+	 ERCAL	FATAL
+	movem	B,FILPOS	; Save it for possible later SFPTR
+	hrrz	A,FILJFN
+	move	B,[POINT 8,BUFFER]
+	movni	C,BUFSIZ
+	TXNE	F,F%K
+	 movni	C,KBUF
+	SIN%
+	 ERCAL	GETEOF
+	TXNN	F,F%K
+	IFSKP.
+	 addi	C,^D1024
+	ELSE.
+	 addi	C,^D128		; compute number of bytes read
+	ENDIF.
+	RET
+GETEOF:	TXO	F,F%EOF		; SIN inserts a null at EOF !!!
+	movei	E,SUB		; force it into a ^Z
+	idpb	E,B
+	RET
+
+PUTBUF:	push	P,B
+	hrrz	A,FILJFN
+	move	B,[POINT 8,BUFFER]
+	movni	C,BUFSIZ
+	TXNE	F,F%K
+	 movni	C,KBUF
+	movei	D,SUB
+	TXNN	F,F%B		; stop on ^Z for text files
+	 movn	C,C
+	SOUT%
+	cain	C,0		; stopped on ^Z?
+	IFSKP.
+RMLAST:	 RFPTR%			; remove the last character
+	  trn			; from the file.  This is really
+	 sos	C,2		; a lot more complicated than
+	 hrli	A,.FBSIZ	; I would like it to be, but
+	 seto	B,		; is necessary to avoid inconsistancies
+	 CHFDB%			; in programs that generate CRCs at
+	  ERCAL DSKERR		; each end of the transfer
+	 hrli	A,.FBBYV
+	 hrlzi	B,(FB%BSZ)
+	 hrlzi	C,(7B11)
+	 CHFDB%
+	  ERCAL DSKERR
+	ENDIF.
+	 pop	P,B
+	RET
+
+DSKERR:	REPEAT 20,< trn>
+	RET
+
+
+CLSFIL:	hrrz	A,FILJFN
+	TXNN	F,F%ITS
+	 jrst	CLSFL1
+	movei	B,^D8
+	SFBSZ%
+	 trn
+CLSFL1:	CLOSF%
+	 trn
+	setzm	FILJFN
+	RET
+
+CLSFLX:	hrrz	A,FILJFN	; get JFN
+	hrli	A,(CZ%ABT)	; abort any operations in progress
+	jrst	CLSFL1
+
+
+OPNFIL:	skipa	B,[OF%WR]
+IPNFIL:	move	B,[OF%RD]
+	andi	A,-1
+	setzm	BYTSIZ
+	TXNE	B,OF%WR		; If writing,
+	 jrst	OPNFL1		; skip following exercise
+	push	P,B		; Save type of request
+	move	B,[1,,.FBBYV]	; set to get byte type
+	movei	C,4		; result in AC4
+	GTFDB%			; get it
+	 ERJMP NOFDB		; skip if error
+	lsh	D,-<^D35-^D11>	; shift value into position
+	andi	D,77		; mask off everything elsse
+	movem	D,BYTSIZ	; save result
+	caie	D,^D8		; 8 bit bytes?
+	 jrst	IPNFL1		; no, skip
+	TXO	F,F%B		; set binary type flag
+IPNFL1:	cain	D,^D36		; 36 bit bytes?
+	 TXO	F,F%ITS!F%B	; Set both ITS and Binary flags, sort out later
+NOFDB:	pop	P,B		; restore request type
+OPNFL1:	hrli	B,(^D8B5)	; Assume 8-bit mode
+	TXNN	F,F%B		; unless binary was not determined
+	 hrli	B,(7B5)		; then assume ASCII mode
+	TXO	B,OF%PLN	; Disable line number checking
+	OPENF%			; open the file
+	IFJER.
+	 EMSG <
+OPENF% error: >
+	 jrst	FILERX
+	ENDIF.
+	movem	A,FILJFN	; save JFN
+	TXNE	B,OF%WR		; If open for write,
+	 RET			; then just return
+	TXNN	F,F%B		; Binary mode?
+	 RET			; No, just return
+	BIN%			; yes, check for sixbit/DSK8/
+	caie	B,223
+	 jrst	NOTITS
+	BIN%
+	caie	B,72
+	 jrst	NOTITS
+	BIN%
+	caie	B,330
+	 jrst	NOTITS
+	BIN%
+	jumpn	B,NOTITS
+	TXO	F,F%ITS!F%B	; Set both flags
+	RET
+
+NOTITS:	caie	D,^D36		; Is byte size 36?
+	IFSKP.			; yes, then
+	 TXZ	F,F%B!F%ITS	; clear ITS and binary flags
+	 hrrz	A,FILJFN
+	 movei	B,7
+	 SFBSZ%			; reset the byte size to ASCII (7)
+	 IFJER.
+	  EMSG <
+SFBSZ% error: >
+	  jrst	FILERX
+	 ENDIF.
+	ENDIF.
+	hrrz	A,FILJFN
+	setz	B,
+	SFPTR%			; Set the file pointer to start of file
+	 ERCAL DSKERR
+	RET
+
+	SUBTTL	Get filespec and switches
+
+PARFIL:	movei	A,GJSBLK	; Assume SEND GTJFN block
+	TXNN	F,F%SND		; If not SEND, then
+	 movei	A,GJRBLK	; use RECEIVE GTJFN block
+	movem	A,CMDBLK+.CMGJB	; and set address in CSB
+	movei	A,CMDBLK	; Point to CSB
+	NOISE <FILE>
+PRSFIL:	movei	B,[FLDDB. .CMFIL,CM%SDH,,filespec,,SWIFDB]
+	CALL	GETCMD		; Get the filename and switch(es)
+	 jrst	PARERR
+	caie	E,.CMFIL	; Was a filename parsed?
+	 jrst	PARERR		; No...
+PRSFL1:	movem	B,TMPJFN	; Yes, save JFN
+	movei	B,[FLDDB. .CMCFM,,,,,SWIFDB]
+	CALL	GETCMD		; then get CR or more switches
+	 jrst	PARERR
+	move	B,TMPJFN	; restore JFN
+	setzm	TMPJFN		; clear temporary JFN
+	movem	B,FILJFN	; and save it for real
+	movem	B,MULJFN	; in both locations
+	TXNE	B,GJ%DEV!GJ%UNT!GJ%DIR!GJ%NAM!GJ%EXT!GJ%VER
+	 TXOA	F,F%WCF		; set wildcard flag
+	  TXZ	F,F%WCF		; or clear it
+	SKIPN	NETJFN		; Using remote TTY line?
+	 TXO	F,F%Q		; no, force Quiet on
+	TXNN	F,F%A!F%B	; If neither ASCII nor BINARY set,
+	 TXO	F,F%B		; force BINARY
+	TXNE	F,F%Q		; If Quiet,
+	 TXZ	F,F%R!F%S!F%V	; then turn off others
+	TXNE	F,F%R!F%S!F%V	; Conversely, if any of these are set,
+	 TXZ	F,F%Q		; turn off Quiet flag
+	CALL	TTYINI		; configure the port
+	movem	F,SAVE2		; Stash F for transfer fork
+	SKIPN	A,RCVFRH	; if TTY connection is open
+	IFSKP.			; Yes...
+	 MOVX	B,<1B<XFRCHN>>	; set to switch receive fork
+	 IIC%			; and interrupt it
+	  ERCAL	FATAL
+	 jrst	PARERX
+	ENDIF.
+
+; XFR is used either for a direct transfer or entered from XFRFRK
+; when the receive fork is interrupted above
+
+XFR:	MOVX	A,.FHSLF
+	MOVX	B,<1B<TIMCHN>>	; Enable timer interrupts
+	AIC%
+	TXNN	F,F%SND		; Processing a SEND Command?
+	 jrst	RCV0		; No, do RECEIVE
+	jrst	SND0		; Yes
+
+; Receive fork comes here on XFRCHN interrupt to handle the file transfer
+; while the superior fork watches and is in a position to abort the
+; transfer via the ABTCHN interrupt (escape character followed by an "A").
+
+; XFRFRK disables the XFRCHN interrupt and activates the ABTCHN interrupt
+; and then jumps to the appropriate file transfer routine.  Note that the
+; superior's flags were saved by the superior in a variable so that the
+; receive fork can restore them in its F register for its use.
+
+XFRFRK:	MOVE	P,RDLPTR	; Initialize fork stack
+	move	F,SAVE2		; Get flags
+	MOVX	A,.FHSLF
+	MOVX	B,<1B<XFRCHN>>	; Disable transfer interrupt
+	DIC%
+	MOVX	B,<1B<ABTCHN>>	; Enable abort interrupt
+	AIC%
+	TXNN	F,F%SND		; Processing a SEND Command?
+	 jrst	XFR		; No, skip this
+	TXNN	F,F%A		; Yes, is ASCII mode requested?
+	 jrst	XFR
+	TXNN	F,F%WCF		; Is it wild card?
+	 jrst SNDRAW		; No, assume a blind SEND
+	TMSG <
+Blind wildcard Sends not allowed.>
+	setzm	FILJFN
+	setzm	MULJFN
+	jrst	PARERX
+
+
+; PARERR calls CMDERR and then falls through to PARERX to restore the
+; stack context appropriate to the mode from which the file transfer
+; routines were called.
+
+PARERR:	CALL	CMDERR
+PARERX:	move	P,OREPAP	; Restore TLKCMD stack context
+	SKIPN	NETJFN		; Using TLKCMD?
+	 move	P,REPARP	; no, restore Main Loop stack context
+	RET			; and try again
+
+; GETCMD was stolen from ASCIFY by Gail Zacharias (GZ@MIT-MC).
+; It is designed to parse and dispatch any switches before
+; returning to the caller.
+;
+; RETURNS: +1 on no parse error
+;	   +2 on successful primary parse
+
+GETCMD:	movei	A,CMDBLK
+	COMND%
+	 ERJMP	ERROR
+	TXNE	A,CM%NOP
+	 RET
+	LOAD	E,CM%FNC,(C)
+	caie	E,.CMSWI
+	 jrst	RSKP
+	hrrz	B,(B)
+	CALL	(B)
+	hlrz	B,C
+	jrst	GETCMD
+
+
+; TRANSMIT sends a file a line at a time to the TTY port.  The main
+; loop was stolen from KERMIT.
+
+.TRANS:	PHELP	HTRANS
+	TXO	F,F%SND!F%A
+	jrst	PARFIL
+SNDRAW:	MOVX	A,.FHSLF
+	MOVX	B,<1B<TIMCHN>>	; Enable timer interrupts
+	AIC%			; as XFR does
+	move	A,FILJFN
+	CALL	IPNFIL		; go get info on type
+	CALL	CHKFIL		; Get size and NBLKS
+	CALL	TYPFIL		; type name, etc.
+	TXNN	F,F%B		; Is file not BINARY (i.e., ASCII)?
+	IFSKP.			; it is BINARY...
+	 TMSG <
+TMODEM: File is not ASCII.  Blind send aborted.>
+	 jrst	ABORT		; and give up
+	ENDIF.
+SNDRLP:	move	A,FILJFN
+	move	B,[POINT 8,BUFFER]	; Where to put the line
+	MOVX	C,^D512		; Maximum characters to read
+	MOVX	D,.CHLFD	; terminate on linefeed.
+	SIN%
+	 ERJMP	[MOVX	A,.FHSLF	; Get last process error.
+		GETER%		; Test for eof.
+		hrrzs	B	; Erase fork handle from left half.
+		caie	B,IOX4	; Was error EOF?
+		 CALL	ERROR	; No, give message.
+		jrst	SNDR99]
+	ldb	D,B		; Was last char a LF?
+	caie	D,.CHLFD
+	 ibp	B		; If not, don't overwrite it.
+	setz	D,		; Deposit a null, overwriting
+	dpb	D,B		;  last char if it was a LF.
+	move	A,[POINT 8,BUFFER]	; Point to the string.
+	move	B,A		; Here too.
+	TXNN	F,F%ECHO	; local host echoes?
+	 jrst	SNDR5		; no, skip
+	PSOUT%			; Yes, display it at the tty.
+	MOVX	A,.CHLFD	; Also need to add linefeed.
+	PBOUT%
+
+; Tack on desired parity, in place.
+
+	move	A,[POINT 8,BUFFER]	; Point to the string.
+SNDR5:	ildb	B,A		; Get a byte.
+	jumpe	B,SNDR6		; If null, done.
+	CALL	SETPAR		; Set parity bit.
+	dpb	B,A		; Put it back.
+	jrst	SNDR5		; Back for more.
+
+; Send the string
+
+SNDR6:	move	A,MODDEV	; ... out the communication line.
+	move	B,[POINT 8,BUFFER]
+	setzb	C,D
+	SOUT%
+	 ERJMP	ERROR
+
+; Now wait for prompt.
+
+SNDR7:	move	A,MODDEV	; Get char from line.
+	setz	B,
+	BIN%
+	 ERJMP	ERROR
+	TXZ	B,CH%PAR	; Strip any parity.
+	MOVX	A,.PRIOU	; Echo it.
+	BOUT%
+	cain	B,.CHLFD	; Match?
+	 jrst	SNDRLP		; Yes, done
+	jrst	SNDR7		; No, loop for more
+
+SNDR99:	TMSG <
+[EOF]
+>
+	jrst	RCVER1
+
+	SUBTTL	Parity routines
+
+; SETPAR was stolen from TTLINK by Frank DaCruz (SY.FDC@CU20B)
+; Set parity bit of character in B.  Destroys D.
+
+SETPAR:	move	D, PARITY	; Get desired parity and compute it:
+	xct [	NOP			; None,
+		tro	B,CH%PAR	; Mark,
+		jrst	EVEN		; Even,
+		jrst	ODD		; Odd,
+		trz	B,CH%PAR](D)	; Space.
+	RET				; Done.
+
+EVEN:	SAVEAC <C>		; Even parity
+	trz	B,CH%PAR	; Start off with bit 8=0.
+	jrst	BOTH		; Join shared code.
+
+ODD:	SAVEAC <C>		; Odd parity.
+	tro	B,CH%PAR	; Start off with bit 8=1.
+
+BOTH:	movei	C,(B)		; Make a copy.
+	lsh	C,-4		; Get high order 4 bits of character
+	xori	C,(B)		; Fold into 4 bits.
+	trce	C,14		; Left two bits both 0 or 1?
+	 trnn	c,14		;  or both 1?
+	 xori	B,CH%PAR	; Yes, set parity
+	trce	C,3		; Right two bits both 0?
+	 trnn	C,3		;  or both 1?
+	 xori	B,CH%PAR	; Yes, set parity.
+	RET
+
+	SUBTTL Command parser
+
+; Get a command, do it, and return.  These are subroutines because errors
+; break out by doing RET.
+
+PARSER:	MOVEM	P,REPARP	; save stack context
+	MOVEI	A,REPARS	; set reparse address
+	MOVEM	A,CMDBLK+.CMFLG
+	MOVEI	A,CMDBLK	; get host name
+	TXNE	F,F%MONC	; if invoked by monitor command, no prompt
+	 SKIPA	B,[-1,,[ASCIZ//]]	; monitor command, no prompt
+	  HRROI	B,[ASCIZ/TMODEM>/]	; otherwise normal prompt
+	MOVEM	B,CMDBLK+.CMRTY
+	PARSE <.CMINI>		; initialize parse state
+	 JRST	ERROR
+REPARS:	MOVE	P,REPARP	; restore stack context
+	ANDX	F,F%KEEP	; Clear all our flags
+	SETZM	GTJBLK+.GJEXT	; clear extension default
+	PARSEA	CMDCMD
+	 JRST	CMDERR		; command bad
+	IFQE.	CM%FNC,(C)	; (.CMKEY=0) if a command
+	 HRRZ	B,(B)		; get address for continued parsing
+	 CALLRET (B)		; and dispatch to it
+	ENDIF.
+
+; Parser when connection open
+
+OPARSE:	MOVEM	P,OREPAP	; save stack context
+	MOVEI	A,OREPAR	; set reparse address
+	MOVEM	A,CMDBLK+.CMFLG
+	MOVEI	A,CMDBLK	; get command block pointer
+	HRROI	B,[ASCIZ/TMODEM!/]	; do prompt
+	MOVEM	B,CMDBLK+.CMRTY
+	PARSE <.CMINI>
+	 JRST	ERROR
+OREPAR:	MOVE	P,OREPAP	; restore stack context
+	ANDX	F,F%KEEP	; Clear all our flags
+	PARSE <.CMCFM,CM%SDH,,RETURN to get back to talk mode,,<[
+		FLDDB. .CMKEY,,CMOTAB,<command,>]>>
+	 JRST	CMDERR
+	JN	CM%FNC,(C),R	; (.CMKEY=0) just return if confirm
+	HRRZ	B,(B)		; dispatch to it
+	CALLRET	(B)
+
+
+; Talk mode commands
+
+TLKCMD:	TXNE	F,F%EXTN	; enter extended mode immediately?
+	IFSKP.
+	 DO.
+	  MOVX	A,.PRIIN	; get command from terminal
+	  TXNE	F,F%ECHO	; see if possible line editor
+	   TXNN F,F%LINE
+	  IFSKP.
+	   SOSGE TTICTR		; looks like line editor - anything there?
+	  ANSKP.
+	   ILDB	B,TTIPTR	; snarf byte from buffer and charge in
+	  ELSE.
+	   BIN%			; yes, get following character
+	  ENDIF.
+	  ANDX	B,CH%CHR	; ignoring parity
+	  CAMN	B,ESCCHR	; send it if doubled escape character
+	   JRST	RSKP
+	  CAIE	B,"?"
+	  IFSKP.
+	   CALL	TTYRST		; normalize TTY in case OPAQUE
+	   TMSG <
+Type a single character command:
+
+?  This message
+A  ABORT file transfer in progress
+B  Send a (simulated) BREAK
+C  CLOSE TTY connection
+D  Disconnect via DTR toggle
+L  LOG file recording toggle
+P  PUSH to inferior EXEC
+Q  QUIT (temporary EXIT) out of TMODEM
+S  STATUS of remote TTY connection
+X  Enter eXtended command mode
+
+Typing the escape character twice sends it to the host.
+
+Command:>
+	   CALL	TTYINI		; reinit TTY
+	   LOOP.
+	  ENDIF.
+	 ENDDO.
+	 CAIL	B,"a"		; convert lower case to upper case
+	  CAILE	B,"z"
+	   CAIA
+	    SUBI B,"a"-"A"
+	 caie	B,"A"
+	 IFSKP.
+	  move	A,RCVFRH
+	  MOVX	B,<1B<ABTCHN>>
+	  IIC%
+	   ERCAL FATAL
+	 ENDIF.
+	 CAIE	B,"B"
+	 IFSKP.
+	  CALL	NETFRC		; Flush the output buffer
+	  move	A,NETJFN
+	  MOVX	B,.MOSPD
+	  move	C,BRKSPD	; get the current speed setting
+	  hrri	C,^D50		; change just the output speed
+	  MTOPR%
+	   ERNOP
+	  skipg	C,BRKCNT
+	   movei C,DEFBRK
+	  caile	C,MAXNUL
+	   movei C,MAXNUL
+	  movns	C
+	  move	B,[POINT 7,NULLS]
+	  setz	D,
+	  MOVE	A,NETJFN	; force network buffer out
+	  SOUTR%		; send it now
+	   ERNOP		; don't ITRAP on this guy
+	  move	A,NETJFN
+	  MOVX	B,.MOSPD
+	  move	C,BRKSPD
+	  MTOPR%
+	   ERNOP
+	  RET
+	 ENDIF.
+	 CAIE	B,"C"
+	 IFSKP.
+	  CALL	TTYRST		; reset terminal mode before message output
+	  CALLRET CLOSE1
+	 ENDIF.
+	 caie	B,"D"
+	 IFSKP.
+	  move	A,NETJFN
+	  MOVX	B,.MOHUP	; then hang up modem
+	  MTOPR%
+	   ERNOP
+	  movei	A,1000		; wait for one second
+	  DISMS%
+	  move	A,NETJFN
+	  MOVX	B,.MODUP	; now pick it up
+	  MTOPR%
+	   ERNOP		; ignore failures
+	  RET
+	 ENDIF.
+	 caie	B,"L"
+	 IFSKP.
+	  SKIPE	LOGJFN		; if a log file exists
+           SETCMM LOGFLG	; toggle the recording status
+	  RET
+	 ENDIF.
+	 CAIE	B,"P"
+	 IFSKP.
+	  CALL	TTYRST		; normalize TTY
+	  CALL	PUSH1		; enter inferior EXEC
+	  CALLRET TTYINI	; reinit TTY
+	 ENDIF.
+	 CAIE	B,"S"
+	 IFSKP.
+	  CALL	TTYRST		; normalize TTY in case OPAQUE
+	  CALL	STATU1		; show status
+	  CALLRET TTYINI	; reinit TTY and return
+	 ENDIF.
+	 CAIE	B,"Q"
+	 IFSKP.
+	  CALL	TTYRST		; normalize TTY
+	  CALL	QUIT1
+	  CALLRET TTYINI	; reinit TTY and return to talk mode
+	 ENDIF.
+	 CAIN	B,"X"		; extended command?
+	ANSKP.
+	 MOVX	A,.CHBEL	; feep at bad command
+	 PBOUT%
+	 RET			; invalid command, ignore it
+	ENDIF.
+	CALL	TTYRST		; put TTY in ordinary mode
+	DO.
+	 CALL	OPARSE		; parse "connection open" commands
+	 TXZ	F,F%HLP
+	 TXNE	F,F%TAKE	; out of TAKE file yet?
+	  LOOP.			; not yet
+	ENDDO.
+	SKIPN	NETJFN		; connection open?
+	 RET			; if not, don't TTYINI again
+	CALLRET	TTYINI		; reinit TTY and return
+
+	SUBTTL Command service routines
+
+; CLOSE command
+
+.CLOSE:	NOISE <CONNECTION>
+	PHELP	HCLOSE
+	CONFIRM
+CLOSE1:	MOVX	A,.PRIIN	; flush TTY input
+	CFIBF%
+	 ERCAL	FATAL
+	SKIPE	A,RCVFRH	; kill receive fork
+	 KFORK%
+	  ERNOP			; don't die if some hacker zapped our fork
+	SETZM	RCVFRH
+	SKIPN	A,NETJFN	; close network JFN
+	IFSKP.
+	 TXZN	F,F%SPD		; need to reset speed?
+	 IFSKP.			; Yes
+	  MOVX	B,.MOSPD	; set the speed
+	  move	C,NETSPD	; get the original speed
+	  CAMN	C,[-1]		; was it defined?
+	   setz	C,		; no, set speed to 0
+	  MTOPR%
+	   ERNOP
+	 ENDIF.
+	 MOVX	B,.MOHUP	; turn off DTR
+	 MTOPR%
+	  ERNOP
+	 CLOSF%
+	  ERNOP			; don't die.
+	ENDIF.
+	SETZM	NETJFN
+	MOVX	A,.PRIOU	; Get console designator
+	movem	A,MODDEV	; and save as MODDEV
+	TMSG <Connection closed>
+	SKIPN	A,LOGJFN	; is a log file open?
+	IFSKP.
+	 TXO	A,CO%NRJ	; yes, close the file without releasing the JFN
+	 CLOSF%
+	  ERCAL	FATAL
+	 SETZM	LOGFLG		; Turn off log flag (for insurance)
+	ELSE.
+	 TXNE	F,F%TAKE	; don't do this if TAKE in progress
+	 IFSKP.
+	  SETO	A,		; flush all files
+	  CLOSF%
+	   ERNOP		; don't die.
+	 ENDIF.
+	ENDIF.
+	CALL	SLOG
+	RET
+
+; CONTROL command
+
+.CONTR:	NOISE <CHARACTER>
+	PHELP	HCONTR
+	PARSE <.CMQST,CM%SDH,,character to send in control form in quotes,<"^">,[
+	       FLDDB. .CMNUM,CM%SDH,^D8,ASCII code for control character in octal]>
+	 JRST	ERROR
+	LOAD	C,CM%FNC,(C)	; get function code of parse
+	CAIE	C,.CMNUM	; did user specify a number?
+	IFSKP.
+	 SKIPL	D,B		; barf if number invalid
+	  CAILE	B,.CHDEL
+	   ERMSG <Invalid ASCII value>
+	ELSE.
+	 LDB	D,[POINT 7,ATMBUF,6]	; no, try for character
+	 CAIL	D,"a"		; see if lower case
+	  CAILE	D,"z"
+	   CAIA
+	    SUBI D,"a"-"A"	; yes, convert to upper case
+	 CAIL	D,"@"		; is it a meaningful to CTRL this character?
+	  CAILE	D,"_"
+	   ERMSG <Character doesn't have a control form>
+	 SUBI	D,"@"-.CHNUL	; controllify
+	ENDIF.
+	CONFIRM
+	MOVE	B,D		; get character back
+	CALL	NETOUT		; output it
+	CALLRET	NETFRC		; and force the data out
+
+; DDT command
+
+.DDT:	NOISE <MODE>
+	PHELP	HDDT
+	CONFIRM
+	MOVE	A,[.FHSLF,,DDTADR/1000]	; see if a page of DDT exists
+	RPACS%			; get page accessability
+	 ERCAL	FATAL
+	TXNN	B,PA%PEX	; does page exist?
+	 TDZA	A,A		; no
+	  MOVE	A,DDTADR	; get DDT start location
+	CAMN	A,[JRST DDTADR+2]	; look like a DDT?
+	IFSKP.
+	 MOVX	A,GJ%OLD!GJ%SHT	; get a JFN on DDT
+	 HRROI	B,[ASCIZ/SYS:UDDT.EXE/]
+	 GTJFN%
+	  ERJMP	ERROR		; DDT not available
+	 HRLI	A,.FHSLF	; load DDT in
+	 GET%
+	  ERCAL	FATAL
+	 DMOVE	A,.JBSYM	; give DDT our symbol table pointers
+	 DMOVEM	A,@DDTADR+1
+	 MOVX	A,.FHSLF	; reset entry vector back to us
+	 MOVE	B,[EVECL,,EVEC]
+	 SEVEC%
+	  ERCAL	FATAL
+	ENDIF.
+	TMSG <Type R$G to return to TMODEM.  You're in >
+	CALLRET	DDTADR
+
+
+; Get ON or OFF with default opposite of current setting
+
+ONOFF:	SKIPA	B,[ASCIZ/OFF/]	; was ON, toggle to OFF
+OFFON:	 move	B,[ASCIZ/ON/]	; was OFF, toggle to ON
+	movem	B,SAVE2
+	movei	B,[FLDDB. .CMKEY,,TOGTAB,,<ON>]
+	hrroi	A,SAVE2
+	movem	A,.CMDEF(B)
+	movei	A,CMDBLK
+	RET
+
+; ECHO command
+
+.ECHO:	PHELP	HECHO,SECHO
+	NOISE <TO>
+	TXNN	F,F%ECHO
+	 SKIPA	B,[ASCIZ/LOCAL/]
+	  move	B,[ASCIZ/REMOTE/]
+	movem	B,SAVE2
+	movei	B,[FLDDB. .CMKEY,,ECHTAB,,<X>]
+	hrroi	A,SAVE2
+	movem	A,.CMDEF(B)
+	movei	A,CMDBLK
+	COMND%
+	 ERJMP	ERROR
+	TXNE	A,CM%NOP
+	 jrst	ERROR
+	hrrz	B,(B)
+	movem	B,SAVE2
+	CONFIRM
+	SKIPN	SAVE2		; want LOCAL ECHO on?
+	IFSKP.
+	 CALL	LCLECO		; Yes, enter local echo mode
+	ELSE.
+	 CALL	RMTECO		; No, enable remote echoing
+	ENDIF.
+	RET
+
+
+; ESCAPE command
+
+.ESCAP: PHELP	HESCAP,SESCAP
+	NOISE <CHARACTER TO>
+	PARSE <.CMQST,CM%SDH,,escape character in quotes,<"">,[
+	       FLDDB. .CMNUM,CM%SDH,^D8,ASCII code for character in octal]>
+	 JRST	ERROR
+	LOAD	C,CM%FNC,(C)	; get function code of parse
+	CAIE	C,.CMNUM	; did user specify a number?
+	 LDB	B,[POINT 7,ATMBUF,6]	; no, try for character
+	SKIPL	D,B		; barf if number invalid
+	 CAILE	B,.CHDEL
+	  ERMSG <Invalid ASCII value>
+	CONFIRM
+	MOVEM	D,ESCCHR
+	RET
+
+
+; EXIT command
+
+.EXIT:	NOISE <FROM TMODEM>
+	PHELP	HEXIT
+	CONFIRM
+	SKIPN	RCVFRH		; have a connection?
+	IFSKP.
+	 CALL	TTYRST		; reset terminal mode before message output
+	 CALL	CLOSE1
+	ENDIF.
+
+; Continuable exit point from TMODEM
+
+EXIT:	HALTF%			; return to superior
+	TXZ	F,F%MONC	; flag no more monitor command since exited
+;	JRST	CAPINI		; (not CALLRET since CAPINI can come back here)
+
+; Initialize capabilities (in case EXEC tries to mess us up)
+
+CAPINI:	MOVX	A,.FHSLF	; enable all my capabilities
+	RPCAP%
+	IOR	C,B
+	IFXE.	C,SC%CTC	; better have ^C capability
+	  EMSG <Must have CONTROL-C capability to run TMODEM>
+	  JRST	EXIT
+	ENDIF.
+	EPCAP%
+	 ERCAL	FATAL
+	RET
+
+
+; EXTENDED command
+
+.EXTEN:	NOISE <COMMAND MODE>
+	PHELP	HEXTEN,SEXTEN
+	TXNE	F,F%EXTN
+	IFSKP.
+	 CALL	OFFON
+	ELSE.
+	 CALL	ONOFF
+	ENDIF.
+	COMND%
+	 ERJMP	ERROR
+	TXNE	A,CM%NOP
+	 jrst	ERROR
+	hrrz	B,(B)
+	movem	B,SAVE2
+	CONFIRM
+	TXZ	F,F%EXTN
+	SKIPE	SAVE2
+	 TXO	F,F%EXTN
+	RET
+
+; LINE command
+
+.LINE:	NOISE <EDITOR FOR LOCAL ECHO CONNECTIONS>
+	PHELP	HLINE,SLINE
+	TXNE	F,F%LINE
+	IFSKP.
+	 CALL	OFFON
+	ELSE.
+	 CALL	ONOFF
+	ENDIF.
+	COMND%
+	 ERJMP	ERROR
+	TXNE	A,CM%NOP
+	 jrst	ERROR
+	hrrz	B,(B)
+	movem	B,SAVE2
+	CONFIRM
+	TXZ	F,F%LINE
+	SKIPE	SAVE2
+	 TXO	F,F%LINE
+	RET
+
+
+; HELP command
+
+.HELP:	PHELP	HLPTXT
+	NOISE <WITH COMMAND>
+	TXO	F,F%HLP
+	movei	B,[FLDDB. .CMCFM,CM%SDH,,RETURN for general help on using TMODEM,,[
+		FLDDB. .CMKEY,,CMDTAB,<a command,>]]
+	SKIPN	NETJFN
+	IFSKP.
+	 movei	A,CMOTAB
+	 hrrz	C,.CMFNP(B)
+	 movem	A,.CMDAT(C)
+	ENDIF.
+	movei	A,CMDBLK
+	COMND%
+	 ERJMP	ERROR
+	TXNE	A,CM%NOP
+	 jrst	ERROR
+	JN	CM%FNC,(C),HLPHLP
+	hrrz	B,(B)
+	CALLRET	(B)
+
+HLPHLP:	hrroi	A,HLPTXT
+	PSOUT%
+	RET
+
+
+; LOG file command
+
+.LOG:	NOISE <FILE>
+	PHELP	HLOG,SLOG	; Check if HELP command entry
+	SKIPN	LOGJFN		; Does a log file already exist?
+	IFSKP.			; yes,
+	 CALL	ONOFF		; offer to close it
+	ELSE.			; no...
+	 CALL	OFFON		; offer to open one
+	ENDIF.
+	COMND%
+	 ERJMP	ERROR
+	TXNE	A,CM%NOP
+	 jrst	ERROR
+	hrrz	B,(B)
+	movem	B,SAVE2		; Save result
+	SKIPE	SAVE2		; Turn it off?
+	IFSKP.			; yes...
+	 CONFIRM		; get confirmation
+	 SKIPN	A,LOGJFN	; was there a log file?
+	 IFSKP.			; yes...
+	  CLOSF%		; close the file
+	   ERNOP		; ignore errors
+	  SETZM	LOGJFN		; clear the JFN
+	  SETZM	LOGFLG		; turn off recording (for insurance)
+	 ENDIF.
+	ELSE.			; otherwise turn it on
+	 NOISE <FILE IS>	; get the filename desired
+	 HRROI	A,[ASCIZ/LOG/]	; default extension is .LOG
+	 MOVEM	A,GTJBLK+.GJEXT
+	 movei	A,GTJBLK	; point to the GJFN% block
+	 movem	A,CMDBLK+.CMGJB	; stuff the pointer into the CSB
+	 movei	A,CMDBLK
+	 SKIPN	OLGJFN		; was there a previous log file?
+	  SKIPA	A,[-1,,[ASCIZ/TMODEM.LOG/]]	; no, use this default
+	   hrroi A,LOGSTR	; else default to the previous filename
+	 movei	B,[FLDDB. .CMFIL,CM%SDH,,file to append transcript to,<X>]
+	 movem	A,.CMDEF(B)
+	 movei	A,CMDBLK
+	 COMND%
+	  ERJMP	ERROR
+	 TXNE	A,CM%NOP
+	  JRST	ERROR
+	 MOVEM	B,TMPJFN	; save the new JFN across the CONFIRM
+	 CONFIRM		; get the confirmation
+	 SKIPN	A,LOGJFN	; was there a previous log file?
+	 IFSKP.			; yes...
+	  CLOSF%		; close it
+	   ERNOP
+	  SETZM	LOGFLG		; turn off recording
+	 ENDIF.
+	 MOVE	A,TMPJFN	; and make new JFN the log file JFN
+	 MOVEM	A,LOGJFN
+	 movem	A,OLGJFN	; and save it as the previous
+	 SETZM	TMPJFN		; zap the temporary JFN
+	 hrroi	A,LOGSTR	; get the name for status display
+	 move	B,LOGJFN
+	 setz	C,
+	 JFNS%
+	  ERCAL	FATAL
+	 SKIPN	NETJFN		; connection open?
+	 IFSKP.			; yes...
+	  move	A,LOGJFN	; then open the log file
+	  MOVX	B,<<FLD 7,OF%BSZ>!OF%APP> ; yes, open for append
+	  OPENF%
+	  IFJER.
+	   EMSG <Log file error - >
+	   SETZM LOGJFN
+	   CALL	ERROUT		; output last error message
+	   CALLRET RETURN	; output newline and return
+	  ENDIF.
+	  SETOM	LOGFLG		; turn on recording
+	 ENDIF.
+	ENDIF.
+	RET
+
+
+; SET NULLS command
+
+.NULLS:	PHELP	HNULLS,SNULLS
+	NOISE <TO>
+	hrroi	A,SAVE2
+	movei	C,^D10
+	NOUT%
+	 ERJMP	.NULL1
+	setz	C,
+	idpb	C,A
+	movei	B,[FLDDB. .CMNUM,,^D10,<Number of NULLs at 50 BPS to simulate BREAK,>,<X>]
+	hrroi	A,SAVE2
+	movem	A,.CMDEF(B)
+	SKIPA
+.NULL1:	movei	B,[FLDDB. .CMNUM,,^D10,<Number of NULLs at 50 BPS to simulate BREAK,>]
+	movei	A,CMDBLK
+	COMND%
+	 ERJMP	ERROR
+	TXNE	A,CM%NOP
+	 JRST	CMDERR
+	skipge	B
+	 ERMSG <?Number must be positive>
+	caig	B,MAXNUL
+	IFSKP.
+	 EMSG <?Too many NULLs.  Maximum number allowed is >
+	 move	B,MAXNUL
+	 CALL	OUT10
+	 RET
+	ENDIF.
+	movem	B,SAVE2
+	CONFIRM
+	move	B,SAVE2
+	movem	B,BRKCNT
+	RET
+
+
+; SET OPAQUE and PAGE commands
+
+.OPAQU:	NOISE <MODE>
+	PHELP	HOPAQU,SOPAQU
+	TXNE	F,F%OPAQ
+	IFSKP.
+	 CALL	OFFON
+	ELSE.
+	 CALL	ONOFF
+	ENDIF.
+	COMND%
+	 ERJMP	ERROR
+	TXNE	A,CM%NOP
+	 jrst	ERROR
+	hrrz	B,(B)
+	movem	B,SAVE2
+	CONFIRM
+	TXZ	F,F%OPAQ
+	SKIPE	SAVE2
+	 TXO	F,F%OPAQ
+	RET
+
+.PAGE:	NOISE <MODE>
+	PHELP	HPAGE,SPAGE
+	TXNE	F,F%PAGE
+	IFSKP.
+	 CALL	OFFON
+	ELSE.
+	 CALL	ONOFF
+	ENDIF.
+	COMND%
+	 ERJMP	ERROR
+	TXNE	A,CM%NOP
+	 jrst	ERROR
+	hrrz	B,(B)
+	movem	B,SAVE2
+	CONFIRM
+	TXZ	F,F%PAGE
+	SKIPE	SAVE2
+	 TXO	F,F%PAGE
+	RET
+
+
+; PARITY
+
+.PARIT:	PHELP	HPARIT,SPARIT
+	NOISE <TO>
+	move	A,PARITY	; Set dynamic default.
+	move	A,[ASCIZ/NONE/
+		ASCIZ/MARK/
+		ASCIZ/EVEN/
+		ASCIZ/ODD/
+		ASCIZ/SPACE/](A)
+	movem	A,SAVE2
+	setzm	SAVE2+1
+	movei	B,[FLDDB. .CMKEY,,PARTAB,,<NONE>]
+	hrroi	A,SAVE2
+	movem	A,.CMDEF(B)	; Stuff default into fdb.
+	movei	A,CMDBLK
+	COMND%
+	 ERJMP	ERROR
+	TXNE	A,CM%NOP
+	 JRST	ERROR
+	hrrz	B,(B)		; Get the value for the keyword.
+	movem	B,SAVE2		; Save it
+	CONFIRM			; get confirmation.
+	move	B,SAVE2		; get it back
+	movem	B,PARITY
+	RET
+
+
+; PUSH command
+
+.PUSH:	NOISE <TO INFERIOR EXEC>
+	PHELP	HPUSH
+	CONFIRM
+PUSH1:	STKVAR <EXCJFN>
+	SETO	A,		; get subsystem/program names into T/TT
+	MOVE	B,[-2,,T]
+	MOVX	C,.JISNM	; note .JIPNM = .JISNM + 1
+	GETJI%
+	 ERCAL	FATAL
+	MOVX	A,.FHSLF	; disable PSIs
+	DIR%
+	 ERCAL	FATAL
+	SKIPN	A,EXCFRH	; have an EXEC already?
+	IFSKP.
+	 MOVE	A,EXCFRH	; yes, continue the extant fork
+	 TXO	A,SF%CON
+	 SFORK%
+	  ERNOP			; fork vanished or something
+	ELSE.
+	 MOVX	A,GJ%OLD!GJ%SHT	; try to get an EXEC
+	 HRROI	B,[ASCIZ/SYSTEM:EXEC.EXE/]
+	 GTJFN%
+	  ERJMP	ERROR
+	 MOVEM	A,EXCJFN	; save EXEC's JFN
+	 MOVX	A,CR%CAP	; make an inferior fork
+	 CFORK%
+	 IFJER.
+	  MOVE	A,EXCJFN	; get JFN back
+	  RLJFN%		; flush it
+	   ERNOP
+	  JRST	ERROR		; report it
+	 ENDIF.
+	 MOVEM	A,EXCFRH	; remember this EXEC's fork handle
+	 MOVE	A,EXCJFN	; save fork handle, get JFN
+	 HRL	A,EXCFRH	; stuff the fork
+	 GET%
+	  ERCAL	FATAL
+	 MOVX	A,.FHSLF	; get my current capabilities
+	 RPCAP%
+	 MOVE	A,EXCFRH	; get back fork handle of inferior
+	 TXZ	B,SC%LOG	; don't let inferior log out
+	 SETZ	C,		; and don't enable any capabilities
+	 EPCAP%
+	  ERCAL	FATAL
+	 SETZ	B,		; run it and wait for it to stop
+	 SFRKV%
+	  ERCAL	FATAL
+	ENDIF.
+	WFORK%
+	 ERCAL	FATAL
+	MOVX	A,.FHSLF	; re-enable PSIs
+	EIR%
+	 ERCAL	FATAL
+	DMOVE	A,E		; restore old names
+	SETSN%
+	 ERCAL	FATAL
+	RET
+
+
+; QUIT command
+
+.QUIT:	NOISE <OUT OF TMODEM>
+	PHELP	HQUIT
+	CONFIRM
+QUIT1:	SKIPN	A,RCVFRH	; if connection is not open
+	 JRST	EXIT		; this is easy
+	FFORK%			; freeze net input fork so it doesn't die
+	 ERCAL	FATAL		;  if you enter DDT or something
+	CALL	EXIT		; return to EXEC
+	MOVE	A,RCVFRH	; resume net input fork
+	RFORK%
+	 ERCAL	FATAL
+	RET
+
+
+; SET command
+
+.SET:	NOISE <PARAMETER>
+	TXNN	F,F%HLP
+	IFSKP.			; Processing HELP command
+	 movei	B,[FLDDB. .CMCFM,CM%SDH,,RETURN for help on using SET,,[
+		FLDDB. .CMKEY,,STNTAB,<parameter,>]]
+	 SKIPN	NETJFN
+	 IFSKP.			; Open connection
+	  movei	A,STOTAB
+	  hrrz	C,.CMFNP(B)
+	  movem	A,.CMDAT(C)
+	 ENDIF.
+	ELSE.			; Normal SET command
+	 movei	B,[FLDDB. .CMKEY,,STNTAB,<parameter,>]
+	 SKIPN	NETJFN
+	 IFSKP.			; Open connection
+	  movei	A,STOTAB
+	  movem	A,.CMDAT(B)
+	 ENDIF.
+	ENDIF.
+	movei	A,CMDBLK
+	COMND%
+	 ERJMP	ERROR
+	TXNE	A,CM%NOP
+	 jrst	ERROR
+	TXNE	F,F%HLP
+	 JN	CM%FNC,(C),SETHLP
+	HRRZ	B,(B)
+	CALLRET	(B)
+
+SETHLP:	hrroi	A,HSET
+	PSOUT%
+	RET
+
+
+; STATUS command
+
+STABSZ==^D20			; size of status buffer
+
+.STATU:	NOISE <OF CONNECTION>
+	CONFIRM
+	TXZ	F,F%HLP
+STATU1:	STKVAR <<STABUF,STABSZ>>
+	HRROI	A,STABUF	; get our local name
+	CALL	GTLCL
+	IFSKP.
+	 HRROI	A,STABUF	; output it if success (shouldn't fail)
+	 PSOUT%
+	ENDIF.
+	TMSG < TMODEM >
+	MOVX	A,.PRIOU	; set up for primary output
+	LOAD	B,VI%MAJ,EVEC+2	; get major version
+	TMNN	VI%DEC,EVEC+2	; decimal versions?
+	 SKIPA	C,[^D8]		; no, octal for typeout
+	  MOVX	C,^D10		; yes, output in decimal
+	NOUT%
+	 ERCAL	FATAL
+	LOAD	B,VI%MIN,EVEC+2	; get minor version
+	IFN.	B		; ignore if no minor version
+	 MOVEI	A,"."		; output delimiting dot
+	 PBOUT%
+	 CALL	OUTNUM		; now output the minor version
+	ENDIF.
+	LOAD	B,<VI%EDN&^-VI%DEC>,EVEC+2	; get edit version
+	IFN.	B		; ignore if no edit version
+	 MOVEI	A,"("		; edit delimiter
+	 PBOUT%
+	 CALL	OUTNUM		; now output the edit version
+	 MOVEI	A,")"		; edit close delimiter
+	 PBOUT%
+	ENDIF.
+	LOAD	B,VI%WHO,EVEC+2	; get who last edited
+	IFN.	B		; ignore if last edited at DEC
+	 MOVEI	A,"-"		; output delimiting hyphen
+	 PBOUT%
+	 CALL	OUTNUM		; now output the who version
+	ENDIF.
+	TMSG <
+This is >
+	HRROI	A,.SYSVER	; length of SYSVER table
+	GETAB%
+	 ERCAL	FATAL
+	HRLZ	B,A		; get up AOBJN pointer for name
+	ADDI	A,STABSZ	; make sure there's enough space!
+	SKIPGE	A		; a-okay
+	 MOVSI	B,-STABSZ	; otherwise use buffer size as a maximum
+	MOVEI	C,STABUF	; resolve address
+	DO.
+	 MOVX	A,.SYSVER	; table number
+	 HRLI	A,(B)		; index into table
+	 GETAB%
+	  ERCAL	FATAL
+	 MOVEM	A,(C)		; store in buffer
+	 ADDI	C,1		; index to next word
+	 AOBJN	B,TOP.		; get next word
+	ENDDO.
+	HRROI	A,STABUF
+	PSOUT%
+	CALL	STTY
+	CALL	SECHO
+	CALL	SLINE
+	CALL	SOPAQU
+	CALL	SPAGE
+	CALL	SLOG
+	CALL	STAKE
+	CALL	SEXTEN
+	CALL	SPARIT
+	CALL	SNULLS
+	CALL	SESCAP
+	SKIPE	NETJFN
+	 CALL	FRKST
+	JRST	RETURN
+	ENDSV.
+
+STTY:	SKIPN	HOST		; Got a TTY defined?
+	IFSKP.			; yes...
+	 SKIPN	NETJFN
+	  SKIPA	A,[-1,,[ASCIZ/
+Not yet connected to TTY/]]
+	   hrroi A,[ASCIZ/
+Connected to TTY/]
+	 PSOUT%
+	 MOVE	B,HOST
+	 CALL	OUT8
+	 TMSG < at >
+	 SKIPN	C,BRKSPD
+	  SKIPE	C,NEWSPD
+	   SKIPA
+	    setz C,
+	 SKIPE	C
+	 IFSKP.
+	  TMSG <Current Speed or 0>
+	  jrst	NOSPD
+	 ENDIF.
+	 HLRZ	B,C		; extract input speed
+	 HRRZS	C
+	 PUSH	P,B
+	 PUSH	P,C
+	 CALL	OUT10
+	 POP	P,C
+	 POP	P,B
+	 CAMN	B,C		; skip if input = output
+	 IFSKP.
+	  TMSG </>
+	  CALL	OUT10
+	 ENDIF.
+	 TMSG < BPS >
+	 CALL	SCARR
+	ELSE.
+	 TMSG <
+No TTY connection defined>
+	ENDIF.
+NOSPD:	RET
+
+SCARR:	SKIPN	A,NETJFN
+	 RET
+	RFMOD%
+	 ERJMP NOSPD
+	hrroi	A,[ASCIZ/(Carrier ON)/]
+	TXNN	B,TT%CAR
+	 hrroi A,[ASCIZ/(No Carrier)/]
+	PSOUT%
+	RET
+
+SECHO:	REPORT	F%ECHO,<Remote host is echoing>,<Local host is echoing>
+	RET
+
+SESCAP:	TMSG <
+The Escape Character is ">
+	move	A,ESCCHR
+	PBOUT%
+	TMSG <">
+	RET
+
+SLINE:	REPORT	F%LINE,<Line editor disabled>,<Line editor enabled>
+	RET
+
+SOPAQU:	REPORT	F%OPAQ,<Opaque mode disabled>,<Opaque mode enabled>
+	RET
+
+SPAGE:	REPORT	F%PAGE,<Page mode disabled>,<Page mode enabled>
+	RET
+
+SLOG:	hrroi	A,[ASCIZ/
+No log file/]
+	SKIPN	LOGJFN
+	IFSKP.
+	 hrroi	A,[ASCIZ/
+Log file: /]
+	 PSOUT%
+	 hrroi	A,LOGSTR
+	 PSOUT%
+	 SKIPN	LOGFLG
+	  SKIPA	A,[-1,,[ASCIZ/ (inactive)/]]
+	   hrroi A,[ASCIZ/ (active)/]
+	 PSOUT%
+	ELSE.
+	 PSOUT%
+	ENDIF.
+	RET
+
+STAKE:	REPORT	F%TAKE,<No TAKE file>,<TAKE file in progress>
+	RET
+
+SEXTEN:	REPORT	F%EXTN,<Simple talk command mode>,<Extended talk command mode>
+	RET
+
+SPARIT:	TMSG <
+Parity is set to >
+	move	D,PARITY	; Parity
+	hrroi	A,@[[ASCIZ\NONE\]
+		[ASCIZ\MARK\]
+		[ASCIZ\EVEN\]
+		[ASCIZ\ODD\]
+		[ASCIZ\SPACE\]](D)
+	PSOUT%
+	RET
+
+SNULLS:	TMSG <
+BREAK simulated with >
+	move	B,BRKCNT
+	CALL	OUT10
+	TMSG < NULLs>
+	RET
+
+
+; SWITCH-HELP Command
+
+.SWITC:	NOISE <NAMED>
+	TXZ	F,F%HLP
+	movei	B,[FLDDB. .CMCFM,CM%SDH,,RETURN for help on all the switches,,[
+		FLDDB. .CMKEY,,HSWTAB,<a switch,>]]
+	COMND%
+	 ERJMP	ERROR
+	TXNE	A,CM%NOP
+	 jrst	ERROR
+	JN	CM%FNC,(C),SWIHLP
+	movem	B,SAVE2
+	CONFIRM
+	move	B,SAVE2
+	HRRZ	B,(B)
+	hrroi	A,(B)
+	PSOUT%
+	RET
+
+SWIHLP:	hrroi	A,HSWITC
+	PSOUT%
+	movei	B,0
+	movei	C,HSWLEN
+SWIHP1:	move	A,@HSWLST
+	XCT	A
+	PSOUT%
+	addi	B,1
+	sojg	C,SWIHP1
+	RET
+
+HSWLST:	XCT	.+1(B)
+	hrroi	A,HSWA
+	hrroi	A,HSWB
+	hrroi	A,HSWC
+	hrroi	A,HSWD
+	hrroi	A,HSWK
+	hrroi	A,HSWQ
+	hrroi	A,HSWR
+	hrroi	A,HSWS
+	hrroi	A,HSWV
+HSWLEN==<.-HSWLST>-1
+
+
+; TAKE command
+
+.TAKE:	PHELP	HTAKE,STAKE
+	TXNE	F,F%TAKE	; TAKE in progress?
+	 ERMSG <TAKE command in progress>
+	NOISE <COMMANDS FROM FILE>
+	HRROI	[ASCIZ/CMD/]	; default extension is .CMD
+	MOVEM	GTJBLK+.GJEXT
+	movei	A,GTJBLK
+	movem	A,CMDBLK+.CMGJB
+	movei	A,CMDBLK
+	PARSE <.CMFIL>		; now get input file
+	 JRST	ERROR
+	MOVEM	B,TMPJFN	; save JFN over CONFIRM
+	SETZM	GTJBLK+.GJEXT	; clear default extension
+	CONFIRM
+	MOVE	A,TMPJFN	; now open the file
+TAKE1:	MOVX	B,<<FLD 7,OF%BSZ>!OF%RD>
+	OPENF%
+	 ERJMP	ERROR
+	SETZM	TMPJFN
+	HRLM	A,CMDBLK+.CMIOJ	; input JFN in left half
+	MOVX	A,.NULIO	; no output
+	HRRM	A,CMDBLK+.CMIOJ	; set as new I/O JFNs
+	TXO	F,F%TAKE	; flag TAKE in progress
+	RET
+
+UNTAKE:	TXZ	F,F%TAKE	; flag no more TAKE file
+	HLRZ	A,CMDBLK+.CMIOJ	; get TAKE file JFN back
+	CLOSF%			; close it
+	 ERCAL	FATAL		; yeegs
+	MOVE	A,[.PRIIN,,.PRIOU]	; restore command input from primaries
+	MOVEM	A,CMDBLK+.CMIOJ
+	RET
+
+	SUBTTL TTY ICP setup routine (CONNECT or TTY command)
+
+.TTY:
+.CONNE:	PHELP	HTTY,STTY
+	TXOA	F,F%TFLG	; Flag CONNECT in progress
+.PORT:	TXZ	F,F%TFLG
+	NOISE <LINE NUMBER>	; prompt for host
+	TXNE	F,F%TFLG
+	IFSKP.
+	 PHELP	HPORT,STTY
+	ENDIF.
+	SKIPN	B,HOST
+	 jrst	.CONN1
+	hrroi	A,SAVE2		; Yes, so make it the default.
+	movei	C,^D8
+	NOUT%
+	 ERJMP .CONN1
+	setz	C,
+	idpb	C,A
+	movei	B,[FLDDB. .CMNUM,CM%SDH,^D8,octal TTY number,<X>]
+	hrroi	A,SAVE2
+	movem	A,.CMDEF(B)
+	SKIPA
+.CONN1:	 movei	B,[FLDDB. .CMNUM,CM%SDH,^D8,octal TTY number]
+	movei	A,CMDBLK
+	COMND%
+	 ERJMP	ERROR
+	TXNE	A,CM%NOP
+	 JRST	CMDERR
+	MOVEM	B,HOST		; set as "host number"
+	DMOVE	A,[POINT 7,FILBUF,20
+		 ASCII/TTY/]	; build TTY: filename
+	MOVEM	B,FILBUF
+	MOVE	B,HOST		; TTY number
+	MOVX	C,^D8
+	NOUT%
+	 ERCAL	FATAL
+	MOVX	B,":"
+	IDPB	B,A
+	SETZ	B,
+	IDPB	B,A
+	MOVEI	A,CMDBLK
+	NOISE <SPEED OF LINE>
+	SKIPN	B,BRKSPD	; If we already know the speed (not 0)
+	 SKIPE	B,NEWSPD	; or we set the speed with SET PORT
+	  SKIPA			; or a previous TTY command
+	   setz	B,		; use it, else set to 0
+	SKIPN	B		; Now, is it 0?
+	IFSKP.			; no, prompt with the non-zero value
+	 hrrzs	B		; as the default value
+	 hrroi	A,SAVE2
+	 movei	C,^D10
+	 NOUT%
+	  ERJMP	.CONN2
+	 setz	C,
+	 idpb	C,A
+	 movei	B,[FLDDB. .CMCFM,,,,<X>,[
+		FLDDB. .CMKEY,,SPDTAB,<decimal number,>]]
+	 hrroi	A,SAVE2
+	 movem	A,.CMDEF(B)
+	ELSE.			; otherwise require a value
+.CONN2:	 movei	B,[FLDDB. .CMCFM,,,,,[
+		FLDDB. .CMKEY,,SPDTAB,<decimal number,>]]
+	ENDIF.
+	movei	A,CMDBLK
+	COMND%
+	 ERJMP	ERROR
+	TXNE	A,CM%NOP
+	 jrst	ERROR
+	IFQE.	CM%FNC,(C)	; (.CMKEY=0) if a command
+	 HRRZ	B,(B)		; get the data
+	 hrl	B,B
+	 movem	B,SAVE2		; save the value temporarily
+	 MOVEI	A,CMDBLK
+	 CONFIRM
+	 move	B,SAVE2		; get the temporary value back
+	 movem	B,NEWSPD	; and save it for real
+	ENDIF.
+	TXZN	F,F%TFLG
+	 RET
+	SETZ	C,
+	TMSG < Trying... >
+	MOVX	A,GJ%SHT	; short form, restricted
+	HRROI	B,FILBUF	; pointer to file string we made
+	GTJFN%			; make a JFN on it
+	 ERJMP	ERROUT		; failed?
+	MOVEM	A,NETJFN	; save JFN
+	MOVX	B,<<FLD ^D8,OF%BSZ>!OF%RD!OF%WR>	; 8 bit read/write
+	IOR	B,C		; with network-dependent other bits
+	OPENF%			; open it
+	IFJER.
+	 CAIE	A,OPNX7		; some other job has the TTY line?
+	 IFSKP.
+	  TMSG <In use by job >
+	  MOVE	A,NETJFN	; get back JFN
+	  DVCHR%		; find out who has it
+	   ERCAL FATAL
+	  HLRE	B,C		; get job number in B
+	  jrst	OUT10		; output the job number in decimal
+	 ENDIF.
+	 CAIE	A,OPNX10	; better than "Entire file structure full"
+	 IFSKP.
+	  TMSG <Insufficient system resources>
+	  RET
+	 ENDIF.
+	 CALL	ERROUT		; otherwise use last error's string
+	ENDIF.
+	move	C,BRKSPD	; Get previous value
+	TXZE	F,F%SPD		; Clear the flag... did we set the speed?
+	IFSKP.			; no...
+	 MOVX	B,.MORSP	; get current speed of line
+	 MTOPR%
+	  setz	C,		; force to 0 on error
+	 movem	C,NETSPD	; save original speed for CLOSE
+	ENDIF.
+	movem	C,BRKSPD	; Save for BREAK command
+	SKIPN	NEWSPD		; Do we need set a new speed?
+	IFSKP.			; yes...
+	 move	C,NEWSPD	; get the new speed
+	 MOVX	B,.MOSPD	; want to set speed
+	 movem	C,BRKSPD	; overwrite as new current value
+	 MTOPR%			; do it
+	  ERCAL	FATAL		; report error and continue
+	 TXO	F,F%SPD		; Flag that we actually set the speed
+	ENDIF.
+	MOVX	B,.MODUP	; now turn on DTR
+	MTOPR%
+	 ERNOP			; ignore failures
+	RFMOD%			; get current mode for this line
+	 ERCAL	FATAL
+	setz	B,		; no echo, binary mode, no paging, etc.
+	SFMOD%
+	 ERCAL	FATAL
+	STPAR%
+	 ERCAL	FATAL
+	move	A,NETJFN
+	movem	A,MODDEV
+	TMSG <Open
+>
+	CALL	TTYINI		; init TTY modes for talk mode
+	SKIPN	A,LOGJFN	; log file?
+	IFSKP.
+	 MOVX	B,<<FLD 7,OF%BSZ>!OF%APP>	; yes, open for append
+	 OPENF%
+	 IFJER.
+	  EMSG <Log file error - >
+	  SETZM	LOGJFN		; flag no more log file
+	  SETZM	LOGFLG
+	  CALL	ERROUT		; output last error message
+	  CALLRET RETURN	; output newline and return
+	 ENDIF.
+	 SETOM	LOGFLG		; turn recording on
+	ENDIF.
+	DMOVE	A,[POINT 8,NTOBFR
+		 4*NTOBSZ]
+	DMOVEM	A,NTOPTR	; init NET output buffer pointer/counter
+	DMOVE	A,[POINT 8,TTOBFR
+		 4*TTOBSZ]
+	DMOVEM	A,TTOPTR	; init TTY output buffer pointer/counter
+	MOVX	A,<CR%MAP!CR%CAP!CR%ST!RCVFRK>
+	CFORK%			; create receive fork
+	 ERCAL	FATAL
+	MOVEM	A,RCVFRH	; save the handle
+	CALL	NETFRC		; force initial negotiations now
+	CALL	SLOG
+	CALL	RETURN
+	CALL	SCARR
+	CALL	RETURN
+
+	SUBTTL Keyboard input loop
+
+	DO.
+	 SKIPN	RCVFRH		; possibly a command closed the connection
+	  RET			; quit if receive fork went away
+	 SOSGE	TTICTR		; any characters left in the buffer?
+	 IFSKP.
+	  ILDB	B,TTIPTR	; yes, read a byte
+	  CAIE	B,.CHCRT	; did we just get a CR?
+	  IFSKP.
+	   SOSGE TTICTR		; yes, there is probably an LF to eat!
+	  ANSKP.
+	   ILDB	A,TTIPTR	; get the LF
+	   CAIN	A,.CHLFD	; well??
+	  ANSKP.
+	   AOS	TTICTR		; this shouldn't happen, but do the right thing
+	   SETO	A,
+	   ADJBP A,TTIPTR
+	   MOVEM A,TTIPTR
+	  ENDIF.
+	 ELSE.
+	  TXNE	F,F%ECHO	; local echoing?
+	   TXNN F,F%LINE	; yes, using line editor?
+	   IFSKP.
+	    DMOVE A,[POINT 7,TTIBFR	; set up pointer to TTY input buffer
+	      RD%BEL!<5*TTIBSZ>] ; return on EOL, # of characters
+	    MOVEM A,TTIPTR
+	    SETZ C,		; no ^R buffer
+	    RDTTY%		; get the line
+	     ERCAL FATAL
+	    MOVX A,5*TTIBSZ	; compute number of characters read
+	    SUBI A,(B)
+	    MOVEM A,TTICTR	; set up counter
+	    LOOP.
+	   ELSE.
+	    MOVX A,.PRIIN	; no line editor, get a byte from user
+	    BIN%
+	   ENDIF.
+	 ENDIF.
+	 LOAD	C,CH%CHR,B	; get a copy of the character without parity
+	 TXNE	F,F%OPAQ	; opaque mode?
+	  CAIE	C,.CHCRT	; yes, character a CR?
+	  IFSKP.
+	   PBIN%		; yes, eat the LF
+	   ANDX	A,CH%CHR	; ignore parity
+	   CAIN	A,.CHLFD	; saw LF?
+	  ANSKP.
+	   MOVX	A,.PRIIN	; shouldn't happen, but...
+	   BKJFN%
+	    ERCAL FATAL
+	  ENDIF.
+	 CAME	C,ESCCHR	; intercept character?
+	  IFSKP.
+	   CALL	TLKCMD		; yes, process command
+	   LOOP.		; no command to do
+	  ENDIF.
+	 TXNN	F,F%ECHO	; see if have to echo
+	 IFSKP.
+	  MOVX	A,.PRIOU	; echo the byte
+	  TXNN F,F%LINE		; if line editor, already did it to terminal
+	   BOUT%
+	  SKIPE	A,LOGJFN	; is there a log file?
+	   SKIPN LOGFLG		; and is recording on?
+	    SKIPA		; no, skip
+	     BOUT%		; yes, then put it in the log file too
+	 ENDIF.
+	 CALL	NETOUT		; output it
+	 MOVX	A,.PRIIN	; any more bytes in TTI buffer?
+	 SKIPG	TTICTR		; or any line editor stuff?
+	  SIBE%
+	   LOOP.		; yes, get them before doing network output
+	 CALL	NETFRC		; otherwise force the buffer out
+	 LOOP.
+	ENDDO.
+
+	SUBTTL Interrupt stuff
+
+; PSI blocks
+
+LEVTAB:	LEV1PC			; priority level table
+	LEV2PC
+	LEV3PC
+
+CHNTAB:	PHASE	0		; channel table
+ABTCHN:!1,,ABTINT		; abort interrupt
+XFRCHN:!1,,XFRINT		; transfer interrupt
+TIMCHN:!2,,TIMINT		; timer channel
+	REPEAT .ICIFT-.,<0>
+.ICIFT:!1,,CLSINT		; receive fork termination channel
+	REPEAT ^D36-.,<0>
+	DEPHASE
+
+
+; Set up interrupts
+
+SETPSI:	MOVX	A,.FHSLF	; set level/channel tables
+	MOVE	B,[LEVTAB,,CHNTAB]
+	SIR%
+	 ERCAL	FATAL
+	EIR%			; enable PSIs
+	 ERCAL	FATAL
+	RET
+
+; Abort tranfer interrupt handler
+
+ABTINT:	CALL	CLRTIM
+	MOVX	A,PC%USR!ABORT	; dismiss to abort handler
+	MOVEM	A,LEV1PC
+	DEBRK%
+
+; Transfer interrupt for receive fork
+
+XFRINT: MOVX	A,PC%USR!XFRFRK	; Switch to transfer mode
+	MOVEM	A,LEV1PC
+	DEBRK%
+
+
+; Connection closed interrupt
+
+CLSINT:	MOVEM	17,IN1ACS+17	; save all ACs
+	MOVEI	17,IN1ACS
+	BLT	17,IN1ACS+16
+	MOVE	17,IN1ACS+17
+	SKIPN	A,RCVFRH	; is there a receive fork?
+	IFSKP.
+	 RFSTS%
+	  ERCAL	FATAL
+	 LOAD	A,RF%STS,A	; get fork status code
+	 CAIE	A,.RFFPT	; did somebody zap me?
+	 IFSKP.
+	  CALL	TTYRST		; no, restore TTY to normal mode
+	  EMSG <Abnormal receive fork termination interrupt
+>
+	  CALL	FRKST
+	  CALL	CLOSE1		; flush JFNs, etc.
+	  MOVX	A,PC%USR!CLSRET ; dismiss back to top level
+	  MOVEM	A,LEV1PC
+	 ELSE.
+	  CAIE	A,.RFHLT	; stopped voluntarily?
+	 ANSKP.			; if not then some other fork caused the int
+	  CALL	TTYRST		; restore TTY to normal mode for message
+	  CALL	CLOSE1
+	  TMSG < by foreign host>
+	  MOVX	A,PC%USR!CLSRET ; dismiss back to top level
+	  MOVEM	A,LEV1PC
+	 ENDIF.
+	ENDIF.
+	MOVSI	17,IN1ACS	; restore ACs
+	BLT	17,17
+	DEBRK%
+
+	SUBTTL	TIMER routines
+
+; Here to initialize the timer for TMODEM tranfer mode
+; Called via JSP D,SETTIM
+
+SETTIM:	move	A,[.FHSLF,,.TIMEL]	; Tick the timer
+	MOVX	B,<TMRTCK*^D1000>	; Every TMRTCK seconds
+	MOVX	C,TIMCHN
+	TIMER%
+	 ERCAL	FATAL
+	jrst	(D)
+
+CLRTIM:	setom	TIMKIL		; Turn off timer recycle
+	setzm	INTOK		; Turn off time-out counter
+	setzm	TIMLOC		; And the return adr
+	move	A,[.FHSLF,,.TIMAL]	; Remove any pending timer requests
+	setzb	B,C
+	TIMER%
+	 ERCAL	FATAL
+	RET
+
+;;; Here on timer interrupt for TMODEM transfer mode
+
+TIMINT:	dmovem	A,IN1ACS	; Save ACs we use
+	dmovem	C,IN1ACS+2
+	aose	TIMKIL		; If we weren't asked to kill the clock
+	 jsp	D,SETTIM	; Reinitialize the timer
+	aose	INTOK		; Should time out now?
+	IFSKP.
+	 skipn	A,TIMLOC	; Get time-out routine
+	  jrst	TIMINX		; FATAL <No time-out PC set>
+	 movem	A,LEV2PC	; Set it
+	 move	P,TIMRTP	; Reset stack ptr
+	ENDIF.
+TIMINX:	dmove	A,IN1ACS	; Restore ACs
+	dmove	C,IN1ACS+2
+	DEBRK%
+
+
+; GETTIM - 	This routine sets up the timeout time as being TIMFAC times
+; 		the length of time that it should take to transmit a
+; 		full packet based on the terminal speed of transfer line.
+
+GETTIM:	movni	C,^D17		; preset worse-case 300 baud default
+	movem	C,TIM128	; with 128 byte blocks (128/30)*TIMFAC
+	movni	C,^D137		; preset worse-case 300 baud default
+	movem	C,TIM1K		; with 1K blocks (1024/30)*TIMFAC
+	move	A,MODDEV
+	MOVX	B,.MORSP	; get terminal speeds
+	MTOPR%
+	 ERJMP	R
+	jumple	C,R		; if unspecified use default time
+	hlrz	B,C		; input speed
+	hrrz	B,B		; output speed
+	camle	B,C
+	 move	B,C		; take the minimum speed
+	idivi	B,^D10		; characters per second
+	fltr	B,B		; float it
+	push	P,B		; save it
+	move	C,[<128.0>]	; TIMFAC * transmission time
+	CALL	GETTMX
+	movnm	C,TIM128	; save short block value
+	pop	P,B
+	move	C,[<1024.0>]	; TIMFAC * transmission time
+	CALL	GETTMX
+	movnm	C,TIM1K		; save 1K block value
+	RET
+
+GETTMX:	fmpri	C,(TIMFAC)
+	fdvr	C,B		; convert to seconds per packet
+	fix	C,C
+	caige	C,1		; wait at least 1 second though
+	 movei	C,1
+	RET
+
+	SUBTTL Receive/Transfer Fork Status
+
+FRKST:	TMSG <
+Receive/Transfer fork status: >
+	MOVE	A,RCVFRH	; Get receive fork handle
+	MOVEI	B,.RFSFL+1	; Set up LRFSTS for a long RFSTS%
+	MOVEM	B,LRFSTS+.RFCNT
+	HRLI	A,(RF%LNG)
+	MOVEI	B,LRFSTS
+	RFSTS%			; Get status in A, PC in B
+FRKST0:	MOVE	B,LRFSTS+.RFPSW	; Load status to determine message
+	HLRZ	C,B		; B1-17 = status
+	CAIN	C,-1		; -1 = unassigned handle
+	JRST	[MOVEI D,[ASCIZ /Receive fork disappeared/]
+		JRST FRKST1]
+	TXZ	C,<(RF%FRZ)>	; Flush FROZEN bit
+	CAIE	C,.RFHLT	; HALT or FORCED TERM?
+	CAIN	C,.RFFPT
+	TXZ	B,RF%FRZ	; Yes, wasn't result of ^C
+	CAIE	C,.RFTTY	; TTY I/O WAIT?
+	CAIN	C,.RFTRP	; JSYS trapped?
+	TXZ	B,RF%FRZ	; Yes, not result of ^C
+	SKIPL	B
+	IFSKP.
+	 TMSG <^C from >	; "FROZEN" bit ON
+	ENDIF.
+	hrroi	A,@[[ASCIZ/Running/]
+		[ASCIZ/IO wait/]
+		[ASCIZ/HALT/]	; includes NEVER STARTED
+		[ASCIZ/HALT: /]
+		[ASCIZ/Fork wait/]
+		[ASCIZ/SLEEP/]
+		[ASCIZ\JSYS/UUO trap\]
+		[ASCIZ/Address break/]
+		[ASCIZ\TTY I/O wait\]](C)
+	PSOUT%
+	CAIE	C,.RFFPT
+	JRST	FRKST1		; Go output "AT <PC>"
+	HRRZ	C,LRFSTS+.RFPSW	; Instr at CHNLST indexes by CHAN thru C
+	MOVE	A,@CHNLST
+	PSOUT%
+FRKST1:	MOVE	T,LRFSTS+.RFPPC	; Load address part of PC
+	TMSG < at >
+	CALL	SYMOUT
+	RET
+
+CHNLST:	XCT .+1(C)		;Error Message from following table
+
+	HRROI	A,[ASCIZ/Abort Channel interrupt at /]	; Channel 0
+	HRROI	A,[ASCIZ/Transfer Channel interrupt at /]	; Channel 1
+	HRROI	A,[ASCIZ/Timer Channel interrupt at /]	; Channel 2
+	HRROI	A,[ASCIZ/Channel 3 interrupt at /]	; Channel 3
+	HRROI	A,[ASCIZ/Channel 4 interrupt at /]	; Channel 4
+	HRROI	A,[ASCIZ/Channel 5 interrupt at /]	; Channel 5
+	HRROI	A,[ASCIZ/Overflow at /]	; Channel 6
+	HRROI	A,[ASCIZ/Floating overflow at /]	; Channel 7
+	HRROI	A,[ASCIZ/Channel 8 interrupt at /]	; Channel 8
+	HRROI	A,[ASCIZ/Pushdown overflow at /]	; Channel 9
+	HRROI	A,[ASCIZ/End-of-file at /]	; Channel 10
+	HRROI	A,[ASCIZ/IO data error at /]	; Channel 11
+	HRROI	A,[ASCIZ/Quota exceeded at /]	; Channel 12
+	HRROI	A,[ASCIZ/File error 4 interrupt at /]	; Channel 13
+	HRROI	A,[ASCIZ/Time-of-day interrupt at /]	; Channel 14
+	HRROI	A,[ASCIZ/Illegal instruction at /]	; Channel 15
+	HRROI	A,[ASCIZ/Illegal memory READ at /]	; Channel 16
+	HRROI	A,[ASCIZ/Illegal memory WRITE at /]	; Channel 17
+	HRROI	A,[ASCIZ/Illegal memory EXECUTE at /]	; Channel 18
+	HRROI	A,[ASCIZ/Fork termination interrupt at /]	; Channel 19
+	HRROI	A,[ASCIZ/File or swapping space exceeded at /]	; Channel 20
+	HRROI	A,[ASCIZ/Channel 21 interrupt at /]
+	HRROI	A,[ASCIZ/Channel 22 interrupt at /]
+	HRROI	A,[ASCIZ/Channel 23 interrupt at /]
+	HRROI	A,[ASCIZ/Channel 24 interrupt at /]
+	HRROI	A,[ASCIZ/Channel 25 interrupt at /]
+	HRROI	A,[ASCIZ/Channel 26 interrupt at /]
+	HRROI	A,[ASCIZ/Channel 27 interrupt at /]
+	HRROI	A,[ASCIZ/Channel 28 interrupt at /]
+	HRROI	A,[ASCIZ/Channel 29 interrupt at /]
+	HRROI	A,[ASCIZ/Channel 30 interrupt at /]
+	HRROI	A,[ASCIZ/Channel 31 interrupt at /]
+	HRROI	A,[ASCIZ/Channel 32 interrupt at /]
+	HRROI	A,[ASCIZ/Channel 33 interrupt at /]
+	HRROI	A,[ASCIZ/Channel 34 interrupt at /]
+	HRROI	A,[ASCIZ/Channel 35 interrupt at /]
+
+	SUBTTL Network input fork
+
+RCVFRK:	MOVE	P,RDLPTR	; set up fork's stack
+	CALL	SETPSI
+RCVFRX:	MOVX	A,.FHSLF
+	MOVX	B,<1B<XFRCHN>>
+	AIC%
+
+; Network input fork main loop
+
+	DO.
+	 SOSL	NTICTR		; anything in net input buffer?
+	 IFSKP.
+	  MOVE	A,NETJFN	; no, any input in the system for me?
+	  SIBE%
+	  IFSKP.
+	   CALL	TTOSND		; no, force out TTY buffer
+	   MOVE	A,NETJFN	; and read in exactly one byte
+	   MOVX	B,1
+	  ENDIF.
+	  CAILE	B,4*NTIBSZ	; bounds check
+	   MOVX	B,4*NTIBSZ	; guess we should reassemble!
+	  MOVEM	B,NTICTR	; note number of words this buffer
+	  MOVNI	C,(B)
+	  MOVE	B,[POINT 8,NTIBFR]
+	  MOVEM	B,NTIPTR	; re-initialize pointer
+	  SIN%			; slurp up the net data
+	   LOOP.
+	  ENDIF.
+	 ILDB	B,NTIPTR	; read a single byte
+	 IDPB	B,TTOPTR	; else stick it in buffer
+	 SOSG	TTOCTR		; buffer full now?
+	  CALL	TTOSND		; force it out then
+	 LOOP.
+	ENDDO.
+
+	SUBTTL Network I/O subroutines
+
+; Add a single byte to the network output buffer
+
+NETOUT:	CALL	SETPAR
+	IDPB	B,NTOPTR	; stuff byte in buffer
+	SOSLE	NTOCTR		; any space left in buffer?
+	 RET			; yes, just return
+;	CALLRET	NETFRC		; no, force buffer out
+
+; Force the accumulated buffer out to the network
+
+NETFRC:	DMOVE	B,[POINT 8,NTOBFR ; get pointer/counter to net output buffer
+		 4*NTOBSZ]
+	CAMN	C,NTOCTR	; no-op if buffer empty
+	 RET
+	MOVEM	B,NTOPTR	; reset pointer
+	EXCH	C,NTOCTR	; reset counter, get old counter
+	SUB	C,NTOCTR	; C := negative count of bytes in buffer
+	MOVE	A,NETJFN	; force network buffer out
+	MOVE	B,NTOPTR	; from start of buffer
+	SOUTR%			; send it now
+	 ERJMP	R		; don't ITRAP on this guy
+	RET			; return
+
+	SUBTTL TTY I/O subroutines
+
+; Force out accumulated TTY buffer (called when full or net input buffer empty)
+
+TTOSND:	DMOVE	B,[POINT 8,TTOBFR
+		 4*TTOBSZ]
+	CAMN	C,TTOCTR	; no-op if buffer empty
+	 RET
+	MOVEM	B,TTOPTR	; re-init buffer pointer/counter
+	EXCH	C,TTOCTR
+	SUB	C,TTOCTR	; C := negative count of bytes in buffer
+	PUSH	P,C		; save the counter in case log file
+	SKIPE	A,LOGJFN	; is there a log file?
+	 SKIPN	LOGFLG		; and is recording on?
+	  SKIPA			; no, skip
+	   SOUT%		; yes, output the text to the file
+	MOVX	A,.PRIOU	; buffer full, output it
+	MOVE	B,[POINT 8,TTOBFR]
+	POP	P,C
+TTOPC:	SOUT%			; output the buffer
+	RET
+
+; Outputs a CRLF iff it is necessary
+
+CRLF:	SAVEAC <A,B>
+	MOVX	A,.PRIOU
+	RFPOS%			; get cursor position
+	JXE	B,.RHALF,R	; is it necessary?
+	jrst	RETURN
+
+
+; Initialize TTY state for talk mode
+
+TTYINI:	TXOE	F,F%TTYI	; are we already TTYINI'd?
+	 RET			; yes, ignore
+	MOVX	A,.FHJOB	; disable all TTY interrupts
+	SETZ	B,
+	STIW%
+	 ERCAL	FATAL
+	MOVX	A,.PRIOU
+	SKIPN	NETJFN		; Do we have a TTY line?
+	IFSKP.			; yes
+	 MOVE	B,TTYMOD	; get nominal TTY mode
+	 TXNN	F,F%OPAQ	; opaque mode?
+	  TXZ	B,TT%DAM	; no, enter binary mode
+	 TXNN	F,F%LINE	; using line editor?
+	  TXZ	B,TT%ECO	; no, disable echo as well
+	 SFMOD%
+	  ERCAL	FATAL
+	 TXNE	F,F%PAGE	; PAGE mode enabled?
+	  TXOA	B,TT%PGM	; enable page mode
+	   TXZ	B,TT%PGM	; disable page mode
+	 STPAR%
+	  ERCAL	FATAL
+	 TXNN	F,F%OPAQ	; opaque mode?
+	  RET			; no, no need to do CCOC hackery
+	 DMOVE	B,[BYTE(2) 2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2
+		   BYTE(2) 2,2,2,2,2,2,2,2,2,2,2,2,2,2]
+	 SFCOC%			; diddle CCOC words
+	  ERCAL	FATAL
+	ELSE.			; Set up console as MODDEV
+	 dmove	B,[BYTE(2) 1,1,1,1,1,1,1,2,2,3,2,1,1,2,1,1,1,1
+	 	   BYTE(2) 1,1,1,1,1,1,1,1,1,1] ; set new COC 
+	 SFCOC%			; to echo CR, LF, BS, and TAB properly
+	  ERCAL	FATAL
+	 setz	B,		; clear everything
+	 SFMOD%			; Set 8-bit, no echo mode
+	  ERCAL	FATAL
+	 STPAR%			; etc.
+	  ERCAL	FATAL
+	 MOVX	A,.CTTRM	; Get current refuse
+	 MOVX	B,.MOSNT	; For sys messages.
+	 MOVX	C,.MOSMN	; Turn them off.
+	 MTOPR%
+	  ERCAL	FATAL
+	 MOVX	A,<TL%CRO!TL%COR!TL%SAB!TL%STA!.CTTRM>
+	 seto 	B,		; Clear all links.
+	 TLINK%
+	  ERCAL	FATAL
+	 CALL	NETBON		; maybe turn net binary on
+	ENDIF.
+	RET
+
+
+; Reset TTY state when leaving talk to remote host mode
+
+TTYRST:	TXZN	F,F%TTYI	; are we TTYINI'd?
+	 RET			; no, ignore
+	CALL	RETURN		; output (unconditional) newline
+	MOVX	A,.FHJOB
+	MOVE	B,TTYTIW	; restore old TTY interrupt word
+	STIW%
+	 ERCAL	FATAL
+	SKIPN	NETJFN		; Do we have a TTY line?
+	IFSKP.			; yes
+	 MOVX	A,.PRIIN	; restore old TTY state
+	 MOVE	B,TTYMOD
+	 SFMOD%
+	  ERCAL	FATAL
+	 STPAR%
+	  ERCAL	FATAL
+	 TXNN	F,F%OPAQ	; opaque mode?
+	  RET			; no, no need to do CCOC hackery
+	 DMOVE	B,TTYCOC	; restore CCOC words
+	 SFCOC%
+	  ERCAL	FATAL
+	ELSE.
+	 CALL	NETBOF		; maybe turn net binary off
+	 MOVX	A,.CTTRM
+	 move	C,TTYSYS	; Old sys message status.
+	 MOVX	B,.MOSNT	; Restore state
+	 MTOPR%
+	  ERCAL	FATAL
+	 move	D,TTYMOD	; get old link bits
+	 movei	A,-1
+	 TXNE	D,TT%ALK	; accept links ?
+	  TXO	A,TL%SAB!TL%ABS
+	 TXNE	D,TT%AAD	; accept advice ?
+	  TXO	A,TL%STA!TL%AAD
+	 movei	B,-1
+	 TLINK%			; maybe re-enable links/advice
+	  ERCAL	FATAL
+	 MOVX	A,.PRIOU
+	 dmove	B,TTYCOC
+	 SFCOC%			; restore control character echoing
+	  ERCAL	FATAL
+	 move	B,TTYMOD
+	 SFMOD%
+	  ERCAL	FATAL
+	 STPAR%			; restore pause commands
+	  ERCAL	FATAL
+	 MOVX	A,.FHSLF
+	 move	C,TTYCAP
+	 EPCAP%			; restore capabilities
+	  ERCAL	FATAL
+	ENDIF.
+	RET
+
+
+; Enter remote echo
+
+RMTECO:	TXZE	F,F%ECHO	; already in the state?
+	 RET			; yes, no-op
+	TXNN	F,F%LINE	; using line editor?
+	IFSKP.
+	 MOVX	A,.PRIIN	; get current TTY modes
+	 RFMOD%
+	  ERCAL	FATAL
+	 TXZ	B,TT%ECO	; disable echoing
+	 SFMOD%
+	  ERCAL	FATAL
+	ENDIF.
+	RET			; return to caller
+
+; Enter local echo
+
+LCLECO:	TXON	F,F%ECHO	; were we already in local echo mode?
+	 RET			; yes, no-op this routine
+	MOVX	A,.PRIIN	; get current TTY modes
+	RFMOD%
+	 ERCAL	FATAL
+	TXNN	F,F%LINE	; using line editor?
+	 TXZA	B,TT%ECO	; no, disable echo as well
+	  TXO	B,TT%ECO	; yes, enable echoing
+	SFMOD%
+	 ERCAL	FATAL
+	RET			; return to caller
+
+
+; GTLCL - Get name of local host (stolen from MM's HSTNAM.MAC)
+; Accepts:
+;	A/ pointer to destination host string
+;	CALL GTLCL
+; Returns +1: Failed (shouldn't happen)
+;	  +2: Success, with updated pointer in A
+
+GTLCL:	SAVEAC <B,C,D>
+	STKVAR <HSTPTR,HSTNBR,<HSTSTR,HSTNMW>>
+	TXC	A,.LHALF	; is destination pointer's LH -1?
+	TXCN	A,.LHALF
+	 HRLI	A,(<POINT 7,>)	; yes, set up byte pointer
+	MOVEM	A,HSTPTR	; save pointer
+	MOVX	A,.GTHSZ	; Get our local host number
+	GTHST%			;  ..
+	 ERJMP	LCLFIL		;  Failed!  Try file
+	MOVEM	D,HSTNBR	; set new host address
+	MOVX	A,.GTHNS	; Now get the primary name
+	MOVE	B,HSTPTR	; destination pointer
+	MOVE	C,HSTNBR	; host address
+	GTHST%			;  ..
+	 ERJMP	LCLFIL		;  Failed! Try file
+	MOVE	A,B		; Point to the area
+	RETSKP			; And done
+
+LCLFIL:	MOVX	A,GJ%SHT!GJ%OLD	; try for the local hostname file
+	HRROI	B,[ASCIZ/SYSTEM:HOSTNAME.TXT/]
+	GTJFN%			; find system file with our name
+	IFNJE.
+	 MOVEM	A,TMPJFN	; save JFN in case OPENF% failure
+	 MOVX	B,<<FLD 7,OF%BSZ>!OF%RD>	; open in 7-bit ASCII
+	 OPENF%
+	 IFNJE.
+	  HRROI	B,HSTSTR	; read in host name
+	  MOVX	C,HSTNML	; up to this many characters
+	  MOVX	D,.CHLFD	; terminate on a linefeed
+	  SIN%
+	   ERNOP
+	  CLOSF%		; close off file
+	   ERNOP
+	  MOVE	A,[POINT 7,HSTSTR]	; now process string a bit
+	  DO.
+	   ILDB	B,A		; get byte from string read in
+	   CAIE	B,.CHLFD	; LF terminates
+	    CAIN B,.CHCRT	; CR terminates
+	     SETZ B,
+	   CAIE	B,.CHTAB	; TAB terminates
+	    CAIN B,.CHSPC	; space terminates
+	     SETZ B,
+	   IDPB	B,HSTPTR	; return byte to user
+	   JUMPN B,TOP.		; if null, done
+	  ENDDO.
+	  MOVE	A,HSTPTR	; return updated pointer
+	  RETSKP
+	 ELSE.
+	  MOVE	A,TMPJFN	; get back JFN we got
+	  RLJFN%		; free it
+	   ERJMP R		; not interested in errors here
+	  RET
+	 ENDIF.
+	ENDIF.
+	MOVE	A,HSTPTR	; destination
+	HRROI	B,[ASCIZ/TOPS-20/]	; default name string
+	SETZ	C,		; no limit
+	SOUT%			; copy the string
+	 ERJMP	R		; can't fail
+	RETSKP
+
+	SUBTTL HELP strings
+
+; Top-level HELP strings
+
+HLPTXT:	ASCIZ\
+
+     TMODEM is a subsystem to allow users to communicate with
+other systems via an outgoing TTY line and exchange files, or to
+exchange files directly with the user's terminal.  The simplest
+way to run TMODEM is to enter "TTY number speed" at the TMODEM
+prompt, or the SEND or RECEIVE command for direct file transfers.
+
+     While talking to a remote host through the outgoing TTY
+line, you may type commands to TMODEM by typing the ^^ character
+(CTRL/^, 036 octal) followed by a single character command
+character.  The most useful command characters are:
+
+	C	Close the connection and return to command level
+	^^	Send a CTRL/^ character to the foreign host.
+	?	List the CTRL/^ command options
+
+     Use the HELP command for more information on each of the
+individual commands.  Bugs should be reported to Internet address
+BUG-TMODEM@SIMTEL20.ARPA.
+
+\
+
+HCLOSE:	ASCIZ\
+CLOSE (CONNECTION)
+
+     Close the network connection to the remote host.  Exit if TMODEM
+was invoked with a command line argument, else return to the top-level
+command parser.  This command is only valid in talk mode.
+
+\
+
+HCONTR:	ASCIZ\
+CONTROL (CHARACTER) [quoted character | octet]
+
+     Sends the control form of the quoted character, or the given
+octet as an ASCII code.  This command is only valid in talk mode.
+
+\
+
+HDDT:	ASCIZ\
+DDT
+
+     Maps in DDT and calls it.  R$G returns.
+
+\
+
+HEXIT:	ASCIZ\
+EXIT (FROM TMODEM)
+
+     Return to the superior process (normally the EXEC) without
+closing the TTY connection.  This is the graceful way out of TMODEM
+once the connection has been closed.
+
+\
+
+HPUSH:	ASCIZ\
+PUSH (COMMAND LEVEL)
+
+     Run EXEC in an inferior process.  The EXEC's POP command may be
+used to return to TMODEM.  This is useful for doing something
+temporarily at the local host while preserving the TMODEM connection.
+TMODEM disables SC%LOG capability in the inferior EXEC to protect the
+user against accidentally logging out with a connection still open.
+
+\
+
+HQUIT:	ASCIZ\
+QUIT (OUT OF TMODEM)
+
+     This command returns the user to the EXEC without closing any
+open connection; e.g. the effect is similar to that of a CTRL/C.  EXIT
+is the preferred command to leave TMODEM, as it closes any open
+connections.
+
+\
+
+HRECEI:	ASCIZ\
+RECEIVE (FILE) filespec {/switches}
+R (FILE) filespec {/switches}
+
+     Receive a file or set of files into the local host using the
+Christensen Protocol.  The file type defaults to TOPS-20 Binary if not
+otherwise specified by the /ASCII switch.  To receive a set of files,
+use RECEIVE *.*, and the default file type will default to TOPS-20
+Binary regardless of any specified switch setting.  Files will be
+received from the controlling terminal if no TTY port connection is
+open.  A file transfer through an open TTY connection may be aborted
+from the controlling terminal by typing the escape character followed
+by an A.  The currently open receiving file will be closed, but not
+deleted, and the remote host may be have to be aborted manually.  The
+SWITCHES or HELP SWITCHES command describes the available switches.
+
+RA filespec {/switches} = R filespec/ASCII{/switches}
+RC filespec {/switches} = R filespec/CHECKSUM{/switches}
+RAC filespec {/switches} = R filespec/ASCII/CHECKSUM{/switches}
+
+\
+HSEND:	ASCIZ\
+SEND (FILE) filespec {/switches}
+S (FILE) filespec {/switches}
+
+     Send a file or set of files using a wild-card filespec with the
+Christensen Protocol.  SEND automatically determines the type of file
+and opens the accordingly.  Files will be sent to the controlling
+terminal is no TTY connection is open.  A file transfer through an
+open TTY connection may be aborted from the controlling terminal by
+typing the escape character followed by an A.  The SWITCHES or HELP
+SWITCHES command describes the available switches.
+
+SK filespec {/switches} = S filespec/KILOBYTE{/switches}
+
+\
+
+HSET:	ASCIZ\
+SET (PARAMETER) parameter value
+
+     SET the specified parameter to the indicated value.  A parameter
+which has only two possible values, such as ON/OFF, will default to
+the opposite of its current setting.  For help on a specific
+parameter, type HELP SET parameter.
+
+\
+
+HSWITC:	ASCIZ\
+SEND filespec{/switch.../switch}
+RECEIVE filespec{/switch.../switch}
+
+The following switches are available for use with the SEND or RECEIVE
+file transfer commands:
+
+\
+
+HSWA:	ASCIZ\
+/ASCII-MODE	Specifies that the received file is to be stored as an
+	ASCII text file, i.e., as a file containing only 7-bit
+	characters.  This switch is ignored when sending files because
+	TMODEM automatically determines the file type.
+
+\
+
+HSWB:	ASCIZ\
+/BINARY-MODE	Specifies that the received file is to be stored as a
+	TOPS-20 Binary file.  This is the assumed type if not
+	specified otherwise as an ASCII file in single file transfers.
+	Wild card file transfers will always store the files as
+	TOPS-20 Binary files, and ignore any /ASCII-MODE switch.
+
+\
+
+HSWC:	ASCIZ\
+/CHECKSUM-MODE	Specifies that the RECEIVE Command start the file
+	transfer in the obsolete CHECKSUM mode instead of assuming the
+	sending end is capable of using CRC mode.  This switch exists
+	purely to accomodate improperly implemented versions of the
+	protocol and is not recommended under normal circumstances.
+
+\
+
+HSWD:	ASCIZ\
+/DISCONNECT	Specifies that the connection is to be closed after
+	the file transfer is complete or aborts.  (NOT IMPLEMENTED)
+
+\
+
+HSWK:	ASCIZ\
+/KILOBYTE-MODE	Specifies that the SEND Command is to use 1K data
+	packets instead of 128-byte data packets as described in the
+	YMODEM documentation, and that the receiving host is capable
+	of handling either type of packet.
+
+\
+
+HSWQ:	ASCIZ\
+/QUIET-MODE	Specifies that no file transfer status, including
+	error messages, is to be reported to the controlling terminal
+	when the file transfer takes place over an open TTY
+	connection.  This switch is always on when the file transfer
+	is with the controlling terminal.  This switch takes
+        precedence over the /RECEIVED, /SENT, and /VIEW switches.
+
+\
+
+HSWR:	ASCIZ\
+/RECEIVED	Specifies that only received characters are to be
+	displayed on the controlling terminal when the file transfer
+	takes place over an open TTY connection, in addition to the
+	regular transfer progress reports.  This switch is
+        ignored when the file transfer is with the controlling
+        terminal.  The /QUIET-MODE switch takes precedence over
+        this switch.
+
+\
+
+HSWS:	ASCIZ\
+/SENT		Specifies that only sent characters are to be
+	displayed on the controlling terminal when the file transfer
+	takes place over an open TTY connection, in addition to the
+	regular transfer progress reports.  This switch is
+        ignored when the file transfer is with the controlling
+        terminal.  The /QUIET-MODE switch takes precedence over
+        this switch.
+
+\
+
+HSWV:	ASCIZ\
+/VIEW		Specifies that the contents of the data packets are to
+	be displayed on the controlling terminal when the file
+	transfer takes place over an open TTY connection.  This switch
+	is ignored when the file transfer is with the controlling
+	terminal.  The /QUIET-MODE switch takes precedence over this
+	switch.
+
+\
+
+HTAKE:	ASCIZ\
+TAKE (COMMANDS FROM FILE) take file name
+
+     Accept commands from the specified input file.  At end of file
+revert to accepting commands from the terminal.  TMODEM does an
+implicit TAKE TMODEM.CMD at startup.
+
+\
+
+HTRANS:	ASCIZ\
+
+TRANSMIT (FILE) filename
+
+     Send a existing ASCII text file to the TTY port a line at a time
+and wait for the remote host to echo an LF (CTRL/J) before sending the
+next line.  Any LFs in the file are sent, except when the LF follows a
+CR (CTRL/M).  No other handshaking or error detection/correction is
+done during the transfer.  The transfer may be aborted by typing the
+escape character and an A.  This command is available only in talk
+mode.
+
+\
+
+HTTY:	ASCIZ\
+CONNECT | TTY (LINE NUMBER) line-number (SPEED OF LINE) speed
+
+     Open a connection with the specified TTY port at the requested
+speed.  The speed defaults to the current speed of the port.  Both the
+line-number and the speed may be preset by the SET PORT command.
+\
+
+
+; SET HELP strings
+
+HECHO:	ASCIZ\
+SET ECHO (BY) {LOCAL | REMOTE}
+
+     Toggle or specify the state the flag controlling whether or not
+TMODEM expects the local host to handle echoing of user typein.  In
+local echo mode, TMODEM handles the echoing.  The default offered is
+the opposite of the current state of this flag.  This command may be
+specified without an open TTY connection.  However, it takes effect
+only in talk mode.  The initial default setting is REMOTE echo.
+\
+
+HESCAP:	ASCIZ\
+SET ESCAPE (CHARACTER TO) {quoted-character | octal-number}
+
+     Set the escape character from talk mode to the specified
+character.  The default escape character is CTRL/^ (ASCII 036,
+control-caret).  When this character is input from the terminal,
+TMODEM will read a single command character as follows:
+
+	Character	Action
+
+	    ?		Lists the command characters
+	    A		ABORT file transfer in progress
+	    B		Send a (simulated) BREAK
+	    C		CLOSE the TTY connection
+	    D		Disconnect via DTR toggle
+	    P		PUSH to an inferior EXEC
+	    Q		QUIT (temporary EXIT) out of TMODEM
+	    S		STATUS of remote TTY connection
+	    X		Enter eXtended command mode
+
+     Neither the escape character nor the following command character
+are echoed.  If the escape character is given as a command character,
+it is sent as a single character to the remote host (which is how you
+send that character!).  It was a design goal of TMODEM to allow any
+character (including the escape character) to be sent to the remote
+host without causing messing up of the transcript due to prompts, etc.
+
+     Extended command mode (see also HELP SET EXTENDED) allows the
+user to have a more standard command parser at the expense of a prompt
+and echoed input on the typescript.  Extended command mode is the only
+way to do certain functions (such as log file usage) while in talk
+mode.  Extended command mode is similar to top-level, except that a
+different set of commands are valid in talk mode; some, such as ECHO,
+are meaningful only in talk mode.  Each command notes whether or not
+it is valid in talk mode.  When an extended command has been completed
+(or has failed with an error), TMODEM returns to talk mode.
+\
+
+HEXTEN:	ASCIZ\
+SET EXTENDED (COMMAND MODE) {ON | OFF}
+
+     Toggle or specify the state of the flag controlling whether or
+not TMODEM will enter extended talk command mode when the escape
+character is typed immediately instead of going into talk command
+mode.  The default is to go to talk command mode.  Note that if
+EXTENDED mode is enabled there is no way to send the escape character
+to the remote host.  The default offered is the opposite of the
+current state of this flag.
+\
+
+HLINE:	ASCIZ\
+SET LINE (EDITOR FOR LOCAL ECHO CONNECTIONS) {ON | OFF}
+
+     Toggle or specify the state of the flag controlling whether or
+not TMODEM will use line buffering when communicating to the remote
+host.  Line buffering only takes effect when echoing is being done by
+TMODEM.  When line buffering is enabled, the TOPS-20 editing
+characters (rubout, CTRL/R, CTRL/W, CTRL/U) will work since line
+buffering uses the system TEXTI% JSYS.  No text is sent to the remote
+host until a carriage return or a line feed is typed.  This command is
+useful for communicating with line-oriented systems.  The default
+offered is the opposite of the current state of this flag.
+\
+
+HLOG:	ASCIZ\
+SET LOG {ON} (FILE IS) log file name
+SET LOG (FILE) {OFF}
+
+	Toggle or specify the status of the log file.  The default
+offered is the opposite of the current status of the log file.  If no
+log file exists, then prompt for a name with a default extension of
+.LOG.  If a log file was previously declared and closed, that filename
+is the default, otherwise the filename defaults to TMODEM.LOG.  The
+log file will contain a transcript of the user's session during an
+open connection.  Recording to the log file may be temporarily suspend
+and resumed by typing the escape character followed by an "L".  The
+CLOSE command also closes the log file, which is reopened for append
+and recording turned on when another connection is opened.  TMODEM
+defaults to not keeping a log file.
+\
+
+HNULLS:	ASCIZ\
+SET NULLS (TO) decimal number
+
+     Specify the number of NULLs to be sent at 50 BPS to simulate a
+BREAK signal when connected to a remote host via a TTY port.
+\
+
+HOPAQU:	ASCIZ\
+SET OPAQUE (MODE) {ON | OFF}
+
+     Toggle or specify the state of the flag controlling whether or
+not TMODEM will use "opaque mode", ie, continue doing local terminal
+handling such as padding and keeping track of the cursor position,
+etc.  In addition, certain typein characters may be affected by opaque
+mode; nulls are ignored and character conversion may occur.  The
+default is OPAQUE OFF, which specifies an image link between TMODEM
+and the remote host with no local terminal handling.  Opaque mode
+generally precludes being able to do things like use a display editor
+at the remote system, but it is sometimes necessary when using certain
+inferior terminals.  Opaque mode does not change XON/XOFF handling;
+this is controlled by the PAGE command although opaque mode is
+required along with page mode to get automatic holding at end of
+screen.  The default offered is the opposite of the current state
+of this flag.
+\
+
+HPAGE:	ASCIZ\
+SET PAGE (MODE) {ON | OFF}
+
+     Toggle or specify the state of the flag controlling whether or
+not TMODEM will enable local host XON/XOFF handling ("terminal page"
+mode).  In page mode, the pause and resume characters, by default
+CTRL/Q (XON) and CTRL/S (XOFF), are handled by the local TOPS-20
+operating system and there is no way to send either of those
+characters to the remote system.  Automatic holding at the end of the
+screen requires opaque mode as well, so TOPS-20 can know how many
+lines it has output.  The default is PAGE OFF, which specifies that
+CTRL/Q and CTRL/S are passed to the remote host in image mode.  Page
+mode is sometimes necessary when XON/XOFF handling is required and the
+remote host does not or can not handle it.  For example, old style
+DECnet connections do not allow TERMINAL PAGE at the remote host, and
+certain terminals (such as VT100's in smooth scroll mode) require
+faster XON/XOFF handling than can take place over a network.  The
+default offered is the opposite of the current state of this flag.
+\
+
+HPARIT:	ASCIZ\
+SET PARITY (TO) {NONE | MARK | EVEN | ODD | SPACE}
+
+     Set the parity of the TTY connection to the specified value.  The
+default value is NONE.  The parity setting is ignored during SEND or
+RECEIVE command file transfers.
+
+\
+
+HPORT:	ASCIZ\
+SET PORT (LINE NUMBER) line-number (SPEED OF LINE) speed
+
+     This command presets the values for the line-number and speed to
+be used by the CONNECT or TTY commands without opening a connection.
+These values may be overridden by another SET PORT or the CONNECT or
+TTY commands.  The SET PORT command is not available in talk mode.
+\
+
+	SUBTTL Error handling stuff
+
+CMDERR:	EMSG <>
+	CALL	ERROUT		; output last error message
+	TMSG < - ">
+	HRROI	A,ATMBUF	; output last atom
+	PSOUT%
+	TMSG <"
+>
+	SKIPE	A,TMPJFN	; flush possible JFN
+	 RLJFN%
+	  ERNOP			; don't loop in error output
+	SETZM	TMPJFN
+	RET
+
+; Other non-fatal JSYS error
+
+ERROR:	TXNN	F,F%TAKE	; TAKE file in progress?
+	IFSKP.
+	 MOVX	A,.FHSLF	; yes, check last error
+	 GETER%
+	 HRRZS	B		; only want error code
+	 CAIN	B,IOX4		; end of TAKE file?
+	  JRST	UNTAKE		; leave TAKE file and return to user
+	ENDIF.
+	EMSG <>
+	CALL	ERROUT		; output last error message
+	SKIPE	A,TMPJFN	; flush possible JFN
+	 RLJFN%
+	  ERNOP			; don't loop in error output
+	SETZM	TMPJFN
+	CALLRET	CRLF		; output newline and return
+
+; Common routine called to output last error code's message
+
+ERROUT:	SAVEAC <A>		; save error code if here
+	MOVX	A,.PRIOU
+	HRLOI	B,.FHSLF	; dumb ERSTR%
+	SETZ	C,
+	ERSTR%
+	IFNJE.			; ERSTR% has TWO failure returns...ugh!
+	..TAGF (ERJMP,)		; I sure wish ANNJE. existed!
+	  RET
+	ENDIF.
+	TMSG <Undefined error >
+	MOVX	A,.FHSLF	; get error number
+	GETER%
+	HRRZS	B		; only right half where error code is
+	jrst	OUT8
+
+
+; Fatal errors arrive here
+
+FATAL:	MOVEM	17,FATACS+17	; save all ACs
+	MOVEI	17,FATACS
+	BLT	17,FATACS+16
+	MOVE	17,FATACS+17
+	EMSG <>
+	CALL	ERROUT
+	TMSG <, >
+	MOVE	T,(P)		; get PC
+	MOVE	T,-2(T)		; get instruction which lost
+	CALL	SYMOUT
+	TMSG < at PC >
+	POP	P,T
+	MOVEI	T,-2(T)		; point PC at actual location of the JSYS
+	CALL	SYMOUT
+	CALL	CRLF
+DEATH:	DO.
+	 HALTF%			; non-continuable TMODEM exit point
+	 EMSG <Can't continue>
+	 LOOP.
+	ENDDO.
+
+
+;  Clever symbol table lookup routine.  For details, read "Introduction to
+; DECSYSTEM-20 Assembly Language Programming", by Ralph Gorin, published by
+; Digital Press, 1981.  Called with desired symbol in F.
+
+SYMOUT:	SETZB	C,E		; no current program name or best symbol
+	MOVE	D,.JBSYM	; symbol table pointer
+	HLRO	A,D
+	SUB	D,A		; -count,,ending address +1
+	DO.
+	 LDB	A,[POINT 4,-2(D),3]	; symbol type
+	 IFN.	A		; program names are uninteresting
+	  CAILE A,2		; 0=prog name, 1=global, 2=local
+	 ANSKP.
+	  MOVE	A,-1(D)		; value of the symbol
+	  CAME	A,T		; exact match?
+	  IFSKP.
+	   MOVE	E,D		; yes, select it
+	   EXIT.
+	  ENDIF.
+	  CAML	A,T		; smaller than value sought?
+	 ANSKP.
+	  SKIPE	B,E		; get best one so far if there is one
+	   CAML A,-1(B)		; compare to previous best
+	    MOVE E,D		; current symbol is best match so far
+	 ENDIF.
+	 ADD	D,[2000000-2]	; add 2 in the left, sub 2 in the right
+	 JUMPL	D,TOP.		; loop unless control count is exhausted
+	ENDDO.
+	IFN. E			; did we have anything that could help?
+	 MOVE	B,T		; yes, get desired value
+	 SUB	B,-1(E)		; less symbol's value = offset
+	 CAIL	B,200		; is offset small enough?
+	ANSKP.
+	 MOVE	A,-2(E)		; symbol name
+	 TXZ	A,<MASKB 0,3>	; clear flags
+	 CALL	SQZTYO		; print symbol name
+	 SUB	T,-1(E)		; value we wanted less this symbol's value
+	 JUMPE	T,R		; if no offset, don't print "+0"
+	 MOVX	A,"+"		; add + to the output line
+	 PBOUT%
+	ENDIF.
+	MOVE	B,T		; and copy numeric offset to output
+	jrst	OUT8		; getting the offset first...
+
+
+; Convert a 32-bit quantity in A from squoze to ASCII
+
+SQZTYO:	IDIVI	A,50		; divide by 50
+	PUSH	P,B		; save remainder, a character
+	SKIPE	A		; if A is now zero, unwind the stack
+	 CALL	SQZTYO		; call self again, reduce A
+	POP	P,A		; get character
+	ADJBP	A,[POINT 7,[ASCII/ 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ.$%/],6]
+	LDB	A,A		; convert squoze code to ASCII
+	PBOUT%
+	RET
+
+	SUBTTL Other randomness
+
+; Constants
+
+...VAR:!VAR			; generate variables (there shouldn't be any)
+IFN .-...VAR,<.FATAL Variables can't be in this program>
+...LIT:	XLIST			; save trees during LIT
+	LIT			; generate literals
+	LIST
+
+	END	<EVECL,,EVEC>

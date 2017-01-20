@@ -1,0 +1,2254 @@
+%TITLE 'I N D E X  -- IDX file routines'
+!<BLF/REQUIRE 'RMSBLF.REQ'>
+MODULE INDEX (IDENT = '2.0'
+		) =
+BEGIN
+!
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1977, 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+
+!++
+! FACILITY:	RMS
+!
+! ABSTRACT:
+!
+!	This module contains all routine which traverse and modify
+!	the index structure of an RMS-36 indexed file.
+!
+! ENVIRONMENT:	User mode, no interrupts
+!
+! AUTHOR: S. Blount , CREATION DATE: 27-Oct-1976
+!
+! MODIFIED BY:
+!
+!	Ron Lusk, 24-May-82 : VERSION 1
+! 01	- (SB) Release bucket if GTBKTPTR fails
+! 02	- (SB) Changes for locking
+! 03	- (SB) Make INSRTIREC release index bucket if no high-key
+! 04	- (SB) Fix bug in SPTINDEX re: loc of split
+! 05	- (SB) Don't insert new idx rec if old key same as new hi-key
+! 06	- (SB) Add call to ADJIPTR if key of hi-key rec NEQ index key
+! 07	- (SB) Fix bug in GTBKTPTR on getting wrong bktsize when going to data
+! 08	- (SB) Bug in INSRTIREC if 3-bucket split with NOHIKEY set
+! 09	- (SB) Check for FLGHIKEY in SINDEXBKT (SIXBIT keys)
+! 10	- (SB) Move HIKEY flag to new rec on INSRTIREC
+! 11	- (SB) Fix SINDEXBKT to handle <0 keys
+! 12	- (SB) Fix debug error in GTBKTPTR
+! 13	- (SB) Add big comment to IDXUPD
+! 14	- Make key comparisons work in SINDEXBKT (RMS edit 62)
+!	Ron Lusk, 21-Jun-83 : VERSION 2
+! 400	- Clean up code some more
+! 412	- Fix parameter binding in GTNBKT.
+!--
+
+!
+! TABLE OF CONTENTS
+!
+!
+!    makeirecord,		- Create an index record
+!    getroot,			- Locate, lock, map root bucket
+!    sindexbkt,			- Search bucket for key string
+!    followpath,		- Follow index to data level
+!    fndrec,			- Traverse index to any level
+!    idxupdate,			- Update the index structure
+!    gtbktptr,			- Get next bucket down in tree
+!    gtnbkt,			- Get next bucket in this level
+!    sptindex,			- Split an index bucket
+!    insrtirecord,		- Insert an index record
+!    fnddata;			- Traverse index from root to data
+!
+! INCLUDE FILES:
+!
+
+REQUIRE 'rmsreq';
+
+!
+! MACROS:
+!
+!   None.
+!
+! EQUATED SYMBOLS:
+!
+!   None.
+!
+! OWN STORAGE:
+!
+!   None.
+!
+! EXTERNAL REFERENCES:
+!
+!   None
+!
+%SBTTL 'MAKEIRECORD -- Create index record'
+
+GLOBAL ROUTINE makeirecord (bucketnumber, recordptr, keyptr) : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!	Create an index record in an indexed file.
+!
+! FORMAL PARAMETERS
+!
+!	Bucketnumber -- bucket to put in the index record
+!	Recordptr -- address to write record
+!	Keyptr -- address of key string to go in index record
+!
+! IMPLICIT INPUTS
+!
+!	Unknown.
+!
+! ROUTINE VALUE:
+!
+!	NONE.
+!
+! SIDE EFFECTS:
+!
+!	Unknown.
+!
+!--
+
+    BEGIN
+
+    MAP
+	recordptr : REF BLOCK,
+	keyptr : REF BLOCK;
+
+    TRACE ('MAKEIRECORD');
+    checkinput (bucketnumber, GTR, 0);
+    !
+    !   Store flags and bucket number
+    !
+    recordptr [irflags] = defirflags;		! Use the default
+    recordptr [irbucket] = .bucketnumber;
+    !
+    !   Now, move the string
+    !
+    recordptr = .recordptr + irhdrsize;
+    movewords (.keyptr, 			! From
+	.recordptr, 				! To
+	.kdb [kdbkszw]);			! Size
+    RETURN
+    END;					!End of MAKEIRECORD
+
+%SBTTL 'GETROOT -- get root of index'
+
+GLOBAL ROUTINE getroot (recdesc, bktdesc) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!	Routine to get the root of an index structure.  GETROOT
+!	is responsible for locating and mapping the current root
+!	of the index.  If there is not a current root, then the
+!	file prologue must be read to find the new root.
+!
+! FORMAL PARAMETERS
+!
+!	RECDESC -- address of record descriptor packet
+!	BKTDESC -- address of bucket descriptor packet
+!
+! IMPLICIT INPUTS
+!
+!	Unknown.
+!
+! COMPLETION CODES:
+!
+!	TRUE -- root found.
+!	FALSE -- error (error code in USRSTS): BUSY, NO FREE CORE AVAILABLE
+!
+! SIDE EFFECTS:
+!
+!	Unknown.
+!
+!--
+
+    BEGIN
+
+    MAP
+	bktdesc : REF BLOCK,
+	recdesc : REF BLOCK;
+
+    LOCAL
+	idbptr : REF BLOCK,			! Ptr to index descriptor
+	plogbktdesc : BLOCK [bdsize],		! Bucket desc for file prologue
+	lockfunction,				! Function code for ENQ/DEQ
+	loopcount,				! Keep track of out progress
+	bucketsize,				! Size of root bucket
+	rootbucket;				! Root bucket number
+
+    REGISTER
+	rootpointer : REF BLOCK;		! Ptr to root bucket
+
+    LITERAL
+	maxloops = 1;				! Max # of times we will loop
+
+    TRACE ('GETROOT');
+    loopcount = 0;				! Clear our loop counter
+    bucketsize = .kdb [kdbibkz];		! Get bucket size
+
+    !+
+    !   Here is the big loop. This loop is executed more
+    !   than once only if there is a root in the KDB
+    !-
+
+    repeat
+
+    						! Indefinitely
+	BEGIN
+
+	IF .loopcount GTR maxloops THEN rmsbug (msgloop);
+
+	!
+	!   Get the current bucket number
+	!
+	rootbucket = .kdb [kdbroot];
+
+	IF .rootbucket NEQ 0
+	THEN
+
+	!+
+	!	There must be an index for this key
+	!-
+
+	    BEGIN
+
+	    IF getbkt (.rootbucket, 		! Bucket
+		    .bucketsize, 		! Bucketsize
+		    false, 			! Lock
+		    .bktdesc			! Descriptor
+		) EQL false
+	    THEN
+		RETURN false;
+
+	    rootpointer = .bktdesc [bkdbktadr];	! Get address
+
+	    IF chkflag (rootpointer [bhflags], bhflgroot) NEQ 0	!
+	    THEN
+		RETURN true;			! This is the root
+
+	    !
+	    !   This bucket is no longer the root
+	    !
+	    rmsbug (msgrchanged)
+	    END;				! Of if rootbucket isnt zero
+
+	!
+	!   We must read the index descriptor in the file
+	!   prologue
+	!
+
+	IF (idbptr = getidb (plogbktdesc)) EQL false	!
+	THEN
+	    RETURN false;
+
+	!
+	!   Get the new root bucket number
+	!
+	kdb [kdbroot] = .idbptr [idbroot];
+	!
+	!   Return the prologue bucket
+	!
+	putbkt (false, 				! No update
+	    plogbktdesc);			! Bucket
+	!
+	!   Now, check if there is a root yet for this index.
+	!   There will be a valid root except where a file was
+	!   "$CREATED" without any records, and then the file
+	!   was opened for input.
+	!
+
+	IF .kdb [kdbroot] EQL 0
+	THEN
+	! There is no root
+	    BEGIN
+
+	    IF seqadr				!
+	    THEN
+		usrsts = er$eof			! We should return EOF
+	    ELSE
+		usrsts = er$rnf;		! We should return RNF
+
+	    					! (record not found)
+	    RETURN false
+	    END					! Of if there is no root
+	ELSE
+	    clrflag (kdb [kdbflags], flgnoindex);
+
+	!
+	!   Bump our loop counter and go back and try again
+	!
+	loopcount = .loopcount + 1
+	END;					! Of repeat loop
+
+    rmsbug (msgcantgethere);			! Can never execute this
+    RETURN false;
+    END;					!End of GETROOT
+
+%SBTTL 'SINDEXBKT -- search index bucket'
+
+GLOBAL ROUTINE sindexbkt (recdesc, bktdesc) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Routine to search a mapped, locked index bucket for
+!	a key string.  SINDEXBKT searches an index bucket for
+!	the index record which is greater than or equal to a
+!	specified user search key.  Both strings must be
+!	non-segmented.
+!
+! FORMAL PARAMETERS
+!
+!	RECDESC -- record descriptor packet
+!	    USERPTR -- address of search key string ( K(S) )
+!	    USERSIZE -- size of search key string
+!	    RECPTR -- address to begin search
+!		EQL ZERO ==> Start at top of bucket
+!		GTR ZERO ==> Address to start at
+!		LSS ZERO ==> Search only first record
+!	    RECPTR is modified to point to record terminating search
+!	    LASTRECPTR -- modified to point at previous record
+! 	BKTDESC -- bucket descriptor packet
+!
+! IMPLICIT INPUTS
+!
+!	Unknown.
+!
+! ROUTINE VALUE:
+!
+!	TRUE -- search terminated normally (search key is LEQ index record)
+!		FLGLSS may be set (in recdesc) if K(S) < record key
+!	FALSE -- Key string not found
+!
+! SIDE EFFECTS:
+!
+!	Unknown.
+!
+!--
+
+    BEGIN
+
+    MAP
+	recdesc : REF BLOCK,
+	bktdesc : REF BLOCK;
+
+    REGISTER
+	tempac,
+	tempac1,
+	tempac2;
+
+    LOCAL
+	endptr : REF BLOCK,			! End of bucket pointer
+	recordtocheck : REF BLOCK,		! Pointer for bucket scan
+	interval,				! 1/2 # rec's left to scan
+	bktptr : REF BLOCK,			! Pointer to top of bucket
+	firstrecord,				! Address of first record
+	words,					! Words to compare for key
+	slackbytes,				! Left-over bytes
+	bytesperword,				! # of bytes in each word
+	keybsz,					! Byte size of key
+	sizeofrecord,				! Total size of each record
+	addr1,					! Address of given key
+	addr2,					! Addr of key to compare against
+	comparesult,				! Result of last compare
+	lastlessorequal,			! Outcome of last LEQ compare
+	count,					! Keeps track of key compare
+	temp1,					! Temps used for string compare
+	temp2,
+	temp5;
+
+    TRACE ('SINDEXBKT');
+    !
+    !   Clear the LSS flag in the record descriptor
+    !
+    clrflag (recdesc [rdstatus], rdflglss);
+    !
+    !   Set up the end-of-bucket pointer
+    !
+    bktptr = .bktdesc [bkdbktadr];
+    endptr = .bktptr + .bktptr [bhnextbyte];
+    !
+    !   Check a few things
+    !
+
+    IF (.bktptr [bhthisarea] NEQ .kdb [kdbian]) OR 	!
+	(.bktptr [bhbtype] NEQ btypeindex)	! Check bucket header
+    THEN
+	BEGIN
+	fileproblem (fe$bhe);			! Bad bucket header
+	usrret ()
+	END;
+
+    !
+    !   Make sure bucket isn't empty
+    !
+
+    IF .bktptr [bhnextbyte] EQL bhhdrsize
+    THEN
+    ! No records in this bucket
+	BEGIN
+	fileproblem (fe$bem);			! Empty bucket found
+	usrret ()
+	END;
+
+    !
+    !   Compute total size of an index record
+    !
+    sizeofrecord = .kdb [kdbkszw] + irhdrsize;
+    !
+    !   Get byte size for later
+    !
+    keybsz = .kdb [kdbkbsz];
+    !
+    !   Adjust start and end of search space
+    !
+
+    IF (firstrecord = .recdesc [rdrecptr]) LEQ 0
+    THEN
+    ! Start from first record in bucket
+	BEGIN
+
+	IF .firstrecord LSS 0
+	THEN
+	! Pretend end of bucket is after first record
+	    endptr = .bktptr + bhhdrsize + .sizeofrecord;
+
+	firstrecord = .bktptr + bhhdrsize
+	END
+    ELSE
+    ! Make sure start address is in bucket
+	BEGIN
+	!   Check start address
+
+	IF .firstrecord GEQ .endptr THEN rmsbug (msginput);
+
+	END;
+
+    !
+    !   Set up first interval and initial record to check
+    !
+    interval = (.endptr - .firstrecord)/(2*.sizeofrecord);
+    recordtocheck = .interval*.sizeofrecord + .firstrecord;
+    !
+    !   Set up for key compare
+    !
+    bytesperword = 36/.keybsz;
+    words = .recdesc [rdusersize]/.bytesperword;
+    slackbytes = (.recdesc [rdusersize] MOD .bytesperword);
+    !
+    !   Get address of key we're looking for
+    !
+    addr1 = .recdesc [rduserptr];
+
+    !+
+    !   Main loop
+    !-
+
+    repeat
+
+	BEGIN
+	!
+	!   Compare strings
+	!
+	!
+	!   This is the key we're checking against this time
+	!
+	addr2 = .recordtocheck + irhdrsize;
+	lookat ('	RECORD PROBE AT: ', recordtocheck);
+
+	!+
+	!   Compare the entire index key. We will do this
+	!   by comparing each word as a unit (ignoring extra
+	!   bits in the word), and then compare the slack bytes.
+	!-
+
+	tempac = false;				! Assume no full words
+
+	IF .words GTR 0
+	THEN
+
+	!+
+	!   We must compare the whole words.  TEMPAC will be set to
+	!   true if a difference in the keys can be determined
+	!   without checking the slack bytes.
+	!-
+
+	    BEGIN
+	    comparesult = 1;			! Assume our key is GTR
+	    temp2 = POINT (.recdesc [rduserptr], 36, .bytesperword*.keybsz);
+	    temp5 = .temp2;
+	    temp5<rh> = .addr2;			! Form destination address
+	    !
+	    !   Compare the whole words in the key
+	    !
+
+	    IF cstringle (temp2, 		! Search key
+		    temp5, 			! Index key
+		    words, 			! Size
+		    words			! Size
+		) EQL false
+		!
+		!   If this failed, then our search key is GTR
+		!   than the index record key.
+		!
+	    THEN
+		tempac = true			! Exit from loop
+	    ELSE
+
+	    !+
+	    !   Our key is LEQ the index key
+	    !-
+
+		BEGIN
+		ldb (tempac1, temp2);		! Get the bytes
+		ldb (tempac2, temp5);
+		comparesult = -1;		! Assume LSS
+		tempac = (IF .tempac1		! Search key
+		    LSSU .tempac2		! Index key	!M62
+		THEN true ELSE false)
+		END;
+
+	    END;
+
+	!
+	!   Now, compare the slack bytes if there are any,
+	!   and if the word comparison was equal up to this point
+	!
+
+	IF .tempac EQL false
+	THEN
+	! We must compare the slack bytes
+	    BEGIN
+	    temp1 = POINT (.recdesc [rduserptr] + .words, 36, .slackbytes*.keybsz);
+	    temp2 = (.addr2 + .words);
+	    temp2<lh> = .temp1<lh>;
+	    !
+	    !   Load the last series of bytes as a single byte
+	    !
+	    tempac1 = scani (temp1);
+	    tempac2 = scani (temp2);
+
+	    IF .tempac1 LSSU .tempac2		!M62
+	    THEN
+		comparesult = -1
+	    ELSE
+		BEGIN
+		!
+		!   Our slack bytes were GEQ index bytes
+		!
+		comparesult = (IF .tempac1 EQL .tempac2	!
+		THEN 0				! Equal
+		ELSE 1)				! Our key is GTR
+		END
+
+	    END;				! Of compare the slack bytes
+
+	!
+	!   Was our key greater than this one?
+	!
+
+	IF .comparesult GTR 0
+	THEN
+	! Try second half of search space
+	    BEGIN
+	    ! Our key is greater
+	    rtrace (%STRING ('	RECORD PROBE EQL TOO LOW...', 	!
+		    %CHAR (13), %CHAR (10)));
+
+	    IF .recordtocheck GEQ (.endptr - .sizeofrecord)
+	    THEN
+	    ! Key isn't in bucket
+		BEGIN
+		! Bad return
+		recdesc [rdlastrecptr] = .recordtocheck;
+		recdesc [rdrecptr] = .endptr;
+		RETURN false
+		END
+	    ELSE
+		BEGIN
+		! Update
+
+		IF .interval EQL 0
+		THEN
+		! Next one must be right
+		    BEGIN
+		    recdesc [rdlastrecptr] = .recordtocheck;
+		    recdesc [rdrecptr] = .recordtocheck + .sizeofrecord;
+
+		    IF .lastlessorequal LSS 0 THEN setlssflag (recdesc);
+
+		    RETURN true
+		    END
+		ELSE
+		! We aren't finished yet
+		    BEGIN
+		    ! Adjust record and interval
+		    recordtocheck = 		!
+		    .recordtocheck + ((.interval + 1)/2)*.sizeofrecord;
+		    interval = .interval/2
+		    END
+
+		END
+
+	    END
+	ELSE
+	! Our key was less than or equal, which?
+	    BEGIN
+	    ! Less than or equal
+	    lastlessorequal = .comparesult;	! Remember for later
+
+	    IF .interval NEQ 0
+	    THEN
+	    ! We aren't through yet
+		BEGIN
+		! Adjust record and interval
+		recordtocheck = .recordtocheck - ((.interval + 1)/2)*.sizeofrecord;
+		interval = .interval/2
+		END
+	    ELSE
+	    ! Interval is 0
+		BEGIN
+		! Success with < or =
+
+		IF .recordtocheck EQL .firstrecord
+		THEN
+		    recdesc [rdlastrecptr] = .recordtocheck
+		ELSE
+		    recdesc [rdlastrecptr] = .recordtocheck - .sizeofrecord;
+
+		recdesc [rdrecptr] = .recordtocheck;
+
+		IF .comparesult LSS 0		!
+		THEN
+		    setlssflag (recdesc)	!
+		ELSE
+		    clrflag (recdesc [rdstatus], rdflglss);	!
+
+		RETURN true
+		END
+
+	    END;
+
+	END
+
+    END;					!End of SINDEXBKT
+
+%SBTTL 'FOLLOWPATH -- follow index path'
+
+GLOBAL ROUTINE followpath (recdesc, databd) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	FOLLOWPATH follows the index path from a particular
+!	starting bucket down to a specified level in the index
+!	structure.  In general, it will be called with the starting
+!	bucket being the root and will search the index and stop
+!	at the data bucket.  This routine is called only from $PUT.
+!
+! FORMAL PARAMETERS
+!
+!	RECDESC -- record descriptor packet
+!	    USERPTR -- address of search key
+!	    USERSIZE -- size of search key
+!	    RECPTR -- modified to address of data record position
+!	    LASTRECPTR -- modified to addr of prev record (if any)
+!	DATABD -- bucket descriptor of data level bucket
+!
+! IMPLICIT INPUTS
+!
+!	Unknown.
+!
+! ROUTINE VALUE:
+!
+!	TRUE -- Record position located
+!	FALSE -- Error, or Record Not Found
+!
+! SIDE EFFECTS:
+!
+!	Unknown.
+!
+! NOTES:
+!
+!	This routine attempts to recover the correct index
+!	structure when a system crash causes an "inefficient
+!	tree". This means that the key value in the index record
+!	does not reflect the highest key in the data bucket.
+!	In such a case, any attempt to locate a key which is
+!	between the highest actual key in the data bucket and
+!	what the index record key value is, must search the next
+!	bucket in the data bucket chain.  Therefore, as this
+!	routine searches down the index, it modifies the key
+!	in the index record to reflect the correct value.
+!
+!--
+
+    BEGIN
+
+    MAP
+	recdesc : REF BLOCK,
+	databd : REF BLOCK;
+
+    LOCAL
+	indexbd : BLOCK [bdsize],		! Index bucket descriptor
+	temp;
+
+    REGISTER
+	tempac;
+
+    TRACE ('FOLLOWPATH');
+    !
+    !   Fetch the root
+    !
+
+    IF getroot (.recdesc, indexbd) EQL false THEN RETURN false;
+
+    !+
+    !   Do this loop until we reach the data level
+    !-
+
+    repeat
+
+	BEGIN
+	!
+	!   Follow the path to level 0
+	!
+	recdesc [rdlevel] = datalevel;
+	recdesc [rdrecptr] = 0;			! Start at top
+
+	IF fndrec (.recdesc, indexbd, .databd) EQL false
+	    !
+	    !   Did we get down to the data?
+	    !
+	THEN
+	    RETURN false;
+
+	!
+	!   If we are data level, we can exit
+	!
+
+	IF .recdesc [rdlastlevel] EQL datalevel THEN RETURN true;
+
+	IF (emptyflag (recdesc) NEQ 0)
+	THEN
+	! We have a bad file
+	    BEGIN
+	    fileproblem (fe$bem);		! Empty bucket
+	    usrret ()
+	    END;
+
+	!
+	!   At this point, we are past the last
+	!   entry, update R(LAST) with K(S). This
+	!   situation could have been caused by a
+	!   record insertion which aborted (crash,...)
+	!   before the index was completely updated.
+	!   RMS-36 can then notice this condition and
+	!   correct it, as it is doing now.
+	!
+	movewords (.recdesc [rduserptr], 	! From
+	    .recdesc [rdlastrecptr] + irhdrsize, 	! To
+	    .kdb [kdbkszw]);			! Size
+	!
+	!   At this point, we updated the index
+	!   key part way down the tree.
+	!
+	rtrace (%STRING ('	RESTARTING FPATH...', 	!
+		%CHAR (13), %CHAR (10)))
+	END;
+
+    rmsbug (msgcantgethere);
+    RETURN false;
+    END;					! End of FOLLOWPATH
+
+%SBTTL 'FNDREC -- locate data record'
+
+GLOBAL ROUTINE fndrec (recdesc, startbd, endbd) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	FNDREC locates a data record (UDR/SIDR) by searching the index
+!	structure.  This routine begins its search at an arbitrary
+!	bucket in the index and searches downward until it reaches the
+!	desired level in the tree.  If a bucket is found with
+!	K(LAST) < K(S), then we know that there may have been a crash and
+!	the index didn't get updated fully.  In such a case, the next
+!	bucket in the chain is searched to see if K(0) in the new bucket
+!	is > K(S).  If so, we continue the operation with the current
+!	bucket.  If K(0) < K(S), we must continue the search at the top
+!	of the next bucket.
+!
+!	Whether we continue the search in the next bucket is determined
+!	by the HORIZOK bit in the record descriptor flag field.  This
+!	bit is set on a $FIND/$GET and clear on a $PUT.
+!
+! FORMAL PARAMETERS
+!
+!	RECDESC -- record descriptor packet
+!	    USERPTR -- address of search key string
+!	    USERSIZE -- size of search key string
+!	    RECPTR -- address to start search (0 = top of bucket)
+!		    Modified to address of record terminating search.
+!	    FLAGS -- flag bits
+!		HORIZOK -- horizontal search is OK
+!		PASTLAST -- may be set, even on successful exit
+!	    LASTRECPTR -- Modified to point to record before that one
+!		    which terminated search.
+!	    LASTLEVEL -- modified to last level searched.
+!	STARTBD -- bucket descriptor of starting bucket
+!	ENDBD -- bucket descriptor of ending bucket (returned)
+!
+! IMPLICIT INPUTS
+!
+!	Unknown.
+!
+! ROUTINE VALUE:
+!
+!	TRUE -- search terminated normally
+!	FALSE -- error, data bucket is busy (busy flag set)
+!
+! SIDE EFFECTS:
+!
+!	Unknown.
+!
+!--
+
+    BEGIN
+
+    MAP
+	recdesc : REF BLOCK,
+	startbd : REF BLOCK,
+	endbd : REF BLOCK;
+
+    LABEL
+	iteration;
+
+    LOCAL
+	bktno,					! Bucket to read during
+						! horizontal scan --
+						!   -1: K(S) > K(0)
+						!   0: Last bucket in chain
+						!  +n: Look here for K(0)
+	currentbktptr : REF BLOCK,		! Current bucket top
+	currentlevel,				!
+	nbp : REF BLOCK,			! Next bucket in chain
+	nextbd : BLOCK [bdsize],		! Next bucket
+	currentbucket,				! This bucket number
+	saverecptr,				! Temp storage
+	savelastrecptr,				! ...
+	savestatus,				! ...
+	targetlevel;				! Input level number
+
+    TRACE ('FNDREC');
+    !
+    !   For now, we always want to go to the data level
+    !
+    checkinput (recdesc [rdlevel], EQL, datalevel);
+    !
+    !   Make sure we do a key search
+    !
+    recdesc [rdrfa] = 0;
+    targetlevel = .recdesc [rdlevel];		! Get level #
+    !
+    !   Set up some pointers
+    !
+    currentbktptr = .startbd [bkdbktadr];
+    !
+    !   Make the input bucket the current bucket
+    !
+    movebktdesc (startbd, 			! From
+	endbd);					! To
+
+    !+
+    !   This is the big loop. It is executed once for each
+    !   level of the index that it searches.
+    !-
+
+    repeat
+
+iteration :
+	BEGIN
+	!
+	!   Get level of current bucket
+	!
+	currentbktptr = .endbd [bkdbktadr];
+	currentlevel = .currentbktptr [bhlevel];
+	!
+	!   Store this value in the record desc
+	!
+	recdesc [rdlastlevel] = .currentlevel;
+	!
+	!   Store this bucket number in the path array
+	!
+	currentbucket = .endbd [bkdbktno];
+	path [.currentlevel, pathbkt] = .currentbucket;
+	lookat ('	PREPARING TO SEARCH BKT: ', currentbucket);
+	lookat ('	AT LEVEL: ', currentlevel);
+	!
+	!   We now must search the current bucket
+	!
+
+	IF (IF .currentlevel EQL datalevel	!
+	    THEN 				! We should use the data bucket ROUTINE
+		sdatabkt (.recdesc, 		! Record descriptor
+		    .endbd)			! Bucket
+	    ELSE
+	    ! We should use the index bucket routine
+		sindexbkt (.recdesc, 		! Record descriptor
+		    .endbd)			! Bucket
+	    ) EQL false
+	    !
+	    !   What happened?
+	    !
+	THEN
+	    BEGIN
+	    !
+	    !   We did not find the record. The following
+	    !   could be the cause:
+	    !
+	    !   1. K(LAST) < K(S)
+	    !
+	    !
+	    rtrace (%STRING ('	BUCKET SEARCH FAILED...', 	!
+		    %CHAR (13), %CHAR (10)));
+	    !
+	    !   First, save the output of the search
+	    !
+	    saverecptr = .recdesc [rdrecptr];
+	    savelastrecptr = .recdesc [rdlastrecptr];
+	    savestatus = .recdesc [rdstatus];
+	    !
+	    !   Fetch the next bucket in the chain
+	    !
+	    !
+	    !   If GTNBKT returns false, then there was no
+	    !   next bucket...this situation is perfectly OK
+	    !
+
+	    IF gtnbkt (.endbd, 			! Current
+		    nextbd, 			! Next
+		    false			! No lock
+		) EQL false
+	    THEN
+		RETURN true;
+
+	    !
+	    !   We have now gotten the next bucket
+	    !   in the chain. We must check the first
+	    !   record to see if we should continue the
+	    !   search or stay with the current record.
+	    !   If HORIZOKFLAG, then the search continues regardless
+	    !   of whether K(S) > K(0). If it's off,
+	    !   implying insert mode, continue
+	    !   the search only if insert point beyond K(0).
+	    !
+
+	    IF horizokflag (recdesc) EQL 0
+	    THEN
+		repeat
+
+		    BEGIN
+		    ! compare K(S) with K(0) in the next bucket
+		    recdesc [rdrecptr] = -1;	! Flag 1 rec search
+
+		    IF .currentlevel EQL datalevel
+		    THEN
+			BEGIN
+			recdesc [rdrfa] = 0;	! Key search
+			sdatabkt (.recdesc, nextbd)
+			END
+		    ELSE
+		    !  This is an index bucket
+			sindexbkt (.recdesc, nextbd);
+
+		    !
+		    !	Is K(S) < K(0)? First, determine if key is
+		    !	there;  if not there, also check if EOF
+		    !
+		    bktno = -1;			! Presume valid entry seen
+
+		    IF pastlastflag (recdesc) NEQ 0	! Any key in bucket
+		    THEN
+			BEGIN			! No
+			nbp = .nextbd [bkdbktadr];	! Pt at bkt last read
+
+			IF chkflag (nbp [bhflags], bhflgend) EQL 0
+			THEN
+			    bktno = .nbp [bhnextbkt]	! Set bkt to read
+			ELSE
+			    bktno = 0;		! EOF
+
+			END;
+
+		    IF lssflag (recdesc) NEQ 0 OR .bktno EQL 0
+		    THEN
+
+		    !+
+		    !	Insertion point found by key comparison
+		    !	or EOF, and we should release the next
+		    !	bucket and use the old one.
+		    !-
+
+			BEGIN			!
+						!   Yes
+						!
+			rtrace (%STRING ('	K(S)<K(0)', %CHAR (13), %CHAR (10)));
+			putbkt (false, 		! No update
+			    nextbd);		! Bkt
+			!
+			!   Restore our search keys
+			!
+			recdesc [rdrecptr] = .saverecptr;
+			path [.currentlevel, pathoffset] = 	!
+			.saverecptr - .currentbktptr;
+			recdesc [rdlastrecptr] = .savelastrecptr;
+			recdesc [rdstatus] = .savestatus;
+			setpastlastflag (recdesc);
+			RETURN true;
+			END;			! of if K(S) < K(0)
+
+		    IF .bktno LSS 0 THEN EXITLOOP;	!K(S)>=K(0)
+
+		    ! No keys in bkt chained to, pick up next 1
+		    putbkt (false, 		! No update
+			nextbd);		! Bkt
+
+		    IF getbkt (.bktno, 		! Bucket to read
+			    .kdb [kdbdbkz], 	! Always data bucket
+			    false, nextbd) EQL false
+		    THEN
+			RETURN false;
+
+		    END;
+
+	    !
+	    !   No...K(S) >= K(0) or HORIZONTAL-OK flag
+	    !   was on.  We should restart
+	    !   the search at the top of next buckeT
+	    !
+	    recdesc [rdrecptr] = 0;		! Start at top
+	    putbkt (false, 			! No update
+		.endbd);			! Bucket
+	    !
+	    !   Make the next bucket the current one
+	    !
+	    movebktdesc (nextbd, 		! From
+		endbd);				! To
+	    !
+	    !   Exit from the loop and start at top again
+	    !
+	    LEAVE iteration
+	    END;
+
+	!
+	!   We have found a record with key >= K(S).
+	!
+	rtrace (%STRING ('	FOUND TARGET RECORD', %CHAR (13), %CHAR (10)));
+	!
+	!   Store the offset into the current bucket in the path array
+	!
+	path [.currentlevel, pathoffset] = .recdesc [rdrecptr] - .currentbktptr;
+	!
+	!   Is this the level we wanted?
+	!
+
+	IF .currentlevel EQL .targetlevel THEN RETURN true;
+
+%IF dbug
+%THEN
+
+	IF .currentlevel LSS .targetlevel THEN rmsbug (msglevel);
+
+%FI
+
+	!
+	!   Get the bucket at the next level in the tree
+	!
+	savestatus = gtbktptr (.recdesc, 	! Record descriptor
+	    .endbd, 				! Current bucket
+	    nextbd);				! Next bucket
+	!
+	!   We can now release the current bucket
+	!
+	putbkt (false, 				! No update
+	    .endbd);				! Bucket
+	!
+	!   If we couldn't get the next bucket, then exit
+	!
+
+	IF .savestatus EQL false THEN RETURN false;
+
+	!
+	!   Make sure we start at top of bucket
+	!
+	recdesc [rdrecptr] = 0;
+	!
+	!   Make the next bucket to be the current one
+	!
+	movebktdesc (nextbd, 			! From
+	    endbd);				! To
+	END;
+
+    rmsbug (msgcantgethere);
+    RETURN false;
+    END;					! End of FNDREC
+
+%SBTTL 'IDXUPDATE -- modify index in split'
+
+GLOBAL ROUTINE idxupdate (recdesc, databd, splitbd1, splitbd2) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!   This routine is responsible for all index modifications which
+!   must be done when a new data record insertion causes the data
+!   bucket to split.  This routine iteratively traces up the tree;
+!   then, it inserts or modifies the index records to reflect the
+!   split at the next lower level.  If this index record insertion
+!   also causes a bucket split, the procedure is repeated up until
+!   (potentially) a new root is generated.  The data bucket is not
+!   unlocked in this routine.
+!
+!   Terminology used in IDXUPDATE:
+!	R(NEW)  -- The new inserted data record
+!	R(LOW)  -- Set of records with keys < R(NEW)
+!	R(HIGH) -- Set of records with keys > R(NEW)
+!	K(HIGH) -- New high key for original bucket which split
+!
+! FORMAL PARAMETERS
+!
+!   RECDESC -- record descriptor
+!	LASTRECPTR -- points to last data record (K(HIGH)) of original bucket
+!	USERPTR -- pointer to user key string
+!	USERSIZE -- full key string size
+!   DATABD -- bucket descriptor of original data bucket
+!   SPLITBD1 -- bucket descriptor of split-bucket (contains R(HIGH))
+!   SPLITBD2 -- bucket descriptor of second split-bucket (if 3-way split)
+!
+! IMPLICIT INPUTS
+!
+!	Unknown.
+!
+! ROUTINE VALUE:
+!
+!   TRUE -- OK
+!   FALSE -- error, no pages left for split of index
+!
+! SIDE EFFECTS:
+!
+!	Unknown
+!
+! NOTES:
+!
+!	1.	See the notes under "INSRTIRECORD" for a discussion
+!		of the placement of the new high-key value for
+!		a bucket split.
+!
+!	2.	Note that the bucket which contains R-HIGH (SPLITBD1)
+!		has already been released when this routine is entered.
+!		Thus, only the bucket number is used from the bucket
+!		descriptor...the actual bucket itself must not be
+!		accessed in any way.
+!
+!	3.	There are three conditions which may arise when the index
+!		record is checked in this routine:
+!
+!		a) the search key (of new record) is LSS the key of the
+!			index record. this is by far the usual case.
+!		b) the search key is EQL to index key. This is caused by
+!			a split of a bucket with a lot of a single dup key.
+!			Thus, the old bucket still has a dup for the hi-key
+!			and the new bucket contains only the same dup keys.
+!		b) the search key is GTR the index key. this is very
+!			unusual and is caused when the bucket which is being
+!			split is not the same data bucket found when the search
+!			terminated at the data level (e.g., a series of dups
+!			had to be passed to get to the insertion point).
+!			In this case, we really need to be at the index record
+!			which reflect the new hi-key value of the split bucket.
+!			Thus, we will call ADJIPTR to find the new index record.
+!--
+
+    BEGIN
+
+    MAP
+	recdesc : REF BLOCK,
+	databd : REF BLOCK,
+	splitbd1 : REF BLOCK,
+	splitbd2 : REF BLOCK;
+
+    LOCAL
+	indexbd : BLOCK [bdsize],		! Root bucket descriptor
+	arrayindex,				! Used to index into path
+	nextindexbucket,			! Next bucket to get
+	indexbucketsize,
+	originalbd : BLOCK [bdsize],
+	irecordptr : REF BLOCK,			! Ptr to current index record
+	saveduserptr,				! Temp storage for search key
+	bktonnextlevel;
+
+    TRACE ('IDXUPDATE');
+    !
+    !   Move the bucket descriptor so it won't get clobbered
+    !
+    movebktdesc (databd, 			! From
+	originalbd);				! To
+    indexbucketsize = .kdb [kdbibkz];		! Save time later
+
+    !+
+    !   We are currently positioned at level 1 of the index.
+    !   We will continue to insert index records until either
+    !   we reach the root of no index bucket splitting occurs.
+    !
+    !   We have the following values:
+    !
+    !   1.	ORIGINALBD	bucket which was split
+    !   2.	SPLITBD1	bucket which contains R(HIGH)
+    !   3.	SPLITBD2	bucket which contains R(NEW)
+    !                (Only if data is splitting and was 3-bucket split)
+    !   4.	INDEXBD		index bucket which will contain
+    !                               the new record
+    !
+    !
+    !-
+
+    !
+
+    !   Start at level 1
+    !
+    arrayindex = seqsetlevel;
+
+    !+
+    !   This is the main index update loop
+    !-
+
+    UNTIL idxupdateflag (recdesc) EQL 0 DO
+	BEGIN
+	!
+	!   Get the bucket directly above us
+	!
+	bktonnextlevel = .path [.arrayindex, pathbkt];
+
+	!+
+	!   Locate the bucket
+	!-
+
+	IF getbkt (.bktonnextlevel, 		! Bucket #
+		.indexbucketsize, 		! Size
+		false, 				! No lock
+		indexbd				! Bucket
+	    ) EQL false
+	    !
+	    !   Did we get it?
+	    !
+	THEN
+	    RETURN false;
+
+	!+
+	!   At this point, we have mapped in the next higher
+	!   bucket in the index structure. We can now compute the
+	!   address of the index entry which got us to the
+	!   current level because we have the bucket offset
+	!   stored in the path array.
+	!-
+
+	irecordptr = (recdesc [rdrecptr] = .path [.arrayindex, pathoffset] + .indexbd [bkdbktadr]);
+
+	!+
+	!   We now must determine if we should, in fact, actually
+	!   insert a new index record. We don't want to do this if
+	!   the old index key is the same as the new high-key value
+	!   in the bucket which split. Such a case could be caused
+	!   by a series of dups which got moved to a new bucket.
+	!-
+
+	saveduserptr = .recdesc [rduserptr];	! Save key ptr
+	recdesc [rduserptr] = .rst [rstkeybuff] + (.fst [fstkbfsize]/2);
+	irecordptr = .irecordptr + irhdrsize;	! Bump pointer to index key
+	!
+	!   Compare the index key to the new high key
+	!
+
+	IF ckeykk (.recdesc, 			! New high key
+		.irecordptr			! Index key
+	    ) EQL false
+	    !
+	    !   If we fail, it means there was a key in the bucket
+	    !   which was gtr than the index key. This is caused by
+	    !   a split in a data bucket which was not the first bucket
+	    !   searched when the record position was initially located.
+	    !
+
+	    !++
+	    !   ***** NOTE *****
+	    !   This entire operation of comparing the key of the
+	    !   old index record to the new hi-key of the data bucket
+	    !   which was split is necessary if bucket splits can be
+	    !   anywhere in the bucket, regardless of whether there
+	    !   are duplicates present or not. However, the bucket
+	    !   split algorithm currrently (MAY, 1977) divides the
+	    !   bucket either before or after the inserted record if
+	    !   duplicates are allowed (primary only). Thus, it is
+	    !   impossible for a bucket to be split if that bucket is
+	    !   <<<not>>> the bucket where the index search terminated
+	    !   (i.e., it is not in a list of buckets which are not
+	    !   contained in the index). Therefore, this next check
+	    !   will never be executed. The code is left in for
+	    !   reliability and documentation.
+	    !--
+
+	THEN
+	    adjiptr (.recdesc, indexbd)
+	ELSE
+	! The hi-key is .leq. the index key
+	    BEGIN
+	    !
+	    !   If the less-than flag is on, we are ok
+	    !
+
+	    IF lssflag (recdesc) EQL 0
+	    THEN
+		BEGIN
+		putbkt (false, 			! No
+		    indexbd);			! Bucket
+		RETURN true
+		END
+
+	    END;
+
+	recdesc [rduserptr] = .saveduserptr;	! Restore ptr
+
+	!+
+	!   At this point, RECPTR points to the place to insert
+	!   the new index record. We will insert it and
+	!   INSERTIRECORD will return updated bucket descriptors
+	!   if a further index update is needed.
+	!-
+
+	IF insrtirecord (.recdesc, 		! Record descriptor
+		indexbd, 			! Bucket
+		originalbd, 			! Old bucket
+		.splitbd1, 			! Split
+		.splitbd2			! Split
+	    ) EQL false
+	    !
+	    !   What happened?
+	    !
+	THEN
+	    RETURN false;
+
+	!
+	!   Bump the level number that we are at
+	!
+	arrayindex = .arrayindex + 1;
+	END;
+
+    !
+    !   At this point, we have done all our updating
+    !
+    RETURN true
+    END;					! End of IDXUPDATE
+
+%SBTTL 'GTBKTPTR -- get next bucket down'
+
+GLOBAL ROUTINE gtbktptr (recdesc, thisbd, nextbd) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       GTBKTPTR gets the next bucket downward in th index.  It assumes
+!       that we are positioned at the current index record, fetches the
+!       bucket number of the next bucket in the index and maps it in.
+!
+! FORMAL PARAMETERS
+!
+!       RECDESC -- record descriptor
+!           RECPTR -- address of index record
+!       THISBD -- bucket descriptor of current bucket
+!       NEXTBD -- bucket descriptor of next bucket (returned)
+!
+! IMPLICIT INPUTS
+!
+!	Unknown.
+!
+! ROUTINE VALUE:
+!
+!       TRUE -- bucket found and mapped
+!       FALSE -- error, no more memory
+!
+! SIDE EFFECTS:
+!
+!	Unknown.
+!
+!
+! NOTES:
+!
+!	This routine will never lock any buckets, either
+!	index or data.
+!
+!--
+
+    BEGIN
+
+    MAP
+	recdesc : REF BLOCK,
+	thisbd : REF BLOCK,
+	nextbd : REF BLOCK;
+
+    REGISTER
+	acptr : REF BLOCK;
+
+    LOCAL
+	nextbucket,				! Next bucket in the index
+	lockflag,				! Tells if we will lock it
+	bucketsize;
+
+    TRACE ('GTBKTPTR');
+    !
+    !   Find out the bucket number we need to get
+    !
+    acptr = .recdesc [rdrecptr];
+    nextbucket = .acptr [irbucket];
+    !
+    !   Find out the level of this bucket
+    !
+    acptr = .thisbd [bkdbktadr];
+    bucketsize = .kdb [kdbibkz];		! Assume index
+    lockflag = false;				! Same
+
+    IF .acptr [bhlevel] EQL seqsetlevel
+    THEN
+    ! We are going to data level
+	bucketsize = .kdb [kdbdbkz];
+
+    !
+    !   Get the bucket and return
+    !
+    RETURN getbkt (.nextbucket, 		! Number
+	    .bucketsize, 			! Size
+	    .lockflag, 				! Lock
+	    .nextbd);				! Desc
+    END;					! End of GTBKTPTR
+
+%SBTTL 'GTNBKT -- get next bucket in chain'
+
+GLOBAL ROUTINE gtnbkt (thisbd, nextbd, lockflag) =	!		!M412
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	GTNBKT fetches the next bucket in the horizontal chain of
+!	the current level of the index structure.  If there is
+!	a next bucket, this routine will map and, if it is a
+!	data bucket, will lock it.  If there is no next bucket,
+!	GTNBKT returns with an error condition.
+!
+! FORMAL PARAMETERS
+!
+!	THISBD -- bucket descriptor of current bucket
+!	NEXTBD -- bucket descriptor of next bucket (returned)
+!	LOCKFLAG -- flag to determine if we should lock next bucket
+!
+! IMPLICIT INPUTS
+!
+!	Unknown.
+!
+! ROUTINE VALUE:
+!
+!	TRUE -- OK
+!	FALSE -- error
+!		 bucket was busy (busy flag will be set)
+!		 no next bucket
+!
+! SIDE EFFECTS:
+!
+!	Unknown.
+!
+!--
+
+    BEGIN
+
+!   BIND					! Delete binding	!D412
+!	lockflag = .p_lockflag;			! ...			!D412
+
+    MAP
+	thisbd : REF BLOCK,
+	nextbd : REF BLOCK;
+
+    LOCAL
+	thisbktptr : REF BLOCK,			! Bucket pointer
+	savedstatus,				! Results of GETBKT here
+	nextbucket,				! Number of next bucket
+	bucketsize;				! Size of next bucket
+
+    TRACE ('GTNBKT');
+    !
+    !   Get a pointer to the current bucket
+    !
+    thisbktptr = .thisbd [bkdbktadr];
+    !
+    !   Is this the end of the bucket chain?
+    !
+
+    IF chkflag (thisbktptr [bhflags], bhflgend) NEQ 0	!
+    THEN
+    ! This is the end
+	RETURN false;
+
+    !
+    !   There is another bucket in the chain...find it
+    !
+    nextbucket = .thisbktptr [bhnextbkt];
+    bucketsize = .kdb [kdbibkz];		! Same
+
+    IF .thisbktptr [bhbtype] EQL btypedata THEN bucketsize = .kdb [kdbdbkz];
+
+    !
+    !   Map (and lock) the bucket
+    !
+    RETURN getbkt (.nextbucket, 		! Bucket
+	    .bucketsize, 			! Size
+	    .lockflag, 				! Lock
+	    .nextbd);				! Next-bucket descriptor
+    END;					! End of GTNBKT
+
+%SBTTL 'SPTINDEX -- split index bucket'
+
+GLOBAL ROUTINE sptindex (recdesc, indexbd, newindexbd) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	SPTINDEX splits an index bucket during a record insertion.
+!	This routine takes the current index bucket and splits
+!	the records in it into two groups.  One group of records
+!	is moved to a new bucket;  the other group remains in
+!	this bucket.
+!
+! FORMAL PARAMETERS
+!
+!	RECDESC -- record descriptor packet
+!	    RECPTR -- address in index bucket to insert record;
+!		    modified to point to address to insert new records
+!	    LENGTH -- amount of space required for new index records
+!	    LASTRECPTR -- address of last record in index bucket which split
+!	INDEXBD -- bucket descriptor of index bucket to be split.
+!	NEXINDEXBD -- bucket descriptor of new index bucket (returned)
+!
+! IMPLICIT INPUTS
+!
+!	Unknown.
+!
+! ROUTINE VALUE:
+!
+!	TRUE -- OK
+!	FALSE - Error
+!		No more buckets
+!
+! SIDE EFFECTS:
+!
+!	Unknown.
+!
+! NOTES:
+!
+!   1.	This routine only splits the index bucket.  It does not leave
+!	room for the index record, nor does it adjust the next byte
+!	pointer of the bucket to account for the index record which is
+!	to be inserted.
+!
+!   2.	This routine does not move the key of the last record in the
+!	old bucket because the key-buffer currently contains the new
+!	high-key value of the next lower level.
+!
+!   3.	The algorithm for splitting an index bucket is very similat
+!	to the same algorithm for splitting a data bucket.  That is,
+!	the new record(s) is placed with R(LOW) if possible, and as
+!	many R(HIGH) records as will fit will also stay in the old
+!	bucket.  If the nrew record(s) will not fit with R(LOW), then
+!	it is moved to the new bucket completely with R(HIGH).  This
+!	algorithm has the effect that inserting records at the bottom
+!	of the bucket will tend to fill the old bucket more than the
+!	new bucket.  The alternative, however, is backward scanning of
+!	the index records in R(LOW) in order to maximize precisely the
+!	split location.  Such a technique is not judged to be worth the
+!	extra manipulations required to support it.  Note that this
+!	algorithm assumes that at least three index records will fit
+!	in an index bucket.  If this ever becomes not true, then
+!	extra machinations will be required by this routine.
+!
+!--
+
+    BEGIN
+
+    MAP
+	recdesc : REF BLOCK,
+	indexbd : REF BLOCK,
+	newindexbd : REF BLOCK;
+
+    LOCAL
+	totalsize,				! Space needed for new records
+	sizeofidxrecord,			! Size of one index record
+	amounttomove,				! Amount of stuff to move out
+	thislevel,				! Level of this index bucket
+	bktflags,				! Flags of current index bkt
+	newbucket,				! Bkt # of new index bkt
+	nextfreebyte,				! Temp
+	sizelow,				! Size of R(LOW) records
+	spaceneeded,				! Size of new record(s)
+	amountofdata,				! Amount of record space used up
+	maxdatasize,				! Max space available in empty bkt
+	oldindexptr : REF BLOCK,		! Ptr to old index bkt
+	endptr : REF BLOCK,			! Ptr to end of bucket
+	newindexptr : REF BLOCK;		! Ptr to new index bkt
+
+    REGISTER
+	tptr : REF BLOCK,			! Temp pointer
+	splitptr : REF BLOCK,			! Ptr to place to split
+	insertptr : REF BLOCK;			! Place to insert record
+
+    TRACE ('SPTINDEX');
+    !
+    !   Get the flags and level number of current bucket
+    !
+    oldindexptr = .indexbd [bkdbktadr];
+    thislevel = .oldindexptr [bhlevel];
+    bktflags = .oldindexptr [bhflags] AND bhflgend;	! Leave end bit
+    nextfreebyte = .oldindexptr [bhnextbyte];
+    !
+    !   Allocate a new index bucket
+    !
+
+    IF alcbkt (btypeindex, 			! Type
+	    .bktflags, 				! Flags
+	    .thislevel, 			! Level
+	    .newindexbd				! Bucket
+	) EQL false
+	!
+	!   Could we do it?
+	!
+    THEN
+	RETURN false;
+
+    !
+    !   Get ptr to the new bucket
+    !
+    newindexptr = .newindexbd [bkdbktadr];
+
+    !+
+    !   We must now compute how much of this bucket should be
+    !   moved to the new bucket. The algorithm is described
+    !   above
+    !-
+
+    !
+
+    !   Compute total size of an index record
+    !
+    sizeofidxrecord = .kdb [kdbkszw] + irhdrsize;
+    lookat ('	SIZE-OF-REC: ', sizeofidxrecord);
+    !
+    !   Now, we need to figure out how we want to split this bucket
+    !
+    insertptr = .recdesc [rdrecptr];		! Start at insertion point
+    sizelow = .insertptr - .oldindexptr - bhhdrsize;	! Size of R(LOW)
+    lookat ('	SIZE-LOW: ', sizelow);
+    spaceneeded = .recdesc [rdlength];		! Space we need
+    maxdatasize = .kdb [kdbibkz]^b2w;		! Space we have
+    !
+    !   If the user specified his own load fills, we must use
+    !   them.
+    !
+
+    IF chkflag (rab [rabrop, 0], roploa) NEQ 0 THEN maxdatasize = .kdb [kdbifloffset];
+
+    maxdatasize = .maxdatasize - bhhdrsize;	! Account for header
+    lookat ('	MAX-DATA-SIZE: ', maxdatasize);
+    splitptr = .insertptr;			! Assume split here
+    !
+    !   Can we fit the new record(s) with R(LOW)?
+    !
+
+    IF (.sizelow + .spaceneeded) LEQ .maxdatasize
+    THEN
+    ! The new idx record will go with R(LOW)
+	BEGIN
+	rtrace (%STRING ('	Index record stays with R-LOW...', 	!
+		%CHAR (13), %CHAR (10)));
+	sizelow = .sizelow + .spaceneeded;	! Bump counter
+	!
+	!   Loop over all the records from here down and
+	!   keep as many of them as possible (until we go
+	!   over one-half of the bucket).
+	!
+	amountofdata = .oldindexptr [bhnextbyte] - bhhdrsize + .spaceneeded;
+
+	UNTIL .sizelow GTR (.amountofdata^divideby2lsh) DO
+	    BEGIN
+	    splitptr = .splitptr + .sizeofidxrecord;
+	    sizelow = .sizelow + .sizeofidxrecord;	! Bump counter
+	    lookat ('	Bump SPLITPTR to: ', splitptr);
+	    lookat ('	Bump SIZELOW to: ', sizelow);
+	    END
+
+	END
+    ELSE
+    ! The new record must be moved out with R(HIGH)
+	insertptr = .newindexptr + bhhdrsize;	! Reset pointer
+
+    !
+    !   Figure out how much must go
+    !
+    amounttomove = .oldindexptr [bhnextbyte] + .oldindexptr - .splitptr;
+    lookat ('	AMT-TO-MOVE:', amounttomove);
+
+%IF dbug
+%THEN
+
+    IF .amounttomove LSS 0 THEN rmsbug (msgcount);
+
+%FI
+
+    !
+    !   Move the bottom of the index out
+    !
+
+    IF .amounttomove NEQ 0
+    THEN
+	movewords (.splitptr, 			! From
+	    .newindexptr + bhhdrsize, 		! To
+	    .amounttomove);			! Size
+
+    						!
+    !   Reset bucket header data
+    !
+    oldindexptr [bhnextbyte] = .oldindexptr [bhnextbyte] - .amounttomove;
+    newindexptr [bhnextbyte] = bhhdrsize + .amounttomove;
+    newindexptr [bhnextbkt] = .oldindexptr [bhnextbkt];
+    oldindexptr [bhnextbkt] = .newindexbd [bkdbktno];
+    clrflag (oldindexptr [bhflags], bhflgend);	! Clear end flag
+    !
+    !   Let's see the new headers
+    !
+
+%IF dbug
+%THEN
+    bugout (%STRING ('DUMP OF OLD BKT HEADER: ', %CHAR (13), %CHAR (10)));
+    dumpheader (.oldindexptr);
+    bugout (%STRING ('DUMP OF NEW INDEX BKT HDR:', %CHAR (13), %CHAR (10)));
+    dumpheader (.newindexptr);
+%FI
+
+    !
+    !   Reset the address where the new record will go
+    !
+    recdesc [rdrecptr] = .insertptr;
+    RETURN true
+    END;					! End of SPTINDEX
+
+%SBTTL 'INSRTIRECORD -- insert new record'
+
+GLOBAL ROUTINE insrtirecord (			! Insert new record
+    recdesc, indexbd, originalbd, splitbd1, splitbd2) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	INSRTIRECORD inserts a new record into an index bucket.
+!	It is called when either an index or a data bucket has split
+!	and we need to create a new index entry for the split bucket.
+!
+! FORMAL PARAMETERS
+!
+!	RECDESC -- record descriptor packet
+!	    RECPTR -- address where new record is to be inserted
+!	    USERPTR -- address of search key
+!	    USERSIZE -- size of search key
+!	    COUNT -- number of new buckets in the split (1 for index,
+!		    1 or two for data)
+!	INDEXBD -- bucket descriptor for index bucket
+!	ORIGINALBD -- bucket descriptor of bucket which split;
+!		modified to contain same data as INDEXBD
+!	SPLITBD1 -- bucket descriptor of new bucket # 1
+!	SPLITBD2 -- bucket descriptor of new bucket # 2
+!
+! IMPLICIT INPUTS
+!
+!	Unknown.
+!
+! ROUTINE VALUE:
+!
+!	TRUE -- index update OK
+!	FALSE - error
+!		Couldn't modify index
+!
+! SIDE EFFECTS:
+!
+!	Unknown
+!
+! NOTES:
+!
+!   1.	Data splits may involve 2 extra buckets, index splits require
+!	only 1 extra bucket.
+!
+!   2.	On output, the input bucket descriptor of the ORIGINALBD
+!	(the bucket that split)  and SPLITBD1 (the newly allocated
+!	bucket)  will be modified to reflect the index bucket and any
+!	newly allocated index bucket.  Thus, this routine modifies
+!	the input args so as to set up for the next call upon itself.
+!
+!   3.	On input to this routine, the new high-key value for the bucket
+!	which split is contained in the bottom half of the RST key buffer.
+!	However, if the bucket which split now contains only RRV records,
+!	then a new index record need not be created.  This condition is
+!	indicated by the "HOHIKEY" flag being set.  If so, we only
+!	need to change the old index entry to point to the
+!	new (i.e., split) bucket.  This action has the important
+!	effect of removing a bucket which contains only RRV's from
+!	the vertical tree path.
+!
+!   4.	All index buckets are written out in this routine.
+!
+!--
+
+    BEGIN
+
+    MAP
+	recdesc : REF BLOCK,
+	indexbd : REF BLOCK,
+	originalbd : REF BLOCK,
+	splitbd1 : REF BLOCK,
+	splitbd2 : REF BLOCK;
+
+    REGISTER
+	tempac,
+	ptrac : REF BLOCK,			! Temporary pointer
+	oldirecordptr : REF BLOCK;
+
+    LOCAL
+	insertptr : REF BLOCK,			! Address to insert record
+	oldibktptr : REF BLOCK,			! Original index bucket
+	newhighkeyptr : REF BLOCK,		! Ptr to new high-key
+	totalsize,				! Amount of space needed
+	splitflag,				! On if we need to split
+	bucketsize,				! Size in words of a bucket
+	maxoffset,				! Max offset into bkt before we split
+	rootsplitflag,				! On if we split the root
+	noofidxrecords,				! Number of index records to create
+	freespace,				! Free space left in this buckt
+	topofindexptr : REF BLOCK,		! Ptr to top of current bucket
+	sizeofidxrecord,			! Guess
+	keystringptr : REF BLOCK,		! Ptr to key string
+	buckettoindex,				! Bucket number to put in index
+	keysizeinwords,
+	newindexbd : BLOCK [bdsize];		! Desc for new index bucket
+
+    TRACE ('INSRTIRECORD');
+    !
+    !   Assume we won't split the index
+    !
+    rootsplitflag = false;
+    splitflag = false;
+    noofidxrecords = .recdesc [rdcount];	! Get # of split buckets
+    keysizeinwords = .kdb [kdbkszw];
+    !
+    !   Check some more input values
+    !
+    checkinput (recdesc [rdcount], GTR, 0);
+    checkinput (recdesc [rdcount], LEQ, 2);
+    !
+    !   Get the address of the current index record
+    !
+    oldirecordptr = .recdesc [rdrecptr];
+    !
+    !   Get a pointer to the bottom half of the key-buffer (which
+    !   contains the new high-key value for the split bucket)
+    !
+    newhighkeyptr = .rst [rstkeybuff] + (.fst [fstkbfsize]/2);
+    !
+    !   Assume that we won't need any further splits
+    !
+    clrflag (recdesc [rdstatus], rdflgidxupdate);
+    !
+    !   Compute size of an index record
+    !
+    sizeofidxrecord = .keysizeinwords + irhdrsize;
+    !
+    !   Calculate how much space we need and how much we have
+    !
+    totalsize = .sizeofidxrecord*.noofidxrecords;
+    !
+    !   Find the location where we will attempt to place
+    !   the new index record (just beyond the old index record)
+    !
+    insertptr = .oldirecordptr + .sizeofidxrecord;
+    !
+    !   If there is no high-key record in the original bucket,
+    !   just change the existing index record to point to the
+    !   new bucket
+    !
+
+    IF (chkflag (recdesc [rdstatus], rdflgnohikey) NEQ 0)
+    THEN
+	BEGIN
+	rtrace (%STRING ('	NO HI-KEY FOUND', %CHAR (13), %CHAR (10)));
+	oldirecordptr [irbucket] = .splitbd1 [bkdbktno];
+	!
+	!   Adjust the amount of space we will need
+	!
+	totalsize = .totalsize - .sizeofidxrecord;
+	!
+	!   Insert new index record before old one
+	!
+	insertptr = .insertptr - .sizeofidxrecord;
+	!
+	!   If this is a 2-bucket split (normal case), we can exit
+	!
+
+	IF .noofidxrecords EQL 1
+	THEN
+	! Just release the bucket
+	    BEGIN
+	    putbkt (nohikeyupdflag, 		! Update
+		.indexbd);
+	    RETURN true				! Exit OK
+	    END
+
+	END;
+
+    !
+    !   More pointers
+    !
+    oldibktptr = (topofindexptr = .indexbd [bkdbktadr]);
+    !
+    !   We now need to determine the point at which we
+    !   should consider the bucket to be full. If user
+    !   fill percentages are being used, then we use his
+    !   fill offset value; otherwise, we use the end of the
+    !   bucket as the limiting factor
+    !
+    maxoffset = (bucketsize = .kdb [kdbibkz]^b2w);
+
+    IF (chkflag (rab [rabrop, 0], roploa) NEQ 0)
+    THEN
+    ! The user wants to define a "full" bucket
+	maxoffset = .kdb [kdbifloffset];
+
+    lookat ('	MAXOFFSET: ', maxoffset);
+    !
+    !   Is this bucket full?
+    !
+
+    IF (.oldibktptr [bhnextbyte] + .totalsize) GEQ .maxoffset
+    THEN
+    ! We need to split
+	BEGIN
+	splitflag = true;
+	rtrace (%STRING ('	SPLITTING THE INDEX...', %CHAR (13), %CHAR (10)));
+	recdesc [rdlength] = .totalsize;	! Total space we need
+	recdesc [rdrecptr] = .insertptr;	! Insert new rec here
+
+	IF sptindex (.recdesc, 			! Record descriptor
+		.indexbd, 			! Index
+		newindexbd			! New
+	    ) EQL false
+	THEN
+	    RETURN false;
+
+	!
+	!   If the root split, we must remember it
+	!
+
+	IF (chkflag (topofindexptr [bhflags], bhflgroot) NEQ 0)	!
+	THEN
+	    rootsplitflag = true;
+
+	!
+	!   Now, is the new record going to go into the
+	!   new bucket?
+	!
+
+	IF .insertptr NEQ (tempac = .recdesc [rdrecptr])
+	THEN
+	! The new record goes in new bucket
+	    BEGIN
+	    insertptr = .tempac;
+	    topofindexptr = .newindexbd [bkdbktadr]
+	    END;
+
+	!
+	!   Check that there is enough room to
+	!   write the records
+	!
+	freespace = (.bucketsize) - .topofindexptr [bhnextbyte];
+
+	IF .totalsize GTR .freespace THEN rmsbug (msgnospace)
+
+	END;
+
+    !+
+    !   At this point, we can more the records down and
+    !   insert the new index records. We have the following:
+    !
+    !   KEYBUFFER	Contains new high key value
+    !   INSERTPTR	Ptr to point at which
+    !                   insert is to be done
+    !   OLDIRECORDPTR	Ptr to the old index record whose
+    !                   key value we must change
+    !   TOPOFINDEXPTR	Ptr to top of bkt in which we will
+    !                   insert new index record
+    !
+    !-
+
+    !
+
+    !   Compute the end of the bucket address and check
+    !   to see if there are any index records we must move down
+    !
+    rtrace (%STRING ('	MOVING IDX RECS DOWN...', %CHAR (13), %CHAR (10)));
+    ptrac = .topofindexptr + .topofindexptr [bhnextbyte];
+    lookat ('	PTRAC: ', ptrac);
+
+    IF .ptrac NEQ .insertptr
+    THEN
+	movedown (.insertptr, 			! From
+	    .ptrac - 1, 			! To
+	    .totalsize				! Size
+	);					!
+
+    !   If this is a 3-bucket split, create an index record
+    !   for the record R(NEW)
+    !
+
+    IF .noofidxrecords EQL 2
+    THEN
+	BEGIN
+	rtrace (%STRING ('	CREATING IDX REC FOR R-NEW...', %CHAR (13), %CHAR (10)));
+	keystringptr = .recdesc [rduserptr];
+	buckettoindex = .splitbd2 [bkdbktno];
+	!
+	!   Make the index record
+	!
+	makeirecord (.buckettoindex, 		! Bucket
+	    .insertptr, 			! At
+	    .keystringptr);			! Key
+	!
+	!   Bump the insertptr over this index record
+	!
+	insertptr = .insertptr + .sizeofidxrecord;
+	lookat ('	INSERTPTR after creating R-NEW index record: ', 	!
+	    insertptr)
+	END;					! Of if this was a 3-bkt split
+
+    !
+    !   We must now create an index record for the new bucket
+    !   which contains R(HIGH). This index record will consist of
+    !   its bucket and the key string in the original index
+    !   record. Note that in the unusual case that there was a 3-bkt split
+    !   and the "NOHIKEY" flag was set, then we don't want to
+    !   do all this (if the NOHIKEY flag is set at this point,
+    !   it must be a 3-bkt split since we would have exited earlier
+    !   if this had been a normal split)
+    !
+
+    IF (chkflag (recdesc [rdstatus], rdflgnohikey) EQL 0)
+    THEN
+	BEGIN
+	buckettoindex = .splitbd1 [bkdbktno];	! Get bucket number
+	keystringptr = .oldirecordptr + irhdrsize;
+	makeirecord (.buckettoindex, 		! Bkt
+	    .insertptr, 			! At
+	    .keystringptr);			! Key
+	!
+	!   We have now created all index records. we must
+	!   reset the value of the key in the old index record
+	!
+	movewords (.newhighkeyptr, 		! From
+	    .oldirecordptr + irhdrsize, 	! To
+	    .keysizeinwords);			! Size
+	!
+	!   Clear the old "HIKEY" flag and set it in the
+	!   new index record if it is already set in the
+	!   old one
+	!
+	insertptr [irflags] = .oldirecordptr [irflags];
+	oldirecordptr [irflags] = defirflags
+	END;					! Of if nohikey is off
+
+    !
+    !   Bump the end-of-bucket pointer in the bucket header
+    !
+    topofindexptr [bhnextbyte] = .topofindexptr [bhnextbyte] + .totalsize;
+    !
+    !   We must now check to see if we split the root. If so,
+    !   we must allocate a new root bucket that contains an index
+    !   record for each of the two new index buckets. Note that
+    !   the allocation of the new root should be done before
+    !   the old root is written out (below). This is so that,
+    !   at worst, some extra index records will exist in the
+    !   old root (if a crash occured after the new root
+    !   has been written but before the old root can be
+    !   written to the file).  If the old root were written first,
+    !   the potential would exist for the loss of 1/2 of the data
+    !   records in the file because the old root would contain
+    !   only half of its former entries.  Also, the root bit
+    !   would be off so we could never locate the true index root.
+    !
+
+    IF .rootsplitflag NEQ false
+    THEN
+    ! We must allocate a new root
+	BEGIN
+	rtrace (%STRING ('	ALLOCATING NEW ROOT...', %CHAR (13), %CHAR (10)));
+	RETURN makroot (.indexbd, 		! Bkt
+		newindexbd)			! Bkt-2
+	END;					! Of if rootsplitflag is on
+
+    !
+    !   If we split the index in order to add the new index
+    !   record, we must write out that bucket and set up the
+    !   new high-key value in the key buffer
+    !
+
+    IF .splitflag
+    THEN
+	BEGIN
+	!
+	!   Find the last index record in the old index
+	!   bucket and move its key into the bottom of the
+	!   user's key buffer.
+	!
+	ptrac = .rst [rstkeybuff] + (.fst [fstkbfsize]/2);
+	newhighkeyptr = .oldibktptr + .oldibktptr [bhnextbyte] - .keysizeinwords;
+	lookat ('	MOVING NEW HIGH-KEY AT: ', newhighkeyptr);
+	movewords (.newhighkeyptr, 		! From
+	    .ptrac, 				! To
+	    .keysizeinwords);			! Size
+	!
+	!   Now, write the new bucket out
+	!
+	putbkt (true, 				! Update it
+	    newindexbd)				! Bucket
+	END;					! Of if .splitflag
+
+    !
+    !   We now need to write out the index bucket into which
+    !   we tried to insert the new index record
+    !
+    putbkt (true, 				! Update
+	.indexbd);				! Bucket
+    !
+    !   If we split, we must modify the input args to
+    !   reflect what we've done so we can be called again
+    !   easily. Note that this implies that when the data
+    !   bucket descriptor is passed to this routine, it
+    !   must also be passed in a temp because it will be
+    !   destroyed.
+    !
+
+    IF .splitflag EQL false THEN RETURN true;	! No more splits needed
+
+    setflag (recdesc [rdstatus], rdflgidxupdate);
+    !
+    !   Reset the number of buckets in the split so we won't
+    !   screw up if we come back to this routine again
+    !
+    recdesc [rdcount] = 1;
+    movebktdesc (indexbd, 			! From
+	originalbd);				! To
+    !
+    !   Make the new bucket the split bucket
+    !
+    movebktdesc (newindexbd, 			! From
+	splitbd1);				! To
+    RETURN true
+    END;					! End of INSRTIRECORD
+
+%SBTTL 'FNDDATA -- get to data level'
+
+GLOBAL ROUTINE fnddata (recdesc, databd) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	FNDDATA traverses the entire index structure from the
+!	root bucket to the data level.  This routine simply locates
+!	the root, then calls fndrec to travel to the data level.
+!	The index bucket will be released regardless of whether
+!	there was an error or not during the index search.
+!	If this routine returns success, then the data bucket
+!	is mapped and locked;  if not successful, then no buckets
+!	are mapped and locked.
+!
+! FORMAL PARAMETERS
+!
+!	RECDESC -- record descriptor packet
+!	    USERPTR -- address of search key
+!	    USERSIZE  -- size of search key
+!	DATABD -- bucket descriptor of data level (returned)
+!
+! IMPLICIT INPUTS
+!
+!	Unknown.
+!
+! ROUTINE VALUE:
+!
+!	TRUE -- data level reached, record position found
+!	FALSE - error
+!		Tree error
+!		Data busy (busy flag will be set)
+!
+! SIDE EFFECTS:
+!
+!	Unknown.
+!
+!--
+
+    BEGIN
+
+    MAP
+	recdesc : REF BLOCK,
+	databd : REF BLOCK;
+
+    LOCAL
+	indexbd : BLOCK [bdsize];		! Bkt descriptor for index
+
+    REGISTER
+	savedstatus;
+
+    TRACE ('FNDDATA');
+    !
+    !   Fetch the root
+    !
+
+    IF getroot (.recdesc, indexbd) EQL false THEN RETURN false;
+
+    !
+    !   Start search at top and go to data level
+    !
+    recdesc [rdrecptr] = 0;
+    recdesc [rdlevel] = datalevel;		! Go to data
+    RETURN fndrec (.recdesc, indexbd, .databd)
+	!
+	!   Return the result of the search
+	!
+    END;					! End of FNDDATA
+
+END						! End of Module INDEX
+
+ELUDOM
+   

@@ -1,0 +1,3424 @@
+%TITLE 'L O A D E R  - RMSLOD loading routines'
+!<BLF/REQUIRE 'RMSBLF.REQ'>
+MODULE loader (IDENT = '1'
+		) =
+BEGIN
+!
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1984, 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+!++
+! FACILITY:	RMSLOD
+!
+! ABSTRACT:
+!
+!	LOADER contains the routines which take an input file (specified
+!	by a FAB) and an empty RMS indexed file (again, a FAB) and yield
+!	a loaded RMS indexed file.  The file fill limits will be observed,
+!	allowing both efficient reading and efficient writing.  LOADER may
+!	call SORT if secondary keys are present.
+!
+! ENVIRONMENT:	User mode, but probably as a Dynamic Library eventually.
+!
+! AUTHOR: Ron Lusk , CREATION DATE: 30-Aug-84
+!
+! MODIFIED BY:
+!
+!	, : VERSION
+! 01	-
+!       20-Sep-85 asp - Cleanup after Ron's departure to the seminary.
+!--
+
+!
+! TABLE OF CONTENTS
+!
+
+FORWARD ROUTINE
+    lodlod,					! Internal loading entry point
+    print_stats,				! Print out statistics
+    rmslod,					! External call entry point
+    do_load,					! Called by both entry points
+    get_pid,					! Return a PID from the system
+    init_rms_blocks,				! Isolated to keep it clean
+    cleanup,					! Close files
+    brfile,					! Build an RMS file
+    bldidx,					! Build one index of the file
+    primary_index,				! Build the primary index
+    do_udrs,					! Create user data records
+    do_data_bucket,				! Allocate a data bucket
+    extract_secondary_key,			! Extract keys from UDR
+    do_idr,					! Make an index record
+    do_index_bucket,				! Allocate an index bucket
+    secondary_index,				! Build an alternate index
+    sort_tag_file,				! Sort the extracted keys
+    generate_tag_file_name,			! Name a tag file uniquely
+    do_sidrs,					! Create all SIDR records
+    do_rfa,					! Handle duplicate keys
+    create_tag_file,				! Make file for extracted keys
+    open_key_file,				! Prepare sorted key file
+    read_data,					! Read a primary input record
+    read_key_file,				! Read the sorted key file
+    sec_xcp_rec,				! Process a duplicate alt. key
+    do_xcp_rec,					! Process an illegal UDR
+    do_mrg_rec,					! Process an out-of-order UDR
+    lodinp,					! Read data internally
+    rmserr,					! RMS error signaller
+    utlerr,					! $UTLINT error signaller
+    lodhdl;					! Condition handler
+
+!
+! INCLUDE FILES:
+!
+
+LIBRARY 'rmssys';
+
+LIBRARY 'bli:tops20';
+
+LIBRARY 'bli:xport';
+
+LIBRARY 'bli:fao';
+
+LIBRARY 'utllib';
+
+!
+! MACROS:
+!
+
+KEYWORDMACRO
+    $signal_error (
+	    status_code = 0,			! Default to generalized error
+	    control,				! FAO control string
+	    p1 = 0,
+	    p2 = 0,
+	    p3 = 0,
+	    p4 = 0,
+	    p5 = 0,
+	    p6 = 0 ) =
+	BEGIN
+	LOCAL
+	    faoprms : VECTOR [5];
+	!
+	!   Set up parameters
+	!
+	faoprms [0] = (p1);
+	faoprms [1] = (p2);
+	faoprms [2] = (p3);
+	faoprms [3] = (p4);
+	faoprms [4] = (p5);
+	!
+	!   Signal the error
+	!
+	SIGNAL ((status_code), $fao_ctl (control), faoprms)
+	END %;
+
+MACRO
+    $trace [] = %,
+!	BEGIN
+!	IF .typeout
+!	THEN
+!	    psout ($stptr (' * * * >', %REMAINING, %CHAR(13,10)));
+!	END %,
+    $tracei [] = %,
+!	BEGIN
+!	IF .typeout
+!	THEN
+!	    psout ($stptr ('--->    ', %REMAINING, %CHAR(13,10)));
+!	END %,
+    $traceo [] = %;
+!	BEGIN
+!	IF .typeout
+!	THEN
+!	    psout ($stptr ('    <---', %REMAINING, %CHAR(13,10)));
+!	END %;
+
+MACRO
+    $copy_words ($$from, $$to, $$length) =
+	BEGIN
+
+	BUILTIN
+	    machop;
+
+	LITERAL
+	    $xblt_opcode = %O'020',
+	    $extend_opcode = %O'123';
+
+	BIND
+	    extinst = UPLIT ($xblt_opcode^27);
+
+	REGISTER
+	    R1 = 1,
+	    R2 = 2,
+	    R3 = 3;
+
+	R1 = ($$length);			! Length in words
+	R2 = ($$from);				! Source
+	R3 = ($$to);				! Destination
+	machop ($extend_opcode, R1, extinst);	! Move the data
+	R1 = .R1;				! Dummy move
+	R2 = .R2;				! ...
+	R3 = .R3;				! ...
+	END %,
+    !
+    !	Generate a pointer to a literal string
+    !
+    $stptr [] =
+ CH$PTR (UPLIT (%ASCIZ %STRING (%REMAINING))) %,
+    !
+    !	Move a bucket descriptor from one place to another swiftly
+    !
+    $move_bucket_descriptor (xfrom, xto) =
+    BEGIN
+    BUILTIN
+    	machop;
+    REGISTER
+	R1 = 1,
+	R2 = 2;
+    BIND
+	xx$$from = (xfrom),
+	xx$$to = (xto);
+    R1 = 0;					! Dummy
+    R2 = 0;					! ...
+    $dmove (R1, xx$$from);			! Fetch descriptor
+    $dmovem (R1, xx$$to);			! Store it away
+    R1 = .R2;					! Dummy 
+    END %;
+
+!+
+!   $LOD_TAG_RECORD defines a buffer, the first word of which
+!   is the RFA of a UDR, the remaining words contain a secondary
+!   key of that UDR.  The TAG_RECORD is written to a tag file.
+!-
+
+FIELD
+    tag$r_fields =
+	SET
+	tag$g_rfa = [0, 0, 36, 0],		! RFA of key
+	tag$t_key = [1, 0, 0, 0]		! Beginning of key
+	TES;
+
+LITERAL
+    tag$k_bln = rms$k_max_key_words + 1;
+
+MACRO
+    $lod_tag_record =
+ BLOCK [tag$k_bln] FIELD (tag$r_fields) %;
+
+!+
+!   $LOD_INPUT_DESCRIPTOR is the descriptor of the input
+!   record returned by the record input routine (whether
+!   RMSLOD's internal routine or a user routine) which
+!   specifies the record's address, length in bytes, and
+!   length in words.
+!-
+
+FIELD
+    inp$r_fields = 				! Input record descriptor
+	SET
+	inp$h_bytes = [0, 0, 18, 0],		! Length in bytes
+	inp$h_words = [0, 18, 18, 0],		! Length in words
+	inp$a_section = [1, 18, 18, 0],		! Data's section
+	inp$a_address = [1, 0, 18, 0],		! Data's in-section address
+	inp$a_data = [1, 0, 36, 0]		! Address of data
+	TES;
+
+LITERAL
+    inp$k_bln = 2;
+
+MACRO
+    $lod_input_descriptor =
+ BLOCK [inp$k_bln] FIELD (inp$r_fields) %;
+
+!
+! EQUATED SYMBOLS:
+!
+
+BIND
+    work_area = CH$PTR (UPLIT (%ASCIZ'LOD$WORK'));	! Logical name
+
+BIND
+    xcp$t_too_big = $fao_ctl (			!
+	    'XCP record !SL (input record !SL) rejected because !/', 	!
+	    '!_record size (!SL) is greater than maximum allowed (!SL)!/'),
+    xcp$t_too_small = $fao_ctl (		!
+	    'XCP record !SL (input record !SL) rejected because !/', 	!
+	    '!_record size (!SL) is less than minimum required (!SL)!/'),
+    xcp$t_not_mrs = $fao_ctl (			!
+	    'XCP record !SL (input record !SL) rejected because !/', 	!
+	    '!_record size (!SL) does not equal fixed record size (!SL)!/'),
+    xcp$t_illegal_dup = $fao_ctl (		!
+	    'XCP record !SL (input record !SL) rejected because !/', 	!
+	    '!_duplicate primary keys are not allowed!/'),
+    xcp$t_ill_sec_dup = $fao_ctl ('XCP record !SL rejected because !/', 	!
+	    '!_duplicate keys not permitted for key !SL!/');
+
+LITERAL
+    lod$_success = 1,
+    lod$_no_data = 2,
+    lod$_bug = 0,
+    lod$k_inbuf_count = 5,			! Input buffers to use
+    input_buffer_length = %O'2000',		! Big (but dynamic!)
+    list_buffer_length = 300/5,			! 300 characters across
+    fname_buffer_length = 90/5,			! 90 characters across
+    srtcmd_buffer_length = 132/5,		! 132 characters across
+    key_buffer_length = rms$k_max_key_words;
+
+!
+! OWN STORAGE:
+!
+
+OWN
+    lodsec,					! Section we're in
+    rmssec,					! Section RMS is in
+    usrsec,					! Section caller is in
+    !
+    !   I/O structures
+    !
+    infab : REF $fab_decl,			! Input FAB
+    inrab : $rab_decl,				! Input RAB
+    outfab : REF $fab_decl,			! Output FAB
+    outrab : $rab_decl,				! Output RAB
+    xcp_fab : $fab_decl,			! Exception record FAB
+    xcp_rab : $rab_decl,			!     "       "    RAB
+    mrg_fab : $fab_decl,			! Out-of-order record FAB
+    mrg_rab : $rab_decl,			!      "         "    RAB
+    lst_fab : $fab_decl,			! Listing file FAB
+    lst_rab : $rab_decl,			!    "     "   RAB
+    ttyfab : $fab_decl,				! TTY output FAB
+    ttyrab : $rab_decl,				!  "    "    RAB
+    input_rtn,					! Input routine address
+    error_rtn,					! User error routine
+    in_rec : $lod_input_descriptor,		! Describes input
+    !
+    !   Tag file structures
+    !
+    tag_fab : VECTOR [rms$k_max_keys],		! Pointers to tag FABs
+    tag_rab : VECTOR [rms$k_max_keys],		! Pointers to tag RABs
+    tag_record : $lod_tag_record,		! Tag record buffer
+    key_fab : $fab_decl,			! For reading tag files
+    key_rab : $rab_decl,			! ...
+    !
+    !   Record counters
+    !
+    input_count,				! Records read
+    loaded_count,				! Records in output file
+    mrg_count,					! Records loaded later
+    xcp_count,					! Error records
+    !
+    !   Flags, etc.
+    !
+    print_messages : VOLATILE,			! For error handler
+    typeout : INITIAL (0),			! For debugging
+    eof,					! End of File flag
+    secondary_dup,				! If newkey EQL oldkey
+    tag_file_created : BITVECTOR [rms$k_max_keys + 1],	! Set if opened
+    !
+    !   Conversion factors and other odd storage
+    !
+    inpbpw,					! Input bytes-per-word
+    outbpw,					! Output bytes-per-word
+    idrlen,					! Set as each key processed
+    sidrlen,					! SIDR length (hdr+key,no RFA)
+    minimum_data_size,				! Minimum legal record length
+    number_of_keys,				! Keys in file
+    udr_header_length,				! Fix=2, Var=3
+    udr_length,					! Total length of UDR
+    output_bytes,				! Converted from input bytes
+    rfa : $rms_rfa,				! Current RFA
+    pid,					! PID of this process
+    !
+    !   Buffers and pointers
+    !
+    input_buffer : REF VECTOR [input_buffer_length],	! Dynamically allocated
+    key_buffer : VECTOR [key_buffer_length],	! Current key here
+    hikey_buffer : VECTOR [key_buffer_length],	! HIKEY for this index here
+    key_ptr,					! Pointer to key buffer
+    !
+    !	Arguments for calls to FAO
+    !
+    control,					! Address of control string
+    faoprm : VECTOR [15],			! Parm-list for $FAOL calls
+    !
+    !	Buffer variables for the LIS file
+    !
+    lstlen,					! Length of output
+    lstbuf : VECTOR [list_buffer_length],	! List file buffer
+    lstdsc : $str_descriptor (class = fixed, 	! Buffer descriptor for
+	    string = (list_buffer_length*5, 	! error listing
+	    CH$PTR (lstbuf))),			!
+    !
+    !	Buffer variables for building filenames
+    !
+    fn_buf : VECTOR [fname_buffer_length],	! Tag file name buffer
+    fn_dsc : $str_descriptor (class = fixed, 	! Buffer descriptor for
+	    string = (fname_buffer_length*5, 	! tag-file name
+	    CH$PTR (fn_buf))),			!
+    !
+    !	Buffer variables for building the commands for SORT
+    !
+    srtbuf : VECTOR [srtcmd_buffer_length],	! SORT command buffer
+    srtdsc : $str_descriptor (class = fixed, 	! Buffer descriptor for
+	    string = (srtcmd_buffer_length*5, 	! SORT command
+	    CH$PTR (srtbuf))),			!
+    srtlen,					! Length of SORT command
+    srtsts,					! Status returned from SORT
+    !
+    !	Buffer variables for TTY: output
+    !
+    ttylen,					! Length of output
+    ttybuf : VECTOR [list_buffer_length],	! TTY: buffer
+    ttydsc : $str_descriptor (class = fixed, 	! Buffer descriptor for
+	    string = (list_buffer_length*5, 	! TTY:
+	    CH$PTR (ttybuf))),			!
+    !
+    !	Buffer variables for the error handler;
+    !	FAB and RAB, too
+    !
+    errctl,					! FAO control string
+    errprm : VECTOR [4],			! FAO parameters
+    errbuf : VECTOR [list_buffer_length],	! Same purpose, same size
+    errfab : $fab (fna = 'TTY:', fac = put),
+    errrab : $rab (fab = errfab, ubf = errbuf),
+    errdsc : $str_descriptor (			! Buffer descriptor for
+	    string = (list_buffer_length*5, 	!   errors
+	    CH$PTR (errbuf))),			! ...
+    errlen,					! Length of FAO output
+    !
+    !   Internal RMS structures
+    !
+    kdb : REF $rms_kdb,				! Current KDB
+    !
+    !   Variables indexed by number of level in index
+    !
+    curbkt : BLOCKVECTOR [rms$k_max_levels, bkt$k_bln]	!
+	FIELD (bkt$r_fields),			! Current bucket on level
+    lstbkt : BLOCKVECTOR [rms$k_max_levels, bkt$k_bln]	!
+	FIELD (bkt$r_fields),			! Previous bucket on level
+    nxtrec : VECTOR [rms$k_max_levels],		! Next record location
+    currec : VECTOR [rms$k_max_levels],		! This record location
+    freespace : VECTOR [rms$k_max_levels];	! Space left in bucket
+
+!
+! EXTERNAL REFERENCES:
+!
+
+EXTERNAL LITERAL
+    ss$unw;					! Condition value for CHF
+
+EXTERNAL ROUTINE
+    mapit,					! Jump to extended addressing
+    demap,					! Come back to section 0
+    freexabs,					! Free dynamic XABs
+    sort : FORTRAN_SUB,				! SORT interface
+    getmem,					! Get some memory
+    fremem;					! Free some memory
+
+%SBTTL 'Routine LODLOD'
+
+GLOBAL ROUTINE lodlod (p_infab, p_outfab) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	LODLOD is the internal routine which calls the
+!	RMSLOD Load routines.  It enables a condition
+!	handler, sets up parameters into own storage,
+!	and then calls DO_LOAD.  At the end of all
+!	things, it then prints out statistics for
+!	the current run.
+!
+! FORMAL PARAMETERS
+!
+!	P_INFAB	    - input FAB for file to be read
+!	P_OUTFAB    - output FAB describing file to be built
+!
+! IMPLICIT INPUTS
+!
+!	None I can think of
+!
+! ROUTINE VALUE:
+!
+!	LOD$_SUCCESS	- successful operation
+!	LOD$_BUG	- internal error
+!
+! SIDE EFFECTS:
+!
+!	Statistics are printed out
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	lodsts;					! Status of LODLOD call
+
+    !
+    !   Set up the parameters so that they are
+    !	available throughout DO_LOAD.
+    !
+    infab = .p_infab;				! INFAB for DO_LOAD
+    outfab = .p_outfab;				! OUTFAB
+    input_rtn = 0;				! Input routine (may be 0)
+    error_rtn = 0;				! Error record routine
+    !
+    !	Put us into a non-zero section
+    !
+    sdvec ($fhslf, 0);				! Clear section 0 RMS
+    mapit ();					! Map us to section 1
+    $init;					! Get extended RMS
+    !
+    !	What sections do we and RMS occupy, respectively?
+    !
+    BEGIN
+
+    BUILTIN
+	machop;
+
+    REGISTER
+	R1;
+
+    $xmovei (R1, %O'20');			! Will get us section number
+    lodsec = .R1;				! Get the address
+    lodsec<0, 18> = 0;				! Leave the section number
+    END;
+    !
+    !	Get RMS's section
+    !
+    BEGIN
+
+    LOCAL
+	ev_length,				! Length of Entry Vector
+	ev_address;				! Address of EV
+
+    xgsev_ ($xsevd^18 or $fhslf;		! Get the entry vector
+	ev_length, ev_address);			! ...
+    rmssec = .ev_address<18, 11>^18;		! Get the section number
+    END;
+    usrsec = 0;					! No user section
+    !
+    !	Set up a FAB/RAB combo to write to the user.
+    !
+    $fab_init (fab = ttyfab, fac = put, fna = 'TTY:');
+    $rab_init (rab = ttyrab, fab = ttyfab, ubf = ttybuf, rbf = ttybuf);
+    $open (fab = ttyfab);
+    $connect (rab = ttyrab);
+    !
+    !	Because we are running interactively, we
+    !	can print messages to the user.
+    !
+    print_messages = 1;
+    !
+    !	We are in non-zero space, have our section numbers,
+    !	and have moved the parameters around.  Let us hope
+    !	that that is enough and load the file.
+    !
+    lodsts = do_load ();			! Load the file proper
+    !
+    !	Check the status anyway
+    !
+
+    SELECTONE .lodsts OF 			! Check status
+	SET
+
+	[lod$_success] :
+	    BEGIN
+	    print_stats ();			! Let the user know how he did
+	    $close (fab = ttyfab);		! Close the TTY:
+	    demap ();				! Back to section 0
+	    freexabs (.outfab [fab$a_xab]);	! Free our XABs
+	    RETURN lod$_success;		! And we shall succeed as well
+	    END;
+
+	[lod$_no_data] :
+	    BEGIN
+	    !
+	    !	Put out an informatory message
+	    !
+	    control = $fao_ctl ('!/[No valid input data was found]!/');
+	    $faol (ctrstr = .control, outlen = ttylen, 	! Format it
+		outbuf = ttydsc, prmlst = 0);
+	    ttyrab [rab$h_rsz] = .ttylen;	! Set record length
+	    $put (rab = ttyrab);
+	    !
+	    !	Undo things
+	    !
+	    $close (fab = ttyfab);		! Close error reporting
+	    demap ();				! Back to section 0
+	    freexabs (.outfab [fab$a_xab]);	! Free our XABs
+	    RETURN lod$_success;		! We did OK
+	    END;
+
+	[lod$_bug] :
+	    BEGIN
+	    !
+	    !	Undo things
+	    !
+	    $close (fab = ttyfab);
+	    demap ();				! Back to section 0
+	    freexabs (.outfab [fab$a_xab]);	! Free our XABs
+	    RETURN lod$_bug;			! Return error
+	    END;
+	TES;
+
+    1
+    END;					! End of LODLOD
+
+%SBTTL 'Routine RMSLOD'
+
+GLOBAL ROUTINE rmslod (p_infab, p_outfab, p_input_rtn, p_error_rtn) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	RMSLOD is the Dynamic Library interface to the
+!	RMSLOD Load routines.  It enables a condition
+!	handler, sets up parameters into OWN storage,
+!	and then calls DO_LOAD.
+!
+! FORMAL PARAMETERS
+!
+!	P_INFAB	    - input FAB for file to be read
+!	P_OUTFAB    - output FAB describing file to be built
+!	P_INPUT_RTN - address of the user's input routine
+!	P_ERROR_RTN - address of routine to call if error occurs
+!
+! IMPLICIT INPUTS
+!
+!	None I can think of
+!
+! ROUTINE VALUE:
+!
+!	LOD$_SUCCESS	- successful operation
+!	LOD$_BUG	- internal error
+!
+! SIDE EFFECTS:
+!
+!	N
+!--
+
+    BEGIN
+    !
+    !	Start immediately by checking our section number.
+    !	We must be in a non-zero section if this routine
+    !	has been called.
+    !
+    BEGIN
+
+    BUILTIN
+	machop;
+
+    REGISTER
+	R1;
+
+    $xmovei (R1, %O'20');			! Will get us section number
+    lodsec = .R1;				! Get the address
+    lodsec<0, 18> = 0;				! Leave the section number
+    END;
+
+    IF .lodsec EQL 0				! Section zero?
+    THEN
+	RETURN 0;				! Horrid failure
+
+    !
+    !   Set up the parameters so that they are
+    !	available throughout DO_LOAD.
+    !
+    infab = .p_infab;				! INFAB for DO_LOAD
+    outfab = .p_outfab;				! OUTFAB
+    input_rtn = .p_input_rtn;			! Input routine (may be 0)
+    error_rtn = .p_error_rtn;			! Error record routine
+    $init;					! Get extended RMS
+    !
+    !	What section does RMS occupy?
+    !
+    BEGIN
+
+    LOCAL
+	ev_length,				! Length of Entry Vector
+	ev_address;				! Address of EV
+
+    xgsev_ ($xsevd; ev_length, ev_address);	! Get the entry vector
+    rmssec = .ev_address<18, 11>^18;		! Get the section number
+    END;
+    !
+    !	Get the user's section number
+    !
+    usrsec = .p_input_rtn;			! Use user's routine as guide
+    usrsec<0, 18> = 0;
+    print_messages = 0;				! No output allowed
+    !
+    !	We are in non-zero space, have our section numbers,
+    !	and have moved the parameters around.  Let us hope
+    !	that that is enough and load the file.
+    !
+    RETURN do_load ();				! Load the file proper
+    END;					! End of RMSLOD
+
+%SBTTL 'Routine PRINT_STATS'
+ROUTINE print_stats =
+    BEGIN
+    !
+    !   Write out the final statistics
+    !
+    control = $fao_ctl ('!/!7SL input record!%S read!/');
+    faoprm [0] = .input_count;
+    $faol (ctrstr = .control, outbuf = ttydsc, 	!
+	prmlst = faoprm, outlen = ttylen);
+    ttyrab [rab$h_rsz] = .ttylen;		! Length of output
+    ttyrab [rab$a_rbf] = ttybuf;		! Address of data
+    $put (rab = ttyrab);
+    control = $fao_ctl ('!7SL record!%S loaded into file!/');
+    faoprm [0] = .loaded_count;
+    $faol (ctrstr = .control, outbuf = ttydsc, 	!
+	prmlst = faoprm, outlen = ttylen);
+    ttyrab [rab$h_rsz] = .ttylen;		! Length of output
+    ttyrab [rab$a_rbf] = ttybuf;		! Address of data
+    $put (rab = ttyrab);
+
+    IF .mrg_count NEQ 0				! Print only if some merged
+    THEN
+	BEGIN
+	control = $fao_ctl ('!7SL out-of-order record!%S merged into file!/');
+	faoprm [0] = .mrg_count;
+	$faol (ctrstr = .control, outbuf = ttydsc, 	!
+	    prmlst = faoprm, outlen = ttylen);
+	ttyrab [rab$h_rsz] = .ttylen;		! Length of output
+	ttyrab [rab$a_rbf] = ttybuf;		! Address of data
+	$put (rab = ttyrab);
+	END;
+
+    IF .xcp_count NEQ 0				! Only if we have some
+    THEN
+	BEGIN
+	control = $fao_ctl ('!7SL error record!%S written to XCP file!/', 	!
+	    '!_!_(See RMSLOD.LIS for error information)!/');
+	faoprm [0] = .xcp_count;
+	$faol (ctrstr = .control, outbuf = ttydsc, 	!
+	    prmlst = faoprm, outlen = ttylen);
+	ttyrab [rab$h_rsz] = .ttylen;		! Length of output
+	ttyrab [rab$a_rbf] = ttybuf;		! Address of data
+	$put (rab = ttyrab);
+	END;
+
+    RETURN lod$_success;
+    END;					! End of PRINT_STATS
+%SBTTL 'Routine DO_LOAD'
+
+GLOBAL ROUTINE do_load =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       RMSLOD zeroes the several record counters; clears
+!       the EOF flag; and checks for the presence of input
+!       data, issuing an error message if there are no
+!       valid input records.  If there is valid input data,
+!       DO_LOAD calls BRFILE to do the heavy work.
+!
+! FORMAL PARAMETERS
+!
+!
+!       INPUT_FAB	- address of FAB for input file,
+!        		  or 0 if "release load" being done.
+!       OUTPUT_FAB	- address of FAB for skeleton index
+!        		  file; any existing file will be
+!        		  superseded.
+!       INPUT_ROUTINE	- for "release load": this is caller's
+!        		  routine, which is called to fill
+!        		  our record buffer, rather than
+!        		  using INPUT_FAB, etc.
+!
+!
+! IMPLICIT INPUTS
+!
+!	EOF	- end of current file (primary input file,
+!		  in this case); used to check for existence
+!		  of valid data in input file.
+!
+! ROUTINE VALUE:
+!
+!	LOD$_SUCCESS	- normal termination
+!	LOD$_NO_DATA	- no input data
+!	LOD$_BUG	- internal error
+!
+! SIDE EFFECTS:
+!
+!	INPUT_COUNT, LOADED_COUNT, MRG_COUNT, XCP_COUNT all
+!	initially set to zero; reflect appropriate values on
+!	return.  Data file read to EOF on return; loaded
+!	RMS indexed file exists.
+!
+!--
+
+    BEGIN
+
+    ENABLE
+	lodhdl (print_messages);
+
+    $tracei ('DO_LOAD');
+    !
+    !	Initialize EOF
+    !
+    eof = false;
+    !
+    !	Get our PID
+    !
+    pid = get_pid ();
+
+    !+
+    !	Open the MRG, XCP, and LST files
+    !-
+
+    init_rms_blocks ();				! Set up FABs, RABs
+    $create (fab = mrg_fab, err = rmserr);
+    $connect (rab = mrg_rab, err = rmserr);
+    $create (fab = xcp_fab, err = rmserr);
+    $connect (rab = xcp_rab, err = rmserr);
+    $create (fab = lst_fab, err = rmserr);
+    $connect (rab = lst_rab, err = rmserr);
+    !
+    !	Zero the several record counters.
+    !
+    input_count = loaded_count = mrg_count = xcp_count = 0;
+    !
+    !	Allocate the buffer we need
+    !
+    input_buffer = getmem (input_buffer_length);
+    !
+    !   Open the input file, if one exists.
+    !
+
+    IF .input_rtn EQL 0				! No user input routine?
+    THEN
+	BEGIN
+	$open (fab = .infab, err = rmserr);	! Open the input file
+	$rab_init (rab = inrab, rac = seq, fab = .infab, 	!
+	    rop =  rah, mbf = lod$k_inbuf_count, ! 8/5/85 asp
+	    ubf = (.lodsec OR .input_buffer), usz = input_buffer_length);
+	$connect (rab = inrab, err = rmserr);	! Create record stream
+	END
+    ELSE
+	BEGIN
+
+	IF .infab EQL 0				! No input FAB
+	THEN
+	    RETURN $signal_error (		! We need more data
+		    status_code = lod$_bug, 	! Input fab needed
+		    control = '?No input FAB provided');
+
+	END;
+
+    !
+    !   Create the output file
+    !
+    outfab [fab$v_sup] = 1;			! Supersede existing file
+    $create (fab = .outfab, err = rmserr);	! Create file
+    $rab_init (rab = outrab, rac = key, 	! Keyed output
+	rop = loa, fab = .outfab, 		! Load limits
+	ubf = (.lodsec OR .input_buffer), 	! Our buffer (not much used)
+	usz = input_buffer_length);		! ...
+    $connect (rab = outrab, err = rmserr);	! Connect a record stream
+    !
+    !   Set up the bytes-per-word for
+    !   both input and output files
+    !
+    inpbpw = 36/.infab [fab$v_bsz];
+    outbpw = 36/.outfab [fab$v_bsz];
+    !
+    !   Set up the UTLINT environment
+    !
+    $utl_setenv (rab = .lodsec OR outrab, 	! Always returns TRUE
+	error = utlerr);			! ...we hope
+    !
+    !   Set up the minimum data record length, etc.
+    !
+    kdb = $utl_getkdb (key_of_reference = 0, error = utlerr);
+
+    IF .kdb EQL 0				! Failure
+    THEN
+	RETURN $signal_error (status_code = lod$_bug, 	!
+		control = '?Cannot get KDB 0 for output file !J!/', 	!
+		p1 = .outfab [fab$h_jfn]);
+
+    kdb = .rmssec OR .kdb;			! Cross-section reference
+    minimum_data_size = .kdb [kdb$h_minimum_rsz];
+    !
+    !   Get the prologue for the number of keys
+    !
+    BEGIN
+
+    LOCAL
+	prol_desc : $rms_bucket_descriptor,
+	fpt : REF $rms_fpt;
+
+    $utl_getbkt (bucket_no = 0, 		! Get prologue bucket
+	bucket = .lodsec OR prol_desc, 		! ...
+	error = utlerr);			! ...
+    fpt = .rmssec OR .prol_desc [bkt$a_address];	! Map the FPT
+    number_of_keys = .fpt [fpt$b_keys];		! Get the key count
+    $utl_putbkt (update = 0, 			! Get rid of bucket
+	bucket = .lodsec OR prol_desc, 		!   without updating it
+	error = utlerr);
+    END;
+    !
+    !   Zero the key buffer for comparisons
+    !
+    key_ptr = CH$PTR (key_buffer, 0, .kdb [kdb$v_byte_size]);
+    CH$FILL (0, .kdb [kdb$h_key_size_bytes], .key_ptr);
+    !
+    !	Get a valid input data record.  Do not check
+    !	for out-of-order key on first input.
+    !
+    read_data (false);
+
+    !+
+    !	If EOF is still false, then we have
+    !	at least one valid data record and
+    !	can continue to load the file.
+    !-
+
+    IF .eof					! No data
+    THEN
+	BEGIN
+	cleanup ();
+	RETURN lod$_no_data;
+	END
+    ELSE
+	BEGIN
+	brfile ();
+	cleanup ();
+	RETURN lod$_success;
+	END;
+
+    END;					! End of DO_LOAD
+
+%SBTTL 'Routine GET_PID'
+ROUTINE get_pid =
+    BEGIN
+
+    LOCAL
+	retval,
+	pdb : VECTOR [$ipcfp + 1];		! IPCF packet descriptor block
+
+    pdb [$ipcfl] = ip_cfb OR ip_cpd;		! Don't block; create PID
+    pdb [$ipcfs] = pdb [$ipcfr] = pdb [$ipcfp] = 0;
+
+    IF NOT msend ($ipcfp + 1, pdb)
+    THEN
+	retval = 0				! No PID, fake it
+    ELSE
+	retval = .pdb [$ipcfs];			! Return the PID
+
+    $traceo ('GET_PID');
+    RETURN .retval;
+    END;					! End of GET_PID
+%SBTTL 'Routine INIT_RMS_BLOCKS'
+ROUTINE init_rms_blocks =
+    BEGIN
+    !
+    !   MRG file: GET & PUT, in case we have to read later.
+    !   Also, notice that RAT = BLK, so we don't really
+    !   a user buffer when reading later.
+    !
+    $fab_init (fab = mrg_fab, fac = <get, put>, shr = nil, 	!
+	bsz = .outfab [fab$v_bsz], org = seq, 	!
+	fop = <sup, drj>, mrs = .outfab [fab$h_mrs], 	!
+	fna = 'RMSLOD.MRG', rat = blk);
+    mrg_fab [fab$v_rfm] = .outfab [fab$v_rfm];	! Move format
+    $rab_init (rab = mrg_rab, fab = mrg_fab);
+    !
+    !	XCP file
+    !
+    $fab_init (fab = xcp_fab, fac = <put>, shr = nil, 	!
+	bsz = .outfab [fab$v_bsz], org = seq, 	!
+	fop = <sup, drj>, mrs = 0, 		!
+	fna = 'RMSLOD.XCP', rfm = var);		! Variable format required
+    $rab_init (rab = xcp_rab, fab = xcp_fab);
+    !
+    !	LST file
+    !
+    $fab_init (fab = lst_fab, fac = <put>, shr = nil, 	!
+	bsz = 7, org = seq, 			!
+	fop = <sup, drj>, mrs = 0, 		!
+	fna = 'RMSLOD.LIS', rfm = stm);
+    $rab_init (rab = lst_rab, fab = lst_fab);
+    RETURN lod$_success;
+    END;					! End of INIT_RMS_BLOCKS
+%SBTTL 'Routine CLEANUP'
+ROUTINE cleanup =
+    BEGIN
+    $tracei ('CLEANUP');
+
+    IF .xcp_count EQL 0				! No XCP records?
+    THEN
+	BEGIN
+	$close (fab = xcp_fab, err = rmserr);
+	$close (fab = lst_fab, err = rmserr);
+	xcp_fab [fab$v_drj] = 0;		! Release JFN this time
+	$erase (fab = xcp_fab, err = rmserr);	! Delete the file
+	lst_fab [fab$v_drj] = 0;		! Release JFN
+	$erase (fab = lst_fab, err = rmserr);	! Delete file
+	END
+    ELSE
+	BEGIN
+	xcp_fab [fab$v_drj] = 0;		! Release JFN
+	$close (fab = xcp_fab, err = rmserr);	! Close the file
+	lst_fab [fab$v_drj] = 0;		! Release JFN
+	$close (fab = lst_fab, err = rmserr);
+	END;
+
+    !+
+    !	Merge the MRG records in here
+    !-
+
+    IF .mrg_count EQL 0				! Work to do?
+    THEN
+	BEGIN
+	$close (fab = mrg_fab, err = rmserr);	! Close the file
+	mrg_fab [fab$v_drj] = 0;		! Release the JFN
+	$erase (fab = mrg_fab, err = rmserr);	! Erase the file
+	END
+    ELSE
+	BEGIN
+	$disconnect (rab = mrg_rab, err = rmserr);	! Reset the record stream
+	$connect (rab = mrg_rab, err = rmserr);	! ...
+	mrg_rab [rab$v_loc] = 1;		! Use locate mode
+	mrg_rab [rab$a_ubf] = .lodsec OR .input_buffer;	! Might not need this
+	mrg_rab [rab$h_usz] = input_buffer_length;
+
+	WHILE $get (rab = mrg_rab, err = rmserr) DO 	! Loop through records
+	    BEGIN
+	    outrab [rab$a_rbf] = .mrg_rab [rab$a_rbf];	! Point at record
+	    outrab [rab$h_rsz] = .mrg_rab [rab$h_rsz];	! Give the length
+	    $put (rab = outrab, err = rmserr);
+	    END;
+
+	$close (fab = mrg_fab, err = rmserr);	! Close the MRG file
+	mrg_fab [fab$v_drj] = 0;		! Release the JFN
+	$erase (fab = mrg_fab, err = rmserr);	! Delete it
+	END;
+
+    !
+    !   Free the buffer memory
+    !
+    fremem (.input_buffer, input_buffer_length);
+    !
+    !	Close the files
+    !
+    $close (fab = .infab, err = rmserr);
+    $close (fab = .outfab, err = rmserr);
+    $traceo ('CLEANUP');
+    RETURN lod$_success;
+    END;					! End of CLEANUP
+%SBTTL 'Routine BRFILE'
+ROUTINE brfile =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!   	BRFILE performs several initialization
+!   	functions:  it checks for and defines (if necessary)
+!   	the logical name LOD$WORK:, which is used for the
+!   	tag files and temporary sort files; it zeroes the
+!   	tag file flags (which mark when a tag file exists);
+!   	and it then calls BLDIDX for each key.  Finally,
+!   	it undefines LOD$WORK if it was defined by the program.
+!
+! FORMAL PARAMETERS
+!
+!	NONE.
+!
+! IMPLICIT INPUTS
+!
+!	KDB 	- used to keep track of current index
+!
+! COMPLETION CODES:
+!
+!	LOD$_SUCCESS	- successful run
+!   	LOD$_BUG    	- internal error
+!
+! SIDE EFFECTS:
+!
+!	TAG_FILE    	- all bits zeroed
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	ln_buf : VECTOR [50],
+	we_defined_lod$work;			! Flag logical name def'n
+
+    $tracei ('BRFILE');
+
+    !+
+    !   If system or user defined the work area, OK.
+    !   Otherwise, define it ourselves, and remember
+    !   that we did so.
+    !-
+
+    we_defined_lod$work = 0;			! Initialize before checking
+
+    IF NOT lnmst ($lnsjb, 			! Check job tables
+	    work_area, 				! ...
+	    CH$PTR (ln_buf))			! Throw away translation
+    THEN
+
+	IF NOT lnmst ($lnssy, 			! Check system tables
+		work_area, 			! ...
+		CH$PTR (ln_buf))		! ...
+	THEN
+	    BEGIN				! Define our own
+
+	    IF NOT crlnm ($clnjb, 		! Define job logical name
+		    work_area, 			! ...
+		    CH$PTR (UPLIT ('DSK:')))	! Point at DSK:
+	    THEN
+		RETURN $signal_error (status_code = lod$_bug, 	!
+			control = '!/?Cannot define work area LOD$WORK!/')
+	    ELSE
+		we_defined_lod$work = 1;
+
+	    END;
+
+    !+
+    !   Zero the tag file flags.
+    !-
+
+    BEGIN
+
+    BIND
+	tfc_words = tag_file_created : VECTOR [];
+
+    INCR i FROM 0 TO %ALLOCATION (tag_file_created) - 1 DO
+	tfc_words [.i] = 0;
+
+    END;
+
+    !+
+    !   Cycle through the indexes, building
+    !   as we go.
+    !-
+
+    kdb = $utl_getkdb (key_of_reference = 0, error = utlerr);
+
+    DO
+	BEGIN
+	kdb = .rmssec OR .kdb;			! For cross-section reference
+	bldidx ();				!
+	kdb = $utl_getkdb (key_of_reference = (.kdb [kdb$h_reference] + 1), 	!
+	    error = utlerr);
+	END
+    UNTIL (.kdb EQL 0);
+
+    !+
+    !   If we defined the logical name for the work area,
+    !   delete it now that we don't need it any more.
+    !-
+
+    IF .we_defined_lod$work			!
+    THEN
+	BEGIN
+
+	IF NOT crlnm ($clnj1, work_area, 0)	! Delete the name
+	THEN
+	    RETURN $signal_error (status_code = lod$_bug, 	!
+		    control = '!/?Cannot undefine work area LOD$WORK!/');
+
+	END;
+
+    $traceo ('BRFILE');
+    RETURN lod$_success;
+    END;					! End of BRFILE
+%SBTTL 'Routine BLDIDX'
+ROUTINE bldidx =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!   	BLDIDX sets up initial state for building
+!   	an index and then calls either PRIMARY_INDEX
+!   	(if the current key is 0) or SECONDARY_INDEX.
+!
+! FORMAL PARAMETERS
+!
+!	NONE.
+!
+! IMPLICIT INPUTS
+!
+!	KDB 	- key length in words
+!
+! COMPLETION CODES:
+!
+!	LOD$_SUCCESS	- all OK
+!   	LOD$_BUG    	- internal error
+!
+! SIDE EFFECTS:
+!
+!	The LSTBKT and CURBKT bucket descriptors
+!   	for all levels are zeroed.
+!
+!   	IDRLEN is set up.
+!
+!--
+
+    BEGIN
+    $tracei ('BLDIDX');
+
+    !+
+    !   Zero all last- and current-bucket descriptors.
+    !-
+
+    INCR level FROM 0 TO rms$k_max_levels DO
+	BEGIN
+	lstbkt [.level, bkt$a_address] = 0;
+	curbkt [.level, bkt$a_address] = 0;
+	END;
+
+    !
+    !   Set up the index record length for this index.
+    !
+    idrlen = .kdb [kdb$h_key_size_words] + idx$k_bln;
+    !
+    !   Store the HIKEY for this index in HIKEY_BUFFER
+    !
+
+    CASE .kdb [kdb$v_datatype]			! Determine by datatype
+    FROM xab$k_stg				! ...
+    TO xab$k_bn4 OF 				! ...
+	SET
+
+	[xab$k_stg, xab$k_ebc, xab$k_as8, xab$k_six] :
+	    !
+	    !   Character types
+	    !
+	    BEGIN
+
+	    LOCAL
+		char_ptr;
+
+	    char_ptr = CH$PTR (			! Build a pointer
+		hikey_buffer, 			! Start here
+		0, 				! No offset
+		.kdb [kdb$v_byte_size]);	! Character byte size
+	    !
+	    !   Fill the HIKEY buffer
+	    !
+	    CH$FILL (-1, .kdb [kdb$h_key_size_bytes], .char_ptr);
+	    END;
+
+	[xab$k_pac] :
+	    BEGIN
+
+	    LOCAL
+		char_ptr;
+
+	    char_ptr = CH$PTR (hikey_buffer, 0, 9);	! Pointer for packed
+	    !
+	    !   Fill the HIKEY buffer.  %O'231' is a 9-bit
+	    !   value equivalent to packed '99'.
+	    !
+	    CH$FILL (%O'231', .kdb [kdb$h_key_size_bytes], .char_ptr);
+	    !
+	    !	Locate the sign byte
+	    !
+	    char_ptr = CH$PTR (hikey_buffer, 	! Start here
+		.kdb [kdb$h_key_size_bytes] - 1, 	! Point at this byte
+		9);				! Use 9-bit pointer
+	    !
+	    !   Deposit a '9+' into the last byte
+	    !
+	    CH$WCHAR (%O'234', .char_ptr);
+	    END;
+
+	[xab$k_in4, xab$k_fl1] :
+	    hikey_buffer = %O'377777777777';
+
+	[xab$k_in8, xab$k_fl2, xab$k_gfl] :
+	    hikey_buffer [0] = hikey_buffer [1] = %O'377777777777';
+
+	[xab$k_bn4] :
+	    hikey_buffer = -1;			! Highest unsigned integer
+	TES;
+
+    !+
+    !   Call the appropriate routine to build
+    !   the index we want.
+    !-
+
+    IF .kdb [kdb$h_reference] EQL 0		! Primary or secondary key?
+    THEN
+	primary_index ()			! It's primary
+    ELSE
+	secondary_index ();			! It's secondary
+
+    !
+    !	Flush all the buffers after each index
+    !
+    $flush (rab = outrab, err = rmserr);
+    $traceo ('BLDIDX');
+    RETURN lod$_success;
+    END;					! End of BLDIDX
+%SBTTL 'Routine PRIMARY_INDEX'
+ROUTINE primary_index =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!   	PRIMARY_INDEX builds the primary index of
+!   	the RMS file.  It sets up a few things,
+!   	then processes each valid input data record.
+!   	After EOF is reached on the input data, the
+!   	current buckets for each level are output,
+!   	the root bucket is noted and the IDB's root
+!   	pointer is updated to point to that bucket.
+!
+! FORMAL PARAMETERS
+!
+!	NONE.
+!
+! IMPLICIT INPUTS
+!
+!	OUTFAB	    - the record format is read
+!   	EOF 	    - to end UDR processing
+!   	CURBKT - to determine the root bucket
+!
+! COMPLETION CODES:
+!
+!	LOD$_SUCCESS	- all OK
+!   	LOD$_BUG    	- bug somewhere
+!
+! SIDE EFFECTS:
+!
+!	UDR_HEADER_LENGTH 	- set to length appropriate for record format
+!   	IDB for key 0	- root-pointer is set
+!   	Indexed file	- has a primary index in it
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	root_level,				! Level of root bucket
+	root_bucket;				! Number of root bucket
+
+    $tracei ('PRIMARY_INDEX');
+    !
+    !   Set up the length of the record header,
+    !   which depends on the record format of
+    !   the output file.
+    !
+
+    IF .outfab [fab$v_rfm] EQL fab$k_var	! Check format
+    THEN
+	udr_header_length = udr$k_var_bln	! Variable is longer
+    ELSE
+	udr_header_length = udr$k_fix_bln;	! Don't need record length
+
+    !
+    !   Set up the length of the current data record.
+    !
+    udr_length = .in_rec [inp$h_words] + .udr_header_length;
+
+    !+
+    !   DO_UDRS will return at EOF.
+    !-
+
+    do_udrs ();					! Check for failure
+
+    !+
+    !   We have to finish the output of data by writing
+    !   the remaining index and data buckets to the
+    !   file.  While we do this, we want to
+    !   keep track of the highest level encountered,
+    !   because that is the root bucket.
+    !-
+
+    INCR level FROM 0 TO rms$k_max_levels DO
+	BEGIN
+
+	BIND
+	    out_bucket = .rmssec OR 		!
+		.lstbkt [.level, bkt$a_address] : $rms_bucket_header;
+
+	!+
+	!   Output the bucket
+	!-
+
+	$utl_putbkt (update = 1, 		! Write bucket
+	    bucket = .lodsec OR lstbkt [.level, 0, 0, 0, 0], 	! ...
+	    error = utlerr);			!
+	!
+	!   If the root flag is set, this is our root
+	!
+
+	IF .out_bucket [bhd$v_root]		! Root bucket?
+	THEN
+	    BEGIN
+	    root_bucket = .lstbkt [.level, bkt$h_number];	! Number
+	    root_level = .level;		! Levels in index
+	    EXITLOOP;
+	    END;
+
+	END;
+
+    !+
+    !   Update the IDB's root pointer and level count
+    !-
+
+    BEGIN
+
+    LOCAL
+	idbptr : REF $rms_index_descriptor_block,	! Pointer to IDB
+	idbbkt : $rms_bucket_descriptor;	! Bucket to hold prologue
+
+    idbptr = $utl_getidb (bucket = .lodsec OR idbbkt, 	! Get the IDB
+	error = utlerr);			! ...
+    idbptr = .rmssec OR .idbptr;		! Reference across sections
+    idbptr [idb$h_root] = .root_bucket;		! Update IDB
+    idbptr [idb$b_levels] = .root_level;	! ...
+    $utl_putbkt (update = 1, 			! Write prologue out
+	bucket = .lodsec OR idbbkt, 		! ...
+	error = utlerr);			! ...
+    END;
+
+    !+
+    !	Close the tag files
+    !-
+
+    INCR file_number FROM 1 TO .number_of_keys - 1 DO
+	BEGIN
+
+	IF .tag_file_created [.file_number]	! Did we create a file?
+	THEN
+	    BEGIN
+	    $close (fab = .tag_fab [.file_number], 	! Close the file
+		err = rmserr);
+	    !
+	    !	Free the memory used by the tag-file structures
+	    !
+	    fremem (.tag_rab [.file_number], rab$k_bln);	! Free memory
+	    fremem (.tag_fab [.file_number], fab$k_bln);	! ...
+	    END;
+
+	END;
+
+    $traceo ('PRIMARY_INDEX');
+    RETURN lod$_success;
+    END;					! End of PRIMARY_INDEX
+%SBTTL 'Routine DO_UDRS'
+ROUTINE do_udrs =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!   	DO_UDRS fills a data bucket by individually
+!   	processing each input data record.  First,
+!   	a bucket is allocated if necessary. The UDR header
+!   	is created and the data is moved into the bucket.
+!   	Pointers into the bucket and counts are adjusted as
+!   	necessary.
+!
+!   	If there are alternate keys, EXTRACT_SECONDARY_KEY
+!   	is called for each alternate key, to pull out that
+!   	key and write it (with the current RFA) to a tag file.
+!
+!   	Finally, the data file is read again, and if the next
+!   	record will not fit in this bucket, or if EOF is reached,
+!   	an index record is generated with a call to DO_IDR.
+!	DO_UDRS will return when EOF is reached.
+!
+! FORMAL PARAMETERS
+!
+!	NONE.
+!
+! IMPLICIT INPUTS
+!
+!	CURBKT [0]	- if empty, a bucket is allocated
+!   	    	    	- NEXT_ID provides the UDR_ID
+!   	    	    	- the current bucket number makes the RFA
+!   	IN_REC 	- WORDS: length of current record in words
+!   	OUTPUT_BYTES  	- length of current record in output bytes
+!
+!
+! COMPLETION CODES:
+!
+!	LOD$_SUCCESS	- OK
+!   	LOD$_BUG    	- internal error
+!
+! SIDE EFFECTS:
+!
+!	RFA 	    	- generated herein
+!   	FREESPACE [0]	- initialized and adjusted
+!   	NXTREC [0]	- " 	"
+!   	CURREC [0]	- " 	"
+!   	UDR_LENGTH  	- set for each record
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	data_bkt_hdr : REF $rms_bucket_header,
+	new_record : REF $rms_user_data_record;
+
+    $tracei ('DO_UDRS');
+
+    DO
+	BEGIN
+	!
+	!   Allocate a bucket, if needed
+	!
+
+	IF .curbkt [0, bkt$a_address] EQL 0	! Empty?
+	THEN
+	    do_data_bucket ();			! Allocate a data_bucket
+
+	data_bkt_hdr = .rmssec OR .curbkt [0, bkt$a_address];
+	!
+	!   Set pointers for this new record.
+	!
+	currec [0] = .nxtrec [0];		! Where new record goes
+	nxtrec [0] = .nxtrec [0] + .udr_length;	! Next record here
+
+	!+
+	!   Build the record header.  This comprises the flags,
+	!   RRV pointer, ID, and size of the data.
+	!-
+
+	new_record = .currec [0];
+	!
+	!   Set the ID, and build the RFA at the same time.
+	!   Also, bump the bucket's NEXT_ID.
+	!
+	new_record [udr$h_id] = .data_bkt_hdr [bhd$h_next_id];
+	rfa [rfa$h_bucket] = .curbkt [0, bkt$h_number];
+	rfa [rfa$h_id] = .data_bkt_hdr [bhd$h_next_id];
+	data_bkt_hdr [bhd$h_next_id] = .data_bkt_hdr [bhd$h_next_id] + 1;
+	!
+	!   Set the RRV pointer and the flags.
+	!
+	new_record [udr$g_rrv_address] = .rfa;	! Point at self
+	new_record [udr$h_flags] = udr$m_default_flags;
+	!
+	!   If this is a variable length record, then
+	!   we have to set the record length in bytes
+	!   into the next field.  If it is not variable
+	!   length, there IS no next field.  We can use
+	!   the UDR_HEADER_LENGTH as an indicator of format.
+	!
+
+	IF .udr_header_length EQL udr$k_var_bln	! Variable length?
+	THEN
+	    new_record [udr$h_size] = .output_bytes;	! Set the length
+
+	!
+	!   Move the data to the appropriate spot
+	!
+	$copy_words (.in_rec [inp$a_data], 	! From here
+	    .currec [0] + .udr_header_length, 	! To here
+	    .in_rec [inp$h_words]);		! Length in words
+	!
+	!   Decrement the space remaining appropriately
+	!   and update the bucket header as well
+	!
+	freespace [0] = .freespace [0] - .udr_length;
+	data_bkt_hdr [bhd$h_next_byte] = 	!
+	.data_bkt_hdr [bhd$h_next_byte] + .udr_length;
+
+	!+
+	!   Process the alternate keys
+	!-
+
+	IF .number_of_keys GTR 1		! Secondary keys exist?
+	THEN
+	    BEGIN				! Write tag files
+
+	    !+
+	    !   Set up KDB for each key, and extract and write
+	    !   the key to the tag file.
+	    !-
+
+	    INCR extract_key FROM 1 TO (.number_of_keys - 1) DO
+		BEGIN
+		!
+		!   Get the KDB
+		!
+
+        $utl_setenv (rab = .lodsec OR outrab, 	! Always returns TRUE
+	error = utlerr);			! ..we hope 8/12/85 asp 2 lines
+
+		kdb = .rmssec OR $utl_getkdb (error = utlerr, 	!
+		    key_of_reference = .extract_key);
+		!
+		!   Process this key
+		!
+		extract_secondary_key ();	!
+		END;
+
+	    !
+	    !   Reset to key 0
+	    !
+	    kdb = .rmssec OR $utl_getkdb (key_of_reference = 0, 	!
+		error = utlerr);
+	    END;
+
+	!
+	!   Get the next data record, checking
+	!   for out-of-order keys.
+	!
+	read_data (true);
+	!
+	!   Set up the length of the current data record.
+	!
+	udr_length = .in_rec [inp$h_words] + .udr_header_length;
+
+	!+
+	!   If we have reached end of file or
+	!   if we have filled this bucket,
+	!   then make an index record for this bucket.
+	!-
+
+	IF .eof OR 				! End-of-file?
+	    (.freespace LSS .udr_length)	! Bucket full?
+	THEN
+	    do_idr (1);				! Generate an index record
+
+	END
+    UNTIL .eof;					! Loop until EOF
+
+    $traceo ('DO_UDRS');
+    RETURN lod$_success;
+    END;					! End of DO_UDRS
+%SBTTL 'Routine DO_DATA_BUCKET'
+ROUTINE do_data_bucket =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!   	DO_DATA_BUCKET allocates a data bucket; sets
+!   	up the record pointers and the free-space
+!   	for that bucket.  If there is a bucket in
+!   	LSTBKT for the data level, the buckets
+!   	will be linked and the LSTBKT output.
+!
+! FORMAL PARAMETERS
+!
+!	NONE.
+!
+! IMPLICIT INPUTS
+!
+!	LSTBKT 	- to test for its existence
+!   	KDB 	    	- data-fill-offset, to set up freespace
+!
+! COMPLETION CODES:
+!
+!	LOD$_SUCCESS	- all OK
+!   	LOD$_BUG    	- internal error
+!
+! SIDE EFFECTS:
+!
+!	LSTBKT 	- linked to new bucket and written to file
+!   	CURBKT	- allocated brand new
+!   	CURREC	- set to 0
+!   	NXTREC 	- set to point at top of bucket (below header)
+!   	FREESPACE   	- set up to load limit for this bucket
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	new_bkt_hdr : REF $rms_bucket_header;
+
+    $tracei ('DO_DATA_BUCKET');
+
+    $utl_setenv (rab = .lodsec OR outrab, 	! Always returns TRUE
+	error = utlerr);			! ...we hope 8/6/85 asp 2 lines
+
+    $utl_alcbkt (				! Allocate a bucket
+	type = bhd$k_data, 			! Data bucket
+	flags = bhd$m_end, 			! Rightmost bucket
+	level = bhd$k_data_level, 		! Data level (=0)
+	bucket = .lodsec OR curbkt [0, 0, 0, 0, 0], 	! Bucket descriptor
+	error = utlerr);
+    new_bkt_hdr = .rmssec OR .curbkt [0, bkt$a_address];
+
+    IF .lstbkt [0, bkt$a_address] EQL 0		! No LAST-BUCKET?
+    THEN
+	new_bkt_hdr [bhd$h_next_bucket] = .curbkt [0, bkt$h_number]
+    ELSE
+	BEGIN
+
+	LOCAL
+	    old_bkt_hdr : REF $rms_bucket_header;
+
+	!
+	!   Point at the previous bucket
+	!
+	old_bkt_hdr = .rmssec OR .lstbkt [0, bkt$a_address];
+	old_bkt_hdr [bhd$v_end] = 0;		! No longer rightmost
+	!
+	!   Link the buckets
+	!
+	old_bkt_hdr [bhd$h_next_bucket] = .curbkt [0, bkt$h_number];
+	new_bkt_hdr [bhd$h_next_bucket] = .lstbkt [0, bkt$h_number];
+	!
+	!   Output the old bucket
+	!
+	$utl_putbkt (update = 1, 		! Be sure it is updated
+	    bucket = .lodsec OR lstbkt [0, 0, 0, 0, 0], 	! ...
+	    error = utlerr);			! ...
+	lstbkt [0, bkt$a_address] = 0;		! Zero the pointer
+	END;
+
+    freespace [0] = .kdb [kdb$h_dfl_offset] - bhd$k_bln;	! Space left
+    currec [0] = 0;				! No current record
+    nxtrec [0] = .rmssec OR .curbkt [0, bkt$a_address]	! First free space
+    + bhd$k_bln;				! Beyond bucket header
+    $traceo ('DO_DATA_BUCKET');
+    RETURN lod$_success;
+    END;					! End of DO_DATA_BUCKET
+%SBTTL 'Routine EXTRACT_SECONDARY_KEY'
+ROUTINE extract_secondary_key =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!   	EXTRACT_SECONDARY_KEY extracts the alternate keys from a
+!   	primary data record and writes them to a file, tagged
+!   	with the RFA of the primary data record.  It only writes
+!   	keys for those records long enough to contain the key,
+!
+!
+! FORMAL PARAMETERS
+!
+!	NONE.
+!
+! IMPLICIT INPUTS
+!
+!	NONE.
+!
+! COMPLETION CODES:
+!
+!	LOD$_SUCCESS	- all OK
+!   	LOD$_BUG    	- internal error
+!
+! SIDE EFFECTS:
+!
+!	NONE.
+!
+!--
+
+    BEGIN
+    $tracei ('EXTRACT_SECONDARY_KEY');
+
+    IF .output_bytes GEQ .kdb [kdb$h_minimum_rsz]	! Length OK?
+    THEN
+	BEGIN
+
+	LOCAL
+	    this_rab : REF $rab_decl;		! Current RAB
+
+	IF NOT .tag_file_created [.kdb [kdb$h_reference]]	!
+	THEN
+	    create_tag_file (.kdb [kdb$h_reference]);
+
+	this_rab = .tag_rab [.kdb [kdb$h_reference]];	! Point at RAB
+	!
+	!   Move this secondary key from the input record
+	!   to the key field of the tag record.
+	!
+	$utl_movekey (recptr = .in_rec [inp$a_data], 	! Input record
+	    keybuf = .lodsec OR tag_record [tag$t_key], 	! Tag buffer
+	    error = utlerr);			! ...
+	tag_record [tag$g_rfa] = .rfa;
+	this_rab [rab$h_rsz] = .kdb [kdb$h_key_size_bytes]	! Key length
+	+ (%BPVAL/.kdb [kdb$v_byte_size]);	! Size of RFA in bytes
+	this_rab [rab$a_rbf] = tag_record;
+	$put (rab = .this_rab, err = rmserr);
+	END;
+
+    $traceo ('EXTRACT_SECONDARY_KEY');
+    RETURN lod$_success;
+    END;					! End of EXTRACT_SECONDARY_KEY
+%SBTTL 'Routine DO_IDR'
+ROUTINE do_idr (this_level) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	DO_IDR creates an index record from the key in
+!	the key buffer.  It first allocates an index
+!	bucket on level THIS_LEVEL if necessary.
+!	The bucket number of the current bucket
+!	on the next lower level is inserted into
+!	the record header.  If EOF is set, then the
+!	HIKEY flag is set and the key is set to the
+!	highest possible; otherwise, the key in the key
+!	buffer is moved to the index record.  Bucket space
+!	counters and pointers are adjusted.  If this is
+!	the last record to go into this bucket (as at EOF
+!	or if the bucket is full) and this is not a root bucket,
+!	then generate an index record for this bucket.
+!
+!	Finally, take the bucket for which we just generated
+!	an index record and move its descriptor from CURBKT
+!	to LSTBKT.  This reaching backwards may be confusing
+!	in a way, but retirement of a bucket is associated closely
+!	with the generation of an index record for it, and so
+!	the operation is done here.
+!
+!
+! FORMAL PARAMETERS
+!
+!	THIS_LEVEL	- level to build record on
+!
+! IMPLICIT INPUTS
+!
+!	CURBKT	- this level's current bucket
+!	    NEXT_BYTE	- next word in bucket
+!	EOF		- end of input file
+!	NEXT_I_REC	- this level's next index record
+!	FREESPACE	- this level's freespace left
+!	IDRLEN - length of idx recs for this key
+!	CURBKT	- previous level's current bucket
+!
+! COMPLETION CODES:
+!
+!	LOD$_SUCCESS	- all OK
+!   	LOD$_BUG    	- internal error
+!
+! SIDE EFFECTS:
+!
+!	New index record in CURBKT
+!	NEXT_BYTE, FREESPACE, this level's record pointers updated.
+!	LSTBKT on previous level holds bucket pointed at
+!		by new index record.
+!	CURBKT on previous level is zeroed.
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	idx_bkt_hdr : REF $rms_bucket_header,
+	new_idx_record : REF $rms_index_record;
+
+    $tracei ('DO_IDR');
+
+    IF .curbkt [.this_level, bkt$a_address] EQL 0	! Do we have a bucket
+    THEN
+	do_index_bucket (.this_level);		! Prepare index bucket
+
+    idx_bkt_hdr = .rmssec OR .curbkt [.this_level, bkt$a_address];
+    !
+    !   Set pointers for this new record
+    !
+    currec [.this_level] = .nxtrec [.this_level];	! New record here
+    nxtrec [.this_level] = .nxtrec [.this_level] + .idrlen;
+
+    !+
+    !   Build the record header.
+    !-
+
+    new_idx_record = .currec [.this_level];	! Point at it
+    new_idx_record [idx$h_bucket] = 		! Point at correct bucket
+    .curbkt [.this_level - 1, bkt$h_number];
+
+    IF .eof					! End of file (Hikey?)
+    THEN
+	BEGIN
+	new_idx_record [idx$v_hikey] = 1;	! Set HIKEY flag
+	!
+	!   Move the data to the appropriate spot
+	!
+	$copy_words (.lodsec OR hikey_buffer, 	! From here
+	    .currec [.this_level] + idx$k_bln, 	! To here
+	    .kdb [kdb$h_key_size_words]);	! Length to move
+	END
+    ELSE
+	BEGIN
+	new_idx_record [idx$v_hikey] = 0;	! Clear it (just in case)
+	!
+	!   Move the data to the appropriate spot
+	!
+	$copy_words (.lodsec OR key_buffer, 	! From here
+	    .currec [.this_level] + idx$k_bln, 	! To here
+	    .kdb [kdb$h_key_size_words]);	! Length to move
+	END;					!
+
+    !
+    !   Decrement the space remaining appropriately
+    !   and update the bucket header as well
+    !
+    freespace [.this_level] = .freespace [.this_level] - .idrlen;
+    idx_bkt_hdr [bhd$h_next_byte] = 		!
+    .idx_bkt_hdr [bhd$h_next_byte] + .idrlen;
+
+    !+
+    !   If we have reached end of file, then we need
+    !   to generate an index record for this bucket
+    !   (unless this bucket is the root bucket, when we just
+    !   move the bucket to the LSTBKT slot).
+    !   If we have not reached EOF, then we need to
+    !   generate an index record *for* this bucket
+    !   only if there is not enough
+    !   room for another record *in* this bucket.
+    !-
+
+    IF .eof					! Make index rec if needed
+    THEN
+	BEGIN
+
+	IF .idx_bkt_hdr [bhd$v_root]		! Is this the root?
+	THEN
+	    $move_bucket_descriptor (		! Retire this bucket
+		curbkt [.this_level, 0, 0, 0, 0], 	! From this descriptor
+		lstbkt [.this_level, 0, 0, 0, 0])	! To this descriptor
+	ELSE
+	    do_idr (.this_level + 1);		! No - generate an index record
+
+	END
+    ELSE
+	BEGIN
+
+	IF .freespace [.this_level] LSS .idrlen	! More room?
+	THEN
+	    do_idr (.this_level + 1);		! Generate record, flush bucket
+
+	END;
+
+    !
+    !   Move this bucket from current bucket to last bucket.
+    !
+    $move_bucket_descriptor (			! Retire this bucket
+	curbkt [.this_level - 1, 0, 0, 0, 0], 	! From this descriptor
+	lstbkt [.this_level - 1, 0, 0, 0, 0]);	! To this descriptor
+    !
+    !   Zero CURBKT of previous level
+    !
+    curbkt [.this_level - 1, bkt$a_address] = 0;
+    $traceo ('DO_IDR');
+    RETURN lod$_success;
+    END;					! End of DO_IDR
+%SBTTL 'Routine DO_INDEX_BUCKET'
+ROUTINE do_index_bucket (this_level) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	DO_INDEX_BUCKET allocates an index bucket.  If there
+!	is a previous bucket on this level, DO_INDEX_BUCKET
+!	links the buckets together and writes out the
+!	previous bucket.  If there is not a previous bucket,
+!	DO_INDEX_BUCKET marks the new bucket as a root and
+!	points it at itself.  Record pointers are set
+!	appropriately.
+!
+! FORMAL PARAMETERS
+!
+!	THIS_LEVEL	- index level of this bucket
+!
+! IMPLICIT INPUTS
+!
+!	LSTBKT 	- BUCKET_NUMBER used in linking new bucket
+!			- written to file
+!	KDB		- IFL_OFFSET used in determining FREESPACE
+!
+! COMPLETION CODES:
+!
+!	LOD$_SUCCESS	- ok
+!	LOD$_BUG	- internal error
+!
+! SIDE EFFECTS:
+!
+!	CURBKT	- describes new bucket
+!			- ROOT set if first bucket on this level
+!	LSTBKT	- linked to CURBKT
+!			- ROOT cleared
+!			- END cleared
+!	NXTREC	- points to top of CURBKT
+!	CURREC	- set to 0
+!	FREESPACE	- set to index-fill-offset
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	new_bkt_hdr : REF $rms_bucket_header;
+
+    $tracei ('DO_INDEX_BUCKET');
+    $utl_setenv (rab = .lodsec OR outrab, 	! Always returns TRUE
+	error = utlerr);			! ...we hope
+    $utl_alcbkt (				! Allocate a bucket
+	type = bhd$k_index, 			! Index bucket
+	flags = bhd$m_end, 			! Rightmost bucket
+	level = .this_level, 			! Current level
+	bucket = .lodsec OR curbkt [.this_level, 0, 0, 0, 0], 	! Put it here
+	error = utlerr);
+    new_bkt_hdr = .rmssec OR .curbkt [.this_level, bkt$a_address];
+
+    IF .lstbkt [.this_level, bkt$a_address] EQL 0	! No LAST-BUCKET?
+    THEN
+	BEGIN
+	new_bkt_hdr [bhd$h_next_bucket] = 	! Point at self
+	.curbkt [.this_level, bkt$h_number];
+	new_bkt_hdr [bhd$v_root] = 1;		! Must be a root
+	END
+    ELSE
+	BEGIN
+
+	LOCAL
+	    old_bkt_hdr : REF $rms_bucket_header;
+
+	!
+	!   Point at the previous bucket
+	!
+	old_bkt_hdr = .rmssec OR .lstbkt [.this_level, bkt$a_address];
+	old_bkt_hdr [bhd$v_end] = 0;		! No longer rightmost
+	old_bkt_hdr [bhd$v_root] = 0;		! No longer a root
+	!
+	!   Link the buckets
+	!
+	old_bkt_hdr [bhd$h_next_bucket] = 	! Point old at new
+	.curbkt [.this_level, bkt$h_number];
+	new_bkt_hdr [bhd$h_next_bucket] = 	! Point new at old
+	.lstbkt [.this_level, bkt$h_number];
+	!
+	!   Output the old bucket
+	!
+	$utl_putbkt (update = 1, 		! Write it out
+	    bucket = .lodsec OR lstbkt [.this_level, 0, 0, 0, 0], 	! ...
+	    error = utlerr);			! ...
+	lstbkt [.this_level, bkt$a_address] = 0;	! Zero the pointer
+	END;
+
+    freespace [.this_level] = .kdb [kdb$h_ifl_offset] - bhd$k_bln;	! Space available
+    currec [.this_level] = 0;			! No current record
+    nxtrec [.this_level] = .rmssec OR .curbkt [.this_level, bkt$a_address] + bhd$k_bln;	! First free space
+    $traceo ('DO_INDEX_BUCKET');
+    RETURN lod$_success;
+    END;					! End of DO_INDEX_BUCKET
+%SBTTL 'Routine SECONDARY_INDEX'
+ROUTINE secondary_index =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!
+! FORMAL PARAMETERS
+!
+!	NONE.
+!
+! IMPLICIT INPUTS
+!
+!	NONE.
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NONE.
+!
+! SIDE EFFECTS:
+!
+!	NONE.
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	root_level,				! Level of root bucket
+	root_bucket;				! Number of root bucket
+
+    $tracei ('SECONDARY_INDEX');
+    sort_tag_file ();				! Sort this file
+    open_key_file (.kdb [kdb$h_reference]);	! Open the file
+    !
+    !   Zero the key buffer for comparisons
+    !
+    key_ptr = CH$PTR (key_buffer, 0, .kdb [kdb$v_byte_size]);
+    CH$FILL (0, .kdb [kdb$h_key_size_bytes], .key_ptr);
+    !
+    !	Get the first record
+    !
+    read_key_file (false);			! Get a record
+
+    IF .eof					! No records?
+    THEN
+	BEGIN
+	$close (fab = key_fab, err = rmserr);	! Close the key file,
+	key_fab [fab$v_drj] = 0;		!     release the JFN,
+	$erase (fab = key_fab, err = rmserr);	!     and erase it.
+	$traceo ('SECONDARY_INDEX (no data)');
+	RETURN 1;
+	END
+    ELSE
+	BEGIN
+	!
+	!	Set up the length of a SIDR header and key
+	!	and the length of an index record.
+	!
+	sidrlen = sdr$k_bln + .kdb [kdb$h_key_size_words];	!
+	idrlen = idx$k_bln + .kdb [kdb$h_key_size_words];
+	!
+	!	Process the secondary records
+	!
+	do_sidrs ();
+
+	!+
+	!   We have to finish the output of data by writing
+	!   the remaining index and data buckets to the
+	!   file.  While we do this, we want to
+	!   keep track of the highest level encountered,
+	!   because that is the root bucket.
+	!-
+
+	INCR level FROM 0 TO rms$k_max_levels DO
+	    BEGIN
+
+	    BIND
+		out_bucket = .rmssec OR 	!
+		    .lstbkt [.level, bkt$a_address] : $rms_bucket_header;	!
+
+	    !   Output the bucket
+	    !
+	    $utl_putbkt (update = 1, 		! Write bucket
+		bucket = .lodsec OR lstbkt [.level, 0, 0, 0, 0], 	! ...
+		error = utlerr);		! ...
+	    !
+	    !   If the root flag is set, this is our root
+	    !
+
+	    IF .out_bucket [bhd$v_root]		! Root bucket?
+	    THEN
+		BEGIN
+		root_bucket = .lstbkt [.level, bkt$h_number];	! Number
+		root_level = .level;		! Levels in index
+		EXITLOOP;
+		END;
+
+	    END;
+
+	!+
+	!   Update the IDB's root pointer and level count
+	!-
+
+	BEGIN
+
+	LOCAL
+	    idbptr : REF $rms_index_descriptor_block,	! Pointer to IDB
+	    idbbkt : $rms_bucket_descriptor;	! Bucket to hold prologue
+
+	idbptr = $utl_getidb (bucket = .lodsec OR idbbkt, 	! Get IDB
+	    error = utlerr);			! ...
+
+	IF .idbptr EQL 0			! Did this work?
+	THEN
+	    RETURN $signal_error (		!
+		    control = '!/?Failure getting IDB for key !SL!/', 	!
+		    p1 = .kdb [kdb$h_reference]);
+
+	idbptr = .rmssec OR .idbptr;		! Reference across sections
+	idbptr [idb$h_root] = .root_bucket;	! Update IDB
+	idbptr [idb$b_levels] = .root_level;	! ...
+	$utl_putbkt (update = 1, 		!
+	    bucket = .lodsec OR idbbkt, error = utlerr);	! Write it out
+	!
+	!   Close and delete the input file
+	!
+	$close (fab = key_fab, err = rmserr);	! Close the key file,
+	key_fab [fab$v_drj] = 0;		!     release the JFN,
+	$erase (fab = key_fab, err = rmserr);	!     and erase it.
+	END;
+	$traceo ('SECONDARY_INDEX');
+	RETURN lod$_success;
+	END;
+
+    END;					! End of SECONDARY_INDEX
+%SBTTL 'Routine SORT_TAG_FILE'
+ROUTINE sort_tag_file =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!
+! FORMAL PARAMETERS
+!
+!	NONE.
+!
+! IMPLICIT INPUTS
+!
+!	NONE.
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NONE.
+!
+! SIDE EFFECTS:
+!
+!	NONE.
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	srtarg : VECTOR [2];			! Argument for SORT
+
+    BIND
+	file_ascii = $stptr ('/ASCII'),
+	file_ebcdic = $stptr ('/EBCDIC'),
+	file_sixbit = $stptr ('/SIXBIT'),
+	file_binary = $stptr ('/BINARY'),
+	file_as8 = $stptr ('/EBCDIC /COLLATE:ASCII'),
+	key_pac = $stptr (',COMP3,SIGNED'),
+	key_signed = $stptr (',SIGNED'),
+	key_gfl = $stptr (',GFloating'),
+	key_unsigned = $stptr (',UNSIGNED'),
+	key_null = $stptr ('');
+
+    BIND
+	tag_file_ctl = $fao_ctl (		!
+		'SORT /REC:!SL /KEY:!SL,!SL!AZ !AZ ', 	! Keys and filetype
+		'/SUPPRESS-ERROR:ALL', 		! No errors, please
+		'/TEMPORARY:LOD$WORK: !AZ ', 	! Work area, input file
+		'!-!AZ /RMS/ORG:SEQ/VAR!%^@');	! Output file
+!    BIND
+!	tag_file_ctl = $fao_ctl (		!
+!		'SORT /REC:!SL /KEY:!SL,!SL!AZ !AZ ', 	! Keys and filetype
+!		'/STATISTICS',			! Type stats for debugging
+!		'/TEMPORARY:LOD$WORK: !AZ ', 	! Work area, input file
+!		'!-!AZ /RMS/ORG:SEQ/VAR!%^@');	! Output file
+
+    $tracei ('SORT_TAG_FILE');
+    generate_tag_file_name (.kdb [kdb$h_reference]);
+    !
+    !	Set up common parameters
+    !
+    faoprm [5] = CH$PTR (fn_buf);		! Filename
+    control = tag_file_ctl;			! See above
+
+    !+
+    !	Create for ourselves a SORT command
+    !-
+
+    CASE .kdb [kdb$v_datatype]			! Determine by datatype
+    FROM xab$k_stg				! ...
+    TO xab$k_bn4 OF 				! ...
+	SET
+
+	[xab$k_stg, xab$k_ebc, xab$k_six, xab$k_as8] :
+	    BEGIN
+
+	    LOCAL
+		keybpw;				! Key bytes per word
+
+	    keybpw = %BPVAL/.kdb [kdb$v_byte_size];	! How many per word
+	    !
+	    !	Record length is key size + length of RFA (in bytes)
+	    !
+	    faoprm [0] = .kdb [kdb$h_key_size_bytes] + .keybpw;	! Reclen
+	    !
+	    !	First byte must be 1 past the RFA
+	    !
+	    faoprm [1] = .keybpw + 1;		! Skip over RFA
+	    faoprm [2] = .kdb [kdb$h_key_size_bytes];	! Key length
+	    faoprm [3] = key_null;		! No additional info
+
+	    SELECTONE .kdb [kdb$v_datatype] OF
+		SET
+
+		[xab$k_stg] :
+		    faoprm [4] = file_ascii;	! ASCII file
+
+		[xab$k_ebc] :
+		    faoprm [4] = file_ebcdic;	! EBCDIC file
+
+		[xab$k_six] :
+		    faoprm [4] = file_sixbit;	! SIXBIT file
+
+		[xab$k_as8] :
+		    faoprm [4] = file_as8;	! Strange file
+		TES;
+
+	    END;
+
+	[xab$k_pac] :
+	    BEGIN
+	    faoprm [0] = .kdb [kdb$h_key_size_bytes] + 4;	! Reclen
+	    faoprm [1] = 5;			! Skip over RFA
+	    faoprm [2] = (.kdb [kdb$h_key_size_bytes]*2) - 1;	! Key length
+	    faoprm [3] = key_pac;		! Give more information
+	    faoprm [4] = file_ebcdic;		! EBCDIC file
+	    END;
+
+	[xab$k_in4, xab$k_fl1, xab$k_bn4] :
+	    BEGIN
+	    faoprm [0] = 2;			! Two-word record
+	    faoprm [1] = 2;			! Skip over RFA
+	    faoprm [2] = 1;			! Key length
+
+	    IF .kdb [kdb$v_datatype] EQL xab$k_bn4	!
+	    THEN
+		faoprm [3] = key_unsigned	! Unsigned key
+	    ELSE
+		faoprm [3] = key_signed;	! Signed keys
+
+	    faoprm [4] = file_binary;		! Binary file
+	    END;
+
+	[xab$k_in8, xab$k_fl2, xab$k_gfl] :
+	    BEGIN
+	    faoprm [0] = 3;			! Three-word record
+	    faoprm [1] = 2;			! Skip over RFA
+	    faoprm [2] = 2;			! Key length
+
+	    IF .kdb [kdb$v_datatype] EQL xab$k_gfl	!
+	    THEN
+		faoprm [3] = key_gfl		! G-floating key
+	    ELSE
+		faoprm [3] = key_signed;	! Use signed keys
+
+	    faoprm [4] = file_binary;		! Binary file
+	    END;
+	TES;
+
+    $faol (ctrstr = .control, outbuf = srtdsc, 	! Make the command
+	outlen = srtlen, prmlst = faoprm);
+!    psout (ch$ptr (srtbuf));
+!    psout ($stptr (%char(13,10)));
+    !
+    !	Set up the SORT command descriptor
+    !
+    srtarg [0] = .lodsec or .srtdsc [str$a_pointer];	! Pointer to command
+    srtarg [1] = .srtlen;			! Length of command
+
+    IF NOT (srtsts = sort (srtarg))		! Sort the tag file
+    THEN
+	BEGIN
+	RETURN $signal_error (			!
+		control = '!/?SORT failed for key !SL!/', 	!
+		p1 = .kdb [kdb$h_reference]);
+	END
+    ELSE
+	BEGIN
+	RETURN lod$_success;
+	END;
+
+    END;					! End of SORT_TAG_FILE
+%SBTTL 'Routine GENERATE_TAG_FILE_NAME'
+ROUTINE generate_tag_file_name (key_number) =
+    BEGIN
+    $tracei ('GENERATE_TAG_FILE_NAME');
+    !
+    !	Generate the file name
+    !
+    control = $fao_ctl ('LOD$WORK:LOD!SL.ID-!SL!%^@');
+    faoprm [0] = .key_number;			! This key
+    faoprm [1] = .pid<0, 18>;			! Unique identifier
+    $faol (ctrstr = .control, outbuf = fn_dsc, prmlst = faoprm);
+    $traceo ('GENERATE_TAG_FILE_NAME');
+    RETURN lod$_success;
+    END;					! End of GENERATE_TAG_FILE_NAME
+%SBTTL 'Routine DO_SIDRS'
+ROUTINE do_sidrs =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!
+! FORMAL PARAMETERS
+!
+!	NONE.
+!
+! IMPLICIT INPUTS
+!
+!	NONE.
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NONE.
+!
+! SIDE EFFECTS:
+!
+!	NONE.
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	data_bkt_hdr : REF $rms_bucket_header,
+	new_record : REF $rms_sidr;
+
+    $tracei ('DO_SIDRS');
+
+    DO
+	BEGIN
+	!
+	!   Allocate a bucket, if needed
+	!
+
+	IF .curbkt [0, bkt$a_address] EQL 0	! Empty?
+	THEN
+	    BEGIN
+	    $trace ('Allocating data bucket');
+	    do_data_bucket ();			! Allocate a data_bucket
+	    END;
+
+	data_bkt_hdr = .rmssec OR .curbkt [0, bkt$a_address];
+	!
+	!   Set pointers for this new record.  Notice that
+	!   NXTREC will point at the location of the first
+	!   RFA in the SIDR (it will be incremented as
+	!   RFAs are appended to the record).
+	!
+	currec [0] = .nxtrec [0];		! Where new record goes
+	nxtrec [0] = .nxtrec [0] + .sidrlen;	! Next here
+
+	!+
+	!   Build the record header.  This comprises the flags,
+	!   ID, and size of the data.
+	!-
+
+	new_record = .currec [0];
+	!
+	!   Set the ID, and build the RFA at the same time.
+	!   Also, bump the bucket's NEXT_ID.
+	!
+	new_record [sdr$h_id] = .data_bkt_hdr [bhd$h_next_id];
+	data_bkt_hdr [bhd$h_next_id] = .data_bkt_hdr [bhd$h_next_id] + 1;
+	!
+	!   Set the length of the record (which for now
+	!   is just the key) in the header.
+	!
+	new_record [sdr$h_size] = .kdb [kdb$h_key_size_words];
+	!
+	!   Move the key to the appropriate spot
+	!
+	$copy_words (.lodsec OR key_buffer, 	! From here
+	    .currec [0] + sdr$k_bln, 		! To here
+	    .kdb [kdb$h_key_size_words]);	! Length in words
+	!
+	!   Decrement the space remaining appropriately
+	!   and update the bucket header as well
+	!
+	freespace [0] = .freespace [0] - .sidrlen;
+	data_bkt_hdr [bhd$h_next_byte] = 	!
+	.data_bkt_hdr [bhd$h_next_byte] + .sidrlen;
+	!
+	!   Add the RFA(s) to this record (more than
+	!   one if dups exist and are allowed).
+	!
+	$trace ('Appending RFA(s) to SIDR');
+	do_rfa ();
+
+	!+
+	!   If we have reached end of file or
+	!   if we have filled this bucket,
+	!   then make an index record for this bucket.
+	!-
+
+	IF .eof OR 				! End-of-file?
+	    (.freespace [0] LSS (.sidrlen + rfa$k_bln))	! Bucket full?
+	THEN
+	    BEGIN
+	    $trace ('Generating index record for SIDR bucket');
+	    do_idr (1);				! Generate an index record
+	    END;
+
+	END
+    UNTIL .eof EQL true;
+
+    $traceo ('DO_SIDRS');
+    RETURN 1;
+    END;					! End of DO_SIDRS
+%SBTTL 'Routine DO_RFA'
+ROUTINE do_rfa =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!
+! FORMAL PARAMETERS
+!
+!	NONE.
+!
+! IMPLICIT INPUTS
+!
+!	NONE.
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NONE.
+!
+! SIDE EFFECTS:
+!
+!	NONE.
+!
+!--
+
+    BEGIN
+
+    BIND
+	new_record = .currec [0] : $rms_sidr,	! Current SIDR
+	sdr_bucket = .rmssec OR 		!
+	    .curbkt [0, bkt$a_address] : $rms_bucket_header;
+
+    $tracei ('DO_RFA');
+
+    DO
+	BEGIN
+
+	BIND
+	    new_rfa = .nxtrec [0];		! For easy pointing
+
+	new_rfa = .tag_record [tag$g_rfa];	! Move the RFA
+	nxtrec [0] = .nxtrec [0] + rfa$k_bln;	! Bump pointer
+	new_record [sdr$h_size] = 		! Increment record size
+	.new_record [sdr$h_size] + rfa$k_bln;
+	sdr_bucket [bhd$h_next_byte] = 		! Bump this too
+	.sdr_bucket [bhd$h_next_byte] + rfa$k_bln;
+	freespace [0] = .freespace [0] - rfa$k_bln;	! Decrement space left
+	read_key_file (true);			! Get the next record
+
+	IF .eof					!
+	THEN
+	    BEGIN
+	    $trace ('Finished with RFAs because of EOF');
+	    EXITLOOP;				! Quit on EOF
+	    END;
+
+	IF .freespace [0] LSS rfa$k_bln		! No more room?
+	THEN
+	    BEGIN
+	    $trace ('Finished with RFAs because bucket is full');
+	    EXITLOOP;				! Exit and make new SIDR
+	    END;
+
+	IF NOT .secondary_dup			! Loop for dups
+	THEN
+	    BEGIN
+	    $trace ('Finished with RFAs because no dups exist');
+	    EXITLOOP;
+	    END;
+
+	END
+    WHILE 1;
+
+    $traceo ('DO_RFA');
+    RETURN lod$_success;			! Leave gracefully
+    END;					! End of DO_RFA
+%SBTTL 'Routine CREATE_TAG_FILE'
+ROUTINE create_tag_file (key_number) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!
+! FORMAL PARAMETERS
+!
+!	NONE.
+!
+! IMPLICIT INPUTS
+!
+!	NONE.
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NONE.
+!
+! SIDE EFFECTS:
+!
+!	NONE.
+!
+!--
+
+    BEGIN
+    $tracei ('CREATE_TAG_FILE');
+    !
+    !	Allocate space for the FAB and RAB
+    !
+    tag_fab [.key_number] = getmem (fab$k_bln);
+    tag_rab [.key_number] = getmem (rab$k_bln);
+    !
+    !	Create the file name for this tag file
+    !
+    generate_tag_file_name (.key_number);
+    !
+    !   Initialize the RAB and FAB
+    !
+    $fab_init (fab = .tag_fab [.key_number], 	!
+	org = seq, rfm = var, fna = fn_buf, 	!
+	rat = blk, mrs = 0, fac = <put, get>, 	!
+	fop = sup, bsz = .kdb [kdb$v_byte_size]);	! Appropriate bytes
+    $rab_init (rab = .tag_rab [.key_number], 	!
+	fab = .tag_fab [.key_number], 		!
+	rac = seq, ubf = tag_record, 		! UBF is for later input
+	usz = tag$k_bln);			! USZ, too
+    !
+    !	Create the file and connect the RAB thereto
+    !
+    $create (fab = .tag_fab [.key_number], err = rmserr);
+    $connect (rab = .tag_rab [.key_number], err = rmserr);
+    tag_file_created [.key_number] = 1;
+    $traceo ('CREATE_TAG_FILE');
+    RETURN lod$_success;
+    ;
+    END;					! End of CREATE_TAG_FILE
+%SBTTL 'Routine OPEN_KEY_FILE'
+ROUTINE open_key_file (key_number) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!
+! FORMAL PARAMETERS
+!
+!	NONE.
+!
+! IMPLICIT INPUTS
+!
+!	NONE.
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NONE.
+!
+! SIDE EFFECTS:
+!
+!	NONE.
+!
+!--
+
+    BEGIN
+    $tracei ('OPEN_KEY_FILE');
+    !
+    !	Open the file name for this tag file
+    !
+    generate_tag_file_name (.key_number);
+    !
+    !   Initialize the RAB and FAB
+    !
+    $fab_init (fab = key_fab, fna = fn_buf, fac = get, fop = drj);	!
+    $rab_init (rab = key_rab, fab = key_fab, 	!
+	ubf = tag_record, usz = tag$k_bln);
+    !
+    !	Open the file and connect the RAB thereto
+    !
+    $open (fab = key_fab, err = rmserr);
+    $connect (rab = key_rab, err = rmserr);
+    eof = false;				! Reset EOF
+    $traceo ('OPEN_KEY_FILE');
+    RETURN lod$_success;
+    END;					! End of OPEN_KEY_FILE
+%SBTTL 'Routine READ_DATA'
+ROUTINE read_data (order_checking) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!
+! FORMAL PARAMETERS
+!
+!	NONE.
+!
+! IMPLICIT INPUTS
+!
+!	NONE.
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NONE.
+!
+! SIDE EFFECTS:
+!
+!	NONE.
+!
+!--
+
+    BEGIN
+
+    LITERAL
+	record_ok = 1,				! Record is valid
+	xcp_record = 2,				! Exception (illegal) record
+	mrg_record = 3;				! Out-of-order record
+
+    LOCAL
+	status;					! Input status
+
+    $tracei ('READ_DATA');
+
+    WHILE 1 DO
+	BEGIN
+
+	IF .input_rtn EQL 0			! Use default routine?
+	THEN
+	    status = lodinp (in_rec)		! Yes - get a record
+	ELSE
+	    BEGIN				! No - call user back
+
+	    BIND ROUTINE
+		usrinp = .input_rtn;		! Set up routine
+
+	    status = usrinp (in_rec);		! Make the call
+	    END;
+
+	IF NOT .status				! Something wrong?
+	THEN
+	    BEGIN
+	    eof = true;				! Set end of file
+	    $traceo ('READ_DATA (eof)');
+	    RETURN 0;				! Return false
+	    END;
+
+	input_count = .input_count + 1;		! Bump counter
+	in_rec [inp$h_words] = 			! Do calculations
+	(.in_rec [inp$h_bytes] - 1)/.inpbpw + 1;
+
+	IF .infab [fab$v_bsz] EQL .outfab [fab$v_bsz]	! Check byte size
+	THEN
+	    output_bytes = .in_rec [inp$h_bytes]	! Accurate to the byte
+	ELSE
+	    BEGIN
+
+	    LOCAL
+		extra_bits,			! Extra bits
+		extra_inp_bytes,		! Spare input bytes
+		extra_out_bytes;		! Spare output bytes
+
+	    !
+	    !   Figure the input bytes inside whole words
+	    !
+	    output_bytes = (.in_rec [inp$h_words] - 1)*.outbpw;
+	    !
+	    !   Now the input bytes left over
+	    !
+	    extra_inp_bytes = .in_rec [inp$h_bytes] MOD .inpbpw;
+	    !
+	    !   How many bits was that?
+	    !
+	    extra_bits = .extra_inp_bytes*.infab [fab$v_bsz];
+	    !
+	    !   How many output bytes does that take?
+	    !
+	    extra_out_bytes = (.extra_bits - 1)/.outfab [fab$v_bsz] + 1;
+	    !
+	    !   Done!
+	    !
+	    output_bytes = .output_bytes + .extra_out_bytes;
+	    END;
+
+	if .kdb[kdb$v_datatype] eql xab$k_stg  then   ! Ascii?
+		BEGIN
+		in_rec [inp$h_bytes] = .in_rec [inp$h_bytes] - 2;
+		output_bytes = .output_bytes - 2;
+		END;
+
+	!+
+	!   Now that we have the input and output lengths, check
+	!   to be sure that the record is of legal length.
+	!-
+
+	status = record_ok;			! Everything's fine to start
+
+	IF .outfab [fab$v_rfm] EQL fab$k_fix	! What record format?
+	THEN
+	    BEGIN				! Check fixed format
+
+	    IF .output_bytes NEQ .outfab [fab$h_mrs]	! Wrong length
+	    THEN
+		BEGIN
+		status = xcp_record;
+		control = xcp$t_not_mrs;	! Set up message
+		faoprm [2] = .output_bytes;	! What we had
+		faoprm [3] = .outfab [fab$h_mrs];	! What it should be
+		END;
+
+	    END
+	ELSE
+	    BEGIN				! Check variable format
+
+	    IF .outfab [fab$h_mrs] NEQ 0 AND 	! Check record size?
+		.output_bytes GTR .outfab [fab$h_mrs]	! Record too big?
+	    THEN
+		BEGIN
+		status = xcp_record;		! Illegal record
+		control = xcp$t_too_big;	! Set up message
+		faoprm [2] = .output_bytes;	! What we had
+		faoprm [3] = .outfab [fab$h_mrs];	! What it should be
+		END
+	    ELSE
+
+		IF .output_bytes LSS .minimum_data_size	! Too small?
+		THEN
+		    BEGIN
+		    status = xcp_record;
+		    control = xcp$t_too_small;	! Set up message
+		    faoprm [2] = .output_bytes;	! What we had
+		    faoprm [3] = .minimum_data_size;	! What it should be
+		    END;
+
+	    END;
+
+	!+
+	!   If we have not eliminated this record because of
+	!   length problems, then test for out-of-order keys
+	!   (unless such checks are prohibited, as on the
+	!   first input).
+	!-
+
+	IF .order_checking			! Do we need to look at key?
+	THEN
+	    BEGIN
+
+	    LOCAL
+		comp_sts,			! Returned comparison value
+		this_rec : $rms_record_descriptor;
+
+	    this_rec [rec$a_user] = .lodsec OR key_buffer;
+	    this_rec [rec$h_user_size] = .kdb [kdb$h_key_size_bytes];
+	    comp_sts = $utl_ckeyku (udr = .in_rec [inp$a_data], 	!
+		recdesc = .lodsec OR this_rec, error = utlerr);	!
+
+	    IF .comp_sts EQL true		! Last key LEQ new key
+	    THEN
+		BEGIN				! New key GEQ old key
+
+		IF NOT .this_rec [rec$v_less]	! New key EQL old key
+		THEN
+
+		    IF NOT .kdb [kdb$v_dup]	! Dups allowed?
+		    THEN
+			BEGIN
+			status = xcp_record;	! No - illegal record
+			control = xcp$t_illegal_dup;	! Set up message
+			END;
+
+		END
+	    ELSE
+		BEGIN				! Key out of order
+		status = mrg_record;		! Output and merge later
+		END;
+
+	    END;				! End of order checking
+
+	!
+	!   Well, by now we know if we want to put this record
+	!   in the file, to write it to the exception file, or
+	!   to write it out and try to merge it later.
+	!
+
+	SELECTONE .status OF
+	    SET
+
+	    [record_ok] :
+		!
+		!   Update KEY_BUFFER, bump the counter,
+		!   and exit this loop.
+		!
+		BEGIN
+		$utl_movekey (keybuf = .lodsec OR key_buffer, 	! Key buffer
+		    recptr = .in_rec [inp$a_data], 	! Input record
+		    error = utlerr);		! ...
+		loaded_count = .loaded_count + 1;	! Bump counter
+		EXITLOOP;
+		END;
+
+	    [xcp_record] :
+		do_xcp_rec ();			! Write XCP record
+
+	    [mrg_record] :
+		do_mrg_rec ();			! Write MRG record
+	    TES;
+
+	END;
+
+    $traceo ('READ_DATA');
+    RETURN 1;
+    END;					! End of READ_DATA
+%SBTTL 'Routine READ_KEY_FILE'
+ROUTINE read_key_file (order_checking) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!
+! FORMAL PARAMETERS
+!
+!	NONE.
+!
+! IMPLICIT INPUTS
+!
+!	NONE.
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NONE.
+!
+! SIDE EFFECTS:
+!
+!	NONE.
+!
+!--
+
+    BEGIN
+
+    LITERAL
+	record_ok = 1,				! Record is valid
+	xcp_record = 2;				! Exception (illegal) record
+
+    LOCAL
+	comp_sts,				! Returned comparison value
+	this_rec : $rms_record_descriptor,	! Argument to CKEYKK
+	status;					! Input status
+
+    $tracei ('READ_KEY_FILE');
+
+    WHILE 1 DO
+	BEGIN
+	status = $get (rab = key_rab, err = rmserr);
+
+	IF NOT .status				! Something wrong?
+	THEN
+	    BEGIN
+	    eof = true;				! Set end of file
+	    $traceo ('READ_KEY_FILE (eof)');
+	    RETURN 0;				! Return false
+	    END;
+
+	!+
+	!   If we have not eliminated this record because of
+	!   length problems, then test for out-of-order keys
+	!   (unless we shouldn't, as on the first input).
+	!-
+
+	IF .order_checking			! Check keys?
+	THEN
+	    BEGIN
+	    !
+	    !   THIS_REC describes the "search key", which is
+	    !   the new record in the TAG_RECORD buffer.
+	    !
+	    this_rec [rec$a_user] = .lodsec OR tag_record [tag$t_key];
+	    this_rec [rec$h_user_size] = .kdb [kdb$h_key_size_bytes];
+	    !
+	    !   Compare the search key against the value in
+	    !   KEY_BUFFER, wherein lies the last key
+	    !   read in.
+	    !
+	    comp_sts = $utl_ckeykk (keybuf = .lodsec OR key_buffer, 	!
+		recdesc = .lodsec OR this_rec, error = utlerr);	!
+	    END
+	ELSE
+	    comp_sts = false;			! Pretend new key is GTR
+
+	!+
+	!   If the status returned is TRUE, then the
+	!   new key is less than or is equal to the
+	!   old key.  "Less than" would be an error, and
+	!   "equal to" is an error if duplicates are not
+	!   allowed.
+	!
+	!   If the status returned is FALSE, then the new
+	!   key is greater than the previous key, which is
+	!   as it should be.
+	!-
+
+	IF .comp_sts EQL true			! Is all well?
+	THEN
+	    BEGIN				! New key is not greater
+
+	    IF .this_rec [rec$v_less]		! Is new key a duplicate?
+	    THEN
+		BEGIN				! No - key out of order
+		RETURN $signal_error (		! This is terrible
+		    control = '!/?Out-of-order key in !J!/', !
+		    p1 = .key_fab [fab$h_jfn]);
+		END
+	    ELSE
+		BEGIN				! This IS a duplicate
+		$trace ('New key EQL old one');
+
+		IF .kdb [kdb$v_dup]		! Dups allowed?
+		THEN
+		    BEGIN
+		    $trace ('...and duplicates ARE allowed');
+		    secondary_dup = true;	! Make note: legal dup
+		    END
+		ELSE
+		    BEGIN
+		    $trace ('...but duplicates ARE NOT allowed');
+		    secondary_dup = false;	! Forget it: illegal dup
+		    status = xcp_record;	! No - illegal record
+		    control = xcp$t_ill_sec_dup;	! Set up message
+		    faoprm [1] = .kdb [kdb$h_reference];
+		    END;
+
+		END;
+
+	    END
+	ELSE
+	    BEGIN				! Key is in right order
+	    $trace ('New key GTR old one: all OK');
+	    secondary_dup = false;		! Clear dups flag
+	    END;
+
+	!+
+	!   Well, by now we know if we want to put this record
+	!   in the file, to write it to the exception file, or
+	!   to write it out and try to merge it later.
+	!-
+
+	SELECTONE .status OF
+	    SET
+
+	    [record_ok] :
+		!
+		!   Update KEY_BUFFER, bump the counter,
+		!   and exit this loop.
+		!
+		BEGIN
+		$trace ('Record OK');
+
+		IF NOT .secondary_dup		! Do we have to update key?
+		THEN
+		    BEGIN
+		    $trace ('Copying new key to key buffer');
+		    $copy_words (		! Copy this key
+			.lodsec OR tag_record [tag$t_key], 	! From here
+			.lodsec OR key_buffer, 	! To here
+			.kdb [kdb$h_key_size_words]);	! Length to move
+		    END;
+
+		EXITLOOP;
+		END;
+
+	    [xcp_record] :
+		BEGIN
+		$trace ('Record has a problem');
+		sec_xcp_rec ();			! Write XCP record
+		END;
+	    TES;
+
+	END;
+
+    $traceo ('READ_KEY_FILE');
+    RETURN 1;
+    END;					! End of READ_KEY_FILE
+%SBTTL 'Routine SEC_XCP_REC'
+ROUTINE sec_xcp_rec =
+    BEGIN
+
+    LOCAL
+	current_key,				! Save key here
+	rd_packet : $rms_record_descriptor,	! Record descriptor packet
+	xcp_bdesc : $rms_bucket_descriptor,
+	xcp_bkt : $rms_bucket_header,
+	xcp_rec : $rms_user_data_record;
+
+    $tracei ('SEC_XCP_REC');
+    !
+    !	Find the record specified by the tag-file's RFA
+    !
+    current_key = .kdb [kdb$h_reference];	! Save current key
+    kdb = .rmssec OR $utl_getkdb (key_of_reference = 0, 	!
+		error = utlerr);
+    rd_packet [rec$g_rfa] = .tag_record [tag$g_rfa];	! Set up RFA
+    rd_packet [rec$a_record] = 0;		! Search whole bucket
+    $utl_fbyrfa (				! Find the record
+	recdesc = .lodsec OR rd_packet, 	! Record RFA
+	bucket = .lodsec OR xcp_bdesc, 		! Bucket to hold it
+	error = utlerr);			! ...
+    kdb = .rmssec OR $utl_getkdb (key_of_reference = .current_key, 	!
+		error = utlerr);
+    xcp_rec = .rmssec OR .rd_packet [rec$a_record];	! Set pointer
+
+    !+
+    !	We now have a record which has at least one
+    !	duplicate secondary key.  If it has not been
+    !	deleted, then bump the XCP counter and
+    !	decrement the Loaded counter.
+    !	Write the data to the XCP file with an
+    !	appropriate entry in the LIS file.
+    !
+    !	If it has been deleted already, don't do anything.
+    !-
+
+    IF NOT .xcp_rec [udr$v_deleted]		! Is record still valid?
+    THEN
+	BEGIN					! Yes - process appropriately
+	$trace ('Record has not been deleted - delete it');
+	xcp_count = .xcp_count + 1;		! Bump counter
+	loaded_count = .loaded_count - 1;	! Decrement this counter
+
+	!+
+	!   How big a record are we writing?
+	!-
+
+	IF .outfab [fab$v_rfm] EQL fab$k_fix	! Fixed or variable
+	THEN
+	    xcp_rab [rab$h_rsz] = .outfab [fab$h_mrs]	! Size is MRS
+	ELSE
+	    xcp_rab [rab$h_rsz] = .xcp_rec [udr$h_size];	! From record
+
+	xcp_rab [rab$a_rbf] = .xcp_rec + .udr_header_length;	! Point at it
+	$put (rab = xcp_rab, err = rmserr);	! Write it out
+	faoprm [0] = .xcp_count;		! Which XCP record
+	$faol (ctrstr = .control, outbuf = lstdsc, 	! Write to LIS file
+	    prmlst = faoprm, outlen = lstlen);	!
+	lst_rab [rab$h_rsz] = .lstlen;		! Length of output
+	lst_rab [rab$a_rbf] = lstbuf;		! Address of data
+	$put (rab = lst_rab, err = rmserr);	! Write LIS item
+
+	!+
+	!   Delete the record and update the bucket.
+	!-
+
+	xcp_rec [udr$v_deleted] = 1;		! Delete record
+	$utl_putbkt (update = 1, 		! Write it out
+	    bucket = .lodsec OR xcp_bdesc, 	! ...
+	    error = utlerr);			! ...
+	END;
+
+    $traceo ('SEC_XCP_REC');
+    RETURN lod$_success;
+    END;					! End of SEC_XCP_REC
+%SBTTL 'Routine DO_XCP_REC'
+ROUTINE do_xcp_rec =
+    BEGIN
+    $tracei ('DO_XCP_REC');
+    !
+    !	Bump the counter and write out the XCP record
+    !
+    xcp_count = .xcp_count + 1;
+    xcp_rab [rab$h_rsz] = .output_bytes;
+    xcp_rab [rab$a_rbf] = .in_rec [inp$a_data];
+    $put (rab = xcp_rab, err = rmserr);
+    faoprm [0] = .xcp_count;
+    faoprm [1] = .input_count;			! Which record failed?
+    $faol (ctrstr = .control, outbuf = lstdsc, 	!
+	prmlst = faoprm, outlen = lstlen);
+    lst_rab [rab$h_rsz] = .lstlen;		! Length of output
+    lst_rab [rab$a_rbf] = lstbuf;		! Address of data
+    $put (rab = lst_rab, err = rmserr);
+    $traceo ('DO_XCP_REC');
+    RETURN lod$_success;
+    END;					! End of DO_XCP_REC
+%SBTTL 'Routine DO_MRG_REC'
+ROUTINE do_mrg_rec =
+    BEGIN
+    $tracei ('DO_MRG_REC');
+    !
+    !	Bump the counter and write out the MRG record
+    !
+    mrg_count = .mrg_count + 1;
+    mrg_rab [rab$h_rsz] = .output_bytes;
+    mrg_rab [rab$a_rbf] = .in_rec [inp$a_data];
+    $put (rab = mrg_rab, err = rmserr);
+    $traceo ('DO_MRG_REC');
+    RETURN lod$_success;
+    END;					! End of DO_MRG_REC
+%SBTTL 'Routine LODINP'
+ROUTINE lodinp (inrec : REF $lod_input_descriptor) =
+    BEGIN
+	$tracei ('LODINP');
+    $get (rab = inrab, err = rmserr);
+
+    IF .inrab [rab$h_sts] NEQ rms$_normal	! Not OK?
+    THEN
+	BEGIN
+	RETURN 0;				! Return false
+	END
+    ELSE
+	BEGIN					! Set up descriptor
+	inrec [inp$a_data] = .inrab [rab$a_rbf];
+
+	IF .inrab [rab$a_rbf] NEQ .inrab [rab$a_ubf]	! Our or RMS's buffers?
+	THEN
+	    inrec [inp$a_data] = .inrec [inp$a_data] OR .rmssec	! RMS's buffers
+	ELSE
+	    inrec [inp$a_data] = .inrec [inp$a_data] OR .lodsec;	! Ours
+
+	inrec [inp$h_bytes] = .inrab [rab$h_rsz];
+	$traceo ('LODINP');
+	RETURN 1;				! Return true
+	END;
+
+    END;					! End of LODINP
+%SBTTL 'RMSERR - signal an RMS error'
+ROUTINE rmserr (jsys_code, 			! JSYS which bombed
+    rms_block : REF BLOCK []
+
+    FIELD
+    (fab$r_fields, rab$r_fields), 		!
+    rms_status) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	RMSERR is called when an RMS error occurs.  It has the
+!	standard RMS error routine interface, which receives the
+!	JSYS code, the block address, and the status code as
+!	arguments.  If the status code is EOF, RMSERR returns a
+!	0; otherwise, it prepares an FAO control string and
+!	parameter list to describe the error.  It then SIGNALs an
+!	error, and the LODLOD condition handler, LODHDL, catches
+!	the signal, outputs the message, and (probably) unwinds,
+!	after performing some cleanup.
+!
+! FORMAL PARAMETERS
+!
+!	JSYS_CODE	- the RMS JSYS or call which failed
+!	RMS_BLOCK	- the RMS argument block given to the
+!			  call; this is declared here with both
+!			  FAB and RAB fields declared to provide
+!			  a generalized RMS block, because the block
+!			  may be either a FAB or a RAB.
+!	RMS_STATUS	- error status; good for a quick check
+!
+!
+! IMPLICIT INPUTS
+!
+!	NONE.
+!
+! ROUTINE VALUE:
+!
+!	Zero if EOF; no return expected otherwise
+!
+! SIDE EFFECTS:
+!
+!	NONE.
+!
+!--
+
+    BEGIN
+
+    BIND
+	jsys_msgs = UPLIT (			! Table of messages
+	    $stptr ('opening'),			! $OPEN
+	    $stptr ('closing'),			! $CLOSE,
+	    $stptr ('reading record from'),	! $GET
+	    $stptr ('writing record to'),	! $PUT
+	    $stptr ('updating record in'),	! $UPDATE
+	    $stptr ('deleting record from'),	! $DELETE
+	    $stptr ('locating record in'),	! $FIND
+	    $stptr ('truncating'),		! $TRUNCATE
+	    $stptr ('connecting to'),		! $CONNECT
+	    $stptr ('disconnecting from'),	! $DISCONNECT
+	    $stptr ('creating'),		! $CREATE
+	    $stptr ('setting debugging'),	! $DEBUG
+	    $stptr ('releasing record in'),	! $RELEASE
+	    $stptr ('flushing buffers of'),	! $FLUSH
+	    $stptr ('enabling messages'),	! $MESSAGE
+	    $stptr ('disabling messages'),	! $NOMESSAGE
+	    $stptr ('displaying attributes of'),	! $DISPLAY
+	    $stptr ('deleting the file'),	! $ERASE
+	    $stptr ('freeing all records in'),	! $FREE
+	    $stptr ('making a utility call')) : VECTOR [];
+
+    BIND
+	bugctl = $fao_ctl (			! Strange bug
+		'!/?RMS JSYS !4OW returned error status !OW!/'),
+	jfnctl = $fao_ctl (			! File error
+		'!/?RMS error !OW (!OW) encountered when !AZ !J!/'),
+	fnactl = $fao_ctl (			! File error
+		'!/?RMS error !OW (!OW) encountered when !AZ !AZ!/'),
+	nflctl = $fao_ctl (			! Non-file error
+		'!/?RMS error !OW encountered when !AZ !/');
+
+    LOCAL
+	errfna,					! FNA of error FAB
+	errjfn;					! JFN of error
+
+    !+
+    !	Don't let an EOF go any further.
+    !-
+
+    IF .rms_status EQL rms$_eof THEN RETURN 0;
+
+    CASE .jsys_code				! What do we do?
+    FROM rms$open_jsys TO rms$utlint_jsys OF
+	SET
+
+	[rms$debug_jsys, rms$message_jsys, rms$nomessage_jsys] :
+	    BEGIN
+	    errctl = nflctl;
+	    errprm [0] = .rms_status;
+	    errprm [1] = .jsys_msgs [.jsys_code - %O'1000'];
+	    END;
+
+	[INRANGE] :
+	    BEGIN
+	    errprm [0] = .rms_status;
+	    errprm [1] = .rms_block [fab$h_stv];	! Pretend it's a FAB
+	    errprm [2] = .jsys_msgs [.jsys_code - %O'1000'];
+
+	    !+
+	    !	Get the JFN
+	    !-
+
+	    IF .rms_block [fab$h_bid] EQL fab$k_bid	! This is a FAB
+	    THEN
+		BEGIN
+		errfna = .rms_block [fab$a_fna];	! Get filename
+		errjfn = .rms_block [fab$h_jfn];	! Get JFN easily
+		END
+	    ELSE
+		BEGIN				! Get JFN with difficulty
+
+		LOCAL
+		    tmpfab : REF $fab_decl;
+
+		tmpfab = .rms_block [rab$a_fab];	! Point at FAB
+		errfna = .tmpfab [fab$a_fna];	! Get filename
+		errjfn = .tmpfab [fab$h_jfn];	! Now get the JFN
+		END;
+
+	    !+
+	    !	If we have no JFN, then use the FNA field.
+	    !-
+
+	    IF .errjfn EQL 0			! No JFN?
+	    THEN
+		BEGIN				! Use FNA instead
+		errctl = fnactl;		! Set up control string
+		errprm [3] = CH$PTR (.errfna);	! Point at ASCII filename
+		END
+	    ELSE
+		BEGIN
+		errctl = jfnctl;		! Use JFNS for filename
+		errprm [3] = .errjfn;		! Pass the JFN
+		END;
+
+	    END;
+
+	[OUTRANGE] :
+	    BEGIN
+	    errctl = bugctl;
+	    errprm [0] = .jsys_code;
+	    errprm [1] = .rms_status;
+	    END;
+	TES;
+
+    RETURN SIGNAL (lod$_bug, .errctl, errprm);	! Signal an error
+    END;					! End of RMSERR
+%SBTTL 'UTLERR - signal a UTLINT error'
+ROUTINE utlerr (jsys_code, 			! JSYS which bombed
+    rms_block : REF BLOCK []
+
+    FIELD
+    (fab$r_fields, rab$r_fields), 		!
+    rms_status) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	UTLERR is called when a $UTLINT error occurs.  It has the
+!	standard RMS error routine interface, which receives the
+!	JSYS code, the block address, and the status code as
+!	arguments.  If the status code is EOF, UTLERR returns a
+!	0; otherwise, it prepares an FAO control string and
+!	parameter list to describe the error.  It then SIGNALs an
+!	error, and the LODLOD condition handler, LODHDL, catches
+!	the signal, outputs the message, and (probably) unwinds,
+!	after performing some cleanup.
+!
+! FORMAL PARAMETERS
+!
+!	JSYS_CODE	- the RMS JSYS or call which failed: always $UTLINT
+!	RMS_BLOCK	- the RMS argument block given to the
+!			  call; this is declared here with both
+!			  FAB and RAB fields declared to provide
+!			  a generalized RMS block, because the block
+!			  may be either a FAB or a RAB.
+!	RMS_STATUS	- error status; good for a quick check
+!
+!
+! IMPLICIT INPUTS
+!
+!	NONE.
+!
+! ROUTINE VALUE:
+!
+!	No return expected
+!
+! SIDE EFFECTS:
+!
+!	NONE.
+!
+!--
+
+    BEGIN
+
+    BIND
+	utlctl = $fao_ctl (			! Strange bug
+		'!/?RMS utility interface error: status !OW!/');
+
+    errctl = utlctl;				! Utility error
+    errprm [0] = .rms_status;			! Status code
+    RETURN SIGNAL (lod$_bug, .errctl, errprm);	! Signal an error
+    END;					! End of UTLERR
+%SBTTL 'LODHDL - condition handler'
+ROUTINE lodhdl (sig : REF VECTOR, mech : REF VECTOR, enbl : REF VECTOR) =
+    BEGIN
+
+    BIND
+	cond = sig [1],
+	retval = mech [1],
+	printmsg = .enbl [1],
+	ctrl = sig [2],
+	fprm = .sig [3] : VECTOR;
+
+    IF .cond EQL ss$unw				! Unwinding?
+    THEN
+	RETURN 0;				! Resignal
+
+    IF .printmsg				! Can we print anything
+    THEN
+	BEGIN
+	!
+	!   Format the message
+	!
+	$faol (ctrstr = .ctrl, prmlst = fprm, outbuf = errdsc, outlen = errlen);
+	!
+	!   Open the FAB, write the message, etc.
+	!
+	$open (fab = errfab);
+	$connect (rab = errrab);
+	errrab [rab$h_rsz] = .errlen;		! Length to output
+	$put (rab = errrab);
+	$close (fab = errfab);
+	END;
+
+    retval = lod$_bug;				! Return an error
+    SETUNWIND ();				! Unwind
+    RETURN 0;
+    END;					! End of LODHDL
+END						! End of Module LOADER
+
+ELUDOM
+    

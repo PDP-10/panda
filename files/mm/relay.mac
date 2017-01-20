@@ -1,0 +1,479 @@
+	TITLE RELAY Module to handle hosts defined in MAILER-RELAY-INFO.TXT
+	SUBTTL Written by C. Hedrick/CLH/MRC
+
+	SEARCH MACSYM,MONSYM	;System definitions
+	SALL			;Suppress macro expansions
+	.DIRECTIVE FLBLST	;Sane listings for ASCIZ, etc.
+
+	EXTERN $ADDOM,CPYSTR
+	EXTERN RLYTBL,RLYPGS
+
+; Definitions
+
+A=1				;JSYS/argument passing
+B=2				;...
+C=3				;...
+D=4				;...
+;P=17				;Stack pointer
+
+; Character definitions
+
+.CHDQT==42			;Double quote
+	SUBTTL Impure storage
+
+	.PSECT DATA
+
+BRCHAR:	BLOCK 1			;Break char, in INIRLY
+RLYJFN:	BLOCK 1			;JFN for reading RELAYS.TXT
+RLYSTK:	BLOCK 1			;Saved P for nonlocal exit in INIRLY
+MEMALC:	BLOCK 1			;Address of memory allocator
+HSTNME:	BLOCK 1			;Address of hostname
+DMTBLL==50
+DOMTAB:	BLOCK DMTBLL+1		;TBLUK table for pseudo-domains
+
+STRBFL==30			;Length of string buffers
+STRBFR:	BLOCK STRBFL		;String buffer, used globally
+	SUBTTL Relay code
+
+;Basic data structures:
+
+DM%LEN==:3	;Pseudo-domain block:
+DM%NAM==:0	;   Pointer to ASCIZ name of the pseudo-domain
+DM%RLY==:1	;   Pointer to a list of hosts that will relay to this pseudo-domain
+DM%TRN==:2	;   Pointer to ASCIZ text to be used for transmogrification.
+		;	The first character is % or . and the rest are a host
+		;	name.  foo@HOST will transmogrify to foo%HOST@new-host
+
+HS%LEN==2	;Host block:
+HS%DOM==0	;   Address of pseudo-domain descriptor block
+HS%CAN==1	;   Canonical name of host, including .PSEUDO-DOMAIN, ASCIZ
+
+		;Nickname block:
+		;   Nickname, ASCIZ, including .PSEUDO-DOMAIN  
+
+		;TBLUK tables:
+		;   Hosts/nicknames
+		;   Pseudo-domains
+
+	.ENDPS
+	.PSECT CODE
+
+; $GTRLY - Gets a relay host name
+; Accepts:
+;	a/ pointer to host name
+;	CALL $GTRLY
+; Returns +1: Failure
+;	  +2: Success, with pointer to canonical name in A, pseudo-domain block in B
+
+$GTRLY::SAVEAC <C,D>
+	STKVAR <HSTPTR,DOMPTR,<STRBF1,STRBFL>>
+	TXC A,.LHALF		; is source LH -1?
+	TXCN A,.LHALF
+	 HRLI A,(<POINT 7,>)	; yes, set up byte pointer
+	MOVEM A,HSTPTR
+;We want the match to be exact, except that the user may omit
+;the pseudo-domain.  The strings in the table all have pseudo-domains.  The
+;easiest way to do this is (1) if the user supplies a pseudo-domain
+;force the match to be exact; (2) if not, stick on a dot and
+;then allow any match that doesn't have TL%NOM set.
+
+;First question.  Does the user's string include a pseudo-domain?
+	SETZM DOMPTR
+	DO.
+	  ILDB B,A
+	  CAIN B,"."
+	   MOVEM A,DOMPTR
+	  JUMPN B,TOP.
+	ENDDO.
+	SKIPN B,DOMPTR		;If have a pseudo-domain candidate
+	IFSKP.
+	  MOVEI A,DOMTAB	;Is it really a pseudo-domain and not just
+	  TBLUK%		;part of the host name
+	ANDXN. B,TL%EXM		;Have a pseudo-domain?
+	  HRRZM A,DOMPTR	;Save pointer to pseudo-domain block
+	  MOVE B,HSTPTR		;Do an exact match
+	  MOVEI A,RLYTBL
+	  TBLUK%
+	  IFXE. B,TL%EXM	;Host is unknown
+	    HRRZ B,@DOMPTR	;Return pseudo-domain block in B
+	    MOVE A,HSTPTR	;And host name in A
+	    RETSKP
+	  ENDIF.
+	ELSE.
+;No, stick on a dot and allow anything
+	  MOVEI A,STRBF1
+	  HRLI A,<(POINT 7,)>
+	  MOVE B,HSTPTR		;Have to copy to STRBFR
+	  MOVX D,<STRBFL*5>-2	;Space for dot and null
+	  DO.
+	    ILDB C,B		;Copy string sans null
+	    IFN. C
+	      IDPB C,A		;Non-null
+	      SOJGE D,TOP.	;Still more possible
+	      RET		;String impossibly long
+	    ENDIF.
+	  ENDDO.
+	  MOVEI C,"."		;Now add the dot
+	  IDPB C,A
+	  SETZ C,
+	  IDPB C,A
+	  MOVEI A,RLYTBL
+	  MOVE B,[POINT 7,STRBF1]
+	  TBLUK%
+	  JXN B,TL%NOM,R	;Any match is OK here
+	ENDIF.
+	HRRZ A,(A)		;Address of host block
+	MOVE B,HS%DOM(A)	;Pseudo-domain block
+	HRRI A,HS%CAN(A)	;Name
+	HRLI A,(<POINT 7,>)	;Make pointer
+	RETSKP
+
+	ENDSV.
+
+;INIRLY sets up the tables involving relaying.  Here is the file format:
+
+;RELAY MIT-CHAOS,%MC.LCS.MIT.EDU,MC.LCS.MIT.EDU,XX.LCS.MIT.EDU
+;       pseudo-domain name
+;		  string for transmogrification
+;			  list of hosts you can relay via
+;RELAY SU-NET,%SCORE.STANFORD.EDU,SCORE.STANFORD.EDU,SUMEX-AIM.STANFORD.EDU
+;HOST MIT-CHAOS,OZ.AI.MIT.EDU
+;     pseudo-domain name
+;	     primary name, without pseudo-domain
+;	       	       nicknames, any pseudo-domains will be ignored
+;HOST SU-NET,TINY.STANFORD.EDU,SUMEX-2020
+
+;INIRLY
+; A/ address of ALCBLC.  This routine takes a block size in A and
+;	returns a block of that size in B.
+; B/ address of HSTNAM.  This routine takes a string in B and returns
+;	the representation that the caller wants for a host.  It is
+;	used to construct lists of hosts for relaying.  If the caller
+;	passes 0, host lists will not be constructed.
+;return + 1 always, with address of DOMTAB in A
+
+$INRLY::SAVEAC <B,C,D>
+	ACVAR <T,TT>
+	STKVAR <BLKSIZ,HSTBLK>
+	MOVEM A,MEMALC		;Save address of memory allocator
+	MOVEM B,HSTNME		;And address of host name thing
+	MOVEM P,RLYSTK		;Save P for nonlocal exit at EOF
+	MOVEI A,<RLYPGS*1000>-1	;Init TBLUK tables
+	MOVEM A,RLYTBL
+	MOVEI A,DMTBLL
+	MOVEM A,DOMTAB
+	MOVX A,GJ%SHT!GJ%OLD!GJ%PHY
+	HRROI B,[ASCIZ/MAIL:MAILER-RELAY-INFO.TXT/]
+	GTJFN%
+	 ERJMP INRRET
+	MOVEM A,RLYJFN
+	MOVX B,7B5!OF%RD
+	OPENF%
+	IFJER.
+	  MOVE A,RLYJFN
+	  RLJFN%
+	   NOP
+	  TMSG <%Can't open MAIL:MAILER-RELAY-INFO.TXT
+>
+	  JRST INRRET
+	ENDIF.
+	SETZ T,
+	DO.
+	  CALL RDATOM		;Get an atom
+	  MOVE C,STRBFR		;Now look at the atom
+	  ANDCM C,[1+<BYTE (7) 040,040,040,040,040>] ;Upper caseify
+	  CAMN C,[ASCII/RELAY/]
+	   JRST RDDOM
+	  CAMN C,[ASCII/HOST/]
+	   JRST RDHST
+
+RDEOL:	  MOVE A,RLYJFN
+	  MOVE B,BRCHAR
+	  DO.
+	    CAIN B,.CHLFD
+	     EXIT.
+	    BIN%
+	     ERJMP RLYEOF
+	    LOOP.
+	  ENDDO.
+	  LOOP.
+
+DM%LEN=3	;Pseudo-domain block:
+DM%NAM=0	;   Pointer to ASCIZ name of the pseudo-domain
+DM%RLY=1	;   Pointer to a list of hosts that will relay to this pseudo-domain
+DM%TRN=2	;   Pointer to ASCIZ text to be used for transmogrification.
+		;	The first character is % or . and the rest are a host
+		;	name.  foo@HOST will transmogrify to foo%HOST@new-host
+
+HS%LEN=2	;Host block:
+HS%DOM=0	;   Address of pseudo-domain descriptor block
+HS%CAN=1	;   Canonical name of host, including .PSEUDO-DOMAIN, ASCIZ
+
+
+
+;Here for RELAY command.  Build up a pseudo-domain block, and add it to DOMTAB.
+;  The relay list is built up in T
+RDDOM:	  SETZ T,		;Start with empty list
+	  MOVEI A,DM%LEN	;Generate pseudo-domain block
+	  CALL @MEMALC
+	  IFNSK.
+	    TMSG <%No space for pseudo-domain block - please report this
+>
+	    JRST RLYEOF
+	  ENDIF.
+	  MOVE TT,B
+	  MOVE A,RLYJFN
+	  MOVX B,"$"		;Funny initial character
+	  MOVE C,[POINT 7,STRBFR]
+	  MOVX D,<STRBFL*5>-2	;Max keyword length
+	  SETZM STRBFR		;Clear the guy first
+	  IDPB B,C		;Stuff that in
+	  CALL RDATM1		;Pseudo-domain name
+	  LDB A,[POINT 7,STRBFR,13] ;Make sure there is one
+	  IFE. A
+	    TMSG <%Missing pseudo-domain name
+>
+	    JRST RDEOL
+	  ENDIF.
+	  MOVEI A,STRBFR
+	  CALL CPYSTR		;Copy it into free space
+	  MOVEM B,DM%NAM(TT) 
+	  MOVE A,RLYJFN
+	  DO.
+	    BIN%
+	     ERJMP RLYEOF
+	    CAIE B,.CHCRT
+	     CAIN B,.CHLFD
+	     IFNSK.
+	       TMSG <%Missing transmogrification character
+>
+	       JRST RDEOL
+	     ENDIF.
+	    CAIE B,.CHSPC
+	     CAIN B,.CHTAB	;Skip space
+	      LOOP.
+	  ENDDO.
+	  MOVE C,[POINT 7,STRBFR]
+	  SETZM STRBFR
+	  IDPB B,C		;Put funny char at beginning of name
+	  MOVX D,<STRBFL*5>-2	;Max keyword length
+	  CALL RDATM1		;Now read host for transmogrification
+	  MOVEI A,STRBFR
+	  CALL CPYSTR		;Copy it into free space
+	  MOVEM B,DM%TRN(TT) 
+	  MOVE A,RLYJFN
+	  DO.			;Now make up relay list
+	    CALL RDATOM		;Host name into STRBFR
+	    SKIPN STRBFR	;Check for syntax error
+	    IFSKP.
+	      MOVE B,[POINT 7,STRBFR]
+	      CALL RLCONS
+	    ENDIF.
+	    MOVE B,BRCHAR
+	    CAIE B,.CHCRT
+	    IFSKP.
+	      BIN%
+	       ERJMP RLYEOF
+	    ENDIF.
+	    CAIE B,.CHLFD
+	     LOOP.
+	  ENDDO.
+	  MOVEM T,DM%RLY(TT)	;T (from RLCONS) is now relay list
+	  MOVEI A,DOMTAB	;Now add it to pseudo-domain table
+	  HRL B,DM%NAM(TT)	;Get name,,pseudo-domain block
+	  HRR B,TT
+	  TBADD%		;And add to table
+	   ERCAL TBADLZ
+	  MOVE A,RLYJFN		;Get back JFN
+	  LOOP.	
+
+;Here for HOST command.  Build up the RELAY spec in T
+;Build a host block and nickname blocks, and add to RLYTBL
+
+RDHST:	  MOVX B,"$"		;Funny initial character
+	  MOVE C,[POINT 7,STRBFR]
+	  MOVX D,<STRBFL*5>-2	;Max keyword length
+	  SETZM STRBFR		;Clear the guy first
+	  IDPB B,C		;Stuff that in
+	  CALL RDATM1		;Pseudo-domain name
+	  LDB A,[POINT 7,STRBFR,13] ;Make sure there is one
+	  JUMPE A,RDEOL		;Ignore line
+	  HRROI B,STRBFR	;And look up pseudo-domain
+	  MOVEI A,DOMTAB	;In pseudo-domain table
+	  TBLUK%
+	  JXE B,TL%EXM,RDEOL	;Don't worry about host if no match
+	  HRRZ TT,(A)		;Get pseudo-domain block for this pseudo-domain
+	  MOVE A,RLYJFN
+	  CALL RDATOM		;Now main name
+	  SETO A,		;Need to back over null
+	  ADJBP A,C		;Host
+	  HRRO B,DM%NAM(TT)	;Pseudo-domain
+	  CALL $ADDOM
+	  IBP A
+	  MOVEI A,-STRBFR+2(A)	;Size of block needed
+	  MOVEM A,BLKSIZ	;Save for later
+	  CALL @MEMALC		;Address of block to B
+	  IFNSK.
+	    TMSG <%No space for host block - please report this
+>
+	    JRST RDEOL
+	  ENDIF.
+	  MOVEM B,HSTBLK	;This is the host block
+	  HRLI A,STRBFR		;Copy name to block
+	  HRRI A,1(B)		;Leave one word for code
+	  MOVE C,BLKSIZ
+	  ADD C,B
+	  BLT A,-1(C)		;Name
+	  MOVEM TT,(B)		;Put in list of relay hosts
+	  HRLI B,1(B)		;Now have nickname,,host block
+	  MOVEI A,RLYTBL
+	  TBADD%
+	   ERCAL TBADLZ
+	  MOVE A,RLYJFN
+	  MOVE B,BRCHAR
+	  DO.
+	    MOVE B,BRCHAR
+	    CAIE B,.CHCRT
+	    IFSKP.
+	      BIN%
+	       ERJMP RLYEOF
+	    ENDIF.
+	    CAIN B,.CHLFD
+	     EXIT.
+	    CALL RDATOM		  
+	    SKIPN STRBFR	;Check for syntax error
+	    IFSKP.
+	      SETO A,		;Need to back over null
+	      ADJBP A,C		;Host
+	      HRRO B,DM%NAM(TT)	;Pseudo-domain
+	      CALL $ADDOM
+	      IBP A
+	      MOVEI A,-STRBFR+1(A) ;Size of block needed
+	      MOVEM A,BLKSIZ	;Save for later
+	      CALL @MEMALC	;Addr of block to B
+	      IFNSK.
+		TMSG <%No space for relay block - please report this
+>
+		JRST RDEOL
+	      ENDIF.
+	      HRLI A,STRBFR	;Copy name to block
+	      HRRI A,(B)
+	      MOVE C,BLKSIZ
+	      ADD C,B
+	      BLT A,-1(C)	;Name
+	      HRL B,B		;Now have nickname,,host block
+	      HRR B,HSTBLK
+	      MOVEI A,RLYTBL
+	      TBADD%
+	       ERCAL TBADLZ
+	      MOVE A,RLYJFN
+	    ENDIF.
+	    LOOP.
+	  ENDDO.
+	  LOOP.	
+	ENDDO.
+
+RLYEOF:	MOVE P,RLYSTK		;Restore stack for nonlocal exit
+	MOVE A,RLYJFN
+	CLOSF%
+	 NOP
+INRRET:	MOVEI A,DOMTAB		;Return pseudo-domain table
+	RET
+
+TBADLZ:	SAVEAC <A,B,C>
+	TMSG <%Entry in MAIL:MAILER-RELAY-INFO.TXT ">
+	HLRO A,B		;Name that couldn't be added
+	PSOUT%
+	TMSG <" ignored - >
+	MOVX A,.PRIOU		;To primary output
+	HRLOI B,.FHSLF		;This process,,last error
+	SETZ C,			;No limit
+	ERSTR%
+	 NOP
+	 NOP
+	TMSG <
+>
+	RET
+
+	ENDSV.	
+
+;RDATOM
+;A - jfn
+;B - returns break char
+;C - returns updated pointer to STRBFR
+;Jumps to RLYEOF at end
+;sets BRCHAR to break char
+
+RDATOM:	SETZM STRBFR
+	MOVE C,[POINT 7,STRBFR]	;Place to put keyword
+	MOVX D,<STRBFL*5>-1	;Max keyword length
+RDATM1:	DO.
+	  BIN%
+	   ERJMP RLYEOF
+	  CAIE B,.CHSPC		;Skip spaces
+	   CAIN B,.CHTAB
+	    LOOP.
+	ENDDO.
+	DO.			;Collect an atom
+	  CAIE B,.CHSPC		;Stop at break chars
+	   CAIN B,.CHTAB
+	    EXIT.
+	  CAIE B,","
+	   CAIGE B,.CHSPC
+	    EXIT.
+	  IDPB B,C		;Else file it away
+	  SOJLE D,[TMSG <%Atom too long in MAILER-RELAY-INFO.TXT
+>
+		   JRST RLYEOF]
+	  BIN%
+	   ERJMP RLYEOF
+	  LOOP.
+	ENDDO.
+	MOVEM B,BRCHAR
+	SETZ B,
+	IDPB B,C
+	MOVE B,BRCHAR
+	RET
+
+;B - string pointer to relay host name
+;T - old list
+;returns T - new list
+RLCONS:	SKIPN HSTNME		;Does the user want relay host lists?
+	 RET			;No, forget it
+	SAVEAC <A,C>
+	STKVAR <HSTPTR>
+	CALL @HSTNME		;Convert string pointer to host pointer
+	 RET
+	IFN. T			;First item?
+	  MOVEI A,1		;No, need to CONS up list element
+	  MOVEM B,HSTPTR	;Save pointer
+	  CALL @MEMALC
+	  IFNSK.
+	    TMSG <%No space for cons block - please report this
+>
+	    RET			;This should be impossible
+	  ENDIF.
+	  MOVE A,HSTPTR		;Put address of new entry
+	  HRRZM A,(B)		;In free word we just got
+	  MOVEI A,T		;A := current entry
+	  DO.
+	    HLRZ C,(A)		;Get next in list
+	    IFN. C		;End of list?
+	      MOVEI A,(C)	;No, make this the current entry
+	      LOOP.		;Run down rest of list
+	    ENDIF.
+	  ENDDO.
+	  HRLM B,(A)		;Put new entry at end of list
+	ELSE.
+	  MOVE T,B		;First time, just use T
+	ENDIF.
+	RET
+
+	ENDAV.
+	ENDSV.	  
+
+...LIT:	XLIST
+	LIT
+	LIST
+
+	END

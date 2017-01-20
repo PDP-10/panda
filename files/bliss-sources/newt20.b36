@@ -1,0 +1,574 @@
+!	COPYRIGHT (c) DIGITAL EQUIPMENT CORPORATION 1985, 1989.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A  LICENSE AND MAY BE USED AND  COPIED
+!	ONLY IN  ACCORDANCE  WITH  THE  TERMS OF  SUCH  LICENSE  AND  WITH  THE
+!	INCLUSION OF THE ABOVE  COPYRIGHT NOTICE.  THIS  SOFTWARE OR ANY  OTHER
+!	COPIES THEREOF MAY NOT BE PROVIDED  OR OTHERWISE MADE AVAILABLE TO  ANY
+!	OTHER PERSON.  NO  TITLE TO  AND OWNERSHIP  OF THE  SOFTWARE IS  HEREBY
+!	TRANSFERRED.
+!
+!	THE INFORMATION IN THIS  SOFTWARE IS SUBJECT  TO CHANGE WITHOUT  NOTICE
+!	AND SHOULD  NOT  BE CONSTRUED  AS  A COMMITMENT  BY  DIGITAL  EQUIPMENT
+!	CORPORATION.
+!
+!	DIGITAL ASSUMES NO  RESPONSIBILITY FOR  THE USE OR  RELIABILITY OF  ITS
+!	SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+
+!
+! This is the TOPS-20 System Specific portion of the MXUFIL utility module.
+!
+
+
+%routine ('ALLOC_BUFFER', FILE : ref FILE_DATA_BLOCK) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!     This routine adds a buffer to the buffer ring, or creates a buffer
+!     ring if none exists.
+!
+! FORMAL PARAMETERS
+!
+!	.FILE     The address of the FILE DATA BLOCK
+!
+! IMPLICIT INPUTS
+!
+!	NONE.
+!
+! ROUTINE VALUE:
+!
+!	$TRUE if successful
+!       $FALSE otherwise
+!
+! SIDE EFFECTS:
+!
+!	NONE.
+!
+!--
+
+    BEGIN
+    BIND
+        first_buffer = .file [fd_current_buffer] : buffer_data_block;
+
+    LOCAL
+         buffer : REF buffer_data_block;
+
+    EXTERNAL ROUTINE
+             nmu$page_get;
+
+    buffer = nmu$memory_get (buffer_data_block_allocation);
+
+    buffer [bd_valid] = $false;
+
+    !
+    ! Get the number of a page to use as a buffer.
+    !
+
+    IF (buffer [bd_address] = nmu$page_get ()) EQL 0
+    THEN
+        BEGIN
+        file [fd_error] = uf$cgp;       !Can't get page
+        RETURN $false;
+        END;
+
+    !
+    ! Convert the page number to an address and save it.
+    ! Set up allocation and length of buffer.
+    ! Build pointer to current position within buffer.
+    !
+
+    buffer [bd_address] = .buffer [bd_address] * page_size;
+
+    buffer [bd_allocation] = page_size;
+    buffer [bd_length] = page_size * (%BPVAL / .file [fd_byte_size]);
+
+    !
+    ! Link buffer into buffer ring
+    !
+
+    IF first_buffer EQL 0
+    THEN
+        BEGIN
+        file [fd_current_buffer] = .buffer;
+        buffer [bd_next] = .buffer;
+        END
+    ELSE
+        BEGIN
+        buffer [bd_next] = .first_buffer [bd_next];
+        first_buffer [bd_next] = .buffer;
+        END;
+
+    RETURN $true
+
+    END;				!End of ALLOC_BUFFER
+
+%routine ('DEALLOC_BUFFER', file : REF file_data_block) : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!        This routine removes a buffer from the buffer ring.
+!
+! FORMAL PARAMETERS
+!
+!	.FILE     The address of the FILE DATA BLOCK
+!
+! IMPLICIT INPUTS
+!
+!	NONE.
+!
+! ROUTINE VALUE:
+!
+!	NONE.
+!
+! SIDE EFFECTS:
+!
+!	NONE.
+!
+!--
+
+    BEGIN
+    BIND
+        buffer_ring = .file [fd_current_buffer] : buffer_data_block ;
+
+    LOCAL
+        buffer : REF buffer_data_block ;
+
+    EXTERNAL ROUTINE
+             nmu$page_release;
+
+    buffer = buffer_ring;
+
+    nmu$page_release ((.buffer [bd_address] / page_size));
+
+    buffer [bd_address] = 0;
+    buffer [bd_length] = 0;
+    buffer [bd_allocation] = 0;
+
+    IF .buffer [bd_next] EQL .buffer
+    THEN 
+        file [fd_current_buffer] = 0
+    ELSE 
+        file [fd_current_buffer] = .buffer [bd_next];
+
+    nmu$memory_release (.buffer, buffer_data_block_allocation);
+
+    RETURN $true
+
+    END;				!End of DEALLOC_BUFFER
+
+%routine ('OPEN_FILE', FILE : ref FILE_DATA_BLOCK, FN : ref FILE_NAME_BLOCK) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Performs system specific functions to allow access to a
+!       file. Sets various fields within the FILE_BLOCK.
+!
+! FORMAL PARAMETERS
+!
+!	.FILE - Address of a file data block.
+!       .FN - Address of a file name block.
+!
+! IMPLICIT INPUTS
+!
+!	NONE.
+!
+! ROUTINE VALUE:
+!
+!	$TRUE, if file is successfully opened;
+!       $FALSE, otherwise.
+!
+! SIDE EFFECTS:
+!
+!	NONE.
+!
+!--
+
+    BEGIN
+
+    LOCAL
+         err,
+         gtjfn_flags,
+         openf_flags;
+
+    declare_jsys (gtjfn,openf,sizef,chfdb,rljfn);
+
+    gtjfn_flags = gj_sht ;
+
+    IF .file [fd_access] EQL file_access_write_only
+    THEN
+        gtjfn_flags = .gtjfn_flags OR gj_fou
+    ELSE
+        BEGIN
+        gtjfn_flags = .gtjfn_flags OR gj_old;
+        IF .file [fd_access] EQL file_access_append_only
+        THEN
+            gtjfn_flags = .gtjfn_flags OR gj_del;
+        END;
+
+    openf_flags = (fld (.file[fd_byte_size], of_bsz)
+                   OR (IF .file[fd_access] EQL file_access_read_only
+                       THEN of_rd
+                       ELSE (of_rd OR of_wr)));
+
+    !
+    ! Get a JFN to the file. Use file name string in FD_NAME
+    ! because GTJFN needs ASCIZ string.
+    !
+
+    IF NOT $$gtjfn (.gtjfn_flags, CH$PTR(file [fd_name]); file [fd_jfn])
+    THEN
+        BEGIN
+        file [fd_error] = .file [fd_jfn];
+        IF (.file [fd_error] EQL gjfx18)
+        OR (.file [fd_error] EQL gjfx19)
+        OR (.file [fd_error] EQL gjfx24)
+        THEN
+            file [fd_error] = uf$fnf;
+        file [fd_jfn] = 0;
+        RETURN $false;
+        END;
+
+    !
+    ! Open the file for required access and byte size.
+    !
+
+    IF NOT $$openf (.file [fd_jfn], .openf_flags; err)
+    THEN
+        BEGIN
+        file [fd_error] = .err;
+        $$rljfn(.file [fd_jfn]);
+        RETURN $false;
+        END;
+    !
+    ! If file is being opened for write access only then it will
+    ! be treated as a new file. Set its byte size in the FDB.
+    !
+    ! Otherwise it must be an existing file. Determine its length
+    ! in bytes and save in file data block.
+    !
+
+    IF .file [fd_access] NEQ file_access_write_only
+    THEN
+        BEGIN
+        IF NOT $$sizef(.file[fd_jfn];err,file[fd_length])
+        THEN
+            BEGIN
+            $TRACE ('SIZEF failed on open of file %A - %J',
+                CH$PTR(file[fd_name]),
+                .err);
+
+            file[fd_abort] = 1;
+            close_file(.file);
+            file[FD_ERROR] = .err;
+            RETURN $false;
+            END;
+
+        file[fd_page_count] = (.file[fd_length]/(512*5)) + 1;
+        END;
+!    ELSE
+        BEGIN
+        LOCAL
+             fdb_fbbyv;
+
+        !
+        ! Set word .FBBYV (11) of the files FDB, to reflect the
+        ! files byte size.
+        !
+
+        fdb_fbbyv = fld (.file [fd_byte_size], fb_bsz);
+
+        $$chfdb ((cf_nud OR fld ($fbbyv, cf_dsp)
+                  OR fld (.file [fd_jfn], cf_jfn)),
+                  fb_bsz,
+                  .fdb_fbbyv);
+
+        END;
+
+    $true
+    END;				!End of OPEN_FILE
+
+%routine ('MAP_PAGE', FILE : ref FILE_DATA_BLOCK) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!     This routine does a PMAP to map a file page to the process.  The
+!     appropriate counts and pointers to the buffer are maintained.
+!
+! FORMAL PARAMETERS
+!
+!	.FILE     The address of a FILE DATA BLOCK
+!
+! IMPLICIT INPUTS
+!
+!	NONE.
+!
+! ROUTINE VALUE:
+!
+!	NONE.
+!
+! SIDE EFFECTS:
+!
+!	NONE.
+!
+!--
+
+    BEGIN
+    BIND
+        buffer = .file [fd_current_buffer] : buffer_data_block,
+        bytes_per_page = .buffer [bd_length];
+
+    LOCAL
+         file_page,
+         buffer_page,
+         flag_count;
+
+    declare_jsys (pmap);
+
+    !
+    ! This buffer is at next position to read from file.
+    !
+
+    buffer [bd_file_position] = .file [fd_file_position];
+
+    !
+    ! Set up to do PMAP. Get the files JFN. Calculate a page number
+    ! in the file to be mapped. Page will be mapped into our process
+    ! at page number determined by address in BD_ADDRESS. Preload
+    ! the page and allow copy-on-write access.
+    !
+    ! Note that by using PMAP we can go directly to the page
+    ! indicated by current position. Sequential access would
+    ! require multiple file reads.
+    !
+
+    file_page<18,18> = .file [fd_jfn];
+    file_page<0,18> = .file [fd_current_position] / bytes_per_page;
+    buffer_page<18,18> = $fhslf;
+    buffer_page<0,18> = .buffer [bd_address] / page_size;
+
+    flag_count = pm_rd OR pm_wr ;
+
+    !
+    ! Assuming a sequential file the current page to be mapped
+    ! should be less than the number of pages in the file.
+    !
+
+    IF NOT $$pmap (.file_page,.buffer_page,.flag_count)
+    THEN
+        BEGIN
+        file [fd_error] = $last_error;
+        RETURN $false;
+        END;
+
+    buffer [bd_current_position] = .file [fd_current_position] MOD bytes_per_page;
+
+    buffer [bd_pointer] = CH$PTR (.buffer [bd_address],
+                                  .buffer [bd_current_position],
+                                  .file [fd_byte_size]);
+
+    IF (.file [fd_current_position] + bytes_per_page) GEQ .file [fd_length]
+    THEN
+        BEGIN
+        buffer [bd_end_of_file] = $true;
+        buffer [bd_data_count] = .file [fd_length] MOD bytes_per_page;
+        buffer [bd_remaining_count] = .file [fd_length] -
+                                      .file [fd_current_position];
+        END
+    ELSE
+        BEGIN
+        buffer [bd_data_count] = bytes_per_page;
+        buffer [bd_remaining_count] = bytes_per_page - .buffer [bd_current_position]
+        END;
+
+    !
+    ! Update position in file.
+    !
+
+    buffer [bd_max_position] = .buffer [bd_file_position] +
+                               .buffer [bd_data_count];
+
+    file [fd_file_position] = .buffer [bd_max_position];
+
+
+    !
+    ! Buffer now has valid data.
+    ! File is now positioned by amount of data read.
+    !
+
+    buffer [bd_valid] = $true;
+
+    RETURN $true
+
+    END;				!End of READ_FILE
+
+%routine ('UNMAP_PAGE', FILE : ref FILE_DATA_BLOCK) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!     This routine PMAP to release a page that was mapped by a previous PMAP.
+!     The buffer is invalidated.
+!
+! FORMAL PARAMETERS
+!
+!	.FILE     The address of a FILE DATA BLOCK
+!
+! IMPLICIT INPUTS
+!
+!	NONE.
+!
+! ROUTINE VALUE:
+!
+!	NONE.
+!
+! SIDE EFFECTS:
+!
+!	NONE.
+!
+!--
+
+    BEGIN
+    BIND
+        buffer = .file [fd_current_buffer] : buffer_data_block,
+        bytes_per_page = ((%BPVAL / .file [fd_byte_size]) * page_size);
+
+    LOCAL
+         buffer_page;
+
+    declare_jsys (pmap);
+
+    !
+    ! Set up to do PMAP.  Buffer page will be unmapped.
+    !
+
+    buffer_page<18,18> = $fhslf;
+    buffer_page<0,18> = .buffer [bd_address] / page_size;
+
+    IF NOT $$pmap (-1, .buffer_page, 0)
+    THEN
+        BEGIN
+        file [fd_error] = $last_error;
+        RETURN $false;
+        END;
+
+    buffer [bd_valid] = $false;
+
+    RETURN $true
+
+    END;				!End of READ_FILE
+
+%routine ('CKP', file: ref FILE_DATA_BLOCK) =
+    BEGIN
+    declare_jsys(chfdb,ufpgs);
+    LOCAL
+        openf_flags,
+        err;
+
+    $$ufpgs((.file[fd_jfn]^18) + MAX(.file[fd_page_count] - 1,0),
+             .file[fd_length]/bytes_per_page - .file[fd_page_count] + 2);
+
+!    $$chfdb ((cf_nud OR fld ($fbbyv, cf_dsp)
+!              OR fld (.file [fd_jfn], cf_jfn)),
+!              fb_pgc,
+!              .file [fd_length]/bytes_per_page + 1);
+
+    $$chfdb ((fld ($fbsiz, cf_dsp)
+              OR fld (.file [fd_jfn], cf_jfn)),
+              -1,
+              .file [fd_length]);
+
+    file[fd_page_count] = (.file[fd_length]/(512*5)) + 1;
+
+    RETURN 0;
+    END;
+
+%routine ('CLOSE_FILE', FILE : ref FILE_DATA_BLOCK) =
+
+!++
+! Functional description:
+!     Actually close an open file.
+!
+! Formal parameters:
+!
+!       .FILE    Address of file data block
+!
+! Implicit inputs:
+!
+!
+! Routine value:
+!
+!       $true    close succeeded
+!       $false   close failed
+!
+! Note:  Even if this routine fails, the file is no longer open
+!        for access.  Close failure means that any changes written
+!        to a file may not be saved.
+!
+!--
+
+    BEGIN
+    LOCAL
+         err;
+
+    declare_jsys (closf,chfdb,ufpgs,rljfn);
+
+    !
+    ! If this is a new file then update file length
+    ! in bytes and save in files FDB.
+    !
+    ! NOTE: To handle the case of update mode access
+    ! a flag must be maintained in the FD to indicate
+    ! whether the file size has changed since it was
+    ! opened and update the FDB only if it has changed
+    ! to avoid updating when not necessary. This code
+    ! will not do any updating now except for new files.
+    !
+
+    IF NOT .file [fd_abort]
+    THEN
+        BEGIN
+        IF .file [fd_access] NEQ file_access_read_only
+        THEN
+            BEGIN
+            $$chfdb ((cf_nud OR fld ($fbsiz, cf_dsp)
+                      OR fld (.file [fd_jfn], cf_jfn)),
+                      -1,
+                      .file [fd_length]);
+
+            IF .file [fd_access] EQL file_access_append_only
+            THEN
+                $$ufpgs((.file[fd_jfn]^18) + MAX(.file[fd_page_count] - 1,0),
+                    .file[fd_length]/bytes_per_page - .file[fd_page_count] + 2)
+            END;
+
+!        $$chfdb ((cf_nud OR fld ($fbbyv, cf_dsp)
+!                  OR fld (.file [fd_jfn], cf_jfn)),
+!                  fb_pgc,
+!                  .file [fd_length]/bytes_per_page + 1);
+
+        $$chfdb ((fld ($fbctl, cf_dsp)
+                  OR fld (.file [fd_jfn], cf_jfn)),
+                 fb_del,
+                 0);
+
+        IF NOT $$closf (fld(.file [fd_jfn], co_jfn) ; err)
+        THEN
+            BEGIN
+            file [fd_error] = .err;
+            RETURN $false;
+            END;
+        END
+    ELSE
+        IF $$closf (fld(1, cz_abt) OR
+                    fld(.file [fd_jfn], co_jfn) ; err)
+        THEN
+            $$rljfn(.file[fd_jfn])
+        ELSE
+            BEGIN
+            file [fd_error] = .err;
+            RETURN $false;
+            END;
+
+    RETURN $true
+
+    END;				!End of CLOSE_FILE

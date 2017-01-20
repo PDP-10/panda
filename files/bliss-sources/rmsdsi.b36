@@ -1,0 +1,1422 @@
+%TITLE 'DSI -- initialize data structures'
+!<BLF/REQUIRE 'RMSBLF.REQ'>
+MODULE dsi (IDENT = '2.0'
+		) =
+BEGIN
+!
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1984, 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+
+!++
+! FACILITY:	RMS
+!
+! ABSTRACT:
+!
+!	DSI contains routines which initialize internal
+!	data structures within RMS-20.
+!
+! ENVIRONMENT:	User mode, interrupts deferred until JSYS return.
+!
+! AUTHOR: Ron Lusk , CREATION DATE: 18-Mar-83
+!
+! REVISION HISTORY:
+! RMS EDIT
+!	Ron Lusk, 9-May-83 : VERSION 2
+! 404	-   SETFST - No locking if FB$SMU is set (DSI edit 401)
+!     
+! 411	-   FENDOFKEY - Handle variable-byte-size records.
+!
+! 427   -   SETKDB - Do not touch KSD's
+!
+!	Andrew Nourse, 14-Jan-1985 : VERSION 3
+! 504   -   Image mode
+! 550	-   If an FFF file class if found (file class < 0), then
+!	    use the non-RMS file organization FST$K_NON. (RL)
+!--
+
+!
+! TABLE OF CONTENTS
+!
+!
+!	SETFST	    -	Set up a File Status Table
+!	SETRST	    -	Set up a Record Satus Table
+!	READADB	    -	Read in the Area Descriptor Block
+!	SETKDB	    -	Set up a Key Descriptor Block
+!	FENDOFKEY   -	Compute the End-of-Key byte
+!			number for SETKDB
+!	UNDOKDBS    -	Flush a partially processed
+!			KDB list
+!
+!
+! INCLUDE FILES:
+!
+
+REQUIRE 'rmsreq';
+
+!
+! MACROS:
+!
+!   None.
+!
+! EQUATED SYMBOLS:
+!
+
+GLOBAL BIND
+    dsiv = 2^24 + 0^18 + 401;			! Module version number
+
+MAP
+    dvflgs : monword;
+
+!
+! OWN STORAGE:
+!
+!   None.
+!
+! EXTERNAL REFERENCES:
+!
+!   None.
+!
+%SBTTL 'SETFST - initialize File Status Table'
+
+GLOBAL ROUTINE setfst =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	SETFST initializes the contents of the File Status
+!	Table.  It is called only from the $OPEN and $CREATE
+!	processors when a file is initially opened for
+!	processing.  It takes all relevant values from the
+!	user's File Access Block (FAB) and moves them into
+!	the FST.  Note that the FAB must contain all the
+!	important information at this time...the File
+!	Prologue is not read at all.
+!
+!	Note:  In order to make selection statements based
+!	on file organization work more easily (as in
+!	"CASE .fileorg ..."), this routine will set up a
+!	special code if the file contains stream or LSA
+!	format records.  If so, the file organization field
+!	(FSTORG) will be set to ORGASC instead of the
+!	sequential organization given by the user.
+!	Therefore, after this routine exits, the original
+!	file organization given by the user is lost.  A
+!	quick check is made by this routine to make sure
+!	that the user's file organization value is not
+!	ORGASC already.
+!
+!	Note further that the block of storage which is
+!	allocated for the FST is cleared by GMEM.  Thus,
+!	there are several source statements in this routine
+!	which clear certain fields and are commented out.
+!	They are included only to make it clear which fields
+!	are being manipulated.
+!
+! FORMAL PARAMETERS
+!
+!	NONE.
+!
+! IMPLICIT INPUTS
+!
+!	FAB	-   FAB must point to the user's File Access
+!		    Block.  Data from the FAB is copied to
+!		    the FST.
+!	FST	-   assumes that the FST has been allocated
+!		    and that the length of the FST is
+!		    already in the BLOCKLENGTH field of the
+!		    FST.
+!	FPT	-   the File Prologue must be mapped and
+!		    pointed to by FPT.
+!
+! COMPLETION CODES:
+!
+!	TRUE	-   FST initialized
+!	FALSE	-   Error
+!		    Invalid file organization specified
+!
+! SIDE EFFECTS:
+!
+!	If there are no errors, then the FST will be
+!	    initialized.
+!	If the file organization specified in the user's FAB
+!	    is invalid, USRSTS is set to ER$ORG, and the FST
+!	    is deallocated.
+!
+!--
+
+    BEGIN
+
+    REGISTER
+	flags;
+
+    TRACE ('SETFST');
+!+
+!   Check the file organization value to make
+!   sure it is in the proper range.  If it is,
+!   then set up the FST properly; if not, give
+!   an error return.
+!-
+
+    CASE .Fab [Fab$v_Org] FROM Fab$k_Seq TO Fab$k_Idx OF		  !m504
+	SET
+
+	[OUTRANGE] : 				! Illegal organization
+!+
+!   The user gave us a bad file
+!   organization, so give him an error.
+!-
+	    returnstatus( Rms$_Org );
+
+	[Fab$k_Seq] :
+!+
+!   Non-RMS files have a
+!   special internal "file organization",
+!   ORGASC (0), so set it up that way.
+!-
+	    BEGIN
+
+	    IF .fst [fst$h_file_class] lss 0	! FFF file?		!A550
+	    then				! 			!A550
+		fst [fst$h_org] = fst$k_non	! Non-RMS organization	!A550
+	    else
+		begin
+		Fst [Fst$h_Org] =		!m504
+		  ( CASE .fab [Fab$v_Rfm]	! 
+		    FROM  Fab$k_Var TO Fab$k_Rfm_Max OF
+		    SET
+		    [Fab$k_Stm,     ! Stream format
+		     Fab$k_Lsa,	! LSA format
+		     Fab$k_Udf]:    !
+			Fst$k_Non;     ! Non-RMS organization
+		    [INRANGE]:
+			Fst$k_Seq;	! Normal sequential org.
+		    [OUTRANGE]:
+			ReturnStatus( Rms$_Rfm );
+		    TES );
+		    end;
+	    END;
+
+	[INRANGE] :
+	    !
+	    !   No special handling for REL, IDX
+	    !
+	    Fst [Fst$h_Org] = .Fab [Fab$v_Org];
+	TES;
+
+!+
+!   Fill in all fields in the FST.
+!-
+    fst [blocktype] = fstcode;			! Type of block
+    fst [blocklength] = fstsize;		! And size [this is redundant;
+    						!   the length is set in
+    						!   RMSOPN]
+    fst [blink] = .fst;				! Link this FST to itself
+    fst [flink] = .fst;				!   and again...
+    fst [fstjfn] = .userjfn;			! Save JFN
+!+
+!   We must now determine if we are going to lock this file
+!   during its access.  This locking will be done only if there
+!   is a writer of the file, and the file is not open for
+!   exclusive access; locking is disabled when FB$SMU is set
+!   in the FAC field, allowing LIBOL to handle locking itself.
+!-
+    flags = 0;					! Assume no locking
+
+    IF rmsfile
+    THEN
+
+	IF ((.fab [fabfac, 0] AND fb$smu) EQL 0) AND 	! RMS locking	!M404
+	    (((.fab [fabshr, 0] AND axwrt) NEQ 0) OR 	! If others will write
+	    ((.fab [fabfac, 0] AND axwrt) NEQ 0))	! Or we will write
+	THEN
+	    flags = flglocking;			! We will lock each record
+
+    						! Unless...
+
+    IF .fab [fabshr, 0] NEQ axnil		! Nil sharing anyway?
+    THEN
+	fst [fstflags] = .flags;		! Sharing, so set locking
+
+!+
+!   We must now get some fields from the file prologue.
+!   However, if the file is null (i.e., an empty ASCII file),
+!   then we cannot even touch the page or we will get a read
+!   trap.
+!-
+
+    IF rmsfile
+    THEN
+	BEGIN
+!+
+!   We must now set the LOBYTE field to be the start of the data
+!   space of the file.  This information is necessary in order
+!   to set the file EOF pointer on a $CLOSE, and to check a
+!   user's RFA to make sure it is within the data space of the
+!   file.
+!-
+	fst [fstlobyte] = 			! Start of records
+	.fpt [blocklength] + endblocksize;
+	END;
+
+!   fst [fsthybyte] = 0;			! Clear these fields...
+!   fst [fstflags] = 0;				! Store flags
+    fst [fstfac] = .fab [fabfac, 0];
+    fst [fstshr] = .fab [fabshr, 0];
+!+
+!   If the user specified NIL in the FAC field,
+!   then we allow him to read and do no locking.
+!-
+
+    IF (.fab [fabfac, 0] EQL axnil) OR 		! NIL access	    !M404
+	(.fab [fabfac, 0] EQL fb$smu)		! NIL with SMU set  !A404
+    THEN
+	fst [fstfac] = axget;			! Transparent read
+
+    fst [fstrat] = .fab [fabrat, 0];
+    fst [fstmrs] = .fab [fabmrs, 0];		! Maximum record size
+    fst [fstmrn] = .fab [fabmrn, 0];		! Maximum record number
+    fst [fstbsz] = .fab [fabbsz, 0];		! Byte size
+    fst [fstrfm] = .fab [fabrfm, 0];		! Record format
+    fst [fstfop] = .fab [fabfop, 0];		! File processing options
+    fst [fstdevtype] = .dvflgs [dv_typ];	! Store device class
+!+
+!   We must now set up the KBFSIZE field, which represents the
+!   size (in words) of a buffer which must be allocated on the
+!   $CONNECT to hold the current key value (indexed files only).
+!   However, the KDB information has not been set up yet, so we
+!   will not fill in this field.  SETKDB will compute the value
+!   and store it in the FST.
+!-
+!+
+!   Fill in minimum number of buffers;
+!   RMS requires at least this many.
+!-
+    fst [fstminbuf] = (				! Base count on organization
+    CASE fileorg FROM orgasc TO orgidx OF
+	SET
+	[orgasc] : minbufasc;			! ASCII
+	[orgseq] : minbufseq;			! RMS sequential
+	[orgrel] : minbufrel;			! Relative
+	[orgidx] : minbufidx			! Indexed
+	TES);
+!+
+!   Fill in number of buffers to allocate.
+!   (RMS should run "better" with more buffers.)
+!   (Note that this field is the default number of
+!   buffers.  The user may override by specifying
+!   MBF in the RAB.)
+!
+!   Note that the number of buffers used for an indexed file is
+!   a constant plus the maximum number of levels in any of the
+!   indexes within the file.  This value is not known until we
+!   process the File Prologue completely and set up the KDBs.
+!   Therefore, we will not add in the MAXLEVEL value until later
+!   when we set up all the KDBs.
+!-
+    fst [fstnumbuf] = (				!
+    CASE fileorg FROM orgasc TO orgidx OF
+	SET
+	[orgasc] : numbufasc;			! ASCII
+	[orgseq] : numbufseq;			! RMS Sequential
+	[orgrel] : numbufrel;			! Relative
+	[orgidx] : numbufidx;			! Indexed (increment later
+						!   by number of levels in
+						!   the file).
+	TES);
+!+
+!   Fill in buffer size.
+!
+!   Note that this field will be filled with the
+!   value 1 for now.  If this is an indexed file,
+!   then the actual buffer size will be set later
+!   when the Index Descriptors are read in.
+!-
+    fst [fstbufsiz] = defbufsiz;
+    RETURN true
+    END;					! End of SETFST
+
+%SBTTL 'SETRST - initialize Record Status Table'
+
+GLOBAL ROUTINE setrst =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	SETRST initializes the contents of the Record Status
+!	Table.  This routine is called only from the
+!	$CONNECT processor.  [It may, at some time in the
+!	future, be called by a $REWIND processor.] It sets
+!	up all the values in the Record Status Table,
+!	including the Next-Record-Pointer.
+!
+!	Again, as in SETFST, the block allocated for the RST
+!	is cleared by GMEM; some expressions which would
+!	normally zero fields are therefore commented out,
+!	although they are left for documentation.
+!
+!	Unlike SETFST (which expects to find an allocated
+!	File Status Table waiting for it where FST is
+!	pointing), SETRST itself will call GMEM to allocate
+!	the core for the Record Status Table.  This is
+!	because the actual amount allocated for the table
+!	depends on the number of buffers allocated to the
+!	record stream (see the opening code below).
+!
+! FORMAL PARAMETERS
+!
+!	None.
+!
+! IMPLICIT INPUTS
+!
+!	FST	-   the File Status Table is referenced to
+!		    determine the number of buffers needed
+!		    and the file organization.
+!	RAB	-   the user's Record Access Block is read
+!		    for buffer count and initial key of
+!		    reference.
+!	KDBs	-   The KDBs are checked to ensure that a
+!		    valid key of reference has been chosen.
+!
+!
+! COMPLETION CODES:
+!
+!	TRUE	-   Success
+!	FALSE	-   Dynamic memory exhausted, or
+!		    Bad key of reference
+!		    (Error code in USRSTS.)
+!
+! SIDE EFFECTS:
+!
+!	FST [FSTSEQBKT] is set to -1 for ASCII files.
+!
+!	Core is allocated for the RST.
+!
+!	Core is allocated for the Key buffer.
+!
+!	Core is allocated for the file buffers.
+!
+!--
+
+    BEGIN
+
+    REGISTER
+	tempac;					! Temporary AC
+
+    LOCAL
+	bytesword,
+	keybuffsize,				! Size of the key buffer
+	bufferpage,				! Page # of first buffer page
+	totalpages,				! Number of buffer pages
+	wordcount,
+	bfdptr : REF BLOCK,			! Current buffer descriptor
+	numbuf,					! Number of buffers to allocate
+	enufbuf,				! Minimum buffers to allocate
+	bufsiz,					! Pages per buffer
+	eofbyte,				! Byte number of the EOF
+	actrstsize,				! Actual size of this RST
+	keyofref,				! Key of reference
+	temp;
+
+!
+!   The meaning of the following comment is unclear, but
+!   it is left for future generations to ponder.
+!				- RL, March '83
+!
+!?! When not all buffers can be allocated
+!
+    TRACE ('SETRST');
+    !
+    !   Compute number buffers, size of buffer, etc.
+    !
+    enufbuf = .fst [fstminbuf];			! Minimum we must allocate
+    bufsiz = .fst [fstbufsiz];			! Pages per buffer
+
+    IF (numbuf = .rab [rabmbf, 0]) EQL 0	! Did user specify a count?
+    THEN
+	numbuf = .fst [fstnumbuf]		! No -- use default
+    ELSE
+	numbuf = MAX (.numbuf, .enufbuf);	! Yes -- but use
+
+    						!   at least ENUFBUF
+!+
+!   The actual size of the RST is the size
+!   of the basic structure itself plus
+!   twice the number of buffers, for the
+!   vector of buffer descriptors and the
+!   vector of Least Recently Used values.
+!-
+    actrstsize = rstsize + 2*.numbuf;		! Compute actual RST size
+!+
+!   Allocate core for the RST.
+!-
+
+    IF (rst = gmem (.actrstsize)) EQL false	! Get core
+    THEN
+	returnstatus (er$dme);
+
+!+
+!   For indexed files, RABKRF must refer to an
+!   existing key of reference.
+!-
+
+    IF idxfile
+    THEN
+	BEGIN
+	rst [rstnrpref] = (keyofref = .rab [rabkrf, 0]);	! Fetch it
+!+
+!   Does a KDB exist for this key number?
+!-
+
+	IF getkdb (.keyofref) EQL false		! Locate KDB
+	THEN
+	    BEGIN
+	    pmem (.actrstsize, rst);		! Free the memory
+	    returnstatus (er$krf)		! Bad KRF
+	    END;
+
+	END;
+
+    !
+    !   Set up initial values.
+    !
+    rst [rstbfdcount] = .numbuf;		! Number of buffers
+    rst [blocktype] = rstcode;			! Block-type code
+    rst [blocklength] = .actrstsize;		! Length of an RST
+    rst [rstfst] = .fst;			! Store address of FST
+!	RST [ RSTRSZ ] = 0;			! These are commented out
+!	RST [ RSTRSZW ] = 0;			!   as noted above
+!	RST [ RSTDATARFA ] = 0;			!   in the routine
+!	RST [ RSTFLAGS ] = 0;			!   description.
+!	RST [ RSTLASTOPER ] = 0;		! Ditto
+!	RST [ RSTBYTECOUNT ] = 0;		! Ditto
+!+
+!   For indexed files, we must now allocate a buffer to hold the
+!   current key.  This buffer must be as large as the largest
+!   key string defined for the file.  The size of this largest
+!   key is kept in the FST.
+!-
+    keybuffsize = .fst [fstkbfsize];		! Get the size
+
+    IF .keybuffsize NEQ 0
+    THEN
+	BEGIN
+	lookat ('	KEY-BUFF-SIZE :', keybuffsize);
+!+
+!   If we can't get enough core for the keybuffer,
+!   flush the RST and return ER$DME.
+!-
+
+	IF (rst [rstkeybuff] = gmem (.keybuffsize)) EQL false
+	THEN
+	    BEGIN
+	    pmem (.actrstsize, 			! Size of RST
+		rst);				! Location of RST
+	    returnstatus (er$dme)
+	    END
+
+	END;
+
+!++
+!   Allocate buffers
+!--
+
+!+
+!   Perform this loop until we either get a contiguous
+!   buffer which is big enough, or we get below the
+!   ENUFBUF value.
+!-
+
+    DO
+	BEGIN
+	!
+	!   Try to get the buffer pages.
+	!
+	totalpages = .numbuf*.bufsiz;
+!+
+!   If we can't get enough, then release
+!   the RST and the key buffer.
+!-
+
+	IF (bufferpage = gpage (.totalpages)) EQL false AND 	!
+	    (numbuf = .numbuf - 1) LSS .enufbuf
+	THEN
+	    BEGIN
+	    temp = .rst [rstkeybuff];		! Address of key buffer
+
+	    IF .keybuffsize NEQ 0
+	    THEN 				! Release key buffer
+		pmem (.keybuffsize, 		! Size
+		    temp);			! Location
+
+	    pmem (.actrstsize, 			! RST size
+		rst);				! Location of RST
+	    returnstatus (er$dme)
+	    END;
+
+	tempac = .bufferpage
+	END
+    UNTIL .tempac NEQ false;			! END OF LOOP
+
+!+
+!   We now have allocated a big chunk of contiguous buffers.  We
+!   must set up the buffer descriptors in the RST so we can use
+!   the buffers in single units if we want to.
+!-
+    bfdptr = bfdoffset;
+    rst [rstbfdcount] = .numbuf;		! Set buffer count
+
+    INCR j FROM 1 TO .numbuf DO
+	BEGIN
+	bfdptr [bfdbpage] = .bufferpage;	! First page of buffer
+	bfdptr = .bfdptr + 1;
+	bufferpage = .bufferpage + .bufsiz;
+	END;
+
+!+
+!   Setup buffer pointer for ASCII files.
+!-
+
+    IF asciifile                        ! ANY NON-RMS FILE
+    THEN
+	BEGIN
+	!
+	!   Form a pointer to the current
+	!   bucket descriptor.
+	!
+	cbd = .rst + rstcbdoffset;		! Point to CBD in RST
+!	bfdptr = bfdoffset;			! Form ptr to buf desc
+	bfdptr = rst [rstbfd];			! Point to BFD vector
+	fst [fstseqbkt] = -1;			! Force positioning on
+						!   1st I/O operation
+	currentfilepage = -1;			! Indicate no page mapped
+	curentbufferadr = 			! Get pointer to buffer
+	.bfdptr [bfdbpage]^p2w;
+	cbd [bkdbfdadr] = .bfdptr;		! Set current BFD
+	cbd [bkdbktsize] = asciibktsize;	! Set bucket size
+	END;
+
+!<BLF/PAGE>
+
+!++
+!	We are now ready to position the file.
+!	There are several distinct cases which must be considered:
+!
+!	    Organization, access		Technique
+!		=========			===
+!
+!	    Sequential, no appending		NRP = 1st byte after prologue
+!
+!	    Sequential, appending		NRP = EOF byte
+!
+!	    Relative, no appending		NRP = 1 (1st record)
+!
+!	    Relative, appending			<><> ILLEGAL <><>
+!
+!		Indexed				Undefined ( 0 )
+!
+!	    Stream, no appending		POSASCFILE (0)
+!
+!	    Stream, appending			POSASCFILE (EOF byte)
+!
+!--
+
+!+
+!   Determine the EOF byte number.
+!-
+
+    IF dasd AND (fileorg NEQ orgrel)		! Disk and not relative file?
+    THEN
+	eofbyte = sizefile (.fst [fstjfn])	! Yes -- return size of file
+    ELSE
+	eofbyte = -1;				! Not disk or relative file,
+
+    						!   so no EOF
+!+
+!   If the file is zero-length, or we are
+!   appending (and if this isn't a TTY:),
+!   then we are at EOF.
+!-
+
+    IF (.eofbyte EQL 0 OR appendoption NEQ 0) AND 	!
+	( NOT tty)				! Can't do it to TTY:
+    THEN
+	setflag (rst [rstflags], flgeof);	! Set EOF flag
+
+    CASE fileorg FROM orgasc TO orgidx OF
+	SET
+
+	[orgasc] :
+	    BEGIN				! ASCII
+
+	    IF dasd
+	    THEN
+		BEGIN
+!+
+!   If RB$EOF is on, we will set the pointer to
+!   the EOF.  Otherwise, we must set it to the
+!   start of the file since another $CONNECT may
+!   have been done to the file.
+!-
+
+		IF appendoption EQL 0 THEN eofbyte = 0;
+
+		!
+		!   Set pointer to start of file.
+		!
+		posascfil (.fst [fstjfn], 	! JFN
+		    .eofbyte);			! Byte
+		END;
+
+	    END;
+
+	[orgseq] :
+	    BEGIN				! Sequential
+
+	    IF (appendoption NEQ 0) AND 	! Appending and
+		(.eofbyte NEQ 0)		!   non-zero file?
+	    THEN
+		rst [rstnrp] = .eofbyte		! Yes - point at EOF
+	    ELSE
+		rst [rstnrp] = .fst [fstlobyte];	! No - look at first
+
+	    					!   byte after prologue
+	    END;
+
+	[orgrel] :
+	    !
+	    !	No choice for relative files
+	    !
+	    rst [rstnrp] = 1;			! Relative file
+
+	[orgidx] :
+	    !
+	    !	Undefined for indexed files
+	    !
+	    rst [rstnrp] = 0;
+	TES;
+
+    !
+    !	Finally, link the RST to the owning FST
+    !
+    link (rst, fst);
+    RETURN true
+    END;					! End of SETRST
+
+%SBTTL 'READADB - read Area Descriptor Block'
+
+GLOBAL ROUTINE readadb (prologptr : REF BLOCK) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	READADB reads in the Area Descriptor Block which is
+!	stored in the initial prologue of an indexed file.
+!	This routine must simply acquire core for the ADB
+!	and transfer it into the new buffer.
+!
+!	This routine presupposes that all Area Descriptors
+!	are contained within page 0 of the file.
+!
+! FORMAL PARAMETERS
+!
+!	PROLOGPTR   -	pointer to start of File Prologue
+!
+! IMPLICIT INPUTS
+!
+!	?
+!
+! COMPLETION CODES:
+!
+!	TRUE	-   OK
+!	FALSE	-   Couldn't get core for the ADB
+!		    File problem: No ADB
+!
+! SIDE EFFECTS:
+!
+!	On return, the location of the in-core
+!	Area Descriptor Block will be stored in
+!	the global variable ADB.
+!
+!--
+
+    BEGIN
+
+    REGISTER
+	adbptr : REF BLOCK;			! Temporary ADB pointer
+
+    LOCAL
+	adblength;				! Length of the ADB
+
+    TRACE ('READADB');
+!+
+!   First, we must find the location of the Area
+!   Descriptors in the Prologue of the file.  This is
+!   done by skipping over the initial file block because
+!   the Area Descriptors are always the second block in
+!   the File Prologue.
+!-
+    adbptr = 					! Skip over file block
+    .prologptr [blocklength] + .prologptr;
+
+    IF .adbptr [blocktype] NEQ adbcode
+    THEN
+	BEGIN					! We have a screwed-up
+						!   File Prologue
+	fileproblem (fe$noa);
+	RETURN false
+	END;
+
+    adblength = .adbptr [blocklength];		! Fill in the length of
+    						!   this block
+!+
+!   We must now allocate some free core for this block.
+!-
+
+    IF (adb = gmem (.adblength)) EQL false	! Get core
+    THEN
+	returnstatus (er$dme);
+
+!+
+!   Move the entire ADB into our free core chunk.
+!-
+    movewords (.adbptr, 			! From
+	.adb, 					! To
+	.adblength);				! Size
+    RETURN true
+    END;					! End of READADB
+
+%SBTTL 'SETKDB - create KDB chain'
+
+GLOBAL ROUTINE setkdb (prologptr : REF BLOCK) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	SETKDB reads in the chain of Index Descriptor Blocks
+!	(IDBs) from the data file and creates the internal
+!	chain of Key Descriptor Blocks (KDBs).  Each KDB is
+!	composed of only a summary of the contents of the
+!	IDB; only that information which will be needed
+!	internally to process a key.  Each KDB is linked to
+!	the next in a continuous linear series with a null
+!	pointer in the last KDB.
+!
+!	There are also a few miscellaneous fields which must
+!	be set up or altered in the FST by this routine.
+!	For example, FSTNUMBUF is altered by adding the
+!	number of levels in the deepest index in the file.
+!	Also, the FSTKBFSIZE field is set up here to be able
+!	to hold the largest key in the file.
+!
+! FORMAL PARAMETERS
+!
+!	PROLOGPTR   -	pointer to start of File Prologue
+!
+! IMPLICIT INPUTS
+!
+!	?
+!
+! COMPLETION CODES:
+!
+!	TRUE	-   OK
+!	FALSE	-   Error (code in USRSTS)
+!		    No more core
+!		    Index bucket size not big enough
+!		    No index descriptor in file (FE$NOI)
+!
+! SIDE EFFECTS:
+!
+!	FST fields are updated as noted above.
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	lastkdb : REF BLOCK,			! Last KDB we have created
+	lastidb,				! Last IDB we have processed
+	multipageflag,				! True if multi-page Prologue
+	windowpage,				! Page into which we have
+						!   mapped Prologue
+	filepagenumber,				! Current page of PROLOGUE
+	keybytesize,				! Bytesize for this key
+	nextkdb,				! Next KDB in our chain
+	maxlevels,				! Maximum number of levels
+						!   for all indexes
+	temp,					! Temporary local[??!!]
+	totalsize,				! Total bytes in key string
+	keybuffsize,				! Largest key buffer required
+	biggestbkz,				! Biggest bucket size
+	idbfileaddress,				! Address of IDB in the file
+	endofkeybyte,				! Highest byte number
+						!   of key string
+	adbptr : REF BLOCK,			! Area descriptors
+	areanumber,				! Area number for this index
+	bucketsize,				! Bucket size for this index
+	keysegptr : REF BLOCK,			! Key segment descriptors
+	thiskdb : REF BLOCK,			! Current KDB
+	idbptr : REF BLOCK,			! Current IDB
+	xabptr : REF BLOCK;			! XAB portion of the IDB
+
+    EXTERNAL
+	dtptable : BLOCK;			! Key datatype table
+
+    REGISTER
+	bltac,
+	tempac : BLOCK [1],
+	tempac2;
+
+    TRACE ('SETKDB');
+    !
+    !   We must now clear the pointer the list of KDBs.
+    !
+    fst [fstkdb] = 0;
+    !
+    !   Initialize some variables.
+    !
+    maxlevels = 1;				! Assume at least 1 level
+    biggestbkz = 0;				! Largest bucket size
+    filepagenumber = 0;
+    windowpage = .prologptr^w2p;		! Find where our buffer is
+    !
+    !   Clear the largest key buffer value.
+    !
+    keybuffsize = 0;
+    !
+    !   We must find the first IDB in the File Prologue.
+    !
+    adbptr = .prologptr [fptadb] + .prologptr;	! Get Area Descriptor
+    idbptr = .prologptr [fptidb] + .prologptr;	! ...and Index Descriptor
+!+
+!   Do a consistency check to see if this is an IDB.
+!-
+
+    IF .idbptr [blocktype] NEQ idbcode
+    THEN
+	BEGIN
+	fileproblem (fe$noi);			! No index descriptor
+	usrret ()
+	END;
+
+    idbfileaddress = 				! Form page 0 address
+    (0^p2w) + (.idbptr AND ofsetmask);
+    lastidb = (lastkdb = 0);			! Clear KDB address
+!+
+!   This is the main loop.  We will fetch each
+!   IDB in the File Prologue area and create an
+!   internal KDB for it.  If at any time our
+!   free core runs out, we must unwind all this.
+!-
+    multipageflag = false;
+
+    WHILE .idbfileaddress NEQ 0 DO
+	BEGIN
+!+
+!   Get some core for a KDB.
+!-
+
+	IF (thiskdb = gmem (kdbsize)) EQL false
+	THEN 					! We must unwind all KDBs
+	    BEGIN
+	    undokdbs ();
+
+	    IF .multipageflag THEN ppage (.windowpage, 1, true);
+
+	    returnstatus (er$dme)
+	    END;
+
+!+
+!   We now are ready to set up the contents of
+!   the KDB.  Note that this code could be
+!   speeded up a little if certain fields which
+!   are in both the IDB and KDB were BLTed
+!   instead of moved one at a time.
+!-
+!+
+!   Set up pointer to the XAB portion of the block.
+!-
+	xabptr = .idbptr + idbxaboffset;	! Make a pointer to
+						!   the XAB portion
+						!   of the IDB
+!+
+!   Set up header.
+!-
+	thiskdb [blockheader] = kdbcode^blktypelsh + kdbsize;
+!+
+!   Move common fields.
+!-
+	thiskdb [kdbroot] = .idbptr [idbroot];
+	thiskdb [kdbnxt] = 0;			! Clear next pointer
+!+
+!   Update the maximum number of levels.
+!-
+
+	IF .idbptr [idblevels] GTR .maxlevels	!
+	THEN
+	    maxlevels = .idbptr [idblevels];	!
+
+!+
+!   Set up the pointer to the disk address of the IDB.
+!-
+	thiskdb [kdbidbaddr] = .idbfileaddress;
+	!
+	!   fill in the datatype of this key, and find
+	!   the bytesize which is associated with
+	!   that datatype.
+	!
+	thiskdb [kdbdtp] = .xabptr [xabdtp, 0];	! Get datatype
+	keybytesize = .dtptable [.xabptr [xabdtp, 0], dtpbytesize];
+	thiskdb [kdbkbsz] = .keybytesize;
+	!
+	!   Fetch the number of levels in the index.
+	!
+	thiskdb [kdblevels] = .idbptr [idblevels];
+	!
+	!   We will now fill in the fields from the
+	!   XAB which is embedded within the IDB.
+	!
+	thiskdb [kdbref] = .xabptr [xabref, 0];
+	!
+	!   Move the XAB flags to the IDB, and
+	!   clear the unused ones.
+	!
+	temp = .xabptr [xabflg, 0] AND allxabflags;
+
+	IF .thiskdb [kdbroot] EQL 0		!
+	THEN
+	    setflag (temp, flgnoindex);
+
+	thiskdb [kdbflags] = .temp;		! Store flags
+	thiskdb [kdbdtp] = .xabptr [xabdtp, 0];
+	!
+	!   We will now set up the information about
+	!   areas.  We will need to set up the area
+	!   number and bucket size of both data and
+	!   index buckets, and set up the word
+	!   offset into a bucket which represents
+	!   the IFL/DFL offset value.
+	!
+	tempac = .xabptr [xabian, 0];		! Get index area number
+	thiskdb [kdbian] = .tempac;		! Store it
+	bltac = (				! Set up AC for BLT
+	thiskdb [kdbibkz] = 			!  and the bucketsize
+	.adbptr [(.tempac*areadescsize) + 1, adbbkz]);	!
+	!   If this bucket size is the largest one we have so far,
+	!   remember how big it is (for future buffer allocation).
+	!
+	biggestbkz = MAX (.bltac, .biggestbkz);
+	tempac2 = .bltac^b2w;			! Get maximum offset value
+!+
+!   Set up the index fill limit,
+!   if user specified one.
+!-
+
+	IF .xabptr [xabifl, 0] GEQ (.tempac2/2)	! Must be 50 percent
+	THEN
+	    tempac2 = .xabptr [xabifl, 0];
+
+	thiskdb [kdbifloffset] = .tempac2;
+!+
+!   Now do the data area.
+!-
+	tempac = .xabptr [xabdan, 0];		! Get data area number
+	thiskdb [kdbdan] = .tempac;		! Store it
+	bltac = (				!
+	thiskdb [kdbdbkz] = 			!
+	.adbptr [(.tempac*areadescsize) + 1, adbbkz]);
+!+
+!   Save the biggest bucketsize.
+!-
+	biggestbkz = MAX (.bltac, .biggestbkz);
+	tempac2 = .bltac^b2w;			! Get maximum offset value
+
+	IF .xabptr [xabdfl, 0] GEQ (.tempac2^divideby2lsh)	!
+	THEN
+	    tempac2 = .xabptr [xabdfl, 0];
+
+	thiskdb [kdbdfloffset] = .tempac2;
+!+
+!   Now, set up key position and size.
+!-
+	movewords (.xabptr + xabksdoffset, 	! From
+	    .thiskdb + kdbksdoffset, 		! To
+	    maxkeysegs);			! Size
+!+
+!   We must now compute the total size of the key string (in
+!   words).  This value is needed when we allocate key
+!   buffers, and when we need to pass over an index record
+!   which contains the key string.  We compute this value by
+!   summing up the total size of the entire key (from each
+!   key segment) and then using the bytesize of the key
+!   data-type.
+!   If the data is not byte-oriented (and therefore not segmented)
+!   we can skip all that, since the size is fixed anyway.
+!-
+
+        keysegptr = .xabptr + xabksdoffset;     ! Point to first key segment
+
+
+        CASE .xabptr [xabdtp,0] FROM 0 to maxdtp OF
+             SET
+             [dtpstg, dtpsix, dtpebc, dtpas8, dtppac]: ! Byte data
+                 BEGIN
+                 totalsize = 0;			     ! Initialize counter
+
+                 INCR j FROM 0 TO maxkeysegs - 1     ! Loop over all segments
+                 DO
+                     BEGIN
+                     totalsize = .totalsize + .keysegptr [.j, keysiz]
+                     END;
+                 END;
+             [dtpin4, dtpun4, dtpfl1]:  ! Word data
+                      totalsize = 1;                                    !M427
+                      
+             [dtpin8, dtpfl2, dtpgfl]:  ! Doubleword data
+                      totalsize = 2;                                    !M427 
+             TES;
+!+
+!   TOTALSIZE now contains the total number
+!   of bytes in the key string.  We must now
+!   compute the number of full words this
+!   string will occupy.
+!-
+	lookat ('	TOTALSIZE: ', totalsize);
+	thiskdb [kdbksz] = .totalsize;
+	tempac = (thiskdb [kdbkszw] = sizeinwords (.totalsize, .keybytesize));
+
+	IF .thiskdb [kdbkszw] GTR .keybuffsize
+	THEN 					!
+	!
+	!	We need a bigger buffer to hold this key
+	!
+	    keybuffsize = .thiskdb [kdbkszw];
+
+!+
+!   We must now insure that the user's index
+!   fill offset is large enough to allow a
+!   minimum of three index records to be
+!   manipulated in the same index bucket.
+!   This restriction greatly simplifies the
+!   algorithms for splitting the index
+!   buckets, so the check should be done
+!   here.
+!-
+
+	IF (temp = ((.tempac + irhdrsize)*3) + bhhdrsize) GTR 	!
+	    .thiskdb [kdbifloffset]
+	THEN 					!
+	!
+	!	Reset the IFL value to be higher
+	!
+	    thiskdb [kdbifloffset] = .temp;
+
+!++
+!		Now, compute the size of the record header.
+!		There are three cases which must be considered:
+!
+!		   Type			Header size
+!		   ====			===========
+!
+!		   Secondary			2
+!
+!		   Primary,variable		3
+!
+!		   Primary,fixed		2
+!--
+
+!+
+!   Assume secondary keys.
+!-
+	tempac = sidrhdrsize;			! Size of a SIDR record
+
+	IF .thiskdb [kdbref] EQL refprimary
+	THEN 					! We have a primary data record
+	    BEGIN
+
+	    IF .fpt [fptrfm] EQL rfmfix
+	    THEN 				! Fixed-length record
+		tempac = fixhdrsize
+	    ELSE 				! Variable-length record
+		tempac = varhdrsize		! Use different header size
+	    END;
+
+	!
+	!   Now, store this value in the KDB.
+	!
+	thiskdb [kdbhsz] = .tempac;
+!+
+!   We must now compute the minimum size
+!   that the record must be in order to
+!   fully include this key within the
+!   record.  This computation is currently
+!   trivial [!] due to the method of addressing
+!   keys and the mapping of data-types onto
+!   key byte sizes.  Once we have computed
+!   this value, then later when a record is
+!   inserted into the file and the record
+!   size is less than this value, we won't
+!   have to insert the record into the index
+!   associated with this key string.
+!-
+	thiskdb [kdbminrsz] = fendofkey (.keybytesize, .keysegptr);
+!+
+!   We have now created the current KDB.  We must link
+!   it into our chain of existing KDBs.
+!-
+
+	IF .lastkdb EQL 0			! Is there a "last KDB"?
+	THEN
+	    fst [fstkdb] = .thiskdb		! No - this is first
+	ELSE
+	    lastkdb [kdbnxt] = .thiskdb;	! Yes - add to chain
+
+	lastkdb = .thiskdb;			! Update current pointer
+	!
+	!   Get the address of the next IDB in the file.
+	!
+	idbfileaddress = .idbptr [idbnxt];	! Bump next IDB pointer
+!+
+!   Does it span page boundaries?
+!-
+
+	IF (.idbfileaddress^w2p) NEQ .filepagenumber
+	THEN
+	    BEGIN
+
+	    IF .multipageflag EQL false
+	    THEN 				! Allocate a new page
+		BEGIN
+		multipageflag = true;
+
+		IF (windowpage = gpage (1)) EQL false
+		THEN
+		    BEGIN
+		    undokdbs ();
+		    returnstatus (er$dme);
+		    END
+
+		END;
+
+	    filepagenumber = .idbfileaddress^w2p;
+!+
+!   Map the File Prologue page in.
+!-
+	    pagin (.fst [fstjfn], 		! JFN
+		.filepagenumber, 		! From
+		.windowpage, 			! To
+		axupd, 				! Access
+		1);				! Count
+	    END;
+
+	idbptr = (.windowpage^p2w) OR 		! Use core page #
+	(.idbfileaddress AND ofsetmask);	! And file offset
+	lookat ('	NEXT IDB-PTR: ', idbptr);
+	lookat ('	IDB-FILE-ADDRESS: ', idbfileaddress);
+	!
+	!   Print out what we've done.
+	!
+
+%IF dbug
+%THEN
+	begindebug (dbblocks)			!
+	bugout(%STRING ('*Dump of KDB *: ', %CHAR (13), %CHAR (10)));
+	dumpkdb (.thiskdb);
+	enddebug;
+%FI
+
+	END;
+
+!+
+!   Store the key buffer size in the File Status Table.
+!   Note that the value which is stored is twice that of
+!   of the actual size of the key.  This is because the
+!   top of the buffer is used for the actual current key
+!   and the bottom half of the buffer is used for
+!   temporary storage of the key in the last-record when a
+!   bucket splits.
+!-
+    fst [fstkbfsize] = 2*.keybuffsize;
+    !
+    !   Set the number of pages in each
+    !   file buffer into the FST.
+    !
+    fst [fstbufsiz] = .biggestbkz;
+    !
+    !   Add the # of levels into the number of buffers
+    !   which this file needs to process correctly.
+    !
+    fst [fstnumbuf] = .fst [fstnumbuf] + .maxlevels;
+!+
+!   Release any extra pages we may have gotten.
+!-
+
+    IF .multipageflag				!
+    THEN
+	ppage (.windowpage, 1, true);
+
+    RETURN true
+    END;					! End of SETKDB
+
+GLOBAL ROUTINE fendofkey (keybytesize, ksdptr : REF BLOCK) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	FENDOFKEY computes the byte number of the data
+!	record which constitutes the last byte in the
+!	specified key.  This value is necessary so we will
+!	know whether we need to enter a particular record
+!	into the index of the particular key.  This
+!	computation is somewhat involved, so it is included
+!	as a separate routine.
+!
+! FORMAL PARAMETERS
+!
+!	KEYBYTESIZE -	bytesize of this key
+!	KSDPTR	    -	pointer to the first Key Segment
+!			Descriptor in the XAB
+!
+! ROUTINE VALUE:
+!
+!	Byte number of last byte in key (expressed in
+!	terms of the record's bytesize).
+!
+!--
+
+    BEGIN                               !R411 Re-write this routine for
+                                        !     mixed byte sizes
+
+    LOCAL
+	answer,					! Highest byte so far
+        end_of_segment,                 	! Rec byte # for End of segment
+	keybytesperword,			! Bytes of the key in each word
+	recbytesperword,			! Bytes of record in each word
+	recordbytesize,				! Byte size of the data record
+        keyend,                         	! End of key in key-size bytes
+	fullkeywords,				! Words occupied by key
+	keybits;				! Bits occupied by key
+
+    TRACE ('FENDOFKEY');
+    !
+    !   Initialize the final result to zero.
+    !
+    answer = 0;
+
+    !+
+    !   Do this loop, once for each key segment.
+    !-
+    INCR j FROM 0 TO maxkeysegs - 1 DO
+	BEGIN
+        !+
+        !  Find the position of the end of the key
+        !   (in key-byte-size bytes)
+        !-
+        keyend =  .ksdptr [.j, keypos] + .ksdptr [.j, keysiz];
+
+        !+
+        ! Find how many of each kind of bytes fit in a word
+        !-
+	recordbytesize = .fst [fstbsz];		! Get record byte size
+	keybytesperword = %BPUNIT/.keybytesize;	! Key bytes in 1 word    !M411
+	recbytesperword = %BPUNIT/.recordbytesize; ! Record bytes / word !M411
+
+	!+
+	!   Compute the number of full words to end of the key,
+	!   and the bit offset in the word.
+        !-
+        fullkeywords = .keyend / .keybytesperword;                        !M411
+        keybits = (.keyend MOD .keybytesperword) * .keybytesize;          !M411
+
+	!
+	!   Let's see some of this stuff.
+	!
+	lookat ('	KEYBYTESPERWORD:', keybytesperword);
+	lookat ('	KEY ENDS AFTER WORD:', fullkeywords);
+	lookat ('	KEY-BITS:', keybits);
+
+	!+
+	!   Compute minimum record size for this key.
+        !   (in record-byte-size bytes)
+	!-
+
+	end_of_segment = (.fullkeywords*.recbytesperword)		  !M411
+	                 +((.keybits+.recordbytesize-1)/.recordbytesize); !M411
+        ! Convert number of full words into record bytes,
+        ! and convert number of extra bits into record bytes
+        ! The total is the number of record bytes we need to fit this segment
+
+        !+
+        !   Check if this key segment is "greater" than the highest one.
+        !-
+	IF .end_of_segment GTR .answer THEN answer = .end_of_segment
+
+	END;
+
+    lookat ('	Final result from FENDOFKEY: ', answer);
+    RETURN .answer
+    END;					! End of FENDOFKEY
+
+GLOBAL ROUTINE undokdbs : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	UNDOKDBS gives back all KDB free memory if we
+!	couldn't process the File Prologue correctly.
+!
+! FORMAL PARAMETERS
+!
+!	None.
+!
+! IMPLICIT INPUTS
+!
+!	FST [FSTKDB] - pointer to KDB chain.
+!
+! ROUTINE VALUE:
+!
+!	None.
+!
+! SIDE EFFECTS:
+!
+!	The free memory for the KDBs is freed.
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	thiskdb : REF BLOCK,
+	nextkdb : REF BLOCK;
+
+    TRACE ('UNDOKDBS');
+    thiskdb = .fst [fstkdb];
+
+    WHILE .thiskdb NEQ 0 DO
+	BEGIN
+	nextkdb = .thiskdb [kdbnxt];		! Save address of next KDB
+	pmem (kdbsize, thiskdb);		! Release memory
+	thiskdb = .nextkdb			! Advance our pointer
+	END;
+
+    RETURN
+    END;					! End of UNDOKDBS
+
+END						! End of Module DSI
+
+ELUDOM
+ 

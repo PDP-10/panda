@@ -1,0 +1,895 @@
+MODULE DIUPER (ident = '253'
+	%require ('DIUPATSWITCH')
+		) =
+begin
+
+!++
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+! FACILITY:	Pat Parser
+!
+! ABSTRACT:
+!
+! 	PATERROR.BLI contains routines that are common to both
+!	local and global error recovery.
+!
+! ENVIRONMENT:	VAX/VMS user mode
+!
+! AUTHORS:  H. Alcabes, C. Mitchell, CREATION DATE:  25-Feb-80
+!
+! MODIFIED BY:
+!
+!  253  Rename file to DIUPER.
+!       Gregory A. Scott 1-Jul-86
+!
+! 002 - C. Richardson 13 Aug 85
+!	Allow debug compilation without debug output
+!
+! 	Charlie Mitchell, 02-Nov-1981 : VERSION X2-001
+! 001 -	Modify to use new PATDATA; reorganize to just contain routines
+!	common to both local and global error recovery.
+!
+! 002 - Remove VMS dependencies.  C. Richardson 29-May-84
+!--
+!
+! INCLUDE FILES:
+!
+
+require 'DIUPATPROLOG';
+
+library 'BLI:XPORT';				! 002
+
+library 'DIUPATERROR';
+
+library 'DIUPATDATA';                   ! PAT/BLISS interface
+
+library 'DIUPATLANGSP';                 ! Language Specific functions
+
+library 'DIUPATPARSER';                 ! Parser driver
+
+library 'DIUPATTOKEN';
+
+library 'DIUDEB';                       ! Debugging
+
+!
+! TABLE OF CONTENTS FOR INTERNAL ROUTINES
+!
+
+forward routine
+    EXPLORE_TRANSITIONS : novalue,		! Set tables for a transition
+    FIND_NEXT_REDUCTION,			! Result of next reduction
+    GNT_PARSE_UNTIL_SHIFT;			! Parse until shift occurs
+
+!
+! MACROS:
+!
+
+macro
+    CLEAR (START, BYTES) =
+!	ZEROBYTE (BYTES, START) %;
+	begin
+	    incr counter from 0 to (bytes-1) do start [.counter] = 0
+	end %;
+!
+! EQUATED SYMBOLS:
+!
+
+literal
+    GNT_MAX_PARSE_STACK_INDEX = 4;
+
+!
+! OWN STORAGE:
+!
+
+own
+    GNT_STATUS,
+    GNT_LAST_TRANSITION,
+    GNT_PARSE_STACK_INDEX,
+    GNT_PARSE_STACK : vector [GNT_MAX_PARSE_STACK_INDEX + 1];
+
+global routine PAT$ERROR_GLOBAL_RECOVERY (PREV_STACK_RECORD, PREV_STATUS, GLOBAL_MSG_STATUS, GLOBAL_MSG_SYMBOL
+    , GLOBAL_MSG_INIT_STATE, ERROR_TOKEN_PTR, REF_STACK_PTR, REF_CURRENT_SYMBOL) : novalue =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+! Called when a syntax error that local and scope recovery cannot repair
+! has occurred; it skips over source until a synchronizing token is found.
+!
+! FORMAL PARAMETERS:
+!
+!	PREV_STACK_RECORD	?
+!	PREV_STATUS		?
+!	GLOBAL_MSG_STATUS	?
+!	GLOABL_MSG_SYMBOL	?
+!	GLOBAL_MSG_INIT_STATE	?
+!	ERROR_TOKEN_PTR		?
+!	REF_STACK_PTR		?
+!	REF_CURRENT_SYMBOL	?
+!
+! IMPLICIT INPUTS:
+!
+!	?
+!
+! IMPLICIT OUTPUTS:
+!
+!	?
+!
+! ROUTINE VALUE:
+!
+!	None.
+!
+! SIDE EFFECTS:
+!
+!	None.
+!
+!--
+
+    begin
+
+    map
+	PREV_STACK_RECORD : ref block [PATSTK_STR_SIZE/%upval] field (PATSTK_FIELDS);
+
+    bind
+	STACK_PTR = .REF_STACK_PTR,
+	CURRENT_SYMBOL = .REF_CURRENT_SYMBOL;
+
+    field
+	FOLLOWER_FIELDS =
+	    set
+		FOLLOWER_F	= [$INTEGER],	! Terminal that can follow errormark
+		STACKPTR_F	= [$INTEGER],	! The parse stack pointer of the ERRORMARKed state
+		ERRORMARK_F	= [$INTEGER],	! (Not used)
+		INDEX_F		= [$INTEGER]	! The state which the ERRORMARK transition shifts to
+	    tes;
+
+    literal
+	follower_size		= $field_set_size * %upval;
+
+    local
+	FOLLOWER_TABLE : blockvector [PAT$DATA_NUM_TERM, follower_size]
+	    field (FOLLOWER_FIELDS),
+	STATE_INDEX,
+	FOLLOWER_TOP,
+	RESULT,
+	SAVE_SP,
+	TERMINAL,
+	ACTION_CODE,
+	BACK_STATE,
+	BACK_SYMBOL,
+	BAD_NON_TERM,
+	ERRORMARK_STACK : bitvector [LS_PARSE_STACK_SIZE],
+	TERMS_TO_PRINT : bitvector [PAT$DATA_NUM_TERM],
+	GROUP_NONTERMS_SEEN : bitvector [LS_NUM_GROUP_NONTERMS];
+
+    label
+	SEARCH;
+
+    DEB_EVENT ('PAR_RECOVERY_GLOBAL',
+	PUT_MSG_EOL ('-----------------------------------------------------'),
+	PUT_MSG ('Starting global recovery - CURRENTSTATE  is '),
+	PUT_NUMBER (.PAT$STACK_P [.STACK_PTR, PATSTK_STATE]),
+	PUT_MSG ('.  Current symbol is '),
+	PUT_STRING (PAT$DATA_SYMBOL_TEXT (.CURRENT_SYMBOL)),
+	PUT_EOL (),
+	PUT_EOL (),
+	PAT$DUMP_PARSE_STACK (),
+	PUT_EOL ());
+!    CLEAR (ERRORMARK_STACK, %allocation (ERRORMARK_STACK));
+    CLEAR (ERRORMARK_STACK, LS_PARSE_STACK_SIZE);
+    BACK_STATE = .PREV_STACK_RECORD [PATSTK_STATE];
+    BACK_SYMBOL = .PREV_STACK_RECORD [PATSTK_SYMBOL];
+    FOLLOWER_TOP = -1;				! Empty the follower table
+    SAVE_SP = .STACK_PTR;
+! For each entry in the parse stack check if any of the ERRORMARK terminals
+! can follow as legal transitions. If so then collect the terminals
+! which may follow each.
+
+    do
+	begin
+	ACTION_CODE = PAT$DATA_MOVE_ACTION (.PAT$STACK_P [.STACK_PTR, PATSTK_STATE], LS_T_ERRORMARK);
+
+!! Currently the only ERRORMARKS that recovery can take place on
+!! are those on which a SHIFT occurs.  This can be improved
+!! so that global error recovery can be even more effective.
+
+	if ( not PAT$DATA_ACTION_IS (.ACTION_CODE, 'ERROR')) and (PAT$DATA_ACTION_IS (.ACTION_CODE, 'SHIFT'))
+	then
+	    begin
+
+	    ! This state has an ERRORMARK transition associated with it -
+	    ! this must be a SHIFT transition otherwise its position within
+	    ! the syntax definition is incorrect.
+
+	    DEB_EVENT ('PAR_RECOVERY_GLOBAL',
+		PUT_MSG ('Parse stack entry '),
+		PUT_NUMBER (.STACK_PTR),
+		PUT_MSG (' has an ERRORMARK transition from index '),
+		PUT_NUMBER (.PAT$STACK_P [.STACK_PTR, PATSTK_STATE]),
+		PUT_EOL ());
+
+	    ! Mark this state in a stack parallel to the parse stack
+	    ! as having an ERRORMARK transition
+
+	    ERRORMARK_STACK [.STACK_PTR] = TRUE;
+	    ! Perform the ERRORMARK shift and collect all the terminals that
+	    ! can follow it in FOLLOWER_TABLE, taking care not to duplicate any
+	    ! terminals already entered there from a higher stacked state.
+
+	    PAT$ERROR_GET_NEXT_TRANS_INIT (CONSUME_TERM_ON_SHIFT, .ACTION_CODE, LS_UNAVAILABLE_NT);
+
+	    while (TERMINAL = PAT$ERROR_GET_NEXT_TRANSITION (TRUE)) neq PAT$ERROR_NO_MORE_TRANSITIONS do
+SEARCH :
+		begin
+
+		incr I from 0 to .FOLLOWER_TOP do
+
+		    if .FOLLOWER_TABLE [.I, FOLLOWER_F] eqlu .TERMINAL then leave SEARCH;
+
+		! Enter this terminal in FOLLOWER_TABLE along with the stack
+		! pointer and errormark values.
+
+		DEB_EVENT ('PAR_RECOVERY_GLOBAL',
+		    PUT_MSG ('	Adding new synchronizing symbol '),
+		    PUT_STRING (PAT$DATA_SYMBOL_TEXT (.TERMINAL)),
+		    PUT_EOL ());
+		FOLLOWER_TABLE [(FOLLOWER_TOP = .FOLLOWER_TOP + 1), FOLLOWER_F] = .TERMINAL;
+		FOLLOWER_TABLE [.FOLLOWER_TOP, STACKPTR_F] = .STACK_PTR;
+		FOLLOWER_TABLE [.FOLLOWER_TOP, INDEX_F] = .ACTION_CODE;
+		end;
+
+	    end;
+
+	end
+    until (STACK_PTR = .STACK_PTR - 1) eql -1;
+
+    ! Have now collected the list of all follower terminals for all ERRORMARKed
+    ! states in the parse stack.  Throw away source until one the these is
+    ! found.  NOTE that EOF had better be there.
+
+    while (incr I from 0 to .FOLLOWER_TOP do
+	    if .FOLLOWER_TABLE [.I, FOLLOWER_F] eql .CURRENT_SYMBOL then
+		begin
+		STATE_INDEX = .I;
+		exitloop FALSE;
+		end
+	) do
+	begin
+	DEB_EVENT ('PAR_RECOVERY_GLOBAL',
+	    PUT_MSG ('Skipping symbol '),
+	    PUT_STRING (PAT$DATA_SYMBOL_TEXT (.CURRENT_SYMBOL)),
+	    PUT_EOL ());
+	CURRENT_SYMBOL = PAT$TOKEN_GET (TRUE);
+	end;
+    ! FOLLOWER_TABLE [state_index] contains the stack pointer at which the
+    ! match occurred.  Because of the way the table was constructed this will
+    ! be the topmost state in the stack where this transition is legal. For
+    ! all the intervening errormarked stack entries generate the errormark
+    ! actions.
+
+    DEB_EVENT ('PAR_RECOVERY_GLOBAL',
+	PUT_MSG ('Current symbol is '),
+	PUT_STRING (PAT$DATA_SYMBOL_TEXT (.CURRENT_SYMBOL)),
+	PUT_MSG_EOL (' which is a synchronizing symbol'));
+    STACK_PTR = .SAVE_SP;
+    ERRORMARK_STACK [.STACK_PTR] = FALSE;
+    STACK_PTR = .STACK_PTR - 1;
+
+    while .STACK_PTR geq 0 do
+	begin
+	ERRORMARK_STACK [.STACK_PTR] = FALSE;
+
+	if .STACK_PTR geq .FOLLOWER_TABLE [.STATE_INDEX, STACKPTR_F]
+	then
+	    DEB_EVENT ('PAR_RECOVERY_GLOBAL',
+		PUT_MSG ('Popping state associated with '),
+		PUT_STRING (PAT$DATA_SYMBOL_TEXT (.PAT$STACK_P [.STACK_PTR, PATSTK_SYMBOL])),
+		PUT_EOL ());
+
+	STACK_PTR = .STACK_PTR - 1;
+	end;
+    ! Now reset the parsing variables to the state they would be in if
+    ! ERRORMARK had been parsed from the recovered state.
+
+    STACK_PTR = .FOLLOWER_TABLE [.STATE_INDEX, STACKPTR_F];
+    PAT$STACK_P [.STACK_PTR, PATSTK_SYMBOL] = LS_T_ERRORMARK;
+    STACK_PTR = .STACK_PTR + 1;
+    PAT$STACK_P [.STACK_PTR, PATSTK_STATE] = .FOLLOWER_TABLE [.STATE_INDEX, INDEX_F];	! set current state
+    BAD_NON_TERM = FIND_NEXT_REDUCTION (.PAT$STACK_P [.STACK_PTR, PATSTK_STATE], .CURRENT_SYMBOL);
+!    CLEAR (TERMS_TO_PRINT, %allocation (TERMS_TO_PRINT));
+    CLEAR (TERMS_TO_PRINT, PAT$DATA_NUM_TERM);
+!    CLEAR (GROUP_NONTERMS_SEEN, %allocation (GROUP_NONTERMS_SEEN));
+    CLEAR (GROUP_NONTERMS_SEEN, LS_NUM_GROUP_NONTERMS);
+
+    if .PREV_STATUS eql SAVED_INFO_NOT_VALID
+    then
+	EXPLORE_TRANSITIONS (ERROR_ENCOUNTERED,
+	    .PAT$STACK_P [.STACK_PTR, PATSTK_STATE], .CURRENT_SYMBOL, GROUP_NONTERMS_SEEN, TERMS_TO_PRINT)
+    else
+	EXPLORE_TRANSITIONS (.PREV_STATUS, .BACK_STATE, .BACK_SYMBOL, GROUP_NONTERMS_SEEN, TERMS_TO_PRINT);
+
+    if .PREV_STATUS eql REDUCT_AFTER_BACKUP_NOT_ALLOWED
+    then
+	EXPLORE_TRANSITIONS (.GLOBAL_MSG_STATUS,
+	    .GLOBAL_MSG_INIT_STATE, .GLOBAL_MSG_SYMBOL, GROUP_NONTERMS_SEEN, TERMS_TO_PRINT);
+
+    LS_GLOBAL_ERROR_MSG (.BAD_NON_TERM, .ERROR_TOKEN_PTR, GROUP_NONTERMS_SEEN, TERMS_TO_PRINT,
+!	%allocation (TERMS_TO_PRINT));
+	PAT$DATA_NUM_TERM);
+    DEB_EVENT ('PAR_RECOVERY_GLOBAL',
+	PUT_MSG ('Global recovery complete - CURRENTSTATE  is '),
+	PUT_NUMBER (.PAT$STACK_P [.STACK_PTR, PATSTK_STATE]),
+	PUT_MSG ('.  Current symbol is '),
+	PUT_STRING (PAT$DATA_SYMBOL_TEXT (.CURRENT_SYMBOL)),
+	PUT_EOL (),
+	PUT_EOL (),
+	PAT$DUMP_PARSE_STACK (),
+	PUT_MSG_EOL ('-----------------------------------------------------'));
+    end;					! Of routine PAT$ERROR_GLOBAL_RECOVERY
+routine EXPLORE_TRANSITIONS (STATUS, STATE, SYMBOL, REF_GROUP_NONTERMS_SEEN, REF_TERMS_TO_PRINT) : novalue =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	EXPLORE_TRANSITIONS is used by PAT$ERROR_GLOBAL_RECOVERY to examine the
+!	transitions that could occur when the parse in in the state
+!	indicated by STATUS, STATE and SYMBOL.  It sets fields in the
+!	tables pointed to by REF_GROUP_NONTERMS_SEEN and REF_TERMS_TO_PRINT
+!	appropriately.
+!
+! FORMAL PARAMETERS:
+!
+!	STATUS			- Parse status
+!
+!	STATE			- Parse state
+!
+!	SYMBOL			- Corresponding terminal or non-terminal symbol
+!
+!	REF_GROUP_NONTERMS_SEEN	- Pointer to table of grouping non-terminals,
+!				  indicating which have been seen
+!
+!	REF_TERMS_TO_PRINT	- Pointer to table of terminals, indicating
+!				  which should be printed
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    begin
+
+    local
+	SYM;
+
+    if .STATE eql PAR_NO_SAVED_STATE then return;
+
+    PAT$ERROR_GET_NEXT_TRANS_INIT (.STATUS, .STATE, .SYMBOL);
+
+    while ((SYM = PAT$ERROR_GET_NEXT_TRANSITION (FALSE)) neq PAT$ERROR_NO_MORE_TRANSITIONS) do
+	LS_EXPECTED_SYMBOL (.SYM, .REF_GROUP_NONTERMS_SEEN, .REF_TERMS_TO_PRINT);
+
+    end;					! Of routine EXPLORE_TRANSITIONS
+routine FIND_NEXT_REDUCTION (CURRENT_STATE, CURRENT_SYMBOL) =
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	?
+!
+! FORMAL PARAMETERS:
+!
+!	CURRENT_STATE	?
+!	CURRENT_SYMBOL	?
+!
+! IMPLICIT INPUTS:
+!
+!	?
+!
+! IMPLICIT OUTPUTS:
+!
+!	?
+!
+! ROUTINE VALUE:
+!
+!	?
+!
+! SIDE EFFECTS:
+!
+!	None.
+!
+!--
+
+    begin
+
+    local
+	NEXT_STATE,
+	IS_REDUCTION,
+	REDUCTION_CODE,
+	ACTION_CODE,
+	LHS_SYMBOL,
+	RHS_COUNT,
+	SEMACT;
+
+    ACTION_CODE = PAT$DATA_MOVE_ACTION (.CURRENT_STATE, .CURRENT_SYMBOL);
+
+    if PAT$DATA_ACTION_IS (.ACTION_CODE, 'LOOK_AHEAD')
+    then
+	begin
+	REDUCTION_CODE = PAT$DATA_AC_TO_LA_PRODUCTION_NO (.ACTION_CODE);
+	IS_REDUCTION = TRUE;
+	end
+    else
+
+	if ( not PAT$DATA_ACTION_IS (.ACTION_CODE, 'ERROR')) and ( not PAT$DATA_ACTION_IS (.ACTION_CODE,
+		'SHIFT'))
+	then 					! it's a non-lookahead reduction
+	    begin
+	    REDUCTION_CODE = -.ACTION_CODE;
+	    IS_REDUCTION = TRUE;
+	    end
+	else
+	    IS_REDUCTION = FALSE;
+
+    if .IS_REDUCTION
+    then
+	PAT$DATA_GET_REDUCTION_INFO (.REDUCTION_CODE, LHS_SYMBOL, RHS_COUNT, SEMACT)
+    else
+	LHS_SYMBOL = LS_UNAVAILABLE_NT;
+
+    return .LHS_SYMBOL
+    end;					!  Of routine FIND_NEXT_REDUCTION
+
+%if PATBLSEXT_DEBUGGING %then
+
+global routine PAT$ERROR_PUT_STATUS (STAT) : novalue =
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Debugging routine to display error status on terminal.
+!
+! FORMAL PARAMETERS:
+!
+!	STAT		Error status.
+!
+! IMPLICIT INPUTS:
+!
+!	None.
+!
+! IMPLICIT OUTPUTS:
+!
+!	None.
+!
+! ROUTINE VALUE:
+!
+!	None.
+!
+! SIDE EFFECTS:
+!
+!	Displays error status on the terminal.
+!
+!--
+
+    begin
+
+    selectone .STAT of
+	set
+
+	[CONSUME_TERM_ON_REDUCTION] :
+	    PUT_MSG ('"consuming a terminal on a reduction"');
+
+	[CONSUME_TERM_ON_SHIFT] :
+	    PUT_MSG ('"consuming a terminal on a shift"');
+
+	[REDUCT_AFTER_BACKUP_NOT_ALLOWED] :
+	    PUT_MSG ('"reduction disallowed further backup"');
+
+	[SAVED_INFO_NOT_VALID] :
+	    PUT_MSG ('"saved information is not valid for further backup"');
+
+	[ERROR_ENCOUNTERED] :
+	    PUT_MSG ('"error encountered"');
+	tes;
+
+    end;					! end of PAT$ERROR_PUT_STATUS
+
+%fi
+global routine PAT$ERROR_GET_NEXT_TRANS_INIT (STATUS, STATE, SYMBOL) : novalue =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine initializes state variables for routine
+!	PAT$ERROR_GET_NEXT_TRANSITION.  It is necessary to call
+!	this routine before calling PAT$ERROR_GET_NEXT_TRANSITION
+!	for a particular state.
+!
+!	This routine and PAT$ERROR_GET_NEXT_TRANSITION are used
+!	to find the set of symbols that are "expected".
+!	These routines are used during local error recovery to
+!	determine the set of terminal symbols that are candidates for
+!	insertion or for replacing an error token.  They are
+!	also used in generating global error messages of the
+!	form:
+!
+!		Found ... when expecting ...
+!
+!	These routines account for the effects of default lookahead
+!	reductions and for the fact that the state saved after
+!	a reduction is not the correct state from which to
+!	collect the set of expected symbols.  This is accomplished
+!	by a subset parsing routine (GNT_PARSE_UNTIL_SHIFT) that
+!	uses a three element parse stack (GNT_PARSE_STACK) and a stack
+!	index (GNT_PARSE_STACK_INDEX).
+!
+!	The easiest way to understand these routines is to
+!	run PAT over the following grammar with the option
+!	that prints the symbolic version of the parse tables
+!	in the listing.
+!
+!		terminal
+!		end;
+!
+!		begin
+!		WHOLETHING	= PROGRAM goalsy ;
+!
+!		PROGRAM		= begin OPT_DECL STM 'end' ;
+!
+!		OPT_DECL	= DECL
+!				| { epsilon };
+!
+!		STM		= NAME ':=' NAME ';'
+!				| CALL_STM ';' ;
+!
+!		CALL_STM	= NAME ;
+!
+!		NAME		= ID ;
+!
+!		ID		= identifier ;
+!
+!		end.
+!
+!
+!	Assume the state was saved immediately after "begin" is
+!	consumed on a shift.  Then notice from the parse tables
+!	that a default reduction
+!
+!		OPT_DECL	= { epsilon }
+!
+!	and a shift on OPT_DECL have to be done before
+!	arriving at the state that allows us to construct the
+!	set of terminals that are expected:  { identifier }.
+!
+!	Next assume the input A := B;  Assume the state was
+!	saved after the reduction
+!
+!		ID = identifier
+!
+!	for the identifier "A".  Thus, the saved status would be
+!	CONSUME_TERM_ON_REDUCTION.  Notice what has to be done to
+!	construct the set of terminals that are expected:  {":=" and ";"}.
+!	It is first necessary to reduce ID to NAME and to do a shift
+!	on NAME to see the terminal ":=".  Then it is
+!	necessary to do a default lookahead reduction from NAME
+!	to CALL_STM to arrive in a state with a transition on ";".
+!
+! FORMAL PARAMETERS:
+!
+!	STATUS	- status_type (CONSUME_TERM_ON_SHIFT, etc.)
+!
+!	STATE	- State index associated with STATUS
+!
+!	SYMBOL	- If STATUS is CONSUME_TERM_ON_REDUCTION or
+!		  REDUCT_AFTER_BACKUP_NOT_ALLOWED, the non-terminal after
+!		  the reduction occurred.  Otherwise, LS_UNAVAILABLE_NT.
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	Initialize the small parse stack (GNT_PARSE_STACK,
+!	GNT_PARSE_STACK_INDEX) for routines PAT$ERROR_GET_NEXT_TRANSITION
+!	and GNT_PARSE_UNTIL_SHIFT.  Initialize GNT_LAST_TRANSITION
+!	to indicate that want to find the first transition in the
+!	state.  Initialize GNT_STATUS to the status.
+!
+! ROUTINE VALUE:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    begin
+
+    ! First save the status and set up the stack with the
+    ! initial state.
+
+    GNT_STATUS = .STATUS;
+    GNT_PARSE_STACK_INDEX = 0;
+    GNT_PARSE_STACK [.GNT_PARSE_STACK_INDEX] = .STATE;
+    GNT_LAST_TRANSITION = PAT$DATA_FIND_FIRST_TRANSITION;
+    DEB_EVENT ('PAR_GET_NEXT_TRANSITION',
+	PUT_MSG_EOL ('PAT$ERROR_GET_NEXT_TRANS_INIT'),
+	PUT_MSG ('  Status = '),
+%if PATBLSEXT_DEBUGGING %then
+	PAT$ERROR_PUT_STATUS (.STATUS),
+%fi
+	PUT_MSG ('  State = '),
+	PUT_NUMBER (.STATE),
+	PUT_MSG ('  Symbol = '),
+
+	if (.STATUS eql CONSUME_TERM_ON_REDUCTION) or
+	    (.STATUS eql REDUCT_AFTER_BACKUP_NOT_ALLOWED)
+	then
+
+	    if .SYMBOL eql LS_UNAVAILABLE_NT
+	    then
+		PUT_MSG ('**UNAVAILABLE**')
+	    else
+		PUT_STRING (PAT$DATA_SYMBOL_TEXT (.SYMBOL))
+	else
+
+	    PUT_MSG ('[not used]'),
+
+	PUT_EOL ());
+
+    selectone .STATUS of
+	set
+
+	[CONSUME_TERM_ON_REDUCTION, REDUCT_AFTER_BACKUP_NOT_ALLOWED] :
+	    begin
+
+	    ! If save the state after a reduction, need to
+	    ! parse, starting with the symbol on the left hand
+	    ! side of the production, until do a shift.  If
+	    ! can't, then aren't able to figure out what's
+	    ! expected since don't have enough information.
+
+	    if not GNT_PARSE_UNTIL_SHIFT (PAT$DATA_MOVE_ACTION (.STATE, .SYMBOL))
+	    then
+		GNT_STATUS = SAVED_INFO_NOT_VALID;
+
+	    end;
+	tes;
+
+    end;					! Of routine PAT$ERROR_GET_NEXT_TRANS_INIT
+
+global routine PAT$ERROR_GET_NEXT_TRANSITION (ONLY_TERMINALS) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine is called to fetch the next terminal (or non-
+!	terminal) symbol which is a legal transition from a particular
+!	state.  PAT$ERROR_GET_NEXT_TRANS_INIT must be called before
+!	calling this routine.  See documentation for
+!	PAT$ERROR_GET_NEXT_TRANS_INIT.
+!
+! FORMAL PARAMETERS:
+!
+!	ONLY_TERMINALS	- If TRUE, this routine returns only
+!			  terminals.  Otherwise, it returns
+!			  terminals and non-terminals.
+!
+! IMPLICIT INPUTS:
+!
+!	GNT_PARSE_STACK
+!
+!	GNT_PARSE_STACK_INDEX
+!
+!	GNT_STATUS
+!
+! IMPLICIT OUTPUTS:
+!
+!	GNT_PARSE_STACK, GNT_PARSE_STACK_INDEX,
+!	and GNT_LAST_TRANSITION are not modified directly by this routine
+!	but are modified by  calls to GNT_PARSE_UNTIL_SHIFT.  GNT_STATUS
+!	is set to SAVED_INFO_NOT_VALID when finished.
+!
+! ROUTINE VALUE:
+!
+!	Terminal or non-terminal symbol id.  Returns
+!	PAT$ERROR_NO_MORE_TRANSITIONS when at the end of the state.
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    begin
+
+    local
+	SYMBOL,
+	MORE_TO_DO,
+	ACTION_CODE;
+
+    if .GNT_STATUS eql SAVED_INFO_NOT_VALID then return PAT$ERROR_NO_MORE_TRANSITIONS;
+
+    MORE_TO_DO = TRUE;
+
+    while .MORE_TO_DO do
+	begin
+	PAT$DATA_NEXT_TRANSITION (.GNT_PARSE_STACK [.GNT_PARSE_STACK_INDEX], .ONLY_TERMINALS,
+	    GNT_LAST_TRANSITION, ACTION_CODE, SYMBOL);
+
+	if .SYMBOL eql PAT$DATA_NO_MORE_TRANSITIONS
+	then
+	    MORE_TO_DO = GNT_PARSE_UNTIL_SHIFT (.ACTION_CODE)
+	else
+	    begin
+	    DEB_EVENT ('PAR_GET_NEXT_TRANSITION',
+		PUT_MSG ('  Returning symbol '),
+		PUT_STRING (PAT$DATA_SYMBOL_TEXT (.SYMBOL)),
+		PUT_EOL ());
+	    return .SYMBOL;
+	    end;
+
+	end;
+
+    GNT_STATUS = SAVED_INFO_NOT_VALID;
+    return PAT$ERROR_NO_MORE_TRANSITIONS
+    end;					! Of routine PAT$ERROR_GET_NEXT_TRANSITION
+
+routine GNT_PARSE_UNTIL_SHIFT (ACTION) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine is called to parse until a shift occurs.
+!	This routine is designed for use only by PAT$ERROR_GET_NEXT_TRANSITION
+!	and PAT$ERROR_GET_NEXT_TRANS_INIT.
+!
+! FORMAL PARAMETERS:
+!
+!	ACTION	- Initial action code from PAT_ACT_TABLE.
+!
+! IMPLICIT INPUTS:
+!
+!	GNT_PARSE_STACK
+!
+!	GNT_PARSE_STACK_INDEX
+!
+! IMPLICIT OUTPUTS:
+!
+!	GNT_PARSE_STACK and GNT_PARSE_STACK_INDEX are modified to
+!	as reductions and shifts are done.
+!	GNT_LAST_TRANSITION is set to indicate that on the
+!	next call to PAT$DATA_NEXT_TRANSITION we want the first
+!	transition.  (When we return, we are either done or we
+!	have changed parse table states.)
+!
+! ROUTINE VALUE:
+!
+!	TRUE	- Able to do a shift
+!
+!	FALSE	- Unable to do a shift because of stack underflow or
+!		  overflow or because called with status of
+!		  SAVED_INFO_NOT_VALID.
+!
+! SIDE EFFECTS:
+!
+!	NONE.
+!
+!--
+
+    begin
+
+    local
+	ACTION_CODE,
+	LHS_SYMBOL,
+	RHS_COUNT,
+	SEMACT,
+	REDUCTION_CODE,
+	NEW_PTR;
+
+    macro
+	RET (VAL) =
+	    begin
+	    GNT_LAST_TRANSITION = PAT$DATA_FIND_FIRST_TRANSITION;
+	    return (VAL)
+	    end
+	%;
+
+    if .GNT_STATUS eql SAVED_INFO_NOT_VALID then RET (FALSE);
+
+    ACTION_CODE = .ACTION;
+
+    while TRUE do
+	begin
+
+	if PAT$DATA_ACTION_IS (.ACTION_CODE, 'ERROR')
+	then
+	    RET (FALSE)
+	else
+
+	    if PAT$DATA_ACTION_IS (.ACTION_CODE, 'SHIFT')
+	    then
+
+		if .GNT_PARSE_STACK_INDEX lss GNT_MAX_PARSE_STACK_INDEX
+		then
+		    begin
+		    GNT_PARSE_STACK_INDEX = .GNT_PARSE_STACK_INDEX + 1;
+		    GNT_PARSE_STACK [.GNT_PARSE_STACK_INDEX] = PAT$DATA_AC_TO_SHIFT_STATE (.ACTION_CODE);
+		    RET (TRUE);
+		    end
+		else
+		    RET (FALSE)
+
+	    else
+		begin
+
+		if PAT$DATA_ACTION_IS (.ACTION_CODE, 'LOOK_AHEAD')
+		then
+		    begin
+
+		    ! This is a lookahead reduction.
+
+		    REDUCTION_CODE = PAT$DATA_AC_TO_LA_PRODUCTION_NO (.ACTION_CODE);
+		    PAT$DATA_GET_REDUCTION_INFO (.REDUCTION_CODE, LHS_SYMBOL, RHS_COUNT, SEMACT);
+		    NEW_PTR = .GNT_PARSE_STACK_INDEX - .RHS_COUNT;
+		    end
+		else
+		    begin			! ACTION IS 'REDUCE'
+
+		    ! This is a non-lookahead reduction.
+
+		    REDUCTION_CODE = PAT$DATA_AC_TO_PRODUCTION_NO (.ACTION_CODE);
+		    PAT$DATA_GET_REDUCTION_INFO (.REDUCTION_CODE, LHS_SYMBOL, RHS_COUNT, SEMACT);
+		    NEW_PTR = .GNT_PARSE_STACK_INDEX - .RHS_COUNT + 1;
+		    end;
+
+		if .NEW_PTR lss 0
+		then
+		    RET (FALSE)
+		else
+		    begin
+		    GNT_PARSE_STACK_INDEX = .NEW_PTR;
+		    ACTION_CODE = PAT$DATA_MOVE_ACTION (.GNT_PARSE_STACK [.GNT_PARSE_STACK_INDEX],
+			.LHS_SYMBOL);
+		    end;
+
+		end;
+
+	end;
+
+    return FALSE
+    end;					! Of routine GNT_PARSE_UNTIL_SHIFT
+end						! End of module
+
+eludom

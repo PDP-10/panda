@@ -1,0 +1,826 @@
+%TITLE 'R M S I O   -- SEQ/REL I/O'
+!<BLF/REQUIRE 'RMSBLF.REQ'>
+MODULE rmsio (IDENT = '3.0'
+		) =
+BEGIN
+!+
+!
+!    FUNCTION:	THIS MODULE CONTAINS ROUTINES WHICH INTERFACE
+!    TO THE MONITOR TO PERFORM VARIOUS I/O FUNCTIONS
+!    FOR SEQUENTIAL AND RELATIVE FILES.
+!
+!
+!
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1977, 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+!
+!
+!    AUTHOR:	S. BLOUNT
+!
+!
+!    **********	TABLE OF CONTENTS	**************
+!
+!
+!
+!
+!    ROUTINE			FUNCTION
+!    =======			========
+!
+!    GTBYTE			POSITION FILE TO A BYTE LOCATION
+!
+!    GETWINDOW		MAP IN A FILE PAGE
+!
+!    MOVEREC			TRANSFER A RECORD FROM/TO USER BUFFER
+!
+!    NOSPAN			CHECK A SEQUENTIAL FILE FOR PAGE OVERLAP
+!
+!
+!    NUMBERTORFA		CONVERT A RECORD NUMBER TO A BYTE ADDRESS
+!
+!    WRITEBUFFER		OUTPUT A BUFFER FOR ASCII FILE
+!
+!    READBUFFER		INPUT A BUFFER FOR ASCII FILE
+!
+!
+!
+!
+!
+!    REVISION HISTORY:
+!
+!    EDIT		DATE		WHO		PURPOSE
+!    ====		====		===		========
+!
+!    1		8-JUL-76	/JK	ADD READ AHEAD TO GETWINDOW AND MOVEREC
+!    2		15-JUL-76	SEB	MOVE SETPLOG TO RMSFIL
+!    3		27-JUL-76	JK	'PUTBUF' HAS 4 ARGS, NOT 3!!!
+!    4		27-JUL-76	JK	'GETWINDOW' SHOULD ALWAYS ASK FOR PMAPRD.
+!    5		5-AUG-76	JK	ADD NEW ASCII CHANGES.
+!    6		7-FEB-77	SB	TAKE OUT FSTHSZ
+!    7		21-FEB-77	SB	ADD ARG TO SINJSYS
+!    8		14-MAR-77	SB	ADD CHECK-BYTE AT END OF RECORD
+!    9		5-PAR-77	SB	TAKE OUT READ-AHEAD IN MOVEREC,
+!    MAKE NUMBERTORFA USE MRS, NOT RSZW
+!
+!    *************************************************
+!    *						*
+!    *		NEW REVISION HISTORY		*
+!    *						*
+!    *************************************************
+!
+!    PRODUCT	MODULE	 SPR
+!    EDIT	 EDIT	 QAR		DESCRIPTION
+!    ======	======	=====		===========
+!
+!
+!
+!    ***** BEGIN VERSION 2 DEVELOPMENT *****
+!
+!
+!    PRODUCT	MODULE	 SPR
+!    EDIT	 EDIT	 QAR		DESCRIPTION
+!    ======	======	=====		===========
+!
+!    301	300	XXXXX		SUPPORT EXTENDED ADDRESSING.
+!
+!    400	400	xxxxx		Clean up BLISS code (RL, 22-Apr-83)
+!
+!    504                                Image mode
+!    570                                Image mode fix
+!
+!    ***** END OF REVISION HISTORY *****
+!
+!-
+
+REQUIRE 'RMSREQ';
+
+%SBTTL 'GTBYTE - position to next record'
+
+GLOBAL ROUTINE gtbyte (rfa, abortflag) =
+! GTBYTE
+! ======
+! THIS ROUTINE MAKES SURE THAT THE NEXT RECORD TO BE ACCESSED
+!	IS POSITIONED CORRECTLY WITHIN THE FILE WINDOW.
+!	THIS ROUTINE IS USED ONLY FOR SEQUENTIAL AND RELATIVE FILES.
+!	IT IS CALLED BY ALMOST ALL RMS-20 RECORD VERB PROCESSORS
+!	FOR SEQUENTIAL OR RELATIVE FILES. THIS ROUTINE IS NOT
+!	CALLED AT ALL TO PROCESS INDEXED FILES.
+!	ON INPUT, THE 'RECORD-FILE ADDRESS' (RFA) OF THE RECORD
+!	IS PASSED.  ON OUTPUT, THE RECORD IS IN THE CURRENT BUCKET
+!	AND THE "PAGPTR" FIELD OF THE RST CONTAINS THE ADDRESS
+!	WITHIN THE WINDOW OF THE FIRST WORD OF THE RECORD
+!	HEADER.
+!
+! INPUT:
+!	RFA		RFA OF TARGET RECORD
+!	ABORTFLAG 	FLAG TO DETERMINE IF PAGE EXISTS
+!		TRUE: ABORT IF NEXT PAGE IS NON-EXISTENT
+!		FALSE: DONT ABORT
+! OUTPUT:
+!	TRUE:	OK
+!	FALSE:	ERROR
+!
+! ROUTINES USED:
+!	GETWINDOW
+!
+! NOTES:
+!
+!	1.	THE FOLLOWING SYMBOLS ARE MACROS WHICH ARE DEFINED
+!		IN "RST.REQ". DO NOT CONFUSE THEM WITH LOCAL VARIABLES:
+!
+!			CURRENTFILEPAGE
+!			CURRENTWINDOW
+!			CURENTBUFFERADR
+!
+!	2.	THE RFA WHICH IS PASSED TO THIS ROUTINE IS ACTUALLY
+!		THE BYTE NUMBER OF THE STARTING ADDRESS OF THE TARGET
+!		RECORD. FOR SEQUENTIAL FILES, THIS BYTE NUMBER IS ALSO
+!		THE RFA, BUT FOR RELATIVE FILES, THE RFA (RECORD NUMBER)
+!		MUST BE CONVERTED INTO A BYTE NUMBER BEFORE THIS ROUTINE
+!		IS CALLED.
+!
+!	3.	"ABORTFLAG" IS PASSED DIRECTLY TO GETWINDOW AND IS NOT
+!		USED BY THIS ROUTINE.
+    BEGIN
+
+    LOCAL
+	newpagptr,
+	arg1,
+	arg2,
+	arg3,
+	rfapagenum;
+
+    MAP
+	rfa : BLOCK [];
+
+    TRACE ('GTBYTE');
+
+    !+
+    !    CHECK INPUT PARAMETERS
+    !-
+
+    checkinput (rfa, GEQ, 0);			! RFA MUST BE POSITIVE
+    checkinput (rfa, LSS, bitn (8));		! AND ...
+
+    !+
+    !    CHECK IF PAGE IS CURRENTLY IN WINDOW
+    !-
+
+    rfapagenum = .rfa [rfapage];
+
+    IF (.currentwindow EQL 0)			! THERE IS NO CURRENT BUCKET
+	OR (.currentfilepage NEQ .rfapagenum)
+    THEN
+	BEGIN
+	%( GET THE NEW PAGE )%
+
+	IF getwindow (%( PAGE NO. )%.rfapagenum, %( PAGE MUST EXIST )%.abortflag) EQL false
+	THEN
+	    RETURN false			! BADRETURN IF PAGE DOESN'T EXIST
+	END;%( OF GET THE NEW PAGE )%
+
+!+
+!    NOW, THE PAGE WE WANT IS IN OUR WINDOW .
+!    WE MUST SET UP A POINTER TO IT IN THE RST
+!-
+    rst [rstpagptr] = (.curentbufferadr) + .rfa [ofset];
+    RETURN true;				! Return to caller
+    END;
+
+%( OF GTBYTE	)%
+%SBTTL 'GETWINDOW - position page in window'
+
+GLOBAL ROUTINE getwindow (fpage, abortf) =
+! GETWINDOW
+! ======
+!  THIS ROUTINE MAKES SURE THAT THE SPECIFIED FILE PAGE IS IN THE WINDOW.
+! 'GETBKT' IS CALLED TO CHECK IF THE FILE PAGE IS ALREADY MAPPED INTO OUR
+! PROCESS (OTHERWISE, THE FILE PAGE WILL BE MAPPED IN.)  'PUTBKT' WILL BE
+! CALLED TO RELEASE THE BUFFER CONTAINING THE FILE PAGE WHICH IS CURRENTLY
+! IN THE WINDOW.
+!
+!	IF THE ABORT-FLAG IS ON, THEN A PRELIMINARY CHECK IS
+!	TO INSURE THAT THE TARGET FILE PAGE ACTAULLY EXISTS.
+!	IF THE PAGE DOES NOT EXIST, AN ERROR RETURN IS TAKEN.
+! INPUT:
+!	FPAGE		PAGE NO. OF FILE PAGE
+!	ABORTF		FLAG TO DETERMINE IF PAGE EXISTS
+!		TRUE =  PAGE MUST EXIST
+!	 	FALSE = PAGE DOESN'T HAVE TO EXIST
+! OUTPUT:
+!	TRUE :	OK
+!	FALSE:	PAGE NON-EXISTENT
+    BEGIN
+
+    LOCAL
+	bpage,
+	bfdadr,
+	incore,
+	arg;
+
+    TRACE ('GETWINDOW ');%( CHECK INPUT PARAMETERS )%
+    checkinput (fpage, GEQ, 0);			! PAGE #'S ARE POSITIVE
+    checkinput (fpage, LSS, bitn (17));		! 2**18 FILE PAGES
+
+    !+
+    !    IF THERE IS A PAGE IN THE WINDOW, RELEASE IT
+    !-
+
+    IF NOT nullbd (cbd) THEN %(THERE IS A CURRENT BUCKET)%putbkt (%(NO UPDATE)%false, %(BKT DESC)%.cbd);
+
+    !+
+    !    CHECK IF SPECIFIED FILE PAGE EXISTS (IF CALLER WANTS US TO)
+    !-
+
+    IF .abortf NEQ false
+    THEN
+	BEGIN
+	%( CHECK IF PAGE EXISTS )%
+
+	!+
+	!    READ THE PAGE'S ACCESSIBILITY
+	!-
+
+	IF pagexist (.fst [fstjfn], .fpage) EQL false	! JFN + PAGE NO
+	THEN
+	    RETURN false;			! Page non-existent
+
+	END;%( OF CHECK IF PAGE EXISTS )%
+
+    !+
+    !    WE CAN NOW FETCH THE NEW BUCKET AND MAKE IT "CURRENT"
+    !-
+
+    IF getbkt (%(BKT NUM)%.fpage, %(SIZE)%seqbktsize, %(LOCK)%false, %(BD)%.cbd) EQL false
+    THEN
+	rmsbug (msgfailure);
+
+    RETURN true					! RETURN FROM GETWINDOW
+    END;
+
+%( OF GETWINDOW )%
+%SBTTL 'MOVEREC - move a record around'
+
+GLOBAL ROUTINE moverec (windowptr, useradr, putflag, bytes, bytesize) =
+! MOVEREC
+! =======
+! THIS ROUTINE TRANSFERS A RECORD FROM ONE PLACE TO ANOTHER.
+!	IT IS USED ON BOTH INPUT AND OUTPUT FOR SEQUENTIAL AND
+!	RELATIVE FILES. IT IS NOT CALLED FOR INDEXED FILES.
+!
+!	ALL PAGE BOUNDARY PROBLEMS ARE HANDLED BY SWITCHING
+!	WINDOW PAGES. NO INDICATION IS GIVEN IF A NON-EXISTENT
+!	PAGE IS FOUND.
+! INPUT:
+!	ADDRESS OF RECORD IN SYSTEM BUFFER
+!	ADDRESS OF USER BUFFER
+!	PUT-FLAG:
+!		TRUE :	MOVE FROM USER TO WINDOW
+!		FALSE:	MOVE FROM WINDOW TO USER
+!	# BYTES TO MOVE
+!	BYTE-SIZE OF RECORD
+! OUTPUT:
+!	TRUE ALWAYS
+!
+! ROUTINES USED:
+!	GETWINDOW
+! NOTES:
+!
+!	1.	THE FOLLOWING SYMBOLS ARE MACROS WHICH ARE DEFINED
+!		IN "RST.REQ". DO NOT CONFUSE THEM WITH LOCAL VARIABLES:
+!
+!			CURRENTFILEPAGE
+!			CURRENTWINDOW
+!			CURENTBUFFERADR
+!
+!	2.	ON A $PUT OPERATION, THIS ROUTINE WILL MOVE FULL
+!		WORDS FROM THE USER'S BUFFER TO THE SYSTEM FILE
+!		BUFFER. ON A $GET, ONLY THE EXACT NUMBER OF BYTES
+!		IN THE RECORD ARE MOVED. THUS, THE USER'S BUFFER
+!		DOES NOT GET DESTROYED PAST THE END OF HIS RECORD.
+    BEGIN
+
+    LOCAL
+	wordcount,				! COUNTER OF WORDS TO MOVE
+	bytesword,
+	room,					! AMOUNT OF ROOM LEFT ON CURRENT PAGE
+	temp2,
+	extrabytes,
+	SOURCE,
+	dest,
+	buf2ptr : VECTOR [2];			!TWO-WORD BP IF NEEDED
+
+    REGISTER
+	temp;
+
+    TRACE ('MOVEREC');%( CHECK INPUT PARAMETERS )%
+
+%IF dbug
+%THEN
+
+    IF (.bytes LSS 0) OR (.bytesize LEQ 0) OR (.bytesize GTR 36) THEN rmsbug (msginput);
+
+						! BAD INPUT VALUES
+%FI
+
+    bytesword = 36/.bytesize;			! FIND # OF BYTES IN WORD
+    wordcount = .bytes/.bytesword;		! # OF WORDS TO MOVE
+    extrabytes = .bytes - (.wordcount*.bytesword);
+!+
+!    FOR A $PUT OPERATION, WE WILL MOVE THE RECORD BY USING
+!    A BLT INSTEAD OF A ILDB-IDPB LOOP. WHEN WE ARE LATER
+!    READING THE RECORD, WE MUST INSURE THAT WE DON'T MOVE
+!    THE EXTRA GARBAGE BYTES IN THE RECORD
+!-
+
+    IF (.putflag)
+    THEN
+
+	IF (.extrabytes NEQ 0)
+	THEN
+	    BEGIN
+	    wordcount = .wordcount + 1;		! BUMP THE WORDCOUNT
+	    extrabytes = 0			! NO EXTRA BYTES
+	    END;%( PRINT OUT THE RESULTS, SO FAR )%
+
+    lookat ('	WORDCOUNT: ', wordcount);
+    lookat ('	EXTRA: ', extrabytes);%([ LOOP FOR ALL FULL WORD MOVES...ONE LOOP FOR EACH PAGE
+	  ONTO WHICH THE RECORD IS MOVED ])%
+
+    WHILE .wordcount NEQ 0 DO
+	BEGIN
+
+	!+
+	!    COMPUTE HOW MUCH SPACE WE HAVE LEFT ON THIS PAGE
+	!-
+
+	room = (.curentbufferadr + pagesize) - .windowptr;
+
+%IF dbug
+%THEN
+
+	IF (.room LSS 0) OR (.room GTR pagesize) THEN rmsbug (msgcount);
+
+	IF .wordcount LSS 0 THEN rmsbug (msgcount);	! BAD VALUE FOR WORDCOUNT
+
+%FI
+
+	!+
+	!    WE MUST NOW CHECK TO SEE IF THE FILE PAGE IS COMPLETELY FULL
+	!-
+
+	IF .room EQL 0
+	THEN
+	    %( WE MUST GET NEXT PAGE )%
+	    BEGIN
+	    temp = .currentfilepage + 1;	! GET # OF NEXT PAGE IN FILE
+	    rtrace (%STRING (' 	SWITCHING PAGES...', %CHAR (13), %CHAR (10), ' '));
+
+	    !+
+	    !    LOAD THE PAGE WE WANT RIGHT NOW.
+	    !-
+
+	    getwindow (%( PAGE NO. )%.temp, %( DON'T ABORT )%false);
+	    windowptr = .curentbufferadr;	! RESET PTR TO START OF FILE BUFFER
+	    room = pagesize			! AND AMOUNT LEFT
+	    END;%( OF IF ROOM IS ZERO )%%( FIND THE LESSER OF RECORD SIZE, OR AMOUNT ON PAGE )%
+
+	IF .wordcount LSS .room THEN room = .wordcount;
+
+	!+
+	!    ASSUME THAT THIS IS A $GET AND SET UP OUT POINTERS
+	!-
+
+	SOURCE = .windowptr;			! MOVE FROM FILE PAGE...
+	dest = .useradr;			! ...TO USER BUFFER
+
+	IF .putflag NEQ false %( MOVE FROM USER TO WINDOW )%
+	THEN
+	    BEGIN
+	    setbfdupd (cbd [bkdbfdadr]);	!INDIC FILE PAGE UPD
+	    SOURCE = .useradr;			! GET ADDRESS
+	    dest = .windowptr			! AND DESTINATION
+	    END;%( OF IF PUTFLAG IS TRUE )%
+
+	!+
+	!    NOW, MOVE THIS RECORD SEGMENT FROM/TO USER BUFFER
+	!-
+
+	IF .rmssec NEQ 0
+	THEN
+	    xcopy (%(FROM)%.SOURCE, %(TO)%.dest, %(SIZE)%.room)
+	ELSE
+	    movewords (%(FROM)%.SOURCE, %(TO)%.dest, %(SIZE)%.room);
+
+	useradr = .useradr + .room;		! BUMP USER BUFFER POINTER
+	windowptr = .windowptr + .room;		! AND WINDOW POINTER
+	wordcount = .wordcount - .room
+	END;%( OF WHILE WORDCOUNT NEQ ZERO )%%([ WE HAVE NOW MOVED ALL FULL WORDS IN THE RECORD. WE MUST
+
+	  THEN SEE IF THERE WERE ANY BYTES LEFT OVER TO MOVE ])%
+
+    IF .extrabytes EQL 0 THEN RETURN true;	! No extra bytes to move
+
+!+
+!    FIRST, WE MUST CHECK TO SEE IF THESE LAST FEW BYTES
+!    WILL OVERLAP INTO THE NEXT PAGE OF THE FILE. IF SO,
+!    WE MUST MAP IN THE NEXT FILE PAGE AND MOVE THE BYTES
+!    IN THE NEW PAGE
+!-
+
+    IF ((.curentbufferadr + pagesize) EQL .windowptr)
+    THEN
+	BEGIN
+	temp = (.currentfilepage + 1);		! GET # OF NEXT FILE PAGE
+	rtrace (%STRING ('	CURRENT PAGE EXHAUSTED...', %CHAR (13), %CHAR (10), ' '));
+
+	IF getwindow (%( PAGE NO. )%.temp, %( DON'T ABORT )%false) EQL false THEN rmsbug (msgfailure);
+
+	windowptr = .curentbufferadr		! RESET ADDRESS
+	END;%( OF IF WINDOW IS EXHAUSTED )%
+
+    !+
+    !    SET UP AN APPROPRIATE BYTE POINTER
+    !-
+
+    temp = .bytesize*.extrabytes;		! # OF BITS TO MOVE
+    temp = (.temp^6) + nullbp;			! FORM LH OF PTR
+    windowptr<lh> = .temp;			!GET LOCAL BP TO WINDOW
+
+    IF .rmssec NEQ 0
+    THEN
+	BEGIN
+	buf2ptr [1] = .useradr;
+	buf2ptr<lh> = .temp OR %O'40';		!2-WORD BP
+	buf2ptr<rh> = 0;
+	ildb (temp, windowptr);
+	idpb (temp, buf2ptr)
+	END
+    ELSE
+	BEGIN
+	useradr<lh> = .temp;			! STORE IN POINTERS
+	ildb (temp, windowptr);
+	idpb (temp, useradr)
+	END;
+
+    RETURN true
+    END;
+
+%( OF MOVEREC )%
+%SBTTL 'NOSPAN - Calculate sequential NRP'
+
+GLOBAL ROUTINE nospan (nrp) =
+! NOSPAN
+! ======
+! THIS ROUTINE PERFORMS CALCULATION ON THE NRP
+!	OF A SEQUENTIAL FILE WHEN A RECORD IS TO BE WRITTEN.
+!	IF THE "BLOCKED" ATTRIBUTE ( FB$BLK) IS NOT
+!	DEFINED FOR THIS FILE, THIS ROUTINE IS NOT CALLED.
+!	ON INPUT TO THE ROUTINE, THE NRP IS PASSED AS AN ARGUMENT.
+!	THIS ROUTINE COMPUTES IF THE RECORD TO BE WRITTEN
+!	CAN FIT ON THE CURRENT PAGE. IF SO, THE NRP
+!	VALUE WHICH WAS PASSED TO THIS ROUTINE IS RETURNED
+!	UNCHANGED.  IF NOT, IT RETURNS
+!	THE NEW VALUE OF THE NRP.
+!	IN THIS CASE, AN "END-OF-PAGE" MARKER WILL BE WRITTEN INTO
+!	THE FILE AT THE PLACE WHERE THIS RECORD WAS TO BE PLACED.
+! INPUT:
+!	CURRENT NRP VALUE
+! OUTPUT:
+!	UPDATED NRP
+!
+! GLOBALS USED:
+!	<NONE>
+! NOTES:
+!
+!	1.	THE FOLLOWING SYMBOLS ARE MACROS WHICH ARE DEFINED
+!		IN "RST.REQ". DO NOT CONFUSE THEM WITH LOCAL VARIABLES:
+!
+!			CURRENTWINDOW
+    BEGIN
+
+    LOCAL
+	newnrp;
+
+    MAP
+	newnrp : BLOCK [1];
+
+    MAP
+	nrp : BLOCK [];
+
+    TRACE ('NOSPAN');
+!+
+!    WE WILL NOW DEFINE A NEW BEGIN-END BLOCK IN ORDER
+!    TO REMAP NRP ONTO ANOTHER STRUCTURE LATER.
+!-
+    BEGIN
+    %( A NEW BLOCK TO ALLOW RE-MAPPING OF NRP )%
+
+    !+
+    !    COMPUTE AMOUNT OF SPACE REQUIRED FOR RECORD
+    !-
+
+    newnrp = .nrp + .rst [rstrszw] + headersize - 1;	! FIND END OF THIS RECORD
+
+    IF .newnrp [page] EQL .nrp [page]		! Check if it slops over to next page
+    THEN
+	RETURN .nrp;
+
+!+
+!    WE NOW KNOW THAT THE NEXT RECORD TO BE WRITTEN
+!    CANNOT FIT ON THE CURRENT PAGE. SO, WE WILL
+!    BUMP THE NRP TO THE NEXT PAGE, AND STICK AN
+!    END-OF-PAGE MARKER AT THE END OF THIS PAGE
+!-
+    newnrp = (.nrp OR ofsetmask) + 1;		! COMPUTE START OF NEXT PAGE
+    nrp [page] = .currentwindow;		! FORM ADDRESS OF PLACE TO PUT EOP
+    END;%( OF BEGIN BLOCK )%
+    BEGIN
+    %( A NEW BLOCK )%
+
+    MAP
+	nrp : REF BLOCK;
+
+!+
+!    STORE THE END-OF-PAGE MARKER (-1) AT THE END
+!    OF THE LAST PAGE
+!-
+    nrp [wholeword] = eopmarker;		! STORE MARKER
+!+
+!    RETURN THE VALUE OF THE UPDATED POINTER TO THE
+!    NEXT PAGE
+!-
+    RETURN .newnrp;				! RETURN THE NEW VALUE
+    END;
+    END;
+
+%( OF NOSPAN )%
+%SBTTL 'NUMBERTORFA - calculate relative record address'
+
+GLOBAL ROUTINE numbertorfa (recnum) =
+! NUMBERTORFA
+! ===========
+! THIS ROUTINE COMPUTES THE ABSOLUTE BYTE ADDRESS OF A RECORD
+!	IN A RELATIVE FILE.  IT MUST COMPUTE THIS ADDRESS
+!	DEPENDING UPON WHETHER THE FILE HAS THE "BLK" ATTRIBUTE
+!	OR NOT.
+! INPUT:
+!	RECNUM =	RECORD NUMBER
+! OUTPUT:
+!	NOT FALSE :	RFA OF RECORD
+!	FALSE:		BAD RECORD NUMBER
+! GLOBALS USED:
+!	< NONE >
+! USER ERRORS:
+!	BYTE NUMBER OF RECORD .GTR. FILE ADDRESS SPACE
+    BEGIN
+
+    LOCAL
+	startofdata,			! MOVING VALUE WHICH DENOTES THE START OF THE DATA WITHIN THE FILE
+	bytenum,				! BYTENUMBER OF RECORD
+	sizeofrecord,				! SIZE OF THE CURRENT RECORD
+	recsonanypage,				! NUMBER OF RECORDS ON ANY PAGE OF THE FILE
+	recsonpage0,				! NUMBER OF RECORDS ON THE FIRST FILE PAGE ( PAGE 0 )
+	temp;
+
+    MAP
+	recnum : BLOCK [];
+
+    TRACE ('NUMBERTORFA');
+
+    !+
+    !    PRINT OUT THE INPUT VALUE
+    !-
+
+    lookat ('	INPUT RECORD #: ', recnum);
+
+    !+
+    !    COMPUTE THE TOTAL SIZE OF A RECORD IN THIS FILE
+    !-
+
+    sizeofrecord = sizeinwords (.fst [fstmrs], .fst [fstbsz]) + headersize;
+						! COMPUTE TOTAL LENGTH OF RECORD
+!+
+!    WE MUST NOW CHECK TO SEE IF THIS RECORD NUMBER IS
+!    WITHIN THE ACCEPTABLE RANGE FOR THIS FILE. FOR
+!    INSTANCE, IT MAY BE .GTR. THE MAX-RECORD-NUMBER.
+!-
+
+    IF ((.fst [fstmrn] NEQ 0) AND (.recnum GTR .fst [fstmrn])) OR (.recnum LEQ 0) THEN RETURN false;
+
+    !+
+    !    COMPUTE THE ADDRESS OF THIS RECORD
+    !-
+
+    startofdata = .fst [fstlobyte];		! 1ST BYTE AFTER PROLOGUE
+
+    !+
+    !    DETERMINE THE # OF RECORDS WHICH WILL EXIST ON PAGE 0
+    !-
+
+    recsonpage0 = (pagesize - .startofdata)/(.sizeofrecord);	! FIND # OF RECORDS ON PAGE 1
+!+
+!    IF THIS FILE HAS THE FB$BLK ATTRIBUTE, AND THIS
+!    RECORD IS NOT ON THE FIRST PAGE OF THE FILE, THEN
+!    WE MUST FIND THE PAGE ON WHICH IT LIVES.  EACH PAGE
+!    AFTER PAGE 0 WILL HAVE THE SAME NUMBER OF RECORDS ON IT.
+!    THAT IS WHY WE MUST TREAT THE FIRST PAGE DIFFERENTLY
+!    THAN THE OTHER PAGES OF THE FILE.
+!-
+
+    IF (blocked) AND .recnum GTR .recsonpage0
+    THEN 					! ITS NOT ON PAGE 1
+	BEGIN
+	recnum = .recnum - .recsonpage0;	! SUBTRACT 1 PAGE OF RECORDS
+	recsonanypage = 512/.sizeofrecord;	! # OF RECORDS ON ANY FILE PAGE
+	temp = (.recnum - 1)/.recsonanypage;	! FIND WHERE RECORD BEGINS
+	bytenum = (.temp + 1)^p2w + ((.recnum - 1) MOD .recsonanypage)*.sizeofrecord;
+						! COMPUTE OFFSET INTO THAT PAGE
+	END %( OF IF .RECNUM GTR RECSONPAGE0 )%
+    ELSE
+!+
+!    THIS FILE DOES NOT HAVE THE "FB$BLK" ATTRIBUTE,
+!    SO WE CAN COMPUTE THE START OF THE RECORD DIRECTLY
+!-
+	bytenum = ((.recnum - 1)*(.sizeofrecord)) + .startofdata;%(LET'S SEE IT)%
+
+    lookat ('	BYTE #: ', bytenum);
+
+    !+
+    !    MAKE ONE LAST CHECK TO SEE IF THIS RECORD IS OFF THE END OF THE WORLD
+    !-
+
+    IF .bytenum GEQ bitn (8) THEN RETURN false;
+
+    RETURN .bytenum				! GIVE BACK THE BYTE ADDRESS
+    END;
+
+%( OF NUMBERTORFA )%
+%SBTTL 'WRITEBUFFER - Write non-indexed buffer'
+
+GLOBAL ROUTINE writebuffer : NOVALUE =
+! WRITEBUFFER
+! ===========
+! THIS ROUTINE WRITES OUT THE CURRENT BUFFER FOR FILES ON A SEQUENTIAL
+!	DEVICE, OR FOR ASCII ( LINE-SEQUENCED OR STREAM ) FILES.
+! INPUT:
+!	<NONE>
+! OUTPUT:
+!	<NONE>
+! IMPLICIT INPUTS:
+!
+!	RSTBYTECOUNT =		NUMBER OF BYTES REMAINING IN FILE BUFFER
+!
+! ON EXIT, THE FILE BUFFER POINTER ( PAGPTR ) WILL BE RESET TO
+!	THE TOP OF THE FILE BUFFER. ALSO, THE BUFFER WILL BE
+!	SET TO INDICATE THAT IT IS EMPTY ( BYTECOUNT WILL BE SET
+!	TO THE SIZE OF AN EMPTY BUFFER )
+! NOTES:
+!
+!	1.	THE FOLLOWING SYMBOLS ARE MACROS WHICH ARE DEFINED
+!		IN "RST.REQ". DO NOT CONFUSE THEM WITH LOCAL VARIABLES:
+!
+!			CURENTBUFFERADR
+    BEGIN
+
+    REGISTER
+	bufadd;					!FOR CURRENT BUF ADDR
+
+    TRACE ('WRITEBUFFER');
+
+    !+
+    !    DETERMINE THE NUMBER OF BYTES WE HAVE TO WRITE OUT
+    !-
+
+    bufadd = .curentbufferadr;
+    rtrace ('FLUSHING BUFFERS');		! Use for debugging
+
+    IF .rst [rstbytecount] GTR 0		!ANYTHING THERE TO WRITE?
+    THEN
+	BEGIN					!YES
+	ascwrite (.fst [fstjfn], .rst [rstnrp], .bufadd, .rst [rstbytecount]);
+
+	IF .rst[rst$h_byte_count]
+          EQL ( ( %BPVAL / .fst[fst$h_bsz] ) * rms$k_page_size )          !m570
+	THEN
+	    BEGIN				!WRITING FULL PAGE, SO POSIT TO NEXT P
+	    rst [rstnrp] = .rst [rstnrp] + 1;	!DONE (RE)WRITING THIS PAGE, POSIT TO NXT
+	    rst [rstpagptr] = POINT (.bufadd,   !m504
+                                     36,
+                                     .Fst[Fst$h_Bsz]); !RESET PTR TO TOP OF BUF
+	    rst [rstbytecount] = 0;		! RESET NUMBER OF BYTES IN BUFFER
+!+
+!    CLEAR ENTIRE BUFFER TO RESET ALL BIT 35'S.
+!    THIS IS NECESSARY SO THAT THE SECOND BUFFER WE WRITE
+!    DOESNT HAVE RANDOM BIT 35'S SET IN IT
+!-
+
+	    IF sequenced THEN clear (.bufadd, pagesize);
+
+	    END;				!END FULL PAGE
+
+	END;					!END NON-EMPTY PAGE
+
+    RETURN
+    END;
+
+%( OF WRITEBUFFER )%
+%SBTTL 'READBUFFER - read non-indexed buffer'
+
+GLOBAL ROUTINE readbuffer : NOVALUE =
+! READBUFFER
+! ==========
+! THIS ROUTINE READS IN A NEW BUFFER FOR RMS-20 FILES ON
+!	A SEQUENTIAL DEVICE OR FOR ASCII FILES.
+!
+! INPUT:
+!	<NONE>
+!
+! OUTPUT:
+!	<NONE>
+!
+! NOTES:
+!
+!	1.	FOR INPUT FROM THE TTY, A <CONTROL-Z> WILL RETURN
+!		AN ER$EOF ERROR CODE, BUT FURTHER INPUT FROM THE TTY
+!		WILL BE ALLOWED.
+    BEGIN
+
+    LOCAL
+        bytes_per_page;                 ! # of byte per page !a504
+
+    REGISTER
+	bufadd;
+
+    TRACE ('READBUFFER');
+
+    !+
+    !    IF WE ARE ALREADY AT EOF, DONT BOTHER...
+    !-
+
+    IF endoffile THEN RETURN;
+
+    bufadd = .curentbufferadr;			!USE A LOCAL
+
+    ! REPOSITION TO BEGIN OF BUFFER
+    rst [rstpagptr] = POINT (.bufadd, 36, .Fst[Fst$h_bsz] ); !M504
+
+    !+
+    !    FOR DEBUGGING
+    !-
+
+    rtrace ('READING BUFFER...');
+
+    bytes_per_page = (%BPUNIT/.Fst[Fst$h_Bsz])*pagesize;  !a504
+
+!+
+!    IF WE ARE READING FROM THE TTY, PROCESS ONE RECORD AT A TIME
+!    ELSE TRY TO FILL ENTIRE BUFFER
+!-
+
+    IF tty
+    THEN
+	rst [rstbytecount] = readtty ( .bufadd, .bytes_per_page )
+    ELSE
+	BEGIN
+	rst [rstbytecount] = ascread (.fst [fstjfn],
+                                      .rst [rstnrp],
+                                      .bufadd,
+                                      .bytes_per_page );        !m504
+
+	rst [rstnrp] = .rst [rstnrp] + 1;	!NEXT GROUP OF RECORDS IN NEXT BKT
+	END;
+
+    IF .rst [rstbytecount] EQL 0
+    THEN
+	BEGIN
+	setflag (rst [rstflags], flgeof);	! SET EOF FLAG
+
+	IF dasd					!DISK FILE?
+	THEN
+	    posascfil (.fst [fstjfn], sizefile (.fst [fstjfn]));	!POSIT TO APPEND
+
+	END;
+
+    RETURN
+    END;
+
+%(OF READBUFFER)%
+END
+
+ELUDOM
+   

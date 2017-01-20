@@ -1,0 +1,485 @@
+	TITLE SNDMSG - Routines to send local and network TTY messages
+	SUBTTL David Eppstein/DE/KSL/MRC/WHP4
+
+	SEARCH MONSYM,MACSYM,SNDDEF
+	EXTERN $WAKE
+	EXTERN $GTLCL,$RMREL
+	ASUPPRESS
+	SALL
+IFNDEF OT%822,OT%822==:1
+
+; Definitions and Storage
+
+A=:1				;Temporary AC's for JSYS use etc
+B=:2
+C=:3
+D=:4
+
+ADR=10				;Pointer to current address block
+ABLOCK=11			;Pointer to argument block
+
+FP=:15				;TRVAR frame pointer
+CX=:16				;Scratch for MACREL
+P=:17				;Main stack pointer
+
+	BUFLEN==MAXCHR/5	;Length of command buffers (for long msgs)
+	PDLEN==100		;Length of pushdown stack
+
+; Macros for returning error strings and codes
+
+DEFINE RETSTR (ERTEXT,ERCODE,OP<JRST>) <
+	OP [	HRROI A,[ASCIZ\ERTEXT\]
+		MOVX C,ERCODE
+		RET ]
+>
+
+; Storage allocation
+
+	.PSECT DATPAG		;Paged storage
+
+BUFFER:	BLOCK 1000		;Random text storage etc (must be whole page)
+	BUFPAG==BUFFER/1000	;The associated page number
+
+	.ENDPS
+
+	.PSECT CODE		;Rest of this file is pure code
+
+; $SEND - Send a terminal message to multiple recipients
+; Call with A/pointer to ASCIZ message text
+;	    B/list of recipients to send to
+;	    C/argument block
+; Returns +1/Failed, A/error string
+;		     B/points to failed recipient
+;		     C/error code (TTXxxx defined in SNDDEF)
+;	  +2/Success, A, B, and C changed
+;
+; Format of the recipient list:
+;	Each recipient block is in the form of a header word possibly
+;	followed by some data words.  The format of the header word is
+;	RC%TYP,,RC%NXT where RC%TYP is a code for the type of recipient
+;	coded for by this block, and RC%NXT is the next recipient.
+;	End the list with a 0 RC%NXT field.  Values for RC%TYP are:
+;		RC.TTY - Recipient is a local terminal.
+;			 Data is the terminal number (without .TTDES)
+;		RC.USR - Recipient is a local user - data is user number.
+;		RC.ALL - Send to all local users (no data).
+;		RC.NET - Send to a net user.  Data are two word-aligned
+;			 ASCIZ strings for the user and host names.
+;
+;	Example: to send to TTY4, FMF, and CSD.KDO@SCORE one might have:
+;		RBLOCK:	RC.TTY,,RBLK0
+;			4		;TTY 4 (not 400004)
+;		RBLK0:	RC.USR,,RBLK1
+;			500000,,137	;FMF's user number (use RCUSR%)
+;		RBLK1:	RC.NET,,0
+;			ASCIZ/CSD.KDO/	;Net user name (CSD.KDO)
+;			ASCIZ/SCORE/	;Net host name (SCORE)
+;
+;
+; Format of the argument block:
+;	Word 0 (.SDPID): PID for IPCF messages.  Set to zero to make $SEND
+;			 create a new PID - it will be filled in if created.
+;	Word 1 (.SDFLG): Flags for the IPCF send server.  Defined flags:
+;		1B0 (T%USER) - "User program features" like typing the status
+;			       of a send to user with multiple ttys
+;		1B1 (T%RAFT) - Obey REFUSE SYS after this message
+;		1B2 (T%HDR)  - Don't supply a message header (needs WHEEL)
+;		1B3 (T%RSYS) - Obey REFUSE SYS always
+
+$SEND::	SAVEAC <D,ADR,ABLOCK,CX> ;Don't mung anything for caller
+	TRVAR <MSPTR,QUEJFN>	;Make some pseudo-globals
+	SETZM QUEJFN		;So nobody thinks random crud is a JFN
+	MKPTR (A)		;Turn into a byte pointer
+	MOVEM A,MSPTR		;Get message text pointer
+	MOVE ADR,B		;Get address block
+	MOVE ABLOCK,C		;Get argument block
+	DO.
+	  CALL SNDONE		;Send one message
+	  IFSKP.
+	    MOVE B,.SDFLG(ABLOCK) ;Done, get SNDSRV flags
+	    TXZN B,T%RAFT	;Obey REFUSE SYS after that message
+	    IFSKP.
+	      TXON B,T%RSYS	;Yes, set flag for that
+	       MOVEM B,.SDFLG(ABLOCK) ;Save changed flag word
+	    ENDIF.
+	    LOAD ADR,RC%NXT,(ADR) ;Done, get next
+	    JUMPN ADR,TOP.	;And loop back with it
+	  ELSE.
+	    CALL MQUEUE		;Failed, queue net sends
+	    MOVE B,ADR		;Get address block back
+	    RET			;And return failure
+	  ENDIF.
+	ENDDO.
+	CALL MQUEUE		;Done, finish queueing net sends
+	MOVE A,MSPTR		;Get message text pointer again
+	MOVE B,ADR		;Get final value in ADR (should be 0)
+	MOVE C,ABLOCK		;Get address block address
+	RETSKP			;Return success with them
+
+; Finish queueing net sends
+
+MQUEUE:	SAVEAC <A,B,C>		;Don't mung error code or whatever
+	SKIPN QUEJFN		;Are we queueing anything?
+	 RET			;No, done already
+
+	;; Finish creating the queued mail file
+	HRROI A,BUFFER		;Get buffer back
+	FMSG <
+Date: >				;Yes, start text
+	SETO B,
+	MOVX C,OT%DAY!OT%SPA!OT%TMZ!OT%SCL!OT%822 ; RFC 822 standard date/time
+	ODTIM%
+	FMSG <
+From: >
+	CALL .DIRST		;Put in my username
+	FMSG <@>
+	PUSH P,A
+	CALL $GTLCL		;Local host name
+	IFNSK.
+	  POP P,A
+	  RETSTR <Couldn't get local host name>,TTXNET
+	ENDIF.
+	POP P,A
+	CALL $RMREL
+	MOVE A,QUEJFN
+	HRROI B,BUFFER		;Get buffer back
+	SETZ C,			;Until null
+	SOUT%			;Start making file
+	FMSG <
+
+>
+	MOVE B,MSPTR		;Get pointer to message text
+	SETZ C,			;Ending on null
+	SOUT%			;Send it off
+	CLOSF%			;Close the file
+	 NOP
+	CALLRET $WAKE		;Wake up MMailr and return
+
+; SNDONE - Send one message
+; returns +1/failure, A and C set up; +2/success
+
+SNDONE:	LOAD A,RC%TYP,(ADR)	;Get send type
+	CAIG A,RC.NET		;In range?
+	IFSKP.
+	  HRROI A,[ASCIZ/Unknown function code/]
+	  MOVEI C,TTXUNK	;No, get error string and code
+	  RET			;Return failure
+	ENDIF.
+	CAIN A,RC.NET		;If it's a net send
+	 JRST SNDNET		;Then send that way
+	JRST SNDLOC		;Else it's a local send
+
+; Here to make error string for JSYS error and return
+
+JSRET:	HRROI A,BUFFER+200	;Use a likely buffer
+	HRLOI B,.FHSLF		;With ourself
+	MOVEI C,40*5-1		;Number of characters available
+	ERSTR%			;Copy error string
+	 NOP
+	 NOP
+	HRROI A,BUFFER+200		;Now point to the string we made
+	MOVX C,TTXNET		;Random network error (not called from SNDLOC)
+	RET
+
+; Sending a Local Message
+
+SNDLOC:	LOAD A,RC%TYP,(ADR)	;Fetch type of field we parsed
+	MOVE A,[ SIXBIT/SNDLIN/
+		 SIXBIT/SNDUSR/
+		 SIXBIT/SNDALL/ ](A)
+	MOVEM A,BUFFER+SN$HDR	;Set up appropriate function code
+	MOVE A,1(ADR)		;Retrieve word of data (garbage for SNDALL)
+	MOVEM A,BUFFER+SN$DAT	;Set up data
+	MOVE A,.SDFLG(ABLOCK)	;Get flags for IPCF
+	MOVEM A,BUFFER+SN$FLG	;Set them
+	HRROI A,BUFFER+SN$MSG	;Into the appropriate place in the IPCF page
+	MOVE B,MSPTR		;From message pointer given to us
+	CALL MOVSTR		;Copy the message
+	MOVE D,.SDPID(ABLOCK)	;With PID we were given
+	CALL DOIPCF		;Go send it off
+	IFNSK.
+	  MOVEM D,.SDPID(ABLOCK) ;Failed, copy PID back anyway
+	  RET			;Give fail return
+	ENDIF.
+	MOVEM D,.SDPID(ABLOCK)	;Succeeded, copy PID back
+	SKIPN BUFFER+SN$HDR	;Header word is -1 on errors
+	IFSKP.
+	  HRROI A,BUFFER+SN$STR	;Point to error string
+	  MOVE C,BUFFER+SN$ERR	;And get error code returned
+	  RET			;Return failure
+	ENDIF.
+	MOVE A,BUFFER+SN$TTY	;Fetch number of terminals sent to
+	CAIG A,1		;One or none?
+	 RETSKP			;Yes, done (none?? should be error)
+	MOVE A,.SDFLG(ABLOCK)	;Get argument flags
+	TXNN A,T%USER		;We running a user program?
+	 RETSKP			;No, be quiet
+
+	;; Multiple jobs with T%USER set - give status of each
+	LOAD A,RC%TYP,(ADR)	;Get address type
+	CAIE A,RC.ALL		;Is it to *?
+	IFSKP.			;Yes, "* has multiple jobs" is ugly, so:
+	  TMSG <Status of system-wide send:
+>
+	ELSE.
+	  MOVX A,.PRIOU		;To the terminal
+	  MOVE B,ADR		;With current address
+	  CALL $WTRCP		;Write recipient name
+	  TMSG < has multiple jobs:
+>				;Start message
+	ENDIF.
+	MOVN D,BUFFER+SN$TTY	;Fetch and negate no. of terminals pawed over
+	HRLZS D			;Swap and clear
+	DO.
+	  TMSG <  >		;Space over for pretty
+	  MOVEI A,.PRIOU	;A to the terminal
+	  HRRZ B,BUFFER+SN$TTY+1(D)
+	  ADDI B,.TTDES		;Make TTY number into a device designator
+	  DEVST%		;Write device name, e.g. TTY6
+	   ERJMP .+1
+	  TMSG <: -- >	;Add a colon and separating dashes
+	  HLRZ B,BUFFER+SN$TTY+1(D)	 ;Fetch status flag for that line
+	  HRRO A,[ [ASCIZ/refused/]
+		   [ASCIZ/ok/]
+		   [ASCIZ/timed out/]
+		   [ASCIZ/refused/] ]+1(B)
+	  PSOUT%		;Print out the status
+	  TMSG <
+>				;End with a CRLF
+	  AOBJN D,TOP.		;Loop over the list
+	ENDDO.
+	RETSKP
+
+; DOIPCF - send an IPCF page to the send server and await the response
+; call with BUFFER/message, D/PID of this process (zero if none)
+; returns +1/failure, +2/success, reply page in BUFFER
+
+	PACLEN==7		;Length of MSEND/MRECV packet
+
+DOIPCF:	STKVAR <SRVPID,<SNDARG,4>,<PACKET,PACLEN>>
+	MOVX A,IP%CPD		;Get create pid flag into place
+	SKIPE D			;Do we already have a pid?
+	 SETZ A,		;Yes, no special flags needed
+	MOVEM A,.IPCFL+PACKET	;Set up flag word
+	MOVEM D,.IPCFS+PACKET	;We are the sender
+	SETZM .IPCFR+PACKET	;INFO is the receiver
+	MOVEI A,SNDARG
+	HRLI A,4
+	MOVEM A,.IPCFP+PACKET	;Set up pointer to argument block
+	MOVX A,.IPCIW
+	MOVEM A,.IPCI0+SNDARG	;Get pid for this name
+	SETZM .IPCI1+SNDARG	;No duplicate
+	DMOVE A,[ASCIZ/SNDSRV/]	;Point to string for SNDSRV's PID name
+	DMOVEM A,.IPCI2+SNDARG	;Stash the id
+	MOVEI A,PACLEN
+	MOVEI B,PACKET
+	MSEND%			;Ask info for server PID, maybe create our PID
+	 RETSTR <Error while sending to INFO>,TTXIPC
+	MOVE D,.IPCFS+PACKET	;Fetch our PID in case it was created
+	MOVEM D,.IPCFR+PACKET	;We are receiver this time
+	SETZM .IPCFL+PACKET	;Sender is INFO
+	MOVEI A,PACLEN
+	MOVEI B,PACKET
+	MRECV%			;Receive reply from INFO
+	 RETSTR <Error receiving from INFO>,TTXIPC
+	LDB A,[POINT 6,.IPCFL+PACKET,29] ;Get INFO error code field
+	IFN. A
+	  CAIN A,76		;Couldn't find it?
+	   RETSTR <Server not running>,TTXIPC
+	  RETSTR <INFO error other than server not running>,TTXIPC
+	ENDIF.
+	MOVE A,.IPCI1+SNDARG
+	MOVEM A,SRVPID		;Store server's PID
+	MOVX A,IP%CFV
+	MOVEM A,.IPCFL+PACKET	;Sending a page of data
+	MOVEM D,.IPCFS+PACKET	;We are the sender
+	MOVE A,SRVPID
+	MOVEM A,.IPCFR+PACKET	;The server is the receiver
+	MOVEI A,BUFPAG		;From the data page
+	HRLI A,1000		;A whole page full
+	MOVEM A,.IPCFP+PACKET
+	MOVEI A,PACLEN
+	MOVEI B,PACKET
+	MSEND%			;Send off the request
+	 RETSTR <Error sending to server>,TTXIPC
+	MOVX A,IP%CFV
+	MOVEM A,.IPCFL+PACKET	;Receiving a page of data
+	MOVE A,SRVPID
+	MOVEM A,.IPCFS+PACKET	;From the server
+	MOVEM D,.IPCFR+PACKET	;To our own PID
+	MOVEI A,BUFPAG		;Back to the same data page
+	HRLI A,1000
+	MOVEM A,.IPCFP+PACKET
+	MOVEI A,PACLEN
+	MOVEI B,PACKET
+	MRECV%			;Receive a reply
+	 RETSTR <Error receiving from server>,TTXIPC
+	RETSKP
+
+; SNDNET - Send a Network Message
+; returns +1/failure, A and C set for return; +2/success
+
+SNDNET:	SKIPE A,QUEJFN		;Do we have a queued mail file yet?
+	 JRST NETRCP		;Yes, just add recipient
+	HRROI A,BUFFER		;Into a free place
+	HRROI B,[ASCIZ/MAILQ:[--QUEUED-MAIL--].NEW-/]
+	SETZ C,
+	SOUT%			;Start making name
+	PUSH P,A		;Create frame to save string pointer
+	GTAD%			;Now output date/time
+	MOVE B,A
+	MOVE A,(P)
+	MOVEI C,^D8		;Output in octal
+	NOUT%
+	 RETSTR <Couldn't make name for queued mail file>,TTXNET
+	FMSG <-SNDMSG-J>
+	MOVEM A,(P)		;Update saved string pointer
+	GJINF%			;Get my job number
+	POP P,A			;Get string pointer back
+	MOVE B,C		;Get job number in B
+	MOVEI C,^D10		;Output in octal
+	NOUT%
+	 RETSTR <Couldn't make name for queued mail file>,TTXNET
+	FMSG <.-1;P770000>	;Next generation, set protection
+	MOVX A,GJ%SHT!GJ%FOU	;File for output
+	HRROI B,BUFFER		;With nice file name
+	GTJFN%			;Get handle on queue file
+	 RETSTR <Couldn't get handle on queued mail file>,TTXNET
+	MOVX B,FLD(7,OF%BSZ)!OF%WR ;Writing
+	OPENF%			;Open it up
+	 RETSTR <Couldn't open queued mail file>,TTXNET
+	MOVEM A,QUEJFN		;Save for later
+	HRROI A,BUFFER		;Into buffer space
+	FMSG <=DELIVERY-OPTIONS:SEND
+_>				;This is a send, from someone
+	CALL $GTLCL		;Get local host name
+	 RETSTR <Couldn't get local host name>,TTXNET
+	FMSG <
+>				;CRLF (still in buffer)
+	CALL .DIRST		;And our user name
+	FMSG <
+>				;Another CRLF
+	MOVE A,QUEJFN		;Get file again
+	HRROI B,BUFFER		;Get buffer back
+	SETZ C,			;Until null
+	SOUT%			;Start making file
+
+; Here with A/QUEJFN, add one recipient to the list in the file
+NETRCP:	MOVEI B,"L"-100		;Control L
+	BOUT%			;To start another host/recip pair
+	HRROI A,BUFFER		;Get a place to buffer user name
+	HRROI B,1(ADR)		;With pointer from address block
+	CALL MOVSTR		;Copy string
+	MOVE A,QUEJFN		;Get JFN back again
+	HRROI B,1(B)		;With next string in block
+	SOUT%			;Send host name first
+	FMSG <
+>				;Then a CRLF
+	HRROI B,BUFFER		;Then point to user name
+	SETZ C,			;To null
+	SOUT%			;Add user name
+	FMSG <
+>				;Another CRLF to tie it off
+	RETSKP			;Done for now with the net send
+
+; $SSTAT - Send a request for statistics to the send server
+; call with D/PID, returns +1/always, D/updated PID
+
+$SSTAT::SAVEAC <A,B,C,CX>	;Don't mung caller's registers
+	MOVE A,['SNDSTA']	;SIXBIT function code
+	MOVEM A,BUFFER+SN$HDR	;Set it in IPCF page
+	SETZM BUFFER+SN$FLG	;No format flags
+	CALL DOIPCF		;Send it off
+	 NOP			;Ignore failure
+	RET
+
+; $WTRCP - Make string for recipient block
+; Call with A/Destination pointer (string or JFN)
+;	    B/Recipient block (as for $SEND)
+; Returns +1/Always
+
+$WTRCP::SAVEAC <B,C,ADR>	;Don't mung caller's registers
+	MKPTR (A)		;Make sure we have a real byte pointer
+	MOVE ADR,B		;Copy address block pointer
+	LOAD B,RC%TYP,(ADR)	;Find out what kind of send this is
+	JRST @[	WRTTTY		;RC.TTY - to line number
+		WRTUSR		;RC.USR - to user number
+		WRTALL		;RC.ALL - to all
+		WRTNET ](B)	;RC.NET - network send
+
+WRTTTY:	MOVE B,1(ADR)		;Get send data
+	MOVEI B,.TTDES(B)	;Turn into device designator
+	DEVST%			;Type it
+	 IFNJE. <RET>
+	FMSG <Unknown terminal>
+	RET
+
+WRTUSR:	MOVE B,1(ADR)		;Get send data
+	DIRST%			;Type user name
+	 IFNJE. <RET>
+	FMSG <Unknown user>
+	RET
+
+WRTALL:	FMSG <*>		;To everyone, just type a star
+	RET
+
+WRTNET:	HRROI B,1(ADR)		;Point to user
+	SETZ C,			;No limit
+	SOUT%			;Add it
+	HRROI C,1(B)		;Save it
+	MOVEI B,"@"		;Atsign
+	BOUT%			;Add that too
+	MOVE B,C		;Get pointer back
+	SETZ C,			;Ending on null
+	SOUT%			;Copy host name
+	RET
+
+; Random string copying utilities
+
+;MOVSTR - move ASCIZ string from source in B to dest in A, including the null
+MOVSTR:	MKPTR (A)
+	MKPTR (B)
+	DO.
+	  ILDB C,B
+	  IDPB C,A
+	  JUMPN C,TOP.
+	ENDDO.
+	RET
+
+; CPYSTR - copy an asciz string from source to destination without the null
+CPYSTR:	MKPTR (A)
+	MKPTR (B)
+	DO.
+	  ILDB C,B
+	  JUMPE C,R
+	  IDPB C,A
+	  LOOP.
+	ENDDO.
+
+; .DIRST - Copy our user name or string describing n-l-i into pointer in A
+.DIRST:	SAVEAC <B,C,D>		;Don't mung other registers
+	PUSH P,A		;Save pointer
+	GJINF%			;Get our user number
+	HLRZ B,A		;Get left half only
+	CAIE B,500000		;Look like a user number?
+	IFSKP.
+	  MOVE B,A		;Save user number
+	  POP P,A		;Get pointer back
+	  DIRST%		;Type it out
+	   IFSKP. <RET>		;If succeeded, we're all done
+	  HRROI B,[ASCIZ/Unknown user, /] ;Else start making string
+	ELSE.
+	  POP P,A		;Get dest back
+	  HRROI B,[ASCIZ/Not logged in, /]
+	ENDIF.
+	CALL CPYSTR		;Start string
+	IFL. D			;If detached (how'd a n-l-i det run send???)
+	  HRROI B,[ASCIZ/detached/]
+	  JRST CPYSTR		;Say so
+	ENDIF.
+	MOVEI B,.TTDES(D)	;Else get as terminal designator
+	DEVST%			;Write "TTYn"
+	 ERJMP .+1		;Ignore errors
+	RET			;All done
+
+	END

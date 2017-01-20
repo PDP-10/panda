@@ -1,0 +1,395 @@
+		KCC CODE GENERATION SEQUENCES
+
+	There are certain constructs in C that do not correspond to
+any direct PDP-10 machine instruction equivalents, and require KCC to
+generate a code sequence to implement the construct properly.  Since
+the most efficient sequence is often a quite subtle and non-obvious
+collection of instructions, this file exists to document the sequences
+and the reasons why they look like they do.  There is no guarantee
+that these are optimal, of course; some of them may well be
+susceptible to improvement by very clever programmers.
+
+
+UNSIGNED ARITHMETIC
+
+	It is most unfortunate that the PDP-10 does not include any
+unsigned arithmetic instructions; they would be easy to do.  Anyway,
+here is the code generated for all the possible unsigned operations,
+where those operations are DIFFERENT from those for signed arithmetic.
+Note that all logical and bit-wise operators use exactly the same
+code, and because the PDP-10 uses twos-complement arithmetic, the
+addition and subtraction instructions also work for both signed and
+unsigned ints.
+
+!,^,~,|,& (logical and bit-wise ops)	SAME.
++,-	(addition & subtraction)	SAME (ADD, SUB).
+<<	(left-shift)			SAME (LSH).
+==,!=	(equality)			SAME (CAME/CAIE, CAMN/CAIN).
+
+/,%	(divide,remainder)	DIFFERENT: see next page (very hairy).
+Casts	(cast conversions)	DIFFERENT: see int->float and int->double pages
+
+>>	(right-shift)		DIFFERENT:
+	Uses LSH instead of (signed) ASH.
+
+<,<=,>,>= (inequality ops)	DIFFERENT:
+	Unsigned CAMx of A,B becomes:
+		MOVE R,A		; Can optimize if A or B are constants.
+		TLC R,400000		; Toggle sign bit
+		MOVE S,B		; Same thing for other operand, sigh.
+		TLC S,400000
+		CAMx R,S		; Now can compare.
+
+*	(multiply)		DIFFERENT:
+	Unsigned MUL of A,B becomes:
+		MOVE R,A	; R is a double-word register pair
+		MUL R,B		; Do long multiply
+		TRNE R,1	; Check low bit in high-order word of result.
+		 TLOA R+1,400000	; Copy it into high bit of low word.
+		  TLZ R+1,400000	; Whether 1 or 0.
+		<result in R+1>
+
+		Alternative sequences, which take less space but are
+		slower (MUCH slower on non-KLs):
+			MUL R,B		or	MUL R,B
+			LSH R+1,1		LSH R+1,1
+			LSHC R,-1		LSHC R,-35.
+			result in R+1		result in R
+
+UNSIGNED ARITHMETIC - INTEGER DIVISION:
+
+	This is the hairiest unsigned operation, particularly when
+the divisor has its high bit set; for that case we currently do the
+division by hand.  The other cases are more amenable but still need
+to be distinguished.
+		 Dividend / Divisor
+	     Case 1:	+ / +
+	     Case 2:	- / +
+	     Case 3:	+ / -
+	     Case 4:	- / -
+
+What KCC currently outputs for the pseudo-instruction P_UIDIV, which
+leaves its quotient in RQ and the remainder in RQ+1:
+
+	UIDIV RQ,MEM:		/* RR = RQ+1 */		
+
+		SKIPGE 16,MEM	; Get mem ref first before clobbering RQ or RR!
+		 JRST $1	; Negative divisor (case 3 or 4)
+		JUMPGE RQ,$3	; If both operands positive, just do IDIV!
+
+		; Case 2: Negative dividend, positive divisor
+		CAIG 16,1	; Dividend negative.  Is divisor 2 or greater?
+		 JRST $2	; No, is 1 or 0, must special-case this as
+				; result must still have high bit set!
+		MOVE RR,RQ	; Set up dividend
+		MOVEI RQ,1	; High bit copied into high-order word.
+		DIV RQ,16
+		JRST $4		; Done.
+
+		; Case 3&4: Negative (very large) divisor.  Manual division.
+	$1:	MOVE RR,RQ
+		MOVEI RQ,0
+		JUMPGE RR,$4	; All done if case 3 (positive dividend)
+		CAMGE RR,16	; Case 4: both neg, compare.
+		 JRST $4	; Divisor is greater, result is <0 ? dvdend>
+		SUB RR,16	; Dividend is >=, divide once!
+		AOJA RQ,$4	; Result is <1 ? dvdend-divisor>
+			
+	$2:	TDZA RR,RR	; Divisor is 1 or 0, just clear remainder
+	$3:	 IDIV MQ,16	; Both operands positive, normal IDIV!
+	$4:
+
+Note that when the divisor is a constant, KCC attempts to use this information
+to output a much smaller code sequence (the appropriate subset of the above
+full-fledged sequence).  The only really odd variant is for divisors that
+are a power of 2, in which case KCC outputs an LSHC and LSH instruction
+to shift the dividend properly.
+
+Other alternatives that came up:
+
+	(1)	CAIL MQ,0
+		 SKIPGE MQ+1,MEM
+		  PUSHJ P,$UIDIV	; Some kind of grossness
+		IDIV MQ,MQ+1
+	(2) Convert to double float, then DFDV, then back to uint???
+		Gross, gross, gross!
+	(3) KL-10s could use DDIV, but requires 4 sequential ACs!
+
+	(4) Code from Peter Samson at Systems Concepts:
+		(not used directly as MEM ref can conflict with AC refs)
+	; Reg MQ/
+	; Reg AC=MQ+1/ dividend
+	; Addr MEM/ divisor
+
+	SKIPGE MQ,MEM
+	JRST $1
+	SOJN MQ,$2
+	EXCH AC,MQ
+	JRST $3
+$1:	MOVEI MQ,0
+	JUMPGE AC,$3
+	CAMGE AC,MEM
+	JRST $3
+	SUB AC,MEM
+	AOJA MQ,$3
+$2:	TLNN AC,400000
+	TDZA MQ,MQ
+	MOVEI MQ,1
+	DIV MQ,MEM
+$3:
+
+	; MQ/ quotient
+	; AC/ remainder
+
+"if the compiler knows in a given case that the divisor doesn't have
+the sign bit on, and that the divisor isn't 1, it need only compile
+the four instructions starting at $2.  Since divisors are frequently
+constants, this simplification should help in a lot of cases."
+
+POINTER ARITHMETIC - COMPARISON:
+
+	For == and != the CAME and CAMN instructions can be used just
+as for integer comparison.  For relative inequalities a few more instructions
+are necessary.  These will work for any size byte pointer, subject to
+the following constraints:
+	(1) the pointers must have the same bytesize.
+	(2) Neither pointer may be NULL (C leaves the result undefined).
+	(3) Local-fmt BPs cannot have a P (position) field of 40-44 inclusive.
+
+General case (works for both 0-section and N-section)
+This is what KCC outputs when the code must run in either context.
+In fact, this is what is always output anyway.
+	SKIPL R,A	; Fetch A, test sign bit.
+	 TLC R,770000	; If OWGBP, invert P&S bits.
+	ROT R,6		; Get byte position into low-order bits.
+	SKIPL S,B	; Repeat for B.
+	 TLC S,770000
+	ROT S,6
+	CAMx R,S	; Now can compare.
+
+If the code will never run multi-section (no OWGBPs) then this will work,
+for all values of P.  KCC does not currently test for or output this.
+	MOVE R,A
+	MOVE R+1,B	; Set up A and B close together
+	ROTC R,6	; Rotate both at once, swapping P fields!
+	CAMx R,R+1	; Then compare.
+
+If the code is multi-section only (just OWGBPs) then this can be used.
+KCC does not currently test for or output this.
+	MOVE R,A
+	ROT R,6		; Must get and shift each operand separately.
+	MOVE S,B
+	ROT S,6
+	CAMx R,S
+
+
+POINTER ARITHMETIC - ADDITION/SUBTRACTION:
+
+	Addition is done with ADJBP and so works with any size byte.
+For KA-10s there is an ADJBP simulation routine which likewise works
+for any bytesize.  It is not efficient, but then it is unlikely to be
+needed nowadays.
+
+	Subtraction is much trickier.  There are four possible situations
+depending on whether the format (OWGBP or local) and byte size are known
+or unknown.
+
+	Known format/size	Unknown format/size
+				SKIPL 16,A
+				 LSH 16,6
+				LSH 16,-30.	; Get size or PS
+	SUB A,B			SUB A,B
+	MULI A,bpw<<bits	MUL A,$BPMUL(16)	; 64-wd table
+	LSH A+1,-bits		LSH A+1,@$BPLSH(16)	; 64-wd table
+				ADD A,$BPADD(16)	; 64-wd table
+	ADD A+1,<table>(A)	ADD A+1,(A)
+
+Unknown format/Known size	Known format/unknown size
+				LDB 16,[$$BPSZ,,A]	; get PS from A
+	SUB A,B			SUB A,B
+	MULI A,$$BPMn		MUL A,$BPMUL(16)
+	LSH A+1,$$BSHF		LSH A+1,$$BSHF
+				ADD A,$BPTAB(16)
+	ADD A+1,$BPTBn(A)	ADD A+1,(A)
+
+Currently KCC implements the latter two.  The unknown-size algorithm is
+used except in such cases (such as subtracting a pointer constant) where
+the byte size is definitely known.  Byte sizes 6, 7, 8, 9, and 18 are
+supported, but no others.  The actual values of the symbols used will
+vary depending on whether the program is loaded for 0-section or N-section
+operation.
+
+	The program PARITH.C, found in the KCC source directory, is
+used to test various algorithms for pointer subtraction, and to
+compute the values in the various magic tables.
+
+POINTER ARITHMETIC - CONVERSIONS:
+
+	These are a bit tricky since in some cases the actual instruction
+that results is not known until load time.  We defer this by assembling
+special symbol references which are defined one way by the 0-section
+runtime, and a different way by the N-section runtime; resolving those
+references at load time thus produces either 0-section or N-section code
+sequences.  Naturally both forms for an operation must occupy the same
+number of words!  (Hence the JFCLs in some cases.)
+
+Conversion of a byte pointer (any kind) to a word pointer is done with:
+		TLZ R,$$BPPS	; 770000 if multi-section, -1 if 0-section.
+
+Conversion of a word pointer to a byte pointer is done with:
+		TLO R,$$BPmn
+where m = byte size, and n = byte position.  These symbols are set
+appropriately for the section being loaded into.
+
+Conversion of an 18-bit to 9-bit pointer:
+	Local			Extended
+	TLZE R,007700		TLZA R,050000
+	 TLO R,111100		 JFCL
+
+Conversion of a 9-bit to an 18-bit pointer:
+	Local			Extended
+	TLZE R,117700		TLZ R,010000
+	 TLOA R,002200		TLON R,060000
+	  JFCL			 TLC R,030000
+
+Naturally, the JFCLs could be eliminated if it was known at compile time
+which section the code would run in.
+
+Casts from other byte pointers to other byte pointers are done by
+first converting to a word pointer and then to a byte pointer; no attempt
+is made to preserve alignment in those cases.
+
+STRUCTURE COPYING
+
+	The code sequence constructed depends on the size of the structure
+(number of words) and whether the section number is known at compile time;
+that is, whether KCC knows the result will run only in section 0, or section
+N, or (as is normal) must be capable of running in either.
+
+**	P_SMOVE reg,addr+offset(idx)  [plus Pbsize set to # words]
+**		reg = register containing destination word address
+**		addr+offset(idx) = source address
+**		Pbsize = # words to copy
+
+If there are 3 words or less, this sequence is used:
+	XMOVEI 16,-1(R)		; Get destination address
+	PUSH 16,address		; Copy source words there.
+	PUSH 16,address+1
+	...
+
+If there are 4 or more, and we know we will be 0-section:
+	MOVEI 16,(R)		; Get dest address
+	HRLI 16,address		; Make <source>,,<dest>
+	BLT 16,size-1(16)	; Use BLT to copy words!
+
+If there are 4-10 inclusive, and we know we will be N-section:
+	<simple PUSHes as before>
+If there are more than 10, known N-section:
+	PUSH P,14
+	PUSH P,15
+	MOVEI 14,size		; XBLT arg 1: <# words>
+	XMOVEI 15,address	; XBLT arg 2: <source>
+	XMOVEI 16,(R)		; XBLT arg 3: <dest>
+	EXTEND 14,[XBLT]
+	POP P,15
+	POP P,14
+
+A combination of these is normally put together for the general case
+(either 0-section or N-section) using JUMPGE 17, tests to jump if
+multi-section or not.  The resulting pastiches are not beautiful, but
+they work as efficiently as possible.
+
+FLOAT <-> INT CONVERSIONS:
+
+	Conversions between (float) and (int) are normally done using
+the FIX and FLTR instructions.
+
+(int)<-(float):
+	FIX R,M		; For both signed and unsigned int.
+
+(float)<-(int):
+	Signed int (or unsigned int smaller than a word)
+	FLTR R,M
+
+	Unsigned int
+	SKIPGE R,M
+	 LSH R,1	; Too big, shift down
+	FLTR R,R	; Float it
+	SKIPGE M	; If was shifted,
+	 FSC R,1	; account for it.
+
+NOTE: For the KA-10, which does not have FIX or FLTR, simulations of
+these are used.
+	FIX R,R simulation (R is a register pair!):
+		MUL R,0400	; Get exponent in R, rest in R+1 */
+		TSC R,R		; If negative, make positive exponent */
+		ASH R+1,-243(R)	; Shift "rest" by right amount */
+		<result in R+1>
+
+	FLTR A,M simulation:
+		MOVE A,M
+		MOVE 16,A+1	/* Must save A+1 */
+		ASHC A,-10	/* Shift valid bits out of exponent field */
+		FSC A,233+10	/* Now can float the high bits of integer */
+		ASH A+1,-32	/* Right-justify low 8 bits of integer */
+		FSC A,233	/* Float them too */
+		FADR A,A+1	/* Add together to produce result! */
+		MOVE A+1,16	/* Restore A+1 */
+
+If KCC knows that the integer will have no more than 27 significant
+bits (e.g. floating a short int), it will simply substitute a
+FSC A,233 for the FLTR sequence.
+
+DOUBLE <-> INT CONVERSIONS:
+
+	There are no instructions however for casting integers to double
+precision floating point, so a code sequence must be used:
+
+(double)<-(int):
+	Signed int		Unsigned int
+	ASHC R,-8		LSHC R,-9	; Get integer into low word
+				LSH R+1,-1
+	TLC R,243000		TLC R,244000	; Set proper exponent
+	DFAD R,[0 ? 0]		DFAD R,[0 ? 0]	; Normalize the result
+
+(int)<-(double):
+	; The internal pseudo-instruction P_DFIX R,M expands into:
+	DMOVE	R,M
+	HLRE	16,R		;This mattered when shifts were bit-at-a-time
+	ASH	16,-11		;Get just exponent (9 bits)
+	JUMPGE	16,.+3		;Positive?
+	  DMOVN	R,R		;No, negate, orig sign still in 1B0[A]
+				; For KA-10 format this is DFN R,R+1.
+	  TRC	16,777777	;Watch for diff between twos and ones comp
+	TLZ	R,777000	;Bash exponent and sign ... now positive
+				; For KA-10 format, LSH R+1,10 goes here.
+	ASHC	R,-233(16)	;Make an integer (may overflow)
+	CAIGE	16,		;Original negative?  Check its sign.
+	 MOVN	R,R		;Yup, negate result.
+
+FLOAT <-> DOUBLE CONVERSIONS:
+
+	Again, there are no specific instructions for doing this.
+
+(double)<-(float):
+	SETZ R+1,		; Just set 2nd word to 0
+
+
+(float)<-(double):
+	; The internal pseudo-instruction P_DSNGL R,M expands into:
+
+	DMOVE R,M		; Get double value
+	SKIPGE 16,R		; Check sign, save indicator
+	 DMOVN R,R		; Negative, make positive temporarily.
+				;  For KA-10 format this is DFN R,R+1.
+	TLNE R+1,200000		; If low word >= .5
+				;  For KA-10 format this is TLNE R+1,000400
+	 TRON R,1		; then must round high wd, try fast hack
+	  JRST .+4		; Won!
+	   MOVE R+1,R		; Ugh, have to do it hard way.  Copy high wd
+	   AND R+1,[777000000001]	; Zap all but exp and low-order bit
+	   FADR R,R+1		; Add low bit to effect rounding
+	CAIGE 16,		; Now if original was negative,
+	 MOVN R,R		; make it negative again.
+
+

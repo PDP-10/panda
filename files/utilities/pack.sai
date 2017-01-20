@@ -1,0 +1,798 @@
+begin "PACK"
+
+comment This program was developed on WAITS (by DON) and adapted for use on T(W)ENEX (by
+	JLS and DON).  Where differences between the two versions are required, the
+	following macros are used.  Note that JFNS is pre-declared only in T(W)ENEX SAIL.;
+
+require "{~<>" delimiters;
+
+define	TENEX = declaration(jfns),
+	!!TENEXONLY = {ifc tenex thenc~,
+	!!WAITSONLY = {ifc not tenex thenc~,
+	!!ENDTENEX = {endc~,
+	!!ENDWAITS = {endc~,
+	!! = {~;
+
+!!WAITSONLY
+!!	require "  (Compiling WAITS version)  " message;
+!!ENDWAITS;
+
+!!TENEXONLY
+!!	require "  (Compiling TENEX version)  " message;
+!!	require "G15000S" compilerswitches;
+!!ENDTENEX;
+
+define	 = {begin~,
+	 = {end~,
+	thru = {step 1 until~,
+	repeat = {do~,
+	 = {'15&'12~,
+	! = {comment~;
+
+! This program compresses text & binary files.  Unlike "CRUNCH" (CRU2 & SPINDL), the
+  compression is on a character-by-character basis.  The file is scanned twice: once
+  to determine the character frequencies so that an optimum encoding may be
+  computed, then again to perform the encoding.  About 40 to 50% of the file size
+  may be eliminated by judicious choice as to which characters should be represented
+  by the fewest bits.  The program can also be used to perform the reverse
+  operation, which takes a single pass.;
+
+define	MX = {12~;
+
+! MX is the maximum number of bits which will be used to represent any char, < 18.
+  Some related pieces of info follow.;
+
+define	MXBIT = {(1 lsh (MX-1))~,
+	ONES = {((MXBIT lsh 1) - 1)~;
+
+integer array TALLY, ORDER, NBITS, PATTERN[0:'777], INFO[1:6], FDB[0:30],
+	FIRST, LAST[1:MX], BUF[0:'377], TABLE, SKIP[0:ONES];
+integer BRK, EOF, FULLWORD, MODE, X, Y, WORDPTR, BITPTR, CHAR, TOTBITS, THISWORD, NEXTWORD,
+	BYTESIZE, MAXCHAR, BITSWRITTEN, PACKCHAN, UNPKCHAN;
+boolean VERBOSE, CHECKSUM, NONTEXT;
+string S;
+comment BLATHER;
+
+procedure BLATHER (integer WHAT; string MSG (null));
+
+! This routine produces some of the verbose-mode output.;
+
+if VERBOSE then case WHAT of 
+
+	print (, "Character tally:", );
+	for X _ 0 thru MAXCHAR do
+		print (TALLY[X], (if X land 7 = 7 then  else '11))
+;
+
+	print (, MSG, " bit assignments:", );
+	for X _ 1 thru MX do
+		if LAST[X]  FIRST[X] then
+			print (X, ": ");
+			for Y _ FIRST[X] thru LAST[X] do
+				if NONTEXT then
+					print ("'",cvos(ORDER[Y])," ")
+				else
+					case ORDER[Y] of 
+					[0]	print ("<CRLF>");
+					['11]	print ("<TAB>");
+					['12]	print ("<LF>");
+					['13]	print ("<VT>");
+					['14]	print ("<FF>");
+					['15]	print ("<CR>");
+					['40]	print ("<SP>");
+					['175]	print ("<ALT>");
+					['177]	print ("<BS>");
+					else	print (ORDER[Y]&null)
+					;
+			print ()
+		;
+	print ()
+;	
+
+;
+comment OUTBITS, INBITS;
+
+procedure OUTBITS (integer VAL, SIZE);
+
+! Pack SIZE bits from left of VAL into BUF.  WORDPTR is number of words of
+  BUF filled so far, and BITPTR is number of bits used in current word.
+  BITSWRITTEN keeps track of actual amount of output--if it differs from
+  TOTBITS something's dreadfully wrong (probably missing-buffer-bug).;
+
+	BUF[WORDPTR] _ BUF[WORDPTR] lor (VAL lsh -BITPTR);
+	BITPTR _ BITPTR + SIZE;
+	if BITPTR  36 then
+		CHECKSUM _ CHECKSUM xor BUF[WORDPTR];
+		WORDPTR _ WORDPTR + 1;
+		if WORDPTR = '400 then	! Flush full buffer;
+			arryout (PACKCHAN, BUF[0], '400);
+			arrclr (BUF);
+			WORDPTR _ 0
+		;
+		BITPTR _ BITPTR - 36;
+		BUF[WORDPTR] _ VAL lsh (SIZE-BITPTR)
+	;
+	BITSWRITTEN _ BITSWRITTEN + SIZE
+;
+
+integer procedure INBITS (integer SIZE; boolean SKIP (true));
+
+! Unpack SIZE bits from THISWORD and NEXTWORD, returning them right-justified.
+  Assume BITPTR bits have been used out of THISWORD.  If SKIP, then advance the
+  BITPTR over the bits used and decrement TOTBITS.;
+
+	integer VAL;
+
+	if BITPTR  36 then
+		BITPTR _ BITPTR - 36;
+		THISWORD _ NEXTWORD;
+		CHECKSUM _ CHECKSUM xor (NEXTWORD _ wordin (PACKCHAN))
+	;
+	VAL _ (THISWORD lsh BITPTR) lor (NEXTWORD lsh (BITPTR-36));
+	if SKIP then
+		BITPTR _ BITPTR + SIZE;
+		TOTBITS _ TOTBITS - SIZE
+	;
+	return (VAL lsh (SIZE-36))
+;
+comment READSOME, READCHAR, READFRONT, READNAME;
+
+string procedure READSOME;
+
+! Read in a hunk of file UNPKCHAN, up to 1000 chars.  If line number encountered, it's
+  not a text file unless MODE0 and char after number is a tab.  If MODE still zero,
+  set it based on whether file starts with line number.;
+
+	string INP, LNO;
+
+	INP _ input (UNPKCHAN, 1);
+	if BRK < 0 then
+		if MODE > 0 or length (LNO _ input (UNPKCHAN, 2))  5 then
+			if equ (LNO, "     "&'15&'15) and BRK = '14 then
+				INP _ INP & '14
+			else
+				NONTEXT _ EOF _ true;
+				INP _ S _ null
+			
+		else if MODE = 0 then
+			MODE _ -1;
+			print ("(Ignoring SOS line numbers)", )
+		
+	
+	else if MODE = 0 then
+		MODE _ 1;
+	return (INP)
+;
+
+integer procedure READCHAR;
+
+! Lop char from front of S and return it, being sure to leave S non-null unless at
+  EOF.  Detect crlf as special case, returning 0.  (Real nulls are discarded.)  If
+  not text, return next 9-bit byte out of FULLWORD.;
+
+	integer CH;
+
+	if NONTEXT then
+		CH _ (FULLWORD _ FULLWORD rot 9) land '777;
+		if (BRK _ BRK + 1) = 4 then
+			BRK _ 0;
+			FULLWORD _ wordin (UNPKCHAN)
+		;
+		return (CH)
+	;
+	while length(S) < 3 and not EOF do
+		S _ S & readsome;	! Make sure at least 3 chars, if possible;
+	if (CH _ lop(S))  '15 or S[1 for 1]  '12 then
+		return (CH);
+	return (0*lop(S))
+;	
+
+procedure READFRONT (boolean TELL);
+
+! Set up to read text file on channel UNPKCHAN.  Skip ETV directory if present,
+  reporting the fact to varying degrees depending on TELL and VERBOSE.  Leave at
+  least one char in S unless file is empty, since S=null is EOF indicator.  If we
+  already know it's not text, read first word into FULLWORD and set byte count.;
+
+	if NONTEXT then
+		BRK _ 0;
+		FULLWORD _ wordin (UNPKCHAN)
+	
+	else
+		S _ readsome;
+		while length (S) < 24 and not EOF do
+			S _ S & readsome;
+		if equ (S[1 for 10] & S[13 for 6] & S[24 for 6], "COMMENT  VALID  PAGES") then
+			if TELL then
+				print ("(Discarding ETV directory)", )
+			else if VERBOSE then
+				print ("(Ignoring ETV directory)", );
+			while length(S) do
+				if readchar = '14 and length(S) then
+					return;
+			print ("File contains nothing but ETV directory (which is ignored).", )
+		
+	;
+
+boolean procedure READNAME (reference string NM);
+
+! Reads a file name frm the terminal into NM, returns TRUE and types "aborted" if
+  the input is null.;
+
+	if length (NM _ inchwl) > 0 then return (false);
+	print ("...aborted.", );
+	return (true)
+;
+comment TWEAK;
+
+procedure TWEAK;
+
+! This routine is used by PACK to tweak the assignment for better packing.  There
+  are two kinds of tweak.  [1] If, for some i, the least frequent (i-1)-bit char is
+  less frequent than the 2^k most frequent (i+k)-bit chars, then it pays to use one
+  less bit for each of those (i+k)-bit chars and one more bit for the (i-1)-bit
+  char.  [2] If, for some i, the most frequent i-bit char is more frequent than the
+  two least frequent ones, then it pays to use one less bit for the former and one
+  more for the latter.  Tweaks of type 1 are done even if they only break even,
+  since they may cut down on the number of different bit-lengths used (saving 7 bits
+  at the front of the packed file) and because it keeps the process alive a bit
+  longer, so we might find more tweaks.;
+
+while true do
+	integer I, K, N, BEST, HOW, SAVE;
+	BEST _ HOW _ 0;
+	for I _ 2 thru MX-1 do
+		if LAST[I-1]  FIRST[I-1] then
+			for K _ 1 thru MX-I do
+				if LAST[I+K]  FIRST[I+K] + (ONES lsh (K-MX)) then
+					SAVE _ TALLY[ORDER[LAST[I-1]]];
+					for N _ 1 thru (1 lsh K) do
+						SAVE _ SAVE - TALLY[ORDER[FIRST[I+K]+N-1]];
+					if SAVE  BEST then
+						BEST _ SAVE;
+						HOW _ (K lsh 18) + I
+					
+				;
+		if LAST[I]  FIRST[I]+2 then
+			SAVE _ TALLY[ORDER[LAST[I]]] + TALLY[ORDER[LAST[I]-1]]
+				- TALLY[ORDER[FIRST[I]]];
+			if SAVE < BEST then
+				BEST _ SAVE;
+				HOW _ I
+			
+		
+	;
+	if HOW lsh -18 then
+		I _ HOW land '777777;
+		K _ HOW lsh -18;
+		if VERBOSE then
+			print ("Tweaking ", I-1, " and ", I+K, " inward saves ", -BEST, );
+		NBITS[ORDER[LAST[I-1]]] _ NBITS[ORDER[LAST[I-1]]] + 1;
+		LAST[I-1] _ LAST[I-1] - 1;
+		FIRST[I] _ FIRST[I] - 1;
+		LAST[I+K-1] _ LAST[I+K-1] + (1 lsh K);
+		FIRST[I+K] _ FIRST[I+K] + (1 lsh K);
+		for N _ 1 thru (1 lsh K) do
+			NBITS[ORDER[FIRST[I+K]-N]] _ NBITS[ORDER[FIRST[I+K]-N]] - 1
+	
+	else if HOW then
+		if VERBOSE then
+			print ("Tweaking ", HOW, " outward saves ", -BEST, );
+		LAST[HOW-1] _ LAST[HOW-1] + 1;
+		NBITS[ORDER[FIRST[HOW]]] _ NBITS[ORDER[FIRST[HOW]]] - 1;
+		NBITS[ORDER[LAST[HOW]]] _ NBITS[ORDER[LAST[HOW]]] + 1;
+		NBITS[ORDER[LAST[HOW]-1]] _ NBITS[ORDER[LAST[HOW]-1]] + 1;
+		FIRST[HOW] _ FIRST[HOW] + 1;
+		LAST[HOW] _ LAST[HOW] - 2;
+		FIRST[HOW+1] _ FIRST[HOW+1] - 2
+	
+	else
+		done
+;
+comment PACK;
+
+procedure PACK;
+	integer TOTAL, CH, POSN, NUMDIFF, NEW, OLD, USED, FREQ, BIT;
+	string UNPKNM, PACKNM;
+
+	print ("ack...", , "Text file: ");
+!!WAITSONLY
+!!	open (UNPKCHAN_getchan, "dsk", 0, 19, 0, 1000, BRK, EOF_0);
+!!	repeat
+!!		if readname (UNPKNM) then
+!!			release (UNPKCHAN);
+!!			return
+!!		;
+!!		lookup (UNPKCHAN, UNPKNM, EOF);
+!!		if EOF then
+!!			print ("Can't find it, try again: ")
+!!	 until not EOF;
+!!	fileinfo (INFO);
+!!	OLD _ - (INFO[4] rot 18);	! Original file size;
+!!ENDWAITS
+!!TENEXONLY
+!!	UNPKNM _ jfns (UNPKCHAN _ openfile (null, "ROC"), 0);
+!!	setinput (UNPKCHAN, 1000, BRK, EOF_0);
+!!	swdptr (UNPKCHAN, -1);		! Point to end of file;
+!!	OLD _ rwdptr (UNPKCHAN);	! Get value;
+!!	swdptr (UNPKCHAN, 0);		! Back to beginning of file;
+!!ENDTENEX
+	if OLD = 0 then
+		print ("Can't pack zero-word file!", );
+		release (UNPKCHAN);
+		return
+	;
+
+	print ("Packed output file: ");
+!!WAITSONLY
+!!	open (PACKCHAN_getchan, "dsk", 8, 0, 19, EOF, EOF, EOF);
+!!	repeat
+!!		if readname (PACKNM) then
+!!			release (PACKCHAN);
+!!			release (UNPKCHAN);
+!!			return
+!!		;
+!!		enter (PACKCHAN, PACKNM, EOF);
+!!		if EOF then
+!!			print ("Can't enter file, try again: ")
+!!	 until not EOF;
+!!ENDWAITS
+!!TENEXONLY
+!!	PACKCHAN _ openfile (null, "WC");
+!!ENDTENEX
+
+	! First step: count number of occurrences of each character in input file;
+
+	setbreak (1, null, null, "LI");
+	setbreak (2, '11&'14, null, "I");
+	MODE _ 0;		! -1 for line numbers, +1 for no line numbers;
+	NONTEXT _ false;
+	arrclr (TALLY);
+	readfront (false);	! Set up to read file, maybe skipping directory;
+	while length(S) do	! This is done here to make sure about NONTEXT;
+		TALLY[CH _ readchar] _ TALLY[CH] + 1;
+	if NONTEXT then
+		print ("Invalid format for text file.", , "Type Y to pack using 9-bit bytes. ");
+		if inchrw lor '40  "y" then
+			release (PACKCHAN);
+			release (UNPKCHAN);
+			return
+		;
+		print ();
+!!WAITSONLY
+!!		release (UNPKCHAN);	! Need to reopen it in binary mode;
+!!		open (UNPKCHAN_getchan, "dsk", 8, 19, 0, EOF, EOF, EOF_0);
+!!		lookup (UNPKCHAN, UNPKNM, EOF);
+!!ENDWAITS
+!!TENEXONLY
+!!		release (UNPKCHAN);	! Can't just swdptr to 0 since SAIL then loses first 1-bit in bit 35;
+!!		UNPKCHAN _ openfile (UNPKNM, "RO");
+!!		setinput (UNPKCHAN, 1000, BRK, EOF_0);
+!!ENDTENEX
+		arrclr (TALLY);
+		readfront (false);
+		while not EOF do
+			TALLY[CH _ readchar] _ TALLY[CH] + 1;
+		BYTESIZE _ 9;
+		MAXCHAR _ '777
+	
+	else
+		BYTESIZE _ 7;
+		MAXCHAR _ '177
+	;
+	blather (0);
+
+	! Next, sort the chars by frequency and accumulate total;
+
+	TOTAL _ NUMDIFF _ 0;
+	for CH _ 0 thru MAXCHAR do
+		if TALLY[CH] then
+			POSN _ NUMDIFF _ NUMDIFF + 1;
+			while (POSN _ POSN-1) > 0 and TALLY[ORDER[POSN-1]]<TALLY[CH] do
+				ORDER[POSN] _ ORDER[POSN-1];	! Simple bubble;
+			TOTAL _ TOTAL + TALLY[ORDER[POSN] _ CH]
+		;
+
+	! Special case for fewer than 2 distinct chars.;
+
+	if NUMDIFF < 2 then
+		if VERBOSE then
+			print (, "Special case for <2 different characters.", );
+		print ("From ", OLD, " words to 1 (saving ",
+			cvf((OLD-1)/OLD * 100), "%)", );
+		wordout (PACKCHAN, ((if NONTEXT then -TOTAL else TOTAL) lsh 7) + ORDER[0]);
+		! Note that, if 9-bit bytes, bottom two bits of TOTAL are zeros.;
+		release (PACKCHAN);
+		release (UNPKCHAN);
+		return
+	;
+
+	! Compute initial allocation of bit combinations.  Number of bits is
+	  proportional to negative lg of proportion of char in file, rounded down.
+	  If this would not leave enough combinations for the remaining chars, then
+	  more bits (hence fewer comb's) are allocated for this char.  Actually,
+	  this might fail to allocate all comb's (e.g. if only 2 chars with freq =
+	  1000 to 1).  So allocate k comb's where k = fc/t rounded up to power of 2,
+	  f = freq of char, c = number of unused comb's, t = total freq of remaining
+	  chars.  No chars are allocated MX bits at this stage, so total comb's =
+	  2^(MX-1) = MXBIT.  Note that since chars are taken in decr order of freq,
+	  fc/t  1.;
+
+	USED _ 0;
+	for POSN _ 0 thru NUMDIFF-1 do
+		! Find k by shifting t (in CH) until  fc, subtracting one bit per shift;
+		CH _ TOTAL;	BIT _ MX-1;
+		while CH < TALLY[ORDER[POSN]] * (MXBIT-USED) do
+			CH _ CH lsh 1;
+			BIT _ BIT - 1
+		;
+		while USED + (MXBIT lsh -BIT) + (NUMDIFF-POSN) > (MXBIT+1) do
+			BIT _ BIT + 1;
+		NBITS[ORDER[POSN]] _ BIT;
+		TOTAL _ TOTAL - TALLY[ORDER[POSN]];
+		USED _ USED + (MXBIT lsh -BIT)
+	;
+
+	! Find first/last chars in ORDER which were assigned each number of bits;
+
+	FIRST[1] _ POSN _ 0;
+	for BIT _ 1 thru MX-1 do
+		while POSN < NUMDIFF and NBITS[ORDER[POSN]]  BIT do
+			POSN _ POSN + 1;
+		LAST[BIT] _ POSN - 1;
+		FIRST[BIT+1] _ POSN
+	;
+	LAST[MX] _ NUMDIFF - 1;
+	blather (1, "Initial");
+
+	! Tweak the assignment to optimise it, then compute compression factor.
+	  It's probably high time to describe the format of the packed file.  The
+	  first word contains (TOTBITS lsh 18)+USED.  TOTBITS is the total number of
+	  bits of packed data, and is used to determine when the end of the packed
+	  file has been reached when unpacking.  USED has bit (1 lsh (k-1)) set iff
+	  there are k-bit chars.  Bit (1 lsh 17) is set if 9-bit bytes are being
+	  used.  Next, for each k which does have k-bit chars, there is a 7-bit (or
+	  9-bit) count saying how many such chars, followed by that many 7- or 9-bit
+	  chars.  Then comes the packed data, and finally a checksum at the end so
+	  the unpacker can (a) always snarf as many bits as it wants without
+	  worrying about overshooting eof, and (b) detect whether there was a bit
+	  wrong in the packed file.;
+
+	tweak;
+	blather (1, "Final");
+	TOTBITS _ USED _ 0;
+	for POSN _ 0 thru NUMDIFF-1 do
+		TOTBITS _ TOTBITS + TALLY[ORDER[POSN]] * NBITS[ORDER[POSN]];
+	for BIT _ 1 thru MX do
+		if LAST[BIT]  FIRST[BIT] then
+			USED _ USED lor (1 lsh (BIT-1));
+			TOTBITS _ TOTBITS + BYTESIZE
+		;
+	if NONTEXT then
+		USED _ USED lor (1 lsh 17);
+	TOTBITS _ TOTBITS + NUMDIFF*BYTESIZE + 72;
+	NEW _ (TOTBITS + 35) % 36;
+	print ("From ", OLD, " words to ", NEW, " (saving ",
+		cvf((OLD-NEW)/OLD * 100), "%)", );
+
+	! Put out header stuff into packed file.  Simultaneously compute the bit
+	  pattern which will be used for each char.;
+
+	arrclr (BUF);
+	BITSWRITTEN _ CH _ CHECKSUM _ WORDPTR _ BITPTR _ 0;
+	outbits ((TOTBITS lsh 18) lor USED, 36);
+	for BIT _ 1 thru MX do
+		if LAST[BIT]  FIRST[BIT] then
+			outbits ((LAST[BIT]-FIRST[BIT]+1) lsh (36-BYTESIZE), BYTESIZE);
+			for POSN _ FIRST[BIT] thru LAST[BIT] do
+				outbits (ORDER[POSN] lsh (36-BYTESIZE), BYTESIZE);
+				PATTERN[ORDER[POSN]] _ (CH lsh (36-MX));
+				CH _ CH + (MXBIT lsh (1-BIT))
+			
+		;
+
+	! And here we go!  Rewind the file and start packing.;
+
+!!WAITSONLY
+!!	useti (UNPKCHAN, 1);
+!!ENDWAITS
+!!TENEXONLY
+!!	swdptr (UNPKCHAN, 0);	! For some obscure reason useti loses;
+!!ENDTENEX
+	readfront (true);
+	while (if NONTEXT then (not EOF) else length(S)) do
+		CH _ readchar;
+		outbits (PATTERN[CH], NBITS[CH])
+	;
+
+	! Close it up;
+
+	if BITSWRITTEN  TOTBITS-36 then
+		print ("File different on second pass.  Suggest you try again.", );
+	if BITPTR  0 then
+		outbits (0, 36-BITPTR);
+	arryout (PACKCHAN, BUF[0], WORDPTR);
+	wordout (PACKCHAN, CHECKSUM);
+	release (PACKCHAN);	! Have to release (not just close) so that;
+	release (UNPKCHAN)	! subsequent operations can getchan same chans;
+;
+comment UNPACK;
+
+procedure UNPACK;
+	integer BIT, USED, CODE, I, J, CH, HOWMANY, SIZE, OSIZE;
+	string NM;
+
+	boolean procedure ASKOUT;
+		if NONTEXT then
+			print ("Binary output file: ")
+		else
+			print ("Text output file: ");
+!!WAITSONLY
+!!		open (UNPKCHAN_getchan, "dsk", (if NONTEXT then 8 else 0), 0, 19, EOF, EOF, EOF_0);
+!!		repeat
+!!			if readname (NM) then
+!!				release (UNPKCHAN);
+!!				return (true)
+!!			;
+!!			enter (UNPKCHAN, NM, EOF);
+!!			if EOF then
+!!				print ("Can't enter file, try again: ")
+!!		 until not EOF;
+!!		return (false)
+!!ENDWAITS
+!!TENEXONLY
+!!		UNPKCHAN _ openfile (null, "WC");
+!!		if EOF _ (UNPKCHAN = -1) then
+!!			print ("Can't enter file.", );
+!!		return (EOF)
+!!ENDTENEX
+	;
+
+	print ("npack...", , "Packed file: ");
+!!WAITSONLY
+!!	open (PACKCHAN_getchan, "dsk", 8, 19, 0, EOF, EOF, EOF);
+!!	repeat
+!!		if readname (NM) then
+!!			release (PACKCHAN);
+!!			return
+!!		;
+!!		lookup (PACKCHAN, NM, EOF);
+!!		if EOF then
+!!			print ("Can't find it, try again: ")
+!!	 until not EOF;
+!!	fileinfo (INFO);
+!!	OSIZE _ - (INFO[4] rot 18);	! Original file size;
+!!ENDWAITS
+!!TENEXONLY
+!!	PACKCHAN _ openfile (null, "ROC");
+!!	setinput (PACKCHAN, 0, EOF, EOF);
+!!	if rfbsz (PACKCHAN)  36 then
+!!	       print ("Input not packed.", );
+!!		release (PACKCHAN);
+!!		return
+!!	;
+!!	swdptr (PACKCHAN, -1);		! Point to end of file;
+!!	OSIZE _ rwdptr (PACKCHAN);	! Get value;
+!!	swdptr (PACKCHAN, 0);		! Back to beginning of file;
+!!ENDTENEX
+
+	if OSIZE = 1 then	! One-word file, special case;
+		if (NONTEXT _ (SIZE _ (CODE _ wordin (PACKCHAN)) ash -7) < 0) and CODE land 1 = 0 then
+		! Can't be all-identical 9-bit bytes with bottom bit zero;
+			print ("Input not packed.", );
+			release (PACKCHAN);
+			return
+		;
+		if NONTEXT then
+			SIZE _ -(SIZE land -4);
+		print ("Special file (", SIZE, " identical", (if NONTEXT then
+			" 9-bit" else null), " characters).", );
+		if ASKOUT then
+			release (PACKCHAN);
+			return
+		;
+		if NONTEXT then
+			FULLWORD _ (CODE land '777) * '1001;
+			FULLWORD _ FULLWORD + (FULLWORD lsh 18);
+			for I _ 1 thru SIZE div 4 do
+				wordout (UNPKCHAN, FULLWORD)
+		
+		else
+			S _ (if CODE land '177 = 0 then  else CODE);
+			for I _ 1 thru SIZE do
+				out (UNPKCHAN, S)
+		;
+		release (UNPKCHAN);
+		release (PACKCHAN);
+		return
+	;
+
+	THISWORD _ wordin (PACKCHAN);	NEXTWORD _ wordin (PACKCHAN);
+	CHECKSUM _ THISWORD xor NEXTWORD;
+	CODE _ BITPTR _ 0;
+	TOTBITS _ inbits (18);		! Number of bits used, mod 2^18;
+	USED _ OSIZE - 1;	! Last word not counting 0 at end;
+	if (I _ (36 + USED*36 - TOTBITS) land '777777)  36 then
+		USED _ 0	! Bits used inconsistent with file size;
+	else
+		TOTBITS _ USED*36 - I - 18;	! Useful bits remaining;
+		USED _ inbits (18)	! So far so good, now read encoding;
+	;
+	BYTESIZE _ (if (NONTEXT _ USED land (1 lsh 17)) then 9 else 7);
+	for BIT _ 1 thru MX do
+		if USED land (1 lsh (BIT-1)) then
+			HOWMANY _ inbits (BYTESIZE);
+			for I _ 1 thru HOWMANY do
+				CH _ inbits (BYTESIZE);
+				SIZE _ ((MXBIT lsh 1) lsh -BIT);
+				if CODE + SIZE > (MXBIT lsh 1) then
+					print ("Input not packed.", );
+					release (PACKCHAN);
+					return
+				;
+				for J _ 0 thru SIZE-1 do
+					TABLE[CODE+J] _ CH;
+					SKIP[CODE+J] _ BIT
+				;
+				CODE _ CODE + SIZE
+			
+		;
+	if CODE  (MXBIT lsh 1) then
+		print ("Input not packed.", );
+		release (PACKCHAN);
+		return
+	;
+
+	if ASKOUT then			! Waited until now to avoid disaster if;
+		release (PACKCHAN);	! file names given in wrong order;
+		return
+	;
+
+	BRK _ FULLWORD _ S _ null;
+	while TOTBITS > 0 do
+		CH _ inbits (MX, false);	! "false" stops incr of bitptr;
+		if NONTEXT then
+			FULLWORD _ (FULLWORD lsh 9) lor TABLE[CH];
+			if (BRK _ BRK + 1) = 4 then
+				wordout (UNPKCHAN, FULLWORD);
+				BRK _ FULLWORD _ 0
+			
+		
+		else
+			if length (S _ S & (if TABLE[CH]=0 then  else TABLE[CH]))  1000 then
+				out (UNPKCHAN, S);
+				S _ null
+			;
+		BITPTR _ BITPTR + SKIP[CH];
+		TOTBITS _ TOTBITS - SKIP[CH]
+	;
+	CH _ inbits (0);	! Force it to read the last word for checksum;
+	if TOTBITS < 0 then	! Oh dear, it didn't come out on the right bit;
+		print ("Unpacked file is badly garbled.", )
+	else if CHECKSUM then
+		print ("Unpacked file is slightly garbled.", );
+
+	if not NONTEXT then
+		out (UNPKCHAN, S);
+
+	release (PACKCHAN);	! Have to release (not just close) so that;
+	release (UNPKCHAN)	! subsequent operations can getchan same chans;
+;
+comment HELP, DETAIL, OPTMESS;
+
+procedure HELP;
+	print ("
+If you don't know what this program is for, type ! for details.
+Command summary:
+   P	Pack text file
+   U	Unpack packed file
+   V	enter Verbose mode
+   T	enter Terse mode
+   ?	print this
+   !	print explanation
+   O	explain Optimisation messages
+   E	exit
+");
+
+
+procedure DETAIL;
+	print ("
+This program uses a Shannon  variable-length bit encoding to  condense
+the contents of a text file.  Since the nature of the encoding is such
+that the characters occurring most frequently in the original file are
+encoded using the fewest bits, the ""packed"" file tends to require much
+less disk space than the  original.  Typical savings range between  25
+and 50%.  Larger  savings can  be expected for  files in  which a  few
+characters are highly predominant.   Smaller savings (or even,  heaven
+forbid, negative savings) may occur if  the original uses most of  the
+Stanford Ascii character  set and  the characters  occur with  roughly
+uniform distribution, in which case the overhead involved in recording
+the encoding  pattern  tends  to exceed  the  savings  accrued.   This
+overhead also acts to decrease the savings realised for smaller  files
+in general.
+
+The packing operation scans the input file twice; once to establish  a
+character-frequency distribution,  and  once  to  perform  the  actual
+packing.  Between  passes, the  sizes of  the old  and new  files  are
+printed, along with the percentage saved.
+
+The packed  file may  be  unpacked (thank  goodness) using  this  same
+program.  The unpacking operation requires only a single pass  through
+the file and  is very fast.   (Not that the  packing operation is  all
+that slow, either!)", "
+
+The commands V  and T  switch the  program between  Verbose and  Terse
+modes.  (It starts out  in Terse mode.)  In  Verbose mode, it  reports
+various statistics while packing,  to wit, the character  distribution
+table,  the  number  of  bits  initially  chosen  to  represent   each
+character, the amounts saved by optimising the encoding, and the final
+encoding.  If you're curious as  to how to interpret the  optimisation
+messages, use  the  command O.   Verbose  mode has  no  effect  during
+unpacking.
+
+Some notes:
+[1] The packing operation  discards nulls and  line numbers, and  also
+    removes an ETV directory if  one existed.  These are not  restored
+    upon unpacking.
+[2] If the file is not a text file (i.e., it has line-number words not
+    in SOS format), the program offers to pack it anyway, using  9-bit
+    bytes instead of 7-bit characters.  Unpacking still works, and the
+    savings are often impressive, since most non-text files have large
+    quantities of zero-bytes.
+[3] With  the  exception  of  crlfs,  this  program  does  not  detect
+    frequently-occurring sequences of characters; the packing is on  a
+    strict character-by-character basis.  Hence the savings are not as
+    great as  with  ""crunch"" and  ""spindle"".   (Type HELP  SPINDL  for
+    details on these programs.)  Nor are packed files compatible  with
+    the SPINDL program.  On the  other hand, this program is  somewhat
+    less complicated to use, and it works on non-text files (which the
+    other programs do not).
+[4] Due to the density of information in packed files, any single  bit
+    being incorrect  due to  I/O  errors or  the  like can  cause  the
+    unpacking operation to yield utter garbage.  Usually, however, the
+    program gets back in step fairly quickly, so only a few characters
+    are actually munged.  The program puts  out a checksum at the  end
+    of the file to help it detect when such an error has occurred.
+");
+
+
+procedure OPTMESS;
+	print ("
+If you are in Verbose mode, the  following 2 types of messages may  be
+printed out while the bit-encoding is being optimised.
+	Tweaking x and y inward saves z bits.
+	Tweaking x outward saves z bits.
+In the first case,  it means that the  least frequent character  which
+was being  represented by  x bits  is being  changed to  an  (x+1)-bit
+representation, and  the  most  frequent  2^(y-x-1)  characters  being
+represented by y bits are being  changed to y-1.  In the second  case,
+it means that the most frequent character being represented by x  bits
+is being changed to x-1, and the 2 least frequent are being changed to
+x+1.  In either case, the change causes  a reduction of z bits in  the
+size of the packed file.  z may equal 0 only for inward tweaks.
+");
+comment Main program;
+
+CHAR _ VERBOSE _ 0;
+setformat (0, 2);
+while CHAR  "e" do
+	case CHAR of 
+	["p"]	pack;
+	["u"]	unpack;
+	["v"]		VERBOSE _ true;
+			print ("erbose mode.")
+		;
+	["t"]		VERBOSE _ false;
+			print ("erse mode.")
+		;
+	["?"]	help;
+	["!"]	detail;
+	["o"]	optmess;
+	else	print ("Type ? for help")
+	;
+	print (, "*");
+	CHAR _ inchrw lor '40
+;
+print ("xit.", )
+
+end "PACK"

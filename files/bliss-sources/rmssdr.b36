@@ -1,0 +1,1342 @@
+%TITLE 'S D R   -- Secondary Data Record routines'
+!<BLF/REQUIRE 'RMSBLF.REQ'>
+MODULE sdr (IDENT = '2.0'
+		) =
+BEGIN
+
+GLOBAL BIND
+    sdrv = 2^24 + 0^18 + 415;			! Edit date: 7-Jul-83
+
+!+
+!
+!
+!
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1977, 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+!
+!
+!    AUTHOR:	S. BLOUNT /EGM
+!
+!
+!
+!    THIS MODULE CONTAINS ALL ROUTINES WHICH DEAL PRIMARILY
+!    WITH SECONDARY DATA RECORDS. SEVERAL OTHER ROUTINES
+!    THROUGHOUT RMS-20 ALSO PROCESS SECONDARY RECORDS (CALLED
+!    "SIDR" RECORDS ) BUT THESE ROUTINES PROCESS ONLY THESE
+!    DATA RECORDS.
+!
+!    **********	TABLE OF CONTENTS	**************
+!
+!
+!
+!    ROUTINE			FUNCTION
+!    =======			========
+!
+!    MAKESIDR		CREATE A SECONDARY DATA RECORD
+!
+!    BLDCSIDR		BUILD A CONTINUATION SIDR
+!
+!    DOSIDR			PROCESS THE SIDR INSERTION
+!
+!    INSRTSIDR		OUTER-LEVEL SIDR INSERTION ROUTINE
+!
+!    BLDISIDR		BUILD AN INITIAL SIDR
+!
+!    DELSIDR			DELETE A SIDR RECORD
+!
+!    SQUEEZESIDR		SQUEEZE ONE SIDR RECORD FROM BUCKET
+!
+!    PUTSIDR			INSERT CURRENT RECORD INTO SECONDARY INDEX
+!
+!
+!
+!
+!    REVISION HISTORY:
+!
+!    PRODUCT	LOCAL
+!    EDIT	EDIT	DATE		WHO		PURPOSE
+!    ====	====	====		===		=======
+!
+!    -	1	11-OCT-76	SB	ADD DELSIDR
+!    -	2	28-OCT-76	SB	FIX BUG IN MOVEDOWN ARG IN DOSIDR
+!    -	3	7-NOV-76	SB	ADD DELETED RFA BIT
+!    -	4	9-DEC-76	SB	FIX BUG SO THAT IF ALL
+!    SIDR RECORDS ARE MOVED OUT
+!    OF THE BUCKET ON A SPLIT, THE
+!    NEW HIGH-KE IS OF R-NEW
+!    -	5	8-MAR-77	SB	TAKE OUR CHECK FOR SIDR ALREADY DELETED
+!    -	6	3-MAY-77	SB	ADD FIX FOR SIDRELEMENT FIELD
+!    6	7	26-JAN-78	SB	IF SIDR BKT IS FULL, FREESPACE
+!    WAS NEGATIVE, CHECK WAS BAD
+!
+!    *************************************************
+!    *						*
+!    *		NEW REVISION HISTORY		*
+!    *						*
+!    *************************************************
+!
+!    PRODUCT	MODULE	 SPR
+!    EDIT	 EDIT	 QAR		DESCRIPTION
+!    ======	======	=====		===========
+!
+!    12		    8	11439
+!
+!				    RST KEY BUFFER IS NOT BEING
+!				    UPDATED WHEN A SIDR BUCKET SPLITS.
+!				    THIS CAUSES THE ALTERNATE KEY ROOT
+!				    BUCKET TO BE UPDATED INCORRECTLY,
+!				    SOMETIMES WITH KEY VALUES FROM
+!				    OTHER INDEX LEVELS (SUCH AS
+!				    PRIMARY).  THE END RESULT IS THAT
+!				    A VALID GET/FIND LOSES.  MAKE SURE
+!				    THE LAST KEY FROM THE ORIGINAL
+!				    BUCKET IS COPIED TO THE RST KEY
+!				    BUFFER AFTER A SPLIT OCCURS.  ALSO
+!				    - FIX AN OFF BY 1 BUG (END
+!				    POINTER) WHICH GARBAGES THE
+!				    CURRENT AND FOLLOWING SIDR AFTER
+!				    SPLIT MOVES THE CURRENT SIDR TO A
+!				    NEW BUCKET.
+!
+!   **** Begin RMS V2 Development
+!
+!	400	400	xxxxx	    Clean up BLISS code (RL,22-Apr-83)
+!
+!	415		xxxxx	    Use 30-bit address when needed in
+!				    PUTSIDR's call to MOVEKEY.
+!				    (RL, 7-Jul-83)
+!
+!    ***** END OF REVISION HISTORY *****
+!
+!
+!
+!
+!
+!-
+
+REQUIRE 'rmsreq';
+
+%SBTTL 'MAKESIDR - create SIDR'
+
+GLOBAL ROUTINE makesidr (recdesc, sidrptr) : NOVALUE =
+! MAKESIDR
+! ========
+! ROUTINE TO CREATE A SECONDARY INDEX DATA RECORD (SIDR).
+!	THIS ROUTINE ASSUME THAT THE CORRECT POSITION TO
+!	CREATE THE RECORD HAS BEEN FOUND. NO ADJUSTMENT
+!	OF THE BUCKET HEADER INFO, NOR ANY INDEX UPDATES
+!	ARE DONE WITHIN THIS ROUTINE.
+!	THE RFA FOR THE SIDR MUST BE ALLOCATED BEFORE THIS
+!	ROUTNE IS CALLED
+! INPUT:
+!	RECDESC		RECORD DESCRIPTOR PACKET
+!		RFA		RFA OF SIDR RECORD
+!		RRV		RECORD POINTER TO INSERT INTO SIDR
+!		USERPTR		ADDRESS OF SEARCH KEY STRING
+!
+!	SIDRPTR		ADDRESS TO WRITE RECORD
+! OUTPUT:
+!	<NO STATUS RETURNED>
+! INPUT ARGS MODIFIED:
+!	RECORD DESCRIPTOR:
+!		<NONE>
+! ROUTINES CALLED:
+!	<NONE>
+    BEGIN
+
+    MAP
+	recdesc : REF BLOCK,
+	sidrptr : REF BLOCK;
+
+    REGISTER
+	keysizeinwords;				! SIZE OF KEY STRING
+
+    TRACE ('MAKESIDR');
+
+    !+
+    !    STORE THE FLAGS AND THE ID OF THE SIDR
+    !-
+
+    keysizeinwords = .kdb [kdbkszw];		! GET THIS NOW
+    sidrptr [drflags] = defsidrflags;
+    sidrptr [drrecordid] = idofrfa (.recdesc [rdrfa]);
+    sidrptr [sidrrecsize] = .keysizeinwords + 1;	! KEY + 1 PTR
+    sidrptr [sidrdupcount] = 0;			! FOR FUTURE
+    sidrptr = .sidrptr + sidrhdrsize;
+
+    !+
+    !    MOVE THE KEY STRING INTO THE RECORD
+    !-
+
+    movewords (.recdesc [rduserptr], 		! From
+	.sidrptr, 				! To
+	.keysizeinwords);			! Size
+
+    !+
+    !    BUMP PTR PAST THE DATA PORTION
+    !-
+
+    sidrptr = .sidrptr + .keysizeinwords;
+    sidrptr [wholeword] = .recdesc [rdrrv];	! STORE PTR
+    RETURN
+    END;					! End MAKESIDR
+
+%SBTTL 'BLDCSIDR - make continuation SIDR'
+
+GLOBAL ROUTINE bldcsidr (recdesc, sidrbd, newbd) =
+! BLDCSIDR
+! ========
+! ROUTINE TO BUILD A CONTINUATION SECONDARY INDEX DATA RECORD (SIDR)
+!	THIS ROUTINE IS CALLED WHEN THE CURRENT BUCKET BECOMES FILLED
+!	WITH OTHER RECORDS (MAYBE DUPLICATES OF THIS KEY VALUE), AND
+!	A NEW SIDR IS NEEDED. THIS SIDR IS ALLOCATED IN ITS OWN
+!	BUCKET WHICH IS THEN <NOT> ENTERED INTO THE INDEX STRUCTURE.
+!	THIS MEANS THAT THE INDEX WILL CONTAIN ONE INDEX RECORD
+!	WHICH REPRESENTS MORE THAN ONE DATA BUCKET...NAMELY ALL
+!	THOSE BUCKETS WHICH CONTAIN A SINGLE CONTINUATION SIDR
+!	FOR THIS KEY.  THUS, ONCE A CONTINUATION SIDR HAS BEEN
+!	BUILT IN A PARTICULAR BUCKET, NO OTHER RECORDS ARE
+!	ENTERED INTO THE BUCKET. THAT SIDR WILL CONTINUE TO GROW
+!	UNTIL IT FILLS THE BUCKET...AT WHICH TIME A NEW CONTINUATION
+!	SIDR IS BUILT IN A NEW BUCKET.
+!
+!	THIS ROUTINE DOES THE FOLLOWING:
+!
+!		1.	ALLOCATE A NEW BUCKET TO USE
+!		2.	LINK IT INTO THE BUCKET CHAIN
+!		3.	BUILD A NEW SIDR AT THE TOP OF IT.
+!
+! NOTES:
+!
+!	1.	A CONTINUATION SIDR LOOKS JUST LIKE THE INITIAL SIDR.
+!		IF DUP COUNTS ARE EVER SUPPORTED, THAT FIELD IN THE
+!		CONTINUATION SIDR CAN BE USED FOR SOME OTHER PURPOSE
+!		SINCE THE DUP COUNT IS NEEDED ONLY IN THE INITIAL
+!		SIDR RECORD.
+!
+!	2.	THE COUNT FIELD IN THE RECORD DESC. IS NOT ALTERED
+!		HERE, SO IF A SIDR BUCKET IS SPLITTING, WHOEVER CALLS
+!		THIS ROUTINE MUST UPDATE THE COUNT FIELD.
+! INPUT:
+!	RECDESC		RECORD DESCRIPTOR PACKET
+!		RRV		RECORD POINTER TO USE
+!		RECPTR		<IGNORED>
+!
+!	SIDRBD		BUCKET DESCRIPTOR OF SIDR BUCKET (OLD BUCKET)
+!	NEWBD		BUCKET DESCRIPTOR OF NEW BUCKET (RETURNED)
+! OUTPUT:
+!	TRUE:	OK, SIDR CREATED
+!	FALSE:	ERROR
+!		NO MORE BUCKET LEFT
+!		BUCKET BUSY
+! ROUTNES CALLED:
+!	ALCBKT
+!	MAKESIDR
+    BEGIN
+
+    MAP
+	recdesc : REF BLOCK,
+	sidrbd : REF BLOCK,
+	newbd : REF BLOCK;
+
+    LOCAL
+	bktsize,				! SIZE OF THIS BUCKET
+	thislevel,				! LEVEL OF THIS BUCKET
+	newflags,				! FLAGS FOR NEW BUCKET
+	tptr : REF BLOCK;
+
+    REGISTER
+	oldbktptr : REF BLOCK,			! PTR TO OLD SIDR BUCKET
+	newbktptr : REF BLOCK;
+
+    TRACE ('BLDCSIDR');
+    oldbktptr = .sidrbd [bkdbktadr];		! GET SOME POINTERS
+    newflags = .oldbktptr [bhflags] AND bhflgend;	! SAVE END BIT
+
+    !+
+    !    ALLOCATE A NEW BUCKET
+    !-
+
+    IF alcbkt (btypedata, 			! Type
+	    .newflags, 				! Flags
+	    datalevel, 				! Level
+	    .newbd) EQL false			! Bucket
+    THEN
+	RETURN false;
+
+!+
+!    WE NOW HAVE A BUCKET. FIRST, WE MUST CLEAR THE END
+!    BIT OF THE OLD BUCKET
+!-
+    clrflag (oldbktptr [bhflags], bhflgend);
+
+    !+
+    !    LINK THIS BUCKET INTO THE CHAIN
+    !-
+
+    newbktptr = .newbd [bkdbktadr];
+    newbktptr [bhnextbkt] = .oldbktptr [bhnextbkt];	! MOVE VALUE OVER
+    oldbktptr [bhnextbkt] = .newbd [bkdbktno];	! LINK TO LAST ONE
+
+    !+
+    !    NOW, CREATE A NEW SIDR RECORD AT THE TOP OF THE BUCKET
+    !-
+
+    tptr = .newbktptr + bhhdrsize;		! STORE IN LOCAL
+    recdesc [rdrecptr] = .tptr;			! RETURN IT TO CALLER
+
+    !+
+    !    ALLOCATE RFA FOR SIDR RECORD
+    !-
+
+    recdesc [rdrfa] = alcrfa (.newbd);
+    makesidr (.recdesc, .tptr);
+
+    !+
+    !    BUMP THE BUCKET HEADER DATA
+    !-
+
+    newbktptr [bhnextbyte] = 			! Add new length
+    .newbktptr [bhnextbyte] + (sidrhdrsize + .kdb [kdbkszw] + 1);
+    RETURN true
+    END;					! End BLDCSIDR
+
+%SBTTL 'DOSIDR - perform SIDR insertion'
+
+GLOBAL ROUTINE dosidr (recdesc, sidrbd, splitbd) =
+! DOSIDR
+! ======
+! ROUTINE TO PERFORM THE ACTUAL INSERTION OF A SIDR RECORD.
+!	THIS ROUTINE DETERMINES WHETHER THE INSERTION WILL
+!	CAUSE THE CREATION OF A BRAND NEW SIDR RECORD, A
+!	CONTINUATION RECORD (DUPS ALLOWED ONLY), OR JUST
+!	THE ADDITION OF A RECORD POINTER THE THE END OF AN
+!	EXISTING SIDR ARRAY.
+!
+!	NO INDEX MODIFICATION OR FILE BUCKET UPDATING IS DONE
+!	WITHIN THIS ROUTINE
+! INPUT:
+!	RECDESC		RECORD DESCRIPTOR PACKET
+!		RRV		RECORD POINTER TO INSERT INTO SIDR
+!		RECPTR		ADDRESS OF SEARCH TERMINATION
+!				(I.E., 1ST RECORD WITH KEY > K(S) )
+!		LASTRECPTR	RECORD BEFORE SEARCH TERMINATION RECORD
+!
+!	SIDRBD		BUCKET DESCRIPTOR OF CURRENT SIDR BUCKET
+!	SPLITBD		BUCKET DESCRIPTOR OF EXTRA BUCKET (RETURNED)
+! OUTPUT:
+!	TRUE:	OK, SIDR IS INSERTED
+!	FALSE:	ERROR
+!		NO MORE BUCKETS
+!		BUCKET BUSY
+! INPUT ARGS MODIFIED:
+!	RECORD DESCRIPTOR:
+!		RECPTR		ADDRESS OF THE SIDR RECORD
+!		SIDRELEMENT	OFFSET INTO SIDR OF CURRENT RECORD POINTER
+!
+! NOTES:
+!
+!	1.	IF NO DUP RECORDS WERE SEEN, THEN RECPTR POINTS TO
+!		THE PLACE WHERE WE NEED TO INSERT THE NEW SIDR
+!		RECORD. IF DUPS WERE SEEN, THEN RECPTR POINTS TO
+![12]		THE FINAL DUPLICATE SIDR ARRAY (INCLUDING CONTINUATIONS),
+![12]		AND LASTRECPTR HAS BEEN RESET TO POINT TO THE PREVIOUS SIDR.
+    BEGIN
+
+    MAP
+	recdesc : REF BLOCK,
+	sidrbd : REF BLOCK,
+	splitbd : REF BLOCK;
+
+    LABEL
+	loop;
+
+    REGISTER
+	sidrptr : REF BLOCK,			! PTR TO CURRENT SIDR
+	tptr : REF BLOCK,			! TEMP POINTER
+	tempac;					! TEMP AC
+
+    LOCAL
+	topofbktptr : REF BLOCK,		! PTR TO TOP OF CURRENT BUCKET
+	endbktptr : REF BLOCK,			! PTR TO END OF CURRENT BUCKET
+	dataptr : REF BLOCK,			! PTR TO DATA PORTION OF SIDR
+	freespace,				! AMOUNT OF SPACE LEFT IN THIS BUCKET
+	dummybd : BLOCK [bdsize],		! DUMMY BKT DESC USED FOR SPLIT
+	keysizeinwords,				! SAME AS IN KDB
+	savestatus,				! Save status of a routine
+	endofsidrptr : REF BLOCK,		! Ptr to end of current SIDR
+	keybuffptr : REF BLOCK;			! Ptr to RST key buffer
+
+    TRACE ('DOSIDR');
+
+    !+
+    !    SET UP SOME BUCKET POINTERS
+    !-
+
+    topofbktptr = .sidrbd [bkdbktadr];
+    freespace = (.kdb [kdbdbkz]^b2w) - (endbktptr = .topofbktptr [bhnextbyte]);
+    lookat ('	FREE-SPACE: ', freespace);
+    endbktptr = .endbktptr + .topofbktptr;	! Form absolute ptr to end
+!+
+!    DID WE SEE A DUPLICATE RECORD? IF SO, THEN WE NEED
+!    TO TRY TO ADD ONE MORE POINTER TO THE ARRAY. IF NOT,
+!    WE MUST CREATE AN ENTIRELY NEW SIDR RECORD
+!-
+
+    IF duplicateflag (recdesc) EQL 0
+    THEN 					! First insert of this key
+	BEGIN
+
+	!+
+	!    INDICATE THAT THE CURRENT POINTER IS FIRST IN ARRAY
+	!-
+
+	recdesc [rdsidrelement] = 1;
+	RETURN bldisidr (.recdesc, .sidrbd, .splitbd)
+	END;
+
+    !+
+    !    WE HAVE ALREADY PROCESSED A DUP OF THIS KEY VALUE
+    !-
+
+%IF dbug
+%THEN
+
+    IF (chkflag (kdb [kdbflags], flgdup) EQL 0) THEN rmsbug (msgflags);
+
+%FI
+
+!** [12] ROUTINE:DOSIDR AT LINE 7013, EGM, 3-APR-78
+    sidrptr = .recdesc [rdrecptr];		! GET ADDRESS OF LAST SIDR
+    lookat ('	CURRENT SIDR REC EQL AT: ', sidrptr);
+
+    !+
+    !    CHECK THAT IT IS IN THE CURRENT BUCKET
+    !-
+
+    IF ((.sidrptr LEQ .topofbktptr) OR (.sidrptr GTR .endbktptr)) THEN rmsbug (msgptr);
+
+!+
+!    UNLESS THIS BUCKET IS COMPLETELY FILLED, WE CAN ALWAYS
+!    FIT ONE MORE RECORD POINTER INTO THE ARRAY. THEREFORE,
+!    WE MUST DETERMINE IF THE BUCKET IS FULL AND IF NOT,
+!    WE WILL MORE THE BOTTOM DOWN AND INSERT THE RECORD
+!    POINTER. IF SO, WE MUST EITHER SPLIT THE BUCKET OR
+!    CREATE A CONTINUATION SIDR
+!-
+    keysizeinwords = .kdb [kdbkszw];		! MAKE THIS HANDY
+    dataptr = .sidrptr + sidrhdrsize;		! GET PTR TO DATA PORTION OF SIDR
+    endofsidrptr = .dataptr + .sidrptr [sidrrecsize] - 1;
+
+    !+
+    !    COMPUTE THE OFFSET INTO THE SIDR OF THE CURRENT POINTER
+    !-
+
+    recdesc [rdsidrelement] = .endofsidrptr - .dataptr - .keysizeinwords + 1;
+
+    IF .freespace LEQ 0				!**[6]**MAY BE NEGATIVE IF COMPLETELY FULL
+    THEN 					! The bucket is completely full
+	BEGIN
+	rtrace (%STRING ('	BKT EQL FULL...', %CHAR (13), %CHAR (10)));
+!+
+!    WE CAN'T FIT THE NEW SIDR IN THE BUCKET, SO
+!    WE MUST SPLIT. HOWEVER, IF THIS ARRAY IS
+!    THE LAST RECORD IN THE BUCKET, THEN WE
+!    DON'T WANT TO SPLIT THE BUCKETS EVENLY
+!    BECAUSE THAT WOULD UNNECESSARILY DISTRIBUTE
+!    DUP RECORDS ACROSS BUCKETS. WHAT WE NEED TO
+!    DO IS TO BUILD A CONTINUATION RECORD IN A
+!    NEW BUCKET BY ITSELF. THEN, IT WILL GROW
+!    UNTIL IT FILLS UP THAT BUCKET, THEN ANOTHER
+!    CONTINUATION WILL BE ALLOCATED, ETC.
+!-
+
+	IF (.endofsidrptr + 1) EQL .endbktptr
+	THEN 					! We need a continuation record
+	    BEGIN
+	    rtrace (%STRING ('	BUILDING CONT. RECORD', %CHAR (13), %CHAR (10)));
+	    savestatus = bldcsidr (.recdesc, .sidrbd, .splitbd);
+!+
+!    WE MUST INSURE THAT THE CONTINUATION SIDR
+!    GETS WRITTEN OUT, BUT IT SHOULD NOT BE
+!    ENTERED INTO THE INDEX.
+!-
+	    recdesc [rdcount] = 1;		! BKT WILL BE UPDATED
+	    RETURN .savestatus
+	    END;
+
+	recdesc [rdlength] = 0;			! JUST SPLIT, DONT INSERT
+
+	!+
+	!    SPLIT THE SIDR BUCKET
+	!-
+
+	IF split (.recdesc, .sidrbd, .splitbd, dummybd) EQL false THEN RETURN false;
+
+!+
+!    WE NOW MUST ASSIGN NEW ID'S FOR ALL THE SIDR
+!    RECORDS WHICH MOVED TO THE NEW BUCKET.
+!-
+	alcnewids (.splitbd);
+!+
+!    CHECK TO SEE IF THE SIDR MOVED TO THE NEW
+!    BUCKET
+!-
+!+
+!    NOW, THE SIDR IS EITHER IN THE CURRENT BUCKET
+!    OR IT WAS MOVED TO THE TOP OF THE NEXT BUCKET.
+!    THIS IS TRUE BECAUSE THE SPLIT ALGORITHM ALWAYS
+!    TRIES TO KEEP R-NEW ON THE CURRENT BUCKET AND
+!    SINCE THE SIZE OF R-NEW WAS ZERO, THIS WILL ALWAYS
+!    BE TRUE. SO, WE MUST CHECK RECPTR AND IF IT POINTS
+!    TO THE END OF THIS BUCKET, THEN WE KNOW THE SIDR
+!    IS REALLY AT THE TOP OF THE NEXT BUCKET.
+!-
+
+	IF (.sidrptr - .topofbktptr) EQL (.topofbktptr [bhnextbyte])
+	THEN 					! SIDR to top of next bucket
+	    BEGIN
+	    sidrptr = .splitbd [bkdbktadr] + bhhdrsize;
+	    rtrace (%STRING ('	SIDR MOVED TO NEW BKT', %CHAR (13), %CHAR (10)));
+	    topofbktptr = .splitbd [bkdbktadr];
+!** [12] ROUTINE:DOSIDR AT LINE 7106, EGM, 3-APR-78
+	    endofsidrptr = .sidrptr + sidrhdrsize + .sidrptr [sidrrecsize] - 1
+	    END;
+
+	!+
+	!    RDLASTRECPTR NOW POINTS TO THE LAST SIDR ARRAY
+	!    IN THE ORIGINAL BUCKET, HAVING BEEN RESET
+	!    BY SPLIT (SIDR IN OLD) OR LEFT AS RECIEVED FROM
+	!    PUTSIDR (SIDR IN NEW).
+	!    MOVE THIS NEW HIGH KEY VALUE INTO THE RST
+	!    KEY BUFFER.
+	!-
+
+	tptr = .recdesc [rdlastrecptr] + sidrhdrsize;
+	keybuffptr = .rst [rstkeybuff] + (.fst [fstkbfsize]/2);
+	movewords (.tptr, 			! From
+	    .keybuffptr, 			! To
+	    .kdb [kdbkszw])			! Size
+	END;
+
+    !+
+    !    RE-COMPUTE THE ENDOF THIS BUCKET DATA
+    !-
+
+    endbktptr = .topofbktptr + .topofbktptr [bhnextbyte];
+
+    !+
+    !    MOVE THE DATA DOWN IN THE BUCKET
+    !-
+
+    tempac = .endbktptr - .endofsidrptr - 1;	! COMPUTE HOW MUCH TO MOVE
+
+    IF .tempac NEQ 0
+    THEN 					! We must move some data down
+	BEGIN
+	movedown ((.endofsidrptr + 1), 		! Start
+	    .endbktptr - 1, 			! End
+	    1)					! Size
+	END;
+
+    !+
+    !    BUMP THE END-OF-BUCKET INDICATOR
+    !-
+
+    topofbktptr [bhnextbyte] = .topofbktptr [bhnextbyte] + 1;
+
+    !+
+    !    STORE THE NEW RECORD POINTER
+    !-
+
+    endofsidrptr [1, wrd] = .recdesc [rdrrv];
+
+    !+
+    !    BUMP THE SIZE OF THIS SIDR RECORD
+    !-
+
+    sidrptr [sidrrecsize] = .sidrptr [sidrrecsize] + 1;
+
+    !+
+    !    RESET RECPTR TO POINT TO THE LOCATION OF THE SIDR
+    !-
+
+    recdesc [rdrecptr] = .sidrptr;
+    RETURN true
+    END;					! End DOSIDR
+
+%SBTTL 'INSRTSIDR - insert SIDR'
+
+GLOBAL ROUTINE insrtsidr (recdesc, sidrbd, splitbd) =
+! INSRTSIDR
+! =========
+! ROUTINE TO INSERT A SECONDARY DATA RECORD (SIDR).
+!	THIS ROUTINE ACTUALLY IS THE OUTER-LEVEL ROUTINE
+!	WHICH GUIDES THE INSERTION OF THE SIDR. IT PERFORMS
+!	NO DATA MANIPULATION OR RECORD CREATION. SUCH
+!	ACTIONS ARE DONE BY "DOSIDR".  THIS ROUTINE SIMPLY
+!	CALLS DOSIDR AND THEN UPDATES ANY FILE PAGES
+!	WHICH NEED TO BE WRITTEN TO THE FILE.
+! INPUT:
+!	RECDESC		RECORD DESCRIPTOR PACKET
+!		RRV		RECORD POINTER TO INSERT INTO SIDR
+!		RECPTR		ADDRESS OF SEARCH TERMINATION
+!				(I.E., 1ST RECORD WITH K > K(S) )
+!		LASTRECPTR	RECORD BEFORE SEARCH TERMINATION RECORD
+!
+!	SIDRBD		BUCKET DESCRIPTOR OF CURRENT SIDR BUCKET
+!	SPLITBD		BUCKET DESCRIPTOR OF EXTRA BUCKET (RETURNED)
+! OUTPUT:
+!	TRUE:	SIDR RECORD INSERTED PROPERLY AND FILE UPDATED
+!	FALSE:	ERROR
+!		NO MORE BUCKETS
+! ROUTINES CALLED:
+!	DOSIDR
+    BEGIN
+
+    MAP
+	recdesc : REF BLOCK,
+	sidrbd : REF BLOCK,
+	splitbd : REF BLOCK;
+
+    TRACE ('INSRTSIDR');
+
+    !+
+    !    CLEAR THE NUMBER OF NEW SPLIT BUCKETS
+    !-
+
+    recdesc [rdcount] = 0;
+
+    !+
+    !    DO THE INSERTION
+    !-
+
+    IF dosidr (.recdesc, 			! Rec desc
+	    .sidrbd, 				! Bucket
+	    .splitbd) EQL false			! Split bucket
+
+	!+
+	!    WHAT HAPPENED?
+	!-
+
+    THEN
+	RETURN false;
+
+    !+
+    !    IF WE SPLIT, THEN WE MUST UPDATE THE NEW FILE BUCKET
+    !-
+
+    IF .recdesc [rdcount] EQL 1
+    THEN
+	putbkt (true, 				! Update
+	    .splitbd);				! Bucket
+
+    !+
+    !    UPDATE THE BUCKET IN WHICH THE SIDR WAS INSERTED
+    !-
+
+    putbkt (true, 				! Update
+	.sidrbd);				! Bucket
+    RETURN true
+    END;					! End INSRTSIDR
+
+%SBTTL 'BLDISIDR - build first SIDR'
+
+GLOBAL ROUTINE bldisidr (recdesc, sidrbd, splitbd) =
+! BLDISIDR
+! ========
+! ROUTINE TO BUILD THE FIRST INSTANCE OF A SPECIFIC SECONDARY
+!	DATA RECORD. THIS ROUTINE IS CALLED ONLY WHEN THE SIDR
+!	RECORD IS BEING INITIALLY CREATED. CONTINUATION SIDR'S
+!	ARE CREATED ONLY BY "BLDCSIDR".
+! INPUT:
+!	RECDESC		RECORD DESCRIPTOR PACKET
+!		RRV		RECORD POINTER TO USE
+!		RECPTR		ADDRESS TO INSERT SIDR
+!
+!	SIDRBD		BUCKET DESCRIPTOR OF SIDR BUCKET (OLD BUCKET)
+!	NEWBD		BUCKET DESCRIPTOR OF NEW BUCKET (RETURNED)
+!
+! OUTPUT:
+!	TRUE:	SIDR INSERTED CORRECTLY
+!	FALSE:	SIDR COULD NOT BE INSERTED (ERROR CODE IS IN USRSTS)
+!
+! ROUTINES CALLED:
+!	SPLIT
+!	MAKESIDR
+!	ALCNEWIDS
+    BEGIN
+
+    MAP
+	recdesc : REF BLOCK,
+	sidrbd : REF BLOCK,
+	splitbd : REF BLOCK;
+
+    REGISTER
+	ptrac : REF BLOCK,
+	bktptr : REF BLOCK,			! PTR TO TOP OF CURRENT BUCKET
+	tempac;
+
+    LOCAL
+	endptr : REF BLOCK,			! PTR TO END OF CURRENT BUCKET
+	insertptr : REF BLOCK,			! PTR TO PLACE TO INSERT NEWSIDR
+	dummybd : BLOCK [bdsize],		! DUMMY BKT DESC FOR SPLIT
+	currentbd : BLOCK [bdsize],		! CURRENT BUCKET
+	splitflag,				! FOR IS ON IF WE SPLI THE BUCKET
+	maxoffset,				! OFFSET INTO BUCKET TO DETERMINE IF FULL
+	keybuffptr : REF BLOCK,			! PTR TO RST KEY BUFFER
+	spaceneeded;				! SIZE OF NEW SIDR
+
+    TRACE ('BLDISIDR');
+
+    !+
+    !    ASSUME NO SPLITS
+    !-
+
+    splitflag = false;
+!+
+!    SET UP SOME POINTERS AND FIGURE OUT HOW MUCH SPACE
+!    WE HAVE LEFT IN THIS BUCKET
+!-
+    insertptr = .recdesc [rdrecptr];
+    bktptr = .sidrbd [bkdbktadr];		! ADDRESS OF BUCKET
+    recdesc [rdlength] = (spaceneeded = sidrhdrsize + .kdb [kdbkszw] + 1);
+    lookat ('	SPACE-NEEDED: ', spaceneeded);
+
+    !+
+    !    CAN THIS NEW SIDR FIT ONTO THE BUCKET?
+    !-
+
+    maxoffset = .kdb [kdbdbkz]^b2w;		! FIND MAX SIZE OF BUCKET
+
+    IF (chkflag (rab [rabrop, 0], roploa) NEQ 0)
+    THEN 					! User specified fill percent
+	maxoffset = .kdb [kdbdfloffset];
+
+    !+
+    !    WILL THE NEW SIDR FIT IN THIS BUCKET?
+    !-
+
+    IF (.bktptr [bhnextbyte] + .spaceneeded) GTR .maxoffset
+    THEN 					! We must split the SIDR bucket
+	BEGIN
+	rtrace (%STRING ('	SIDR WONT FIT...', %CHAR (13), %CHAR (10)));
+
+	!+
+	!    SPLIT THE SIDR BUCKET
+	!-
+
+	IF split (.recdesc, .sidrbd, .splitbd, dummybd) EQL false
+
+	    !+
+	    !    WHAT HAPPENED?
+	    !-
+
+	THEN
+	    RETURN false;
+
+	splitflag = 1;				! SET THIS FLAG FOR LATER
+
+%IF dbug
+%THEN
+
+	IF .recdesc [rdcount] GEQ 2 THEN rmsbug (msgsplit);
+
+%FI
+
+!+
+!    DETERMINE IF THE INSERTION POINT WAS MOVED
+!    TO THE NEW BUCKET
+!-
+	insertptr = .recdesc [rdrecptr];	! FETCH ADDR OF SIDR
+	END
+    ELSE 					! SIDR can fit in this bucket
+	BEGIN
+!+
+!    WE NOW MUST LOCATE THE END OF THE DATA IN THE
+!    CURRENT BUCKET
+!-
+	endptr = .bktptr + .bktptr [bhnextbyte];
+
+	!+
+	!    COMPUTE AMOUNT OF DATA TO MOVE DOWN
+	!-
+
+	tempac = .endptr - .insertptr;
+	lookat ('	AMOUNT-TO-MOVE: ', tempac);
+
+%IF dbug
+%THEN
+
+	IF .tempac LSS 0 THEN rmsbug (msgcount);
+
+%FI
+
+	IF .tempac NEQ 0
+	THEN
+	    BEGIN
+	    movedown (.insertptr, 		! Start
+		.endptr - 1, 			! End
+		.spaceneeded)			! Size
+	    END;
+
+!+
+!    ALLOCATE AN RFA FOR THE NEW SIDR (SPLIT ALREADY
+!    DID THIS FOR US IF THE BUCKET SPLIT)
+!-
+	recdesc [rdrfa] = alcrfa (.sidrbd);
+
+	!+
+	!    BUMP THE BUCKET HEADER NEXT-BYTE VALUE
+	!-
+
+	bktptr [bhnextbyte] = .bktptr [bhnextbyte] + .spaceneeded;
+	END;
+
+    !+
+    !    CREATE THE SIDR RECORD
+    !-
+
+    makesidr (.recdesc, .insertptr);
+
+    !+
+    !    IF WE DIDNT'T SPLIT THE SIDR BUCKET, THEN WE CAN EXIT
+    !-
+
+    IF .splitflag EQL false THEN RETURN true;
+
+!+
+!    WE NOW MUST ASSIGN ID'S FOR ALL SIDR RECORDS WHICH
+!    MOVED TO THE NEW BUCKET. WE ALSO MUST MOVE THE NEW
+!    HIGH-KEY VALUE IN THE ORIGINAL BUCKET INTO THE KEY
+!    BUFFER (THE BOTTOM HALF OF IT) SO THAT "INDEX-UPDATE"
+!    WILL KNOW WHAT KEY TO PUT IN THE OLD INDEX RECORD.
+!    NOTE THAT THE MOVING OF THIS KEY MUST BE DONE AFTER
+!    THE NEW SIDR IS CREATED SINCE THE NEW RECORD TO BE
+!    INSERTED MAY BE THE NEW HIGH-KEY RECORD.
+!-
+
+    !+
+    !    **NOTE THAT THE INDEX-UPDATE FLAG BIT WAS SET BY SPLIT***
+    !-
+
+!+
+!    WE NOW MUST MOVE THE NEW HIGH-KEY VALUE FOR THE
+!    ORIGINAL BUCKET INTO THE RST KEY BUFFER
+!-
+    ptrac = .recdesc [rdlastrecptr] + sidrhdrsize;	! PTR TO KEY
+    keybuffptr = .rst [rstkeybuff] + (.fst [fstkbfsize]^divideby2lsh);
+    movewords (.ptrac, 				! From
+	.keybuffptr, 				! To
+	.kdb [kdbkszw]);			! Size
+!+
+!    WE NOW MUST ASSIGN NEW ID'S FOR ALL THE SIDR
+!    RECORDS WHICH MOVED TO THE NEW BUCKET.
+!-
+    alcnewids (.splitbd);
+    RETURN true
+    END;					! End BLDISIDR
+
+%SBTTL 'DELSIDR - delete record pointer'
+
+GLOBAL ROUTINE delsidr (recdesc) =
+! DELSIDR
+! =======
+! ROUTINE TO DELETE A SINGLE RECORD-POINTER FROM THE SECONDARY
+!	INDEX DATA RECORDS. THIS ROUTINE IS CALLED WHENEVER
+!	A $PUT TO AN INDEXED FILE RESULTS IN AN ERROR DURING
+!	PROCESSING OF ONE OF THE SECONDARY INDICES. IN SUCH A
+!	CASE, ALL THE PREVIOUS SECONARY INDICES MUST BE MODIFIED
+!	SO THAT THE RECORD IS REMOVED.
+!
+!	IF THE SECONDARY INDEX ALLOWS DUPLICATES, THEN EACH SIDR
+!	POINTER ARRAY MUST BE SCANNED UNTIL THE CORRECT ENTRY IS
+!	FOUND AND THEN IT CAN BE DELETED. IF NO DUPLICATES ARE
+!	ALLOWED, THEN THE ENTIRE SECONDARY DATA RECORD CAN BE
+!	SQUEEZED FROM THE BUCKET.
+! INPUT:
+!	RECDESC		RECORD DESCRIPTOR PACKET
+!		USERPTR		ADDRESS OF SEARCH KEY STRING
+!		USERSIZE	SIZE OF SEARCH KEY STRING
+!		RRV		RFA OF RECORD TO BE DELETED
+! OUTPUT:
+!	TRUE:	RECORD FOUND AND DELETED
+!	FALSE:	ERROR
+!		RECORD NOT FOUND
+!
+! NOTES:
+!
+!	1.	THE INDEX MUST BE LOCKED WHEN THIS ROUTINE IS CALLED.
+! ROUTINES CALLED:
+!	FNDREC
+    BEGIN
+
+    MAP
+	recdesc : REF BLOCK;
+
+    REGISTER
+	sidrptr : REF BLOCK,			! PTR TO CURRENT SIDR
+	arrayptr : REF BLOCK;			! PTR TO SIDR POINTER ARRAY
+
+    LOCAL
+	sidrbd : BLOCK [bdsize],		! BKT DESC FOR SIDR BUCKETS
+	dummybd : BLOCK [bdsize],		! A TEMPORARY BKT DESCRIPTOR
+	recordpointer,				! RFA TO SEARCH FOR
+	dummyptr : REF BLOCK,			! USED TO PASS SIDRPTR AS LOCAL
+	bktptr : REF BLOCK,			! PTR TO CURRENT SIDR BUCKET
+	endptr : REF BLOCK,			! PTR TO END OF CURRENT BUCKET
+	amounttomove,				! AMOUNT OF DATA TO SQUEEZE
+	ptrcount,				! # OF PTRS IN CURRENT ARRAY
+	offsettoptrs,				! OFFSET TO PTRS IN SIDR ARRAY
+	savedstatus;				! RESULTS OF A ROUTINE
+
+!EXTERNAL
+!    SQUEEZESIDR;
+
+    LABEL
+	bigloop;				! LABELS
+
+    TRACE ('DELSIDR');
+
+    !+
+    !    CHECK A FEW THINGS
+    !-
+
+%IF dbug
+%THEN
+
+    IF .kdb [kdbref] EQL refprimary THEN rmsbug (msginput);
+
+%FI
+
+    !+
+    !    SET UP THE RFA OF OUR TARGET RECORD
+    !-
+
+    recordpointer = .recdesc [rdrrv];
+!+
+!    WE WILL TRY TO SEARCH THE ENTIRE INDEX AND POSITION
+!    TO THE SIDR RECORD
+!-
+
+    IF fnddata (.recdesc, 			! Record
+	    sidrbd) EQL false			! Bucket
+    THEN
+	RETURN false;
+
+    !+
+    !    DID WE STOP AT THE DATA LEVEL?
+    !-
+
+    IF .recdesc [rdlastlevel] NEQ datalevel THEN RETURN false;
+
+!+
+!    AT THIS POINT, WE WILL DEFINE A DUMMY BLOCK WHICH
+!    WE WILL BE ABLE TO EXIT FROM.
+!-
+bigloop :
+    BEGIN
+!+
+!    THE RECORD WAS EITHER NOT FOUND, OR THERE WAS AN
+!    EXACT MATCH. CHECK IF THE RECORD WAS FOUND
+!-
+
+    IF chkflag (recdesc [rdstatus], rdflgpst + rdflglss) NEQ 0
+    THEN 					! The record wasn't found
+	LEAVE bigloop WITH (savedstatus = false);
+
+!+
+!    WE HAVE FOUND AN EXACT MATCH. WE MUST NOW CHECK IF WE
+!    CAN FIND THE RECORD POINTER IN THIS ARRAY.
+!-
+    sidrptr = .recdesc [rdrecptr];		! GET PTR TO SIDR
+    offsettoptrs = sidrhdrsize + .kdb [kdbkszw];	! COMPUTE THIS NOW
+!+
+!    IF NO DUPS ARE ALLOWED, THEN WE MUST COMPARE OUR
+!    SEARCH KEY RECORD ADDRESS WITH THE ONE IN THIS SIDR.
+!-
+
+    IF chkflag (kdb [kdbflags], flgdup) EQL 0
+    THEN 					! No dups are allowed
+	BEGIN
+	rtrace (%STRING ('	SEARCHING THIS SIDR...', %CHAR (13), %CHAR (10)));
+	arrayptr = .sidrptr + .offsettoptrs;	! PTR TO RFA'S
+
+	IF .arrayptr [wholeword] NEQ .recordpointer
+	THEN 					! The record wasn't found
+	    LEAVE bigloop WITH (savedstatus = false);
+
+	!+
+	!    WE CAN SET THIS RFA TO BE DELETED
+	!-
+
+	dummyptr = .sidrptr;			! STORE PTR AS LOCAL
+	squeezesidr (.dummyptr, sidrbd);
+	savedstatus = true
+	END
+    ELSE 					! Dups are allowed
+	BEGIN
+!+
+!    WE MUST SCAN ALL SIDR'S UNTIL WE FIND THE CORRECT
+!    RECORD POINTER. WE MAY HIT THE END OF THE CHAIN
+!    FIRST, IN WHICH CASE WE MUST EXIT WITH FAILURE.
+!-
+	repeat
+
+	    BEGIN
+	    rtrace (%STRING ('	SCANNING SIDR...', %CHAR (13), %CHAR (10)));
+	    sidrptr = .recdesc [rdrecptr];	! GET SIDR PTR AGAIN
+	    bktptr = .sidrbd [bkdbktadr];	! FETCH THIS AGAIN
+	    endptr = .bktptr + .bktptr [bhnextbyte];
+	    ptrcount = .sidrptr [sidrrecsize] - .kdb [kdbkszw];
+	    arrayptr = .sidrptr + .offsettoptrs;	! GET PTR TO RFA'S
+	    lookat ('	SIDRPTR: ', sidrptr);
+	    lookat ('	# OF PTRS: ', ptrcount);
+
+	    !+
+	    !    LOOP OVER ALL POINTERS IN THE ARRAY
+	    !-
+
+	    INCR j FROM 0 TO .ptrcount - 1 DO
+		BEGIN
+
+		IF (.arrayptr [wholeword] AND ( NOT allrfaflags)) EQL .recordpointer
+		THEN
+		    BEGIN
+		    lookat ('	FOUND RFA AT: ', arrayptr);
+
+		    !+
+		    !    NOTE NO CHECK FOR SIDR ALREADY DELETED
+		    !-
+
+		    setupd (sidrbd);		!INDIC THIS PG TO BE UPDATED
+		    setdeletedrfa (arrayptr);
+		    LEAVE bigloop WITH (savedstatus = true)
+		    END;
+
+		arrayptr = .arrayptr + 1;
+		END;
+
+!+
+!    AT THIS POINT, WE DIDNT FIND THE RP IN
+!    THE SIDR. SO, WE MUST CHECK IF THERE ARE
+!    ANY CONTINUATION SIDR'S AND IF SO, WE MUST
+!    SCAN ALL OF THEM TO SEE IF WE CAN FIND THE
+!    CORRECT RFA.
+!-
+	    rtrace (%STRING ('	DIDNT FIND RFA IN SIDR...', %CHAR (13), %CHAR (10)));
+	    lookat ('	ARRAY-PTR: ', arrayptr);
+
+	    IF .arrayptr NEQ .endptr
+	    THEN 				! No more continuation SIDRs
+		LEAVE bigloop WITH (savedstatus = false);
+
+!+
+!    START THE SEARCH AT THE END OF THIS BUCKET.
+!    ALSO, INDICATE THAT A HORIZONTAL SEARCH IS OK.
+!-
+	    rtrace (%STRING ('	SEARCHING FOR CONT SIDRS...', %CHAR (13), %CHAR (10)));
+	    setflag (recdesc [rdflags], rdflghorizok);
+	    recdesc [rdrecptr] = .endptr;
+!+
+!    WE MUST MOVE THE SIDR BUCKET DESCRIPTOR
+!    TO A TEMP LOCATION TO INPUT IT TO FNDREC.
+!-
+	    movebktdesc (sidrbd, dummybd);
+	    savedstatus = fndrec (.recdesc, dummybd, sidrbd);
+!+
+!    AT THIS POINT, FNDREC RETURNED A STATUS OF TRUE
+!    UNLESS THERE WAS A FATAL PROBLEM (NO SPACE LEFT
+!    FOR BUCKETS, ...). HOWEVER, WE MUST CHECK THE
+!    STATUS BITS BECAUSE THE NEW RECORD MAY NOT
+!    BE A CONTINUATION RECORD, OR THE END OF THE
+!    BUCKET CHAIN MAY HAVE BEEN REACHED. IN ALL THESE
+!    CASES, WE MUST EXIT FROM THE LOOP.
+!-
+
+	    IF (.savedstatus EQL false) OR 	!
+		(chkflag (recdesc [rdstatus], rdflglss + rdflgpst) NEQ 0)
+	    THEN 				! Not a continuation SIDR
+		LEAVE bigloop WITH (savedstatus = false)
+
+	    END
+
+	END
+
+    END;
+!+
+!    COME HERE WITH SAVEDSTATUS = STATUS OF OUR OPERATION.
+!    WE MUST RELEASE THE CURRENT BUCKET AND RETURN
+!    TO THE CALLER.
+!-
+!+
+!    NOTE THAT WE WILL NOT WRITE OUT THIS BUCKET NOW.
+!    IT IS VERY LIKELY THAT IT WILL GO OUT SOON, AND WE NEED
+!    TO SAVE SOME TIME.
+!-
+    putbkt (false, 				! No update
+	sidrbd);				! SIDR
+    RETURN .savedstatus
+    END;					! End DELSIDR
+
+%SBTTL 'SQUEEZESIDR - compress out SIDR'
+
+GLOBAL ROUTINE squeezesidr (sidrptr, sidrbd) : NOVALUE =
+! SQUEEZESIDR
+! ===========
+! ROUTINE TO SQUEEZE A SINGLE SECONDARY DATA RECORD FROM A BUCKET.
+!	THIS ROUTINE CAN ONLY BE CALLED IF THE SIDR CONTAINS ONLY
+!	ONE RECORD POINTER.
+! INPUT:
+!	SIDRPTR		ADDRESS OF SIDR RECORD
+!	SIDRBD		BUCKET DESCRIPTOR OF SIDR BUCKET
+! OUTPUT:
+!	<NO STATUS RETURNED>
+! ROUTINES CALLED:
+!	<NONE>
+    BEGIN
+
+    MAP
+	sidrptr : REF BLOCK,
+	sidrbd : REF BLOCK;
+
+    REGISTER
+	bktptr : REF BLOCK,			! PTR TO SIDR BUCKET
+	endptr : REF BLOCK;			! PTR TO END OF SIDR BUCKET
+
+    LOCAL
+	amounttomove,				! DATA TO MOVE UP IN BUCKET
+	sizeofsidr;				! SIZE OF SIDR HEADER AND KEY
+
+    TRACE ('SQUEEZESIDR');
+
+    !+
+    !    PICK UP THE BUCKET ADDRESS AND FIND END OF BUCKET
+    !-
+
+    setupd (sidrbd);				!INDIC THIS PG TO BE UPDATED
+    bktptr = .sidrbd [bkdbktadr];
+    endptr = .bktptr + .bktptr [bhnextbyte];
+    sizeofsidr = sidrhdrsize + .kdb [kdbkszw] + 1;
+    amounttomove = .endptr - .sidrptr - .sizeofsidr;
+    lookat ('	AMOUNT-TO-MOVE: ', amounttomove);
+    lookat ('	END OF BKT: ', endptr);
+
+    IF .amounttomove NEQ 0
+    THEN 					! We have some to move
+	BEGIN
+	rtrace (%STRING ('	SQUEEZING BUCKET...', %CHAR (13), %CHAR (10)));
+	movewords (.sidrptr + .sizeofsidr, 	! From
+	    .sidrptr, 				! To
+	    .amounttomove)			! Size
+	END;
+
+    !+
+    !    UPDATE THE BUCKET HEADER INFO
+    !-
+
+    bktptr [bhnextbyte] = .bktptr [bhnextbyte] - .sizeofsidr;
+    RETURN
+    END;					! End SQUEEZE-SIDR
+
+%SBTTL 'PUTSIDR - insert secondary key'
+
+GLOBAL ROUTINE putsidr (recdesc) =
+! PUTSIDR
+! =======
+! ROUTINE TO INSERT A KEY FROM THE USER DATA RECORD INTO A
+!	SECONDARY INDEX. THIS ROUTINE IS CALLED FROM $PUT
+!	AND $UPDATE WHENEVER A NEW KEY IS BEING INSERTED
+!	INTO THE FILE. THE USER DATA RECORD MUST ALREADY HAVE
+!	BEEN CHECK TO MAKE SURE IT IS BIG ENOUGH TO HOLD THE
+!	ENTIRE KEY STRING FOR THIS KEY OF REFERENCE.
+! INPUT:
+!	RECDESC		RECORD DESCRIPTOR PACKET
+!		RRV		RECORD ADDRESS TO INSERT INTO SECONDARY INDEX
+! OUTPUT:
+!	TRUE:	OK...RECORD INSERTED INTO SECONDARY INDEX
+!	FALSE:	ERROR
+! INPUT ARGS MODIFIED:
+!
+!	RECORD DESCRIPTOR:
+!		STATUS		OPERATION STATUS BITS
+!			FLGIDXERROR	INDEX UPDATE ERROR OCCURED
+! ROUTINES CALLED:
+!	MAKIDX
+!	FOLLOWPATH
+!	CHKDUP
+!	INSRTSIDR
+!	IDXUPDATE
+! NOTES:
+!
+!	1.	KDB MUST BE SET UP ON ENTRY FOR THE CURRENT KEY.
+!
+!	2.	THE INDEX MUST BE LOCKED WHEN THIS ROUTINE IS CALLED.
+    BEGIN
+
+    MAP
+	recdesc : REF BLOCK;
+
+    LABEL
+	loop;
+
+    LOCAL
+	userrecordptr : REF BLOCK,		! PTR TO USER DATA RECORD
+	seckeybuffer : VECTOR [maxkszw],	! TEMP BUFFER FOR SEC KEY
+	bktdesc : BLOCK [bdsize],		! BUCKET DESC FOR SIDR BUCKET
+!** [12] ROUTINE:PUTSIDR AT LINE 7725, EGM, 3-APR-78
+	splitbd1 : BLOCK [bdsize],		! BKT DESC FOR SPLITS
+	oldlastrecptr;				! SAVED PTR TO LAST SIDR ARRAY
+
+!EXTERNAL
+!    FOLLOWPATH,			! TRAVERSE THE INDEX
+!    CHKDUP,					! CHECK FOR DUPS
+!    MAKIDX,					! CREATE A NEW INDEX
+!    MOVEKEY,				! MOVE THE SEC KEY INTO BUFFER
+!    INSRTSIDR,				! INSERT THE NEW SIDR
+!    IDXUPDATE;				! UPDATE THE INDEX
+    TRACE ('PUTSIDR');
+
+    !+
+    !    CHECK IF THERE IS AN INDEX
+    !-
+
+    IF noindexflag NEQ 0
+    THEN
+	BEGIN
+	makidx ();				! MAKE ONE
+
+	!+
+	!    IF THE NO-INDEX IS STILL ON, THERE WAS A PROBLEM
+	!-
+
+	IF noindexflag NEQ 0 THEN RETURN false
+
+	END;
+
+    !+
+    !    FETCH THE ADDRESS OF THE USER'S NEW RECORD
+    !-
+
+    userrecordptr = .rab [rabrbf, 0];
+
+    IF .userrecordptr<lh> EQL 0			! Section number?	!A415
+    THEN 					!			!A415
+	userrecordptr = .userrecordptr OR .blksec;	! Default section !A415
+
+    !+
+    !    MOVE THE SECONDARY KEY STRING TO THE TEMPORARY BUFFER
+    !-
+
+    movekey (.userrecordptr, 			! From
+	seckeybuffer);				! To
+    recdesc [rduserptr] = seckeybuffer;
+    recdesc [rdusersize] = .kdb [kdbksz];
+
+    !+
+    !    ***NEXT INSTR ASSUMES RDFLAGS AND RDSTATUS ARE IN WORD 0
+    !-
+
+    recdesc [wholeword] = 0;
+
+    !+
+    !    SEARCH THE SECONDARY INDEX
+    !-
+
+    IF followpath (.recdesc, bktdesc) EQL false THEN RETURN false;
+
+!** [12] ROUTINE:PUTSIDR AT LINE 7773, EGM, 3-APR-78
+
+    !+
+    !    SAVE THE LAST RECORD POINTER AROUND THE CALL TO CHKDUP
+    !-
+
+    oldlastrecptr = .recdesc [rdlastrecptr];
+
+    !+
+    !    CHECK FOR DUPLICATE VALUES
+    !-
+
+!+
+!    WE MUST NOW INSERT THE SIDR RECORD INTO
+!    THE SIDR BUCKET
+!-
+loop :
+    BEGIN
+
+    IF chkdup (.recdesc, bktdesc) NEQ false
+    THEN
+!** [12] ROUTINE:PUTSIDR AT LINE 7785, EGM, 3-APR-78
+	BEGIN
+!+
+!   IF DUPLICATES WERE FOUND, BACKUP THE RECORD POINTERS
+!   TO CORRECTLY POINT TO THE FINAL DUPLICATE SIDR ARRAY,
+!   AND THE PREVIOUS SIDR ARRAY. THIS MUST BE DONE SO THAT
+!   THE RST KEY BUFFER CAN BE UPDATED PROPERLY ON A SPLIT
+!-
+
+	IF duplicateflag (recdesc) NEQ 0
+	THEN
+	    BEGIN
+	    recdesc [rdrecptr] = .recdesc [rdlastrecptr];
+	    recdesc [rdlastrecptr] = .oldlastrecptr
+	    END;
+
+	IF insrtsidr (.recdesc, bktdesc, splitbd1) NEQ false	!
+	THEN
+	    LEAVE loop WITH true;
+
+	END;
+
+    BEGIN
+    putbkt (false, bktdesc);
+    RETURN false
+    END;
+    END;
+
+    !+
+    !    CHECK FOR INDEX UPDATE
+    !-
+
+    IF idxupdateflag (recdesc) NEQ 0
+    THEN
+	BEGIN
+
+	IF idxupdate (.recdesc, bktdesc, splitbd1, 0)	! ONLY 1 EXTRA BKT
+	    EQL false
+	THEN
+
+	!+
+	!    WHAT HAPPENED?
+	!-
+
+	    setidxerrorflag (recdesc);		! SET THE FLAG
+
+	END;
+
+    !+
+    !    RETURN AFTER INSERTING NEW SIDR RECORD
+    !-
+
+    RETURN true
+    END;					! End PUTSIDR
+
+END
+
+ELUDOM
+ 

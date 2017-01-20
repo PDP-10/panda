@@ -1,0 +1,800 @@
+TITLE SIG -- Signalling facilities for the RTL
+
+;
+;	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1984, 1986.
+;	ALL RIGHTS RESERVED.
+;
+;	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+;	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+;	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+;	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+;	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+;	SOFTWARE IS HEREBY TRANSFERRED.
+;
+;	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+;	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+;	EQUIPMENT CORPORATION.
+;
+;	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+;	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+;
+
+SUBTTL Edit History
+
+; Version 1.0
+
+;.EDIT 5	Don't type to terminal from DYNBOO if detached.
+;		Don't output from LDH if SG.OUT is 0
+;		DDB,10-MAY-84,SPR:NONE
+;.EDIT 7	Unwind trashes SG.ENS (ENSTK pointer)
+;		DDB,31-MAY-84,SPR:NONE
+
+SALL
+
+SEARCH DYNSYM, DDBSYM, MONSYM, MACSYM
+
+SEGMENT DATA
+
+EXTERNAL ME$DLM, RTLCER, RTLERR
+
+SUBTTL ENSTK -- The stack of established condition handlers
+
+; SG.ENS holds an xFIW to the bottom of the last entry in use.
+; The stack is empty when (SG.ENS)=ENSTK.
+; Each entry on the stack is an establish block (.ES) as defined in
+; DYNSYM.
+
+; [7] ENSTK and its pointer SG.ENS must be in the same section as the RTL SG
+; [7] routines;  Since they're all in this module, that shouldn't prove hard.
+
+.ESSIZ==^D50			;Large stack, since overflow not checked for
+ENSTK::	BLOCK .ESSIZ*.ESLEN
+SG.ENS:: Z			;Must be master-initialized
+SG.LER:: Z			;Address of last error chain
+
+; Parameters that control last-ditch handler error printing
+SG.OUT:: .PRIOU			;Output designator
+SG.LEV:: .INFIN			;Number of levels of message to print (max)
+SG.PFX:: IFIW SG.DPX		;xFIW address of prefix table (OWL/GBP to
+				;ASCIZ strings) indexed by severity
+SG.SFX:: IFIW SG.DSX		;xFIW address of suffix table (OWL/GBP to
+				;ASCIZ strings) indexed by severity
+
+; Control of asynchronous events -- if SG.NAS is set, DYNLIB won't enable for
+; trapping or interrupts (trapping is enabled on call to DY$MIN).
+; The main reason for setting this is for programs that run in section zero --
+; a trap from section zero can't be handled by a normal non-zero-section
+; trap handler because of the state of the stack.
+SG.NAS:: 0			;By default, trapping is on
+
+SEGMENT CODE
+
+; Default prefix table
+SG.DPX:: POINT 7, [ASCIZ /%/]	;Warning
+	POINT 7, [ASCIZ /!/]	;Success
+	POINT 7, [ASCIZ /?/]	;Error
+	POINT 7, [ASCIZ /[/]	;Info
+	POINT 7, [ASCIZ /??/]	;Severe error
+
+; Default suffix table
+SG.DSX:: POINT 7, [ASCIZ /
+/]				;Warning
+	POINT 7, [ASCIZ /! /]	;Success
+	POINT 7, [ASCIZ /
+/]				;Error
+	POINT 7, [ASCIZ /]
+/]				;Info
+	POINT 7, [ASCIZ /
+/]				;Severe error
+
+
+SUBTTL SG$EST -- Establish a signal handler
+
+; This routine must be called before any adjustments are made to the
+; stack pointer by the calling routine.  For establishing a condition 
+; handler for routines written in higher level languages where this
+; condition cannot easily be met, set the condition handling flag in
+; the library definition for that routine; this will result in generating
+; a jacket definition for that routine which will perform the enable for it.
+
+; This routine is part of the RTL, so is in the same section as SG.ENS.
+
+; Call with the address of the establish block pushed onto the stack.
+; It is removed before returning.  No registers are altered.
+
+; This is hard to use from BLISS -- BLISS doesn't expect the argument
+; it pushed to be removed from the stack by the routine called.
+
+SEGMENT CODE
+
+SG$EST::
+
+	PUSH P, 2		;Make a register to work in
+	MOVX 2, .ESLEN		;Amount of space to allocate on stack
+	ADDB 2, SG.ENS		;Allocate the space
+	POP P, .ESAC2(2)	;Put AC2 in its place
+	DMOVEM 0, .ESAC0(2)	;Put AC0 and AC1 in their places
+	DMOVE 0, [EXP -15, 20]	;Set up for backwards XBLT of 3-17
+	EXTEND 0, [XBLT]	;Move registers 17-3
+	; AC2 now points to .ESAC3, so adjust future references!!
+	SOS .ESSP-.ESAC3(2)	;Decrement stack pointer to where it was before
+	SOS .ESSP-.ESAC3(2)	;call to SG$EST
+	POP P, 0		;Pop return address
+	EXCH 0, 0(P)		;Swap it for the establish block address
+	MOVEM 0, .ESHND-.ESAC3(2) ;Put in its final location
+	DMOVE 0, .ESAC0-.ESAC3(2) ;Restore 0 and 1
+	MOVE 2, .ESAC2-.ESAC3(2) ;Finally restore our work register
+	RET
+SUBTTL SG$LES -- Establish a signal handler from bliss
+
+; This is a version of SG$EST to be called from within BLISS routines.
+; This routine is for use by WIZARDS only!!  In particular, unwinding
+; to a routine that enables for condition handling this way is almost
+; certainly a mistake.
+
+; Call with the address of the handler block in T1.
+
+SEGMENT CODE
+
+SG$LES::
+	PUSH P, 2		;Make a register to work in
+	MOVX 2, .ESLEN		;Amount of space to allocate on stack
+	ADDB 2, SG.ENS		;Allocate the space
+	POP P, .ESAC2(2)	;Put AC2 in its place
+	MOVEM 1, .ESHND(2)	;Store handler block info
+	MOVEM 0, .ESAC0(2)	;Put AC0 in place
+	;Unwinding to this thing will give a strange AC1, better not matter!
+	DMOVE 0, [EXP -15, 20]	;Set up for backwards XBLT of 3-17
+	EXTEND 0, [XBLT]	;Move registers 17-3
+	; AC2 now points to .ESAC3, so adjust future references!!
+	SOS .ESSP-.ESAC3(2)	;Stack pointer to level before call to SIGBST
+	DMOVE 0, .ESAC0-.ESAC3(2) ;Restore 0 and 1
+	MOVE 2, .ESAC2-.ESAC3(2) ;Finally restore our work register
+	RET
+SUBTTL SG$REM -- Remove an established handler
+
+; This routine must be called before leaving a routine which establishes
+; a condition handler.
+
+; Call with the address of the handler block pushed onto the stack.
+; It is removed before returning.  No registers are altered.
+
+; It is an error to remove a handler other than the most recently established
+; one.
+
+SG$REM::
+	PUSH P, 2		;Make workspace
+	MOVE 2, SG.ENS		;Get enable stack pointer
+	MOVE 2, .ESHND(2)	;Get address of handler block
+	CAME 2, -2(P)		;Compare handler block addresses
+	    JRST REMLOS		;Not the same
+
+	MOVX 2, -.ESLEN
+	ADDM 2, SG.ENS		;Pop and discard the enable stack entry
+
+	MOVE 2, -1(P)		;Get return address
+	MOVEM 2, -2(P)		;Overwrite address of handler block
+	POP P, 2		;Restore AC2
+	ADJSP P, -1		;Bury corpse of argument
+	RET			;Return to return address
+
+; Come here if an attempt is made to remove a handler other than the
+; most recently established one.
+
+				;Stack shows ARG, RETADR, AC2
+REMLOS:	MOVE T2, -2(P)		;Get our argument
+	EXCH T2, -1(P)		;Stack shows ARG, ARG, AC2
+	MOVEM T2, -2(P)		;Stack shows RETADR, ARG, AC2
+	MOVX T2, <0,,1>
+	EXCH T2, 0(P)		;Restore AC2 and push arg count
+				;Stack shows RETADR, ARG, <0,,1>
+	PUSH P, [SG$ROS]	;Stack shows RETADR, ARG, <0,,1>, SG$ROS
+	JRST RTLERR
+SUBTTL SG$LRM -- Remove an established handler, BLISS-callable
+
+; This routine must be called before leaving a routine which establishes
+; a condition handler.
+
+; Call with the address of the handler block in T1.
+; Registers 6-17 are preserved.
+
+; It is an error to remove a handler other than the most recently established
+; one.  This error is indicated by signalling SG$ROS.
+
+SG$LRM::
+	PUSH P, 2		;Make workspace
+	MOVE 2, SG.ENS		;Get enable stack pointer
+	MOVE 2, .ESHND(2)	;Get address of handler block
+	CAME 2, 1		;Compare handler block addresses
+	    JRST BEMLOS		;Not the same
+
+	MOVX 2, -.ESLEN
+	ADDM 2, SG.ENS		;Pop and discard the enable stack entry
+
+	POP P, 2		;Restore AC2
+	RET			;Return to return address
+
+; Come here if an attempt is made to remove a handler other than the
+; most recently established one.
+
+				;Stack shows ARG, RETADR, AC2
+BEMLOS:	MOVE T2, -2(P)		;Get ARG
+	EXCH T2, -1(P)		;Stack shows ARG, ARG, AC2
+	MOVEM T2, -2(P)		;Stack shows RETADR, ARG, AC2
+	MOVX T2, <0,,1>		;Extras, arg count
+	EXCH T2, 0(P)		;Restore AC2 and push counts
+				;Stack shows RETADR, ARG, <0,,1>
+	PUSH P, [SG$ROS]	;Stack shows RETADR, ARG, <0,,1>, SG$ROS
+	JRST RTLERR
+SUBTTL SG$SIG -- Initiate a software signal
+
+; Look for a handler on the enable stack that wants to process the signal
+; block specified.  If none found, call the last-ditch handler (ldh).
+
+; Arguments:
+;	1/	EFIW signal block
+
+; Note that signalling can result in program termination or unwinding,
+; in which case this routine will never return.
+
+; Preserves all registers if it returns
+
+; Register allocations:
+; [7]	P1	Local index of establish block under consideration (in enstk)
+;	P2	Address of signal block being signalled
+
+SG$SIG::
+
+; Save all registers
+; This stuff is restored if we return.  If we unwind, stack is reset and
+; we ignore all these values so carefully stored away.  Sob.
+	PUSH P, 0
+	PUSH P, 1
+	PUSH P, 2
+	ADJSP P, 14
+	DMOVE 0, [EXP 14, 3]
+	XMOVEI 2, -13(P)
+	EXTEND 0, [XBLT]
+
+	HRRZ P1, SG.ENS		;local index of where we are on ENSTK
+	MOVE P2, -15(P)		;EFIW signal block (arg was saved along
+				;with rest of registers)
+
+; See if this level on ENSTK wants the problem
+NALHAN:	CAIG P1, ENSTK		;Skip if P1 points to entry that exists
+	    JRST SIGLDH		;No user handlers left, invoke the LDH
+
+; Check if handler wants this signal
+	MOVE T3, .SGCLS(P2)	;Get class from signal block
+	MOVE T2, .ESHND(P1)	;Get address of handler block
+	TDNN T3, .HNCLS(T2)	;Skip if this handler wants this signal
+	    JRST NALNXH		;No luck, try next one
+
+; This handler wants this signal
+	MOVE T1, P2		;Pass EFIW signal block
+
+; Preserve registers we depend on around the call
+	PUSH P, P1
+	PUSH P, P2
+	CALL @.HNHND(T2)	;Call the handler
+				;Handler returns new SG addresses in T1
+				;  on .HNRES
+				;Handler returns action code in T2
+				;Resignal (same or different .SG block)
+				;    Code .HNRES=0
+				;Continue
+				;    Code .HNCON=1
+				;Unwind
+				;    Code .HNUNW=2
+	POP P, P2
+	POP P, P1
+
+	SKIPL T2		;Skip if code is negative (invalid)
+	  CAILE T2, .HNUNW	;Skip if code less-or-equal to max (ok)
+	    SETZ T2,		;Force invalid codes to be 0
+
+	JRST @NALACT(T2)
+
+NALACT:	IFIW NALRES
+	IFIW NALCON
+	IFIW NALUNW
+
+; No luck so far, try next (earlier) handler
+NALNXH:	SUBI P1, .ESLEN		;Step to previous handler
+	JRST NALHAN		;Check it out
+
+; Action routines for SG$SIG
+
+; Resignal requested
+; In this case the handler has changed the signal block address in T1 to point
+; to his new block (if any).
+
+NALRES:	MOVE T2, @T1		;Refer to new SG block address
+	ERJMP .+2		;If the ref fails, don't update SG block adr!
+	  MOVE P2, T1		;Potentially updated signal block address
+	JRST NALNXH		;Keep looking
+
+; Continue requested
+NALCON:	;Restore registers saved on entry
+	MOVX 0, 14
+	XMOVEI 1, -13(P)
+	MOVX 2, 3
+	EXTEND 0, [XBLT]	;Restore 3-16
+	DMOVE 0, -16(P)		;Restore 0 and 1
+	MOVE 2, -14(P)		;Restore 2
+	ADJSP P, -17		;And relinquish stack space
+
+	RET			;Okay, continue
+
+; Unwind requested
+; T0 is value to return after unwind
+; [7] P1 is pointer to the handler's ENSTK entry
+NALUNW:	MOVEM T0, .ESAC0(P1)	;Store away value to be returned to caller
+				;of establisher of current handler
+	HRRZ P2, SG.ENS		;Local index of top of ENSTK
+
+; Next handler to unwind
+NAL001:	MOVE T2, .ESHND(P2)	;Get adr of handler block for this establish
+	MOVE T0, .HNCLS(T2)	;Get enable mask for this handler
+	TXNN T0, SG%UNW		;Does this handler care about unwinding?
+	    JRST NALUNX		;No, loop
+	XMOVEI T1, NALUWB	;Call with our static unwind block
+
+; Preserve registers we depend on around call
+	PUSH P, P1
+	PUSH P, P2
+	CALL @.HNHND(T2)	;Do closing cleanup
+	; No value returned on unwind call
+	POP P, P2
+	POP P, P1
+
+NALUNX:
+
+; Here, do any magic cleanup (like clearing interrupts no longer needed?)
+; in some future, more intelligent, version of this software.
+
+; Loop
+	HRRM P2, SG.ENS		;[7] Pop the establish block
+	SUBI P2, .ESLEN		;Look at previous one
+	CAML P2, P1		;Skip if we're back to the one that handled it
+	    JRST NAL001		;Loop Loop Loop ... oops (Ha Ha only kidding)
+
+; We're getting down to the grim and dirty, now...
+; Our next mission, should we decide to accept it, is to restore registers 
+; and stack pointer from the establish block, pop the establish block,
+; and return the value specified to the caller of the establisher of the
+; handler represented by the establish block now in P1.  Easy, huh?
+
+	MOVX 0, 15
+	XMOVEI 1, .ESAC3(P1)	;Start with AC3 of establish block
+	MOVX 2, 3		;Restore to ACs!
+	EXTEND 0, [XBLT]	;Restore 3-17
+	; AC1 left pointing to .eshnd of the .es block used.  Very convenient!
+	MOVE 0, .ESAC0(1)	;Restore AC0
+	MOVE 2, .ESAC2(1)	;Restore AC2
+	PUSH P, .ESAC1(1)	;Save it somewhere safe
+	MOVX 1, <-.ESLEN>	;[7]
+	ADDM 1, SG.ENS		;[7] Pop the establish block
+	POP P, 1		;Finally restore AC1
+	RET			;Return to establishers caller
+				;[7] (Return value was placed over saved AC0
+				;[7] on ENSTK, so it got properly set up on the
+				;[7] restore above.)
+
+; Static signal block passed during unwind
+NALUWB:	$SGBLK (SG$UNW,0,"SIGNAL","UNWIND","SHOULD NEVER SEE THIS",0,SG%UNW)
+
+
+SUBTTL SIGLDH -- The last-ditch condition handler
+
+; This handler gets control whenever a signal is not handled (continue
+; or unwind; resignalling doesn't count as handling) by any user handler.
+
+; This is not enabled normally (say during master initialization) because
+; that would cause all sorts of interrupts to be turned on, since this handler
+; of course wants to see everything.  Instead, it's handled as a special
+; case.  SG$SIG JRSTs to here if nobody else will help.
+
+; (To continue, JRST to NALCON)
+
+SIGLDH:
+	MOVE T2, P2		;Address of signal block
+	MOVE T1, SG.OUT		;Destination designator
+	MOVE T3, SG.LEV		;Levels to go to
+	XMOVEI T4, @SG.PFX	;Prefix table
+	XMOVEI T5, @SG.SFX	;Suffix table
+	CALL SG$PEM		;Print the error message
+
+	LDB T1, [POINTR .SGCC(P2), SG%SEV] ;Fetch severity code
+	JRST @LDHDIS(T1)
+
+LDHDIS:	IFIW NALCON		;Warning
+	IFIW NALCON		;Success
+	IFIW LDHDIE		;Error
+	IFIW NALCON		;Information
+	IFIW LDHDIE		;Severe error
+	IFIW LDHDIE		;Not used
+	IFIW LDHDIE		;Not used
+	IFIW LDHDIE		;Not used
+
+LDHDIE:
+	MOVE T1, SG.OUT		;Get output designator
+	JUMPE T1, LDHHLT	;[5] Don't print to JFN of 0!!!
+	MOVX T2, <POINT 7, [ASCIZ /?? Program terminating due to previous error
+/]>
+	SETZB T3, T4
+	SOUT
+	  ERJMP .+1		;No errors within errors
+	
+; Close the log file, if possible
+	HRRZ T1, SG.OUT		;Get output designator
+	CLOSF%
+	    JFCL		;No errors within errors
+
+LDHHLT:	HALTF%
+	JRST LDHHLT		;Don't fall through!
+
+SUBTTL SG$PEM -- Print error message
+
+; Print an error message given a chain of signal blocks and some
+; rules on how to print it.
+
+; Arguments:
+;	1/	Destination designator
+;	2/	Address of signal block
+;	3/	Number of levels to print to
+;	4/	Address of prefix table
+;	5/	Address of suffix table
+
+; Prefix and suffix tables are vectors (indexed by severity) of addresses of
+; ASCIZ prefix and suffix strings (respectively) to bracket each error message
+; with.  "Addresses" means xFIW's here.
+
+; Printed message resulting is:
+;	<prefix><facility>-<severity>: <message><suffix>
+; repeated as many times as necessary or allowed (see arg 3).
+
+; Registers preserved: 6-17
+
+; Stacklocal storage:
+PEMLEV==-2			;Level left to print
+PEMPFX==-1			;Prefix table address
+PEMSFX==0			;Suffix table address
+PEMTMP==3			;Space needed
+
+SG$PEM::
+	PUSH P, P1		;To hold signal block address
+	MOVE P1, T2		;Starting location
+	ADJSP P, PEMTMP		;Scratch-pad space
+	MOVEM T3, PEMLEV(P)
+	MOVEM T4, PEMPFX(P)
+	MOVEM T5, PEMSFX(P)
+
+; [5] If JFN to print to is 0, DON'T PRINT!!!!!
+	JUMPE T1, PEMDON	;[5] Leave if JFN is 0
+
+; You get a free CRLF before the first message only
+	MOVX T2, <POINT 7, [ASCIZ /
+/]>
+	SETZB T3, T4		;Type ASCIZ string
+	SOUT
+	    ERJMP .+1
+
+PEM001:
+	MOVE T2, .SGFLG(P1)
+	TXNE T2, SG%NPR		;Skip if noprint not selected
+	    JRST PEMNXT		;Don't print this
+
+; Prefix string
+	LDB T3, [POINTR .SGCC(P1), SG%SEV] ;Get severity code
+	ADD T3, PEMPFX(P)	;Index table by severity
+	GETBP T2, 0(T3), T4
+	SETZB T3, T4
+	SOUT
+	    ERJMP .+1		;No errors in error processing!!
+
+; Facility name
+	GETBP T2, .SGFAC(P1), T3
+	SETZB T3, T4
+	SOUT
+	    ERJMP .+1
+
+; Punctuation
+	MOVX T2, "-"
+	BOUT
+	    ERJMP .+1
+
+; Condition name
+	GETBP T2, .SGCND(P1), T3
+	SETZB T3, T4
+	SOUT
+	    ERJMP .+1
+
+; Punctuation
+	MOVX T2, <POINT 7, [ASCIZ /: /]>
+	SOUT
+	    ERJMP .+1
+
+; Message
+	GETBP T2, .SGMSG(P1), T3
+	SETZB T3, T4
+	SOUT
+	    ERJMP .+1
+
+; Suffix string
+	LDB T3, [POINTR .SGCC(P1), SG%SEV] ;Get severity code
+	ADD T3, PEMSFX(P)	;Index table by severity
+	GETBP T2, 0(T3), T4
+	SETZB T3, T4
+	SOUT
+	    ERJMP .+1		;No errors in error processing!!
+
+; And now, the next message (if any)
+
+PEMNXT:	SOSG PEMLEV(P)		;Skip if aren't at limit yet
+	    JRST PEMEXI		;Done
+	XMOVEI P1, @.SGNXT(P1)	;This word may contain IFIW
+	SKIPE P1		;Skip if word was zero
+	    JRST PEM001		;Go print next level
+	;Must fall through to exit from here
+
+PEMEXI:	MOVX T2, <-1,,[ASCIZ /
+/]>
+	SETZB T3, T4
+	SOUT
+	    ERJMP .+1
+
+PEMDON:	ADJSP P, -PEMTMP	;[5]
+	POP P, P1
+	RET
+
+SUBTTL SG$DLG -- Deallocate a signal block chain
+
+; Given the first signal block in a chain, deallocate all of the blocks
+; in that chain which have the dynamic bit set.
+
+; Arguments:
+;	1/	Address of signal block
+
+; Preserves registers 6-17
+
+SG$DLG::
+	XMOVEI T0, @.SGNXT(T1)	;Save "NEXT" block address
+	PUSH P, T0
+	MOVE T0, .SGFLG(T1)	;Get flags for examination
+	TXNN T0, SG%DYN		;Skip if dynamic
+	  JRST DLGNXB		;Don't deallocate blocks that aren't dynamic!
+	CALL ME$DLM		;Deallocate the block
+	  ERJMP DLGERR		;Clean-up and pass on the error
+
+DLGNXB:	POP P, T1		;Follow the chain
+	JUMPN T1, SG$DLG	;0 means end of chain
+	RET
+
+DLGERR:	ADJSP P, -1		;Get rid of saved block address
+	JRST RTLCER		;Continue the error upwards
+
+SUBTTL SG$DMG -- Dump an SG chain
+
+; Given the first signal block in a chain, dump the blocks to the tty.
+; This is primarily intended as a debugging routine, and in particular
+; should be callable from DDT.
+
+; Arguments:
+;	1/	Address of signal block
+
+; Preserves registers 6-17
+
+SG$DMG::
+	PUSH P, P1
+	MOVE P1, T1		;Save SG block address
+
+	TMSG <
+********** Dumping SIGNAL block 
+>
+
+DMGDMG:	TMSG <Block at >
+	MOVE T2, P1
+	CALL DMGOOH		;Dump as octal halfwords
+DMGCC:	TMSG <
+    .SGCC:  >
+	MOVE T2, .SGCC(P1)
+	CALL DMGOOH
+	TMSG < [Facility = >
+	LDB T2, [POINTR .SGCC(P1), SG%FAC]
+	CALL DMGOOH
+	TMSG < Message = >
+	LDB T2, [POINTR .SGCC(P1), SG%MSG]
+	CALL DMGOOH
+	TMSG < Severity = >
+	LDB T2, [POINTR .SGCC(P1), SG%SEV]
+	CALL DMGOOH
+DMGNXT:	TMSG <]
+    .SGNXT: >
+	MOVE T2, .SGNXT(P1)
+	CALL DMGOOH
+DMGFAC:	TMSG <
+    .SGFAC: >
+	XMOVEI T2, .SGFAC(P1)
+	CALL DMGOBP
+DMGCND:	TMSG <    .SGCND: >
+	XMOVEI T2, .SGCND(P1)
+	CALL DMGOBP
+DMGMSG:	TMSG <    .SGMSG: >
+	XMOVEI T2, .SGMSG(P1)
+	CALL DMGOBP
+DMGSPC:	TMSG <    .SGPC:  >
+	MOVE T2, .SGPC(P1)
+	CALL DMGOOH
+DMGCLS:	TMSG <
+    .SGCLS: >
+	MOVE T2, .SGCLS(P1)
+	CALL DMGOOH
+	MOVE T4, .SGCLS(P1)
+DMG007:	JFFO T4, DMG006
+	  JRST DMGFLG
+DMG006:	MOVE T1, DMGCLT(T5)	;Get appropriate decoding
+	PSOUT
+	MOVN T5, T5
+	MOVX T1, 1B0
+	LSH T1, (T5)
+	ANDCAM T1, T4
+	JRST DMG007
+
+DMGFLG:	TMSG <
+    .SGFLG: >
+	MOVE T2, .SGFLG(P1)
+	CALL DMGOOH
+DMGDAT:	TMSG <
+    .SGDAT: >
+	MOVE T2, .SGDAT(P1)
+	CALL DMGOOH
+	JUMPE T2, DMG004	;No data to dump?
+	XMOVEI T4, @.SGDAT(P1)	;Get address of count word
+	MOVE T5, 0(T4)
+	TMSG < Count = >
+	MOVE T2, T5
+	CALL DMGOOH
+DMG005:	SOJLE T5, DMG004
+	AOS T4
+	TMSG <
+        >
+	MOVE T2, 0(T4)
+	CALL DMGOOH
+	JRST DMG005
+
+; Follow NXT pointer (if it's not zero)
+DMG004:	TMSG <
+>
+	XMOVEI P1, @.SGNXT(P1)
+	HRRZ T1, P1		;In case pointer was IFIW 0 (stupid, but...)
+	JUMPN T1, DMGDMG
+
+DMGDON:	TMSG <
+********** End of SIGNAL chain dump
+
+>
+	POP P, P1
+	RET
+
+; Dump a byte pointer, and show the string
+; Enter with the Address of the byte pointer in T2
+; This accepts OWL/GBP's
+; Trashes t1, t3
+
+DMGOBP:	PUSH P, T2		;Save the byte pointer as is
+	LDB T2, [POINTR @0(P), BP%POS]
+	CALL DMGOOH
+	CAIGE T2, 45		;Skip if OWGBP
+	  JRST DMG002		;Local byte pointer
+	TMSG < >
+	LDB T2, [POINTR @0(P), MASKB(6,35)]
+	CALL DMGOOH
+	JRST DMG003		;Go print the string
+DMG002:	TMSG < >
+	LDB T2, [POINTR @0(P), BP%SIZ]
+	CALL DMGOOH
+	TMSG < >
+	LDB T2, [POINTR @0(P), BP%ADR]
+	CALL DMGOOH
+DMG003:	TMSG <
+        {>
+	GETBP T1, @0(P), T2
+	PSOUT
+	TMSG <}
+>
+	POP P, T2
+	RET
+
+; Dump a quantity as octal halfwords
+; Enter with value in T2.  T1 and T3 are trashed
+
+DMGOOH:	PUSH P, T2
+	HLRZ T2, 0(P)		;Just left half
+	JUMPE T2, DMG001	;Go print right half if left is zero
+	MOVX T1, .PRIOU
+	MOVX T3, <NO%MAG!FLD(^D8,NO%RDX)>
+	NOUT%
+	  ERJMP .+1		;No errors in debugging routines
+	MOVX T1, ","
+	PBOUT%
+	PBOUT%
+DMG001:	POP P, T2
+	HRRZ T2, T2		;Just right half
+	MOVX T1, .PRIOU
+	MOVX T3, <NO%MAG!FLD(^D8,NO%RDX)>
+	NOUT%
+	  ERJMP .+1		;No errors in debugging routines
+
+; Table for decoding class bits in signal
+DMGCLT:	POINT 7, [ASCIZ / SG%UNW/]
+	POINT 7, [ASCIZ / SG%APR/]
+	POINT 7, [ASCIZ / SG%DER/]
+	POINT 7, [ASCIZ / SG%QUO/]
+	POINT 7, [ASCIZ / SG%EOF/]
+	POINT 7, [ASCIZ / SG%ILI/]
+	POINT 7, [ASCIZ / SG%ILR/]
+	POINT 7, [ASCIZ / SG%ILW/]
+	POINT 7, [ASCIZ / SG%INS/]
+	POINT 7, [ASCIZ / SG%NXM/]
+	POINT 7, [ASCIZ / SG%PDL/]
+	POINT 7, [ASCIZ / SG%SOF/]
+	POINT 7, [ASCIZ / SG%RES/]
+	POINT 7, [ASCIZ / SG%CHR/]
+	POINT 7, [ASCIZ / SG%TRM/]
+	POINT 7, [ASCIZ / BIT 17/]
+	POINT 7, [ASCIZ / BIT 18/]
+	POINT 7, [ASCIZ / BIT 19/]
+	POINT 7, [ASCIZ / BIT 20/]
+	POINT 7, [ASCIZ / BIT 21/]
+	POINT 7, [ASCIZ / BIT 22/]
+	POINT 7, [ASCIZ / BIT 23/]
+	POINT 7, [ASCIZ / BIT 24/]
+	POINT 7, [ASCIZ / BIT 25/]
+	POINT 7, [ASCIZ / BIT 26/]
+	POINT 7, [ASCIZ / BIT 27/]
+	POINT 7, [ASCIZ / BIT 28/]
+	POINT 7, [ASCIZ / BIT 29/]
+	POINT 7, [ASCIZ / BIT 30/]
+	POINT 7, [ASCIZ / BIT 31/]
+	POINT 7, [ASCIZ / BIT 32/]
+	POINT 7, [ASCIZ / BIT 33/]
+	POINT 7, [ASCIZ / BIT 34/]
+	POINT 7, [ASCIZ / BIT 35/]
+
+	RET
+
+SUBTTL SG$NAS -- Enable / disable asynchronous events
+
+; Passing a value to this routine is exactly equivalent to placing that
+; value in galactic variable SG.NAS.  This routine exists because galactic
+; variables are not available from section zero.
+
+; Preserves registers 6-17.
+
+; Arguments:
+;	1/	Value to place in SG.NAS
+
+SG$NAS::
+	MOVEM T1, SG.NAS
+	RET
+
+SUBTTL Various routines specified but not yet implemented
+
+SEGMENT CODE
+
+SG$DIC::
+SG$EIC::
+SG$DLC::
+SG$SEC::
+SG$ALC::
+	PUSH P, 0(P)		;Duplicate return address
+	PUSH P, [1]		;Arg count
+	PUSH P, [DY$NYI]	;Condition
+	JRST RTLERR
+
+IF2 <PURGE ..MX1, ..MX2, ..TX1, ..TX2, .AC1
+>
+
+	END
+  

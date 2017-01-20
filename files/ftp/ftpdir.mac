@@ -1,0 +1,305 @@
+	SEARCH FTPDEF
+	TTITLE(FTPDIR, -- Routines for printing out directory listings)
+	SUBTTL David Eppstein / Stanford University  21-Feb-1984
+
+	;; Copyright (C) 1984 Board of Trustees, Stanford University
+	;; The information in this software is subject to change without
+	;; notice and should not be construed as a commitment by Stanford
+	;; University.  Stanford assumes no responsibility for the use or
+	;; reliability of this software.
+
+	EXTERN DIRJFN,FILPRP,SKPDIR,TEMP,OPSYS
+
+; Here when protocol wants us to print a filespec
+; destination JFN in DIRJFN, file props in FILPRP, flags in FX
+
+LS DIRDIR,20			; This must be permanent for DIRDCH
+
+DIRPNT::ABTSKIP			; See if we got a ^G
+	IFSKP.
+	  TXZE FX,L%HDR		; Then remember we got it.  If not already done
+	   TYPE <[Directory command aborted]%/> ; Tell user what he did
+	  RET			; Ignore this and all remaining files
+	ENDIF.
+
+	;; Not aborted, so start up.  First headers if they haven't been done.
+	SAVEAC <A,B,C,D>	; Save used registers
+	TRVAR <<DIRFIL,20>,DIRDPT,DIRCPT> ; Declare local storage
+	TXON FX,L%HDR		; Set header typed flag.  If not already set
+	 CALL DIRHDR		; Then go make headers
+
+	;; Parse the filename into directory and name-body, and if the
+	;; directory was different from the previously-printed file
+	;; then add the new directory name to the listing.
+	CALL DIRNAM		; Parse filename into P.NAMB and P.DIRE
+	MOVE A,[POINT 7,TEMP]	; Buffer output into temporary storage
+	HRROI B,DIRDIR		; Point to directory
+	TXZN FX,L%NDIR		; Any mismatches found in dir name?
+	IFSKP.
+	  TXZN F,F%NCRF		; Won't need CRLF. If didn't now
+	   WRITE <%/>		; Then perversely write one
+	  WRITE <   %2S%/>	; Add directory name
+	ENDIF.
+	TXZE F,F%NCRF		; If still want a CRLF
+	 WRITE <%/>		; then write one
+
+	;; Add the actual filename, counting characters so later columns
+	;; can be aligned with each other.
+	MOVE B,[POINT 7,DIRFIL]	; Get filename itself
+	SETZ D,			; Nothing found yet
+	DO.
+	  ILDB C,B		; Get next filename char
+	  JUMPE C,ENDLP.	; If null, done
+	  CAIL C," "		; If not printable control char
+	   CAIN C,177		; or equally unprintable del
+	    LOOP.		; then ignore it
+	  IDPB C,A		; Drop into string
+	  AOJA D,TOP.		; Count off, and go back for another char
+	ENDDO.
+
+	;; Now we have made filename - if wanted more cols, print them too.
+	CAIE FX,L%HDR		; Anything else to print?
+	 JRST DIRPAT		; Yes, print attributes
+
+; End of listing for this file
+DIRPDN:	WRITE <%/>		; End buffered text with a CRLF
+	MOVE A,DIRJFN		; Now to our output file
+	HRROI B,TEMP		; With buffer we just filled
+	SETZ C,			; Up to null
+	SOUT%			; Send it off
+	RET			; Done with that file
+
+; Break up Server-Filename for directory listing
+; we put the device and directory etc into DIRDIR
+; and the filename itself into DIRFIL.
+; L%NDIR will be set if the new directory was different from the old.
+
+DIRNAM:	TXZ FX,L%NDIR		; No differences yet
+	MOVE B,[POINT 7,FILPRP+P.SFIL] ; Point to source
+	MOVE C,[POINT 7,DIRDIR]	; Point to directory destination
+	MOVEM C,DIRCPT		; Save pointer in memory
+	MOVE C,OPSYS		; Look at remote operating system
+	CAIN C,OS.DEC		; TOPS-10 or SAIL?
+	 JRST DIRDEC		; Yes, try to be smart
+
+	;; Not TOPS-10 so the directory comes before the file.
+	;; Copy it out into a separate string.
+	CALL SKPDIR		; For other operating systems, skip over dir
+	MOVEM B,DIRDPT		; Save pointer for later comparison
+	MOVE B,[POINT 7,FILPRP+P.SFIL] ; Start at the beginning again
+	DO.
+	  CAMN B,DIRDPT		; Done with directory yet?
+	   TDZA C,C		; Yes, get null
+	    ILDB C,B		; No, get next char
+	  CALL DIRDCH		; Add to directory string
+	  JUMPN C,TOP.		; and go back to the top
+	ENDDO.
+
+	;; Got directory part, now use rest of string as file part.
+	MOVE C,[POINT 7,DIRFIL]	; Now point to file
+	TXZ F,F%TEMP		; No version seen yet
+	DO.
+	  ILDB D,B		; Get next char of filename
+	  IDPB D,C		; Drop it into directory filename
+	  CAIN D,";"		; Semicolon?
+	   TXO F,F%TEMP		; Yes, remember we saw it
+	  JUMPN D,TOP.		; Back for yet another
+	ENDDO.
+
+	;; Now we are mostly done with the filename.  But we might have
+	;; forgotten the generation for TENEX files, so if we have we
+	;; try to add it back in here.
+	TXZE F,F%TEMP		; Seen a semi?
+	 RET			; Yes, don't add generation twice
+	MOVE D,OPSYS		; Get operating system again
+	CAIN D,OS.10X		; Tenex?
+	 SKIPG B,FILPRP+P.VERS	; Yes, do we have a version yet?
+	  RET			; Some better operating system or no version
+	MOVEI D,";"		; Get a semicolon again
+	DPB D,C			; Drop in over null
+	WRITE C,<%2D>		; Add generation
+	RET			; Done with non-DEC filenames
+
+
+; Here to add char in C to directory string
+DIRDCH:	ILDB D,DIRCPT		; Get old char there
+	CAIE C,(D)		; If not the same as new char
+	 TXO FX,L%NDIR		; Remember the difference
+	DPB C,DIRCPT		; Drop new char in
+	RET
+
+; Break up TOPS-10 style filename for directory
+; DEV:FNAME.EXT[PRJ,PRG] is split into DEV:[PRJ,PRG] and FNAME.EXT
+
+; Here from DIRDEC when we find a colon early in the filename.
+; Put that part in the directory name and start over with rest of filename.
+DIRCLN:	MOVE B,DIRDPT		; Start over
+	DO.
+	  ILDB C,A		; Get next char
+	  CALL DIRDCH		; Drop in directory
+	  CAIE C,":"		; If not a colon
+	   LOOP.		; Back for another
+	ENDDO.
+
+; Main entry point.
+; Loop, looking for a device terminator or directory starter.
+; If a device terminator, we've come too far and have to start from the top.
+; If a directory starter, we leave the completed filename and
+; go on to finish filling out the directory name.
+DIRDEC:	MOVEM B,DIRDPT		; Save pointer for possible retry
+	MOVE D,[POINT 7,DIRFIL]	; Point to filename for DIRDEC	
+	DO.
+	  ILDB C,B		; Get next char
+	  CAIN C,":"		; Colon?
+	   JRST DIRCLN		; Yes, treat specially
+	  IDPB C,D		; Drop it in
+	  CAIN C,"["		; If an open bracket
+	   EXIT.		; then go do directory part
+	  JUMPN C,TOP.		; If null then done
+	  CALLRET DIRDCH	; Add character to end of directory name
+	ENDDO.
+
+	;; Here after reading "[" in TOPS-10 filename
+	SETZ C,			; Get a null
+	DPB C,D			; Drop in at end of filename over bracket
+	MOVEI C,"["		; Get open bracket again
+	DO.
+	  CALL DIRDCH		; Add to directory name
+	  JUMPE C,R		; If null, done
+	  ILDB C,B		; Else get next char
+	  LOOP.			; Back for another
+	ENDDO.
+
+; More attributes printed in directory listing
+; D contains number of chars in filename (for alignment).
+
+DIRPAT:	SUBI D,^D24		; Reserve 24 chars for name
+	IFG. D			; If we're already past it
+	  WRITE <%/                        > ; Make new line and space over
+	ELSE.
+	  IFL. D		; If we need to pad out at all
+	    MOVEI B," "		; Get a space
+	    DO.
+	      IDPB B,A		; Add it to buffer
+	      AOJL D,TOP.	; Until we pad line out enough
+	    ENDDO.
+	  ENDIF.
+	ENDIF.
+
+	;; Alignment done, now print attributes.  First file type.
+	TXNE FX,L%TYPE		; List file type?
+	 CALL DIRLTY		; Yes, go do it
+
+	;; Now size (bytes or pages depending on protocol and server)
+	IFXN. FX,L%SIZE		; List file size?
+	  MOVE B,FILPRP+P.SIZE	; Get file size
+	  MOVX C,NO%LFL!NO%OOV!FLD(6,NO%COL)!FLD(^D10,NO%RDX)
+	  NOUT%
+	   NOP			; Ok if number overflows
+	ENDIF.
+
+	;; Now protection
+	IFXN. FX,L%PROT		; List protection?
+	  SKIPL B,FILPRP+P.PROT	; Get protection
+	  IFSKP.
+	    WRITE <    ?? >	; Unknown, don't type as number
+	  ELSE.
+	    MOVX C,NO%LFL!NO%OOV!FLD(7,NO%COL)!FLD(^D8,NO%RDX)
+	    NOUT%
+	     NOP
+	  ENDIF.
+	ENDIF.
+
+	;; Now the various dates and author strings.
+	MOVE B,FILPRP+P.CDAT
+	TXNE FX,L%CDAT		; List creation date?
+	 CALL PRDATE		; Yes, do so
+	MOVE B,FILPRP+P.WDAT
+	TXNE FX,L%WDAT		; List write date?
+	 CALL PRDATE		; Yes, do so
+	MOVE B,FILPRP+P.RDAT
+	TXNE FX,L%RDAT		; List read date?
+	 CALL PRDATE		; Yes, do so
+	HRROI B,FILPRP+P.OAUT
+	SKIPN FILPRP+P.OAUT
+	 HRROI B,[ASCIZ/??      /]
+	TXNE FX,L%OAUT		; List creator?
+	 WRITE < %2S>
+	HRROI B,FILPRP+P.AUTH
+	SKIPN FILPRP+P.AUTH
+	 HRROI B,[ASCIZ/??/]
+	TXNE FX,L%AUTH		; List author?
+	 WRITE < %2S>
+	JRST DIRPDN		; Done with this file's listing
+
+; More directory listing
+
+; Here to list type and byte size of file
+DIRLTY:	HRRZ C,FILPRP+P.TYPE	; Get file type
+	HRRZ B,FILPRP+P.BYTE	; Byte size
+	XCT [ WRITE < ???  >	; Something we don't recognize
+	      WRITE <      >	; Unspecified
+	      WRITE < Text >	; Text
+	      WRITE < B(%2D)>	; Binary
+	      WRITE < Paged>	; Paged (huh?)
+	      WRITE < Dir  >	; Directory
+	      WRITE < EBCD >	; EBCDIC
+	      WRITE < Image>	; Image (?)
+	    ]+1(C)
+	CAIN C,TT.BIN		; Binary?
+	 CAIL B,^D10		; Byte size less than 10?
+	  RET			; No, done
+	WRITE < >		; Yes, another space
+	RET
+
+
+; Print date in correct format for DIRECTORY command
+;	A/ Destination designator (byte pointer to TEMP buffer)
+;	B/ Tops20 format date and time
+;	FX/ List format flags
+; Returns +1 always
+; Clobbers B, C
+
+PRDATE:	IFE. B			; If time is unspecified
+	  WRITE <    ---   >	; Write dashes instead
+	  TXNE FX,L%TIME	; and if we wanted time too
+	   WRITE <      >	; leave more blank space
+	  RET
+	ENDIF.
+	WRITE < >		; Pad from previous column
+	MOVX C,OT%NTM		; Normally omit time
+	TXNE FX,L%TIME		; Want to include time?
+	 TXC C,OT%NTM!OT%NSC	; Yes, but don't include seconds
+	ODTIM%			; Do it
+	RET
+
+; Here to make header for directory listing
+
+DIRHDR:	SETZM DIRDIR		; No directory found yet
+	CAIN FX,L%HDR		; If we have no real flags set
+	 RET			; Then we're done with the header
+	HRROI A,TEMP		; Buffer string
+	WRITE <                        >
+	TXNE FX,L%TYPE		; Printing type?
+	 WRITE < Type >
+	TXNE FX,L%SIZE		; Printing size?
+	 WRITE <  Size>
+	TXNE FX,L%PROT		; Printing protection?
+	 WRITE <   Prot>
+	SETZ B,			; For dates, assume no times
+	TXNE FX,L%TIME		; List times?
+	 HRROI B,[ASCIZ /      /]	; Yes, extra space
+	TXNE FX,L%CDAT		; Printing creation date?
+	 WRITE <  Creation%2S>
+	TXNE FX,L%WDAT		; Printing write date?
+	 WRITE <  Write   %2S>
+	TXNE FX,L%RDAT		; Printing read date?
+	 WRITE <  Read    %2S>
+	TXNE FX,L%OAUT		; Print creator?
+	 WRITE < Creator >
+	TXNE FX,L%AUTH		; Print author?
+	 WRITE < Writer>
+	TXO F,F%NCRF		; Need a CRLF
+	JRST DIRPDN		; Done with that
+
+	END

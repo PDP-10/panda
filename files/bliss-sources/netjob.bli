@@ -1,0 +1,682 @@
+%TITLE 'NETJOB - DECnet Server Controller'
+MODULE NETJOB (MAIN = NETJOB, VERSION = '1(12)') =
+BEGIN
+!++
+!       COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1986.
+!       ALL RIGHTS RESERVED.
+!
+!       THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!       COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!       THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!       ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!       AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!       SOFTWARE IS HEREBY TRANSFERRED.
+!
+!       THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!       NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!       EQUIPMENT CORPORATION.
+!
+!       DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!       ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!       This stand alone program controls jobs which service DECnet requests. A
+!       number of services provided through  DECnet require that the server  be
+!       running as  the  user,  and  not as  a  privleged  OPERATOR  job.  This
+!       controller makes that possible by starting jobs which are not logged in
+!       until they receive a DECnet  connection which includes a valid  user-id
+!       and password.
+!--
+%SBTTL 'Revision History'
+!++
+! REVISION HISTORY
+!
+!   12  Don't get confused when monitor reassigns job number we haven't seen 
+!       die yet.  Its ugly.
+!       Gregory A. Scott  30-Jun-86
+!
+!   11  Tell me what illegal message type we got if any.
+!       Gregory A. Scott  18-Jun-86
+!
+!   10  Detect connection by blank username and say "<blank username>".
+!       Gregory A. Scott  18-Jun-86
+!
+!    7  Job number wasn't set up right in HANDLE_IPCF.
+!       Gregory A. Scott  17-Jun-86
+!
+!    6  Punt the bad IPCF messages; create routine HANDLE_IPCF.
+!       Gregory A. Scott  17-Jun-86
+!
+!    5  Allow 512 jobs on the system; set file size to something reasonable.
+!       Gregory A. Scott  16-Jun-86
+!
+!    4  Change log file format a little to make it easier to find problems and
+!       to make the various log entries follow a similar format.
+!       Gregory A. Scott  16-Jun-86
+!
+!    3  Open and close the log file for each message we write there so that it
+!       can be examined when NETJOB is running.  Write a new log file if one 
+!       doesn't exist.
+!       Gregory A. Scott  16-Jun-86
+!
+!    2  General cleanup.  And did it ever need it.  Don't use DTRLOG:, use
+!       NETJOB-LOG: instead.  Improve error message printer.  Improve the
+!       logging routines.
+!       Gregory A. Scott  13-Jun-86
+!
+!    1  Creation for DTRSRV.
+!       Peter Mierswa --no date--
+!
+!--
+%SBTTL 'Environment'
+
+LIBRARY 'TOPS20';                       ! TOPS-20 JSYS linkages and symbols
+
+FORWARD ROUTINE NETJOB : NOVALUE,               ! Main routine
+                HANDLE_IPCF : NOVALUE,          ! Handle IPCF message
+                MOVEAZ : NOVALUE,               ! Move ASCIZ string
+                READ_CONTROL : NOVALUE,         ! Read SYSTEM:NETJOB.TXT
+                FATAL : NOVALUE,                ! Give fatal error
+                LOG_IT : NOVALUE,               ! Log a line to file
+                START_JOB : NOVALUE,            ! Start a slave job
+                INIT_IPCF : NOVALUE;            ! Init the ipcf system
+
+! Document fatal errors
+
+MACRO $FATAL(TEXT) =
+      BEGIN
+      FATAL(CH$PTR(UPLIT(%ASCIZ TEXT)));
+      END %;
+
+! Make string pointer to an ASCIZ string
+
+MACRO PP(text) = CH$PTR(UPLIT(%ASCIZ %STRING(text, %REMAINING))) %;
+
+! Make a continuation string for the LOG file
+
+MACRO continuation = %CHAR(13,10),'                    '%;
+
+! Literals
+
+LITERAL CI = 0,                         ! JOB flag, means waiting for connect
+        RN = 1,                         ! JOB flag, means link is active
+
+        $NETFAIL = -1,                  ! Failure to LOGIN
+        $NETSUCC = -2,                  ! Successful connection
+        $NETMESS = -3,                  ! Job message to NETJOB
+        $NETCREATE = -4,                ! Job creation
+
+        TRUE = 1,                       ! BLISS style TRUE flag
+        FALSE = 0,                      ! Anybody's style FALSE
+
+        MAX_STRING = 299,               ! Maximum length of a string here
+        MAX_FILE_SIZE = 160,            ! Maximum characters in file
+
+        MAX_OBJECTS = 25,               ! Entry for each type of service
+        MAX_JOB_NUMBER = 513;           ! Entry for each job number possible
+
+! Data structure definitions
+
+FIELD OBJECT_FIELDS =                   ! One entry for each program to run
+      SET
+      FILE = [0,0,36,0],                                ! ASCIZ file to run
+      MIN_JOBS = [(MAX_FILE_SIZE/5),0,18,0],            ! Min jobs allowed
+      MAX_JOBS = [(MAX_FILE_SIZE/5),18,18,0],           ! Max jobs allowed
+      ACTUAL_JOBS = [(MAX_FILE_SIZE/5)+1,0,18,0],       ! Jobs in state RN+CI
+      WAITING_JOBS = [(MAX_FILE_SIZE/5)+1,18,18,0]      ! Jobs in state CI
+      TES;
+
+LITERAL OBJECT_SIZE = (MAX_FILE_SIZE/5)+2;              ! Words in object field
+
+FIELD JOB_FIELDS =                      ! One entry for each job I create
+      SET
+      JOB_STATE = [0,0,18,0],           ! Job's state
+      JOB_SERVICE = [0,18,18,0]         ! Service number
+      TES;
+
+! Module wide storage
+
+OWN jobs : BLOCKVECTOR [MAX_JOB_NUMBER, 1] FIELD (JOB_FIELDS),
+    objects : BLOCKVECTOR [MAX_OBJECTS, OBJECT_SIZE] FIELD (OBJECT_FIELDS),
+    pointer,                          ! Pointer to buffer
+    buffer : BLOCK [CH$ALLOCATION(MAX_STRING)], ! Buffer for writing
+    my_pid,                             ! My PID for IPCF messages from servers
+    last_object,                        ! Index of the last used objects entry
+    pdesc : VECTOR [9],                 ! The descriptor block for IPCF traffic
+    pdata : REF VECTOR[],               ! Address of IPCF data block
+    pdblock : BLOCK [2000];             ! Location of IPCF data block
+%SBTTL 'Routine NETJOB'
+
+ROUTINE NETJOB : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION
+!
+!       This is the top functional level of the NETJOB.  It does the following:
+!
+!       1) Open the log file on NETJOB-LOG: (if that logical exists).
+!       2) Read in the file containing all of the programs to run.
+!       3) Get a named pid for NETSERVER for IPCF communications.
+!       4) Start all detached not logged in jobs.
+!       5) Loop reading IPCF messages which are either status messages or
+!          logout messages.  If it is a logout message, recreate a job.
+!--
+
+BEGIN
+
+! Log our start up.  Try for an old NETJOB.LOG before trying a new one.
+
+LOG_IT(PP('NETJOB started'));           ! Write message to log file
+
+! Fill in the table of servers from SYSTEM:NETJOB.TXT
+
+read_control();
+
+! Establish my identity for IPCF
+
+INIT_IPCF();
+
+! Start all of the jobs
+
+INCR i FROM 1 TO .last_object           ! For each object
+DO BEGIN
+   objects[.i,ACTUAL_JOBS] = 0;         ! No actual jobs
+   objects[.i,WAITING_JOBS] = 0;        ! No waiting jobs
+   INCR j FROM 1 TO .objects[.i,MIN_JOBS]       ! For each minimum jobs
+   DO START_JOB(.i);                            ! Start all waiting jobs
+   END;
+
+! Sit and wait for notification of an event from a job:
+!
+!       1. Connect attempt failed
+!       2. Connect attempt succeeded
+!       3. Log message from slave job
+!       4. Job logged out
+
+WHILE TRUE                              ! Forever
+DO BEGIN                                ! Loop to read IPCF messages
+
+   ! Get an IPCF message.  We will block here at the MRECV most of the time.
+
+   pdesc[$IPCFL] = 0;
+   pdesc[$IPCFS] = 0;
+   pdesc[$IPCFR] = .my_pid;
+   pdesc[$IPCFP] = 512^18 + .pdata;
+   IF NOT MRECV(7, pdesc) THEN FATAL(0);
+
+   ! Handle the IPCF message and loop
+
+   HANDLE_IPCF();
+
+   END;                                 ! End of WHILE TRUE
+END;
+%SBTTL 'Routine Handle_IPCF'
+ROUTINE HANDLE_IPCF : NOVALUE =
+!++
+!
+! FUNCTIONAL DESCRIPTION
+!
+!       Handle IPCF message from slave job.  A log file entry is created.  If
+!       the job is accepting a connection, create another waiting job if
+!       needed.  If the job is logging out, decrement the number of active jobs
+!       if it was running.
+!
+!--
+BEGIN
+
+LOCAL index,                            ! Job index
+      job_number;                       ! Slave job number
+
+! Get job number that sent us this IPCF, and service that sent it to us
+
+job_number = .(pdata[1])<0,18,0>;       ! Second word is the job number
+IF .pdata[0] EQL -4                     ! Is it function -4?
+THEN index = .pdata[2]                          ! Yes, index is in word three
+ELSE index = .jobs[.job_number, JOB_SERVICE];   ! No load index from table
+
+! Start constructing a log file entry for this job
+
+pointer = CH$PTR(buffer);                            ! Point to log buffer
+MOVEAZ(PP('Job '), pointer);                         ! Start with job text
+IF NOT NOUT(.pointer, .job_number, 10; pointer)      ! Output job number
+THEN FATAL(0);                                       ! Punt if NOUT fails
+
+! Make sure that we know about this job.  If illegal, give a message.
+! Otherwise append program name to the log information
+        
+IF .index EQL 0                         ! Do we have a service index for this?
+THEN MOVEAZ(PP(' unknown to NETJOB '), pointer)  ! Nope
+ELSE BEGIN                              ! Job is known to us
+     MOVEAZ(PP(' running '), pointer);  ! Label the filename and output it
+     MOVEAZ(CH$PTR(objects[.index,FILE]), pointer);
+     END;
+
+! Process the message, the first data word will be one of:
+!
+!  $NETFAIL: Failure to login
+!        -2: Logged in OK
+!        -3: Error message
+!    $IPCLO: Job logged out
+! OTHERWISE: Illegal
+
+SELECTONE .pdata[0] OF               ! Select based on message type
+SET
+
+[$NETFAIL] : BEGIN                         ! Connect attempt failed
+
+             ! Log this failure, and wait for logout to happen.
+
+             MOVEAZ(PP(continuation, 'Failed connection by '), pointer);
+             IF .pdata[2]<29,7> EQL 0
+             THEN MOVEAZ(PP('<illegal username>'), pointer)
+             ELSE MOVEAZ(CH$PTR(pdata[2]), pointer);
+             LOG_IT(CH$PTR(buffer));
+             END;
+
+[$NETSUCC] : BEGIN                         ! Connect attempt succeeded
+
+             ! Log the successful login
+
+             MOVEAZ(PP(continuation, 'Successful connection by '), pointer);
+             MOVEAZ(CH$PTR(pdata[2]), pointer);
+             LOG_IT(CH$PTR(buffer));
+
+             ! Set job to running state and count down waiting jobs.  Start
+             ! another waiting job if the max number of jobs hasn't been 
+             ! reached
+
+             jobs[.job_number,JOB_STATE] = RN;
+             objects[.index,WAITING_JOBS] = .objects[.index,WAITING_JOBS] - 1;
+
+             IF .objects[.index,ACTUAL_JOBS] LSS .objects[.index,MAX_JOBS]
+             THEN START_JOB(.index);
+
+             END;
+
+[$NETMESS] : BEGIN                         ! Some other error there, just put
+             MOVEAZ(PP(' message', continuation), pointer);
+             MOVEAZ(CH$PTR(pdata[2]), pointer);
+             LOG_IT(CH$PTR(buffer));
+             END;
+
+[$NETCREATE] : BEGIN                            ! Job created
+       
+               MOVEAZ(PP(' created'), pointer); ! Output what happened
+               LOG_IT(CH$PTR(buffer));          ! Send to log file
+               jobs[.job_number,JOB_SERVICE] = .index;
+               jobs[.job_number,JOB_STATE] = CI;
+
+               END;
+
+[$IPCLO] : BEGIN                     ! Job ended
+           pointer = CH$PTR(buffer);
+           MOVEAZ(PP('Job '), pointer);
+           IF NOT NOUT(.pointer, .job_number, 10; pointer) 
+           THEN FATAL(0);
+           MOVEAZ(PP(' running '), pointer);
+           MOVEAZ(CH$PTR(objects[.index,FILE]), pointer);
+           MOVEAZ(PP(' logged out'), pointer);
+           LOG_IT(CH$PTR(buffer));
+              
+           ! Count down the number of actual jobs, and count down the number
+           ! of waiting jobs if the state was CI.  If the number of waiting
+           ! jobs is less then the minimum and the number of running jobs is
+           ! less then the minimum, then make another job.
+
+           objects[.index,ACTUAL_JOBS] = .objects[.index,ACTUAL_JOBS] - 1;
+
+           IF .jobs[.job_number,JOB_STATE] EQL CI 
+           THEN objects[.index,WAITING_JOBS] = 
+                                             .objects[.index,WAITING_JOBS] - 1;
+           jobs[.job_number,JOB_SERVICE] = 0;
+
+           IF .objects[.index,WAITING_JOBS] LSS .objects[.index,MIN_JOBS]
+              AND .objects[.index,ACTUAL_JOBS] LSS .objects[.index,MAX_JOBS]
+           THEN START_JOB(.index);
+
+           END;
+
+[OTHERWISE] : BEGIN                     ! Log this strange message
+              MOVEAZ(PP(continuation, 'illegal message type '), pointer);
+              IF NOT NOUT(.pointer, .pdata[0], 10; pointer) 
+              THEN FATAL(0);
+              LOG_IT(CH$PTR(buffer));
+              END;
+TES;                                    ! End of selectone set
+END;                                    ! HANDLE_IPCF
+%SBTTL 'Routine MOVEAZ'
+ROUTINE MOVEAZ (source, destination) : NOVALUE =
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION
+!
+!       This routine appends an ASCIZ string to the specified target.
+!       The destination string pointer is updated.
+!
+! FORMAL PARAMETERS
+!
+!       source: pointer to ASCIZ string source
+!       destination: pointer to ASCIZ string to be appended to
+!--
+
+LOCAL char,                             ! Character we are copying
+      spointer;                         ! Source pointer
+
+spointer = .source;                     ! Copy the source pointer down here
+
+! Loop through the string getting each character copied.  Don't do over 299.
+
+INCR i FROM 1 TO MAX_STRING
+DO BEGIN
+   char = CH$RCHAR_A(spointer);
+   IF .char EQL 0 THEN EXITLOOP;
+   CH$WCHAR_A(.char, .destination);
+   END;
+
+! Leave the destination byte pointer ready to append more characters but also
+! insure that the destination is an ASCIZ string.
+
+CH$WCHAR(0, ..destination);
+
+END;
+%SBTTL 'Routine Read_Control'
+ROUTINE read_control : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION
+!
+!       This routine fills in the program tables by reading SYSTEM:NETJOB.TXT
+!--
+
+BEGIN
+
+LOCAL eof,                              ! Flag for EOF
+      jfn,                              ! JFN of SYSTEM:NETJOB.TXT
+      exe_jfn;                          ! EXEC's JFN
+
+! Get a JFN for the file that tells us what to do
+
+IF NOT GTJFN(GJ_SHT+GJ_OLD, PP('SYSTEM:NETJOB.TXT'); jfn)
+THEN $FATAL('Failed to find SYSTEM:NETJOB.TXT');
+
+! Open the control file
+
+IF NOT OPENF(.jfn, OF_RD+7^30)          ! Read access, 7 bit bytes
+THEN $FATAL('Failed to open SYSTEM:NETJOB.TXT');
+
+! Read its entries until EOF seen
+
+eof = FALSE;                            ! Not (yet) at EOF
+
+INCR i FROM 1 TO MAX_OBJECTS-1          ! For each program possible
+DO BEGIN
+
+   ! Read a line of text from the file, exit if EOF
+
+   IF NOT SIN(.jfn, CH$PTR(buffer), MAX_FILE_SIZE-1, %O'12')
+   THEN BEGIN
+        eof = TRUE;
+        EXITLOOP;
+        END;
+
+   ! Get complete name of program to run, store it in a good place
+
+   pointer = CH$PTR(buffer);
+   IF NOT GTJFN(GJ_SHT+GJ_OLD, .pointer; exe_jfn, pointer)
+   THEN $FATAL('Cannot find file specified in SYSTEM:NETJOB.TXT');
+   IF NOT JFNS(CH$PTR(objects[.i,file]), .exe_jfn, %O'111100000001', 0)
+   THEN FATAL(0);
+   IF NOT RLJFN(.exe_jfn) THEN FATAL(0);
+
+   ! Minimum tasks ready to accept connections
+
+   IF NOT NIN(.pointer, 10; pointer, objects[.i, MIN_JOBS])
+   THEN $FATAL('Failed to read minimum number of jobs from NETJOB.TXT');
+
+   ! Maximum jobs started
+
+   IF NOT NIN(.pointer, 10; pointer, objects[.i, MAX_JOBS])
+   THEN $FATAL('Failed to read maximum number of jobs from NETJOB.TXT');
+
+   ! Remember the last one used for later
+
+   last_object = .i;
+
+   END;                                  ! End of INCR DO loop
+
+! Close the control file
+
+IF NOT CLOSF(.jfn)                      ! Try and close the file
+THEN $FATAL('Failed to close SYSTEM:NETJOB.TXT');       ! Oops
+
+! Was the table too small?
+
+IF NOT .eof                             ! Did we get to EOF?
+THEN $FATAL('SYSTEM:NETJOB.TXT is too large');  ! Nope, punt
+
+END;
+%SBTTL 'Routine START_JOB'
+ROUTINE START_JOB (index) : NOVALUE =
+!++
+!
+! FUNCTIONAL DESCRIPTION
+!
+!       Start up a job to receive connections for the specified object in the
+!       object table.  Logs this fact in the log file.
+!
+! FORMAL PARAMETERS
+!
+!       INDEX: Index into the object table.
+!
+!--
+
+BEGIN
+
+LOCAL pointer,
+      result,
+      argblk : VECTOR [12];
+
+BIND filename = objects[.INDEX,FILE];
+
+! Log this attempt
+
+
+! Initialize the argument block
+
+ARGBLK[0] = 0;                          ! User name string
+ARGBLK[1] = 0;                          ! Password string
+ARGBLK[2] = 0;                          ! Account number
+ARGBLK[3] = CH$PTR(objects[.INDEX,FILE]);       ! Program to run
+ARGBLK[4] = 0;                          ! Entry vec offset
+ARGBLK[5] = $NULIO;                     ! Controlling tty
+ARGBLK[6] = 0;                          ! Not used
+ARGBLK[7] = 0;                          ! AC block
+ARGBLK[8] = 0;                          ! EXEC flag bits
+ARGBLK[9] = 0;                          ! IO designators
+ARGBLK[10] = 0;                         ! Runtime limit
+ARGBLK[11] = 0;                         ! Capability mask
+ARGBLK[12] = .my_pid;                   ! PID for logout message
+
+! Start the job
+
+IF NOT CRJOB(CJ_SLO+CJ_CAP+CJ_FIL+CJ_ACS, argblk, 0; result) 
+THEN BEGIN
+     pointer = CH$PTR(buffer);                          ! Point to buffer
+     MOVEAZ(PP('Can''t create job for '), pointer);     ! Output label
+     MOVEAZ(CH$PTR(objects[.index,FILE]), pointer);     ! Output filename
+     LOG_IT(CH$PTR(buffer));                            ! Send to log file
+     IF .result NEQ CRJBX6
+     THEN $FATAL('Failed to start a new job');
+     RETURN;
+     END;
+
+! Send me an IPCF stating that I created a job here just now.  This needed
+! because we can have an IPCF in the queue for job deletion when when we create
+! a job with the same number - to avoid confusion, we just send an IPCF to
+! ourselves when this happens so we aren't confused.
+
+pdesc[$IPCFL] = 0;                      ! Zero flags
+pdesc[$IPCFS] = .my_pid;                ! Sender is me
+pdesc[$IPCFR] = .my_pid;                ! Reciever is me
+pdesc[$IPCFP] = 4^18 + .pdata;          ! Point to the data
+pdata[0] = $NETCREATE;                  ! NETJOB function code
+pdata[1] = .result;                     ! Job number 
+pdata[2] = .index;                      ! Service that is for this job
+
+IF NOT MSEND(4,pdesc) THEN $FATAL('Can''t send IPCF to self');
+
+! Increment the count of running jobs and jobs waiting for connects
+
+objects[.index,ACTUAL_JOBS] = .objects[.index,ACTUAL_JOBS] + 1;
+objects[.index,WAITING_JOBS] = .objects[.index,WAITING_JOBS] + 1;
+
+END;                                    ! START_JOB
+%SBTTL 'Routine LOG_IT'
+ROUTINE LOG_IT (p_pointer) : NOVALUE =
+!++
+!  FUNCTIONAL DESCRIPTION
+!
+!       Send a line of ASCIZ text to the log file
+!
+!  FORMAL PARAMETERS
+!
+!       p_pointer: Pointer to an asciz string
+!
+!--
+
+BEGIN
+
+LOCAL log_jfn,
+      lpointer,
+      lbuffer : VECTOR[CH$ALLOCATION(MAX_STRING)];
+
+! Open up the LOG file
+
+IF NOT GTJFN(GJ_SHT+GJ_OLD,             ! Try to open an old log file
+             PP('NETJOB-LOG:NETJOB.LOG');
+             log_jfn) 
+THEN IF NOT GTJFN(GJ_SHT+GJ_FOU,            ! Try to open a new log file
+              PP('NETJOB-LOG:NETJOB.LOG;P777700');
+              log_jfn) 
+     THEN RETURN;                       ! Return now if no LOG file available
+
+IF NOT OPENF(.log_jfn, OF_APP+7^30)     ! Open the LOG file
+THEN BEGIN                              ! We couldn't open the file
+     RLJFN(.log_jfn);                   ! Dump the JFN
+     RETURN;                            ! Just return now
+     END;
+
+! Now there is a log file.  Make a buffer full of data to send.
+
+lpointer = CH$PTR(lbuffer);             ! Point to the buffer please
+ODTIM(.lpointer, -1, 0; lpointer);      ! Output time to log file
+MOVEAZ(PP(' '), lpointer);              ! and a space
+MOVEAZ(.p_pointer, lpointer);           ! and the line to write
+MOVEAZ(CH$PTR(UPLIT(%CHAR(13,10,0))), lpointer);        ! and a CRLF
+
+! Have a buffer of data; append it to the log file.
+
+SOUT(.log_jfn, CH$PTR(lbuffer), 0);     ! Quickly send that to the log file
+
+! Close the log file for readers.
+
+CLOSF(.log_jfn);                        ! Close it to make it appear
+
+END;
+%SBTTL 'Routine FATAL'
+ROUTINE FATAL (message) : NOVALUE =
+!++
+!  FUNCTIONAL DESCRIPTION
+!
+!       Give a message when a fatal error occurs.  NETJOB then halts.
+!--
+
+BEGIN
+
+LOCAL lpointer,                         ! Pointer to string to log
+      pointer,                          ! Pointer to buffer to make string
+      lbuffer : VECTOR[CH$ALLOCATION(MAX_STRING)];      ! string buffer
+
+! Point to our error buffer
+
+pointer = CH$PTR(lbuffer);
+
+! First get the time and the error string output
+
+CH$WCHAR_A(%C'?', pointer);             ! Output question mark
+ODTIM(.pointer, -1, 0; pointer);        ! Output time
+CH$WCHAR_A(%C' ', pointer);             ! Output space
+lpointer = .pointer;                    ! Save pointer to current text
+
+! Copy the furnished message or zero to the string to print
+
+MOVEAZ(PP('Fatal NETJOB error: '), pointer);    ! Start the error
+IF .message NEQ 0                       ! Is there a message to print?
+THEN MOVEAZ(.message, pointer);         ! Output error text
+
+! Give the last error in this process
+
+MOVEAZ(PP(continuation, 'Last JSYS error: '), pointer);
+ERSTR(.pointer, $FHSLF ^ 18 + %O'777777',0);
+
+! Display message on terminal and in the LOG file
+
+PSOUT(CH$PTR(lbuffer));                 ! Output to terminal always
+LOG_IT(.lpointer);                      ! Log error (less time)
+
+! Exit and never allow continue
+
+WHILE TRUE DO HALTF();
+
+END;
+%SBTTL 'Routine INIT_IPCF'
+ROUTINE INIT_IPCF : NOVALUE =
+!++
+!  FUNCTIONAL DESCRIPTION
+!
+!       Get our PID, and assign us a name (NETSERVER)
+!--
+
+BEGIN
+
+LOCAL argblk : VECTOR[10];
+
+! Save the PDB address (Pick a page-aligned 512 words out of 2 pages)
+
+pdata = (((pdblock AND %O'777777')+777) ^ -9) * 512;
+
+! Get my PID
+
+argblk[0] = $MUCRE;
+argblk[1] = $FHSLF;
+argblk[2] = 0;
+IF NOT MUTIL(3,argblk) THEN $FATAL('Can''t get a PID for myself');
+my_pid = .argblk[2];
+
+! Give my PID a name
+
+pdesc[$IPCFL] = 0;
+pdesc[$IPCFS] = .MY_PID;
+pdesc[$IPCFR] = 0;
+pdesc[$IPCFP] = 4^18 + .pdata;
+pdata[0] = $IPCII;
+pdata[1] = 0;
+pdata[2] = %ASCII 'NETSE';
+pdata[3] = %ASCIZ 'RVER';
+
+IF NOT MSEND(4,pdesc) THEN $FATAL('Can''t get named NETSERVER PID');
+
+! Get response from INFO
+
+pdesc[$IPCFL] = 0;
+pdesc[$IPCFS] = 0;
+pdesc[$IPCFR] = .my_pid;
+pdesc[$IPCFP] = 512^18 + .pdata;
+IF NOT MRECV(7,pdesc) THEN FATAL(0);
+
+END;
+
+END
+ELUDOM
+   

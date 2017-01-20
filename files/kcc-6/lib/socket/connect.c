@@ -1,0 +1,76 @@
+/* 
+ * connect.c - connect(2) initiate a connection on a socket
+ *
+ * Bill Palmer / Cisco Systems / May 1988
+ * Ian Macky / cisco Systems / September 1990
+ */
+
+#include <c-env.h>
+#include <errno.h>
+#include <stdio.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/file.h>
+#include <sys/usydat.h>
+#include <netinet/in.h>
+#include <jsys.h>
+
+static int con_jfn();
+
+int connect(fd, name, namelen)
+int fd;
+struct sockaddr *name;
+int namelen;
+{
+    extern int _openuf();
+    char namebuf[128];
+    struct sockaddr_in *sin;
+    struct _ufile *uf;
+    int jfn;
+
+#if DEBUG
+    printf("connect(fd=%d, name=0%o, namelen=%d)\n", fd, name, namelen);
+#endif
+    sin = (struct sockaddr_in *) name;
+    sprintf(namebuf,"TCP:.%lo-%d;PERSIST:60;CONNECTION:ACTIVE",
+	    (long) sin->sin_addr.S_un.S_addr, sin->sin_port);
+#ifdef DEBUG
+    printf("connect(%d): sin = 0%o, S_addr = 0%lo, sin_port = %d\n",
+	fd, sin, sin->sin_addr.S_un.S_addr, sin->sin_port);
+    printf("namebuf = |%s|\n", namebuf);
+#endif
+    if (!(uf = USYS_VAR_REF(uffd[fd]))) {
+	errno = ENOTCONN;		/* err... */
+	return -1;
+    }
+    if ((jfn = con_jfn(namebuf)) < 0) {
+	errno = EADDRNOTAVAIL;		/* well.. */
+	return -1;
+    }
+    uf->uf_ch = jfn;
+    _openuf(uf, O_RDWR | O_BINARY | O_BSIZE_8);
+#if DEBUG
+    printf("connect(%d) --> %d\n", fd, jfn);
+#endif
+    return 0;
+}
+
+/*
+ |	Open a connection, return the JFN
+ */
+
+static int con_jfn(hostname)
+char *hostname;
+{
+    int jarg[5], jfn;
+
+    jarg[1] = GJ_SHT | GJ_NEW;
+    jarg[2] = (int) (hostname - 1);
+    if (!jsys(GTJFN, jarg))
+	return -1;
+    jfn = jarg[1];
+    jarg[2] = 8<<30 | OF_RD | OF_WR;	/* 8 bit bytes, read/write */
+    if (!jsys(OPENF, jarg))
+	return -1;
+    return jfn;
+}

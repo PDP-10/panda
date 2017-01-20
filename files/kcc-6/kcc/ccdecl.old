@@ -1,0 +1,3313 @@
+/*	CCDECL.C - Declaration Parser
+**
+**	(c) Copyright Ken Harrenstien 1989
+**		All changes after v.371, 28-May-1988
+**	(c) Copyright Ken Harrenstien, SRI International 1985, 1986
+**		All changes after v.154, 8-Aug-1985
+**
+**	Original version (C) 1981  K. Chen
+*/
+
+#include "cc.h"
+
+struct protostate {		/* State block for prototype parse */
+	int nparams;
+	SYMBOL *shead, *stail;	/* Parameter symbol list */
+	SYMBOL decl;
+};
+
+/* Local prototypes */
+#ifdef __STDC__
+#define P_(a) a
+#else
+#define P_(a) ()
+#endif
+
+static NODE *funcdef P_((SYMBOL *b,SYMBOL *d,SYMBOL *syment));
+static int nsetjmps P_((void));
+static void plcmpare P_((TYPE *t1,TYPE *t2,int flag));
+static void plcmpold P_((SYMBOL *s,TYPE *nt,TYPE *ot));
+static void plcheck P_((TYPE *t));
+static void prttok P_((int i));
+static void prtindent P_((int in));
+static void prtsimple P_((TYPE *t,int *needwsp));
+static void prtlpaf P_((TYPE *t,int *needwsp));
+static void prtrpaf P_((SYMBOL *sp,TYPE *t,TYPE *tp,int in));
+static void prtspec P_((SYMBOL *s,SYMBOL *sp,TYPE *t,TYPE *tp,int in));
+static void prtdump P_((SYMBOL *s,SYMBOL *sp));
+static void pdecllist P_((void));
+static TYPE *mkproto P_((SYMBOL *s));
+static TYPE *mkprox P_((SYMBOL *s));
+static NODE *datadef P_((SYMBOL *base,SYMBOL *s,SYMBOL *syment));
+static void decllist P_((SYMBOL *base,SYMBOL *defbase,SYMBOL *d,SYMBOL *s,NODE **root,NODE **tail));
+static int isdecl P_((void));
+static TYPE *qarray P_((TYPE *t,int qflags,int *oflagp));
+static int pbase P_((SYMBOL *symp));
+static TYPE *tagspec P_((int typ));
+static void sdeclenum P_((SYMBOL *tag));
+static int sdeclstruct P_((SYMBOL *tag,int typ));
+static SYMBOL *sdeclaration P_((SYMBOL *tag,SYMBOL *prevsmem,int *offset,int *boffset));
+static int fldsize P_((SYMBOL *d, int bsiz,int *offset,int *boffset));
+static SYMBOL *declarator P_((SYMBOL *d));
+static TYPE *fundecl P_((SYMBOL *d,int dflag));
+static void pidentlist P_((struct protostate *ps));
+static TYPE *paramlist P_((struct protostate *ps));
+static TYPE *addpp P_((TYPE *pp,TYPE *t));
+static TYPE *pushsztype P_((int typ,int flags,int siz,TYPE *ptr));
+static NODE *dodecl P_((int baseclass,SYMBOL *d,SYMBOL *s));
+static NODE *pizer P_((SYMBOL *s));
+static NODE *piztype P_((TYPE *t,int lev));
+static NODE *chkarith P_((TYPE *t,NODE *e,int lev,int noptyp));
+static NODE *pizstruct P_((TYPE *t,int lev,int isunion));
+static NODE *pizarray P_((TYPE *t,int lev));
+static NODE *pexizer P_((int lev));
+static NODE *pizlist P_((void));
+static void pizflush P_((int typ));
+static int nisconst P_((NODE *e));
+#if 0
+static NODE *chkptrcon P_((NODE *e));
+#endif
+static int isauto P_((SYMBOL *s));
+static void errtwotyp P_((SYMBOL *d,SYMBOL *s));
+static void errdupsym P_((SYMBOL *s));
+
+#undef P_
+
+/* Internal data */
+
+static int paramok;	/* True if OK to parse parameter list for a function
+			** definition.  Only true when at top
+			** level and parsing the first declarator.
+			*/
+static int inproto;	/* True when parsing a function prototype list.
+			** This is bumped to indicate level.
+			*/
+
+static NODE *statdecls,	/* Pointer to list of static decls within current fn */
+	*stattail;	/* Pointer to tail of statdecls list */
+static int nsdefs;	/* # of enum/struct/union side effect definitions seen.
+			** The exact number doesn't matter; this is only used
+			** to tell when a type-specifier has had the side
+			** effect of defining a tag or enum constant.
+			*/
+static int itags;	/* # of internal tags defined.  This is used only
+			** to create unique names for internal tags. 
+			*/
+static int tntcnt;	/* # of tentative defs output.  Only used to initialize
+			** tntdef(), by setting to -1.
+			*/
+/* Flags returned from pbase(). */
+/* These aren't really used yet, maybe should be flushed. */
+#define BASEF_SC 01	/* Storage class parsed */
+#define BASEF_TS 02	/* Type-specifier parsed */
+#define BASEF_TAG 04	/* enum/struct/union tag was defined as side effect */
+
+/* Also not really used yet */
+typedef struct {
+	int Dflags;
+	SYMBOL *Dpnext, *Dpsblk;
+	SYMBOL s;
+} declsym;
+#define DSname s.Sname
+#define DSvalue s.Svalue
+#define DSclass s.Sclass
+#define DStype s.Stype
+
+/* INITPAR - Initialize parser
+**	Called once for each file compiled.
+*/
+void
+initpar()
+{
+    nodeinit();			/* No parse-tree nodes used */
+    curfn = NULL;		/* Not in any function yet */
+    itags = 0;			/* Reset internal tag count for gensyms */
+    nsdefs = 0;			/* Reset side-effect def count for neatness */
+    tntcnt = -1;		/* Reset tntdef() */
+}
+
+#if 0	/* No longer supported */
+/* ENTDEFS - Process "entry" statements at start of file
+**	This is a hack routine in several respects, and should vanish
+** someday after all library routines have been fixed to remove their
+** existing "entry" statements.  The hacks, among other things, are that:
+** (1) the char flag table is munged to allow otherwise invalid ident chars.
+** (2) this does both parsing and generation and does not return a NODE *.
+** (3) output to the assembler file is performed here (should not happen
+**	until the code generation phase).  This is necessary to ensure that
+**	the assembler ENTRY statements precede all other code.
+*/
+
+#include "ccchar.h"		/* To access setcsym and clrcsym */
+void
+entdefs()
+{
+    SYMBOL *s;
+
+    /* Verify it's ok to do this stuff at all */
+    if (!clevkcc) return;	/* Return if not using KCC extensions. */
+
+    /* Check out first token to see if it's an entry statement. */
+    if (token != Q_IDENT || strcmp(csymbol->Sname, "entry"))
+	return;			/* 1st token not "entry", can just return. */
+
+    /* Process possible ENTRY statement */
+    setcsym('$');		/* Allow $ and % as identifier chars */
+    setcsym('%');		/* (note '_' becomes '.', so needs no hack) */
+    s = csymbol;		/* Save symbol */
+    if(nextoken() != Q_IDENT) {	/* must be followed by ident */
+	tokpush (Q_IDENT, s);	/* Nope, put "entry" back on stack */
+	clrcsym('$');		/* No longer allow $ or % as ident chars */
+	clrcsym('%');
+	return;			/* And return */
+    }
+    freesym(s);		/* OK, can flush "entry" identifier sym */
+
+    /* Process an ENTRY statement with at least one valid identifier arg */
+    while (1) {
+	outstr("\tENTRY\t");		/* make ENTRY statement */
+	outid(csymbol->Sname);		/* before we call expect() */
+	outnl();			/* so #asm in middle won't screw us */
+	expect(Q_IDENT);		/* it better have been a sym */
+	if (token != T_COMMA) break;	/* repeat while we have more */
+	nextoken();			/* skip COMMA */
+    }
+    clrcsym('$');		/* No longer allow $ or % as ident chars */
+    clrcsym('%');
+    expect(T_SCOLON);	/* Must end with ';', flush til get one */
+			/* Note error recovery will not gobble improper
+			** identifiers due to above clrcsym calls.
+			*/
+    /* Now invoke self again, until no more entry stmts.
+    ** Tail recursion makes this efficient, though it hardly matters.
+    */
+    entdefs();
+}
+#endif /* commented out */
+
+/* EXTDEF() - Parse top-level declaration or definition
+**	[dpANS 3.7, 3.5]
+**
+**	<external-decl> ::= <function-definition> | <decl>
+**
+**	<function-definition> ::=
+**			{decl-specs} <declor> {decl-list} <compound-stmt>
+**
+**	<decl> ::=	<decl-specs> {init-decl-list} ';'
+**
+**	<init-decl-list> ::= <init-declor> {',' init-decl-list}
+**	<init-declor>	::= <declor> {'=' izer}
+**
+** This is the main entry to input parser.  Current token is the
+** first one of the <external-decl>.  Since both possibilities (function
+** def or a decl) can start with <decl-specs>, we parse for that first.
+** If there was nothing but <decl-specs>, we can just return.  Otherwise
+** the initially parsed "base" needs to be passed on for further parsing.
+*/
+
+NODE *
+extdef()
+{
+    SYMBOL *s, tempsym, base;
+
+    /* Do top level initializations */
+    paramok = 1;		/* OK to parse a function parameter list */
+    inproto = 0;		/* Not in prototype scope */
+    curfnnew = fline;		/* Remember line in file where funct started */
+
+    pbase(&base);		/* Parse base (storage class & type) */
+    if (token == T_SCOLON) {	/* Only got a type (struct)? */
+	if ((base.Sflags&SF_SIDEFF) == 0)	/* If no side effs, */
+	    warn("Null declaration");		/* warn user */
+	switch (base.Sclass) {
+	case SC_UNDEF:	break;			/* None given */
+	case SC_AUTO:
+	case SC_RAUTO:	error("Illegal storage class");	break;
+	default:	note("Useless storage class");	break;
+	}
+	nextoken();		/* Skip over the semicolon */
+	return NULL;		/* and stop doing this def */
+    }
+
+    /* Parsed <decl-specs>, now look for <declor> to determine whether
+    ** we're doing a function def or not.
+    */
+    copysym(&tempsym, &base);		/* Copy base storage class & type */
+    if (tempsym.Sclass == SC_UNDEF)	/* Set up for defaults */
+	tempsym.Sclass = SC_EXLINK;	/* Default stg class: extern */
+    if (tempsym.Stype == NULL)
+	tempsym.Stype = deftype;	/* Default type: int */
+    while (!(s = declarator(&tempsym))) {	/* Until we find declarator */
+	/* No declarator found, may want to loop. */
+	warn("Null declarator");
+	if (tempsym.Spmnext)		/* Flush param syms if any (in case) */
+	    ridlsym((SYMBOL *)NULL);
+	if (token == T_COMMA) {		/* Only continue if hit comma */
+	    nextoken();			/* in which case skip over it */
+	    continue;			/* and try again */
+	}
+	if (token != T_SCOLON)		/* Else give up on it */
+	    error("Bad syntax for top-level declaration");
+	errflush();			/* Flush to probable end of stmt */
+	return NULL;
+    }
+
+    paramok = 0;		/* No longer OK to parse function param list */
+
+    /* If function type, need to examine more closely to see whether this
+    ** is a definition or just a forward-reference declaration.
+    ** It is a definition only if the current token is one of:
+    **		Left brace (start of function body)
+    **		A type-specifier keyword (a function parameter declaration).
+    **		The "register" keyword (only permissible storage class for
+    **			function parameter declarations).
+    ** We permit any storage class here, for better error diagnostics later.
+    */
+    if (tempsym.Stype->Tspec == TS_FUNCT) {
+	if (token == T_LBRACE || isdecl())
+	    return funcdef(&base, &tempsym, s);  /* Parse funct def */
+    }
+
+    /* Not a function definition, so is either a function reference, or a
+    ** data definition/reference.
+    */
+    return datadef(&base, &tempsym, s);	/* data def/ref or function ref */
+}
+
+/* TNTDEF - Return next remaining tentative definition, if any.
+**	This is only invoked by the CC mainline after all input parsing
+**	is completed for a file.  It scans for all tentative definitions
+**	with internal or external linkage, and for each one returns a
+**	node that defines it with a zero initializer.
+*/
+NODE *
+tntdef()
+{
+    static SYMBOL *s;
+
+    if (++tntcnt == 0)		/* If first time, */
+	s = symbol;		/* start scanning global sym list */
+    while (s = s->Snext) {
+	switch (s->Sclass) {
+	default: continue;
+	case SC_INTREF:		/* Should only exist for functions */
+	    if (s->Srefs)
+		error("Static function %S not defined", s);
+	    else note("Static function %S not defined or used", s);
+	    continue;
+	case SC_INTDEF:		/* May be function or object */
+	    if (s->Srefs == 0)
+		note("Static %s %S never used",
+			(s->Stype->Tspec != TS_FUNCT ? "object" : "function"),
+			s);
+	    continue;
+	case SC_INLINK:
+	    s->Sclass = SC_INTDEF;
+	    if (s->Srefs)	/* Ensure internal object was used */
+		break;		/* Yup, go define it */
+	    note("Static object %S never used, not emitted", s);
+	    continue;
+	case SC_EXLINK:
+	    s->Sclass = SC_EXTDEF;	/* Always do it if external linkage */
+	    break;
+	}
+	/* Set up a Q_IDENT and a null izer definition for it */
+	return ndefl(N_DATA, ndefl(N_IZ, ndefident(s)));
+    }
+    return NULL;
+}
+
+/* FUNCDEF() - Parse function definition
+**	[dpANS 3.7.1]
+**	<function-definition> ::=
+**			{decl-specs} <declor> {decl-list} <compound-stmt>
+**
+** Only called from extdef() when a function declaration turns out
+** to be the start of a definition.  At this point, the current token
+** is the first one past the <declor>.
+**
+** The first two pointer args always point to temporary symbol
+** structures not in the symbol table.  However, the parameter list
+** symbols ARE in the table, chained as local symbols.
+*/
+
+static NODE *
+funcdef(b, d, syment)
+SYMBOL	*b,		/* Base, contains parsed <decl-specs> */
+	*d,		/* Defaulted <decl-specs> plus <declor> type */
+	*syment;	/* Identifier's symtab entry */
+{
+    int n, siz, nsjmps;
+    NODE *nnode, *header;
+    SYMBOL *s1;
+    SYMBOL *args = d->Spmnext;	/* List of parameter syms */
+    int npartypes = d->Svalue;	/* # of params if new-style proto */
+    int nparidents = 0;
+
+    /* "syment" points to the function name's symtab entry.
+    ** Lexer will have created the symtab entry with
+    ** class SC_UNDEF if it didn't already exist.
+    */
+    if (!args)			/* If no arglist, need to open local sym blk */
+	(void) beglsym();	/* (needn't remember start) */
+
+    curfnloc = curfnnew;
+    curfn = syment;		/* Remember context for error messages */
+    curfn = syment = funchk(1, b->Sclass, d, syment); /* Do funct decl */
+				/* which may update symbol and may also */
+				/* do old-style <decl-list> parse! */
+
+    /* Now that types are set, add up sizes and determine offsets for
+    ** each parameter.  Also, for new-style function prototype defs, make
+    ** sure that every parameter had an identifier associated with it.
+    ** We do this by comparing the # of identifiers on the paramlist with
+    ** the # of parameters that paramlist() actually parsed while building
+    ** the prototype.
+    */
+    n = 0;				/* set up for first arg */
+    siz = sizetype(syment->Stype->Tsubt);	/* get size of return val */
+    if (siz > 2)			/* If returning too-large object, */
+	n = 1;				/* just use struct-return pointer */
+    while (args != NULL) {
+	nparidents++;			/* Count # of param idents */
+	s1 = args;			/* get arg symbol */
+	args = args->Spmnext;		/* Move on before zapping it! */
+	n += sizetype(s1->Stype);	/* count off by size */
+	s1->Svalue = n;			/* set offset */
+    }
+    if (npartypes && (npartypes-1 != nparidents))
+	error("Missing identifier for parameter in function def");
+
+    maxauto = 0;			/* no local variables yet */
+    stackrefs = 0;			/* and therefore no refs to them */
+    nsjmps = nsetjmps();		/* Remember # of setjmp refs */
+    statdecls = stattail = NULL;	/* No static declarations yet */
+
+    /* The big call.  Parse function statement, having already set up a
+    ** local symbol block with the parameters in it.  On return, this
+    ** block will have been ended, and the current token will be the
+    ** T_RBRACE ('}') terminating the function body.  See CCSTMT's
+    ** compound() for further discussion.
+    */
+    nnode = funstmt();			/* Parse function statement */
+
+    nextoken();		/* Now safe to flush the right brace
+			** and set up new current token.
+			** See CCSTMT's compound() for discussion of this.
+			*/
+    stkgoto = (nsjmps != nsetjmps());	/* Say whether any setjmps in funct */
+    header = ndefop(N_NODE);		/* Put together the function header */
+    header->Nright = statdecls;		/* Point to any static decls found */
+    header->Nleft = ndefident(syment);	/* Point to Q_IDENT function name */
+
+    /* Return completed parse tree */
+    return ndeflr(N_FUNCTION, header, nnode);
+}
+
+/* NSETJMPS - Auxiliary to find current # of references to the "setjmp"
+**	function.  Any functions which contain calls to setjmp have to
+**	avoid using tail recursion.
+*/
+static int
+nsetjmps()
+{
+    SYMBOL *s;
+    if (s = symfidstr("setjmp")) {
+	--(s->Srefs);			/* Not a real reference */
+	switch (s->Sclass) {
+	case SC_EXTREF: case SC_XEXTREF: case SC_EXTDEF:
+	    if (s->Stype->Tspec == TS_FUNCT)
+		return s->Srefs;
+	}
+    }
+    return 0;
+}
+
+/* FUNCHK - Check out a function definition or reference for
+**	proper use of storage class and type specifier.
+** Called from funcdef() for a definition and dodecl() for a reference.
+** Also called from CCSTMT's primary() to handle the pretend-declaration
+** done for a call to an undeclared function.
+**
+** The parsed declarator symbol struct will have the following special
+** members set (by fundecl()) if called from funcdef():
+**	Svalue - 0 if an old-style function identlist, N+1 if new-style proto,
+**		where N is the # of real parameters in the prototype.
+**	Spmnext - if non-NULL, points to a list of parameter identifiers
+**		and there is still a local symbol block active for the
+**		prototype scope.  This block needs to be closed and the
+**		symbols flushed if this was only a reference.
+**	Spmhead - what beglsym() returned for the prototype scope block.
+** These syms should be NULL if called from dodecl(), which flushes the
+** prototype scope block itself.
+**
+** May parse the function's <decl-list> if doing an old-style definition.
+** Returns with the symbol table entry completely set up, and returns
+** pointer to the symbol since it may have changed.
+*/
+SYMBOL *
+funchk(def, baseclass, d, s)
+int def;	/* True if a definition */
+int baseclass;	/* Parsed base storage class */
+SYMBOL	*d,	/* Parsed declarator (Sclass and Stype) */
+	*s;	/* Symtab entry for parsed identifier */
+{
+    int oproto = 0;
+    
+    /* Check out storage class.
+    ** Parsing should have resulted in only one of the following three
+    ** things: SC_UNDEF (none), SC_EXTREF (extern), SC_INTREF (static).
+    ** For existing function def/refs, there are 5
+    ** possible symbol classes:
+    ** SC_EXTREF, SC_EXTDEF, SC_INTREF, SC_INTDEF, plus special case of
+    ** normally invisible SC_XEXTREF.
+    */
+    s = symfxext(s);		/* Make SC_XEXTREF visible if any */
+
+    switch (baseclass) {	/* Not all storage classes are allowed */
+    default:
+	error("Illegal storage class for function, assuming \"extern\"");
+	return funchk(def, SC_EXTREF, d, s);	/* Just call again */
+
+    case SC_INTREF:		/* Explicit "static" */
+	/* dpANS: identifier always has internal linkage.
+	** Note this must not appear within block scope!
+	*/
+	if (!lsymhead || def) {
+	    /* At file-scope level, so "s" will be global */
+	    d->Sclass = (def ? SC_INTDEF : SC_INTREF);
+	    if (s->Sclass == SC_UNDEF		/* No old sym */
+	      || s->Sclass == SC_INTREF		/* Or not defined */
+	      || s->Sclass == SC_INTDEF)	/* Or defd, reffing */
+		break;				/* Linkage matches OK */
+	    if (s->Sclass != SC_EXTREF && s->Sclass != SC_EXTDEF
+	      && s->Sclass != SC_XEXTREF) {
+		error("Storage class conflict for \"%s\"", s->Sname);
+
+		break;			/* Keep internal linkage */
+	    }
+	    warn("Linkage conflict for %S, is external", s);
+	    /* Else fall thru as if SC_EXTREF */
+	} else if (!def)
+	    warn("Storage class for function decl in block must be \"extern\"");
+	/* Drop thru to assume extern and carry on */
+
+    case SC_UNDEF:		/* dpANS: default same as explicit "extern" */
+    case SC_EXTREF:		/* Explicit "extern" */
+	/* dpANS: linkage is same as any visible decl of this identifier
+	** with file scope (ie global).  If none, linkage is external.
+	** If there is already an expired external reference (SC_XEXTREF)
+	** then we use that in order to emit advisory warnings if the type
+	** isn't the same.
+	*/
+	/* If doing a reference in block scope and function ident already
+	** belongs to a block-scope symbol, we:
+	** (1) see if a file-scope symbol exists (if so, use that one)
+	** (2) see if existing sym is external ref (if so, use that)
+	**	(this includes SC_XEXTREF)
+	** (3) generate new file-scope symbol with SC_EXTREF.
+	*/
+	if (!def && (s->Sflags&SF_LOCAL)) {
+	    SYMBOL *ns;
+	    if (ns = findgsym(s))	/* If file-scope def/ref exists, */
+		s = ns;			/* use that! */
+	    else if (s->Sclass == SC_EXTREF)
+			;		/* OK if a block-scope extern ref */
+	    else {
+		if (isdupsym(s))	/* If was defined in this block, */
+		    errdupsym(s);	/* barf! */
+		s = uniqsym(s);		/* Create/re-use sym, now SC_UNDEF */
+	    }
+	}
+	/* "s" now points to the sym linked to.  If it has any linkage, we
+	** copy that, otherwise we use external linkage.
+	*/
+	switch (s->Sclass) {
+	case SC_INTDEF:
+	case SC_INTREF:
+	    d->Sclass = (def ? SC_INTDEF : SC_INTREF);
+	    break;
+
+	default:
+	    errdupsym(s);
+	    s->Sclass = SC_UNDEF;		/* Sigh!  Smash it. */
+	    /* Fall thru to handle as if extern */
+
+	case SC_XEXTREF:
+	case SC_EXTDEF:
+	case SC_EXTREF:
+	case SC_UNDEF:
+	    d->Sclass = (def ? SC_EXTDEF : SC_EXTREF);
+	    break;
+	}
+	break;
+    }
+
+    /* Check for duplicate function def */
+    if (def && (s->Sclass == SC_EXTDEF || s->Sclass == SC_INTDEF)) {
+	error("Duplicate function definition");
+	s->Sclass = SC_UNDEF;	/* Wipe out previous definition! */
+    }
+
+    /* Handle simple case where sym hasn't yet been defined. */
+    if (s->Sclass == SC_UNDEF) {	/* Symbol not defined yet? */
+	if (!def) s = uniqsym(s);	/* No, ensure local if needed */
+	s->Sclass = d->Sclass;		/* Copy the parsed class */
+	s->Stype = d->Stype;		/* and the type specification */
+	s->Srefs = 0;			/* and reset usage cnt in case a ref */
+	if (s->Sclass == SC_INTDEF || s->Sclass == SC_INTREF)
+	    mapintsym(s);		/* Set Smaplab (internal unique) */
+	else if (!mapextsym(s))		/* Else check external map */
+	    error("External link name duplicated: %S", s);
+	if (def && !s->Stype->Tproto) {	/* If an old-style definition, */
+	    pdecllist();		/* parse parameter declarations! */
+	    s->Shproto = mkproto(d->Spmnext); /* Build invisible prototype */
+	} else s->Shproto = NULL;	/* Say no hidden prototype */ 
+	if (def) prtdump(s, d->Spmnext); /* If def, check for proto output */
+	return s;			/* All done! */
+    }
+
+    /* There is an existing symbol for this identifier, with a matching
+    ** storage class.  Must now do lots of hairy type checking.
+    ** First we see if old sym is a function returning a
+    ** compatible type, then maybe check parameter list compatibility.
+    **
+    ** If both are old-style, no param checking needed.
+    ** If both are new-style, check their param lists.
+    ** If one sym is old-style ref and other is new-style ref/def,
+    **   just do simple check of the proto list.
+    ** If one sym is old-style DEF, then:
+    **		If this is more recent sym, parse decl-list into prototype
+    **		and then compare param lists as if both were new-style.
+    **		Else is previous sym -- compare with "hidden" prototype
+    **		that was generated during the old-style function def.
+    */
+
+    /* First make sure that basic type is also "function returning ..."
+    ** and that return types are compatible.
+    */
+    if (s->Stype->Tspec != TS_FUNCT
+      || !cmptype(d->Stype->Tsubt, s->Stype->Tsubt)) {
+	/* Earlier ref/def conflicts with current one, smash to current. */
+	errtwotyp(d, s);		/* Complain */
+	s->Stype = d->Stype;		/* Skip prototype testing */
+    }
+
+    /* If doing an old-style definition, OK to parse decl-list now.
+    ** The main reason for not doing this earlier is so error messages
+    ** from the previous checks will show the most helpful context,
+    ** i.e. errors are announced as soon as it is possible to detect them.
+    */
+    if (def && !d->Stype->Tproto) {		/* If no proto was declared, */
+	pdecllist();				/* parse old-style decl-list */
+	s->Shproto = mkproto(d->Spmnext);	/* Build invisible prototype */
+    }
+
+    /* Now see if the parameter lists need to be checked.
+    ** Test for both old-style, or both with identical prototypes.
+    */
+    if (d->Stype->Tproto != s->Stype->Tproto) {
+	TYPE *tc;
+	if (d->Stype->Tproto && s->Stype->Tproto) {	/* Compare 2 protos? */
+	    tc = tcomposite(d->Stype, s->Stype);	/* Get composite */
+	    if (tc) d->Stype = tc;			/* If won, use it! */
+	    else plcmpare(d->Stype->Tproto, s->Stype->Tproto, 0); /* Give err */
+	} else if (d->Stype->Tproto) {
+	    /* Compare existing non-proto ref/def with new prototype */
+	    if (s->Sclass == SC_EXTDEF || s->Sclass == SC_INTDEF) {
+		/* Old-style DEF followed by new-style REF, use hidden proto */
+		if (!tcomposite(d->Stype, s->Stype))	/* If not compatible */
+		    plcmpare(d->Stype->Tproto, s->Shproto, 1);	/* Give err */
+		/* Don't use composite type, just the new prototype, so
+		** leave d->Stype alone.
+		*/
+	    } else /* Old-style REF followed by new-style proto */
+		plcheck(d->Stype->Tproto);		/* Check new proto */
+	} else {
+	    /* Compare existing proto with new non-proto ref/def */
+	    if (def) {
+		/* New-style REF followed by old-style DEF, compare params */
+		plcmpold(d->Spmnext, s->Shproto, s->Stype->Tproto);
+	    } else /* New-style ref/def followed by old-style REF */
+		plcheck(s->Stype->Tproto);	/* Check previous proto */
+	    d->Stype = s->Stype;		/* Ensure proto retained */
+	}
+    }
+
+    /* Force the symbol table entry to match current declaration.
+    ** Note that Srefs was incremented by the symbol lookup, hence needs
+    ** to be set back if this was only a ref-type declaration.
+    ** Also, if the existing symbol was a definition, don't change its
+    ** class.
+    */
+    oproto = s->Stype->Tproto != 0; /* Remember if any previous proto */
+    s->Stype = d->Stype;	/* Force the type specification */
+    if (!def)			/* If this decl was just a ref, */
+	--(s->Srefs);		/* then usage count to undo lookup bump */
+    if (s->Sclass != SC_EXTDEF && s->Sclass != SC_INTDEF)
+	s->Sclass = d->Sclass;	/* Force the storage class */
+    if (def && !oproto) prtdump(s, d->Spmnext);
+				/* If def and no old proto, check for output */
+    return s;
+}
+
+/* PLCMPARE - Compare two prototype parameter lists.
+*/
+static void
+plcmpare(t1, t2, flag)
+TYPE *t1, *t2;
+int flag;			/* 0 if both protos, 1 if t2 is fake proto */
+{
+    int n, found = 0;
+    if (t1 == t2) return;
+
+    /* If pointers don't match, prototypes aren't compatible.  Examine
+    ** more closely so can give helpful error message (or barf at ourselves
+    ** if necessary)
+    */
+    if (t1 && t1->Tspec != TS_PARVOID && t2 && t2->Tspec != TS_PARVOID)
+	for (n = 1; t1 && t2; t1 = t1->Tproto, t2 = t2->Tproto, ++n)
+	    if (t1->Tspec != t2->Tspec
+	      || (t1->Tspec == TS_PARAM && !cmputype(t1->Tsubt, t2->Tsubt))) {
+		if (flag) warn("Type of param #%d (%T) conflicts with prior def (%T)",
+			       n, ParamSubt(t1), ParamSubt(t2));
+		else error("Type of param #%d (%T) conflicts with prior def (%T)",
+			   n, ParamSubt(t1), ParamSubt(t2));
+		found++;
+	    }
+    if (t1 != t2) {
+      if (flag) warn("Number of params conflicts with prior def");
+      else error("Number of params conflicts with prior prototype");
+    }
+    else if (!found)
+      int_warn("plcmpare: proto mismatch not found");
+}
+
+/* PLCMPOLD - Compare old-style parameter sym types against a
+**	prototype parameter list.
+*/
+static void
+plcmpold(s, nt, ot)
+SYMBOL *s;
+TYPE *nt, *ot;
+{
+    int found = 0;
+
+    if (nt == ot) return;
+
+    /* Prototypes don't match, try to give clever error msg */
+    for (; s && nt && ot; s = s->Spmnext, nt = nt->Tproto, ot = ot->Tproto)
+	if (!nt || !ot || nt->Tspec != ot->Tspec || nt->Tsubt != ot->Tsubt) {
+	    warn("Type of parameter \"%s\" (%T) conflicts with prior prototype (%T)",
+		 s->Sname, ParamSubt(nt), ParamSubt(ot));
+	    found++;
+	}
+    if (s || nt || ot)
+      warn("Number of params conflicts with prior prototype");
+    else if (!found)
+      int_warn("plcmpold: proto mismatch not found");
+}
+
+/* PLCHECK - Check a prototype parameter list to ensure that all types
+**	are compatible with default argument promotions.  Note that use
+**	of an ellipsis param (TS_PARINF) is illegal in this context.
+*/
+static void
+plcheck(t)
+TYPE *t;
+{
+    int n;
+
+    if (t->Tspec == TS_PARVOID) {
+	if (t->Tproto)
+	    int_error("plcheck: void param");
+    } else for (n = 1; t; t = t->Tproto, n++) {
+	if (t->Tspec != TS_PARAM) {
+	    warn("Prototype param #%d (...) not compatible with default type",
+		 n);
+	}
+	else if (!cmputype(t->Tsubt,convfparam(t->Tsubt))) {
+	    warn("Prototype param #%d (%T) not compatible with default type (%T)",
+		 n, t->Tsubt, convfparam(t->Tsubt));
+	}
+    }
+}
+
+/* Prototype output routines */
+
+extern FILE *fprt;
+
+static void prtspec(
+  SYMBOL *s,
+  SYMBOL *sp,
+  TYPE *t,
+  TYPE *tp,
+  int in
+  );
+
+/* PRTTOK - Output token.
+*/
+static void
+prttok(i)
+int i;
+{
+  if (i < NTOKDEFS) {
+    if (tokstr[i]) fputs(tokstr[i], fprt);
+    else fprintf(fprt, "?Token=%s?", nopname[i]);
+  }
+  else fprintf(fprt, "?Token=%d.?", i);
+}
+
+/* PRTINDENT - Output current indentation.
+*/
+static void
+prtindent(in)
+int in;
+{
+    int tabs = in / 8;
+    int spaces = in % 8;
+
+    if (in > 0) {
+      prttok(T_EOL);
+      while (tabs--) putc('\t', fprt);
+      while (spaces--) putc(' ', fprt);
+    }
+    else putc(' ', fprt);
+}
+
+/* PRTSIMPLE - Output simple type description.
+*/
+static void
+prtsimple(t, needwsp)
+TYPE *t;
+int *needwsp;
+{
+    while ((t->Tspec == TS_FUNCT)
+	   || (t->Tspec == TS_PARAM)
+	   || (t->Tspec == TS_ARRAY)
+	   || (t->Tspec == TS_PTR))
+	t = t->Tsubt;
+
+    if (tisconst(t)) {
+	if (*needwsp) prttok(T_WSP);
+	prttok(T_CONST);
+	(*needwsp)++;
+    }
+    if (tisvolatile(t)) {
+	if (*needwsp) prttok(T_WSP);
+	prttok(T_VOLATILE);
+	(*needwsp)++;
+    }
+    if (tisinteg(t)) {
+	if (tischar(t)) {
+	    if (tissigned(t)) {
+		if (*needwsp) prttok(T_WSP);
+		prttok(T_SIGNED);
+		(*needwsp)++;
+	    }
+        }
+	else {
+	    if (tisunsign(t)) {
+		if (*needwsp) prttok(T_WSP);
+		prttok(T_UNSIGNED);
+		(*needwsp)++;
+	    }
+	}
+    }
+
+    if (*needwsp) prttok(T_WSP);
+    switch (t->Tspec) {
+    case TS_LNGDBL:
+	fputs("long double", fprt);
+	break;
+    case TS_BITF:
+    case TS_UBITF:
+    case TS_INT:
+    case TS_UINT:
+	prttok(T_INT);
+	break;
+    case TS_CHAR:
+    case TS_UCHAR:
+	if (tbitsize(t) == tgcsize) prttok(T_CHAR);
+	else fprintf(fprt, "_KCCtype_char%d", tbitsize(t));
+	break;
+    case TS_SHORT:
+    case TS_USHORT:
+	prttok(T_SHORT);
+	break;
+    case TS_LONG:
+    case TS_ULONG:
+	prttok(T_LONG);
+	break;
+    case TS_STRUCT:
+    case TS_UNION:
+    case TS_ENUM:
+	fputs(tsnames[t->Tspec], fprt);
+	prttok(T_WSP);
+	fputs(t->Tsmtag->Sname, fprt);
+	break;
+    case TS_PARVOID:
+	prttok(T_VOID);
+	break;
+    case TS_PARINF:
+	prttok(T_ELPSIS);
+	break;
+    default:
+	if (t->Tspec < TS_MAX) fputs(tsnames[t->Tspec], fprt);
+	else fprintf(fprt, "?Type=%d.?", t->Tspec);
+	break;
+    }
+    (*needwsp)++;
+}
+
+/* PRTLPAF - Output left side of pointers, arrays, and functions.
+*/
+static void
+prtlpaf(t, needwsp)
+TYPE *t;
+int *needwsp;
+{
+    while (t && ((t->Tspec == TS_FUNCT)
+		 || (t->Tspec == TS_PARAM)
+		 || (t->Tspec == TS_ARRAY)))
+	t = t->Tsubt;
+
+    if (t->Tspec == TS_PTR) {
+	prtlpaf(t->Tsubt, needwsp);
+	if (*needwsp) prttok(T_WSP);
+	if ((t->Tsubt->Tspec == TS_FUNCT) || (t->Tsubt->Tspec == TS_ARRAY))
+	    prttok(T_LPAREN);
+	putc('*', fprt);
+	*needwsp = 0;
+	if (tisconst(t)) {
+	    prttok(T_CONST);
+	    (*needwsp)++;
+	}
+	if (tisvolatile(t)) {
+	    if (*needwsp) prttok(T_WSP);
+	    prttok(T_VOLATILE);
+	    (*needwsp)++;
+	}
+    }
+}
+
+/* PRTRPAF - Output right side of pointers, arrays, and functions.
+*/
+static void
+prtrpaf(sp, t, tp, in)
+SYMBOL *sp;
+TYPE *t;
+TYPE *tp;
+int in;
+{
+    switch (t->Tspec) {
+    case TS_PARAM:
+	prtrpaf((SYMBOL *)NULL, t->Tsubt, (TYPE *)NULL, in);
+	break;
+    case TS_PARVOID:
+    case TS_PARINF:
+	break;
+    case TS_FUNCT:
+	prttok(T_LPAREN);
+	if (!tp) tp = t->Tproto;
+	while (tp) {
+	    prtindent(in);
+	    prtspec(sp, NULL, tp, NULL, in > 0 ? in+2 : in);
+	    if (tp = tp->Tproto) prttok(T_COMMA);
+	    if (sp) sp = sp->Spmnext;
+	}
+	prttok(T_RPAREN);
+	prtrpaf((SYMBOL *)NULL, t->Tsubt, (TYPE *)NULL, in);
+	break;
+    case TS_ARRAY:
+	prttok(T_LBRACK);
+	if (t->Tsize) fprintf(fprt, "%d", t->Tsize);
+	prttok(T_RBRACK);
+	prtrpaf((SYMBOL *)NULL, t->Tsubt, (TYPE *)NULL, in);
+	break;
+    case TS_PTR:
+	if ((t->Tsubt->Tspec == TS_FUNCT) || (t->Tsubt->Tspec == TS_ARRAY))
+	    prttok(T_RPAREN);
+	prtrpaf((SYMBOL *)NULL, t->Tsubt, (TYPE *)NULL, in);
+	break;
+    }
+}
+
+/* PRTSPEC - Output type specification.
+*/
+static void
+prtspec(s, sp, t, tp, in)
+SYMBOL *s;
+SYMBOL *sp;
+TYPE *t;
+TYPE *tp;
+int in;
+{
+    int needwsp = 0;
+
+    prtsimple(t, &needwsp);
+    prtlpaf(t, &needwsp);
+    if (tisbitf(t)) {
+	if (s) {
+	    if (needwsp) prttok(T_WSP);
+	    fputs(s->Sname, fprt);
+	}
+	fprintf(fprt, ":%d", tbitsize(t));
+    }
+    else if (s) {
+	    if (needwsp) prttok(T_WSP);
+	    fputs(s->Sname, fprt);
+    }
+    prtrpaf(sp, t, tp, in);
+}
+
+/* PRTDUMP - Output function declaration suitable for prototyping.
+*/
+static void
+prtdump(s, sp)
+SYMBOL *s;
+SYMBOL *sp;
+{
+    if (!(ptyp & ((s->Sclass == SC_INTDEF)	/* static definition? */
+		   ? PTYP_STATIC		/* yes, was static selected? */
+		   : PTYP_EXTERN)))		/* no, was extern selected? */
+	return;					/* don't output this one */
+    fprintf(fprt, "\n/* Function: %s */\n", s->Sname);
+    prttok((s->Sclass == SC_INTDEF) ? T_STATIC : T_EXTERN);
+    prttok(T_WSP);
+    prtspec(s, sp, s->Stype, s->Shproto, 2);
+    prttok(T_SCOLON);
+    prttok(T_EOL);
+}
+
+/* DBGSPEC -- Debugging routine to output type specification from DDT
+*/
+TYPE *_dbgtype;
+SYMBOL *_dbgsym;
+void
+_dbgspec()
+{
+  FILE *savfprt = fprt;
+
+  fprt = stdout;
+  prtspec(_dbgsym, 0, _dbgtype, 0, 0);
+  fprintf(fprt, "\n");
+  fprt = savfprt;
+}
+
+/* PRTCHK - Check declaration for function type with no prototype.
+ */
+static void
+prtchk(t, s, pn)
+TYPE *t;
+SYMBOL *s;
+int pn;
+{
+
+  if (clevel < CLEV_STDC) return; /* No check if less than STDC */
+
+  do switch (t->Tspec)
+    {
+    case TS_FUNCT:
+      if (!t->Tproto) {
+	if (pn) advise(
+"Missing function prototype in declaration of parameter %S (#%d)", s, pn);
+	else advise("Missing function prototype in declaration of %S", s);
+
+      }
+    case TS_PARAM:
+    case TS_ARRAY:
+    case TS_PTR:
+      t = t->Tsubt;		/* Follow subtype pointer */
+      break;
+    default:
+      return;			/* Done if doesn't have subtype */
+    } while (t);
+}
+
+/* PDECLLIST - Parse the <decl-list> for an old-style function definition.
+**	[dpANS 3.7.1, 3.6.2]
+**
+**	<decl-list> ::= *[<declaration>]
+**
+** The only storage-class spec allowed is "register".  No initializations
+** are permitted.
+*/
+static void
+pdecllist()
+{
+    TYPE *t;
+    SYMBOL *s1, argbase, stemp;
+
+    while (token != T_LBRACE && token != T_EOF) {	/* type-decl-list */
+	pbase(&argbase);	/* Parse storage class and type specifier */
+	copysym(&stemp, &argbase);
+	switch (stemp.Sclass) {		/* Check storage class */
+	    default:
+		error("Illegal storage class for function parameter");
+	    case SC_UNDEF:		/* Default becomes this. */
+		stemp.Sclass = SC_ARG;
+		break;
+	    case SC_RAUTO:		/* If "register" seen, */
+		stemp.Sclass = SC_RARG;	/* use right symbol class */
+		break;
+	}
+	if ((t = stemp.Stype) == NULL) {	/* Check type-specifier */
+	    if (argbase.Sclass == SC_UNDEF)
+		error("No type-specifier for parameter decl, assuming int");
+	    t = deftype;
+	}
+
+	/* Have <decl-specs> base, now parse each <declor> */
+	while (1) {
+	    stemp.Sname[0] = '\0';	/* no symbol given yet */
+	    stemp.Stype = t;		/* Reset base type */
+	    for(;;) {
+		if (s1 = declarator(&stemp))	/* Get sym and rest of type */
+		    break;
+		if (token == T_COMMA) {
+		    warn("Null parameter declarator");
+		    nextoken();
+		    continue;
+		}
+		if (token == T_SCOLON) {
+		    nextoken();
+		    break;
+		}
+		error("Bad parameter declaration token");
+		errflush();	/* Flush to probable end of statement */
+		break;		/* Will get two err msgs, but so what */
+	    }
+
+	    if (s1 == NULL)
+		warn("Null parameter declaration");
+	    else if (s1->Sclass != SC_ARG && s1->Sclass != SC_RARG) {
+		error("Identifier \"%s\" not in function parameter list",
+			s1->Sname);		/* not an arg to this fn */
+		if (s1->Sclass == SC_UNDEF)
+		    freesym(s1);		/* Clean up if boo-boo */
+	    } else if (s1->Sflags & SF_PARAMDECL) {
+		error("Duplicate parameter declaration: \"%s\"",s1->Sname);
+	    } else {		/* Is arg, set type to what we parsed */
+		s1->Sclass = stemp.Sclass;	/* Maybe indicate register */
+		s1->Sflags |= SF_PARAMDECL;	/* Say decl seen for arg */
+		s1->Stype = convfparam(stemp.Stype);	/* Get right type */
+	    }
+	    prtchk(s1->Stype, s1, 0);	/* Check for missing prototype */
+	    if (token != T_COMMA) break;	/* repeat through list */
+	    nextoken();			/* skipping over commas */
+	}
+	expect(T_SCOLON);		/* decl line ends with a semicolon */
+    }
+}
+
+
+/* MKPROTO - Make a prototype param type list out of a parameter symbol list.
+**	Must be recursive for same reason that paramlist() is.
+**	Note special handling for case of no symbols on list.
+*/
+
+static TYPE *
+mkproto(s)
+SYMBOL *s;
+{
+    return s ? mkprox(s) : findptype(TS_PARVOID, (TYPE *)NULL, (TYPE *)NULL);
+}
+static TYPE *
+mkprox(s)
+SYMBOL *s;
+{
+    return s ? findptype(TS_PARAM, mkprox(s->Spmnext), s->Stype) : NULL;
+}
+
+/* DATADEF - Parse top-level declaration that isn't a function definition.
+**	[dpANS 3.5, 3.7.2]
+**
+**	<decl>		::= <decl-specs> {init-decl-list} ';'
+**
+**	<init-decl-list> ::= {init-decl-list ','} <init-declor>
+**	<init-declor>	::= <declor> {'=' izer}
+**
+** Invoked by extdef() after determining that a declaration is not
+** a function definition, to parse the rest of a top-level data declaration
+** or function reference.
+**	Current token is the first one after the first <declor>.
+*/
+static NODE *
+datadef(base, s, syment)
+SYMBOL	*base,		/* Parsed <decl-specs> */
+	*s,		/* Default <decl-specs> and 1st <declor> */
+	*syment;	/* Symtab entry of identifier for 1st <declor> */
+{
+    SYMBOL defbase;
+    NODE *root = NULL, *tail = NULL;
+
+    /* Check out the storage class and type
+    ** specifications.  At top level, some storage class or type specifier
+    ** must have been given.
+    */
+    defbase.Scontents = base->Scontents;	/* Copy contents of base */
+    switch (defbase.Sclass) {
+	case SC_UNDEF:
+	    defbase.Sclass = s->Sclass;		/* Copy whatever default was */
+	    if (defbase.Stype == NULL) {
+		error("Declaration without storage class or type-spec");
+	    }
+	    break;		
+	case SC_EXTREF:		/* "extern" */
+	case SC_INTREF:		/* "static" */
+	case SC_TYPEDEF:	/* "typedef" */
+	    break;
+	default:
+	    error("Illegal top-level storage class");
+	    s->Sclass = defbase.Sclass = SC_EXLINK;	/* Use default */
+	    break;
+    }
+    if (defbase.Stype == NULL)
+	defbase.Stype = s->Stype;	/* Copy whatever default was */
+
+    decllist(base, &defbase, s, syment, &root, &tail);
+
+    if (!expect(T_SCOLON) && token == T_RBRACE) nextoken();
+    return (root);
+}
+
+/* LDECLLIST() - Parse local block declaration list
+**	[dpANS 3.6.2, 3.5]
+**
+**	<decl-list> ::=	<decl> {decl-list}
+**
+** This is only called by CCSTMT's compound() to parse the
+** optional declaration-list at the start of a compound statement.
+** Makes entries in the symbol and type tables, and returns a node
+** pointer to a list of initializations that must be done.
+**	Current token is the first of a possible <decl>.  If it is not
+** a valid first token for a declaration, nothing is done and NULL is returned.
+*/
+
+NODE *
+ldecllist()
+{
+    SYMBOL base, defbase;
+    NODE *autodecls, *autotail;	/* Pointers to list of inits for decls
+				** within a block */
+
+    if (!isdecl()) return NULL;		/* Most common case -- no decls */
+
+    autodecls = autotail = NULL;
+    do {
+	/* If current token is start of a declaration, handle it. */
+	pbase(&base);		/* Parse base storage-class and type */
+				/* Note all classes are OK */
+	copysym(&defbase, &base);
+	if (defbase.Sclass == SC_UNDEF)
+	    defbase.Sclass = SC_AUTO;	/* Default class is AUTO */
+	if (defbase.Stype == NULL)
+	    defbase.Stype = deftype;
+
+	/* Handle the local declaration, adding defs to the right list. */
+	if (defbase.Sclass == SC_INTREF)	/* "static" */
+	     decllist(&base, &defbase, (SYMBOL *)NULL, (SYMBOL *)NULL,
+			&statdecls, &stattail);
+	else decllist(&base, &defbase, (SYMBOL *)NULL, (SYMBOL *)NULL,
+			&autodecls, &autotail);
+
+	expect(T_SCOLON);
+    } while (isdecl());
+
+    return(autodecls);
+}
+
+/* DECLLIST - Parse declarator list for a declaration, with possible izers.
+**	[dpANS 3.5]
+**
+**	<init-decl-list> ::= <init-declor> {',' init-decl-list}
+**	<init-declor>	::= <declor> {'=' izer}
+**
+** This is called by datadef() for top-level declarations and
+** by ldecllist() for block-level declarations.
+** Note the provision for having already parsed the first declarator.
+*/
+static void
+decllist(base, defbase, d, s, root, tail)
+SYMBOL *base,		/* Base storage class & type-spec furnished */
+	*defbase,	/* Same but completely defaulted as necessary */
+	*d,		/* First parsed declarator (NULL if none) */
+	*s;		/* Symbol table entry for d's ident */
+NODE **root,		/* Addr of Root of declaration parse tree, if any */
+	**tail;		/* Addr of Tail of parse tree, if any */
+{
+    SYMBOL tempsym;
+    NODE *n, *z;
+  
+    if (d == NULL) {		/* Already parsed first declarator? */
+	d = &tempsym;		/* No, so do first one here. */
+	copysym(d, defbase);
+	s = declarator(d);
+	if (s == NULL && token == T_SCOLON && (base->Sflags&SF_SIDEFF))
+	    return;		/* No declarators but have side-effect */
+    }
+    while (1) {
+	if (s == NULL)
+	    warn("Null declarator");
+	else if ((n = dodecl(base->Sclass, d, s)) != NULL) {
+	    z = ndefl(N_DATA, n);
+	    if (*tail == NULL)			/* Add parse result to tree */
+		*root = *tail = z;		/* Either as 1st node */
+	    else *tail = (*tail)->Nright = z;	/* or at end of current tree */
+	}
+	if (token != T_COMMA) break;
+	nextoken();
+	copysym(d, defbase);
+	s = declarator(d);
+    }
+    return;
+}
+
+/* ISDECL() - returns TRUE if current token is the start of a declaration,
+**	i.e. the start of {declaration-specifiers}, one of:
+**		{storage-class-specifier}
+**		{type-specifier}
+**		{type-qualifier}
+*/
+static int
+isdecl()
+{
+    return (csymbol != NULL && (
+	(tok[token].tktype == TKTY_RWSC || tok[token].tktype == TKTY_RWTYPE)
+	|| (csymbol->Sclass == SC_TYPEDEF)
+	));
+}
+
+/* QARRAY() - returns the original type with 'qflags' applied to a
+**	non-array sub-type.
+**	If typedef name was array type, must add qualifier to the
+**	base element of array, not to the array type itself.
+*/
+
+static TYPE *
+qarray(t, qflags, oflagp)
+TYPE *t;
+int qflags;
+int *oflagp;
+{
+  if (t->Tspec == TS_ARRAY)
+    return findctype(t->Tspec, t->Tflag,
+		     t->Tsize, qarray(t->Tsubt, qflags, oflagp));
+  return findctype(t->Tspec, qflags | (*oflagp = t->Tflag),
+		   t->Tsize, t->Tsubt);
+}
+
+/* PBASE(&sym) - Parse base of declaration (stg class & type)
+**	Handles either <decl-specs>, if a symbol pointer is given,
+**   or <spec-qual-list>, if no pointer is given.
+**
+**	[dpANS 3.5, 3.5.1, 3.5.2]
+**
+**	<decl-specs> ::=  *[<stg-class-spec> | <type-spec> | <type-qual>]
+**
+**	<spec-qual-list> ::= *[<type-spec> | <type-qual>]
+**
+**	<type-spec> ::= "void" | "char" | etc...
+**	<type-qual> ::= "const" | "volatile"
+**	<stg-class-spec> ::=
+**			"typedef" | "extern" | "static" | "auto" | "register"
+*/
+
+/* Flags to remember what we've already seen, for tokens that can combine
+** with others in random order.
+*/
+#define PF_SIGNED	01
+#define PF_UNSIGNED	02
+#define PF_CHAR		04
+#define PF_SHORT	010
+#define PF_INT		020
+#define PF_LONG		040
+#define PF_DOUBLE	0100
+
+static int
+pbase(symp)
+SYMBOL *symp;
+{
+    static char *errmsg = "Illegal combination of type-specifiers";
+    int savnsdefs = nsdefs;		/* Remember # side-eff defs so far */
+    TYPE *t = NULL, *nt;
+    int nflag, qflags = 0, tflags = 0;
+    int chrsiz = 0;
+
+    if (symp) {
+	symp->Sname[0] = '\0';		/* init symbol */
+	symp->Svalue = 0;		/* no val yet */
+	symp->Sclass = SC_UNDEF;	/* no storage class */
+	symp->Stype = NULL;		/* no type yet */
+	symp->Sflags = 0;
+    }
+
+    /* First find all type-specs, type-quals, or stg-class-specs.
+    ** Stop only when a token is seen that can't be one of these.
+    */
+    for (;;) {
+
+	if (tok[token].tktype == TKTY_RWTYPE) {
+	    /* Look for reserved word type-qualifiers or type-specifiers */
+	    nt = NULL;
+	    switch (token) {
+#if SYS_CSI
+	    case T_FORTRAN:
+		if( symp->Sflags & (TF_FORTRAN | TF_BLISS) )
+		    error("Duplicate foreign language qualifier!");
+		symp->Sflags |= TF_FORTRAN;
+		nextoken();
+		continue;
+
+	    case T_BLISS:
+		if( symp->Sflags & (TF_FORTRAN | TF_BLISS) )
+		    error("Duplicate foreign language qualifier!");
+		symp->Sflags |= TF_BLISS;
+		nextoken();
+		continue;
+#endif	/*  CSI  */
+	    case T_CONST:		/* "const" type-qualifier */
+		if (qflags & TF_CONST)
+		    error("Duplicate \"const\"");
+		qflags |= TF_CONST;
+		nextoken();
+		continue;
+
+	    case T_VOLATILE:		/* "volatile" type-qualifier */
+		if (qflags & TF_VOLATILE)
+		    error("Duplicate \"volatile\"");
+		qflags |= TF_VOLATILE;
+		nextoken();
+		continue;
+
+	    case T_VOID:	nt = voidtype;	nflag = 0; break;
+	    case T_FLOAT:	nt = flttype;	nflag = 0; break;
+	    case T_STRUCT:	nt = tagspec(TS_STRUCT); nflag = 1; break;
+	    case T_UNION:	nt = tagspec(TS_UNION);	 nflag = 1; break;
+	    case T_ENUM:	(void) tagspec(TS_ENUM);
+				nt = inttype;		 nflag = 1; break;
+		/* Enums always type "int", but have tags and syms defined. */
+
+	    case T_SIGNED:	nflag = PF_SIGNED;	break;
+	    case T_UNSIGNED:	nflag = PF_UNSIGNED;	break;
+	    case T_CHAR:	nflag = PF_CHAR;	break;
+	    case T_SHORT:	nflag = PF_SHORT;	break;
+	    case T_INT:		nflag = PF_INT;		break;
+	    case T_LONG:	nflag = PF_LONG;	break;
+	    case T_DOUBLE:	nflag = PF_DOUBLE;	break;
+	    case T_CHAR6:	nflag = PF_CHAR; chrsiz = 6;	break;
+	    case T_CHAR7:	nflag = PF_CHAR; chrsiz = 7;	break;
+	    case T_CHAR8:	nflag = PF_CHAR; chrsiz = 8;	break;
+	    case T_CHAR9:	nflag = PF_CHAR; chrsiz = 9;	break;
+	    case T_CHAR18:	nflag = PF_CHAR; chrsiz = 18;	break;
+	    default:
+		int_error("ptypespec: unknown RWTYPE %Q", token);
+		nextoken();		/* Skip over, get next */
+		continue;
+	    }
+	    if (nt) {			/* Was type completely set? */
+		if (t || tflags) error(errmsg);	/* Say bad typespec combo */
+		t = nt;
+		tflags = 0;
+		/* Set flag if any side effects (tag or enum defined) */
+		if (symp && savnsdefs != nsdefs)
+		    symp->Sflags |= SF_SIDEFF;
+		if (nflag)		/* If tagspec called, */
+		    continue;		/* don't do another nextoken! */
+	    } else {			/* Nope, nflag must be set */
+		if (t || (tflags&nflag))
+		    error(errmsg);	/* Say bad typespec combo */
+		tflags |= nflag;
+	    }
+	    nextoken();			/* On to next token */
+	    continue;
+
+	} else if (tok[token].tktype == TKTY_RWSC) {
+	    /* Check storage class */
+	    if (!symp)
+		error("Storage class specifier not allowed");
+	    else if (symp->Sclass != SC_UNDEF)	/* Already have one? */
+		error("Only one storage class specifier allowed");
+	    else {
+		if (t || tflags || qflags)
+		    note("Storage class should come first in declaration");
+		switch (token) {
+		case T_AUTO:	symp->Sclass = SC_AUTO;   break;
+		case T_STATIC:	symp->Sclass = SC_INTREF; break;
+		case T_EXTERN:	symp->Sclass = SC_EXTREF; break;
+		case T_REGISTER:	symp->Sclass = SC_RAUTO;  break;
+		case T_TYPEDEF:	symp->Sclass = SC_TYPEDEF; break;
+		default:
+			int_error("ptypespec: unknown RWSC %Q", token);
+		}
+	    }
+	    nextoken();
+	    continue;		/* Skip over and get next */
+	}
+
+	/* Not a type-specifier keyword or storage-class, see if typedef,
+	** but ONLY if we haven't already seen any other type specifiers.
+	** Note that type qualifiers can be added in!  This requires a
+	** special check for function and array types, which can't have
+	** their types qualified except by typedefs.  But the qualifiers
+	** may follow the typedef, so we have to check after all's done.
+	*/
+	if (!t && !tflags && csymbol && csymbol->Sclass == SC_TYPEDEF) {
+	    t = csymbol->Stype;	/* Get the type */
+	    nextoken();
+	    continue;		/* Keep going, sigh */
+	}
+	break;			/* No matches, stop loop! */
+
+    }	/* End of moby loop */
+
+    /* All specifiers gobbled, now see whether a type resulted.  If none,
+    ** but tflags has stuff, we try to decipher the flag combos.
+    */
+    if (!t) {
+	switch (tflags) {
+	case 0:	if (!qflags && (!symp || symp->Sclass == SC_UNDEF))
+		    return 0;		/* Nothing read at all */
+		t = deftype;		/* OK to default to "int" */
+		break;
+
+	/* Chars have special KCC extension case */
+	case PF_CHAR:		  if (!chrsiz) { t = chartype;	break; }
+	case PF_SIGNED|PF_CHAR:	  if (!chrsiz) { t = schartype;	break; }
+	case PF_UNSIGNED|PF_CHAR: if (!chrsiz) { t = uchartype;	break; }
+	    /* Special extension, drop thru to handle */
+	    t = findctype((tflags&PF_UNSIGNED) ? TS_UCHAR : TS_CHAR,
+				qflags | chrsiz, 1, (TYPE *)NULL);
+	    qflags = 0;		/* Don't re-do these */
+	    break;
+
+	case PF_SHORT:
+	case PF_SIGNED|PF_SHORT:
+	case PF_SHORT|PF_INT:
+	case PF_SIGNED|PF_SHORT|PF_INT:	t = shrttype;	break;
+	case PF_UNSIGNED|PF_SHORT:
+	case PF_UNSIGNED|PF_SHORT|PF_INT: t = ushrttype; break;
+	case PF_INT:
+	case PF_SIGNED:
+	case PF_SIGNED|PF_INT:		t = inttype;	break;
+	case PF_UNSIGNED:
+	case PF_UNSIGNED|PF_INT:	t = uinttype;	break;
+	case PF_LONG:
+	case PF_SIGNED|PF_LONG:
+	case PF_LONG|PF_INT:
+	case PF_SIGNED|PF_LONG|PF_INT:	t = longtype;	break;
+	case PF_UNSIGNED|PF_LONG:
+	case PF_UNSIGNED|PF_LONG|PF_INT: t = ulongtype; break;
+	case PF_DOUBLE:			t = dbltype;	break;
+	case PF_LONG|PF_DOUBLE:		t = lngdbltype;	break;
+
+	default:
+	    error(errmsg);	/* Say bad typespec combo */
+	    if (nt == flttype || (tflags&PF_DOUBLE))
+		t = dbltype;
+	    else t = inttype;
+	}
+    }
+    if (qflags) {		/* Add any type qualifiers to the basic type */
+	int oflag = 0;
+
+	if (t->Tspec == TS_FUNCT)	/* See typedef comments */
+	    advise("Ignoring type-qualifiers for function type");
+	else t = qarray(t, qflags, &oflag);
+
+	if (oflag &= qflags)
+	    warn("Redundant type qualifier \"%s\"",
+			(oflag&TF_CONST) ? "const" : "volatile");
+    }
+    if (symp)
+	symp->Stype = t;
+    return (int)t;
+}
+
+/* TAGSPEC - Handles tag for struct/union/enum
+*/
+static TYPE *
+tagspec(typ)
+int typ;		/* TS_STRUCT, TS_UNION, or TS_ENUM */
+{
+    SYMBOL s, *tagsym, *osym;
+
+    switch (nextoken()) {
+    case Q_IDENT:	/* Have tag ident */
+	tagsym = symftag(osym = csymbol);	/* Get existing tag if any */
+	if (nextoken() == T_LBRACE)	/* (Note this clobbers csymbol) */
+	    nsdefs++;			/* Defining, say decl has side effs */
+	break;
+
+    case T_LBRACE:	/* No tag given, will have to make up internal one. */
+	tagsym = osym = NULL;
+	break;
+
+    default:
+	error("struct/union/enum not followed by tag or definition");
+	while (1)  switch (nextoken()) {
+	    case T_EOF: case T_RBRACE: case T_SCOLON:
+		return NULL;
+	}
+    }
+
+    /* If a tag symbol already exists, check it to see whether we can use
+    ** that one or need to create a new one.  This also checks for
+    ** duplicate definitions.
+    ** Note that if this is a reference (not a definition) then we always
+    ** just use whatever tagsym is.
+    */
+    if (tagsym && token == T_LBRACE) {	/* If this will be a definition */
+	if (tagsym->Sclass == SC_TAG) {	/* Tag already defined? */
+	    if (isdupsym(tagsym))	/* Dup def? */
+		error("Duplicate tag definition: %S", tagsym);
+	    tagsym = NULL;		/* Force a new definition */
+	} else if (tagsym->Sclass == SC_UTAG) {	/* A ref already exists? */
+	    if (!isdupsym(tagsym))	/* If not in same block, */
+		tagsym = NULL;		/* don't satisfy the ref! */
+	}
+    }
+    if (tagsym && tagsym->Stype->Tspec != typ) {
+	error("Tag redefined with different type: %S", tagsym);
+	tagsym = NULL;
+    }
+
+    /* If no tag (specified or internal) exists, make one and pretend it
+    ** was seen as a forward reference (which it may well be).
+    */
+    if (tagsym == NULL) { 		/* Need tag symbol? */
+	if (osym)			/* If already have an identifer, */
+	    tagsym = symqcreat(osym);	/* use that for quick sym setup! */
+	else {	/* No existing tag, invent one. */
+		/* Note (safe) assumption that ident string is big enough */
+	    sprintf(s.Sname, "%c%d", SPC_TAG, ++itags);
+	    tagsym = creatsym(s.Sname);	/* Make symbol of right scope */
+	}
+	tagsym->Sflags |= SF_TAG;
+	tagsym->Sclass = SC_UTAG;	/* but with no defined body */
+	tagsym->Ssmnext = NULL;		/* No members yet */
+	tagsym->Srefs++;		/* This creation is a reference too */
+	if (inproto)			/* If created within fn prototype, */
+	    tagsym->Sflags |= SF_PROTOTAG;	/* flag it for ridlsym */
+					/* Create new type for it */
+	tagsym->Stype = findtype(typ, (TYPE *)tagsym);
+	tagsym->Stype->Tsmtag = tagsym;	/* Make sure type points to tag */
+    }
+    if (osym && osym->Sclass == SC_UNDEF)
+	freesym(osym);			/* Can flush orig sym now if unused */
+
+    if (token != T_LBRACE)		/* If no definition, just return */
+	return tagsym->Stype;
+
+    /* Define the structure. */
+    nextoken();				/* Flush the left brace */
+    if (typ == TS_ENUM) sdeclenum(tagsym);
+    else tagsym->Stype->Tsize = sdeclstruct(tagsym, typ);
+    if (eof) error("Unexpected EOF in declaration");
+    else expect(T_RBRACE);		/* Now flush the right brace */
+
+    tagsym->Sclass = SC_TAG;		/* Struct is now defined */
+    return tagsym->Stype;
+}
+
+/* SDECLENUM - define enumeration type
+*/
+static void
+sdeclenum(tag)
+SYMBOL *tag;
+{
+    int val;
+    SYMBOL *s, *last;
+
+    s = NULL;
+    val = 0;			/* start at zero */
+    last = tag;
+    for (;; nextoken()) {
+	if (token == T_RBRACE) {
+	    if (!s) warn("Empty enum definition list");
+	    break;
+	}
+	if (token != Q_IDENT) {
+	    error("Identifier expected as enum constant");
+	    break;
+	}
+	nsdefs++;		/* Enum constant def as "side effect" */
+	s = csymbol;		/* get identifier */
+	if (isdupsym(s))
+	    errdupsym(s);
+	s = uniqsym(s);		/* Create or re-use symbol as needed */
+	s->Sclass = SC_ENUM;	/* this is an enum constant */
+	s->Stype = inttype;	/* acting like an int */
+	s->Ssmtag = tag;	/* Remember tag defined within */
+	s->Ssmnext = NULL;
+	last->Ssmnext = s;	/* Link onto list of enum members */
+
+	if (nextoken() == Q_ASGN) {
+	    nextoken();		/* want specific value for this one */
+	    val = pconst();	/* so set it to given constant */
+	}
+	s->Svalue = val++;		/* with this value */
+	if (token != T_COMMA)
+	    break;
+    }
+    /* Current token should now be T_RBRACE.  Caller will check. */
+}
+
+
+/* SDECLSTRUCT - Parse struct/union member list.
+**	Returns size in words of the struct/union.
+*/
+static int
+sdeclstruct(tag, typ)
+SYMBOL *tag;
+int typ;
+{
+    SYMBOL *lastmem = tag;
+    int maxsize = 0, offset = 0, boffset = 0;
+    int savpok = paramok;
+
+    paramok = 0;			/* Not OK to collect param syms */
+    while (!eof && token != T_RBRACE) {
+	lastmem = sdeclaration(tag, lastmem, &offset, &boffset);
+	if (typ == TS_STRUCT) continue;
+
+	/* For union, each member starts over at beginning */
+	if (boffset > 0) offset++;	/* Round out to full word */
+	if (offset > maxsize)		/* Remember size of largest element */
+	    maxsize = offset;
+	offset = boffset = 0;		/* Start over with zero offset */
+    }
+    paramok = savpok;			/* Restore saved paramok */
+
+    /* Return either total size (struct) or largest element size (union) */
+    if (typ == TS_STRUCT) {
+	if (boffset > 0) offset++;	/* Round offset up to full word */
+	maxsize = offset;		/* Total size is current offset */
+    }
+    if (maxsize == 0)
+	error("Empty %s declaration", typ == TS_STRUCT ? "struct" : "union");
+    return maxsize;
+}
+
+/* SDECLARATION - declare members of a struct or union
+*/
+static SYMBOL *
+sdeclaration(tag, prevsmem, offset, boffset)
+SYMBOL *tag, *prevsmem;
+int *offset, *boffset;
+{
+    SYMBOL base, tempsym, *u, *s;
+    int offcode, bsiz, ts, nelem, bpw, odd;
+
+    pbase(&base);		/* Parse base storage-class and type */
+    if (base.Stype == NULL) {
+	error("No type-specifier for struct member, assuming int");
+	base.Stype = deftype;
+    }
+    if (base.Sclass != SC_UNDEF)
+	error("Storage class illegal for struct member");
+    base.Sclass = SC_MEMBER;
+
+    while (1) {
+	if (token == T_COLON) {
+
+	    /*
+	    ** Colon without declarator before it - specifies space
+	    ** left for alignment.  Constant expression following
+	    ** colon is how much space, or zero to align to a word.
+	    */
+	    if (tag->Stype->Tspec == TS_UNION) {
+		if (clevel < CLEV_ANSI)
+		    error("Bit-field not allowed in union");
+		else advise("Unnamed bit-field meaningless in union");
+	    }
+	    nextoken();			/* skip over colon */
+	    fldsize(NULL, pconst(), offset, boffset); /* parse & handle size */
+	} else {
+
+	    /*
+	    ** Normal declarator.  Parse it, then check if there is
+	    ** a colon expression after it making it a bit field, or
+	    ** if it is a whole word expression.
+	    **
+	    ** For bitfields, the offset is encoded as follows:
+	    **  offcode % 07777 - high 12 bits of byte pointer to the field
+	    **  offcode >> 12   - word offset in struct
+	    ** and then the whole thing is negated.
+	    **
+	    ** Note that we let the bit offset remain at 36 rather
+	    ** than folding it to zero - the calculations are easier.
+	    */
+
+	    copysym(&tempsym, &base);
+	    u = declarator(&tempsym);
+	    if (u == NULL) {		/* Check for case of no identifier */
+		warn("Null declarator");
+		if (token == T_COLON) continue;	/* Pretend no declarator */
+		if (token == T_COMMA) {
+		    nextoken();
+		    continue;
+		}
+		break;			/* Something bad, stop loop */
+	    }
+
+	    if (token == T_COLON) {
+
+		/* Handle bitfield */
+		if (tag->Stype->Tspec == TS_UNION
+		  && clevel < CLEV_ANSI)
+		    error("Bit-field %S not allowed in union", u);
+		switch (tempsym.Stype->Tspec) {
+		    default:
+			error("Bit-field %S has invalid type", u);
+		    case TS_UINT:		/* Above error drops thru */
+		    case TS_UCHAR:
+		    case TS_USHORT:
+		    case TS_ULONG:
+			ts = TS_UBITF; break;
+		    case TS_ENUM:
+		    case TS_INT:
+		    case TS_CHAR:
+		    case TS_SHORT:
+		    case TS_LONG:
+			ts = TS_BITF;  break;
+		}
+
+		nextoken();			/* move over colon */
+		bsiz = pconst();		/* Parse size */
+		if (bsiz > tbitsize(tempsym.Stype)) {
+		    warn("Width of bit-field %S (%d) exceeds its type (%d)",
+			 u, bsiz, tbitsize(tempsym.Stype));
+		    bsiz = tbitsize(tempsym.Stype);
+		}
+		offcode = fldsize(u, bsiz, offset, boffset);	/* Handle it */
+		tempsym.Stype = findctype(ts,		/* Make bitfld type */
+			bsiz | (tempsym.Stype->Tflag&TF_QUALS),
+			1, (TYPE *)NULL);
+	    } else {			/* not bitfield */
+
+		/* Handle normal non-bitfield member */
+
+		if (tempsym.Stype->Tspec == TS_VOID) {
+		    error("Struct/union member %S cannot be void", u);
+		    tempsym.Stype = deftype;
+		}
+
+		bsiz = tisscalar(tempsym.Stype) ?	/* Get object size */
+			tbitsize(tempsym.Stype)		/* in bits if can */
+			: (tisbytearray(tempsym.Stype)	/* Byte array? */
+			   ? elembsize(tempsym.Stype) 	/* Yes, elem. size */
+			   : TGSIZ_WORD);	/* else force wd mode */
+
+		/* Now see if this type should be in byte mode or not.
+		** Sizes smaller than a word will either enter or remain
+		** in byte mode.  If the size is >= to a word, then we
+		** will leave byte mode if needed.
+		*/
+		if (bsiz < TGSIZ_WORD) {
+		    if (*boffset % bsiz)	/* Align to byte bndry */
+			*boffset += bsiz - (*boffset % bsiz);
+		    offcode = fldsize(u, bsiz, offset, boffset);
+		    nelem = sizearray(tempsym.Stype) - 1;
+		    if (nelem > 0) {
+			odd = (TGSIZ_WORD - *boffset) / bsiz;
+			if (nelem <= odd) *boffset += (nelem * bsiz);
+			else {
+			    nelem -= odd; /* Fill remainder of current word */
+			    bpw = TGSIZ_WORD / bsiz;
+					/* Compute bytes per word */
+			    *offset += (nelem / bpw) + 1;
+					/* Use partial and full words */
+			    *boffset = bsiz * (nelem % bpw);
+					/* Position in last word */
+			}
+		    }
+
+		} else {			/* One or more words */
+		    if (*boffset > 0) {		/* If in byte mode */
+			*boffset = 0;	/* Then force word alignment */
+			(*offset)++;	/* and move up */
+		    }
+		    offcode = *offset;		/* starts at offset */
+		    *offset += sizetype(tempsym.Stype); /* remember size */
+		}
+	    }
+
+	    /*
+	    ** Now we have parsed the declarator, and the encoded
+	    ** offset is in offcode.  Always make a new symbol for each
+	    ** structure member.
+	    */
+	    if ((s = symfmember(u, tag)) != NULL) {	/* Check for dup */
+		/* If a dup, just ignore current declaration. */
+		error("Duplicate struct member declaration: %S", s);
+		if (u->Sclass == SC_UNDEF) freesym(u);
+	    } else {
+		u = symqcreat(u);		/* Get new sym w/right scope */
+		u->Sflags |= SF_MEMBER;
+		u->Sclass = SC_MEMBER;		/* Say it is a struct mem */
+		u->Ssmoff = offcode;		/* with the given offset */
+		u->Stype = tempsym.Stype;	/* Store type of member */
+		u->Ssmtag = tag;		/* Point to parent structure */
+		u->Ssmnext = NULL;		/* This is last mem so far */
+		prevsmem->Ssmnext = u;	/* Point prev smem to this one */
+		prevsmem = u;		/* This is new current smem */
+		/* Pass on knowledge of any type qualifiers in struct! */
+		if (u->Stype->Tflag & (TF_QUALS|TF_SIQUALS)) {
+		    if (u->Stype->Tflag & (TF_CONST|TF_SICONST))
+			tag->Stype->Tflag |= TF_SICONST;
+		    if (u->Stype->Tflag & (TF_VOLATILE|TF_SIVOLAT))
+			tag->Stype->Tflag |= TF_SIVOLAT;
+		}
+		prtchk(u->Stype, u, 0);	/* Check for missing prototype */
+	    }
+	}
+	if (token != T_COMMA) break;
+	nextoken();
+    }
+    expect(T_SCOLON);
+    return prevsmem;			/* return with latest pointer */
+}
+
+/* FLDSIZE - handle bitfield size specification
+*/
+static int
+fldsize(d, bsiz, offset, boffset)
+SYMBOL *d;
+int bsiz, *offset, *boffset;
+{
+    if (bsiz > TGSIZ_WORD || bsiz < 0)	/* range check */
+	error("Bit-field %S longer than word (%d bits)", d, TGSIZ_WORD);
+    if (bsiz == 0 && *boffset > 0)	/* Zero size means round to wd bdry */
+	*boffset = TGSIZ_WORD+1;	/* Hack so roundup is forced */
+
+    *boffset += bsiz;			/* advance by that many bits */
+    if (*boffset > TGSIZ_WORD) {	/* If not enough room */
+	*boffset = bsiz;		/* move bit offset to word bdy */
+	(*offset)++;			/* in next word */
+    }
+    /* Return encoded offset */
+    return -(((*offset * 64) + TGSIZ_WORD - *boffset) * 64 + bsiz);
+}
+
+/* DECLARATOR - Parse a declarator with or without identifier
+**	[dpANS 3.5.4, 3.5.5]
+**
+**	<declor> ::= {pointer} <direct-declor>
+**
+**	<direct-declor> ::= <ident>
+**				| '(' <declor> ')'
+**				| <direct-declor> '[' {const-expr} ']'
+**				| <direct-declor> '(' <param-type-list> ')'
+**				| <direct-declor> '(' {ident-list} ')'
+**
+**	<abstract-declor> ::= <pointer>
+**				| {pointer} <direct-abs-declor>
+**	<direct-abs-declor> ::=
+**				| '(' <abstract-declor> ')'
+**				| {direct-abs-declor} '[' {const-expr} ']'
+**				| {direct-abs-declor} '(' {param-type-list} ')'
+**
+**	<pointer> ::= '*' {type-qual-list} {pointer}
+**	<type-qual-list> ::= *[<type-qual>]
+**
+** A DECLARATOR specifies the identifier being declared and may also
+** supply additional type information.  The resulting type is one of:
+**	* decl		- Pointer to
+**	( decl )	- parens used to establish precedence
+**	ident		- Simple declarator
+**	decl [...]	- Array of
+**	decl (...)	- Function (definition or reference)
+**
+** This function parses both <declor> and <abstract-declor>.  The main
+** difficulty in distinguishing them is how to interpret a left-parenthesis;
+** does it indicate a function, or merely group an inner declarator?
+** The decision can be made based on the following token and on whether
+** the identifier has already been seen or not:
+**	Ident?	Next token	Declor	Interpretation	
+**
+**	Yes	'(' <ident>	Direct	Function, with <ident-list>.
+**	Yes	'(' ')'		Direct	Function, no prototype info.
+**	Yes	'(' <decl-spec>	Direct	Function, with <param-type-list>.
+**	Yes	'(' other	Direct	Illegal
+**	No	'(' <ident>	Direct	Start of grouping
+**	No	'(' ')'		Abstract Function, no prototype info.
+**	No	'(' <decl-spec>	Abstract Function, with <param-type-list>.
+**	No	'(' other	Either	Start of grouping
+**
+**
+** All declaration statements eventually call this routine.
+**	normal = extdef (toplevel) & decllist (toplevel & local)
+**	smems = sdeclaration (decl within structure definition)
+**	params = pdecllist (old-style function param decls)
+**		paramlist (new-style proto param decls)
+**	abstract = typename (abstract declaration for casts & sizeof)
+**
+** The argument symbol pointer "d" must always point to a temporary symbol
+** structure which is NOT in the symbol table.  The parsed type is
+** returned in this symbol.  It may be the same as the original type.
+**
+** The return value is NULL if nothing was parsed or the declarator was
+** an abstract declarator.  Otherwise, the return value is a pointer
+** to the symbol table entry of the parsed identifier, and the declarator
+** was a normal non-abstract declarator.
+*/
+#define DF_INABSTR 01	/* In abstract declarator */
+#define DF_INPROTO 02	/* In function prototype */
+#define DF_INSMEM 04	/* In struct/union declaration */
+#define DF_TYPEDEF 010	/* In typedef */
+
+static SYMBOL *
+declarator(d)
+SYMBOL *d;
+{
+    SYMBOL *idsym;	/* Symtab ptr to parsed identifier */
+    TYPE *pp;		/* Holds "derivation part" of type */
+    int saveidsc;	/* Temp while parsing function params */
+
+    d->Spmnext = d->Spmhead = NULL;	/* Init paramlist in case function */
+    d->Svalue = 0;			/* Ditto param style indicator */
+
+    /* Parse <pointer> before ident part, and mung the base type directly. */
+    while (token == Q_MPLY) {
+	int tflag = 0;
+	for (;;) {
+	    switch (nextoken()) {
+	    case T_CONST:
+		if (tflag&TF_CONST) error("Duplicate \"const\"");
+		tflag |= TF_CONST;
+		continue;
+	    case T_VOLATILE:
+		if (tflag&TF_VOLATILE) error("Duplicate \"volatile\"");
+		tflag |= TF_VOLATILE;
+		continue;
+	    }
+	    break;
+	}
+	d->Stype = pushsztype(TS_PTR, tflag, typsiztab[TS_PTR], d->Stype);
+    }
+
+    /* Now parse main part, <direct-declor> or <direct-abs-declor>.
+    ** This is normally the ident,
+    ** but it can be missing for abstract declarators.
+    */
+    switch (token) {
+    case T_LPAREN:			/* Left-paren is tricky case */
+	if (nextoken() == T_RPAREN	/* Must examine next token */
+	  || isdecl()) {
+	    /* '(' ')' -- Abstract function without prototype info */
+	    /* '(' <decl-spec> -- Abstract function with prototype info */
+	    idsym = NULL;
+	    pp = fundecl(d, DF_INABSTR);
+
+	} else {			/* None of those, assume grouping. */
+	    TYPE *savt = d->Stype;	/* Save type thus far */
+	    d->Stype = NULL;		/* and pretend it's null */
+	    idsym = declarator(d);	/* Now parse stuff in parens */
+	    pp = d->Stype;		/* Make base be derived part! */
+	    d->Stype = savt;		/* Then can restore saved type */
+	    expect(T_RPAREN);
+	    /* pp is now NULL if no derivation was added, or will be some
+	    ** sequence of "pointer to", "array of", or "function returning"
+	    ** with an ultimate NULL base which has to be filled in later.
+	    */
+	}
+	break;
+
+    case Q_IDENT:
+	idsym = csymbol;		/* Remember sym ptr for this ident */
+	nextoken();
+	pp = NULL;			/* No derived part */
+	break;
+
+    default:
+	idsym = NULL;			/* No identifier */
+	pp = NULL;			/* No derived part */
+	break;
+    }
+
+    /* Check for function or array specifiers */
+    for (;;) {
+	switch (token) {
+	case T_LPAREN:		/* Function definition or reference */
+	    /* Parse param list of function.  If idsym is a new symbol,
+	    ** we set it temporarily so as to avoid bashing our global
+	    ** function-name symbol if it turns out to have a parameter
+	    ** name the same as the function name!
+	    */
+	    if (idsym && ((saveidsc = idsym->Sclass) == SC_UNDEF))
+		idsym->Sclass = SC_EXLINK;	/* Fake out paramlist */
+	    nextoken();				/* Start paramlist parse */
+	    /* 4-Feb-93 RPH added test on !pp below to free parameter symbol
+		list for pointers to or arrays of functions */
+	    pp = addpp(pp, fundecl(d,
+		(paramok && !pp && !inproto && d->Sclass != SC_TYPEDEF)
+		? 0 : DF_INPROTO));
+	    if (idsym)			/* Restore real class after fakeout */
+	    {   idsym->Sclass = saveidsc;
+#if SYS_CSI
+		idsym->Sflags = d->Sflags;	/* copy base flags */
+#endif
+	    }	    
+	    break;
+
+	case T_LBRACK:		/* Array of something */
+#if SYS_CSI
+	    if( d->Sflags & TF_FORTRAN )
+		warn("FORTRAN arrays not supported: will be C array");
+#endif
+	    nextoken();
+	    pp = addpp(pp, pushsztype(TS_ARRAY, 0,
+				    (token == T_RBRACK)? 0 : pconst(),
+				    (TYPE *)NULL));
+	    expect(T_RBRACK);
+	    break;
+	    
+	default:		/* Not array or function, we're done */
+	    /* Add base type to built-up derived type, return the result */
+	    if (pp) d->Stype = addpp(pp, d->Stype);
+	    return idsym;
+	}
+    }
+}
+
+/* FUNDECL - Parse function parameter list declarator
+**		This may be either <param-type-list> or <ident-list>.
+**	[dpANS 3.5.4]
+**
+**	<param-type-list> ::= <param-list> {',' "..."}
+**	<param-list> ::= <param-decl> *{',' <param-decl>}
+**	<param-decl> ::= <decl-specs> {<declor> | <abs-declor>}
+**	<ident-list> ::= <ident> *{',' <ident>}
+**
+** Only called by declarator() to handle a function type declaration.
+** Current token is the first one following the opening left-paren.
+** On return, current token is first thing after the right paren.
+** (if error, current token is whatever halted the parse).
+** Returns a pointer to the resulting function type, with a NULL
+**	return-value subtype which is filled in later by declarator().
+**
+** If any valid parameter identifiers were seen, the following values are also
+** returned in the declarator symbol struct:
+**	Svalue - 0 if old-style identlist, N+1 if new-style prototype,
+**			where N is the # of parameters ("void" and "..."
+**			are not counted).
+**	Spmnext - pointer to 1st parameter in param list
+**	Spmhead - start of local symbol block that was opened for the
+**		prototype scope, as returned by beglsym().  This block will
+**		still be active on return, and must be closed by the caller
+**		eventually.
+*/
+
+static TYPE *
+fundecl(d, dflag)
+SYMBOL *d;
+{
+    TYPE *proto = NULL;
+
+    if (token == T_RPAREN)		/* Quick check for most common case */
+	nextoken();			/* No param or ident list */
+    else {
+	struct protostate ps;
+	SYMBOL *blkhead;
+
+	blkhead = beglsym();		/* Begin a local symbol block */
+	++inproto;			/* Now inside prototype scope! */
+	ps.nparams = 0;			/* No params yet */
+	ps.shead = ps.stail = NULL;	/* Empty param sym list */
+	if (!isdecl()) {
+	    if (dflag) error("Bad context for old-style function parameters");
+	    pidentlist(&ps);		/* Handle old identlist form */
+	} else {
+	    proto = paramlist(&ps);	/* Handle new prototype form */
+	    ps.nparams += 1;		/* Ensure new-style indicator is set */
+	}
+	--inproto;			/* Out of proto scope... */
+	if (dflag)		/* If wasn't OK to collect params, then */
+	    ridlsym(blkhead);	/* quietly flush all syms defd in prototype */
+	else {			/* Top-level, so remember param idents! */
+	    if (!ps.shead)	/* If no actual parameter idents, then */
+		ridlsym(blkhead);	/* flush sym block anyway */
+	    if (d->Spmnext) {
+		int_error("fundecl: already parsed funct params");
+		ridlsym(blkhead);
+	    } else {		/* Keep local sym block active */
+		d->Spmnext = ps.shead;
+		d->Spmhead = blkhead;
+		d->Svalue = ps.nparams;	/* Remember # of new-style params */
+	    }
+	}
+
+	/* Done, must have ended in right-paren */
+	if (token == T_RPAREN) nextoken();
+	else {
+	    error("Bad syntax in function parameter list");
+	    for (;;) {
+		switch (nextoken()) {
+		default: continue;
+		case T_EOF: case T_RBRACE: case T_SCOLON: case T_RPAREN:
+		    break;
+		}
+		break;
+	    }
+	}
+    }
+    return findftype((TYPE *)NULL, proto);
+}
+
+/* PIDENTLIST - Parse old ident-list form of function params.
+**	Note ps->nparams is always left 0 as "old-style" flag.
+*/
+static void
+pidentlist(ps)
+struct protostate *ps;
+{
+    SYMBOL *s;
+
+    /* Parse parameter list as a simple ident-list. */
+    while (token == Q_IDENT && csymbol->Sclass != SC_TYPEDEF) {
+	if (csymbol->Sclass == SC_ARG)	/* Already a parameter? */
+	    error("Duplicate parameter: \"%s\"", csymbol->Sname);
+	s = uniqsym(csymbol);	/* make local sym for param */
+	if (ps->shead == NULL)	/* Save pointer to this param */
+	    ps->shead = s;	/* either in head of list */
+	else ps->stail->Spmnext = s;	/* or in last param so far */
+	ps->stail = s;		/* Move on to end of chain */
+	s->Spmnext = NULL;	/* This one is now the last */
+	s->Sclass = SC_ARG;	/* Say it's a function parameter */
+	s->Stype = deftype;	/* and (int) unless declared later */
+
+        if (nextoken() != T_COMMA) break;
+	nextoken();
+    }
+}
+
+/* PARAMLIST() - Parse parameter-type-list (function prototype declaration)
+**
+** Recursion is needed in order to come up with a canonical
+** prototype list without lots of wasteful duplication.  The problem is
+** that calls to findptype() must already know what the Tproto value
+** is before a pure type can be found/created.  So we have to parse the
+** entire parameter list before the prototype can be constructed!
+** Stack usage is minimized by using as few args and locals as possible.
+*/
+static TYPE *
+paramlist(ps)
+struct protostate *ps;
+{
+    SYMBOL *s;
+    TYPE *t;
+
+    if (token == T_RPAREN)
+	return NULL;
+    if (token == T_ELPSIS) {
+	if (!ps->nparams)
+	    error("Ellipsis must follow a parameter");
+	return findptype(TS_PARINF,
+		(nextoken() == T_COMMA ? (nextoken(), paramlist(ps)) : NULL),
+		NULL);
+    }
+
+    pbase(&(ps->decl));			/* First get <decl-specs> */
+    switch (ps->decl.Sclass) {
+	default:
+	    error("Only storage class allowed for param is \"register\"");
+		/* Drop thru to pretend normal arg */
+	case SC_UNDEF:	ps->decl.Sclass = SC_ARG;	break;
+	case SC_RAUTO:	ps->decl.Sclass = SC_RARG;	break;
+    }
+    if (ps->decl.Stype == NULL) {
+	if (token == T_COMMA || token == T_RPAREN)
+	    error("Null parameter declaration");
+	else error("No type-specifier for parameter, assuming int");
+	ps->decl.Stype = deftype;
+    }
+    s = declarator(&(ps->decl));	/* Finish type, maybe get ident */
+    t = ps->decl.Stype;
+
+    /* Now check type for conversions, and add to type list */
+    switch (t->Tspec) {
+	case TS_VOID:			/* Check for "(void)" */
+	    if (!ps->nparams && !s && token == T_RPAREN)
+		return findptype(TS_PARVOID, (TYPE *)NULL, (TYPE *)NULL);
+	    error("Function parameter cannot be void");
+	    t = deftype;
+	    break;
+	case TS_FUNCT:			/* Function of T becomes */
+	    t = findtype(TS_PTR, t);	/* pointer to function of T */
+	    break;
+	case TS_ARRAY:			/* Array of T becomes */
+	    t = findtype(TS_PTR, t->Tsubt);	/* pointer to T */
+	    break;
+    }
+
+    /* Add parameter symbol to list.  Always need to build list, even if
+    ** discarding later, so we can diagnose duplicate param defs.
+    */
+    if (s) {
+	if (s->Sclass == SC_ARG	/* Already a parameter? */
+	    || s->Sclass == SC_RARG) {
+	    if (isdupsym(s))		/* See if defined in current block */
+		error("Duplicate parameter: \"%s\"", s->Sname);
+	}
+	s = uniqsym(s);			/* Make local sym for param */
+	if (ps->shead == NULL)		/* Save pointer to this param */
+	    ps->shead = s;		/* either in head of list */
+	else ps->stail->Spmnext = s;	/* or in last param so far */
+	ps->stail = s;			/* Move on to end of chain */
+	s->Spmnext = NULL;		/* This one is now the last */
+	s->Stype = t;			/* Set type, and */
+	s->Sclass = ps->decl.Sclass;	/* say it's a function parameter */
+    }
+
+    ps->nparams++;
+
+    prtchk(t, s, ps->nparams);		/* Check for missing prototype */
+
+    return findptype(TS_PARAM,
+	((token == T_COMMA) ? (nextoken(), paramlist(ps)) : NULL),
+	t);
+}
+
+/* ADDPP - add type to inside of nesting
+**	Only invoked by declarator().
+*/
+static TYPE *
+addpp(pp, t)
+TYPE *pp, *t;
+{
+    /*
+    ** This takes a base-less type structure in pp, and returns the
+    ** result of replacing the NULL where the base should be with t.
+    ** Thus it is the inverse of pushsztype(), adding the new type
+    ** at the base of the structure rather than at the top.
+    **
+    ** I realize the recursive definition below may look messy,
+    ** but an iterative definition of this function would be worse...
+    */
+
+    return (pp == NULL) ? t
+	: pushsztype(pp->Tspec, pp->Tflag, pp->Tsize, addpp(pp->Tsubt, t));
+}
+
+/* PUSHTYPE - Construct a derived declarator type, checking for validity.
+**
+** As per [H&S 4.5.5] checks for the following illegal type
+** combinations:
+**	(1) Any type with "void" except "... function returning void"
+**		Note [dpANS] also permits "pointer to void".
+**	(2) "Array of function ..."
+**	(3) "Function returning array of ..."
+**	(4) "Function returning function ..."
+** There is also one other special case (5) that this list omits: as per
+** [H&S 4.5.3 and 5.5.3], a N-dimensional array must always have
+** all of the last N-1 sizes specified; only the first dimension's size
+** can be omitted.
+**
+**	If the type combination is illegal, some plausible type is
+** substituted, not so that something useful will be compiled but so
+** that no bizarre "types" will unduly interfere with scanning the rest of the
+** source file for further errors.
+**	Note that "void" is OK all by itself as a type.  The checks here
+** only look for illegal COMBINATIONS of types.
+*/
+static TYPE *
+pushsztype(typ, flags, siz, ptr)
+TYPE *ptr;
+{
+    if (ptr != NULL) switch (typ) {	/* If making a combination, check it */
+	default:	/* Top type must be one of array, funct, or ptr! */
+	    int_error("pushsztype: bad top type %d", typ);
+	    ptr = NULL;
+	    break;
+
+	case TS_PTR:			/* Ptr to most anything is OK */
+	    if (ptr->Tspec == TS_VOID	/* But (1) allow "ptr to void" */
+	      && clevel < CLEV_ANSI)	/* only if level high enough */
+		warn("Restricted type - pointer to void");
+	    break;
+
+	case TS_ARRAY:		/* Check for (2) and (5) */
+	    switch (ptr->Tspec) {
+		case TS_VOID:
+		    error("Illegal type - array of void");
+		    ptr = inttype;	/* Use int instead */
+		    break;
+		case TS_ARRAY:		/* Array of arrays OK if size given */
+					/* array[][x] ok, array[x][] bad */
+		    if (ptr->Tsize == 0) {
+			error("Illegal type - array of unknown-sized array");
+			ptr = inttype;	/* Use int instead */
+		    }
+		    break;
+		case TS_FUNCT:		/* Array cannot have functions */
+		    error("Illegal type - array of function");
+		    ptr = inttype;	/* Lose, substitute "int" */
+		}
+		break;
+
+	case TS_FUNCT:		/* Check for (3) and (4) */
+	    switch (ptr->Tspec) {
+		case TS_ARRAY:		/* Function cannot return array */
+		case TS_FUNCT:		/* Function cannot return function */
+		    error("Illegal type - function returning %s",
+			ptr->Tspec == TS_ARRAY ? "array" : "function");
+		    ptr = voidtype;	/* Lose, substitute void */
+		    break;
+	    }
+	    break;
+    }
+
+    /* Now hash up the actual type and return the canonicalized version */
+    return findctype(typ, flags | typbsiztab[typ], siz, ptr);
+}
+
+/* DODECL - Do processing for a parsed declarator
+**	Called by decllist() to process the results of parsing a declarator.
+** This IS called for:
+**	toplevel declarations
+**	local (at head of block) declarations
+** This is NOT called for:
+**	abstract declarators - handled by typename().
+**	function parameter declarations - handled by funcdef().
+**	structure/union declarations - handled by sdeclaration().
+** This also checks for an initializer, and handles it if one
+** exists.  Note the first two args refer to temporary symbol structures
+** which are NOT in the symbol table.
+*/
+
+static NODE *
+dodecl(baseclass, d, s)
+int baseclass;	/* Whatever was actually parsed as storage class */
+SYMBOL *d,	/* Declarator identifier, with sc and type all set up */
+	*s;	/* Symbol table entry for the identifier */
+{
+    SYMBOL *ns;
+    TYPE *nt;
+    NODE *z;
+
+    /* Symbol table entry will always exist, because the
+    ** lexer will have created it if necessary as a global symbol with
+    ** symbol class SC_UNDEF.  If the new symbol actually should be a local one
+    ** then it needs to be flushed and then created again in the right place.
+    */
+
+    /* Check for a function reference, which needs special handling */
+    switch (d->Stype->Tspec) {
+	case TS_VOID:			/* Declaring a void object? */
+	    if (d->Sclass != SC_TYPEDEF) {
+		error("Cannot declare %S (or any object) as void", s);
+		d->Stype = deftype;
+	    }
+	    break;
+	case TS_FUNCT:		/* Function reference or typedef */
+	    /* Take care of open local sym block if necessary */
+	    if (d->Spmnext) {		/* Param sym blk active? */
+		if (d->Svalue == 0)	/* Old-style function identlist? */
+		    error("Bad syntax - function parameters without body");
+		ridlsym(d->Spmhead);	/* Yes, flush syms from paramlist */
+		d->Spmnext = d->Spmhead = NULL;	/* Be neat just in case */
+	    }
+	    if (d->Sclass != SC_TYPEDEF) {	/* A function reference? */
+		funchk(0, baseclass, d, s);	/* Yep, go handle */
+		prtchk(s->Stype, s, 0);	/* Check for missing prototype */
+		return NULL;		/* function decl doesn't use storage */
+	    }
+	    break;
+    }
+
+    /* Real variable or typedef, do things depending on class */
+    switch (d->Sclass) {
+    case SC_TYPEDEF:		/* Type definition */
+	if (isdupsym(s))	/* This symbol already def'd in same block? */
+	    errdupsym(s);
+	s = uniqsym(s);		/* Ensure sym is fresh new one */
+	s->Sclass = d->Sclass;	/* Fill in necessary parts of sym */
+	s->Stype = d->Stype;
+	prtchk(s->Stype, s, 0);	/* Check for missing prototype */
+	return NULL;		/* no initialization or storage */
+
+    case SC_AUTO:		/* local extent variable, in function */
+    case SC_RAUTO:
+	if (isdupsym(s))
+	    error("Duplicate definition: \"%s\"", s->Sname);
+	s = uniqsym(s);		/* Always make local cell */
+	s->Sclass = d->Sclass;	/* Fill in necessary parts of sym */
+	s->Stype = d->Stype;
+	break;			/* Go check for izer */
+
+    /* External linkage, use existing sym if any.
+    ** No storage class given, treat basically as if "extern" with
+    ** possibility of being a tentative definition.
+    ** Not sure what to do about re-using Sflags.
+    */
+    case SC_EXLINK:		/* No storage class given, file-scope */
+	if (lsymhead) {		/* Should always be at file scope */
+	    int_error("dodecl: scope mismatch");
+	    return NULL;
+	}
+	s = symfxext(s);	/* Ensure an SC_XEXTREF is made visible */
+	if (s->Sclass != SC_UNDEF) {	/* Check out type if any */
+	    --(s->Srefs);		/* Linkage isn't a real ref */
+	    if (nt = tcomposite(d->Stype, s->Stype))
+		d->Stype = nt;		/* Types compatible, use composite */
+	    else errtwotyp(d, s);	/* Types not compatible, barf */
+	} else if (!mapextsym(s))	/* New, so set Smaplab now */
+	    error("External link name duplicated: \"%s\"", s->Sname);
+	s->Stype = d->Stype;		/* Clobber sym type to new one */
+
+	if (token != Q_ASGN) switch (s->Sclass) { /* If just a ref, simple */
+	    case SC_INTDEF: case SC_INTREF: case SC_INLINK:
+		error("Linkage conflict (was internal)");
+		s->Sclass = (s->Sclass==SC_INTDEF ? SC_EXTDEF : SC_EXLINK);
+		prtchk(s->Stype, s, 0);	/* Check for missing prototype */
+		return NULL;
+
+	    default:
+		errdupsym(s);		/* Barf & fall thru */
+	    case SC_UNDEF:
+	    case SC_XEXTREF: case SC_EXTREF:
+		s->Sclass = SC_EXLINK;
+	    case SC_EXTDEF: case SC_EXLINK:
+		prtchk(s->Stype, s, 0);	/* Check for missing prototype */
+		return NULL;
+	}
+	/* Handle initializing definition */
+	switch (s->Sclass) {
+	case SC_INTDEF:	case SC_EXTDEF:
+	    error("Multiple initialization of %s", s->Sname);
+	    break;		/* Do it anyway... */
+	case SC_INTREF:	case SC_INLINK:
+	    error("Linkage conflict (was internal)");
+	    /* Fall thru to handle as if extern */
+	case SC_UNDEF:
+	case SC_XEXTREF: case SC_EXTREF: case SC_EXLINK:
+	    s->Sclass = SC_EXTDEF;
+	    break;
+	default:
+	    errdupsym(s);
+	    s->Sclass = SC_EXTDEF;	/* Sigh!  Smash it. */
+	    break;
+	}
+	break;				/* Go parse izer now */
+
+    /* "extern" - existing or external linkage, use existing sym if any.
+    ** If in block scope and object ident already belongs to a
+    ** block-scope symbol, we:
+    ** (1) see if a file-scope symbol exists (if so, use that one)
+    ** (2) see if existing sym is external ref (if so, use that)
+    ** (3) generate new file-scope symbol with SC_EXTREF.
+    ** Again, not sure how to re-use Sflags.
+    */
+    case SC_EXTREF:		/* "extern" given, file or block scope */
+	s = symfxext(s);	/* Ensure an SC_XEXTREF is made visible */
+	if (lsymhead && (s->Sflags&SF_LOCAL)) {
+	    if (ns = findgsym(s))	/* If file-scope def/ref exists, */
+		s = ns;			/* use that! */
+	    else if (s->Sclass == SC_EXTREF)
+			;		/* OK if a block-scope extern ref */
+	    else {
+		if (isdupsym(s))	/* If was defined in this block, */
+		    errdupsym(s);	/* barf! */
+		s = uniqsym(s);		/* Create/re-use sym, now SC_UNDEF */
+	    }
+	}
+	/* "s" now points to the sym linked to.  If it has any linkage, we
+	** copy that, otherwise we use external linkage.
+	*/
+	if (s->Sclass != SC_UNDEF) {	/* Check out type if any */
+	    --(s->Srefs);		/* Linkage isn't a real ref */
+	    if (nt = tcomposite(d->Stype, s->Stype))
+		d->Stype = nt;		/* Types compatible, use composite */
+	    else errtwotyp(d, s);	/* Types not compatible, barf */
+	} else if (!mapextsym(s))	/* New, so set Smaplab now */
+	    error("External link name duplicated: \"%s\"", s->Sname);
+	s->Stype = d->Stype;		/* Clobber sym type to new one */
+
+	if (token != Q_ASGN) switch (s->Sclass) { /* If just a ref, simple */
+	    default:
+		errdupsym(s);
+	    case SC_UNDEF:
+		s->Stype = d->Stype;
+	    case SC_XEXTREF:
+		s->Sclass = SC_EXTREF;
+	    case SC_INTDEF: case SC_INTREF: case SC_INLINK:
+	    case SC_EXTDEF: case SC_EXTREF: case SC_EXLINK:
+		prtchk(s->Stype, s, 0);	/* Check for missing prototype */
+		return NULL;
+	}
+	/* Handle initializing definition */
+	if (lsymhead)
+	    error("Illegal to initialize block-scope extern");
+	switch (s->Sclass) {
+	case SC_INTDEF:	case SC_EXTDEF:
+	    error("Multiple initialization of %s", s->Sname);
+	    break;			/* Do it anyway... */
+	case SC_INTREF:	case SC_INLINK:
+	    s->Sclass = SC_INTDEF;
+	    break;
+	default:
+	    errdupsym(s);		/* Barf and fall thru */
+					/* to handle as if undef */
+	case SC_UNDEF:
+	case SC_XEXTREF: case SC_EXTREF: case SC_EXLINK:
+	    s->Sclass = SC_EXTDEF;
+	    break;
+	}
+	break;				/* Go handle izer now */
+
+    /* "static" - internal or no linkage 
+    ** In block scope always defines a unique object with no linkage;
+    **		this becomes SC_ISTATIC.
+    ** In file scope, it declares an object with internal linkage:
+    **		with izer, it becomes SC_INTDEF (a def w/internal linkage)
+    **		otherwise, SC_INLINK (a tentative def, w/internal linkage)
+    **		It is an error if a SC_INTREF (function ref) already exists.
+    ** Again, not sure how to re-use Sflags.
+    */
+    case SC_INTREF:		/* "static" given - internal linkage */
+	if (!lsymhead) {		/* Check for existing global ref */
+	    d->Sclass = (token == Q_ASGN) ? SC_INTDEF : SC_INLINK;
+	    if (s->Sclass == SC_XEXTREF || s->Sclass == SC_EXTDEF
+	      || s->Sclass == SC_EXTREF || s->Sclass == SC_EXLINK) {
+		error("Linkage conflict (was external)");
+	    } else if (s->Sclass == SC_INTDEF || s->Sclass == SC_INLINK
+		|| s->Sclass == SC_UNDEF) {
+
+		if (s->Sclass != SC_UNDEF) { /* Check out type if any */
+		    --(s->Srefs);	/* Not really a usage */
+		    if (nt = tcomposite(d->Stype, s->Stype))
+			d->Stype = nt;	/* Types compatible, use composite */
+		    else errtwotyp(d, s); /* Types not compatible, barf */
+		} else mapintsym(s);	/* New, set Smaplab to unique name */
+		s->Stype = d->Stype;	/* Clobber sym type to new one */
+
+		if (token != Q_ASGN) {	/* Just a reference? */
+		    s->Sclass = d->Sclass;
+		    prtchk(s->Stype, s, 0); /* Check for missing prototype */
+		    return NULL;	/* Yep, checking all done! */
+		}
+		if (s->Sclass != SC_INTDEF) {
+		    s->Sclass = SC_INTDEF;	/* Def of a prior tent def */
+		    break;			/* Go parse izer */
+		}
+		error("Duplicate initialization of %s", s->Sname);
+		/* Fall thru to create duplicate symbol and initialize it */
+	    }
+	} else
+	    d->Sclass = SC_ISTATIC;	/* Internal static */
+
+	/* Block scope, or handling duplicate top-level sym */
+	if (isdupsym(s))		/* Check for duplicate def */
+	    errdupsym(s);
+	s = uniqsym(s);			/* Then always make unique cell */
+	if (lsymhead)			/* If in a local block (SC_ISTATIC) */
+	    s->Ssym = newlabel();	/* create internal handle on object */
+	s->Sclass = d->Sclass;
+	s->Stype = d->Stype;
+	break;
+
+    default:
+	int_error("dodecl: illegal Sclass %d for %s", d->Sclass, s->Sname);
+	prtchk(s->Stype, s, 0);		/* Check for missing prototype */
+	return NULL;
+    }
+    prtchk(s->Stype, s, 0);		/* Check for missing prototype */
+
+    /* Parse initializer.
+    ** At this point the symbol is guaranteed to have one of these classes:
+    **	SC_EXTDEF, SC_EXLINK, SC_EXTREF,
+    **	SC_INTDEF, SC_INLINK, SC_ISTATIC, SC_AUTO, SC_RAUTO.
+    */
+    if (token == Q_ASGN) {
+	nextoken();		/* skip equal sign */
+	z = pizer(s);		/* New initializer parsing */
+	if (z == NULL)
+	    error("Null initializer for \"%s\"", s->Sname);
+    } else {
+	z = NULL;
+
+	/* No initializer.  Check to make sure this is okay. */
+	if (s->Stype->Tspec == TS_ARRAY		/* If type is array, check */
+	  && s->Stype->Tsize == 0		/* to make sure size 0 okay */
+	  && s->Sclass != SC_EXTREF		/* Only ext refs allowed */ 
+	  && s->Sclass != SC_EXLINK)
+	    error("Missing size for def of array \"%s\"", s->Sname);
+
+	/* If doing a file-scope tentative definition, we defer
+	** creation of a node (and thus defer emitting code to reserve
+	** storage).  This will be done either at end of file or
+	** when an initializing definition is seen.
+	*/
+	if (s->Sclass == SC_INLINK || s->Sclass == SC_EXLINK)
+	    return NULL;
+    }
+
+    /* For auto variables, assign stack offset and update total stack size.
+    ** This must be done after parsing initializer in case the size of an
+    ** array was specified by the izer.
+    */
+    if (s->Sclass == SC_AUTO || s->Sclass == SC_RAUTO) {
+	s->Svalue = maxauto;		/* Remember its stack offset */
+	maxauto += sizetype(s->Stype);	/* and count it in to frame size */
+    }
+
+    /* Make a izer node combining a Q_IDENT for the sym with its izer */
+    return ndeflr(N_IZ, ndefident(s), z);
+}
+
+/* DEFAUTO - Define an automatic variable of the given type.
+**	This routine is for the benefit of CCSTMT's function call
+**	parsing, which sometimes needs to create temporary internal
+**	variables to hold return values.
+**	The id is assumed to be unique.
+*/
+SYMBOL *
+defauto(id, typ)
+char *id;
+TYPE *typ;
+{
+    SYMBOL *s;
+    s = creatsym(id);		/* Make symbol in current scope */
+    s->Sclass = SC_AUTO;
+    s->Srefs++;			/* This is always a reference */
+    s->Stype = typ;
+    s->Svalue = maxauto;	/* Remember stack offset for it */
+    maxauto += sizetype(typ);
+    return s;
+}
+
+/* PIZER - Parse initializer.
+**	[dpANS 3.5.7]
+**
+**	<izer>	::= <assignment-expr>
+**			| '{' <izer-list> {','} '}'
+**
+**	<izer-list> ::= <izer> {',' <izer-list>}
+**
+** Argument is pointer to symbol identifier being initialized.
+** Current token should be first thing after the '='.
+**
+** All expressions for a static extent object, or within an <izer-list> for
+** an array, struct, or union type, must be constant expressions.  This
+** can be checked for as (!izautof || lev) which will be TRUE if the
+** expression must be a constant.
+*/
+
+			/* These are set by pizer and refed by its subrs */
+static int izautof;	/* True if symbol being initialized is automatic */
+static SYMBOL *izsym;	/* Symbol for var being initialized */
+
+static NODE *
+pizer(s)
+SYMBOL *s;
+{
+    izautof = isauto(izsym = s);	/* Set "globals" for subroutines */
+    return piztype(s->Stype, 0);	/* Do outermost-level parse for type */
+}
+
+/* PIZTYPE - Parse initializer for a given type.
+**	Recursive; makes use of izautof/izsym globals.
+**	Returns what was parsed even if encountered error, mainly so
+**	debugging can dump out the parse tree.
+*/
+static NODE *
+piztype(t,lev)
+TYPE *t;
+int lev;			/* Level being parsed.  0 - outermost */
+{
+    NODE *e, *n;
+
+    switch (t->Tspec) {
+	case TS_BITF:	case TS_UBITF:
+	case TS_CHAR:	case TS_UCHAR:
+	case TS_SHORT:	case TS_USHORT:
+	case TS_INT:	case TS_UINT:
+	case TS_LONG:	case TS_ULONG:
+	case TS_ENUM:			/* Enums treated like ints */
+	    if (e = pexizer(lev))	/* Parse a single expression */
+		return chkarith(t, e, lev, N_ICONST);
+	    break;
+
+	case TS_FLOAT:	case TS_DOUBLE: case TS_LNGDBL:
+	    if (e = pexizer(lev))	/* Parse a single expression */
+		return chkarith(t, e, lev, N_FCONST);
+	    break;
+
+	case TS_PTR:
+	    /* Parse a single expression */
+	    if ((e = pexizer(lev)) == NULL)
+		break;
+	    if ((n = convasgn(t, e)) != e)	/* Apply assignment convs */
+		e = (optpar || !izautof || lev)	/* and optimize result if */
+			? evalexpr(n) : n;	/* want or need to. */
+	    if (!cmputype(t, e->Ntype)) {	/* Types must match */
+		error("Pointer (%T) initializer has wrong type (%T)",
+		      t, e->Ntype);
+		break;
+	    }
+
+	    /* A constant expression for a pointer requires hairy checks. */
+	    if ((!izautof || lev)	/* If must be a constant expr */
+	      && !nisconst(e)) {	/* then check it out */
+		error("Pointer initializer not constant");
+		break;
+	    }
+	    break;		/* OK, return e */
+
+	case TS_ARRAY:
+	    return pizarray(t, lev);
+
+	case TS_STRUCT:
+	    return pizstruct(t, lev, 0);
+
+	case TS_UNION:
+	    if (clevel >= CLEV_ANSI)
+		return pizstruct(t, lev, 1);
+	    error("Cannot initialize union type");
+	    return pizlist();	/* Parse it anyway for debugging */
+
+	case TS_VOID:
+	    error("Cannot initialize void type");
+	    return pizlist();	/* Parse it anyway for debugging */
+
+	case TS_FUNCT:
+	    error("Cannot initialize function type");
+	    return pizlist();	/* Parse it anyway for debugging */
+
+	default:
+	    int_error("piztype: unknown Tspec = %d", t->Tspec);
+	    return NULL;
+    }
+    return e;
+}
+
+/* CHKARITH - Check initializer for arithmetic type.
+**	This is a subroutine for code sharing purposes.
+*/
+static NODE *
+chkarith(t, e, lev, noptyp)
+TYPE *t;
+NODE *e;
+int lev, noptyp;
+{
+    NODE *n;
+
+    if (!tisarith(e->Ntype)) {
+	error("Initializer must be of arithmetic type");
+	return e;
+    }
+    if ((n = convasgn(t, e)) != e)	/* Apply assignment convs */
+	e = (optpar || !izautof || lev)	/* and optimize result if */
+		? evalexpr(n) : n;	/* want or need to. */
+
+/* RPH changed 3-Jan-94 to allow pointers cast to integers
+ *	    if ((!izautof || lev) && e->Nop != noptyp)
+ *		error("%s constant required as initializer",
+ *			(noptyp == N_ICONST ? "Integer" : "Floating-point"));
+ * any illegal casts are caught at code generation time.
+ */
+
+    if ((!izautof || lev) && !nisconst(e))
+	error("%s initializer not constant",
+		(noptyp == N_ICONST ? "Integer" : "Floating-point"));
+    return e;
+}
+
+/* PIZSTRUCT - Parse initializer for a structure or union.
+**	If struct/union is static (not auto), izer must be brace-enclosed;
+**		an auto izer may or may not have braces.
+**	If izer is brace-enclosed or within a list, all members must be
+**		constants; for unions, only one constant is allowed, and
+**		this constant initializes the first member.
+**	Otherwise (for auto izer w/o braces), the expression need not be
+**		constant, but must have the proper struct/union type.
+**
+**	Returns parsed stuff even if error, for debugging.
+*/
+static NODE *
+pizstruct(t, lev, isunion)
+TYPE *t;
+int lev;
+int isunion;			/* TRUE if parsing union izer, else struct */
+{
+    register SYMBOL *smem;
+    NODE *e, *n, *root;
+    int braces;
+
+    if (clevel < CLEV_ANSI && izautof)			/* Complain now */
+	error("Initialization of auto struct/union not allowed");
+    if ((smem = t->Tsmtag->Ssmnext) == NULL) {
+	error("Attempting to initialize an undefined struct/union");
+	return pizlist();		/* Flush entire izer */
+    }
+    if (smem->Sclass != SC_MEMBER)		/* Paranoia check */
+	int_error("bad smem class");
+
+    braces = (token == T_LBRACE);	/* Remember if have braces */
+    if (!braces && lev == 0) {		/* Izing with struct/union expr? */
+	if (!izautof) {			/* Can only do if auto */
+	    error("Static struct/union initializer must be enclosed in braces");
+	    return pizlist();		/* Flush entire izer */
+	}
+	e = pexizer(lev);		/* Get struct/union expr */
+	if (e && !cmputype(t, e->Ntype)) {
+	    error("Struct/union (%T) initializer has wrong type (%T)",
+		  t, e->Ntype);
+	    pizlist();
+	}
+	return e;
+    }
+
+    /* Now loop through structure members, reading an initializer for each.
+    ** Note that first thing in list has its type set either to
+    ** the overall type being initialized, if a struct, or the first
+    ** member of the union, if a union.  This is for genadata() in CCGEN1.
+    */
+    if (braces) nextoken();			/* Skip over left-brace */
+    root = n = ndeftl(N_IZLIST,			/* Start list, */
+		(isunion ? smem->Stype : t),	/* giving its type. */
+		piztype(smem->Stype, 1));	/* Parse 1st member */
+
+    if (!braces) {
+	while (token == T_COMMA) {
+	    if (isunion
+	      || (smem = smem->Ssmnext)==NULL)	/* Stop if no more members */
+		return root;
+	    if (smem->Sclass != SC_MEMBER)	/* Paranoia check */
+		int_error("bad smem class");
+	    if (nextoken() == T_RBRACE)		/* Skip comma, allow ",}" */
+		return root;
+	    n = n->Nright = ndefl(N_IZLIST,	/* Parse element and add in */
+				piztype(smem->Stype, 1));
+	}
+	if (token != T_RBRACE)
+	    error("Bad initializer list syntax");
+	return root;
+
+    } else {	/* Have braces, life is more complicated */
+	while (token == T_COMMA) {
+	    if (nextoken() == T_RBRACE)	/* Skip comma, allow ",}" */
+		break;			/* Stop when done */
+	    if (isunion || (smem = smem->Ssmnext) == NULL) {
+		error("Too many members in initializer list");
+		pizflush(1);			/* Flush rest of list */
+		if (token == T_RBRACE) nextoken();
+		return root;
+	    }
+	    if (smem->Sclass != SC_MEMBER)	/* Paranoia check */
+		int_error("bad smem class");
+	    n = n->Nright = ndefl(N_IZLIST,	/* Parse element and add in */
+				piztype(smem->Stype, 1));
+	}
+	/* Check for proper ending */
+	if (token != T_RBRACE) {
+	    error("Bad initializer list syntax");
+	    pizflush(1);		/* Flush inside of list */
+	    if (token == T_RBRACE)
+		nextoken();		/* Flush end close-brace if one */
+	    return root;
+	}
+	nextoken();			/* Skip close-brace */
+    }
+
+    return root;
+}
+
+/* PIZARRAY - Parse initializer for an array.
+*/
+static NODE *
+pizarray(t, lev)
+TYPE *t;
+int lev;
+{
+    register TYPE *subt;
+    NODE *n, *root;
+    int cnt, braces, size, gotstr = 0;
+
+    if (clevel < CLEV_ANSI && izautof)			/* Complain now */
+	error("Initialization of auto arrays is not allowed");
+
+    if (((subt = t->Tsubt) == NULL)	/* Paranoia - must have subtype */
+      || (t->Tsize == 0 && lev)) {	/* Unknown size only OK for top lev */
+	int_error("pizarray: %s",
+			(!subt) ? "null subt" : "no inner array size");
+	return pizlist();		/* Flush entire izer */
+    }
+
+    braces = (token == T_LBRACE);	/* Remember whether have braces */
+    if (braces) nextoken();		/* Skip over left-brace */
+
+    /* Now handle first array element.  Requires some special hackery
+    ** for initializing array of char with a string literal.
+    */
+    if (tischar(subt) && token == T_SCONST) {	/* Char array, and str lit? */
+	if (!(n = pexizer(1)) || n->Nop != N_SCONST) {
+	    int_error("pizarray: bad sconst");	/* Paranoia check */
+	    return NULL;
+	}
+	++gotstr;			/* Got string, set flag! */
+	cnt = n->Nsclen;		/* Set # of elements acquired */
+	if (braces && token == T_COMMA)	/* Permit {"str",} */
+	    nextoken();
+    } else {
+	if (!braces && lev == 0) {
+	    error("Outer array initializer must be enclosed in braces");
+	    pizflush(1);
+	    return NULL;
+	}
+	n = piztype(subt, 1);		/* Parse 1st element of subtype */
+    }
+
+    /* Now loop through list, reading array elements (unless had a string).
+    ** If brace-enclosed, read infinite elements up to closing brace, else
+    ** stop when read just enough elements.
+    ** Note that first node on list has its type set to the overall type
+    ** of the array; this is for genadata() in CCGEN1.
+    */
+    root = n = ndeftl(N_IZLIST, t, n);		/* Put 1st into list */
+
+    if (!gotstr) {
+	size = (braces ? size = ((unsigned)(~0)>>1)	/* Inf if braces */
+			: t->Tsize);
+	for (cnt = 1; token == T_COMMA && cnt < size; ++cnt) {
+	    if (nextoken() == T_RBRACE)		/* Skip comma, allow ",}" */
+		break;
+	    n = n->Nright = ndefl(N_IZLIST,	/* Parse element and add in */
+					piztype(subt, 1));
+	}
+    }
+
+    /* Now either fix up size of array, or check it against # elems we found */
+    if (t->Tsize == 0)			/* If setting size, cnt always OK */
+	root->Ntype = izsym->Stype = findctype(TS_ARRAY,
+		t->Tflag,		/* Keep same flags */
+		cnt, subt);
+    else if (cnt > t->Tsize) {		/* Complain if too many */
+	if (gotstr) {
+	    if (cnt-1 > t->Tsize)	/* For string, permit NUL omission */
+		error("String exceeds char array bounds");
+	} else error("Too many elements in array initializer list");
+    }
+
+    /* Type checked out, do final checking for valid terminator and return */
+    if (braces) {				/* If brace-enclosed, */
+	if (token == T_RBRACE) nextoken();	/* must end in right brace */
+	else {
+	    error("Bad initializer list syntax");
+	    pizflush(1);			/* Flush inner list */
+	    if (token == T_RBRACE)
+		nextoken();
+	}
+    } else if ((!gotstr || lev) && token != T_COMMA && token != T_RBRACE)
+	error("Bad initializer list syntax");
+
+    return root;			/* Done, return N_IZLIST! */
+}
+
+/* PEXIZER - Parse single initializer expression.
+**	Should be only one expression; outermost braces are allowed.
+**	Never returns a list; complains and fixes up as necessary.
+*/
+static NODE *
+pexizer(lev)
+int lev;			/* 0 if outermost level */
+{
+    NODE *n;
+    if (token != T_LBRACE)
+	return (optpar || !izautof || lev)	/* If want or need constant */
+		?  evalexpr(asgnexpr())		/* evaluate parse result */
+		: asgnexpr();
+
+    /* We have a list of some sort.  This is only legal if at outermost
+    ** level AND there is only one thing in the list.
+    */
+    if (lev)
+	error("Inner initializer for this object cannot be a list");
+    n = pizlist();		/* Parse the list, always returns N_IZLIST */
+    if (n->Nright && lev == 0)	/* More than one thing in list? */
+				/* Complain unless already complained above */
+	error("Initializer cannot be a list of more than one element");
+    if ((n = n->Nleft) == NULL) {
+	error("Null initializer");
+	return NULL;
+    }
+    if (n->Nop == N_IZLIST) {	/* Sublist? */
+	error("Initializer cannot have sublist");
+	while (n->Nop == N_IZLIST && (n = n->Nleft));
+    }	
+    return (optpar || !izautof || lev)	/* If want or need constant */
+		?  evalexpr(n)		/* evaluate parse result */
+		: n;
+}
+
+/* PIZLIST - Parse initializer list
+**	Mainly for error recovery, when contents aren't analyzed closely.
+*/
+static NODE *
+pizlist()
+{
+    NODE *n, *root;
+
+    if (token != T_LBRACE)	/* If not a list, return simple izer */
+	return asgnexpr();	/* Don't need to waste time optimizing */
+
+    nextoken();				/* Skip open brace */
+    root = n = ndefl(N_IZLIST, pizlist());
+    while (token == T_COMMA) {
+	nextoken();			/* Skip comma */
+	if (token == T_RBRACE) break;	/* allow comma at end of initializer */
+	n = n->Nright = ndefl(N_IZLIST, pizlist());
+    }
+    expect(T_RBRACE);			/* finish with close brace */
+    return root;			/* return whole thing */
+}
+
+/* PIZFLUSH - Flush initializer tokens
+**	Used during error recovery.  Type says what situation we're in.
+**	0 - at start of izer, flush entire izer.
+**		(stop if top-level comma, gobble end close-brace if one seen)
+**		This also works to flush only a single list, if at its start.
+**	1 - inside a list, flush to higher-level close-brace and don't
+**		gobble it, so caller can handle close-brace.
+*/
+static void
+pizflush(typ)
+int typ;
+{
+    int lev = 0;
+    if (typ) lev = 1;		/* Pretend already in a list */
+    for(;; nextoken()) switch(token) {
+	case T_COMMA:
+	    if (typ == 0 && lev <= 0) return;
+	    break;
+	case T_LBRACE:		/* Start of list */
+	    lev++;
+	    break;
+	case T_RBRACE:		/* End of list */
+	    if (--lev <= 0) {
+		if (typ == 0) nextoken();	/* Maybe gobble close-brace */
+		return;
+	    }
+	    break;
+
+	case T_EOF:		/* Input EOF */
+	case T_SCOLON:		/* End of declaration statement */
+	    return;
+    }
+}
+
+/* NISCONST - Returns true if expression is an allowable initializer constant.
+**	Return value indicates something about the type of constant:
+**	0 - not a constant
+**	1 - definitely a constant (arithmetic, or a cast pointer)
+**	2 - address of some kind
+**	3 - function address (cannot add or subtract from this)
+*/
+static int
+nisconst(e)
+NODE *e;
+{
+    switch(e->Nop) {
+	case N_CAST:		/* Assume generator will be able to handle */
+	    return nisconst(e->Nleft);
+
+	case N_ICONST:
+	case N_FCONST:
+	case N_PCONST:
+	    return 1;		/* Simple constant */
+	case N_SCONST:
+	    return 2;		/* Address */
+
+	case Q_IDENT:
+		/* Identifier.  See documentation for Q_IDENT in INTERN.DOC
+		** for explanation of this method of testing.
+		*/
+	    switch (e->Nid->Stype->Tspec) {
+		case TS_FUNCT:	return 3;	/* Function address */
+		case TS_ARRAY:	return 2;	/* Array address */
+	    }
+	    break;
+
+	case N_ADDR:
+	    switch (e->Nleft->Nop) {
+		case N_PTR:
+		    return nisconst(e->Nleft->Nleft);
+
+#if 0
+		/* Allow for conversion of arrays generated by subscripting */
+		case Q_PLUS:
+		    if (e->Nleft->Ntype->Tspec == TS_ARRAY)
+			return nisconst(e->Nleft);	/* OK, continue */
+		    break;				/* Not array, fail */
+#endif
+		/* Structure hair.
+		** For MEMBER (->) the Nleft must be a constant address.
+		**	Can just apply nisconst to this.
+		** For DOT (.) the Nleft can be anything that evaluates into
+		**	a static structure.  We assume this is only possible
+		**	with either Q_IDENT, or N_PTR of a struct addr.
+		*/
+		case Q_DOT:
+		    if (tisbitf(e->Nleft->Ntype))	/* No bitfield ptrs */
+			return 0;
+		    switch (e->Nleft->Nleft->Nop) {
+			case Q_IDENT:
+			    switch (e->Nleft->Nleft->Nid->Sclass) {
+				case SC_XEXTREF: case SC_EXLINK:
+				case SC_EXTDEF: case SC_EXTREF:
+				case SC_INTDEF: case SC_INTREF:
+				case SC_INLINK: case SC_ISTATIC:
+				    return 2;	/* Good address of object */
+			    }
+			    break;
+			case N_PTR:
+			    if (nisconst(e->Nleft->Nleft->Nleft)==2)
+				return 2;
+			    break;
+		    }
+		    break;			/* Otherwise fail. */
+
+		case Q_MEMBER:
+		    if (!tisbitf(e->Nleft->Ntype)	/* No bitfield ptrs */
+		      && nisconst(e->Nleft->Nleft)==2)	/* If struct addr is */
+			return 2;		/*  OK, then we're OK */
+		    break;			/* Otherwise fail. */
+
+		case Q_IDENT:	/* Addr OK if of external or static */
+			/* Needn't test type since parser checks it while
+			** parsing "&" to verify not function or array.
+			*/
+		    switch (e->Nleft->Nid->Sclass) {
+			case SC_XEXTREF: case SC_EXLINK:
+			case SC_EXTDEF: case SC_EXTREF:
+			case SC_INTDEF: case SC_INTREF:
+			case SC_INLINK: case SC_ISTATIC:
+			    return 2;		/* Good address of object */
+		    }
+		    break;
+	    }
+	    break;
+
+	/* Non-atomic expression checks, for plus and minus. */
+	case Q_PLUS:
+	    if (e->Nleft->Nop == N_ICONST	/* Integ constant */
+		&& nisconst(e->Nright) == 2)	/* plus address */
+		    return 2;
+	    /* Fall through into Q_MINUS code */
+	case Q_MINUS:
+	    if (nisconst(e->Nleft) == 2		/* Address */
+	      && e->Nright->Nop == N_ICONST)	/* plus/minus integ constant */
+		return 2;
+	    break;
+    }
+    return 0;
+}
+
+#if 0
+/* CHKPTRCON - utility routine to check out a pointer initializer.
+**	Allowed initializers (per CARM 4.6.3) must be an integer or
+**	a static/external address plus/minus an integer.
+*/
+static NODE *
+chkptrcon(e)
+NODE *e;
+{
+    NODE *n, *addr, *con;
+
+    n = (e->Nop == N_CAST) ? e->Nleft : e;	/* Allow casts */
+    if (n->Nop == N_ICONST) return e;	/* Integer const OK (case 1,6) */
+    if (n->Nop == Q_IDENT) return e;	/* Funct or array name OK (case 2,3) */
+					/* (type cked by convasgn) */
+
+    if (n->Nop == Q_PLUS || n->Nop == Q_MINUS) {
+	addr = n->Nleft;
+	con = n->Nright;
+	if (n->Nop == Q_PLUS && con->Nop != N_ICONST)
+	    addr = n->Nright, con = n->Nleft;
+	if (con->Nop != N_ICONST) {
+	    error("Pointer initializer constant has bad expression");
+	    return NULL;
+	}
+    } else addr = n;
+
+    /* Check out address */
+    n = (addr->Nop == N_CAST) ? addr->Nleft : addr;	/* Allow casts */
+    if (n->Nop == N_ICONST) return e;	/* Integer const OK (case 6) */
+    if (n->Nop == N_SCONST) return e;	/* String const OK (case 7) */
+    if (n->Nop == N_ADDR) {		/* Addr of something (case 4) */
+	addr = n->Nleft;
+	if (addr->Nop != Q_IDENT
+	  || isauto(addr->Nid)) {
+	    error("Constant pointer initializer has non-constant addr");
+	    return NULL;
+	}
+
+    }
+    return e;
+}
+#endif /* commented-out code */
+
+/* ISAUTO - Returns true if symbol has automatic extent
+*/
+static int
+isauto(s)
+SYMBOL *s;
+{
+    switch(s->Sclass) {
+	case SC_ARG:  case SC_RARG:
+	case SC_AUTO: case SC_RAUTO:
+		return 1;
+	default:
+		return 0;
+    }
+}
+
+/* TYPENAME - Parse type name for cast and sizeof expressions.
+**	[dpANS 3.5.5]
+**
+**	<type-name> ::= <spec-qual-list> {abstract-declor}
+**	
+** This parses a "type name" built from an abstract declarator.
+** Storage-class specifiers and identifiers are illegal.
+*/
+
+TYPE *
+typename()
+{
+    SYMBOL s, *t;
+
+    pbase(&s);			/* Parse base */
+    if (s.Sclass != SC_UNDEF) {
+	error("Storage class not allowed for type-name");
+	s.Sclass = SC_UNDEF;
+    }
+    if (s.Stype == NULL) {
+	error("No type-specifier for type-name, assuming int");
+	s.Stype = deftype;
+    }
+    if ((t = declarator(&s)) != NULL) {
+	error("Identifier not allowed in type-name");
+	if (t->Sclass == SC_UNDEF)
+	    freesym(t);			/* Clean up */
+    }
+    return s.Stype;
+}
+
+/* Miscellaneous auxiliaries */
+
+static void
+errtwotyp(d, s)
+SYMBOL *d, *s;		/* New decl sym and existing sym */
+{
+    error("Symbol %S (type %T) previously declared with different type (%T)",
+	  s, ParamSubt(d->Stype), ParamSubt(s->Stype));
+}
+
+static void
+errdupsym(s)
+SYMBOL *s;
+{
+    error("Symbol %S previously defined", s);
+}

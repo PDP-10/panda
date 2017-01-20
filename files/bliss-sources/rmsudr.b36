@@ -1,0 +1,1044 @@
+%TITLE 'U D R  -- User Data Record routines'
+!<BLF/REQUIRE 'RMSBLF.REQ'>
+MODULE udr (IDENT = '2.0'
+		) =
+BEGIN
+
+GLOBAL BIND
+    udrv = 2^24 + 0^18 + 442;			! Edit date: 13-Dec-83
+
+!+
+!
+!
+!    FUNCTION:	THIS MODULE CONTAINS ROUTINES WHICH PROCESS
+!    USER DATA RECORDS WITHIN AN RMS-20 INDEXED FILE.
+!    AUTHOR:	S. BLOUNT
+!
+!
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1977, 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+!
+!
+!
+!    **********	TABLE OF CONTENTS	**************
+!
+!
+!
+!
+!    ROUTINE			FUNCTION
+!    =======			========
+!
+!    MAKEUDR			MAKE A USER DATA RECORD
+!
+!    SDATABKT		SEARCH A USER DATA BUCKET
+!
+!    INSRTUDR		INSERT A USER DATA RECORD
+!
+!    CHKDUP			CHECK FOR DUPLICATE KEY VALUES
+!
+!
+!
+!
+!    REVISION HISTORY:
+!
+!    EDIT	DATE		WHO	PURPOSE
+!    ====	====		===	========
+!
+!    1	24-AUG-76	JK	ADD 'UPDRRVS' ROUTINE.
+!    2	1-SEP-76	JK	REPLACE REFS TO ZERO ID BY 'NULLID'.
+!    3	1-SEP-76	JK	FIX 'UPDRRVS'.
+!    4	1-SEP-76	JK	FIX 'UPDRRVS' -- 'UPDBKD' SHOULD BE MAPPED 'FORMAT'.
+!    5	2-SEP-76	JK	REMOVE EDIT 3 (EDIT 4 FOUND REAL CULPRIT).
+!    6	2-SEP-76	JK	REMOVE EDIT 5, REINSTATE EDIT 3, UPDATE RRV REC. CORRECTLY.
+!    7	2-SEP-76	JK	'UPDRRVS' NOW HANDLES "RRV NOT FOUND" CORRECTLY.
+!    8	3-SEP-76	JK	RMSUDR SPLIT INTO RMSUDR, RMSUD2, RMSSPT.
+!    9	5-NOV-76	SB	MAKE SDATABKT RETURN EMPTY ON NON-EX BKT
+!    10	9-NOV-76	SB	ADD IDOFRFA INSTEAD OF IDMASK
+!    11	9-DEC-76	SB	CLEAN-UP, TAKE OUT CHECK FOR SAME BKT ON UPDATE
+!    12	13-JAN-77	SB	FIX BUG IN SDATABKT WHERE ENTIRE RFA IS
+!    CHECKED FOR 0 INSTEAD OF ONLY THE ID.
+!    13	17-FEB-77	SB	IF 3-BKT SPLIT & DUP SEEN, MARK AS 2-BKT SPLIT
+!
+!    *************************************************
+!    *						*
+!    *		NEW REVISION HISTORY		*
+!    *						*
+!    *************************************************
+!
+!    PRODUCT	MODULE	 SPR
+!    EDIT	 EDIT	 QAR		DESCRIPTION
+!    ======	======	=====		===========
+!
+!
+!    ***** END OF REVISION HISTORY *****
+!
+!    ***** BEGIN VERSION 2 DEVELOPMENT *****
+!
+!
+!    PRODUCT	MODULE	 SPR
+!    EDIT	 EDIT	 QAR		DESCRIPTION
+!    ======	======	=====		===========
+!
+!    301	300	XXXXX		SUPPORT EXTENDED ADDRESSING.
+!
+!	400	400	xxxxx	    Clean up BLISS code (RL,22-Apr-83)
+!
+!	442	 - 	345002		When RMS attempts to write a
+!					record immediately before a deleted
+!					record with a different key, CHKDUP
+!					may erroneously set the duplicate
+!					flag in the record descriptor, thus
+!					initiating all manner of spurious
+!					processing (done on the assumption
+!					that this is really a duplicate of
+!					the deleted record).
+!					This bug appeared in a three-way
+!					split where SPLIT assumed that the
+!					new record was a duplicate of an
+!					existing record, and so did not
+!					create an index entry for the new
+!					bucket.
+!
+!
+!-
+
+REQUIRE 'rmsreq';
+
+%SBTTL 'MAKEUDR - create UDR'
+
+GLOBAL ROUTINE makeudr (recdesc, userrecordptr) : NOVALUE =
+! MAKEUDR
+! =======
+!
+! THIS ROUTINE CREATES A USER DATA RECORD ( UDR ) IN AN
+!	INDEXED FILE. IT PERFORMS NO INDEX MODIFICATION
+!	OR TRAVERSAL. IT ALSO DOES NOT MODIFY THE CONTENTS OF
+!	THE BUCKET HEADER IN ANY WAY.
+!
+! INPUT:
+!	RECORD DESCRIPTOR:
+!		RECPTR		ADDRESS IN BUCKET TO WRITE RECORD
+!	ADDRESS OF USER DATA RECORD
+!
+! FIELDS WITHIN THE RST WHICH ARE USED:
+!		RSZ		SIZE OF RECORD IN BYTES
+!		RSZW		SIZE OF RECORD IN WORDS
+!
+!
+! OUTPUT:
+!	TRUE ALWAYS
+!
+! INPUT ARGUMENTS MODIFIED:
+!	RECORD DESCRIPTOR:
+!		RFA		RFA OF NEW RECORD
+!		RRV		SET TO BE THE RRV ADDRESS (SAME AS RFA)
+    BEGIN
+
+    REGISTER
+	recordptr,				! POINTER TO THE DATA RECORD
+	recordrfa;				! RFA OF NEW RECORD
+
+    MAP
+	recdesc : REF BLOCK,
+	userrecordptr : REF BLOCK,
+	recordptr : REF BLOCK;
+
+    TRACE ('MAKEUDR');
+
+    !+
+    !    SET UP SOME MISCELLANEOUS STUFF
+    !-
+
+    recordptr = .recdesc [rdrecptr];		! FETCH ADDRESS OF RECORD
+
+    !+
+    !    STORE FLAGS INTO DATA RECORD
+    !-
+
+    recordptr [drflags] = defdrflags;		! USE DEFAULT FLAGS
+
+    !+
+    !    SET UP THE RFA AND THE ID VALUE IN THE RECORD
+    !-
+
+    recordrfa = .recdesc [rdrfa];		! GET IT FROM REC DESC
+    recordptr [drrrvaddress] = .recordrfa;	! STORE IN RECORD
+    recdesc [rdrrv] = .recordrfa;		! PUT BACK IN RRV ADDRESS
+    recordptr [drrecordid] = .recordrfa<lh>;	! 'LH' CORRESPONDS TO RFAID
+
+    IF NOT fixedlength
+    THEN 					! Store size of this record
+	BEGIN
+	recordptr [drrecsize] = .rst [rstrsz];
+	recordptr [drreserved] = 0;		! Just for safety
+	recordptr = .recordptr + 1;		! Bump to data
+	END;
+
+    !+
+    !    Move pointer to the record data
+    !-
+
+    recordptr = .recordptr + fixhdrsize;
+
+    !+
+    !    Move the user record into the file
+    !-
+
+    IF .rmssec NEQ 0
+    THEN
+	xcopy (.userrecordptr, 			! From
+	    .recordptr, 			! To
+	    .rst [rstrszw])			! Size
+    ELSE
+	movewords (.userrecordptr, 		! From
+	    .recordptr, 			! To
+	    .rst [rstrszw]);			! Size
+
+    RETURN
+    END;					! End MAKEUDR
+
+%SBTTL 'SDATABKT - search user data bucket'
+
+GLOBAL ROUTINE sdatabkt (recdesc, bktdesc) =
+! SDATABKT
+! ========
+!
+! ROUTINE TO SEARCH A USER DATA BUCKET.
+!	THIS ROUTINE WILL SEARCH A USER DATA BUCKET FOR
+!	TWO CONDITIONS:
+!		1.	MATCHING KEY VALUE
+!		2.	MATCHING ID VALUE
+!
+!	FOR KEY SEARCHES, THE ROUTINE WILL STOP WHEN A
+!	RECORD KEY VALUE IS FOUND WHICH IS GEQ TO THE
+!	SEARCH KEY VALUE, AND THE STATUS FLAGS IN THE
+!	RECORD DESCRIPTOR WILL BE SET ACCORDINGLY.
+!	FOR KEY SEARCHES, THE SEARCH WILL TERMINATE IF AN
+!	RRV RECORD IS FOUND.
+!
+!	FOR ID SEARCHES, THE ROUTINE WILL STOP WHEN AN
+!	EXACT MATCH IS FOUND, OR WHEN THE END OF THE
+!	BUCKET IS REACHED. FOR ID SEARCHES, THE SEARCH WILL
+!	NOT TERMINATE WHEN AN RRV RECORD IS FOUND.
+!
+!
+! INPUT:
+!	RECORD DESCRIPTOR
+!		RECPTR		PLACE TO START THE SEARCH
+!				.GTR. 0 ==> ADDRESS TO START SEARCH
+!				.EQL. 0 ==> START SEARCH AT TOP OF BKT
+!				.LSS. 0 ==> SEARCH ONLY FIRST RECORD
+!		USERPTR		ADDRESS OF USER DATA RECORD/KEY STRING
+!		USERSIZE	SIZE OF DATA RECORD/KEY STRING
+!		RFA		CONTAINS ID TO SEARCH FOR, OR 0 FOR KEY SEARCH
+!		FLAGS
+!			<NONE>
+!
+!	BUCKET DESCRIPTOR OF BUCKET
+!
+! OUTPUT STATUS:
+!	TRUE:		SEARCH TERMINATED NORMALLY
+!			FLGLSS MAY BE SET IF MATCH WAS .LSS.
+!	FALSE:		SEARCH TERMINATED ABNORMALLY
+!			(I.E. RECORD NOT FOUND)
+!
+! INPUT ARGUMENTS MODIFIED:
+!	RECORD DESCRIPTOR
+!		RECPTR		ADDRESS OF SEARCH TERMINATION
+!		LASTRECPTR	ADDRESS OF RECORD BEFORE CURRENT ONE
+!		STATUS		FLAGPST
+!				FLAGLSS
+!
+! NOTES ON INPUT ARGUMENTS:
+!
+!	1.	IF RECPTR IS LESS THAN 0, IT MEANS THAT THIS
+!		ROUTINE IS TO SEARCH ONLY THE FIRST RECORD IN
+!		THE NEXT BUCKET. THIS OCCURS WHEN AN INDEX
+!		TREE ERROR IS DETECTED (THE INDEX RECORD KEY IS
+!		GREATER THAN THE KEY OF THE LAST RECORD IN THE
+!		BUCKET WHICH IT POINTS TO). BY CHECKING ONLY THE
+!		FIRST RECORD IN THE NEXT BUCKET, WE CAN DETERMINE
+!		THE CORRECT POSITIONING FOR THE OPERATION.
+!
+!NOTE ON OUTPUT ARGUMENTS:
+!	1)  IF FLGPASTLAST IS SET ON RETURN, RECPTR WILL POINT
+!	TO THE RECORD POSITION FOLLOWING THE LAST DATA RECORD (EITHER
+!	END OF BUCKET OR 1ST RRV ) ON KEY SEARCHES. ON ID SEARCHES,
+!	THE SEARCH TERMINATION WILL ONLY BE AT THE END OF BUCKET.
+!
+!	2 )  IF THE SEARCH TERMINATES AT THE FIRST RECORD, THEN
+!	LASTRECPTR WILL POINT TO THE FIRST RECORD (AS WILL RECPTR).
+!
+! ROUTINES CALLED:
+!	CKEYUU
+!	CKEYUI
+    BEGIN
+
+    MAP
+	recdesc : REF BLOCK,
+	bktdesc : REF BLOCK;
+
+    REGISTER
+	movingptr : REF BLOCK,
+	searchid,				! ID OF RFA TO SEARCH FOR
+	searchrfa,				! ENTIRE RFA TO SEARCH FOR
+	tempac;
+
+    LOCAL
+	endptr : REF BLOCK,			! ADDR OF END OF BUCKET
+	headersize,				! SIZE OF RECORD HEADER
+	stopatfirstflag,			! FLAG FOR SEARCH
+	sidrflag,				! ON IF SCANNING SIDR'S
+	dummy,					! DUMMY LOCAL VARIABLE
+	savestatus,
+	dataptr : REF BLOCK;			! PTR TO DATA RECORD
+
+    TRACE ('SDATABKT');
+
+    !+
+    !    SET UP FOR BUCKET SEARCH
+    !-
+
+    sidrflag = (stopatfirstflag = false);
+
+    IF .kdb [kdbref] NEQ refprimary THEN sidrflag = true;
+
+    clrflag (recdesc [rdstatus], rdflglss + rdflgempty + rdflgpst + rdflgdelete);
+    endptr = .bktdesc [bkdbktadr];		! BEGIN TO COMPUTE END
+!+
+!    IF THIS IS NOT A DATA BUCKET, THEN EITHER THERE IS
+!    A BUG, OR THE USER IS DOING RFA ACCESS WITH A BAD
+!    RFA, BUT WE CAN'T TELL WHICH
+!-
+
+    IF .endptr [bhbtype] NEQ btypedata THEN RETURN false;
+
+    IF (movingptr = .recdesc [rdrecptr]) LEQ 0
+    THEN 					! Start at top of bucket
+	BEGIN
+
+	IF .movingptr LSS 0 THEN stopatfirstflag = true;
+
+	movingptr = .endptr + bhhdrsize;
+	recdesc [rdrecptr] = (recdesc [rdlastrecptr] = .movingptr)
+	END;
+
+    !+
+    !    CHECK FOR EMPTY OR NON-EXISTENT BUCKET
+    !-
+
+    IF (tempac = .endptr [bhnextbyte]) LEQ bhhdrsize
+    THEN 					! We have an empty bucket
+	BEGIN
+	setflag (recdesc [rdstatus], rdflgempty + rdflgpst);
+	RETURN false
+	END;
+
+    !+
+    !    NOW, RESET THE END POINTER TO THE END OF DATA
+    !-
+
+    endptr = .endptr + .tempac;			! FIND NEXT FREE BYTE
+
+    !+
+    !    FETCH THE SEARCH ID AND DETERMINE IF THIS IS AN ID SEARCH
+    !-
+
+    searchrfa = .recdesc [rdrfa];		! GET WHOLE RFA
+    searchid = idofrfa (.searchrfa);		! EXTRACT ID FROM RFA
+    headersize = .kdb [kdbhsz];			! ABD SIZE OF HEADER
+
+    !+
+    !    CHECK IF THE STARTING ADDRESS IS PAST THE ENDING ADDRESS
+    !-
+
+    IF .movingptr GEQ .endptr
+    THEN 					! Set some status bits and exit
+	BEGIN
+
+	IF .movingptr GTR .endptr THEN rmsbug (msginput);
+
+	setpastlastflag (recdesc);
+	RETURN false
+	END;
+
+    !+
+    !    THIS IS MAIN SEARCH LOOP
+    !-
+
+    WHILE .movingptr LSS .endptr DO
+	BEGIN
+	recdesc [rdrecptr] = .movingptr;	! SET UP FINAL PTR NOW
+
+	IF .searchrfa NEQ nullid
+	THEN 					! This is an ID search
+	    BEGIN
+
+	    !+
+	    !    IS THIS THE RIGHT ID?
+	    !-
+
+	    IF .searchid EQL .movingptr [drrecordid]
+	    THEN 				! Found it
+		BEGIN
+		lookat ('	ID MATCH FOUND AT: ', movingptr);
+
+		IF chkflag (movingptr [drflags], flgdelete) NEQ 0
+		THEN
+		    setflag (recdesc [rdstatus],
+			rdflgdelete);
+
+		RETURN true
+		END
+
+	    END
+	ELSE 					! This is a key search
+	    BEGIN
+
+	    !+
+	    !    IGNORE RRV RECORDS
+	    !-
+
+	    IF chkflag (movingptr [drflags], flgrrv) NEQ 0
+	    THEN
+		BEGIN				! Exit because key not found
+		setpastlastflag (recdesc);
+		RETURN false;
+		END;
+
+	    dataptr = .movingptr + .headersize;
+!+
+!    COMPARE THE KEY VALUES, DEPENDING ON
+!    WHETHER THE DATA RECORD IS A USER
+!    DATE RECORD OR A SECONDARY DATA RECORD
+!-
+	    savestatus = (IF .sidrflag NEQ 0 THEN 	! It is a SIDR
+		ckeykk (.recdesc, .dataptr) ELSE 	! It is user data record
+		ckeyku (.recdesc, .dataptr));
+
+	    !+
+	    !    SHOULD WE GO ON?
+	    !-
+
+	    IF .savestatus EQL true
+	    THEN
+		BEGIN				! Check for deleted records
+						!   ...then exit
+
+		IF chkflag (movingptr [drflags], flgdelete) NEQ 0
+		THEN
+		    setflag (recdesc [rdstatus],
+			rdflgdelete);
+
+		RETURN true
+		END;
+
+	    !+
+	    !    EXIT FOR FIRST-ONLY SEARCH
+	    !-
+
+	    IF .stopatfirstflag NEQ false THEN RETURN .savestatus
+
+	    END;
+
+	!+
+	!    WE DIDN'T FIND THE RECORD, SKIP OVER IT
+	!-
+
+	recdesc [rdlastrecptr] = .movingptr;	! SAVE LAST RECORD
+	movingptr = .movingptr + sizeofanyrecord (movingptr)
+	END;
+
+    !+
+    !    WE DID NOT FIND THE RECORD
+    !-
+
+    recdesc [rdrecptr] = .movingptr;		! RESTORE POINTER
+    setpastlastflag (recdesc);			! REMEMBER WE WENT TOO FAR
+    RETURN false
+    END;					! End SDATABKT
+
+%SBTTL 'INSRTUDR - insert UDR into bucket'
+
+GLOBAL ROUTINE insrtudr (			!
+    recdesc : REF BLOCK, 			!
+    userrecordptr : REF BLOCK, 			!
+    databd : REF BLOCK, 			!
+    splitbd1 : REF BLOCK, 			!
+    splitbd2 : REF BLOCK) = 			!
+! INSRTUDR
+! =========
+!
+! ROUTINE TO INSERT A USER DATA RECORD INTO A DATA BUCKET
+!	THIS ROUTINE DOES ALL MOVING OF RECORDS AND SPLITS.
+!	HOWEVER, NO INDEX MODIFICATION AT ALL IS DONE BY
+!	THIS ROUTINE OR ANY ROUTINE BELOW THIS ROUTINE.
+!
+! INPUT:
+!	RECDESC		RECORD DESCRIPTOR PACKET
+!		RECPTR		ADDRESS TO INSERT RECORD
+!		LENGTH		LENGTH (IN WORDS) OR RECORD TO INSERT
+!
+!	USERRECORDPTR	ADDRESS OF USER DATA RECORD
+!	DATABD		BUCKET DESC OF CURRENT BUCKET
+!	SPLITBD1	BUCKET DESC OF 1ST SPLIT BUCKET (RETURNED)
+!	SPLITBD2	BUCKET DESC OF 2ND SPLIT BUCKET (RETURNED)
+!
+! OTHER FIELDS USED:
+!	RSZW IN RST = SIZE IN WORDS OF USER RECORD
+!
+! OUTPUT:
+!	TRUE:	RECORD INSERTED
+!	FALSE:	ERROR
+!		NO MORE BUCKETS
+!		NO MORE CORE
+!
+! ON ERROR, USRSTS WILL BE SET TO THE APPROPRIATE ERROR CODE
+!
+! ARGUMENTS MODIFIED:
+!	RECORD DESCRIPTOR
+!		RECPTR		ADDRESS OF INSERTED RECORD
+!		RFA		RFA OF NEW RECORD
+!		LASTRECPTR	ADDRESS OF NEW HIGH RECORD FOR
+!				ORIGINAL BUCKET, IF SPLIT
+!		RRV		RFA OF RRV RECORD (SAME AS RFA)
+!		STATUS		STATUS VALUE OF OPERATION
+!			IDXUPDATE	INDEX UPDATE REQUIRED
+!
+! ROUTINES CALLED:
+!	ALCRFA
+!	MAKEUDR
+!	SPLIT
+!	COMPRESS
+!
+!
+! NOTES:
+!
+!	1.	ON OUTPUT, ALL BUCKETS (ORIGINAL AND SPLIT BUCKETS)
+!		HAVE BEEN UPDATED TO THE FILE. ALSO, THE NEW BUCKETS,
+!		IF ANY, ARE UNLOCKED. HOWEVER, THE ORIGINAL DATA
+!		BUCKET REMAINS LOCKED. IT IS THE CALLER'S RESPONSIBILITY
+!		TO EXPLICITLY UNLOCK THE DATA BUCKET.
+!
+!	2.	IF A 3-BUCKET SPLIT OCCURS (ONLY POSSIBLE IF A VERY
+!		LARGE RECORD IS INSERTED), THEN 1ST SPLIT BUCKET
+!		DESCRIPTOR WILL REPRESENT THE BUCKET CONTAINING THE
+!		R(HIGH) RECORD SET AND R(NEW) WILL BE IN SPLITBD2.
+!
+    BEGIN
+
+    LOCAL
+	areanumber,				! AREA NUMBER OF THE DATA AREA
+	freespace,				! AMOUNT OF FREE SPACE LEFT IN DATA BUCKET
+	bucketsize,				! BUCKET SIZE OF DATA BUCKET
+	nextfreeword,				! NEXT WORD IN BUCKET WHICH IS AVAILABLE
+	newrecordsize,				! SIZE OF RECORD TO BE INSERTED
+	amounttomove,				! AMOUNT OF DATA TO BE MOVED FOR NEW RECORD
+	returnedspace,				! AMOUNT OF NEW SPACE AFTER BUCKET COMPRESSION
+	minfreespace,				! USED TO COMPUTE USER FREE SPACE
+	exitflag,				! USED TO GET US OUT OF LOOP
+	loopcount,				! BINARY SWITCH FOR # OF TIMES THRU LOOP
+	insertptr,				! ADDRESS WHERE RECORD IS TO GO
+	lastrecordptr : REF BLOCK,		! PTR TO LAST RECORD IN ORIGINAL BKT
+	tempptr : REF BLOCK,			! TEMPORARY PTR VARIABLE
+	windowpage;
+
+    REGISTER
+	bktptr : REF BLOCK;
+
+    TRACE ('INSRTUDR');
+
+    !+
+    !    CHECK INPUT VALUES
+    !-
+
+    exitflag = false;				! INIT VALUES
+    loopcount = 0;
+    newrecordsize = .recdesc [rdlength] + .kdb [kdbhsz];
+!+
+!    THIS IS THE MAIN LOOP OF THIS ROUTINE. IF THE RECORD
+!    WILL FIT INTO THE BUCKET, THEN A RETURN IS DONE FROM
+!    THE MIDDLE OF THE LOOP. IF THE RECORD CANNOT FIT INTO
+!    THE BUCKET, THEN THE BUCKET IS COMPRESSED. IF THE
+!    RECORD WILL NOW FIT, THE LOOP IS EXECUTED AGAIN EXACTLY
+!    AS IF THE RECORD WOULD INITIALLY FIT INTO THE BUCKET.
+!    HOWEVER, IF THE RECORD STILL WONT FIT, CONTROL FALLS
+!    THRU THE LOOP AND A BUCKET SPLIT OCCURS.
+!-
+
+    WHILE .exitflag EQL false DO
+	BEGIN
+!+
+!    GET THE ADDRESS WHERE WE WILL INSERT THE NEW RECORD.
+!    NOTE THAT THIS ADDRESS MAY BE CHANGED BY "COMPRESS",
+!    THUS, WE MUST RE-FETCH IT WITHIN THIS LOOP.
+!-
+	insertptr = .recdesc [rdrecptr];	! GET FIRST POINTER
+	bktptr = .databd [bkdbktadr];
+	bucketsize = .kdb [kdbdbkz];
+
+	!+
+	!    COMPUTE FREE SPACE IN THIS BUCKET
+	!-
+
+	freespace = (.bucketsize^b2w) - .bktptr [bhnextbyte];
+!+
+!    CHECK TO SEE IF THE USER WANTED THE BUCKET TO
+!    HAVE A LOAD-FILL PERCENTAGE
+!-
+
+	IF chkflag (rab [rabrop, 0], roploa) NEQ 0
+	THEN 					! Check if bucket is "filled"
+	    BEGIN
+	    minfreespace = (.bucketsize^b2w) - .kdb [kdbdfloffset];
+
+	    IF .minfreespace GEQ .freespace THEN freespace = 0;	! FORCE A SPLIT
+
+	    END;
+
+	!+
+	!    LET'S SEE THESE VALUES
+	!-
+
+	lookat ('	BKTPTR: ', bktptr);
+	lookat ('	FREESPACE: ', freespace);
+
+	!+
+	!    CHECK TO SEE IF IT'LL FIT
+	!-
+
+	IF .newrecordsize LEQ .freespace
+	THEN
+	    BEGIN				! Insert the record
+	    rtrace (%STRING ('	RECORD CAN FIT... ', %CHAR (13), %CHAR (10)));
+	    nextfreeword = .bktptr + .bktptr [bhnextbyte];
+	    amounttomove = .nextfreeword - .insertptr;	! COMPUTE DATA TO MOVE DOWN
+	    lookat ('	NEXTFREEWORD:', nextfreeword);
+	    lookat ('	AMMTTOMOVE:', amounttomove);
+
+	    IF .amounttomove LSS 0 THEN rmsbug (msgcount);
+
+!+
+!    IF THIS ISNT THE LAST RECORD IN THE BUCKET
+!    THEN WE NEED TO MOVE SOME RECORDS DOWN
+!-
+
+	    IF .amounttomove NEQ 0
+	    THEN
+		BEGIN				! Move records down
+		rtrace (%STRING ('	MOVING RECORDS DOWN ', %CHAR (13), %CHAR (10)));
+		movedown (.insertptr, 		! Start
+		    .nextfreeword - 1, 		! End
+		    .newrecordsize);		! Size
+		END;
+
+	    !+
+	    !    ALLOCATE A NEW RFA FOR THIS RECORD
+	    !-
+
+	    recdesc [rdrfa] = alcrfa (.databd);
+
+	    !+
+	    !    CREATE THE RECORD
+	    !-
+
+	    makeudr (.recdesc, 			! Rec desc
+		.userrecordptr);		! UDR ptr
+
+	    !+
+	    !    RESET THE BUCKET HEADER DATA
+	    !-
+
+	    bktptr [bhnextbyte] = .bktptr [bhnextbyte] + .newrecordsize;
+
+	    !+
+	    !    WRITE THE DATA PAGE OUT TO THE DISK
+	    !-
+
+	    IF ( NOT writebehind)
+	    THEN
+		updatebucket (databd)		! BUCKET UPDATE
+	    ELSE
+		setbfdupd (databd [bkdbfdadr]);	!SET WRITE FLAG
+
+	    RETURN true
+	    END;
+
+	!+
+	!    AT THIS POINT, THE RECORD WON'T FIT, WE MUST SPLIT
+	!-
+
+	rtrace (%STRING ('	**RECORD WONT FIT**', %CHAR (13), %CHAR (10)));
+
+	!+
+	!    INITIALIZE THE AMOUNT OF COMPRESSED SPACE TO ZERO
+	!-
+
+	returnedspace = 0;			! CLEAR LOCAL
+!+
+!    IF THIS IS OUR FIRST TIME THRU THE LOOP, WE
+!    MUST TRY TO COMPRESS TO BUCKET. IF THIS IS
+!    OUR SECOND TIME THRU THE LOOP, THEN WE ALREADY
+!    COMPRESSED THE BUCKET AND RECOVERED ENOUGH
+!    SPACE FOR THE RECORD TO FIT. BUT, SOMEHOW
+!    OUR INITIAL COMPUTATION CONCLUDED THAT THE
+!    RECORD WOULD NOT FIT...THUS, WE HAVE A BUG SOMEWHERE
+!-
+
+	IF .loopcount EQL 0
+	THEN
+	    BEGIN
+
+	    !+
+	    !    COMPRESS THE BUCKET
+	    !-
+
+	    returnedspace = compress (.recdesc, .databd);
+
+	    !+
+	    !    BUMP OUR LOOP CONTROL FLAG
+	    !-
+
+	    loopcount = .loopcount + 1;
+
+	    !+
+	    !    DID WE GET BACK ENOUGH SPACE TO INSERT THE RECORD??
+	    !-
+
+	    lookat ('	SPACE RETURNED:', returnedspace);
+
+	    IF (.returnedspace + .freespace) LSS .newrecordsize THEN exitflag = true;
+
+	    END
+	ELSE
+	    rmsbug (msgloop);			! WE WENT THRU LOOP TWICE
+
+	END;
+
+    !+
+    !    WE MUST NOW SPLIT THE BUCKET
+    !-
+
+    !+
+    !    SET UP ARGS FOR SPLIT ROUTINE:
+    !-
+
+    recdesc [rdlength] = .newrecordsize;	! SIZE OF HOLE
+
+    IF split (.recdesc, 			! Rec-desc
+	    .databd, 				! Old databd
+	    .splitbd1, 				! Used for split
+	    .splitbd2) EQL false		! 3-bkt split
+    THEN 					! Something very bad happened
+	RETURN false;
+
+!+
+!    THE BUCKET HAS NOW BEEN SPLIT AND RECPTR
+!    POINTS TO WHERE WE SHOULD WRITE THE NEW RECORD
+!-
+
+    !+
+    !    WE WILL NOW CREATE THE USER DATA RECORD
+    !-
+
+    makeudr (.recdesc, 				! Rec-desc
+	.userrecordptr);			! User record
+!+
+!    NOTE THAT LASTRECPTR NOW POINTS TO THE HIGHEST RECORD
+!    IN THE OLD BUCKET
+!-
+!+
+!    THERE IS ONE LAST THING WE MUST DO...WE MUST MOVE
+!    THE NEW HIGH-KEY VALUE OF THE HIGHEST RECORD IN THE
+!    OLD BUCKET INTO A TEMPORARY KEY BUFFER. WE MUST DO
+!    THIS BECAUSE THE KEY VALUE IS UNAVAILABLE AFTER THE
+!    BUCKET HAS BEEN RELEASED (BECAUSE IF THE BUFFER CAME
+!    FROM FREE CORE, IT WILL BE DESTROYED AFTER USE).
+!    THEREFORE, WE WILL MOVE THIS KEY VALUE INTO THE
+!    BOTTOM HALF OF THE RST KEY BUFFER
+!-
+    tempptr = .rst [rstkeybuff] + (.fst [fstkbfsize]/2);
+    lastrecordptr = .recdesc [rdlastrecptr] + .kdb [kdbhsz];
+    movekey (.lastrecordptr, 			! From UDR
+	.tempptr);				! To buffer
+!+
+!    WE WILL NOW UPDATE THE FILE BUCKETS WHICH WE PROCESSED.
+!    NOTE THAT THESE BUCKETS MUST BE UPDATED IN REVERSE ORDER
+!    OF THEIR LINKAGES IN THE BUCKET CHAIN IN ORDER TO AVOID
+!    THE PROBLEM OF A BUCKET WHICH POINTS TO A NON-EXISTENT
+!    BUCKET.
+!-
+
+    !+
+    !    UPDATE THE THIRD BUCKET IF THERE WAS ONE
+    !-
+
+    IF .recdesc [rdcount] GTR 1 THEN updatebucket (splitbd2);
+
+    !+
+    !    UPDATE THE RRV'S IN THE NEW BUCKET
+    !-
+
+    IF updrrvs (.databd, 			! Old bucket
+	    .splitbd1) EQL false		! New bucket
+
+	!+
+	!    IF WE COULDN'T DO IT, TELL THE USER BUT GO ON
+	!-
+
+    THEN
+	usrsts = su$rrv;
+
+    !+
+    !    UPDATE DATA BUCKET
+    !-
+
+    updatebucket (databd);
+!+
+!    *****NOTE THAT WE HAVE NOW UPDATED THE PRIMARY DATA
+!    BUCKET TO DISK, BUT WE HAVE NOT RELEASED IT YET***
+!-
+
+    !+
+    !    FLUSH ALL SPLIT BUCKETS
+    !-
+
+!+
+!   ** FLUSH OLD BUCKET IF R-NEW GOES INTO NEW BUCKET AND RECORDS ARE **
+!   ** ACCESSED SEQUENTIALLY. ELSE FLUSH THE NEW BUCKET. THIS FIX HAS TO DO **
+!   ** WITH THE PROBLEM OF FLUSHING THE INCORRECT DATA BUCKET ON A SPLIT  **
+!   ** WHEN RECORDS ARE INSERTED SEQUENTIALLY. SO THE FOLLOWING CHECK	**
+!   ** MAKES SURE THE PROPER BUCKET IS FLUSHED. PREVIOUSLY THE SPLIT  **
+!   ** BUCKET WAS BEING FLUSHED ALWAYS EVEN THOUGH THE OLD BUCKET WAS   **
+!   ** NEVER REQUIRED. THIS RESULTED IN THE ER$SEQ ERROR CODE.          **
+!-
+    tempptr = (IF flushorigbd (recdesc) NEQ 0 THEN .databd ELSE .splitbd1);
+!+
+!   **		END OF THE FIX. NOTE: ON THE CALL PUTBKT BELOW 		**
+!   **		'.TEMPPTR'IS USED INSTEAD OF '.SPLITBD1'  **
+!-
+    putbkt (false, 				! No update
+	.tempptr);				! Bucket
+
+    !+
+    !    WAS THIS A 3-BKT SPLIT?
+    !-
+
+    IF .recdesc [rdcount] GTR 1
+    THEN
+	BEGIN
+	putbkt (false, 				! No update
+	    .splitbd2);				! Bucket
+!+
+!    THIS 3-BUCKET SPLIT COULD HAVE BEEN CAUSED BY TWO
+!    THINGS....A VERY BIG NEW RECORD OR A DUP WHICH COULDN'T
+!    FIT IN THE ORIGINAL BUCKET SO A NEW ONE WAS ALLOCATED
+!    JUST FOR THE DUP. IN THE LATTER CASE, WE DON'T WANT THE
+!    DUP BUCKET TO BE ENTERED INTO THE INDEX, SO WE WILL FLAG
+!    THAT ONLY A TWO-BUCKET SPLIT OCCURRED.
+!-
+
+	IF (duplicateflag (recdesc) NEQ 0)
+	THEN 					! Reset split count to 1
+	    recdesc [rdcount] = 1
+
+	END;
+
+    RETURN true
+    END;					! End INSRTUDR
+
+%SBTTL 'CHKDUP - check for duplicate records'
+
+GLOBAL ROUTINE chkdup (recdesc, bktdesc) =
+! CHKDUP
+! ======
+!
+! ROUTINE TO CHECK FOR DUPLICATE RECORDS. THIS ROUTINE
+!	WILL CHECK IF DUPLICATES ARE ALLOWED, AND IF SO,
+!	WHETHER ANY DUPLICATE RECORDS EXIST IN THE FILE.
+!
+!
+! INPUT:
+!	RECDESC		RECORD DESCRIPTOR PACKET
+!		RECPTR		ADDRESS OF CURRENT DATA RECORD
+!		USERPTR		ADDRESS OF SEARCH KEY STRING
+!		USERSIZE	SIZE OF SEARCH KEY STRING
+!
+!	BKTDESC		BKT DESCRIPTOR OF DATA BUCKET
+!
+! OUTPUT:
+!	TRUE:	DUPLICATE NOT SEEN, OR DUPLICATES ALLOWED.
+!		IF ENTRY WITH DUP KEY SEEN, RDFLGDUP SET.
+!		IF ENTRY REPRESENTS EXISTING REC, RDFLGSAME ALSO SET.
+!	FALSE:	A DUPLICATE WAS SEEN AND IS NOT ALLOWED.
+!
+! INPUT ARGUMENTS MODIFIED:
+!
+!	RECORD DESCRIPTOR
+!		RECPTR		ADDRESS OF RECORD WHICH FOLLOWS
+!				LAST RECORD IN THE DUPLICATE SERIES
+! ROUTINES CALLED:
+!	FNDREC
+!
+! NOTES:
+!
+!	1.	THERE IS A MINOR OPTIMIZATION WHICH COULD BE DONE TO
+!		THIS ROUTINE*******************.
+!		THIS OCCURS WHEN WE ARE SKIPPING SECONDARY DATA RECORDS.
+!		BECAUSE SIDR'S ALWAYS EXPAND TO FILL THE BUCKET, UNLESS
+!		THE END OF THE SIDR IS THE LAST WORD IN THE BUCKET, THEN
+!		WE KNOW THAT THERE IS NOT A DUPLICATE OF THIS KEY.
+!		IN SUCH A CASE, THIS ROUTINE WILL READ IN THE NEXT BUCKET
+!		AND CHECK THE KEY OF THE NEXT SIDR, EVEN THOUGH WE KNOW
+!		THAT IT CAN'T BE THE SAME KEY. THUS, THE FOLLOWING
+!		OPTIMIZATION:
+!
+!			WHEN WE GET READY TO SKIP A RECORD, CHECK TO SEE
+!			IF ITS A SECONDARY KEY AND IF THE CURRENT RECORD
+!			DOES NOT TOUCH THE END OF THE BUCKET. IF NOT,
+!			THEN SET LASTRECPTR AND EXIT.
+!
+    BEGIN
+
+    LOCAL
+	rrv;					! SET FROM RDRRV, CALLER'S RRV
+
+    LOCAL
+	i;					! LOOP INDEX FOR SIDR ARRAY
+
+    MAP
+	recdesc : REF BLOCK,
+	bktdesc : REF BLOCK;
+
+    REGISTER
+	tempac;
+
+    REGISTER
+	movingptr : REF BLOCK;			! PTR TO SCAN DATA RECORDS
+
+    TRACE ('CHKDUP');
+    rrv = .recdesc [rdrrv];			!(SEE SIDR ARRAY LOOP)
+
+    !+
+    !    DID WE FIND AN EXACT MATCH?
+    !-
+
+    tempac = .recdesc [rdstatus];		! GET STATUS FLAGS
+
+    IF (chkflag (tempac, (rdflglss + rdflgpst)) NEQ 0)	! Not a match?	!A442
+!	AND (chkflag (tempac, rdflgdelete) EQL 0)	!		!D442
+    THEN 					! No exact match..so exit
+	RETURN true;
+
+    !+
+    !    REMEMBER WE FOUND ANOTHER BKT ENTRY WITH SAME KEY
+    !-
+
+    setduplicatflag (recdesc);
+!+
+!    WE MUST NOW POSITION OURSELVES TO THE END OF THE
+!    LIST OF DUPS
+!-
+
+    UNTIL (chkflag (recdesc [rdstatus], (rdflglss + rdflgpst)) NEQ 0) DO
+	BEGIN
+!+
+!    IF THE "DELETE" FLAG IS OFF AT THIS POINT, IT
+!    MEANS THAT WE HAVE SEEN A TRUE DUPLICATE WHICH
+!    WAS NOT DELETED. IN SUCH A CASE, WE MUST REMEMBER
+!    THAT WE HAVE SEEN IT, AND CHECK TO SEE IF DUPLICATES
+!    ARE ALLOWED.
+!-
+
+	IF chkflag (recdesc [rdstatus], rdflgdelete) EQL 0
+	THEN
+	    BEGIN
+	    rtrace (%STRING ('	A DUP WAS FOUND', %CHAR (13), %CHAR (10)));
+
+	    !+
+	    !    REMEMBER WE FOUND A RECORD WITH SAME KEY
+	    !-
+
+	    setsamekeyflag (recdesc);
+
+	    !+
+	    !    ARE THEY ALLOWED?
+	    !-
+
+	    IF chkflag (kdb [kdbflags], flgdup) EQL 0
+	    THEN 				! No dups are allowed
+		returnstatus (er$dup)
+
+	    END;
+
+	! SCAN SIDR ARRAY TO SEE IF RDRRV ALREADY THERE
+	movingptr = .recdesc [rdrecptr];	! GET PTR TO CURR ENTRY
+
+	IF .kdb [kdbref] NEQ 0
+	THEN
+	    BEGIN
+
+	    INCR i FROM sidrhdrsize + .kdb [kdbkszw] TO .movingptr [sidrrecsize] + sidrhdrsize - 1 DO
+		BEGIN
+
+		IF .movingptr [.i, wrd] EQL .rrv	! CURR UDR ALR THERE?
+		THEN
+
+		    IF chkflag (recdesc [rdstatus], rdflgretex) NEQ 0
+		    THEN
+			BEGIN			! RMSUTL CALL
+			recdesc [rdsidrelement] = .i;	! TELL WHERE AT
+			RETURN false;		! INDIC THAT IT HAPPENED
+			END
+		    ELSE
+			BEGIN			! ALW OPEN FOR WRITE
+			movingptr [.i, wrd] = 0;
+						!ZAP ENTRY THAT WASNT DELETED BECAUSE OF CRASH PROBABLY
+			setupd (bktdesc);	! INSURE IT WRITTEN OUT
+			END			!END IF RRV MATCH
+		END;				!END SIDR ARRAY LOOP
+
+	    END;				!END 2NDARY KEY
+
+	!+
+	!    SKIP A DATA RECORD
+	!-
+
+	recdesc [rdlastrecptr] = .movingptr;	! STORE AS LAST PTR
+	recdesc [rdrecptr] = .movingptr + sizeofdatarecrd (movingptr);
+!+
+!    WE HAVE NOW BUMPED TO THE NEXT DATA RECORD. WE
+!    MUST COMPARE THE KEYS AND POSITION OURSELVES
+!    CORRECTLY.
+!-
+
+	IF fndrec (.recdesc, 			! Record
+		.bktdesc, 			! Start
+		.bktdesc) EQL false		! End
+	THEN
+	    rmsbug (msgfailure)
+
+	END;
+
+    RETURN true
+    END;					! End CHKDUP
+
+END
+
+ELUDOM
+   

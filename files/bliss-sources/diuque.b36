@@ -1,0 +1,1356 @@
+%TITLE 'DIUQUE - Queue Handling Routines'
+
+MODULE DIUQUE (IDENT = '252',
+               LANGUAGE(BLISS36),
+               ENTRY(q$init,   ! Open the queue file and set things up
+                     q$enter,  ! Enter a request in the queue
+                     q$delete, ! Delete a request
+                     q$modify, ! Modify a request
+                     q$find,   ! Find a request, return req. block(s)
+                     q$pick,   ! Pick a request for processing
+                     q$reque   ! Reque a (already picked) request
+                    )
+              ) =
+BEGIN
+!++
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+! FACILITY:    DIU-10/20. (Data Interchange Utility)
+!
+! ABSTRACT:    This module provides queue management for DIU-10/20.
+!
+! ENVIRONMENT: BLISS-36 V4, XPORT V4, RMS-10/20 V3
+!              TOPS-10 V7.03 or TOPS-20 V6.1
+!
+!   The queue is maintained as an RMS relative file.  The request-ID is
+!   the record number of the request record.  Record 1 is a header record,
+!   with pointers to two record chains:  the chain of pending requests,
+!   ordered by priority, and the chain of deleted records.  Deleted records
+!   are never actually deleted from the RMS file, but are reused.
+!
+! AUTHOR: Rick Fricchione      CREATION: August 10, 1984
+
+! HISTORY:
+!
+!  252	Remove library of CONDIT.
+!	Sandy Clemens  1-Jul-86
+!
+!  234  Change library of RMSUSR to RMSINT.
+!       Gregory A. Scott 17-Jul-86
+!
+!  174  Remove library of TOPS20, use routine wild_match instead of wild jsys.
+!       Gregory A. Scott 20-May-86
+!
+!  160  If the queue file was written  by another version we got all  confused.
+!       The problem was that  if the $GET  for record 1  wouldn't work then  we
+!       decided that the queue  file didn't exist.  Now  we check for  RMS$_RNF
+!       error to determine that  the queue file is  virgin, which is the  right
+!       way to do it.
+!       Gregory A. Scott 14-May-86
+!
+!  152  Routines kill_job and q$copy_req_block were defined  as  external  here
+!       but were never called.  Make queue initializing message a real event.
+!       Gregory A. Scott 11-May-86
+!
+!  127  Remove hack to Q$MODIFY where if you were given a negative prerequisite
+!       request id then you  would turn on the  SEQ_CONTINUE bit.  This is  all
+!       removed because of the new (sensible) use of /PREREQ and /SEQUENCE.
+!       Gregory A. Scott 26-Apr-86
+!
+!  122  Protect the QUE file 0 under TOPS-20.
+!       Gregory A. Scott 22-Apr-86
+!
+!  111	Change queue file initialization messge.
+!	Andy Puchrik	3-Apr-86
+!
+!  102  Change routine Q$FIND_NODE to Q$FNODE so that LINK doesn't grab Q$FIND.
+!       Gregory A. Scott 28-Mar-86
+!
+!     DPR0001 V01-04		Doug Rayner			29-Jul-85
+!	      Some minor changes for TOPS-10.  Put the QUE file in SYS:.
+!	      Replace WILD% JSYS with call to routine that emulates it.
+!	      Support [P,Pn]'s in find routine.
+!
+!     RDF0001 V01-03          Rick Fricchione                 21-Aug-1984
+!             Modify for DIU.  Make it work with the new RMS-20. Fix some
+!             bugs in the dependency code, and clean up to be readable!
+!
+!     AWN0001 V01-02          Andrew Nourse                   - no date -
+!             Put in entry points, and clean up code.
+!
+!--
+
+!**************************************************************************
+!            L I B R A R Y   A N D   R E Q U I R E   F I L E S 
+!**************************************************************************
+
+LIBRARY 'DIU';                          ! DIU Data structures
+LIBRARY 'RMSINT';                       ! RMS symbols
+LIBRARY 'BLI:XPORT';                    ! XPORT symbols
+
+!****************************************************************************
+!                  F O R W A R D    R O U T I N E
+!****************************************************************************
+
+FORWARD ROUTINE
+    q$init,                             ! Open the queue file and set things up
+    q$enter,                            ! Enter a request in the queue
+    q$delete,                           ! Delete a request
+    q$modify,                           ! Modify a request
+    q$find,                             ! Find a request, return req. block(s)
+    q$$find_ch,                         ! Condition handler for q$find
+    q$pick,                             ! Pick a request for processing
+    q$reque,                            ! Reque a (already picked) request
+    q$$lower_priority,                  ! Test priority of two requests
+    q$$assign_sequence_no,              ! Assign a new sequence number
+    q$$match_block;                     ! See if two request records match
+
+!*****************************************************************************
+!**                           M A C R O S
+!*****************************************************************************
+
+MACRO
+    queue$$_filespec =
+    %IF NOT %SWITCHES(DEBUG)
+        %THEN %IF %SWITCHES (TOPS20)          ! Production version of file
+                  %THEN 'SYSTEM:DIU.QUE;P000000'        ! Protection 0
+              %FI
+              %IF %SWITCHES (TOPS10)
+              %THEN 'STD:DIU.QUE'
+              %FI
+        %ELSE %IF %SWITCHES (TOPS20)
+                  %THEN 'SYSTEM:DIUDEB.QUE;P000000'     ! Protection 0
+              %FI
+
+              %IF %SWITCHES (TOPS10)
+                  %THEN 'STD:DIUDEB.QUE'
+              %FI
+     %FI %,
+
+! The header record uses certain fields as pointers to records.  Here
+! are the correspondences.
+
+    HDR$H_DELETED_CHAIN = DIU$H_DEPENDENT_ID %,
+    HDR$H_PENDING_CHAIN = DIU$H_NEXT_RECORD %,
+    HDR$H_LENGTH = DIU$H_LENGTH %,
+    HDR$H_FIRST_FREE = DIU$H_PREV_RECORD %;
+
+LITERAL
+    minute = %O'1000000' / (24*60),     ! One minute, universal date/time form
+    requeue_time = 10*minute;           ! Ten minutes -- requeue interval
+
+OWN
+    q_fab : $FAB_DECL;                  ! FAB for the queue file
+
+!*************************************************************************
+!                   E X T E R N A L   R O U T I N E S 
+!*************************************************************************
+
+EXTERNAL ROUTINE
+    wild_match,				! Do a WILD% JSYS or a simulation
+    l$event : NOVALUE,                  ! Write event to system log file
+    q$req_block_init : NOVALUE,         ! Init a request block
+    q$release_chain  : NOVALUE,         ! Release chain of blocks in heap space
+    q$valid_req_block,                  ! Validate a request block
+    q$fnode,                            ! Find a node in a filespec buffer
+    s$time,                             ! Return current system date/time
+    DIU$ABORT,                          ! DIU conditon handler
+    rms$efail        : NOVALUE,         ! RMS error message printer
+    rms$failure      : NOVALUE;         ! Default RMS failure handler
+
+!***********************************************************************
+!                 D E B U G G I N G   R O U T I N E S
+!***********************************************************************
+%IF %SWITCHES (DEBUG)
+%THEN
+ROUTINE q$$debug_routine (arg) = 0;
+%FI
+
+!*************************************************************************
+!                            Q $ I N I T 
+!*************************************************************************
+GLOBAL ROUTINE q$init =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!   This routine opens the queue file, checks to see if the header
+!   record exists and creates it if it doesn't, and sets up various
+!   module-wide parameters.
+!
+! FORMAL PARAMETERS:
+!   NONE
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   DIU$_NORMAL         - queue initialized OK
+!   some RMS code       - RMS error prevented queue initialization
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+
+LOCAL rab : $RAB_DECL,
+      req_block : $DIU_BLOCK,
+      next_record;
+
+ENABLE DIU$ABORT;                       ! Enable condition handler
+
+! Initialize the queue $FAB
+
+$FAB_INIT (FAB=q_fab,            FNA=queue$$_filespec, 
+           FAC=(GET,PUT,DEL,UPD),ORG=REL,
+           SHR=(GET,PUT,DEL,UPD),FOP=CIF,
+           RAT=BLK,              MRS=DIU$K_CHAR_COUNT);
+
+! Initialize the queue $RAB 
+
+$RAB_INIT (RAB=rab, FAB=q_fab, RAC=KEY);
+
+! Create or open the file as appropriate
+
+$CREATE (FAB=q_fab);
+IF NOT $RMS_STATUS_OK (q_fab)
+THEN SIGNAL (DIU$_DAMAGED, .q_fab[FAB$H_STS]);
+
+! Connect RAB to FAB
+
+$CONNECT (RAB=rab);
+IF NOT $RMS_STATUS_OK (rab)
+THEN SIGNAL (DIU$_DAMAGED, .rab[RAB$H_STS]);
+
+! Look up record 1 (header record).
+
+$RAB_STORE (RAB=rab, KBF=(UPLIT (1)), UBF=req_block, USZ=DIU$K_LEN);
+$GET (RAB=rab);
+
+! Check the status returned from the $GET.  If it was record not found, then
+! we must have created a new queue file here.
+
+IF .rab[RAB$H_STS] EQL RMS$_RNF         ! If it was record not found
+THEN BEGIN                              ! Then we must have a new queue file
+     L$EVENT (DIU$_INIT_QUEUE, 0, 0);   ! Give message to log file
+     q$req_block_init (req_block);      ! Get a clean request block
+
+     ! Header record is considered to be deleted.  There is as yet no
+     ! chain of deleted records so DIU$H_NEXT_RECORD is set to zero.
+     ! DIU$H_REQUEST_ID is set to 2 (the first available record).
+
+     req_block[DIU$V_DELETED]       = 1;
+     req_block[HDR$H_DELETED_CHAIN] = 0;
+     req_block[HDR$H_PENDING_CHAIN] = 0;
+     req_block[HDR$H_FIRST_FREE]    = 2;
+     req_block[HDR$H_LENGTH]        = DIU$K_LEN;
+     $RAB_STORE (RAB=rab, RBF=req_block, RSZ=DIU$K_CHAR_COUNT);
+     $PUT (RAB=rab);                    ! Put the header record there
+     IF NOT $RMS_STATUS_OK (rab)        ! Punt if the put didn't work
+     THEN SIGNAL (DIU$_DAMAGED, .rab[RAB$H_STS]);
+     END
+
+! The status returned wasn't record not found.  Make sure that the $GET worked,
+! the length is proper, and the queue file is the proper version.
+
+ELSE IF NOT ($RMS_STATUS_OK (rab)
+             AND .req_block[HDR$H_LENGTH] EQL DIU$K_LEN
+             AND .req_block[DIU$H_VERSION] EQL DIU$K_VERSION)
+     THEN SIGNAL(DIU$_ANOTHER_VERSION, .rab[RAB$H_STS]);
+
+! Now scan through the chain, requeuing any active requests (presumably
+! left over from a system crash).  Signal errors if there is/was a punt
+
+next_record = .req_block[HDR$H_PENDING_CHAIN];
+WHILE .next_record NEQ 0 
+DO BEGIN
+   $RAB_STORE (RAB=rab, KBF=next_record, UBF=req_block, USZ=DIU$K_LEN);
+   $GET (RAB = rab);
+   IF NOT $RMS_STATUS_OK (rab)
+   THEN BEGIN
+        $DISCONNECT (RAB = rab);
+        SIGNAL (DIU$_DAMAGED, .rab[RAB$H_STS])
+        END;
+   next_record = .req_block[DIU$H_NEXT_RECORD];
+   IF .req_block[DIU$V_ACTIVE]
+   THEN BEGIN                           ! Free record so requeue can hack on it
+        $FREE (RAB = rab, ERR = rms$failure);
+        Q$REQUE(.req_block[DIU$H_REQUEST_ID]);
+        END;
+   END; %(while more records)%
+
+! Disassociate ourselves with the file and return OK
+
+$DISCONNECT (RAB=rab, ERR=rms$failure);
+
+RETURN (DIU$_NORMAL);
+
+END;                                ! End of q$init
+
+!*********************************************************************
+!*                       Q $ E N T E R 
+!*********************************************************************
+GLOBAL ROUTINE q$enter (p_req_block) =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Enter a request in the queue.  The information in the request block
+!   is copied to a record which is written to the RMS file containing
+!   the queue.  The new record is linked into the chain of pending
+!   requests in front of the first request with lower priority (i.e.,
+!   the chain is orderd by priority).
+!
+! FORMAL PARAMETERS:
+!   p_req_block         - pointer to request block
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   The RMS queue file is updated with the new entry.
+!   DIU$H_REQUEST_ID is updated with the sequence number assigned
+!   to this request.
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   DIU$_NORMAL                 - request entered OK
+!   DIU$_INVALID_REQUEST        - the request block is invalid
+!   DIU$_RMS_ERROR              - unexpected RMS error
+!
+! SIDE EFFECTS:
+!   The header record is updated to reflect the sequence number assigned.
+!
+!--
+
+BIND
+        req_block = .p_req_block : $DIU_BLOCK;
+
+LOCAL
+        rab       : $RAB_DECL,
+        tmp_block : $DIU_BLOCK,
+        previous,
+        next,
+        req_id,
+        retcode;
+
+IF .req_block[DIU$H_REQUEST_ID] NEQ 0
+   THEN SIGNAL (DIU$_INVALID_REQUEST);
+! They can't give us the id, we assign it.
+
+
+IF NOT (retcode = Q$VALID_REQ_BLOCK(req_block))
+   THEN RETURN (SIGNAL (.retcode));
+! Validate the contents of the block
+
+req_id = req_block[DIU$H_REQUEST_ID] = Q$$ASSIGN_SEQUENCE_NO();
+IF .req_ID EQL -1
+    THEN RETURN (DIU$_QUEUE_FULL);
+! Get the id and return if the queue was full
+
+$RAB_INIT (RAB=rab, FAB=q_fab, RAC=KEY);
+$CONNECT (RAB=rab, ERR=rms$failure);
+$RAB_STORE (RAB=rab, RBF=req_block, RSZ=DIU$K_CHAR_COUNT,KBF=req_id);
+$FIND (RAB=rab, ERR=rms$failure);
+$UPDATE (RAB=rab, ERR=rms$failure);
+! Assign the next sequence number, stuff into record, stuff current
+! date/time into record, and write the record to the queue file.
+
+
+! Now scan the list of pending requests looking for the first of
+! lower priority.  First get the header record, which anchors the chain.
+
+$RAB_STORE (RAB=rab,KBF=(UPLIT (1)),UBF=tmp_block,USZ=DIU$K_LEN);
+$GET (RAB=rab,ERR=rms$failure);
+! Get the header record, and prepare to scan the chain of pending requests
+! looking for the first one with lower priority.
+
+previous = 1;                       
+next = .tmp_block[HDR$H_PENDING_CHAIN];
+! Note the header and first *real* record
+
+WHILE .next NEQ 0 DO
+   BEGIN
+      $RAB_STORE (RAB=rab,KBF=next,UBF=tmp_block,USZ=DIU$K_LEN);
+      $GET (RAB=rab,ERR=rms$failure);
+      IF Q$$LOWER_PRIORITY (tmp_block, req_block)
+      THEN BEGIN
+             req_block[DIU$H_PREV_RECORD] = .previous;
+             req_block[DIU$H_NEXT_RECORD] = .next;
+             ! We found one lowlier than us.  Point to previous
+             ! and next records.
+
+             $RAB_STORE(RAB=rab,KBF=req_id,RBF=req_block,RSZ=DIU$K_CHAR_COUNT);
+             $FIND (RAB=rab, ERR=rms$failure);
+             $UPDATE (RAB=rab, ERR=rms$failure);
+
+             $RAB_STORE (RAB=rab,KBF=previous,UBF=tmp_block,USZ=DIU$K_LEN);
+             $GET (RAB=rab,ERR=rms$failure);
+             tmp_block[DIU$H_NEXT_RECORD] = .req_id;
+             $UPDATE (RAB=rab,ERR=rms$failure);
+             ! Get previous record and make us its next
+
+             ! Get next record and make us its previous
+ 
+             $RAB_STORE (RAB=rab, KBF=next);
+             $GET (RAB=rab, ERR=rms$failure);
+             tmp_block[DIU$H_PREV_RECORD] = .req_id;
+             $UPDATE (RAB=rab, ERR=rms$failure);
+             $DISCONNECT (RAB=rab, ERR=rms$failure);
+             RETURN (DIU$_NORMAL)
+
+            END; %(found lower priority)%
+
+        next = .tmp_block[DIU$H_NEXT_RECORD];
+        previous = .tmp_block[DIU$H_REQUEST_ID];
+        ! Were it guys...
+
+   END; %(while)%
+
+$RAB_STORE (RAB=rab,KBF=req_id,RBF=req_block,RSZ=DIU$K_CHAR_COUNT);
+$FIND (RAB=rab,ERR=rms$failure);
+req_block[DIU$H_PREV_RECORD] = .previous;
+req_block[DIU$H_NEXT_RECORD] = 0;
+$UPDATE (RAB = rab, ERR = rms$failure);
+$RAB_STORE (RAB=rab,KBF=previous,RBF=tmp_block,RSZ=DIU$K_CHAR_COUNT);
+$FIND (RAB=rab,ERR=rms$failure);
+tmp_block[DIU$H_NEXT_RECORD] = .req_id;
+$UPDATE (RAB=rab,ERR=rms$failure);
+$DISCONNECT (RAB=rab,ERR=rms$failure);
+! If we fell out of the loop, we are the lowliest guy.  Just point
+! previous at us and return.
+
+RETURN (DIU$_NORMAL);
+
+END;                                ! End of q$enter
+
+!************************************************************************
+!                     Q $ D E L E T E 
+!************************************************************************
+GLOBAL ROUTINE q$delete (request_ID) =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Delete a request from the queue.
+!
+! FORMAL PARAMETERS:
+!   request-ID          - the request-ID (record no.) of the req. to be deleted
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   The entry is marked as deleted and is inserted at the head of the
+!   deleted entry queue.
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   DIU$_NORMAL                 - request entered OK
+!   DIU$_INVALID_REQUEST        - invalid request block presented
+!   DIU$_REQ_NOT_FOUND          - request not found in queue
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+
+    LOCAL
+        rab       : $RAB_DECL,
+        req_block : $DIU_BLOCK,         ! Request block being deleted
+        hdr_block : $DIU_BLOCK,         ! Header block
+        previous,
+        next;
+
+IF .request_ID LEQ 1 THEN SIGNAL (DIU$_INVALID_REQUEST);
+! Can't delete record 0 or the header record..
+
+$RAB_INIT(RAB=rab,FAB=q_fab,RAC=KEY);
+$CONNECT(RAB=rab,ERR=rms$failure);
+$RAB_STORE(RAB=rab,KBF = request_ID,UBF=req_block,USZ=DIU$K_LEN);
+$GET(RAB=rab,ERR=rms$failure);
+! Get the request they wish to delete...
+
+IF (NOT $RMS_STATUS_OK (rab)) OR .req_block[DIU$V_DELETED]
+   THEN BEGIN
+          $DISCONNECT (RAB = rab);
+          SIGNAL (DIU$_REQ_NOT_FOUND);
+          RETURN (0);
+        END;
+! If its already deleted, or its not there, just fail
+
+req_block[DIU$V_DELETED] = 1;
+$UPDATE (RAB = rab, ERR = rms$failure);
+! Mark the request as deleted.
+
+previous = .req_block[DIU$H_PREV_RECORD];
+next = .req_block[DIU$H_NEXT_RECORD];
+! Get ready to de-link the record
+
+IF .previous NEQ 0
+   THEN BEGIN
+          $RAB_STORE(RAB=rab,KBF=previous);
+          $GET(RAB=rab,ERR=rms$failure);
+          ! Get the previous record
+
+          req_block[DIU$H_NEXT_RECORD] = .next;
+          $RAB_STORE(RAB=rab,KBF=previous,RBF=req_block,RSZ=DIU$K_CHAR_COUNT);
+          $UPDATE(RAB=rab,ERR=rms$failure);
+          ! Update the pointer and put it back
+        END;
+
+
+IF .next NEQ 0
+   THEN BEGIN
+          $RAB_STORE(RAB=rab,KBF=next);
+          $GET(RAB=rab,ERR=rms$failure);
+          ! Get the next record
+
+          req_block[DIU$H_PREV_RECORD] = .previous;
+          $RAB_STORE(RAB=rab,KBF=next,RBF=req_block,RSZ=DIU$K_CHAR_COUNT);
+          $UPDATE(RAB=rab,ERR=rms$failure);
+          ! Update the pointer and put it back
+        END;
+
+$RAB_STORE(RAB=rab,KBF=request_ID);
+$GET(RAB=rab,ERR=rms$failure);
+! Get the deleted record back
+
+$RAB_STORE(RAB=rab,KBF=(UPLIT(1)),UBF=hdr_block,USZ=DIU$K_LEN);
+$GET(RAB=rab,ERR=rms$failure);
+! Get the header record back
+
+req_block[DIU$H_NEXT_RECORD] = .hdr_block[HDR$H_DELETED_CHAIN];
+hdr_block[HDR$H_DELETED_CHAIN] = .request_ID;
+! Point this record at head of chain, and record 1 at this record.
+
+$RAB_STORE(RAB=rab,KBF=request_ID,RBF=req_block,RSZ=DIU$K_CHAR_COUNT);
+$FIND(RAB=rab,ERR=rms$failure);
+$UPDATE(RAB=rab,ERR=rms$failure);
+! Write this record out first (so system crash doesn't result
+! in record 1 pointing to empty chain, thus losing deleted records)
+
+$RAB_STORE(RAB=rab,KBF=(UPLIT(1)),RBF=hdr_block,RSZ=DIU$K_CHAR_COUNT);
+$FIND(RAB=rab,ERR=rms$failure);
+$UPDATE(RAB=rab,ERR=rms$failure);
+$DISCONNECT(RAB=rab,ERR=rms$failure);
+! NOW write the header record
+
+RETURN(DIU$_NORMAL);
+
+END;                                ! End of q$delete
+
+
+!**********************************************************************
+!**                    Q $ M O D I F Y 
+!**********************************************************************
+GLOBAL ROUTINE q$modify (req_ID, item_code, new_value) =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Modify a parameter  of a  request in  the queue.   Since modifying  the
+!       priority, /AFTER,  or /DEADLINE  parameters is  likely to  result in  a
+!       reordering of the queue, MODIFY is implemented as a DELETE followed  by
+!       an ENTER.  We know  the ENTER will assign  the same request ID  because
+!       deleted request ID's are maintained in a LIFO stack.
+!
+! FORMAL PARAMETERS:
+!       req_ID: request ID number
+!       item_code: code identifying item to change
+!       new_value: new value of item
+!
+! IMPLICIT OUTPUTS:
+!
+!       The queue  file entry  is  modified.  If  the modification  alters  the
+!       relative priority of the request, it will move to an appropriate  place
+!       in the queue.
+!
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!       DIU$_NORMAL: successful completion
+!       DIU$_INVALID_FUNCTION: invalid item code
+!       DIU$_ACTIVE: can't modify an active request
+!
+!--
+
+LOCAL
+        retcode,
+	chain_head,
+        original_req_ID,
+        req_block_template : $DIU_BLOCK,
+        req_block : REF $DIU_BLOCK;
+
+! Cannot modify header record..
+
+Q$REQ_BLOCK_INIT (req_block_template);
+IF (original_req_id = req_block_template[DIU$H_REQUEST_ID] = .req_ID) LSS 2
+THEN RETURN (DIU$_INVALID_REQUEST);
+
+! Find this request
+
+IF NOT (retcode = Q$FIND (req_block_template, chain_head))
+THEN RETURN (.retcode);
+
+! We had better have only one request block in the chain.
+
+IF ..chain_head NEQ 0 THEN RETURN (DIU$_BUG);
+
+! Address the request block proper
+
+req_block = .chain_head + %UPVAL;
+
+SELECTONE .item_code OF
+SET
+   [DIUQ$K_AFTER]           : req_block[DIU$G_AFTER]           = .new_value;
+   [DIUQ$K_PRIORITY]        : req_block[DIU$B_PRIORITY]        = .new_value;
+   [DIUQ$K_DEADLINE]        : req_block[DIU$G_DEADLINE]        = .new_value;
+   [DIUQ$K_HOLDING]         : req_block[DIU$V_HOLDING]         = .new_value;
+   [DIUQ$K_DEPENDENT_ID]    : req_block[DIU$H_DEPENDENT_ID]    = .new_value;
+   [DIUQ$K_NOTIFY]          : req_block[DIU$Z_NOTIFY]          = .new_value;
+   [DIUQ$K_SEQUENCE]        : req_block[DIU$V_SEQ_CONTINUE]    = .new_value;
+   [DIUQ$K_PREREQUISITE_ID] : req_block[DIU$H_PREREQUISITE_ID] = .new_value;
+   [DIUQ$K_LOG_FILESPEC]    :
+            BEGIN
+            MAP new_value : REF $STR_DESCRIPTOR ();
+            CH$MOVE (.new_value[STR$H_LENGTH],
+                     .new_value[STR$A_POINTER],
+                      CH$PTR (req_block[DIU$T_LOG_FILESPEC]));
+            req_block[DIU$H_LOG_FILESPEC] = .new_value[STR$H_LENGTH];
+            END;
+   [OTHERWISE]              : RETURN (DIU$_INVALID_REQUEST);
+
+TES; %(select)%
+
+! Delete the existing version of the request
+
+IF NOT (retcode = q$delete (.req_ID))
+THEN BEGIN
+     q$release_chain (.chain_head);
+     RETURN (DIU$_BUG);
+     END;
+
+! Zero the request id, and re-enter on the queue.  Since we take from the
+! deleted chain first, it should get the same request id.
+
+req_block[DIU$H_REQUEST_ID] = 0;
+
+IF NOT (retcode = Q$ENTER (.req_block))
+THEN BEGIN
+     Q$RELEASE_CHAIN (.chain_head);
+     RETURN (DIU$_BUG);
+     END;
+
+! Release the chain of request(s)
+
+Q$RELEASE_CHAIN (.chain_head);
+
+! Make sure it assigned the same request id.
+
+IF .req_block[DIU$H_REQUEST_ID] NEQ .original_req_ID
+THEN RETURN (DIU$_BUG);
+  
+RETURN (DIU$_NORMAL)                    ! Return OK
+  
+END;                                    ! End of q$modify
+  
+
+!**********************************************************************
+!**                    Q $ F I N D 
+!**********************************************************************
+GLOBAL ROUTINE q$find (p_req_block, chain_returned) =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Find a request record, or records.  Caller can specify:
+!       1) A specific request-ID (at most one record will be returned)
+!       2) A wildcarded request-block (matching records are returned)
+!       3) An empty (zero) request-block (all request blocks are returned)
+!
+! FORMAL PARAMETERS:
+!   p_req_block         - pointer to a request block.
+!   chain_returned      - address to store pointer to chain of request
+!                         blocks.  The chain is of request blocks with
+!                         one word prepended to the front of the block
+!                         which is a pointer to the next block, or zero.
+!                         The blocks are allocated in heap space with
+!                         $XPO_GET_MEM and MUST BE FREED BY THE CALLER!
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   DIU$_NORMAL                 - successful completion
+!   DIU$_INVALID_REQUEST        - request block invalid
+!   DIU$_QUEUE_EMPTY            - queue is empty
+!   DIU$_REQ_NOT_FOUND          - can't find the request
+!   DIU$_RMS_ERROR              - unexpected RMS error
+!   DIU$_NO_MEMORY              - insufficient heap space to satisfy request
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+BIND
+        req_block = .p_req_block : $DIU_BLOCK;
+
+LOCAL
+        rab        : VOLATILE $RAB_DECL,
+        chain_head : VOLATILE,
+        hdr_record : $DIU_BLOCK,
+        req_ID,
+        last_block,
+        this_block,
+        this_record : REF $DIU_BLOCK,
+        next_record_number;
+
+ENABLE
+        Q$$FIND_CH(chain_head, rab);
+
+$RAB_INIT(RAB=rab,FAB=q_fab,RAC=KEY);
+$CONNECT(RAB=rab,ERR=rms$failure);
+! Init our RMS blocks
+
+! Handle the case where they gave us a specific request id.  Allocate a 
+! memory chain of one, and return that to the user.
+
+IF .req_block[DIU$H_REQUEST_ID] NEQ 0
+   THEN BEGIN
+        IF NOT $XPO_GET_MEM(UNITS=DIU$K_LEN+%UPVAL,RESULT=this_block)
+           THEN SIGNAL (DIU$_NO_MEMORY);
+        ! Get one block in heap space
+
+        (.this_block) = 0;              
+        ! Zero next pointer (since only one should come back)
+
+        this_record = .this_block + %UPVAL;
+        ! Address the request block proper
+
+        req_ID = .req_block[DIU$H_REQUEST_ID];
+        $RAB_STORE(RAB=rab,KBF=req_ID,UBF=.this_block+%UPVAL,USZ=DIU$K_LEN);
+        $GET(RAB=rab);
+        ! Look up the record
+
+        IF (NOT ($RMS_STATUS_OK (rab))) OR .this_record[DIU$V_DELETED]
+          THEN BEGIN
+               $DISCONNECT(RAB=rab,ERR=rms$failure);
+               $XPO_FREE_MEM(BINARY_DATA=(DIU$K_LEN+%UPVAL,.this_block,UNITS));
+               (.chain_returned) = 0;
+               RETURN (DIU$_REQ_NOT_FOUND);
+                END;
+        ! If there's no record, or if the record is deleted, fail. Set the
+        ! return chain address to zero.
+
+        (.chain_returned) = .this_block;
+        $DISCONNECT (RAB = rab, ERR = rms$failure);
+        RETURN (DIU$_NORMAL)
+        ! OK, return address of block allocated to caller
+
+        END; %(request id specified)%
+
+! Request-ID not specified:  we have to search the queue file for matches.
+! Get the header record, which contains the pending record chain pointer.
+
+$RAB_STORE(RAB=rab,KBF=(UPLIT(1)),UBF=hdr_record,USZ=DIU$K_LEN);
+$GET(RAB=rab,ERR=rms$failure);
+next_record_number = .hdr_record[HDR$H_PENDING_CHAIN];
+! Get header record and find pending chain
+
+IF .next_record_number EQL 0
+   THEN BEGIN
+          $DISCONNECT (RAB = rab, ERR = rms$failure);
+          (.chain_returned) = 0;
+          RETURN (DIU$_QUEUE_EMPTY);
+        END;
+! No pending requests in the queue.. sorry Jack
+
+
+last_block = chain_head;
+! The absence of a dot is intentional
+
+! Now scan the chain of pending records, reading each one into a block
+! in heap space.  If the record matches what the caller specified, it
+! is linked into the chain we're building.  Otherwise the heap space
+! is released and reused.
+
+WHILE .next_record_number NEQ 0 DO
+  BEGIN
+        IF NOT $XPO_GET_MEM (UNITS=DIU$K_LEN+%UPVAL,RESULT=this_block)
+           THEN SIGNAL (DIU$_NO_MEMORY);
+        ! Allocate a block in heap space into which to read the record
+
+        (.this_block) = 0;              
+        ! Zero next pointer
+
+        $RAB_STORE(RAB=rab,KBF=next_record_number,
+                   UBF=.this_block+%UPVAL,USZ=DIU$K_LEN);
+        $GET(RAB=rab,ERR=rms$failure);
+        IF NOT $RMS_STATUS_OK (rab)
+           THEN SIGNAL (DIU$_RMS_ERROR);
+        ! Get this record
+
+        this_record = .this_block + %UPVAL;
+        next_record_number = .this_record[DIU$H_NEXT_RECORD];
+        ! Found a record.  See if it matches what caller supplied.
+
+        IF Q$$MATCH_BLOCK(req_block,.this_record)
+        THEN BEGIN
+               (.last_block) = .this_block;
+               last_block = .this_block;
+             END
+             ! Record matches, link it in to the chain
+        ELSE $XPO_FREE_MEM(BINARY_DATA=(DIU$K_LEN+%UPVAL,.this_block, UNITS));
+             ! Record doesn't match, release the heap space
+
+  END; %(while more requests)%
+
+$DISCONNECT (RAB = rab, ERR = rms$failure);
+! All done.  Pass address of chain of blocks to caller and return.
+
+(.chain_returned) = .chain_head;
+IF .chain_head NEQ 0
+   THEN RETURN (DIU$_NORMAL)
+   ELSE RETURN (DIU$_REQ_NOT_FOUND)
+
+
+END;                                ! End of q$find
+
+!**********************************************************************
+!                     Q $ $ F I N D _ C H 
+!**********************************************************************
+ROUTINE q$$find_ch (sig, mech, enbl) =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Condition handler for q$find.  Our task is to release dynamic
+!   memory acquired, disconnect the RAB, and cause q$find to return
+!   the appropriate failure code to its caller, by unwinding.
+!
+! FORMAL PARAMETERS:
+!   sig         - signal vector
+!   mech        - mechanism vector
+!   enbl        - enable vector
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   NONE
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+
+MAP
+        sig  : REF VECTOR,
+        mech : REF VECTOR,
+        enbl : REF VECTOR;
+
+BIND
+        completion_code = sig[1],
+        chain_head      = .enbl[1],
+        rab             = .enbl[2],
+        retval          = mech[%BLISS16(1)
+                               %BLISS32(3)
+                               %BLISS36(1)];
+
+IF .completion_code EQL STS$K_UNWIND
+   THEN RETURN (0);
+! Handle unwinds through us..
+
+IF .chain_head NEQ 0 THEN Q$RELEASE_CHAIN (.chain_head);
+! If we had a chain, deallocate it..
+
+$DISCONNECT(RAB=rab);
+retval = .completion_code;
+! Set the return value to what was SIGNAL'd
+
+SETUNWIND ()
+! Unwind the sucker..
+
+END;                                ! End of q$$find_ch
+
+!*****************************************************************
+!**                   Q $ P I C K 
+!*****************************************************************
+GLOBAL ROUTINE q$pick (p_req_block) =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Pick a request from the queue for processing.
+!
+! FORMAL PARAMETERS:
+!   p_req_block         - pointer to request block
+!
+! IMPLICIT INPUTS:
+!   DIU$H_REQUEST_ID must contain a valid request ID.
+!
+! IMPLICIT OUTPUTS:
+!   The request is marked as active (DIU$V_ACTIVE), and the caller's request
+!   block is filled in.
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   DIU$_NORMAL         - success
+!   DIU$_ACTIVE         - request already active
+!   DIU$_REQ_NOT_FOUND  - no such request
+!   DIU$_RMS_ERROR      - unexpected RMS error
+!   DIU$_HOLD           - request is on hold by operator
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+
+BIND
+        req_block = .p_req_block : $DIU_BLOCK;
+
+LOCAL
+        rab : $RAB_DECL,
+        req_ID;
+
+IF .req_block[DIU$H_REQUEST_ID] EQL 0
+   THEN RETURN (DIU$_INVALID_REQUEST);
+! Cannot pick request 0 out of the queue..
+
+$RAB_INIT(RAB=rab,FAB=q_fab);
+$CONNECT(RAB=rab,ERR=rms$failure);
+! Init and connect the RMS blocks
+
+req_ID = .req_block[DIU$H_REQUEST_ID];
+$RAB_STORE(RAB=rab,RAC=KEY,KBF=req_ID,UBF=req_block,USZ=DIU$K_LEN);
+$GET(RAB=rab,ERR=rms$failure);
+IF (NOT $RMS_STATUS_OK (rab))
+    THEN BEGIN
+           $DISCONNECT (RAB = rab);
+           RETURN (DIU$_RMS_ERROR)
+        END;
+! Get the record
+
+IF .req_block[DIU$V_DELETED]
+   THEN BEGIN
+          $DISCONNECT (RAB = rab);
+          RETURN (DIU$_REQ_NOT_FOUND)
+        END;
+! Sorry, its deleted..
+
+IF .req_block[DIU$V_ACTIVE]
+   THEN BEGIN
+          $DISCONNECT (RAB = rab);
+          RETURN (DIU$_ACTIVE)
+        END;
+! Its already being used...
+
+req_block[DIU$V_ACTIVE] = 1;
+$UPDATE (RAB = rab, ERR = rms$failure);
+! Request passes all tests.  Set DIU$V_ACTIVE and return.
+
+IF (NOT $RMS_STATUS_OK (rab))
+   THEN BEGIN
+          $DISCONNECT (RAB = rab);
+          RETURN (DIU$_RMS_ERROR);
+          END;
+! Check to make sure it was updated
+  
+$DISCONNECT (RAB = rab);
+! Let go of the queue
+
+RETURN DIU$_NORMAL;
+ 
+END;                                ! End of q$pick
+
+
+!******************************************************************
+!**                    Q $ R E Q U E U E 
+!******************************************************************
+GLOBAL ROUTINE q$reque (req_ID) =
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!   Requeue an already picked (q$pick) request.
+!
+! FORMAL PARAMETERS:
+!   req_ID              - request ID no. of the request
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   DIU$V_ACTIVE is cleared.
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   DIU$_NORMAL         - OK
+!   DIU$_RMS_ERROR      - unexpected RMS error
+!   DIU$_ACTIVE         - request was not active
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+
+LOCAL
+        req_block : $DIU_BLOCK,
+        rab       : $RAB_DECL;
+
+$RAB_INIT(RAB=rab,FAB=q_fab,RAC=KEY);
+$CONNECT(RAB=rab,ERR=rms$failure);
+$RAB_STORE(RAB=rab,RAC=KEY,KBF=req_ID,UBF=req_block,USZ=DIU$K_LEN);
+$GET(RAB=rab,ERR=rms$failure);
+! Get the record
+
+IF NOT $RMS_STATUS_OK (rab)
+   THEN BEGIN
+          $DISCONNECT(RAB=rab);
+          RETURN (DIU$_RMS_ERROR)
+        END;
+! It had better be found...
+
+req_block[DIU$V_ACTIVE] = 0;
+! Turn off active flag
+
+req_block[DIU$G_AFTER] = s$time () + requeue_time;
+! Set /AFTER to 10 minutes from now, to avoid infinite resource hoggage
+
+req_block[DIU$G_REQUEUE_COUNT] = .req_block[DIU$G_REQUEUE_COUNT] + 1;
+! Increment requeue count
+
+$UPDATE(RAB=rab,ERR=rms$failure);
+IF NOT $RMS_STATUS_OK (rab)
+   THEN BEGIN
+          $DISCONNECT(RAB=rab);
+          RETURN (DIU$_RMS_ERROR);
+        END;
+! Update the record..
+
+$DISCONNECT(RAB=rab);
+! Get rid of queue file
+
+RETURN (DIU$_NORMAL)
+! I don't think we're in Kansas anymore Toto...
+
+END;                                ! End of q$reque
+
+!************************************************************
+!**            Q $ $ L O W E R _ P R I O R I T Y 
+!************************************************************
+ROUTINE q$$lower_priority (p_block1, p_block2) =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Test to see if block1 is of lower priority than block2.
+!
+! FORMAL PARAMETERS:
+!   p_block1      - pointer to request block
+!   p_block2      - pointer to request block
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   1   - block 1 is of lower priority than block 2
+!   0   - block 1 is not of lower priority than block 2
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+
+BIND
+        block1 = .p_block1 : $DIU_BLOCK,
+        block2 = .p_block2 : $DIU_BLOCK;
+
+IF .block1[DIU$B_PRIORITY] LSS .block2[DIU$B_PRIORITY]
+   THEN RETURN (1);
+! If block1's priority code is lower, it is definitely of lower priority
+
+IF .block1[DIU$B_PRIORITY] NEQ .block2[DIU$B_PRIORITY]
+   THEN RETURN (0);
+! If the priority codes are unequal (that is, block1 has higher priority
+! code) there's no way block1 can be of lower priority, so return false.
+
+IF .block1[DIU$G_AFTER] NEQ .block2[DIU$G_AFTER]
+   THEN RETURN (0);
+IF .block1[DIU$G_AFTER] GTR .block2[DIU$G_AFTER]
+   THEN RETURN (1);
+! The requests have equal priorities.  Test according to /AFTER.
+
+IF .block2[DIU$G_DEADLINE] NEQ 0
+   THEN IF .block1[DIU$G_DEADLINE] EQL 0
+           THEN RETURN (1)
+           ELSE IF .block1[DIU$G_DEADLINE] GTR .block2[DIU$G_DEADLINE]
+                   THEN RETURN (1);
+! The /AFTER switches are equal.  Check /DEADLINE.
+
+RETURN (0)
+! We failed all tests.  Report that block1 is NOT of lower priority.
+
+END;                                ! End of q$$lower_priority
+
+!********************************************************************
+!**           Q $ $ A S S I G N _ S E Q U E N C E _ N O 
+!********************************************************************
+ROUTINE q$$assign_sequence_no =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Assign an unused sequence number.
+!
+! FORMAL PARAMETERS:
+!   NONE
+!
+! IMPLICIT INPUTS:
+!   The chain of deleted records (pointed to by record 1) is checked.
+!   If it's nonempty, the first such record is delinked and returned
+!   to the caller.  Otherwise, we append a record to the file and return
+!   its ID.
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   The sequence number assigned is returned.  If the queue is full,
+!   we return -1.
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+
+LOCAL
+        rab : $RAB_DECL,                ! RAB for queue file
+        hdr_record : $DIU_BLOCK,        ! Header record
+        del_record : $DIU_BLOCK,        ! Deleted record
+        tmp_pointer;
+
+$RAB_INIT(RAB=rab,FAB=q_fab,RAC=KEY);
+$CONNECT(RAB=rab,ERR=rms$failure);
+
+$RAB_STORE(RAB=rab,KBF=(UPLIT(1)),UBF=hdr_record,USZ=DIU$K_LEN);
+$GET(RAB=rab,ERR=rms$failure);
+IF NOT $RMS_STATUS_OK (rab)
+   THEN $XPO_PUT_MSG (SEVERITY = FATAL, STRING = 'Cannot find header record');
+! Get the header record to see if we have a deleted chain
+
+IF .hdr_record[HDR$H_DELETED_CHAIN] NEQ 0
+   THEN BEGIN
+        !
+        ! We do have a deleted record chain.  Dequeue the first record
+        ! and return its number to our caller.
+        !
+        LOCAL
+            record_number;
+
+        record_number = .hdr_record[HDR$H_DELETED_CHAIN];
+        $RAB_STORE(RAB=rab,KBF=record_number,UBF=del_record,USZ=DIU$K_LEN);
+        $GET(RAB=rab,ERR=rms$failure);
+        IF NOT $RMS_STATUS_OK (rab)
+           THEN $XPO_PUT_MSG (SEVERITY = FATAL,
+                              STRING = 'Cannot find first deleted record');
+        ! Get the first deleted record
+
+        hdr_record[HDR$H_DELETED_CHAIN] = .del_record[DIU$H_NEXT_RECORD];
+        $RAB_STORE(RAB=rab,KBF=(UPLIT(1)),RBF=hdr_record,RSZ=DIU$K_CHAR_COUNT);
+        $FIND(RAB=rab,ERR=rms$failure);
+        $UPDATE(RAB=rab,ERR=rms$failure);
+        $DISCONNECT(RAB=rab);
+        ! Update the pointer to the deleted chain and put back
+
+        del_record[DIU$V_DELETED] = 0;
+        del_record[DIU$V_ACTIVE] = 0;
+        ! Clear the deleted and active flags
+
+        RETURN (.del_record[DIU$H_REQUEST_ID]);
+        ! Return, giving the request id
+
+        END; %(deleted chain exists)%
+
+! No deleted record chain exists.  Append a new record to the file
+! (hdr_record[DIU$H_REQUEST_ID] points to 1st unused record in file).
+! The request ID is set to the relative record number.  If we're
+! at record 250, though, the queue is full, so return -1.
+
+tmp_pointer = .hdr_record[HDR$H_FIRST_FREE];
+IF .tmp_pointer GEQ (250 + 3)
+   THEN BEGIN
+          $DISCONNECT(RAB=rab,ERR=rms$failure);
+          RETURN (-1);
+        END;
+! Grab one from the free list
+
+Q$REQ_BLOCK_INIT(del_record);
+$RAB_STORE(RAB=rab,KBF=tmp_pointer,RBF=del_record,RSZ=DIU$K_CHAR_COUNT);
+$PUT(RAB=rab,ERR=rms$failure);
+! write the record 
+
+hdr_record[HDR$H_FIRST_FREE] = 1 + 
+                              (del_record[DIU$H_REQUEST_ID]=.rab[RAB$G_BKT]);
+! Update first free record field in header record
+
+$RAB_STORE(RAB=rab,KBF=(UPLIT(1)),RBF=hdr_record,RSZ=DIU$K_CHAR_COUNT);
+$FIND(RAB=rab,ERR=rms$failure);
+$UPDATE(RAB=rab,ERR=rms$failure);
+! Put the header record back
+
+$DISCONNECT(RAB=rab,ERR=rms$failure);
+
+RETURN (.del_record[DIU$H_REQUEST_ID])
+
+END;                                ! End of q$$assign_sequence_no
+
+!********************************************************************
+!                 Q $ $ M A T C H _ B L O C K 
+!********************************************************************
+ROUTINE q$$match_block (p_try_block, p_target_block) =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION
+!
+!   Test to see if a request block can match a given request block.
+!   The "try" block can be very sparse (in fact, if it is totally zero,
+!   this routine will return success).  If all data specified in try_block
+!   match the corresponding data in target_block, success is returned.
+!   Wildcarding is allowed.
+!
+!   If there is anything in the source filespec portion of the request block,
+!   it is assumed to be the source node to match.  If anything in the
+!   destination file, it is assumed to be the destination node.  Node names
+!   must have colons ("::") attached.
+!   
+! FORMAL PARAMETERS
+!
+!   p_try_block         - pointer to the (partial) block to test for a match
+!   p_target_block      - pointer to target block
+!
+! IMPLICIT INPUTS
+!   NONE
+!
+! IMPLICIT OUTPUTS
+!   NONE
+!
+! ROUTINE VALUE
+!
+!       TRUE: match
+!       FALSE: no match
+!--
+
+MACRO matchwild [field_name]= 
+BEGIN
+
+LOCAL length;
+
+IF (length = .try_block[%NAME ('DIU$H_', field_name)]) NEQ 0
+THEN BEGIN
+     LOCAL tlength,
+           result,
+           try_buff  : VECTOR [CH$ALLOCATION (40)],
+           targ_buff : VECTOR [CH$ALLOCATION (40)];
+
+           ! Check length of the fields first
+           tlength = .target_block[%NAME ('DIU$H_', field_name)];
+           IF (.length GTR 40) OR (.tlength GTR 40) THEN RETURN (0);
+
+           ! Make the try buffer argument ASCIZ
+           CH$COPY(.length,CH$PTR(try_block[%NAME('DIU$T_',field_name)]),
+                   0,.length+1,CH$PTR(try_buff));
+
+           ! Make the argument buffer ASCIZ
+           CH$COPY(.tlength,CH$PTR(target_block[%NAME('DIU$T_',field_name)]),
+                   0,.tlength + 1, CH$PTR (targ_buff));
+
+           ! Test the ASCIZ strings.. and return false if no match
+           IF NOT wild_match(CH$PTR(try_buff),CH$PTR(targ_buff))
+           THEN RETURN FALSE;
+
+           END;                         ! length not equal 0
+
+END %;                                  ! macro matchwild
+
+BIND try_block    = .p_try_block    : $DIU_BLOCK,
+     target_block = .p_target_block : $DIU_BLOCK;
+
+LOCAL src_node,
+      dst_node,
+      node : $STR_DESCRIPTOR(CLASS=DYNAMIC),
+      buff : $STR_DESCRIPTOR(CLASS=DYNAMIC);
+        
+! If the target is deleted then return false
+
+IF .target_block[DIU$V_DELETED] THEN RETURN FALSE;
+
+! If the request id isn't zero and they don't match, return false
+
+IF .try_block[DIU$H_REQUEST_ID] NEQ 0
+THEN IF .try_block[DIU$H_REQUEST_ID] NEQ .target_block[DIU$H_REQUEST_ID]
+     THEN RETURN FALSE;
+
+%IF %SWITCHES (TOPS10) %THEN            ! TOPS-10 ONLY
+! If the user id isn't zero and they don't match, return false
+IF .try_block[DIU$G_USER_NUMBER] NEQ 0
+THEN IF .try_block[DIU$G_USER_NUMBER] NEQ .target_block[DIU$G_USER_NUMBER]
+     THEN RETURN FALSE;
+%FI                                     ! END TOPS-10 ONLY
+
+! Make sure the jobname and username match if they are specified
+
+MATCHWILD (jobname,username);
+
+! If they gave us a node name to match, try and find it in either the
+! source or destination filespec buffers.  If it isn't there, fail.
+
+IF (.try_block[DIU$H_SOURCE_FILESPEC] GTR 0)
+THEN BEGIN
+     IF NOT (Q$FNODE(target_block[DIU$T_SOURCE_FILESPEC],
+                     .target_block[DIU$H_SOURCE_FILESPEC],
+                     try_block[DIU$T_SOURCE_FILESPEC],
+                     .try_block[DIU$H_SOURCE_FILESPEC])
+             OR Q$FNODE(target_block[DIU$T_DESTINATION_FILESPEC],
+                        .target_block[DIU$H_DESTINATION_FILESPEC],
+                        try_block[DIU$T_SOURCE_FILESPEC],
+                        .try_block[DIU$H_SOURCE_FILESPEC]))
+     THEN RETURN FALSE;
+     END;
+
+! All identifying fields matched.  Return true.
+
+RETURN TRUE;
+
+END;                                ! End of q$$match_block
+
+END 
+ELUDOM
+

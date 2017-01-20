@@ -1,0 +1,827 @@
+
+%TITLE 'FGNFND -- $FIND service routines for non-RMS file types'
+!<BLF/REQUIRE 'BLI:BLF.REQ'>
+MODULE ffffnd (IDENT = 'find'
+		) =
+BEGIN
+!
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1985, 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+!
+!
+!
+!    ********** TABLE OF CONTENTS **********
+!
+!
+!
+!    ROUTINE                    FUNCTION
+!    -------                    --------
+!
+!    F$FIND                  Dispatch to $FIND routines for each file type
+!    FINDSIX                 $FIND routines for ...
+!    FINDEBC
+!    FINDFBIN
+!    .
+!    .
+!    .
+!
+!
+!
+!+
+!  Need a require file similar to RMSREQ.R36
+!  which contains library of all FGNLIB
+!  routines.
+!-
+
+REQUIRE 'fffreq';
+
+EXTERNAL
+    stksec;					! Stack's section
+
+EXTERNAL ROUTINE
+    findisam,				!   Find for Old Cobol Isam files
+    getsix,
+    getebc,
+    getfbin,
+    getisam,
+    getwindow,
+    six_rd_hdr,					! Read SIXBIT record header
+    g_byte,
+    ebc_rd_hdr,
+    ebc_new_block,
+    uaddr,
+    raddr,
+    checkeof;					!   Error handlers
+
+FORWARD ROUTINE
+!
+!   $FIND processor
+!
+    f$find,
+!
+!   $FIND routines for foreign file types
+!
+    findfbin,
+    findsix,
+    findebc,					! $FIND for EBCDIC files
+    fndefu,					! Fixed unblocked EBCDIC
+    fndevu,					! Variable unblocked EBCDIC
+    fndefb,					! Fixed blocked EBCDIC
+    fndevb;					! Variable blocked EBCDIC
+
+%SBTTL 'F$FIND -- $FIND dispatcher'
+
+GLOBAL ROUTINE f$find (usrrab : REF $rab_decl) =
+    BEGIN
+
+    LOCAL
+	findit;
+
+    rab = .usrrab;
+    rst = raddr (.rab [rab$a_isi]);
+    fst = raddr (.rst [rst$a_fst]);
+    cbd = raddr (rst [rst$z_current_bucket]);
+
+    !+
+    !    Dispatch to the proper routine for this file organization
+    !-
+
+    findit = (CASE .fst [fst$h_file_class] FROM typ$k_fff_class_min TO
+	typ$k_fff_class_max OF
+	SET
+	[typ$k_sixbit] : findsix ();		! COBOL SIXBIT
+	[typ$k_ebcdic] : findebc ();		! COBOL EBCDIC
+	[typ$k_fortran_binary] : findfbin ();	! FORTRAN BINARY
+	[typ$k_isam] : findisam ();		! OLD COBOL ISAM
+	TES);
+
+    IF .findit EQL false THEN RETURN false;
+
+    setsuccess (op$k_find);
+    RETURN true;
+    END;
+
+%SBTTL 'FINDFTNIMG -- $FIND for Fortran image files'
+
+GLOBAL ROUTINE findftnimg =
+    BEGIN
+
+    LOCAL
+	crp : BLOCK [1],
+	rfapagenum,
+	nrp,
+	header : BLOCK [1],
+	recordlength,
+	usersize,
+	checkpageflag;
+
+    REGISTER
+	tempac;
+
+    checkpageflag = false;
+    tempac = .rst [rst$g_next_record_pointer];	! Next record pointer
+!+
+!   A relic from RMSFND (kept out of respect
+!   for this clever code --- 8/21/84).
+!-
+
+    IF (.tempac^w2p)^p2w EQL .tempac		! Top of new page
+    THEN
+	checkpageflag = true;			! Check for EOF
+
+!+
+!   Save the current record address.
+!-
+    rst [rst$g_data_rfa] = (crp = .rst [rst$g_next_record_pointer]);
+!+
+!
+!   THIS SEEMS TO BE THE REAL CHECK FOR END OF FILE (8/21/84)
+!-
+!+
+!   If the current page is in our window, then we don't have
+!   to call an external routine to get it.
+!-
+    rfapagenum = .crp [rfapage];
+!+
+!   Check if this is the first page of the file buffers or
+!   a new page.
+!
+!   If it points to a new page then we must FIRST check that
+!   the current record pointer is pointing to an actual record,
+!   not END OF FILE.
+!
+!   NOTE:
+!   Because the buffers are statically allocated in the
+!   intermediate pages of the OWN storage of FORGN, the
+!   first page of the buffers will never be page 0.
+!-
+
+    IF (.currentwindow EQL 1) OR 		! There is no current bucket
+	(.currentfilepage NEQ .rfapagenum)
+    THEN
+	BEGIN
+
+	IF checkeof ()				! End of file ?
+	THEN
+	    SIGNAL (ff$_end_of_file);
+
+	!+
+	!   Get the new page.
+	!-
+
+	IF getwindow (.rfapagenum, 		! Page number
+		.checkpageflag)			! Page must exist
+	    EQL false
+	THEN 					! Page does not exist
+	    SIGNAL (ff$_page_not_exist);
+
+	END;
+
+!+
+!   Now, the page we want is in our window.  We must set up
+!   a pointer to it in the RST.
+!-
+    tempac = (rst [rst$g_page_pointer] = (.curentbufferadr) + .crp [ofset]);
+!+
+!   The record is now available to us.  We must pick up the
+!   record header to see if it is a valid record.
+!
+!   (no headers on Fortran image files)
+!-
+!   header = ..tempac;
+
+!++
+!   We will now compute the starting byte number of the next
+!   record.  We will do this by computing the number of full
+!   words this record occupies and adding the size of the
+!   record header (if any).
+!--
+
+!+
+!   The record size (in bytes) was supplied by the user in the MRS field
+!   then compute the number of full words in this record
+!-
+    usersize = .fst [fst$h_mrs];
+!+
+!   Now, compute the number of full words, which is the
+!   total record size, in this case.
+!-
+    recordlength = $size_in_words (.usersize, .fst [fst$h_bsz]);
+    nrp = .crp + .recordlength;
+!+
+!   Update all data pages.
+!-
+    rst [rst$h_record_size_words] = .recordlength;	! Save RSZ in words
+    rst [rst$h_record_size] = .usersize;	! And in bytes
+    rst [rst$g_next_record_pointer] = .nrp;	! Update the NRP always
+    						! (if seq access-mode)
+!+
+!   Update the count(s).
+!-
+    .rst [rst$g_highest_byte] = .rst [rst$g_highest_byte] + .usersize;
+    RETURN true					! Record found
+    END;					! End of FINDFTNIMG
+
+%SBTTL 'FINDFBIN -- $FIND for Fortran binary files'
+
+GLOBAL ROUTINE findfbin =
+    BEGIN
+
+    LOCAL
+	this_lscw : REF $rms_lscw,		!
+	next_lscw,				! Address of next LSCW
+	total_words,				! Length + LSCWs
+	words_in_record,			! Length of record
+	status;
+
+    !
+    !	Set up RFA of this record
+    !
+    rst [rst$g_data_rfa] = .rst [rst$g_next_record_pointer];
+    words_in_record = total_words = 0;
+    !
+    !	Line up the byte we want
+    !
+
+    IF g_byte (.rst [rst$g_data_rfa])		! Status OK?
+    THEN
+	BEGIN
+	!
+	!   This should be a code 1 LSCW
+	!
+	this_lscw = .rst [rst$g_page_pointer];
+
+	IF .this_lscw [lscw$b_code] NEQ 1	! Bad code?
+	THEN
+	    BEGIN				! Undefined file
+	    rab [rab$h_sts] = rms$_udf;		! UDF error
+	    RETURN false;			! Return an error
+	    END;
+
+	!
+	!   The next LSCW should be at the RFA of this
+	!   record + the count in this LSCW.
+	!
+	next_lscw = .rst [rst$g_data_rfa] + .this_lscw [lscw$h_count_value];
+	!
+	!   Set the initial record length and
+	!   "data length" (LSCW count - 1).
+	!
+	words_in_record = .this_lscw [lscw$h_count_value] - 1;
+	total_words = .this_lscw [lscw$h_count_value];
+	!
+	!   Fetch the next LSCW
+	!
+
+	IF NOT g_byte (.next_lscw)		! Get next LSCW
+	THEN
+	    RETURN false;			! Bombed somewhere
+
+	this_lscw = .rst [rst$g_page_pointer];	! Address of LSCW
+
+	!+
+	!   We may at this point have one or more continuation
+	!   LSCWs; we may have none at all and this could
+	!   be a terminating LSCW.  Loop to process any
+	!   continuation LSCWs that come up.
+	!-
+
+	WHILE .this_lscw [lscw$b_code] EQL 2 DO
+	    BEGIN
+	    !
+	    !	Set the next LSCW's RFA and add the
+	    !	appropriate values to the counters.
+	    !
+	    next_lscw = .next_lscw + .this_lscw [lscw$h_count_value];
+	    total_words = .total_words + .this_lscw [lscw$h_count_value];
+	    words_in_record = .words_in_record + 	!
+	    .this_lscw [lscw$h_count_value] - 1;
+
+	    !+
+	    !	Go after the next LSCW.
+	    !-
+
+	    IF NOT g_byte (.next_lscw)		! Get next LSCW
+	    THEN
+		RETURN false;			! Bombed somewhere
+
+	    this_lscw = .rst [rst$g_page_pointer];	! Address of LSCW
+	    END;
+
+	!+
+	!   We are here because THIS_LSCW is not a code 2
+	!   (continuation) LSCW.  We fervently hope that
+	!   it is a code 3 (terminating) LSCW, and that
+	!   the count contained therein is equal to the
+	!   total number of words in the record (with LSCWs),
+	!   which is contained in TOTAL_WORDS.
+	!-
+
+	IF .this_lscw [lscw$b_code] NEQ 3	! Bad code?
+	THEN
+	    BEGIN				! Undefined file
+	    rab [rab$h_sts] = rms$_udf;		! UDF error
+	    RETURN false;			! Return an error
+	    END
+	ELSE
+	    BEGIN
+	    total_words = .total_words + 1;
+
+	    IF .this_lscw [lscw$h_count_value] NEQ .total_words
+	    THEN
+		BEGIN				! Undefined file
+		rab [rab$h_sts] = rms$_udf;	! UDF error
+		RETURN false;			! Return an error
+		END;
+
+	    END;
+
+	!
+	!   Set the next record pointer.
+	!
+	rst [rst$g_next_record_pointer] = .rst [rst$g_data_rfa] + .total_words;
+	!
+	!   Set the record size
+	!
+	rst [rst$h_record_size] = .words_in_record;
+	!
+	!   Reset the pointers
+	!
+
+	IF NOT g_byte (.rst [rst$g_data_rfa])	! Get back to start of record
+	THEN
+	    RETURN false;			! Just in case
+
+	!
+	!   All OK, return same
+	!
+	rab [rab$g_rfa] = .rst [rst$g_data_rfa];
+	rab [rab$h_sts] = rms$_normal;
+	rab [rab$h_stv] = 0;			! Nothing special
+	rst [rst$v_last_operation] = op$k_find;
+	RETURN true
+	END
+    ELSE
+	RETURN false;				! Problem somewhere
+
+    END;					! End of FINDFTNBIN
+
+%SBTTL 'FINDFTNASC -- $FIND for Fortran ascii files'
+
+GLOBAL ROUTINE findfasc =
+    BEGIN
+    RETURN true
+    END;
+
+%SBTTL 'FINDCASC -- $FIND for Cobol ascii files'
+
+GLOBAL ROUTINE findcasc =
+    BEGIN
+    RETURN true
+    END;
+
+%SBTTL 'FINDSIX -- $FIND for Cobol sixbit files'
+
+GLOBAL ROUTINE findsix =
+    BEGIN
+
+    LOCAL
+	total_bytes,			! Record length + header length
+	offset_to_next,				! Bytes to next record
+	status;
+
+    STACKLOCAL
+	bytes_in_record;			! Length of record
+
+    !
+    !	Set up RFA of this record
+    !
+    rst [rst$g_data_rfa] = .rst [rst$g_next_record_pointer];
+    !
+    !	Line up the byte we want
+    !
+
+    IF g_byte (.rst [rst$g_data_rfa])		! Status OK?
+    THEN
+	BEGIN
+
+	!+
+	!	Get the record length
+	!-
+
+	IF NOT six_rd_hdr (.stksec OR bytes_in_record)	! Return on failure
+	THEN
+	    RETURN false;			! May be EOF, UDF, etc.
+
+	!
+	!	Set the Next Record Pointer
+	!
+	total_bytes = .rst [rst$v_rec_header_size] + .bytes_in_record;
+	offset_to_next = ((.total_bytes + rms$k_six_bpw - 1)/rms$k_six_bpw)*
+	rms$k_six_bpw;
+	rst [rst$g_next_record_pointer] = 	! Set pointer
+	.rst [rst$g_next_record_pointer] + .offset_to_next;
+	!
+	!   Set the record size
+	!
+	rst [rst$h_record_size] = .bytes_in_record;
+	!
+	!   All OK, return same
+	!
+	rab [rab$g_rfa] = .rst [rst$g_data_rfa];
+	rab [rab$h_sts] = rms$_normal;
+	rab [rab$h_stv] = 0;			! Nothing special
+	rst [rst$v_last_operation] = op$k_find;
+	RETURN true
+	END
+    ELSE
+	RETURN false;				! Problem somewhere
+
+    END;					! End of FINDSIX
+
+%SBTTL 'FINDEBC -- $FIND for Cobol ebcdic files'
+
+GLOBAL ROUTINE findebc =
+    BEGIN
+
+    LOCAL
+	status;
+
+    !+
+    !	Find the record according to file format.
+    !-
+
+    IF .fab [fab$v_bls] NEQ 0			! Check blocking
+    THEN
+
+	IF .fst [fst$h_rfm] EQL fst$k_fix	! Blocked - what format?
+	THEN
+	    status = fndefb ()			! Fixed blocked
+	ELSE
+	    status = fndevb ()			! Variable blocked
+    ELSE
+
+	IF .fst [fst$h_rfm] EQL fst$k_fix	! Unblocked - what format?
+	THEN
+	    status = fndefu ()			! Fixed unblocked
+	ELSE
+	    status = fndevu ();			! Variable unblocked
+
+    IF .status					! All OK?
+    THEN
+	BEGIN
+	rab [rab$g_rfa] = .rst [rst$g_data_rfa];
+	rab [rab$h_sts] = rms$_normal;
+	rab [rab$h_stv] = 0;			! Nothing special
+	rst [rst$v_last_operation] = op$k_find;
+	RETURN true;
+	END
+    ELSE
+	RETURN false;
+
+    END;
+
+%SBTTL 'FNDEFU - $FIND for EBCDIC fixed unblocked records'
+ROUTINE fndefu =
+    BEGIN
+
+    LOCAL
+	bytes_in_record;			! Length of record
+
+    !
+    !	Set up RFA of this record
+    !
+    rst [rst$g_data_rfa] = .rst [rst$g_next_record_pointer];
+    !
+    !	Get the length of this record
+    !
+    rst [rst$h_record_size] = bytes_in_record = .fst [fst$h_mrs];
+    !
+    !	Set the Next Record Pointer
+    !
+    rst [rst$g_next_record_pointer] = (		! Set pointer
+    .rst [rst$g_next_record_pointer] + 		! From current position
+    .bytes_in_record);				! and record size
+    !
+    !	Get this record into memory
+    !
+    RETURN g_byte (.rst [rst$g_data_rfa]);
+    END;					! End FNDEFU
+%SBTTL 'FNDEVU - $FIND for EBCDIC variable unblocked records'
+ROUTINE fndevu =
+    BEGIN
+
+    LOCAL
+	status;
+
+    STACKLOCAL
+	bytes_in_record;			! Length of record
+
+    !
+    !	Set up RFA of this record
+    !
+    rst [rst$g_data_rfa] = .rst [rst$g_next_record_pointer];
+    !
+    !	Line up the byte we want
+    !
+
+    IF g_byte (.rst [rst$g_data_rfa])		! Status OK?
+    THEN
+	BEGIN
+
+	!+
+	!	Get the record length
+	!-
+
+	IF NOT ebc_rd_hdr (.stksec OR bytes_in_record)	! Return on failure
+	THEN
+	    RETURN false;			! May be EOF, UDF, etc.
+
+	!+
+	!   Decrement the block byte count, in case we
+	!   are in a blocked file.
+	!-
+
+	IF .fab [fab$v_bls] NEQ 0		! Blocked?
+	THEN
+	    rst [rst$g_blkbyt] = .rst [rst$g_blkbyt] - rms$k_header_ebc;
+
+	!
+	!	Set the Next Record Pointer
+	!
+	rst [rst$g_next_record_pointer] = (	! Set pointer
+	.rst [rst$g_next_record_pointer] + 	! From current position
+	.rst [rst$v_rec_header_size] + 		! Include header, if any
+	.bytes_in_record);			! and record size
+	!
+	!   Set the record size
+	!
+	rst [rst$h_record_size] = .bytes_in_record;
+	!
+	!   All OK, return same
+	!
+	RETURN true
+	END
+    ELSE
+	RETURN false;				! Problem somewhere
+
+    END;					! End FNDEVU
+%SBTTL 'FNDEFB - $FIND for EBCDIC fixed blocked records'
+ROUTINE fndefb =
+    BEGIN
+
+    LOCAL
+	status;
+
+    !+
+    !	See if we have finished with this block,
+    !	and skip to the next if so.
+    !-
+
+    IF .rst [rst$g_blkbyt] LEQ .rst [rst$v_rec_header_size]	!
+    THEN
+	BEGIN
+
+	LOCAL
+	    nrp,				! Current NRP
+	    bytes_to_skip;			! Amount to add to it
+
+	nrp = .rst [rst$g_next_record_pointer];
+	bytes_to_skip = rms$k_ebc_b_p_bl - 	!
+	((.nrp + rms$k_ebc_b_p_bl) MOD rms$k_ebc_b_p_bl);
+
+	IF .bytes_to_skip EQL rms$k_ebc_b_p_bl	! Fix if on boundary
+	THEN
+	    bytes_to_skip = 0;
+
+	nrp = .nrp + .bytes_to_skip;		! Point at next block
+	rst [rst$g_next_record_pointer] = .nrp;	! Set RST
+	!
+	!   Reset block size count
+	!
+	rst [rst$g_blkbyt] = .fst [fst$h_mrs]*.fab [fab$v_bls];
+	END;
+
+    !+
+    !	Find a record
+    !-
+
+    IF (status = fndefu ())			!
+    THEN
+	BEGIN
+	rst [rst$g_blkbyt] = .rst [rst$g_blkbyt] - .rst [rst$h_record_size];
+	RETURN true;
+	END
+    ELSE
+	RETURN .status;
+
+    END;					! End FNDEFB
+%SBTTL 'FNDEVB - $FIND for EBCDIC variable blocked records'
+ROUTINE fndevb =
+    BEGIN
+
+    LOCAL
+	status;
+
+    !+
+    !	See if we have finished with this block,
+    !	and skip to the next if so.  One way to
+    !	finish the block is to use up all its
+    !	bytes (this is the obvious way).  The
+    !	other way is to suddenly come upon a
+    !	record of zero length (this is a sneaky
+    !	COBOL trick which destroys any pretense
+    !	of clean dealing with these files).
+    !-
+
+    IF .rst [rst$g_blkbyt] LEQ .rst [rst$v_rec_header_size]	!
+    THEN
+	BEGIN
+
+	IF NOT ebc_new_block ()			! Get a new block in
+	THEN
+	    RETURN false;
+
+	END
+    ELSE
+	BEGIN
+
+	!+
+	!   We really hate to do this, but COBOL is rather beef-witted in its
+	!   creation of these files -- COBOL neither puts a fixed number of
+	!   records in a block (I KNOW what the user specified -- just trust
+	!   me) nor does it put out variable-length blocks.  It figures out
+	!   the maximum block size (N records per block times maximum record
+	!   size) and always writes that out, even if there are N 1-byte
+	!   records in a block big enough to hold N 3000-byte records.  Thus,
+	!   we figure out that we have reached the end by searching for a null
+	!   record header.  This valuable exercise is brought to you courtesy
+	!   of the original COBOL engineers from days gone by.
+	!-
+
+	STACKLOCAL
+	    record_length;
+
+	IF NOT g_byte (.rst [rst$g_next_record_pointer])	! Set us up
+	THEN
+	    RETURN false;
+
+	IF NOT ebc_rd_hdr (.stksec OR record_length)	! Get the record length
+	THEN
+	    RETURN false;			! Be thorough
+
+	IF .record_length EQL 0			! No record?
+	THEN
+	    BEGIN
+
+	    IF NOT ebc_new_block ()		! Get a new block
+	    THEN
+		RETURN false;
+
+	    END;
+
+	END;
+
+    IF (status = fndevu ())			!
+    THEN
+	BEGIN
+	rst [rst$g_blkbyt] = .rst [rst$g_blkbyt] - .rst [rst$h_record_size];
+	RETURN true;
+	END
+    ELSE
+	RETURN .status;
+
+    END;					! End FNDEVB
+%SBTTL 'FINDCBIN -- $FIND for Cobol binary files'
+
+GLOBAL ROUTINE findcblbin =
+    BEGIN
+    RETURN true
+    END;
+
+%( This routine is sort of a template
+GLOBAL ROUTINE findgeneric =
+    BEGIN
+    LOCAL
+	sizeoflastrecrd,
+	temp;
+!+
+!   RFA access:
+!-
+![2] Using RFA from RAB, set up buffer, count, and pointers
+    IF .rab[Rab$b_rac] EQL Rab$k_Rfa
+    THEN
+	BEGIN
+	LOCAL
+	    pagenum,
+	    rfanum,
+            bytesperpage,
+	    pagebyte;
+	Rst [Rst$v_Eof] = 0;         ! Clear End-Of-File, this is random access
+	Rst [Rst$g_Data_Rfa] = rfanum = .Rab [Rab$g_Rfa];
+        bytesperpage = %BPVAL/.Fst[Fst$h_Bsz]*Rms$k_Page_Size;
+	pagenum = .rfanum/.bytesperpage;		! Get page number
+	pagebyte = .rfanum MOD .bytesperpage;		! and byte within page
+	Rst [Rst$g_Next_Record_Pointer] = .pagenum;
+	! Read page containing start of record
+        getwindow( .pagenum, true );    !!!!!!	readbuffer ();
+	! Point page pointer to correct place in buffer
+	Rst [Rst$g_Page_Pointer] = CH$PLUS (.Rst [Rst$g_Page_Pointer], .pagebyte);
+	! Is RFA past end of file? If so, give EOF error
+	IF .Rst [Rst$h_Byte_count] LSS .pagebyte
+        THEN Usererror (Rms$_Eof);        ! Record not found
+	! Update byte count
+	Rst [Rst$h_Byte_Count] = .Rst [Rst$h_Byte_Count] - .pagebyte;
+	RETURN true;
+	END;
+!+
+!   SEQuential access:
+!-
+!+
+!   If we are at EOF, then don't try finding a record.
+!-
+    IF .Rst[Rst$v_Eof]
+    THEN usererror (Rms$_Eof);
+!+
+!   If the last RMS operation issued was a $FIND, or if the
+!   last record fetched was too big for the user's buffer
+!   (i.e., "partial" record), then we must skip a record and
+!   position ourselves to the next one.  In all other cases
+!   (i.e., the last JSYS was a $OPEN or $GET), we are
+!   already positioned at the correct place.
+!
+!   This module also must insure that the current record's
+!   starting address is maintained correctly.  This
+!   procedure varies depending upon the current file
+!   context.  For instance, if two successive $FINDs are
+!   done, a record must be skipped and its length added to
+!   the starting address of the last record.  If the last
+!   record access was a "partial" record, the length of that
+!   record must be added to its starting address, then the
+!   rest of the record must be skipped and the amount that
+!   was skipped also added into the current RFA address.
+!
+!   For normal conditions (i.e., a $FIND is done after a
+!   successful $GET or $FIND), then the length of the last
+!   record (i.e., current record to the user) must be added
+!   to its starting byte number to produce the address of
+!   the next record, which then immediately becomes the
+!   current record.  This entire process must also be done
+!   for sequenced files, except all bytes are in terms of
+!   words and the line-number must be accounted for in
+!   certain calculations.
+!-
+!+
+!   If last RMS call was a $FIND or last record was too big
+!   then skip record
+!-
+    IF (.rst [Rst$v_Last_Operation] EQL op$k_find) OR .rst[rst$v_partial]
+    THEN
+	BEGIN					! To skip a record
+	IF .Rst[Rst$v_Partial]
+	THEN 					! We must update current RFA
+	    BEGIN
+            ! Get last record's size
+	    sizeoflastrecrd = .Rst [Rst$h_Record_Size];
+	    ! Compute start of this record
+	    Rst [rst$g_Data_Rfa] =
+                 .rst [rst$g_Data_Rfa]
+               + .sizeoflastrecrd
+               + .rst[rst$v_rec_header_size];
+!	    lookat ('	SIZEOFLAST: ', sizeoflastrecrd)
+	    END;
+	rst [Rst$h_Record_Size] = getgeneric (false);	! Skip a record
+	rst [rst$v_partial] = 0;	! Clear the partial flag
+	END;
+!+
+!   We must now update the RFA to point to the current
+!   record's starting address.
+!-
+    rst [rst$g_Data_Rfa] =              ! Compute start of next record
+    .Rst [rst$g_Data_Rfa] + .Rst [Rst$h_Record_Size];
+!+
+!   Return RFA to user
+!-
+    Rab [Rab$g_Rfa] = .Rst [rst$g_Data_Rfa];	![2] Return RFA to user
+    RETURN true
+    END;					! End of FINDGENERIC
+)%
+END
+
+ELUDOM
+   

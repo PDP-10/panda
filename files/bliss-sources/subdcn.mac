@@ -1,0 +1,353 @@
+;	COPYRIGHT (c) DIGITAL EQUIPMENT CORPORATION 1989.
+;	ALL RIGHTS RESERVED.
+;
+;	THIS SOFTWARE IS FURNISHED UNDER A  LICENSE AND MAY BE USED AND  COPIED
+;	ONLY IN  ACCORDANCE  WITH  THE  TERMS OF  SUCH  LICENSE  AND  WITH  THE
+;	INCLUSION OF THE ABOVE  COPYRIGHT NOTICE.  THIS  SOFTWARE OR ANY  OTHER
+;	COPIES THEREOF MAY NOT BE PROVIDED  OR OTHERWISE MADE AVAILABLE TO  ANY
+;	OTHER PERSON.  NO  TITLE TO  AND OWNERSHIP  OF THE  SOFTWARE IS  HEREBY
+;	TRANSFERRED.
+;
+;	THE INFORMATION IN THIS  SOFTWARE IS SUBJECT  TO CHANGE WITHOUT  NOTICE
+;	AND SHOULD  NOT  BE CONSTRUED  AS  A COMMITMENT  BY  DIGITAL  EQUIPMENT
+;	CORPORATION.
+;
+;	DIGITAL ASSUMES NO  RESPONSIBILITY FOR  THE USE OR  RELIABILITY OF  ITS
+;	SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+
+	TITLE SUBDCN - MX's DECnet Subfork
+	TWOSEG
+	RELOC 400000
+
+	SEARCH MONSYM,MACSYM,PROLOG
+
+	SD.INI==0		;Function code for INIT
+	SD.OPN==1		;Function code for OPEN
+	SD.RD==2		;Function code for READ
+	SD.WRM==3		;Function code for WRITE MESSAGE
+	SD.WRS==4		;Function code for WRITE STRING
+	SD.MAX==SD.WRS		;Max function code
+	SD.MIN==SD.INI		;Min function code
+
+;Other constants and variables
+	BIT0==1B0		;
+	DORBEL==1B0		;Our doorbell is channel 0
+	OPNBEL==1B1		;DECnet Link "Open"
+
+;OPNCHN contains the value for T3 in an MTOPR% .MOACN function to turn on
+;"Data Available" and "Connection" interrupts on channel 1.
+
+	OPNCHN==FLD(1,MO%DAV)+FLD(1,MO%CDN)+FLD(.MONCI,MO%INA)
+
+;OFFCHN contains the value for T3 in an MTOPR% .MOACN function to turn off
+;the "Data Available" and "Connection" interrupts.
+
+	OFFCHN==FLD(.MOCIA,MO%DAV)+FLD(.MOCIA,MO%CDN)+FLD(.MOCIA,MO%INA)
+
+	STKSIZ==200		;Arbitrary stack size
+				; We don't need nearly so much...
+
+;Offsets into private page
+	SFFLG==0		;Flag bits
+	SFFUN==1		;Function code
+	SFAC2==2		;Other args
+	SFAC3==3		;
+	SFAC4==4		;
+	CHTAB==5		;36 word channel table for interrupts
+	LVTB1==51		;3 word interrupt level table
+	LVTB2==52		;
+	LVTB3==53		;
+	INPC1==54		;Storing PC during level 1 interrupt
+	INPC2==55		;Storing PC during level 2 interrupt
+	SVJFN==56		;The JFN of the open link
+	SVPTR==57		;The byte pointer for the link
+	SVINT==60		;The interrupt channel number
+	INTCH==61		;The interrupt channel mask
+	QUAYLE==62		;3 dummies, used during $DMPACS
+	BENTSN==63
+	DUKAKS==64
+	LAST==777		;The last location on the page
+
+;Macro definitions
+
+DEFINE $TRACE (TXT,%DONE) <
+	TXNN F,SD%DBG
+	JRST %DONE
+	PUSH P,T1
+	HRROI T1,[ASCIZ /TXT
+/]
+	PSOUT
+	POP P,T1
+%DONE:
+>
+
+DEFINE $TRFUN (%DONE) <
+	TXNN F,SD%DBG
+	JRST %DONE
+	PUSH P,T1
+	HRRO T1,FNDBG(Q2)
+	PSOUT%
+	POP P,T1
+%DONE:
+>
+DEFINE $DMPACS (%DONE) <
+	TXNN F,SD%DBG
+	JRST %DONE
+	MOVEM T1,QUAYLE(P6)
+	MOVEM T2,BENTSN(P6)
+	MOVEM T3,DUKAKS(P6)
+	HRROI T1,[ASCIZ /Subfork ACs:
+/]
+	PSOUT
+	MOVEI T1,.PRIOU
+	MOVE T3,[NO%MAG!NO%LFL!FLD(15,NO%COL)+10]
+	MOVE T2,F
+	NOUT
+	 JFCL
+	MOVE T2,QUAYLE(P6)
+	NOUT
+	 JFCL
+	MOVE T2,BENTSN(P6)
+	NOUT
+	 JFCL
+	MOVE T2,DUKAKS(P6)
+	NOUT
+	 JFCL
+	MOVE T2,T4
+	NOUT
+	 JFCL
+	MOVE T2,P6
+	NOUT
+	 JFCL
+	HRROI T1,[ASCIZ /
+/]
+	PSOUT
+	MOVE T1,QUAYLE(P6)
+	MOVE T2,BENTSN(P6)
+	MOVE T3,DUKAKS(P6)
+%DONE:
+>
+;
+; When we enter the main loop, the ACs are expected to be set up in the
+; following manner:
+;
+; F/  Status bits for ACSTAT
+	SD%RUN==1B0		;Should be set.
+	SD%ERR==1B1		;We set this if an error occurs.
+	SD%DNE==1B2		;We set this if the error is a DECnet
+                                ;disconnect
+	SD%DBG==1B3		;If set by MX, we PSOUT trace info
+	SD%REA==777777		;We store the error/disconnect code here
+
+; T1/ Function Code for ACFUNC
+; T2-T4/ Function specific arguments
+;
+; The following functions expect arguments:
+;
+;	Function	ACFUNC	ACCHAN/ACBREA	ACBYTP	   ACBLEN
+;
+;	Initialize	sd.ini  Int. Chan. No.	Page Addr. N/A
+;	Open		sd.opn	N/A		Filespec   N/A
+;	Read		sd.rd	N/A		Buffer	   Buffer Len
+;	Write Message	sd.wrm	N/A		Buffer	   Buffer Len
+;	Write String	sd.wrs	N/A		Buffer	   Buffer Len
+
+;Main loop begins here
+SUBDCN::CAIL T1,SD.MIN		;Skip if less than min
+	CAILE T1,SD.MAX		;Skip if in range
+	SKIPA T1,[ARGX02]	;Out of range.  Error code in T1, Skip.
+	JRST @FNCTAB(T1)	;Go do the appropriate function
+				;Note that all functions except SDINIT
+                                ;expect P6 to be set up.  P6 is set up by
+                                ;SDINIT...
+
+;Here if some kind of error occured with error in T1
+SDERR:	TXO F,SD%ERR		;Some kind of error occured
+	TXNN T1,.ERBAS		;Is this a TOPS-20 error
+	TXO F,SD%DNE		;It's a DECnet error
+	HRR F,T1		;Stash the error code
+
+;Here when it's time to notify the parent either as a result of SDERR, or a
+;function's normal completion.
+SDDONE:	MOVEM F,SFFLG(P6)	;Squirrel away the status
+	MOVE T2,INTCH(P6)	;Get the interrupt channel.
+	MOVEI T1,.FHSUP		;Want to interrupt my superior.
+	IIC%			;Interrupt him
+	 ERJMP SDNINT		;Couldn't do it.  Give up.
+	
+SDWAIT:	WAIT%			;Ok, wait for the doorbell
+	HALTF%			;Should never happen
+
+;Next comes the interrupt service routine for our doorbell
+SDISR:	MOVEI T1,SDNXTC		;Ready for the next command
+	MOVEM T1,INPC1(P6)	;Change the PC
+	DEBRK%			;Resume
+
+;We get resumed here after the parent rings our doorbell.
+SDNXTC:	DMOVE F,SFFLG(P6)	;Set up the ACs from the data page
+	DMOVE T2,SFAC2(P6)	;...
+	MOVE T4,SFAC4(P6)	;...
+	JRST SUBDCN		;Go back to the beginning and start over
+
+SDNINT:	$TRACE <*** IIC failed! ***>
+SDHALT:	HALTF%			;Here if we can't interrupt our parent.
+	JRST .-1
+
+FNCTAB:	SDINIT			;Initialize function
+	SDOPEN 			;Open function
+	SDREAD 			;Read function
+	SDWRTM 			;Write Message function
+	SDWRTS 			;Write String function
+
+;Routine SDINIT - Initialize Subfork
+;	T2/ Interrupt Channel of Superior fork
+;	T3/ Page number of our data page
+;	JRST SDINIT
+; 	returns to location SDDONE always
+;
+SDINIT:	$TRACE <SDINIT>
+	RESET%			;Start fresh
+	MOVX T1,.FHSLF		;Shut off all interrupts.  We don't want to
+	DIR%			; be interrupted while we're in SDINIT!
+	MOVX T1,<CZ%ABT+.FHSLF>	;Abort all files
+	CLZFF%			; just in case some are still open.
+	SKIPL T4,T2		;Skip if interrupt channel less than 0
+	CAIL T2,^D36		;Skip if in range
+	IFSKP.
+	  $TRACE <Valid Interrupt Channel>
+	  MOVE P6,T3		;Get our data page number...
+	  IMULI P6,1000		;...and make it an address.
+
+	  SETZM 1(P6)		;Clear the first location
+	  HRLI T1,1(P6)		;Source,,0
+	  HRRI T1,2(P6)		;Source,,Destination
+	  BLT T1,LAST(P6)	;Clear the page
+
+	  MOVX T1,BIT0		;Initialize T1
+	  MOVEM T4,SVINT(P6)	;Save the channel number
+	  MOVN T2,T4		;Negate T2
+	  LSH T1,(T2)		;Set the appropriate bit
+	  MOVEM T1,INTCH(P6)	;Store the mask here
+
+	  MOVEI T1,INPC1(P6)	;Where we store pc for level 1 interrupts
+	  MOVEM T1,LVTB1(P6)	;Set up level table
+	  MOVEI	T1,INPC2(P6)	;Where we store pc for level 2 interrupts
+	  MOVEM T1,LVTB2(P6)	;Set up level table
+
+	  MOVEI T4,CHTAB(P6)	;Get the address of the channel table
+	  MOVE T1,[1,,SDISR]	;Channel zero is our doorbell
+	  MOVEM T1,0(T4)	;Set it in the channel table
+	  MOVE T1,[2,,SDOPII]	;Channel 1 is for DECnet "Open" interrupts
+	  MOVEM T1,1(T4)	;Channel table is set up
+	  MOVEI T1,.FHSLF	;Process handle
+	  HRLI T2,LVTB1(P6)	;Level table
+	  HRRI T2,CHTAB(P6)	;Channel table
+	  CIS%			;Clear any pending interrupts
+	  SIR%			;Reset the PSI tables
+	  EIR%			;Enable interrupt system
+	  MOVX T2,DORBEL	;Turn on our doorbell
+	  AIC%			;Now...
+	ELSE.
+	  $TRACE <Invalid Interrupt Channel>
+INVIC:	  HALTF%
+	ENDIF.
+	JRST SDDONE		;Rejoin Main flow
+
+;Routine SDOPEN - Open a connection
+;	P6/ The address of the common data page
+;	JRST SDOPEN
+;	Returns to location SDERR or SDDONE as appropriate
+
+SDOPEN:	$TRACE <Opening>
+	MOVE T2,SFAC2(P6)	;Get the byte pointer
+	MOVEM T2,SVPTR(P6)	;Save the byte pointer
+	MOVX T1,GJ%SHT		;Use short form GTJFN
+	GTJFN%			;Get the JFN
+	 ERJMPR SDERR		;Something went wrong
+	MOVEM T1,SVJFN(P6)	;Save the JFN here
+	MOVEM T1,SFAC3(P6)	;and where the parent can see it.
+	MOVX T2,<OF%RD!OF%WR>+FLD(10,OF%BSZ) ;8 bit bytes, read/write
+	OPENF%			;Open the link
+	 ERJMPR SDERR		;Oh well
+	MOVEI T1,.FHSLF		;Set up for AIC: For me
+	MOVX T2,OPNBEL		;The channel mask
+	CIS%			;Clear any pending interrupts
+	AIC%			;Activate the sucker
+	 ERJMPR SDERR		;Not my day
+	MOVE T1,SVJFN(P6)	;Get the JFN back
+	MOVX T2,.MOACN		;Enable network interrupts
+	MOVX T3,OPNCHN 		;Get the interrupt channel for data available
+	MTOPR%			;Set it
+	 ERJMPR SDERR		;Hmm...
+
+	MOVX T2,.MORLS		;Before we wait, check to make sure that we...
+	MTOPR%			;...weren't rejected while still in the MTOPR
+	 ERJMPR SDERR		;Hmm...
+	TXNN T3,MO%ABT!MO%SYN	;One of these bits set?
+CNWAIT:	WAIT%			;No, wait for the interrupt.
+
+;Here if (and only if) we were rejected quickly.  Otherwise, we will be
+;resumed at location GOTIT by SDOPII.
+	HRRZ P1,T3		;Save the reject code
+	MOVE T1,SVJFN(P6)	;Get the jfn
+	MOVX T2,.MOACN		;Appropriate Function code
+	MOVX T3,OFFCHN		;Turn off DECnet interrupts
+	MTOPR%			; with MTOPR
+	 ERJMPR SDERR		;Oh well...
+
+	MOVEI T1,.FHSLF		;My process doesn't...
+	MOVX T2,OPNBEL		;...want any more interrupts on this...
+	DIC%			;...channel
+	 ERJMPR SDERR		;Hmm...
+
+	MOVE T1,P1		;Get the reject code back
+	JRST SDERR		;And go tell our parent.
+	
+SDOPII:	MOVEI T1,GOTIT		;Here if we received an interrupt
+	MOVEM T1,INPC2(P6)	;Change the PC
+	DEBRK%			;Dismiss the interrupt
+
+;We get resumed here after the connect interrupt.  Turn off DECnet interrupts.
+GOTIT:	MOVE T1,SVJFN(P6)	;Get the jfn
+	MOVX T2,.MOACN		;Appropriate Function code
+	MOVX T3,OFFCHN		;Turn off DECnet interrupts
+	MTOPR%			; with MTOPR
+	 ERJMPR SDERR		;Oh well...
+
+	MOVEI T1,.FHSLF		;My process doesn't...
+	MOVX T2,OPNBEL		;...want any more interrupts on this...
+	DIC%			;...channel at all.
+	 ERJMPR SDERR		;Hmm...
+	JRST SDDONE		;All done
+
+;Routine SDREAD/SDWRTS/SDWRTM
+;	P6/ The address of the common data page
+;	JRST SDREAD/SDWRTS/SDWRTM
+;	Returns to location SDERR or SDDONE as appropriate
+
+SDREAD:	TDZA Q2,Q2		;0 into the flag, skip
+SDWRTS:	MOVEI Q2,1		;1 into the flag
+	SKIPA			;Skip
+SDWRTM: MOVEI Q2,2		;2 into the flag
+	$TRFUN			;Trace the appropriate function
+	MOVE T1,SVJFN(P6)	;Get the JFN
+	MOVE T2,SFAC3(P6)	;Get the buffer pointer
+	MOVN T3,SFAC4(P6)	;Get the size of the user's buffer
+	SETZM T4		;Clear T4
+	XCT SDIOT(Q2)		;Do the appropriate JSYS
+	 ERJMPR SDERR		;Couldn't get it
+	ADDM T3,SFAC4(P6)	;Calculate # of bytes read
+	MOVEM T2,SFAC3(P6)	;Return the updated byte pointer
+	JRST SDDONE		;All done
+
+SDIOT:	SINR%			;SDREAD
+	SOUT%			;SDWRTS
+	SOUTR%			;SDWRTM
+
+FNDBG:  [ASCIZ /Read Link called
+/]
+	[ASCIZ /Write String called
+/]
+	[ASCIZ /Write Message called
+/]
+	END

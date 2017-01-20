@@ -1,0 +1,1216 @@
+/*
+**	READ - URT low-level I/O read
+**
+**	(c) Copyright Ken Harrenstien 1989
+**		for all changes after v.101, 11-Aug-1988
+**	Copyright (C) 1986 by Ian Macky, SRI International
+**	Edits for ITS:  Copyright (C) 1988 Alan Bawden
+*/
+
+#include <c-env.h>
+#if SYS_T20+SYS_10X+SYS_T10+SYS_CSI+SYS_WTS+SYS_ITS	/* Systems supported for */
+
+#include <string.h>	/* For memcpy etc */
+#include <sys/usysio.h>
+#include <sys/usysig.h>
+#include <sys/usytty.h>
+#include <errno.h>
+
+#if SYS_T20+SYS_10X
+#include <jsys.h>
+#define BUFFER_SIZE(uf) UIO_BUFSIZ
+static int indev();
+
+#elif SYS_ITS
+#include <sysits.h>
+#define BUFFER_SIZE(uf) ((UIO_BUFSIZ / 4) * uf->uf_nbpw)
+static int indev();
+
+#elif SYS_T10+SYS_CSI+SYS_WTS
+#include <muuo.h>		/* Also gets uuosym */
+#include <macsym.h>
+#define BUFFER_SIZE(uf) UIO_BUFSIZ
+int _blkprime();		/* From write() */
+static int inbuf(), inctm();
+static int inblk();
+
+#if SYS_WTS
+#include <ctype.h>		/* for isdigit() */
+#endif
+#endif
+
+extern int _uiobuf();		/* From open() */
+
+/* System-dependent routines */
+static int in_filbuf(), insys(), in_slow();
+static int intty(), eofp();
+static int in_cbuf();
+#if SYS_T20
+static int in_rdln();
+#endif
+
+int
+read(fd, buf, nbytes)
+register int fd, nbytes;
+register char *buf;
+{
+    register struct _ufile *uf;
+    register int c, n;
+    int r, slowdev;
+    long old_count;
+
+    USYS_BEG();
+    if (!(uf = _UFGET(fd)) || !(uf->uf_flgs & UIOF_READ))
+	USYS_RETERR(EBADF);
+    if (nbytes <= 0) {		/* Check for bad count */
+	if (nbytes == 0)	/* Permit 0 as no-op */
+	    USYS_RET(0);
+	USYS_RETERR(EINVAL);
+    }
+
+    /* Check for and handle unconverted case */
+    if (!(uf->uf_flgs & UIOF_CONVERTED))	/* If not being converted */
+	for (;;) {			/* Loop for interrupt continuation */
+	    if ((n = insys(uf, buf, nbytes)) > 0)
+		USYS_RET(n-1);		/* Normally wins - note decrement! */
+	    if (n == 0)			/* Failed? */
+		USYS_RETERR(EIO);
+
+	    /* Interrupted.  n has negative of # bytes left to read.
+	    ** If we've read anything already, always return OK.  Otherwise
+	    ** if nothing has been read, we try to continue rather than
+	    ** return EINTR.
+	    */
+	    if ((r = nbytes + n) > 0)	/* If anything was read */
+		USYS_RET(r);		/* Return that much! */
+
+	    /* Nothing whatsoever was read... */
+	    if (USYS_END() < 0) {	/* Allow ints, see if handler done */
+		errno = EINTR;		/* Yeah, fail this way */
+		return -1;		/* Return failure. */
+	    }
+	    /* Can proceed from interrupt! */
+	    USYS_BEG();			/* Disable interrupts again */
+	    if (uf != _uffd[fd])	/* Ensure FD still OK */
+		USYS_RETERR(EIO);	/* Fail if switcheroo happened */
+	    /* Nothing needs updating since nothing was read, just re-try. */
+    }
+
+    /* Converting input.
+    ** Do hairy conversion loop so input CRLF sequences are furnished as LF.
+    ** Need to be careful of slow devices that could hang up; if we're about
+    ** to refill our UIO buffer but some converted chars were already read
+    ** into the user buffer, we just return and don't even attempt to check
+    ** the system input channel.  So a refill happens only if using a fast
+    ** device, or if the buffer was empty at start of the read().
+    */
+    slowdev = uf->uf_flgs & UIOF_CANHANG;	/* Set flag if slow */
+    if ((old_count = uf->uf_rleft) <= 0)
+	old_count = 0;
+    else --uf->uf_cp;			/* Set up for ILDB */
+    r = 1;				/* Things OK so far */
+    n = nbytes;	    	    	    	/* Number of bytes to return */
+    for (;;) {				/* While they want more bytes... */
+	if (--uf->uf_rleft < 0) {		/* Get a char into c */
+	    uf->uf_pos += old_count;	/* Buff gone, update user file pos */
+	    if (r <= 0)			/* If supposed to stop now, */
+		break;			/* stop. */
+	    if (slowdev && n < nbytes)	/* If may hang and already got some */
+		break;			/* then stop, don't try refill */
+	    r = in_filbuf(uf, n < nbytes);	/* Remember result code */
+	    if ((old_count = uf->uf_rleft) <= 0)	/* See if any more to cvt */
+		break;			/* Nope, stop now */
+	    --uf->uf_rleft;
+	    c = *uf->uf_cp;
+	} else c = *++uf->uf_cp;
+
+	/* Have char, now examine it for possible conversion. */
+#if SYS_T10+SYS_CSI+SYS_WTS		/* T10 systems must flush nulls */
+	if (c == '\0')
+	    continue;
+#endif
+	/* Convert CR-LF to just LF.
+	** The lookahead for the LF is obscenely hairy because it has to
+	** work properly even if an interrupt or EOF happens during the
+	** in_filbuf that looks for the LF.  It's still more efficient than
+	** setting and checking a last-char-was-CR flag.
+	*/
+	if (c == '\r') {		/* If a CR, see what follows. */
+	    if (--uf->uf_rleft < 0) {	/* Get a char into c */
+		uf->uf_pos += old_count;	/* Update user file pos */
+		if (r <= 0 || (slowdev && n < nbytes)) { /* If gotta stop, */
+		    uf->uf_rleft++;	/* then put CR back! */
+		    uf->uf_pos--;
+		    break;		/* then stop, don't try refill */
+		}
+		r = in_filbuf(uf, n < nbytes);
+		if ((old_count = uf->uf_rleft) <= 0) {
+		    /* Couldn't check next char for LF. */
+		    if (r == 1) *buf = '\r', --n;	/* EOF, add the CR */
+		    else if (r < 0) {
+			uf->uf_cp = "\r";	/* Interrupt, back up */
+			uf->uf_rleft = 1;		/* sneakily */
+			uf->uf_pos--;
+		    }
+		    break;
+		}
+		--uf->uf_rleft;		/* Will always win */
+		c = *uf->uf_cp;
+	    } else c = *++uf->uf_cp;
+
+	    if (c != '\n') {		/* If next char after CR is NOT LF */
+		uf->uf_rleft++;		/* then put it back! */
+		uf->uf_cp--;
+		c = '\r';		/* (we had a CR originally) */
+	    }
+	}
+	*buf++ = c;			/* Store the char we got */
+	if (--n <= 0) {			/* If that's enough, stop. */
+	    uf->uf_pos += (old_count - uf->uf_rleft);	/* Set user I/O pos */
+	    uf->uf_cp++;		/* Ensure ptr points to next */
+	    break;
+	}
+    }		/* Don't use "while" cuz "continue" mustn't bump cnt */
+
+    /* r has stop indicator.  Pos means OK, counted out;
+    ** 0 means I/O error, and -1 means interrupted.  errno is already set.
+    */
+    if (r > 0			/* Normal case -- return success */
+      || (r < 0 && n < nbytes))	/* also win if interrupted but stuff read */
+	USYS_RET(nbytes - n);	/* Win, return # bytes given to user */
+    if (r == 0)			/* If error, errno is already set */
+	USYS_RET(-1);
+    USYS_RETERR(EINTR);		/* Otherwise was interrupted, nothing read */
+}
+
+/* IN_FILBUF
+**	Fill a buffer to supply raw data for conversion routine.
+**	If no buffer has been assigned yet, make one.
+**	Must set uf_cp, uf_rleft, possibly other vars as needed to get
+**		valid data into buffer.
+**	Should not change uf_pos as caller does that.
+** Returns:
+**	< 0 if interrupted and must return.
+**	0   if error
+**	1   if EOF
+**	> 0 the number of characters (PLUS ONE) ready to read.
+*/
+static int
+in_filbuf(uf, havesome)
+register struct _ufile *uf;
+int havesome;			/* Flag saying whether already got input */
+{
+    register int n;
+
+    uf->uf_rleft = 0;
+    if (uf->uf_eof)
+        return 1;
+
+    for (;;) {
+	n = in_cbuf(uf);
+#if SYS_WTS
+	if (uf->uf_pos == 0)	/* On WAITS check for E directory hdr */
+	    n = chkedir(uf);	/* Barf bletch puke */
+#endif
+	if (n > 0) return n;	/* Have stuff or EOF, return success */
+	if (n == 0) {		/* Error, fail immediately */
+	    errno = EIO;
+	    return 0;
+	}
+	/* Interrupted.
+	** If we've read anything already, always return.  Otherwise
+	** if nothing has been read, we try to continue rather than
+	** return EINTR.
+	*/
+	if (havesome || uf->uf_rleft > 0)	/* Was anything read? */
+	    return -1;		/* Yes, return immediately. */
+
+	/* Nothing was read... */
+	n = USYS_END();		/* Allow ints for a moment, check handler */
+	USYS_BEG();		/* Disable interrupts again */
+	if (n < 0)		/* Was a handler done? */
+	    return -1;		/* Yes, return interrupt indicator */
+
+	/* Can proceed from interrupt! */
+	/* Ensure UF is still OK (int rtn may have closed/reopened) */
+	if (uf->uf_nopen <= 0 || !uf->uf_bpbeg) {
+	    errno = EIO;		/* Fail if switcheroo happened */
+	    return 0;
+	}
+	/* Nothing needs updating since nothing was read, just re-try. */
+    }
+}
+
+
+/* IN_CBUF - Fill conversion buffer auxiliary
+**	(Re)Fill a buffer to supply raw data for conversion routine.
+**	May create a buffer if one is needed and doesn't exist.
+**	Must set uf_bpbeg, uf_cp, uf_rleft.
+** Returns:
+**	< 0 if interrupted, nothing was read.
+**	0   if error
+**	1   if EOF
+**	> 0 the number of characters (PLUS ONE) slurped in.
+*/
+static int
+in_cbuf(uf)
+register struct _ufile *uf;
+{
+    int n;
+
+#if SYS_T10+SYS_CSI+SYS_WTS
+    /* If disk or some random buffered input channel, invoke buffer slurp */
+    if (uf->uf_type == UIO_DVDSK || uf->uf_biring.br_bp)
+	return inbuf(uf);
+#endif
+    if (!uf->uf_buf && !_uiobuf(uf))	/* If no buffer yet, get one */
+	return 0;			/* Fail if can't, errno already set */
+
+    n = insys(uf, uf->uf_bpbeg, uf->uf_blen);
+    if (n > 0)
+	uf->uf_rleft = n-1;
+    else if (n < 0)		/* Interrupted, find # bytes we got */
+	uf->uf_rleft = (n + uf->uf_blen);	/* (may be none at all) */
+    else uf->uf_rleft = 0;
+
+    /* Restore uf_pos since insys() mistakenly bumped it for us */
+    uf->uf_pos -= uf->uf_rleft;
+    uf->uf_cp = uf->uf_bpbeg;	/* Set pointer to start of buffer */
+    uf->uf_wleft = 0;		/* Never permit writing */
+    return n;
+}
+
+#if SYS_T20+SYS_10X
+
+/* INSYS - system-dependent input.
+**	Returns:
+**		> 0 Won, value is # bytes read, PLUS ONE!!!
+**		= 0 Lost, some kind of error.
+**		< 0 Interrupted.  Value is neg of # bytes LEFT to read.
+*/
+static int
+insys(uf, buf, cnt)
+struct _ufile *uf;
+int cnt;
+char *buf;
+{
+    switch (uf->uf_type) {
+	/* Superfast input devices which can do input using PMAP% to map
+	** data pages directly into our address space.
+	** This is only possible for DSK: really.
+	** PMAP input is not yet implemented.
+	*/
+#if 0
+	case _DVDSK:
+	    return inmap(uf);
+#endif
+
+	/* Fast input devices, which should always completely satisfy the
+	** input request (unless EOF or error).
+	*/
+	case _DVDSK:
+	    return indev(SIN, uf, buf, cnt);
+
+	/* Special TTY input devices, which may permit line editing */
+	case _DVTTY:
+	case _DVPTY:
+	    return intty(uf, buf, cnt);
+
+	/* Slow input devices, which may hang indefinitely and for which
+	** we always want to return the available input without waiting
+	** for more to fill out the count.
+	*/
+	default:
+	    return in_slow(uf, buf, cnt);
+    }
+}
+
+static int
+indev(num, uf, buf, cnt)
+struct _ufile *uf;
+int num, cnt;
+char *buf;
+{
+    int i, n, acs[5];
+
+    acs[1] = uf->uf_ch;		/* JFN */
+    acs[2] = (int) (buf - 1);		/* pointer to 1 before buffer */
+    acs[3] = -cnt;			/* -# to read */
+    i = jsys(num, acs);			/* Do it! */
+
+    n = cnt + acs[3];			/* Find # bytes read */
+    uf->uf_pos += n;			/* Update count */
+    if (i > 0) {
+	if (n == 0)		/* If call won, but nothing read, */
+	    uf->uf_eof = -1;	/* then say we're at EOF */
+	return n+1;		/* Return N+1 so 0 looks winning. */
+    } else if (i < 0)		/* Interrupted? */
+	return (acs[3] < 0 ?	/* Yes, see if anything left to read */
+		acs[3] : n+1);	/* return -N if so, else claim we won */
+
+    /* Call failed somehow... */
+    if (eofp(uf)) {		/* Was it EOF of some kind? */
+	uf->uf_eof = -1;		/* Yes, set flag */
+	return n+1;			/* And return win. */
+    }
+    errno = EIO;
+    return 0;			/* Else return failure. */
+}
+
+/* IN_SLOW - system-dependent slow device input.
+**	Returns:
+**		> 0 Won, value is # bytes read, PLUS ONE!!!
+**		= 0 Lost, some kind of error.
+**		< 0 Interrupted.  Value is neg of # bytes LEFT to read.
+*/
+static int
+in_slow(uf, buf, cnt)
+struct _ufile *uf;
+int cnt;
+char *buf;
+{
+    int n, acs[5];
+
+    if (uf->uf_eof)
+	return 1;		/* Return EOF */
+    acs[1] = uf->uf_ch;	/* Get JFN */
+    switch (jsys(SIBE, acs)) {	/* Anything to read? */
+
+	case 1:
+	    if (acs[2] < cnt)	/* Yes!  AC2 has # available, read minimum */
+		cnt = acs[2];
+	    if (cnt <= 0)	/* Just in case SIBE% screws up... */
+		break;
+	    return indev((int)(SIN|JSYS_OKINT), uf, buf, cnt);
+
+	case 2:		/* No input available, ask for just one */
+
+	default:	/* If error, we try BIN% anyway on the grounds that
+			** SIBE% is poorly supported; if there is really
+			** a problem with the JFN then BIN% will find it.
+			*/
+	    break;
+
+    }
+
+    n = jsys(BIN|JSYS_OKINT, acs);	/* Wait until we read 1 byte */
+    if (n < 0)			/* Interrupted? */
+	return -cnt;		/* Say interrupted, nothing read */
+
+    if (n == 0) {		/* Error? */
+	if (eofp(uf)) {	/* Yes, was it EOF? */
+	    uf->uf_eof = -1;	/* If so, mark it */
+	    return 1;		/* and return EOF */
+	}
+	errno = EIO;		/* Otherwise, set error # */
+	return 0;		/* and return error indication */
+    }
+
+    /* Got a byte!  Update things and see if there's any more input. */
+    uf->uf_pos++;
+    *buf++ = acs[2];		/* Store byte */
+    if (--cnt <= 0)		/* Update count */
+	return 1+1;
+
+    switch (jsys(SIBE, acs)) {	/* Want more, so check for more! */
+	default:	/* If SIBE% lost, then SIBE% must be losing
+			** since the BIN% just won.  Ignore the
+			** failure, and act as if no more input was available.
+			*/
+	case 2:		/* No more input available */
+	    break;
+	case 1:			/* Still have more input! */
+	    if (acs[2] < cnt)	/* Set # to read */
+		cnt = acs[2];
+	    if (cnt <= 0)	/* SIBE% sometimes returns 0?? */
+		break;
+	    n = indev((int)(SIN|JSYS_OKINT), uf, buf, cnt);
+	    if (n > 0) n++;	/* Account for the single byte we read */
+	    return n;
+    }
+    return 1+1;		/* Say read just 1 char (plus one) */
+}
+
+/* INTTY - system-dependent TTY input routine.
+**	Return values are same as for IN_SLOW.
+*/
+static int
+intty(uf, buf, cnt)
+struct _ufile *uf;
+int cnt;
+char *buf;
+{
+    register struct _tty *tp;
+
+    tp = &_ttys[uf->uf_dnum];		/* Get ptr to TTY struct */
+    if (tp->tt_uf != uf) {		/* Cross-check... */
+	errno = EIO;
+	return 0;
+    }
+    switch (tp->sg.sg_flags & (RAW|CBREAK)) {	/* Determine mode */
+	case 0:		/* Cooked mode */
+	    return in_rdln(tp, uf, buf, cnt);
+
+	case CBREAK:	/* CBREAK mode */
+	default:	/* RAW mode */
+	    return in_slow(uf, buf, cnt);
+    }
+}
+
+struct texti {		/* Command block for TEXTI% */
+	int rdcwb;	/* # words following in block */
+	int rdflg;	/* Flag bits */
+	union {		/* I/O designators - one word */
+	    char *str;	/* Input str */
+	    struct {	/* or two JFNs */
+		int in : 18;
+		int out: 18;
+	    } jfn;
+	} rdioj;
+	char *rddbp;	/* Where input should go */
+	int rddbc;	/* # bytes available in buffer */
+};
+
+static int
+in_rdln(tp, uf, buf, cnt)
+struct _ufile *uf;
+struct _tty *tp;
+int cnt;
+char *buf;
+{
+    static struct texti			/* for TEXTI */
+	textib = {4, RD_BEL|RD_CRF|RD_JFN|RD_BRK };
+    int i, acs[5];
+
+    if (uf->uf_eof)
+	return 1;		/* EOF, punt */
+    textib.rdioj.jfn.in  = uf->uf_ch;
+    textib.rdioj.jfn.out = uf->uf_ch;
+    textib.rddbp = buf-1;
+    textib.rddbc = cnt;
+    acs[1] = (int) &textib;
+    i = jsys(TEXTI|JSYS_OKINT, acs);
+    if (i == 0) {
+	if (eofp(uf)) {
+	    uf->uf_eof = -1;
+	    return (cnt - textib.rddbc)+1;	/* Return # read, plus 1 */
+	}
+	errno = EIO;
+	return 0;
+    }
+    if (i < 0) {	/* Interrupted? */
+	if (textib.rddbc)		/* If any chars unread, */
+	    return -textib.rddbc;	/* return # unread. */
+    }					/* Else drop thru for normal return! */
+    /* Won normally */
+    if (*textib.rddbp == ('Z'&037)) {	/* Stopped on ^Z? */
+	textib.rddbc++;			/* Yes, don't count as input */
+	uf->uf_eof = -1;		/* Say EOF seen */
+    }
+    return (cnt - textib.rddbc)+1;	/* Return # chars read, plus 1 */
+}
+
+/* EOFP(jfn)
+ *	given a JFN in AC1 return 0 (in AC1) if there's no EOF on that
+ *	JFN, else 1 if there is.
+ */
+
+static int
+eofp(uf)
+struct _ufile *uf;
+{
+    int acs[5];
+    acs[1] = uf->uf_ch;
+    jsys(GTSTS, acs);		/* Always succeeds */
+    return acs[2]&GS_EOF;	/* Return state of EOF bit */
+}
+#endif	/* T20/10X */
+
+#if SYS_T10+SYS_CSI+SYS_WTS
+
+/* INSYS - system-dependent input for TOPS-10/WAITS.
+**	Returns:
+**		> 0 Won, value is # bytes read, PLUS ONE!!!
+**		= 0 Lost, some kind of error.
+**		< 0 Interrupted.  Value is neg of # bytes LEFT to read.
+*/
+static int
+insys(uf, buf, cnt)
+struct _ufile *uf;
+char *buf;
+int cnt;
+{
+    switch (uf->uf_type) {
+	/* Fast block devices, which must read entire blocks at a time,
+	** and which should always completely satisfy the input request
+	** (unless hit EOF or error).
+	*/
+	case UIO_DVDSK:
+	    return inblk(uf, buf, cnt);
+
+	/* TTY input devices, which may permit line editing */
+	case UIO_DVTTY:
+	    return intty(uf, buf, cnt);
+
+	/* Slow input devices, which may hang indefinitely and for which
+	** we always want to return the available input without waiting
+	** for more to fill out the count.
+	*/
+	default:
+	    return in_slow(uf, buf, cnt);
+
+#if 0	/* No such devices known yet */
+	/* Fast character input devices, which should always completely
+	** satisfy the input request (unless EOF or error).
+	*/
+	case UIO_DVxxx:
+	    return indev(uf, buf, cnt);
+#endif
+    }
+}
+
+/* INBLK - Read data from block device (normally disk).
+**	Always reads complete amount unless error or EOF, never interrupted.
+**	Return value is same as for INSYS.
+*/
+static int
+inblk(uf, buf, nbytes)
+struct _ufile *uf;
+char *buf;
+int nbytes;
+{
+    register int n;
+    long begpos = uf->uf_pos;		/* Remember starting user pos */
+
+    for (;;) {
+	if ((n = uf->uf_rleft) <= 0) {	/* Any bytes left in buffer? */
+	    if (!_blkprime(uf, 0))	/* No, get more input */
+		return 0;		/* Error */
+	    if ((n = uf->uf_rleft) <= 0)	/* Got some, see how much */
+		break;			/* EOF, stop loop */
+	}
+	if (nbytes < n) n = nbytes;
+	memcpy(buf, uf->uf_cp, n);	/* Copy to user space */
+
+	/* Now update vars */
+	uf->uf_pos += n;
+	uf->uf_cp += n;
+	uf->uf_wleft -= n;
+	uf->uf_rleft -= n;
+	if ((nbytes -= n) <= 0)		/* If request done, return. */
+	    break;
+	buf += n;			/* More bytes to do, update user ptr */
+    }
+    return 1 + uf->uf_pos - begpos;	/* Return total+1 bytes given user */
+}
+
+
+#if 0	/* Not needed at moment */
+
+/* INDEV - always slurps and copies specified amount unless error or EOF. */
+static int
+indev(uf, buf, cnt)
+struct _ufile *uf;
+int cnt;
+char *buf;
+{
+    register int n;
+    int totcnt = 1;
+
+    while ((n = in_slow(uf, buf, cnt)) > 0) {
+	totcnt += --n;		/* Update # chars read */
+	if (!n || (cnt -= n) <= 0)	/* If EOF or request done, */
+	    return totcnt;	/* return total+1. */
+	buf += n;
+    }
+    return n;			/* Error or interrupted */
+}
+#endif
+
+/* IN_SLOW - attempts to avoid hanging up while reading.
+**	Will only transfer whatever is currently in buffer ring, and
+**	avoids using IN UUO unless there is no input available at all.
+*/
+static int
+in_slow(uf, buf, cnt)
+struct _ufile *uf;
+int cnt;
+char *buf;
+{
+    register int n;
+
+    if ((n = inbuf(uf)) <= 0)		/* Get stuff in buff, or new buff */
+	return n == 0 ? 0 : -cnt;	/* Error or interrupted */
+    if (--n > cnt)			/* Have more input than desired? */
+	n = cnt;			/* Yeah, limit to this much */
+    memcpy(buf, uf->uf_cp, n);		/* Copy */
+
+    /* Now update vars */
+    uf->uf_pos += n;			/* Bump user position in file */
+    uf->uf_wleft -= n;			/* May become negative, that's OK */
+    if ((uf->uf_rleft -= n) > 0)	/* Only update pointer if needed, */
+	uf->uf_cp += n;			/* because it's kinda slow */
+    return n+1;
+}
+
+/* INBUF - auxiliary that gets some (any) data into a buffer.
+**	Either returns amount remaining in current buffer, or
+**	gets a new bufferful and returns that.
+**	returns > 0	# bytes, plus 1 (thus 1 is EOF)
+**		0	Error
+**		< 0	Interrupted, nothing was read.
+*/
+static int
+inbuf(uf)
+struct _ufile *uf;
+{
+    register int n;
+
+    if ((n = uf->uf_rleft) > 0)
+	return n+1;			/* Already stuff in buffer! */
+
+    /* Must get another input buffer.  Check to see if seek needed. */
+    if (uf->uf_type == UIO_DVDSK) {	/* Seeks only possible on disk */
+	if (!_blkprime(uf, 0))		/* Prime block device buffer! */
+	    return 0;			/* Error of some kind */
+	return uf->uf_rleft+1;		/* Won, return # bytes available */
+    }
+
+    /* Buffered character device, slurp stuff in. */
+    uf->uf_bpos = uf->uf_pos;	/* Set buffer pos to current pos */
+    uf->uf_rleft = 0;		/* Nothing in it yet */
+    uf->uf_wleft = 0;		/* Don't permit writing */
+    if (!_filopuse) n = !MUUO_IO("IN", uf->uf_ch, 0);
+    else {
+	int arg = XWD(uf->uf_ch, uuosym(".FOINP"));
+	n = MUUO_AC("FILOP.", XWD(1,(int)&arg));
+    }
+    if (n <= 0) {
+	if (n < 0) return -1;	/* Interrupted? */
+	if (eofp(uf))		/* No was failure due to EOF? */
+	    return 1;		/* Mark and say EOF hit */
+	errno = EIO;		/* Otherwise, set error # */
+	return 0;		/* and return error indication */
+    }
+    if ((n = uf->uf_biring.br_cnt) <= 0) {
+	errno = EIO;		/* Ugh, UUO failed to fix count */
+	return 0;		/* Return error indication */
+    }
+    uf->uf_cp = ++(uf->uf_biring.br_bp); /* Make aligned, barf! */
+
+    /* Got buffer, uf_cp is set and "n" has # valid bytes now in buffer */
+    uf->uf_cp += n;
+    return (uf->uf_rleft = n) + 1;
+}
+
+static int
+eofp(uf)
+struct _ufile *uf;
+{
+    int status;
+    if (!_filopuse) MUUO_IO("GETSTS", uf->uf_ch, &status);
+    else {
+	status = XWD(uf->uf_ch, uuosym(".FOGET"));
+	MUUO_ACVAL("FILOP.", XWD(1,(int)&status), &status);
+    }
+    return status & uuosym("IO.EOF");
+}
+
+/* TOPS-10 TTY input routines */
+
+static int
+intty(uf, buf, cnt)
+struct _ufile *uf;
+char *buf;
+int cnt;
+{
+#if SYS_CSI
+    register struct _tty *tp;
+    struct _toblk to;
+
+    if (!_trmopuse)
+#endif
+    if (uf->uf_ch == UIO_CH_CTTRM)	/* Controlling TTY? */
+	return inctm(uf, buf, cnt);	/* Yes - do specially! */
+    else return in_slow(uf, buf, cnt);
+
+#if SYS_CSI
+    if (uf->uf_eof)		/* TTY must check this specially. */
+	return 1;
+    tp = &_ttys[uf->uf_dnum];	/* Get TTY struct for this UF */
+    to.to_fnc = _TOINP;		/* Function: input byte string */
+#if (UIO_CH_CTTRM != -1)	/* Make sure this the convenient value */
+#error Must fix CSI intty() for UIO_CH_CTTRM!
+#endif
+    to.to_udx = XWD(-1,uf->uf_ch);	/* Specify which TTY */
+    to.to_arg.io.bp = buf-1;		/* Set up IDPB byte pointer */
+    to.to_arg.wd[0] = XWD(0,cnt);	/* Clear LH, put # bytes into RH */
+    to.to_arg.io.timeout = 0;
+
+    if (tp->sg.sg_flags & RAW)		/* If raw mode, always use 8 bits */
+	to.to_arg.wd[0] |= _TOFLG_8BIT;
+    if (tp->sg.sg_flags & CBREAK)	/* If CBREAK mode, break on any char */
+	to.to_arg.wd[0] |= _TOFLG_CHRMODE;
+
+    switch (MUUO_AC("TRMOP.", XWD(5,(int)&to))) {
+	case -1: return -(cnt - to.to_arg.io.cnt);	/* Interrupt */
+	case 0:
+	    errno = EIO;		/* Ugh, random I/O error! */
+	    return 0;
+    }
+    if (!(to.to_arg.wd[0] & _TOFLG_8BIT)	/* If ASCII mode, */
+      && (to.to_arg.wd[0] & _TOFLG_BREAK))	/* Check for ^Z */
+	uf->uf_eof = -1;			/* Set EOF if so */
+    return 1 + (cnt - to.to_arg.io.cnt);
+#endif	/* CSI */
+}
+
+/* INCTM - Input from Controlling Terminal.
+**	May be interrupted.
+**	Return value is same as for INSYS.
+*/
+static int
+inctm(uf, buf, cnt)
+struct _ufile *uf;
+register char *buf;
+int cnt;
+{
+    register struct _tty *tp;
+    register int n, incnt = 0;
+    int inchar, eofch;
+
+    if (uf->uf_eof)		/* TTY must check this specially. */
+	return 1;
+
+    tp = &_ttys[0];		/* Get ptr to controlling TTY struct */
+    if (tp->tt_uf != uf) {	/* Cross-check... */
+	errno = EIO;
+	return 0;
+    }
+    switch (tp->sg.sg_flags & (RAW|CBREAK)) {	/* Determine mode */
+	case 0:		/* Cooked mode */
+	    n = MUUO_TTY("INCHWL", &inchar);	/* Wait for line */
+	    if (!n) n = 1;	/* INCHWL never skips, fake out loop below */
+	    for (;;) {		/* Now return as much as possible */
+		if (n < 0)	/* If interrupted, return count left */
+		    return -cnt;
+		if (n == 0)	/* No more chars available at moment? */
+		    break;	/* Return # we read, plus 1 */
+		if (inchar == ('Z'&037)) {	/* EOF char? */
+		    uf->uf_eof = -1;		/* Yep, say EOF seen */
+		    break;
+		}
+		*buf++ = inchar;	/* Won, deposit char */
+		++incnt;
+		if (--cnt <= 0)		/* Update buffer countdown */
+		    break;
+		n = MUUO_TTY("INCHSL", &inchar);
+	    }
+	    return incnt+1;		/* Return # chars read, plus 1 */
+
+	case CBREAK:	/* CBREAK mode only */
+	    if (1) eofch = 'Z'&037;
+	    else {
+	default:	/* RAW mode */
+		eofch = -1;
+	    }
+	    /* Same loop as above, but uses INCHRW/INCHRS instead.
+	    ** Also, RAW mode doesn't check for EOF.
+	    */
+	    n = MUUO_TTY("INCHRW", &inchar);	/* Wait for char */
+	    if (!n) n = 1;	/* INCHRW never skips, fake out loop below */
+	    for (;;) {		/* Now return as much as possible */
+		if (n < 0)	/* If interrupted, return count left */
+		    return -cnt;
+		if (n == 0)	/* No more chars available at moment? */
+		    break;	/* Return # we read, plus 1 */
+		if (inchar == eofch) {	/* EOF char? */
+		    uf->uf_eof = -1;		/* Yep, say EOF seen */
+		    break;
+		}
+		*buf++ = inchar;	/* Won, deposit char */
+		++incnt;
+		if (--cnt <= 0)		/* Update buffer countdown */
+		    break;
+		n = MUUO_TTY("INCHSL", &inchar);
+	    }
+	    return incnt+1;		/* Return # chars read, plus 1 */
+    }
+}
+
+#endif /* T10+CSI+WAITS */
+
+#if SYS_WTS	/* Special hackery for WAITS */
+
+/* CHKEDIR - Called whenever about to read the first block of a
+**	file using converted input.  If it looks like the start of
+**	an E editor directory page, input is flushed up to but not including
+**	the first formfeed, so that a formfeed is the first thing the user
+**	program reads.
+**	An E page starts with:
+**		"COMMENT \026 xxVALID ddddd PAGES"
+**	where xx is either "  " or "IN" and the 'd's are any digits.
+**
+** Returns # bytes available in current buffer (0 if EOF hit).
+*/
+static char cmpstr[] = "COMMENT \26 \1\2VALID \3\3\3\3\3 PAGES";
+
+static int
+chkedir(uf)
+struct _ufile *uf;
+{
+    register char *s, *cp;
+    register int n;
+
+    n = uf->uf_rleft;
+    if (uf->uf_type != UIO_DVDSK	/* Not a disk file? */
+      || n < sizeof(cmpstr))		/* or too small? */
+	return n;
+    if (*(cp = uf->uf_cp) != cmpstr[0])	/* Check 1st char */
+	return n;
+    s = cmpstr;
+
+    /* OK, start hairy match loop */
+    for (;;) {
+	switch (*++s) {
+	    default:
+		if (*s == *++cp)	/* Char must match */
+	    case '\2':			/* Ignore placeholder */
+		    continue;
+		break;
+	    case '\1':			/* Must match "  " or "IN" */
+		if (*++cp == ' ') {
+		    if (*++cp == ' ')
+			continue;
+		} else if (*cp == 'I') {
+		    if (*++cp == 'N')
+			continue;
+		}
+		break;
+	    case '\3':
+		if (isdigit(*++cp))
+		    continue;
+		break;
+
+	    case '\0':			/* End of match, won */
+		break;
+	}
+	break;
+    }
+    if (*s)
+	return n;			/* Failed */
+
+    /* Won, now must scan up to first formfeed */
+    n -= sizeof(cmpstr)-1;
+    for (;;) {
+	while (--n >= 0)
+	    if (*++cp == '\014') {
+		uf->uf_cp = cp;
+		uf->uf_rleft = ++n;
+		return n+1;
+	    }
+	/* Ran out of room on this buffer, get another and keep going */
+	uf->uf_pos += uf->uf_rleft;	/* Update file pos */
+	uf->uf_rleft = 0;			/* Ensure get more */
+	n = in_cbuf(uf);
+	if (n <= 1) return n;		/* EOF or error? */
+	cp = uf->uf_cp;			/* Set up new ptr */
+	n = uf->uf_rleft;
+    }
+}
+#endif /* SYS_WTS */
+
+#if SYS_ITS
+
+/* INSYS - ITS system-dependent input.
+**	Returns:
+**		> 0 Won, value is # bytes read, PLUS ONE!!!
+**		= 0 Lost, some kind of error.
+**		< 0 Interrupted.  Value is neg of # bytes LEFT to read.
+*/
+static int
+insys(uf, buf, cnt)
+register struct _ufile *uf;
+int cnt;
+char *buf;
+{
+    switch (uf->uf_type) {
+	/* case _DVxxx:		   Non-blocking devices */
+	case _DVTTY:		/* Interactive streams */
+	    /* hack rubouts later, fall through until then */
+	default:		/* DSK-like devices */
+	    if (uf->uf_flgs & UIOF_HANDPACK)
+		return inblock(uf, buf, cnt);
+	    else if (uf->uf_bsize == 7)
+		return inpadded(uf, buf, cnt);
+	    else
+		return insiot(uf, buf, cnt);
+    }
+}
+
+/* IN_CBUF - ITS Fill conversion buffer
+**	Fill a buffer to supply raw data for conversion routine.
+**	Must set uf_cp, uf_rleft.
+** Returns:
+**	< 0 if interrupted, nothing was read.
+**	0   if error
+**	1   if EOF
+**	> 0 the number of characters (PLUS ONE) slurped in.
+*/
+#if 0	/* Combined with T20/10X routine */
+static int
+in_cbuf(uf)
+register struct _ufile *uf;
+{
+}
+#endif
+
+/* ITS Block mode */
+#define IOT_BUFSIZ 300		/* in words */
+
+static int inblock(uf, buf, nbytes)
+  struct _ufile *uf;
+  int nbytes;
+  char *buf;
+{
+    char *ptr = buf;
+    int cnt = nbytes;
+    int words, bytes, iotptr, val, n;
+
+    /* First, give him any bytes saved from last time */
+    while (uf->uf_zcnt > 0 && cnt > 0) {
+	*ptr++ = uf->uf_zbuf[--uf->uf_zcnt];
+	cnt--;
+	uf->uf_pos++;
+    }
+
+    words = cnt / uf->uf_nbpw;	/* He wants this many words */
+    bytes = cnt % uf->uf_nbpw;	/* Plus this many bytes */
+
+    /* If his byte pointer is aligned, and has the right size, then we */
+    /* can IOT words directly into his buffer */
+    if (words > 0 && ptr == ALIGNED_BYTE_PTR(uf->uf_bsize, ptr)) {
+
+	n = (int) (int *) ptr;				/* N: base address */
+	iotptr = (((- words) << 18) | n);
+	val = SYSCALL2("iot", uf->uf_ch, &iotptr);
+	n = ((iotptr & 0777777) - n) * uf->uf_nbpw;	/* N: # bytes read */
+	uf->uf_pos += n;
+	if (val > 0) {				/* Error */
+	    errno = EIO;
+	    return 0;
+	}
+	cnt -= n;
+	if (cnt <= 0) return nbytes + 1;	/* Done */
+	if (val < 0) return -cnt;		/* Interrupted */
+	if (iotptr < 0) {			/* EOF */
+	    uf->uf_eof = -1;
+	    return nbytes + 1 - cnt;
+	}
+	words = 0;		/* No more words */
+	ptr += n;
+    }
+
+    ptr--;			/* IDPB from now on */
+    if (bytes > 0) words++;	/* # words to read into internal buffer */
+
+    while (words > 0) {
+	int iotbuffer[IOT_BUFSIZ];	/* internal buffer */
+	char *bptr;			/* buffer pointer */
+
+	iotptr = (((- (words > IOT_BUFSIZ ? IOT_BUFSIZ : words)) << 18) |
+		  ((int) iotbuffer));
+	val = SYSCALL2("iot", uf->uf_ch, &iotptr);
+	n = ((iotptr & 0777777) - ((int) iotbuffer));	/* N: # words read */
+	words -= n;
+	n *= uf->uf_nbpw;				/* N: # bytes read */
+	bptr = ALIGNED_BYTE_PTR(uf->uf_bsize, iotbuffer);
+
+	/* Save any extra for later */
+	while (n > cnt) uf->uf_zbuf[uf->uf_zcnt++] = bptr[--n];
+
+	/* Now give him everything we got */
+	cnt -= n;
+	uf->uf_pos += n;
+	bptr--;
+	while (n-- > 0) *++ptr = *++bptr;
+
+	if (val > 0) {				/* Error */
+	    errno = EIO;
+	    return 0;
+	}
+	if (cnt <= 0) return nbytes + 1;	/* Done */
+	if (val < 0) return -cnt;		/* Interrupted */
+	if (iotptr < 0) {			/* EOF */
+	    uf->uf_eof = -1;
+	    return nbytes + 1 - cnt;
+	}
+    }
+
+    return nbytes + 1;
+}
+
+/* ITS Unit mode, unpadded */
+static int insiot(uf, buf, cnt)
+  struct _ufile *uf;
+  int cnt;
+  char *buf;
+{
+    int val;
+    char *ptr = buf - 1;
+    int n = cnt;
+
+    val = SYSCALL3("siot", uf->uf_ch, &ptr, &n);
+    n = cnt - n;		/* n = number of bytes read */
+    uf->uf_pos += n;		/* update pos */
+    if (!val) {			/* nothing unusual? */
+	if (n < cnt) uf->uf_eof = -1;	/* now at eof? */
+	return n + 1;		/* return */
+    }
+
+    /* There is no way for an interrupt to happen yet, because */
+    /* we haven't provided a way to give permission, but here is the */
+    /* code to handle it anyway: */
+    if (val < 0) {		/* interrupted? */
+	n = n - cnt;		/* n = - bytes to go */
+	return (n ? n : cnt + 1);	/* if none to go, ignore interrupt */
+    }
+
+    errno = EIO;
+    return 0;
+}
+
+/* inzbuf() is like insiot(), except it pops characters from _uiozbuf */
+/* first.  If this indicates error, interrupt, or EOF, _uiozbuf will be */
+/* empty. */
+static int inzbuf(uf, buf, cnt)
+  struct _ufile *uf;
+  int cnt;
+  char *buf;
+{
+    int val;
+    char *ptr = buf;
+    int nread = 0;
+
+    while (uf->uf_zcnt > 0 && nread < cnt) {
+	*ptr++ = uf->uf_zbuf[--uf->uf_zcnt];
+	nread++;
+	uf->uf_pos++;
+    }
+
+    if (nread == cnt) return cnt + 1;
+
+    val = insiot(uf, ptr, cnt - nread);
+
+    if (val > 0) return val + nread;
+
+    else return val;		/* error or interrupt */
+
+}
+
+/* push some stuff into _uiozbuf */
+static void unzbuf(uf, buf, cnt)
+  struct _ufile *uf;
+  int cnt;
+  char *buf;
+{
+    int i;
+    i = (uf->uf_zcnt += cnt);
+    while (cnt-- > 0) uf->uf_zbuf[--i] = *buf++;
+}
+
+/* ITS Unit mode, 7-bit bytes (=> padded) */
+
+#define PADMAX 4		/* Maximum number of pads */
+
+#if PADMAX > UIO_ZBUFSIZ
+#error _uiozbuf isn't large enough!
+#endif
+
+/* count potential padding characters */
+static int padcount(buf, cnt)
+  int cnt;
+  char *buf;
+{
+    int c, pads = 0;
+    while (pads < PADMAX && cnt > 0) {
+	c = buf[--cnt];
+	if (!(c == 3 || c == 0)) break;
+	pads++;
+    }
+    return pads;
+}
+
+static int inpadded(uf, buf, cnt)
+  struct _ufile *uf;
+  int cnt;
+  char *buf;
+{
+    int val, nread, pads, xcnt;
+    char xbuf[PADMAX];
+
+    if (!(val = inzbuf(uf, buf, cnt))) return 0;
+
+    /* nread = ((val > 0) ? val - 1 : val + cnt); */
+    if (val > 0) nread = val - 1;
+    else nread = val + cnt;
+
+    pads = padcount(buf, nread);
+
+    if (!pads) return val;	/* No padding?  All done! */
+
+    if (nread < cnt) {
+	/* buf wasn't filled => interrupt or EOF */
+	/* It must be the case that _uiozbuf is empty */
+	if (val < 0) {		/* Interrupted => save padding */
+	    unzbuf(uf, buf + (nread - pads), pads);
+	}			/* EOF => flush padding */
+	uf->uf_pos -= pads;
+	return val - pads;
+    }
+
+    /* Screw.  buf was filled, but ends with padding. */
+
+    /* First, ask for enough to certainly empty _uiozbuf: */
+    if (!(val = inzbuf(uf, xbuf, PADMAX))) return 0;
+
+    if (val == (PADMAX + 1)) {		/* No funny stuff? */
+	unzbuf(uf, xbuf, PADMAX);	/* Good, just save chars for later. */
+	uf->uf_pos -= PADMAX;
+	return cnt + 1;
+    }
+
+    /* So how many did we read into xbuf? */
+    /* nread = ((val > 0) ? val - 1 : val + PADMAX); */
+    if (val > 0) nread = val - 1;
+    else nread = val + PADMAX;
+
+    /* This might change our opinion about the pads at the end of buf */
+    /* Note that this cannot set pads <= 0 */
+    if (pads + nread > PADMAX) pads = PADMAX - nread;
+
+    if (val < 0) {		/* Interrupted?  What a nightmare! */
+	unzbuf(uf, xbuf, nread);	/* save stuff */
+	unzbuf(uf, buf + (cnt - pads), pads);	/* all of it */
+	uf->uf_pos -= (nread + pads);
+	return -pads;		/* Must be negative */
+    }
+
+    /* Must have been EOF */
+    /* So how much stuff in xbuf is for real? */
+    xcnt = (nread - padcount(xbuf, nread));
+    if (!xcnt) {		/* None of it */
+	uf->uf_pos -= (nread + pads);	/* Flush it all */
+	return (cnt - pads) + 1;
+    }
+
+    /* Real stuff in xbuf */
+    unzbuf(uf, xbuf, xcnt);	/* Save it for next time */
+    uf->uf_pos -= nread;
+    uf->uf_eof = 0;		/* learn about EOF again the hard way */
+    return cnt + 1;
+}
+
+#endif /* SYS_ITS */
+
+#endif /* T20+10X+T10+CSI+WAITS+ITS */

@@ -1,0 +1,410 @@
+%TITLE 'DIUACT - DIU accounting routines'
+MODULE diuact (
+               IDENT = '257',
+               ENTRY(
+                     a$account          ! Make an accounting entry
+                     )
+               ) =
+BEGIN
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+
+!++
+! FACILITY:
+!   DIU-10/20 -- File Transfer Spooler for DECnet-10/20.
+!
+! ABSTRACT:
+!   This module provides resource accounting for the DIU-10/20 package.
+!
+! ENVIRONMENT:
+!   TOPS-10/20 user mode (privileged), XPORT.
+!
+! AUTHOR: Larry Campbell, CREATION DATE: May 24, 1982
+
+! REVISION HISTORY:
+!
+!  257  Change library BLI:MONSYM to just MONSYM.
+!       Gregory A. Scott 7-Jul-86
+!
+! MODIFIED BY: Andrew Nourse
+!
+! 04 - Major changes for TOPS-10 [Doug Rayner, 5-Aug-85]
+! 03 - Strip out passwords
+! 02 - Put in ENTRY point
+! 01 - beginning
+!--
+
+!
+! TABLE OF CONTENTS:
+!
+FORWARD ROUTINE
+    a$account : NOVALUE,                ! Make an accounting entry
+%IF %SWITCHES (TOPS20) %THEN
+    do_usage_jsys : NOVALUE;            ! Do a USAGE JSYS
+%ELSE
+    do_usage : NOVALUE;                 ! Do a QUEUE. UUO
+%FI
+!
+! INCLUDE FILES:
+!
+LIBRARY 'BLI:XPORT';
+LIBRARY 'DIU';
+
+%IF %SWITCHES (TOPS20)
+%THEN                                   ! TOPS-20 ONLY
+    LIBRARY 'MONSYM';                   ! TOPS-20 Monitor symbols
+    LIBRARY 'ACTSYM';                   ! Accounting system symbols
+
+%ELSE                                   ! TOPS-20 ONLY
+     LIBRARY 'BLI:UUOSYM';
+     UNDECLARE UX$TYP;                  ! Conflict between UUOSYM and ACTSYM
+					! Let ACTSYM win
+     LIBRARY 'BLI:ACTSYM';
+     LIBRARY 'UUODEF';
+%FI
+
+!
+! MACROS:
+!
+MACRO
+
+    mask_to_field (mask) =              ! Convert mask to pos, siz
+	 %NBITSU(mask AND - mask) - 1 ,
+	 %NBITSU(mask) - %NBITSU(mask AND - mask) + 1 %,
+
+%IF %SWITCHES (TOPS20)
+%THEN                                   ! TOPS-20 ONLY
+    fill_entry [immediate, type, length, code, address] =
+        entry[USE$$V_FLAGS] = 0;
+        entry[USE$$V_IMMEDIATE] = immediate;
+	entry[USE$$V_TYPE] = type;
+	entry[USE$$V_CODE] = code;
+        entry[USE$$V_LENGTH] = length;
+	entry[USE$$A_ADDRESS] = address;
+	entry = .entry + 2; %,
+
+%ELSE                                   ! TOPS-10 ONLY
+    fill_entry [immediate, length, code, address] =
+	entry_block[.entry_length] = (immediate * QA$IMM) +
+		(length ^ 18) + code;
+	entry_block[.entry_length + 1] = address;
+	entry_length = .entry_length + 2; %,
+%FI                                     ! END OF TOPS-10 / TOPS-20 CONDITIONAL
+
+    ptr_to_adr (ptr) =                    ![3] Make address from byte pointer
+        (CH$PLUS(ptr,1)) AND %O'777777' %;!
+!
+! EQUATED SYMBOLS:
+!
+%IF %SWITCHES (TOPS20) %THEN
+FIELD                                   ! TOPS-20 ONLY
+    USAGE$$_ENTRY_FIELDS =
+        SET
+        USE$$V_FLAGS = [0, mask_to_field (US_FLG), 0],
+            USE$$V_IMMEDIATE = [0, mask_to_field (US_IMM), 0],
+        USE$$V_TYPE = [0, mask_to_field (US_TYP), 0],
+        USE$$V_LENGTH = [0, mask_to_field (US_LEN), 0],
+        USE$$V_CODE = [0, mask_to_field (US_COD), 0],
+        USE$$A_ADDRESS = [1, 0, 36, 0]
+        TES,
+
+    USAGE$$_RECORD_DESCRIPTOR =
+        SET
+        URD$$B_DEC_VERSION = [0, 27, 9, 0],
+        URD$$B_CUSTOMER_VERSION = [0, 18, 9, 0],
+        URD$$H_ENTRY_TYPE = [0, 0, 18, 0]
+        TES;
+
+%FI                                     ! END TOPS-20 ONLY CONDITIONAL
+
+!
+! OWN STORAGE:
+!
+GLOBAL
+%IF %SWITCHES (TOPS20) %THEN
+    ustype ;! : INITIAL (5002)             ! USAGE entry type code
+%ELSE
+    ustype : INITIAL (19);              ! USAGE entry type code
+%FI
+!
+! EXTERNAL REFERENCES:
+!
+EXTERNAL ROUTINE
+    move_without_password: NOVALUE;
+
+EXTERNAL
+    d_null : $STR_DESCRIPTOR(),
+    jobstatus : BLOCKVECTOR [DIU$K_MAX_MJOB, DIUJ$K_LEN]
+                FIELD (DIUJ$$JOBSTAT_FIELDS);
+
+GLOBAL ROUTINE a$account (job_handle, disposition) : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Make a USAGE file entry for a DIU-10/20 request.  This routine is
+!   called for successful, unsuccessful, and requeued requests.  It is
+!   up to the processor of the USAGE file to sort these all out.
+!
+! FORMAL PARAMETERS:
+!   job_handle          - index into JOBSTATUS table for job
+!   disposition         - three-character code for request disposition:
+!                               SUC     - successful completion
+!                               ERR     - fatal error
+!                               REQ     - request requeued
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   NONE
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+    BEGIN
+
+    BIND
+        req_block = .jobstatus[.job_handle, DIUJ$A_REQ_BLOCK] : $DIU_BLOCK;
+
+    LOCAL
+%IF %SWITCHES (TOPS20) %THEN
+	entry_block : BLOCK [100] FIELD (USAGE$$_RECORD_DESCRIPTOR),
+        entry : REF BLOCK [2] FIELD (USAGE$$_ENTRY_FIELDS),
+%ELSE
+	entry_block : VECTOR [60],
+	entry_length,
+%FI
+        request_type_code,
+        source_desc : $STR_DESCRIPTOR(CLASS=BOUNDED),
+        destination_desc : $STR_DESCRIPTOR(CLASS=BOUNDED),
+        stripped_source_desc : $STR_DESCRIPTOR(),
+        stripped_destination_desc : $STR_DESCRIPTOR();
+
+    !++
+    ! Make passwordless copies of filespecs		[3]
+    !--
+
+    ! Set up descriptors
+    $STR_DESC_INIT(DESC=source_desc, CLASS=BOUNDED,
+                   STRING=(.req_block[DIU$H_SOURCE_FILESPEC],
+                           CH$PTR(req_block[DIU$T_SOURCE_FILESPEC])));
+
+    $STR_DESC_INIT(DESC=destination_desc, CLASS=BOUNDED,
+                   STRING=(.req_block[DIU$H_DESTINATION_FILESPEC],
+                           CH$PTR(req_block[DIU$T_DESTINATION_FILESPEC])));
+
+    $STR_DESC_INIT(DESC=stripped_source_desc, CLASS=DYNAMIC);
+
+    $STR_DESC_INIT(DESC=stripped_destination_desc, CLASS=DYNAMIC);
+
+    IF .ustype EQL 0                    ! IF 0
+    THEN RETURN;                        ! Accounting is disabled
+
+
+    move_without_password (source_desc, stripped_source_desc);
+    move_without_password (destination_desc, stripped_destination_desc);
+
+    ! Make ASCIZ
+    $STR_APPEND(STRING=d_null, TARGET=stripped_source_desc);
+    $STR_APPEND(STRING=d_null, TARGET=stripped_destination_desc);
+
+    !++
+    ! Select a request type code
+    !--
+    request_type_code =
+        (SELECTONE .req_block[DIU$H_FUNCTION]
+         OF
+             SET
+             [DIU$K_COPY] : 'COP';
+             [DIU$K_APPEND] : 'APP';
+             [DIU$K_RENAME] : 'REN';
+             [DIU$K_DELETE] : 'DEL';
+             [DIU$K_SUBMIT] : 'SUB';
+             [DIU$K_DIRECTORY] : 'DIR';
+             [DIU$K_PRINT] : 'PRI';
+             TES);
+
+%IF %SWITCHES (TOPS20)
+%THEN
+    entry_block[URD$$B_DEC_VERSION] = 1;
+    entry_block[URD$$B_CUSTOMER_VERSION] = 1;
+    entry_block[URD$$H_ENTRY_TYPE] = .ustype;
+    entry = entry_block + 1;
+%ELSE
+    entry_length = 7;
+%FI
+
+%IF %SWITCHES (TOPS20) %THEN
+
+    fill_entry
+         (
+1, $USSPC,  0, $USUAR, 0,
+0, $USASC, 39, $USUAS, req_block[DIU$T_ACCOUNT],
+1, $USASC,  3, $USUAS, disposition,
+1, $USDEC,  2, $USUDC, .req_block[DIU$B_PRIORITY],
+1, $USOCT, 12, $USUOC, .jobstatus[.job_handle, DIUJ$G_LAST_ERROR],
+1, $USASC,  3, $USUAS, request_type_code,
+1, $USDEC,  8, $USUDC, .jobstatus[.job_handle, DIUJ$G_PACKETS_XFERRED],
+1, $USDEC,  8, $USUDC, .jobstatus[.job_handle, DIUJ$G_BLOCKS_READ],
+1, $USDEC,  8, $USUDC, .jobstatus[.job_handle, DIUJ$G_BLOCKS_WRITTEN],
+0, $USASC,  6, $USUAS, req_block[DIU$T_JOBNAME],
+1, $USDEC,  6, $USUDC, .jobstatus[.job_handle, DIUJ$H_REQUEST_ID],
+0, $USASC,200, $USUAS, ptr_to_adr(.stripped_source_desc[STR$A_POINTER]),   ![3]
+0, $USASC,200, $USUAS, ptr_to_adr(.stripped_destination_desc[STR$A_POINTER]), !
+1, $USDAT, 14, $USUDT, .req_block[DIU$G_CREATION],
+1, $USDAT, 14, $USUDT, .jobstatus[.job_handle, DIUJ$G_JOB_CREATE_TIME],
+1, $USDEC,  9, $USUDC, .jobstatus[.job_handle, DIUJ$G_RUNTIME],
+1, $USDEC,  6, $USUDC, .req_block[DIU$G_REQUEUE_COUNT]
+          );
+    entry[0, 0, 36, 0] = 0;             ! Tie off the list
+
+%ELSE
+    fill_entry
+         (
+0,  8, $USACT, req_block[DIU$T_ACCOUNT],
+0,  1, $USDIZ, disposition,
+1,  1, $USDIP, .req_block[DIU$B_PRIORITY],
+1,  1, $USDIE, .jobstatus[.job_handle, DIUJ$G_LAST_ERROR],
+0,  1, $USDIT, request_type_code,
+1,  1, $USDIX, .jobstatus[.job_handle, DIUJ$G_PACKETS_XFERRED],
+1,  1, $USDIB, .jobstatus[.job_handle, DIUJ$G_BLOCKS_READ],
+1,  1, $USDIW, .jobstatus[.job_handle, DIUJ$G_BLOCKS_WRITTEN],
+0,  2, $USDIN, req_block[DIU$T_JOBNAME],
+1,  1, $USDII, .jobstatus[.job_handle, DIUJ$H_REQUEST_ID],
+0, 40, $USDIS, ptr_to_adr(.stripped_source_desc[STR$A_POINTER]),   ![3]
+0, 40, $USDID, ptr_to_adr(.stripped_destination_desc[STR$A_POINTER]), !
+1,  1, $USDIC, .req_block[DIU$G_CREATION],
+1,  1, $USDIJ, .jobstatus[.job_handle, DIUJ$G_JOB_CREATE_TIME],
+1,  1, $USDIM, .jobstatus[.job_handle, DIUJ$G_RUNTIME],
+1,  1, $USDIQ, .req_block[DIU$G_REQUEUE_COUNT]
+          );
+%FI
+
+%IF %SWITCHES (TOPS20)
+%THEN
+    do_usage_jsys (entry_block);                ! Make the USAGE entry
+%ELSE
+    do_usage (entry_block, .entry_length);      ! Make the USAGE entry
+%FI
+
+    $XPO_FREE_MEM(STRING=stripped_source_desc);    ! [3] Free stripped filespec
+    $XPO_FREE_MEM(STRING=stripped_destination_desc); ! [3] ditto
+    END;                                ! End of a$account
+
+
+
+%IF %SWITCHES (TOPS20) %THEN            ! *** TOPS-20 ONLY ROUTINE ***
+
+ROUTINE do_usage_jsys (p_entry_block) : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Do the USAGE% JSYS to make an entry in the accounting file.
+!
+! FORMAL PARAMETERS:
+!   p_entry_block       - pointer to entry block
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   NONE
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+    BEGIN
+
+    REGISTER
+        ac1 = 1,
+        ac2 = 2;
+
+    BUILTIN
+        JSYS;
+
+    ac1 = $USENT;                       ! Make an entry
+    ac2 = .p_entry_block;               ! Address of block
+    IF JSYS (-1, USAGE_, ac1, ac2)
+    THEN
+        RETURN
+    ELSE
+        SIGNAL (DIU$_BUG);
+    END;                                ! End of do_usage_jsys
+
+
+
+%ELSE                                   ! *** TOPS-10 ONLY ROUTINE ***
+
+ROUTINE do_usage (p_entry_block, entry_length) : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Do the QUEUE. UUO to make an entry in the accounting file.
+!
+! FORMAL PARAMETERS:
+!   p_entry_block       - pointer to entry block
+!   entry_length	- length of usage record
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   0 - Failure
+!   1 - Success
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+    BEGIN
+
+    BIND
+	entry_block = .p_entry_block : VECTOR;
+
+    REGISTER
+	t1;
+
+    entry_block[$QUFNC] = $QUMAE + QF$PIP;
+    entry_block[$QUNOD] = entry_block[$QURSP] = 0;
+    entry_block[$QUARG] = 1 ^ 18 + $QBAFN + QA$IMM;
+    entry_block[$QUARV] = UGENT$;
+    entry_block[$QUARG + 2] = 1 ^ 18 + $QBAET + QA$IMM;
+    entry_block[$QUARV + 2] = .ustype;
+    t1 = .entry_length ^ 18 + entry_block[0];
+    IF QUEUE$_UUO(t1)
+    THEN
+        RETURN(1)
+    ELSE
+	RETURN(0);
+    END;                                ! End of do_usage
+
+%FI                                     ! ** END TOPS-10/TOPS-20 CONDITIONAL **
+
+
+END                                     ! End of module
+ELUDOM

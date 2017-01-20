@@ -1,0 +1,671 @@
+MODULE DIR20(
+             IDENT='12',
+             ENTRY(
+                    RL$PARSE,               ! Parse a local filespec
+                    RL$MERGE,               ! Merge local filespecs
+                    RL$DIRECTORY,           ! Initiate directory search local 
+                    RL$SEARCH,              ! Search (wildcard) local 
+                    RL$RENAME,              ! Rename local file(s) 
+                    RL$ERASE                ! Delete local file(s)
+                  )
+             )=
+BEGIN
+!  COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1981, 1986.
+!  ALL RIGHTS RESERVED.
+!  
+!  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!  COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!  THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!  ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!  AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!  SOFTWARE IS HEREBY TRANSFERRED.
+!  
+!  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!  NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!  EQUIPMENT CORPORATION.
+!  
+!  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!  ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+
+!++
+! FACILITY:  DAP
+!
+! ABSTRACT:  Routines to transfer records or blocks of file data.
+!
+!
+! ENVIRONMENT:  RMS-20, BLISSNET-20, XPORT-20, Non-Transportable code.
+!
+! AUTHOR:	Andrew Nourse, CREATION DATE:  14-Sep-82
+!
+! 12    - Don't trash JFN when no nam block is being merged in really
+! 11    - Check RLF bit, not presence of an RLF, in RL$MERGE
+! 10    - Make wildcard $RENAME work
+! 07    - Set NAM$V_FNB_WILDCARD if any wildcard bit set in RL$MERGE
+! 06    - First file on next filespec was not being processed correctly
+! 05    - Use RMS BSZ instead of FDB BSZ if it is an RMS file
+! 04    - Fix wildcard delete and rename
+! 03    - Put in ENTRY points
+! 02    - Supress device we get from JFN always if remote file
+! 01	- Separate system-dependant functions of DIRECT into this module
+!--
+!
+! INCLUDE FILES:
+!
+
+!LIBRARY 'BLI:XPORT';
+ LIBRARY 'RMS';
+ LIBRARY 'BLISSNET';
+ LIBRARY 'CONDIT';
+ LIBRARY 'DAP';
+%BLISS36(
+LIBRARY 'TWENTY';
+! LIBRARY 'BLI:TENDEF';
+! LIBRARY 'BLI:MONSYM';
+)
+
+!
+! Table of Contents
+!
+
+FORWARD ROUTINE
+RL$PARSE,               ! Parse a local filespec
+RL$MERGE,               ! Merge local filespecs
+RL$DIRECTORY,           ! Initiate directory search local 
+RL$SEARCH,              ! Search (wildcard) local 
+RL$RENAME,              ! Rename local file(s) 
+RL$ERASE;               ! Delete local file(s)
+
+!
+! Feature Tests
+!
+
+COMPILETIME MULTIPLE_FILESPECS=1;
+
+!
+! Externals
+!
+
+EXTERNAL ROUTINE
+    S$JFN_STR,
+    MOVEAZ,
+    DAP$MERGE,
+    DAP$HANDLE,
+    R$NULL,
+    R$$MERGE;
+%IF MULTIPLE_FILESPECS
+%THEN EXTERNAL ROUTINE RL$NEXTFILESPEC %FI;
+
+
+!
+! System Services
+!
+
+LINKAGE JSYS1S=JSYS(REGISTER=1;REGISTER=1): SKIP(1);
+LINKAGE JSYS2S=JSYS(REGISTER=1,REGISTER=2;REGISTER=1,REGISTER=2): SKIP(1);
+LINKAGE JSYS3E=JSYS(REGISTER=1,REGISTER=2,REGISTER=3): SKIP(-1);
+
+BIND ROUTINE GTFDB__=GTFDB_: JSYS3E;
+BIND ROUTINE GNJFN__=GNJFN_: JSYS1S;                                   
+BIND ROUTINE GTJFN__=GTJFN_: JSYS2S;
+BIND ROUTINE RLJFN__=RLJFN_: JSYS1S;
+BIND ROUTINE RNAMF__=RNAMF_: JSYS2S;
+
+BUILTIN SCANN;
+
+!
+! MACROS:
+!
+
+MACRO CRLF=%CHAR(13,10) %;
+MACRO LH=18,18 %;
+MACRO RH= 0,18 %;
+
+!
+! EQUATED SYMBOLS:
+!
+
+LITERAL
+       FILE_NAME_LENGTH=40;
+
+LITERAL
+       FILESPEC_FIELD_SIZE=40;     ! Length of filespec field in directory list
+
+!
+! OWN STORAGE:
+!
+
+
+GLOBAL ROUTINE RL$PARSE(FAB: REF $FAB_DECL, ERR)=
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Decompose a local filespec & merge in related filespec
+!
+! FORMAL PARAMETERS:
+!
+!       FAB: A FAB as defined by RMS
+!       ERR: Address of error routine
+!
+! COMPLETION CODES:
+!
+!	Standard RMS completion codes
+!
+!--
+    BEGIN
+    RL$MERGE(FAB[$],
+             MERGE$M_EXPANDED+MERGE$M_RLF+MERGE$M_POINT,
+             .ERR)
+    END;       ! RL$PARSE
+
+GLOBAL ROUTINE RL$MERGE (FAB: REF $FAB_DECL, FLAGS: BITVECTOR, ERR) = 
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Merge the related file spec with the filespec
+!       to get the resultant file spec
+!
+! FORMAL PARAMETERS:
+!
+!	FAB: Address of FAB, which may have NAM block attached
+!       FLAGS: Merge bits, defined in RMSUSR
+!
+! COMPLETION CODES:
+!
+!	RMS codes
+!
+! SIDE EFFECTS:
+!
+!	GTJFN will have been done on the filespec
+!       The JFN will be in FAB[FAB$H_JFN]
+!
+!--
+    BEGIN
+    MAP FAB: REF $FAB_DECL;
+    BIND NAM=.FAB[FAB$A_NAM]: $NAM_DECL;
+    BIND ROUTINE $$ERRRTN=.ERR: RMS_ERCAL;
+    LOCAL DESC: $STR_DESCRIPTOR(CLASS=BOUNDED);
+    LOCAL RESULT;
+    LOCAL GJBLK: VECTOR[$GJATR-1];      ! GTJFN block
+    LOCAL NEXT;                             ! Offset to next filespec
+    LOCAL WILDJFN;                          ! Build indexable file handle here
+
+    IF .FAB[FAB$V_FOP_OFP]
+    THEN NEXT=0                             ! No multiple output filespecs
+    ELSE NEXT=.NAM[NAM$H_WCC_NEXT];         ! Input multpile filespecs OK
+
+    IF .FAB[FAB$V_FOP_CIF] THEN FLAGS[MERGE$V_CIF]=1; ! Set Create-if if in FAB
+    IF .FAB[FAB$V_FOP_OFP] THEN FLAGS[MERGE$V_CREATE]=1; ! Set create if in FAB
+    ![11] Do not automatically use related filespec if resultant
+
+    CLEARV(GJBLK);
+    GJBLK[$GJSRC]=$NULIO+($NULIO^18);
+
+    IF .FLAGS[MERGE$V_CREATE]
+    THEN GJBLK[$GJGEN]=GJ_OFG+GJ_IFG+GJ_FOU+GJ_XTN
+    ELSE GJBLK[$GJGEN]=GJ_IFG+GJ_XTN;
+
+    IF (.FAB[FAB$H_JFN] EQL 0)
+    OR .FLAGS[MERGE$V_POINT]
+    THEN
+        BEGIN                 ! Get a JFN if we need one
+        LOCAL BEGPTR;
+        LOCAL ENDPTR;
+
+
+        IF .FAB[FAB$V_REMOTE] THEN RETURN 0;    ! Never do this for remote file
+
+        ! Point to next filespec
+        BEGPTR=CH$PLUS(.FAB[FAB$A_FNA],.NEXT);
+
+        IF GTJFN__(GJBLK,.BEGPTR; RESULT,ENDPTR)
+        THEN
+            BEGIN
+            IF .FAB[FAB$H_JFN] EQL 0    ! If we need this JFN
+            THEN
+                BEGIN
+                LOCAL MULTIPLE;
+                MULTIPLE=.NAM[NAM$V_FNB_MULTIPLE];      ! Save this bit
+                FAB[FAB$H_JFN]=.RESULT;     ! Save the JFN
+                NAM[NAM$G_FNB]=.RESULT^-18; ! Save the flags
+                NAM[NAM$V_FNB_MULTIPLE]=.MULTIPLE;  ! Keep set if it was before
+                END
+            ELSE RLJFN__(.RESULT<0,18>);   ! Don't need this JFN
+            IF .FLAGS[MERGE$V_POINT]       ! Incr offset to next if requested
+            THEN NAM[NAM$H_WCC_NEXT]=
+                  .NAM[NAM$H_WCC_NEXT]+CH$DIFF(.ENDPTR,.BEGPTR)-1;
+
+            SELECT SCANN(ENDPTR) OF     ! Check for multi-filespec delimiters
+                SET
+                [%C',', %C'+']: NAM[NAM$V_FNB_MULTIPLE]=1; ! Multiple filespecs
+                TES;
+            END
+        ELSE
+            BEGIN
+            IF .FAB[FAB$H_JFN] EQL 0    ! If we need the JFN
+            THEN                        ! Do not complain if 
+                BEGIN                   ! just sizing filespec
+                FAB[FAB$H_STS]=(SELECT .RESULT OF
+                                SET
+                                [GJFX24]: RMS$_FNF;
+                                [GJFX35]: RMS$_PRV;
+                                [OTHERWISE]: RMS$_CGJ;
+                                TES);
+                SIGNAL(.FAB[FAB$H_STS], FAB[FAB$H_STV]=.RESULT, FAB[$]);
+                RETURN .FAB[FAB$H_STS]
+                END;
+            END;
+        END;
+
+    NAM[NAM$V_FNB_WILDCARD]=                    ![7] If any wildcard, set this
+       (.NAM[NAM$G_FNB] AND NAM$M_FNB_WILDCARD_BITS) NEQ 0;
+
+    WILDJFN=.FAB[FAB$H_JFN];
+
+    IF .FLAGS[MERGE$V_EXPANDED]                 ! For expanded filespec
+    OR .FLAGS[MERGE$V_DEFAULTS]                 ! or default setting
+    THEN WILDJFN=.WILDJFN+(.NAM[NAM$G_FNB]^18); ! Make Indexable file handle
+
+    ! Set up expanded string
+    $STR_DESC_INIT(DESC=DESC, CLASS=BOUNDED,
+                   STRING=(.NAM[NAM$H_ESS],.NAM[NAM$A_ESA]));
+    NAM[NAM$H_ESL]=S$JFN_STR(.WILDJFN,DESC,0); 
+
+    ! Fill in the blocks
+    $STR_DESC_INIT(DESC=DESC, CLASS=BOUNDED,  ! Device
+                   STRING=(FILE_NAME_LENGTH,CH$PTR(NAM[NAM$T_DEV])));
+    S$JFN_STR(.WILDJFN,DESC,FLD($JSAOF,JS_DEV)+JS_PAF);
+
+    $STR_DESC_INIT(DESC=DESC, CLASS=BOUNDED,  ! Directory
+                   STRING=(FILE_NAME_LENGTH,CH$PTR(NAM[NAM$T_DIR])));
+    S$JFN_STR(.WILDJFN,DESC,FLD($JSAOF,JS_DIR)+JS_PAF);
+
+    $STR_DESC_INIT(DESC=DESC, CLASS=BOUNDED,  ! Name
+                   STRING=(FILE_NAME_LENGTH,CH$PTR(NAM[NAM$T_NAM])));
+    S$JFN_STR(.WILDJFN,DESC,FLD($JSAOF,JS_NAM)+JS_PAF);
+
+    $STR_DESC_INIT(DESC=DESC, CLASS=BOUNDED,  ! Extension
+                   STRING=(FILE_NAME_LENGTH,CH$PTR(NAM[NAM$T_EXT])));
+    S$JFN_STR(.WILDJFN,DESC,FLD($JSAOF,JS_TYP)+JS_PAF);
+
+    $STR_DESC_INIT(DESC=DESC, CLASS=BOUNDED,  ! Generation
+                   STRING=(7,CH$PTR(NAM[NAM$T_VER])));
+    S$JFN_STR(.WILDJFN,DESC,FLD($JSAOF,JS_GEN)+JS_PAF);
+
+    IF .FLAGS[MERGE$V_DEFAULTS]         ! Getting defaults from JFN
+    AND .FAB[FAB$V_REMOTE]              ! but the file is remote
+    THEN
+        BEGIN
+        CH$WCHAR(0,CH$PTR(NAM[NAM$T_DVI])); ! [2] do not believe device
+        CH$WCHAR(0,CH$PTR(NAM[NAM$T_VER])); ! Supress generation number
+        RETURN FAB[FAB$H_STS]=RMS$_SUC  ! Get out
+        END;
+
+    R$$MERGE(NAM[$],.FLAGS);   ! Merge in related filespec
+
+    IF .FLAGS[MERGE$V_RLF]        ![11] If we merged something
+    AND (NAM NEQ .NAM[NAM$A_RLF]) ![12] different
+    AND (.NAM[NAM$A_RLF] NEQ 0)   ![12]
+    THEN                          ! Then we need to get a new
+        BEGIN                     ! JFN
+        LOCAL WINFLAG;
+        RLJFN__(.FAB[FAB$H_JFN]);
+        GJBLK[$GJJFN]=.FAB[FAB$H_JFN];  ! Get this JFN back
+        GJBLK[$GJGEN]=.GJBLK[$GJGEN] OR FLD($GJERR,GJ_JFN);
+        IF (WINFLAG=GTJFN__(GJBLK,.NAM[NAM$A_RSA];RESULT)) EQL 0
+        THEN
+            BEGIN
+            IF .FLAGS[MERGE$V_CIF]    ! Try new file if CIF
+            THEN
+                BEGIN
+                GJBLK[$GJGEN]=GJ_NEW+GJ_OFG+GJ_IFG+GJ_XTN+FLD($GJERR,GJ_JFN);
+                WINFLAG=GTJFN__(GJBLK,.NAM[NAM$A_RSA];RESULT);
+                END;
+
+            IF .WINFLAG EQL 0         ! Still failed?
+            THEN
+                BEGIN
+                FAB[FAB$H_JFN]=0;       ! Blew this JFN away
+                FAB[FAB$H_STS]=(SELECT .RESULT OF
+                                SET
+                                [GJFX24]: RMS$_FNF;
+                                [GJFX35]: RMS$_PRV;
+                                [OTHERWISE]: RMS$_CGJ;
+                                TES);
+                SIGNAL(.FAB[FAB$H_STS],
+                       FAB[FAB$H_STV]=.RESULT,
+                       FAB[$]);
+                RETURN .FAB[FAB$H_STS]
+                END;
+            END;
+        END;
+
+    FAB[FAB$H_STS]=RMS$_SUC             ! Win
+    END;                                ! RL$MERGE
+
+GLOBAL ROUTINE RL$DIRECTORY (FAB,ERR) =	! Get next file 
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       'Open' a local directory for listing
+!
+! FORMAL PARAMETERS:
+!
+!       FAB: A FAB as defined by RMS -- FNA contains wildcard spec
+!       ERR: Address of error routine
+!
+! COMPLETION CODES:
+!
+!	Standard RMS codes
+!--
+
+    BEGIN
+    MAP FAB: REF $FAB_DECL;
+    BIND ROUTINE $$ERRRTN=.ERR: RMS_ERCAL;
+
+    BIND NAM=.FAB[FAB$A_NAM]: $NAM_DECL;   ! Name block
+    LOCAL FABSAV: VOLATILE;
+    LOCAL ERRSAV: VOLATILE;
+    ENABLE DAP$HANDLE(FABSAV,ERRSAV);   ! Setup Condition handler
+
+    ERRSAV=.ERR;
+    FABSAV=.FAB;                   ! Handler will need this
+
+    RL$MERGE(FAB[$],MERGE$M_EXPANDED+MERGE$M_RLF+MERGE$M_POINT,.ERR)
+
+    END;			!End of RL$DIRECTORY
+GLOBAL ROUTINE RL$SEARCH (FAB,ERR) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Get directory info for a local file
+!
+! FORMAL PARAMETERS:
+!
+!       FAB: A FAB as defined by RMS -- FNA contains wildcard spec
+!       ERR: Address of error routine
+!
+! COMPLETION CODES:
+!
+!	Standard RMS status codes
+!--
+
+    BEGIN
+    MAP FAB: REF $FAB_DECL;
+    LOCAL DESC: $STR_DESCRIPTOR();
+    BIND NAM=.FAB[FAB$A_NAM]: $NAM_DECL;
+    BIND ROUTINE $$ERRRTN=.ERR: RMS_ERCAL;
+    BIND TYP=.FAB[FAB$A_TYP]: $TYP_DECL;
+    LOCAL CLASS;
+
+    IF TYP NEQ 0                    ! If we have a datatype block,
+    THEN CLASS=.TYP[TYP$H_CLASS]    ! get the datatype class from it
+    ELSE CLASS=0;
+
+    IF NAM EQL 0 THEN (FAB[FAB$H_STS]=RMS$_NAM;    ! Must have a NAM block
+                       $$ERROR(GET,FAB[$]));       ! or can't do this
+
+    ! Set up descriptor for expanded string
+    $STR_DESC_INIT(DESC=DESC,STRING=(.NAM[NAM$H_RSS],.NAM[NAM$A_RSA]));
+
+
+     IF (.NAM[NAM$H_WCC_COUNT] NEQ 0)     ! No GNJFN first time through
+     THEN
+         BEGIN                          ! 
+         IF GNJFN__((.NAM[NAM$G_FNB]^18)+.FAB[FAB$H_JFN];NAM[NAM$Z_CHA]) EQL 0
+         THEN
+             BEGIN
+             FAB[FAB$H_STS]=RMS$_NMF;  ! No more files
+             %IF MULTIPLE_FILESPECS                 ! Scan another filespec:
+                 %THEN                              !  User can supply 
+                 IF RL$NEXTFILESPEC(FAB[$],.ERR) EQL 0  !  multiple filespecs,
+                 THEN RETURN .FAB[FAB$H_STS]        ! 
+                 %FI                                ! 
+             END;                                   ! File1,file2,file3 
+         END;
+
+!
+! Now get the information for the file
+!
+
+         BEGIN
+         LOCAL FAC,
+               FNA,
+               JFN,
+               RFM,
+               MRS,
+               FOP;
+         FAC=.FAB[FAB$H_FAC];       ! Save FAC
+         FOP=.FAB[FAB$H_FOP];       ! and FOP
+         JFN=.FAB[FAB$H_JFN];       ! And JFN
+         FNA=.FAB[FAB$A_FNA];       ! And file name pointer
+         RFM=.FAB[FAB$Z_RFM];       ! And Record Format
+         MRS=.FAB[FAB$H_MRS];       ! And max record size
+
+         NAM[NAM$H_RSL]=S$JFN_STR(.FAB[FAB$H_JFN],DESC,0); ! Get name
+
+         IF .FAB[FAB$V_FAC_BIO] EQL 0
+         THEN
+             BEGIN
+             FAB[FAB$H_FAC]=FAB$M_FAC_NIL;      ! No access
+             FAB[FAB$V_FOP_DRJ]=0;      ! Do not keep JFN
+             FAB[FAB$H_JFN]=0;          ! do not use this JFN
+             FAB[FAB$A_FNA]=.NAM[NAM$A_RSA];    ! Use resultant name
+
+             $OPEN(FAB=FAB[$]);         ! Open file to get attrs
+             IF .FAB[FAB$H_STS] EQL RMS$_SUC
+             THEN  $CLOSE(FAB=FAB[$]);  ! Close it again
+
+             FAB[FAB$H_FAC]=.FAC;   ! Restore these to what user gave us
+             FAB[FAB$H_FOP]=.FOP;   ! 
+             FAB[FAB$H_JFN]=.JFN;   !
+             FAB[FAB$A_FNA]=.FNA;   ! 
+             END;
+
+         ! Get the length from the monitor, RMS won't do that for us
+             BEGIN
+             LOCAL FDBBUF: VECTOR[$FBLEN];
+             LOCAL BSZ;
+
+             GTFDB__(.FAB[FAB$H_JFN],$FBLEN^18,FDBBUF);
+             FAB[FAB$G_ALQ]=.FDBBUF[$FBBYV] AND FB_PGC; ! # of pages
+
+             ! Get byte size
+             BSZ=.POINTR((FDBBUF[$FBBYV]),FB_BSZ); 
+             IF (.BSZ NEQ 0)                            ! If nonzero
+             AND (.FAB[FAB$Z_RFM] EQL FAB$K_RFM_STM)    ![5] and file is stream
+             OR (.FAB[FAB$Z_BSZ] EQL 0)                 ![5] or RMS has 0
+             THEN FAB[FAB$Z_BSZ]=.BSZ                   ! use BSZ from FDB
+
+             %IF %DECLARED(XABFHC)
+             %THEN                      
+                 BEGIN                  ! File Header Characteristics
+                 XABFHC[XAB$G_EBK]=.FDBBUF[$FBSIZ]/((%BPUNIT/.BSZ)*512);
+                 XABFHC[XAB$H_FFB]=.FDBBUF[$FBSIZ] MOD ((%BPUNIT/.BSZ)*512);
+                 END;
+             %FI;
+
+             IF (.FDBBUF[$FBCTL] AND FB_DIR) NEQ 0      ! File is a directory?
+             THEN FAB[FAB$Z_ORG]=FAB$K_ORG_DIRECTORY;   ! Set file organization
+
+             IF .TYP[TYP$H_CLASS] EQL TYP$K_CLASS_MACY11  ! MACY11?
+             THEN                                   
+                 BEGIN
+                 LOCAL SIZE;
+                 SIZE=.FDBBUF[$FBSIZ];      ! Size in bytes according to FDB
+                 IF .BSZ EQL 36 THEN SIZE=.SIZE*4;  ! Really 8-bit bytes
+                 FAB[FAB$Z_RFM]=.RFM;
+                 FAB[FAB$H_MRS]=.MRS;
+                 IF .RFM EQL FAB$K_RFM_FIX
+                 THEN FAB[FAB$G_MRN]=.SIZE/.FAB[FAB$H_MRS];
+                 END;
+             END;
+         END;
+
+
+    NAM[NAM$H_WCC_COUNT]=.NAM[NAM$H_WCC_COUNT]+1; ! Incr wildcard count
+
+    IF .FAB[FAB$H_STS] EQL RMS$_SUC
+    THEN RL$MERGE(FAB[$],MERGE$M_RLF,.ERR)      ! Get resultant filespec, etc.
+    ELSE $$ERROR(OPEN,FAB[$]);                  ! Call error routine if error
+    .FAB[FAB$H_STS]                             ! Return status
+    END;			!End of RL$SEARCH
+GLOBAL ROUTINE RL$RENAME (SFAB,DFAB,ERR) =	! Rename a file or files
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Rename a local file or files
+!
+! FORMAL PARAMETERS:
+!
+!       SFAB: A FAB as defined by RMS
+!       DFAB: A FAB as defined by RMS
+!       ERR: Address of error routine
+!
+! COMPLETION CODES:
+!
+!	RMS-20 codes
+!
+! SIDE EFFECTS:
+!
+!	The JFN (if any) may have changed
+!--
+
+    BEGIN
+    MAP SFAB: REF $FAB_DECL;
+    MAP DFAB: REF $FAB_DECL;
+    BIND SNAM=.SFAB[FAB$A_NAM]: $NAM_DECL;
+    BIND DNAM=.DFAB[FAB$A_NAM]: $NAM_DECL;
+
+    BIND ROUTINE $$ERRRTN=.ERR: RMS_ERCAL;
+
+    !++
+    ! Get JFN, fill in NAM block, etc.
+    !--
+    WHILE (SNAM[NAM$H_WCC_COUNT]=0;
+           (RL$DIRECTORY(SFAB[$],R$NULL) EQL RMS$_SUC)
+            AND (RL$SEARCH(SFAB[$],R$NULL) NEQ RMS$_NMF))
+           ![10] Start over each time because rename breaks chain
+    DO
+        BEGIN
+        LOCAL RESULT;
+        LOCAL TJFN;                                     ![4]
+
+        IF GTJFN__(GJ_SHT+GJ_IFG,.SNAM[NAM$A_RSA];TJFN) EQL 0  ![10] Wildcard
+        THEN                                            ![4] GTJFN failed
+            BEGIN                                       ![4]
+            SFAB[FAB$H_STS]=RMS$_CGJ;                   ![4]
+            SFAB[FAB$H_STV]=.TJFN;                      ![4]
+            $$ERROR(OPEN,SFAB[$]);                      ![4]
+            END                                         ![4]
+        ELSE
+            BEGIN
+            IF (.SFAB[FAB$Z_ORG] NEQ FAB$K_ORG_DIRECTORY)
+            THEN
+                BEGIN
+                ! Get resultant new name
+                RL$MERGE(DFAB[$],MERGE$M_RLF+MERGE$M_CREATE,.ERR);
+
+                IF RNAMF__(.TJFN<RH>,.DFAB[FAB$H_JFN];RESULT) ![10] Rename it
+                THEN
+                    BEGIN
+                    RLJFN__(.DFAB[FAB$H_JFN]);  ! Release JFN for new name
+                    DFAB[FAB$H_JFN]=0;          ! Get old JFNs out of blocks
+                    SFAB[FAB$H_STS]=DFAB[FAB$H_STS]=RMS$_SUC;    ! Win
+                    END
+                ELSE
+                    BEGIN
+                    SFAB[FAB$H_STS]=DFAB[FAB$H_STS]=RMS$_COF; ! Can't open file
+                    SFAB[FAB$H_STV]=DFAB[FAB$H_STV]=.RESULT;   ! System code
+                    $$ERROR(OPEN,SFAB[$])
+                    END
+                END;
+            END;
+        END;
+
+    IF .SFAB[FAB$H_STS] EQL RMS$_NMF     ! If we did all the files
+    THEN SFAB[FAB$H_STS]=RMS$_SUC;       ! then that's normal
+
+    IF .SFAB[FAB$V_FOP_DRJ] EQL 0        ! Get rid of jfn unless want to keep
+    THEN
+        BEGIN
+        RLJFN__(.SFAB[FAB$H_JFN]);       ! Release JFN
+        SFAB[FAB$H_JFN]=0;               ! and forget it
+        END;
+
+    .SFAB[FAB$H_STS]                     ! Return status
+    END;                                 !End of RL$RENAME
+
+GLOBAL ROUTINE RL$ERASE (SFAB,ERR) =	! Delete a file or files
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Delete a local file or files
+!
+! FORMAL PARAMETERS:
+!
+!       SFAB: A FAB as defined by RMS
+!       ERR: Address of error routine
+!
+! COMPLETION CODES:
+!
+!	RMS-20 codes
+!
+! SIDE EFFECTS:
+!
+!--
+
+    BEGIN
+    MAP SFAB: REF $FAB_DECL;
+    BIND ROUTINE $$ERRRTN=.ERR: RMS_ERCAL;      ! Error routine
+    BIND SNAM=.SFAB[FAB$A_NAM]: $NAM_DECL;
+
+    ! Caller can set this bit before the call to disable local files.
+    IF .SFAB[FAB$V_REMOTE]       ! Must it be remote?
+    THEN
+        BEGIN
+        SFAB[FAB$H_STS]=RMS$_SUP;
+        $$ERROR(OPEN,SFAB[$]);   ! Yes. complain
+        END;
+
+    RL$DIRECTORY(SFAB[$],.ERR);        ! Get JFN, etc    
+
+    WHILE (RL$SEARCH(SFAB[$],R$NULL) NEQ RMS$_NMF)       ! Find next file
+    DO
+        BEGIN
+        LOCAL TFAB: $FAB_DECL;          ![4] Make temp FAB
+
+        $FAB_INIT(FAB=TFAB, FNA=.SNAM[NAM$A_RSA]); ![4] init to resultant name
+
+        IF .SFAB[FAB$Z_ORG] NEQ FAB$K_ORG_DIRECTORY
+        THEN
+            BEGIN
+            $ERASE(FAB=TFAB[$]);            ![4] Erase it
+            SFAB[FAB$H_STS]=.TFAB[FAB$H_STS]; ![4] Keep status
+
+            IF .TFAB[FAB$H_STS] NEQ RMS$_SUC
+            THEN
+                BEGIN
+                SFAB[FAB$H_STV]=.TFAB[FAB$H_STV];   ![4] Keep secondary status
+                $$ERROR(ERASE,SFAB[$])      ![4] process error
+                END;
+            END;
+        END;
+
+    SFAB[FAB$H_JFN]=0;                   ! This JFN is bye-bye.
+
+    IF .SFAB[FAB$H_STS] EQL RMS$_NMF     ! If we did all the files
+    THEN SFAB[FAB$H_STS]=RMS$_SUC;       ! then that's normal
+
+    .SFAB[FAB$H_STS]                     ! Return status
+    END;                                 !End of RL$ERASE
+
+
+GLOBAL BIND ROUTINE RMS$MERGE=RL$MERGE;
+GLOBAL BIND ROUTINE RMS$DIRECTORY=RL$DIRECTORY;
+GLOBAL BIND ROUTINE RMS$SEARCH=RL$SEARCH;
+END
+ELUDOM ! End of module

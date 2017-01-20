@@ -1,0 +1,206 @@
+		Some Comments about Disk and Tape I/O
+			by David I. Bell
+
+
+
+This is an attempt to document some of the aspects of doing Tape and
+Disk I/O using the MASSBUS.  If I appear to wander randomly through
+the subject, so be it!
+
+There are two distinct kinds of operations that are done to disks
+and tapes.  The first kind of operation is where a device is reading
+data into memory or is writing data from memory.  Such an operation is
+called a transfer operation.  The channel's responsibility during a transfer
+operation is to move the data words between the device and memory.  A
+channel doing this is called active or busy, because a channel can only
+handle one transfering device at a time.  The channel will become free again
+when the transfer is done, which can occur either because the I/O is
+finished, or some error condition appears.  When the transfer is complete,
+an interrupt is generated and the monitor can start another transfer.
+
+The second kind of operation is where a device does not transfer data
+between itself and memory.  In such a case, the channel is not needed
+during the operation, and can be doing other things.  Examples of such
+operations are seeks and recalibrations for disks, and rewinds and
+skip operations for magtapes.  These are called positioning or
+non-transfer operations.  The channel starts the operation, and
+then disconnects from the device.  When the device is done or an error
+occurs, an interrupt is generated and the monitor can do something else
+to the device.
+
+All of our current channels have enough logic in them to be able to
+do a positioning operation even while a transfer operation is in progress.
+Thus if a disk is currently reading a page into memory, the monitor can
+still issue a seek to another disk drive.  And since positioning operations
+do not need the channel once the operation is underway, many positioning
+operations can be given one after another.  So it is possible to have all
+of your disks seeking, or all of your tapes rewinding.
+
+This is not necessarily as good as it sounds, however, because there is
+commonly another entity between the device and the channel.  This is the
+controller.  A controller's advantage is that it can increase the possible
+number of devices which are connected to the system.  In addition, much
+money can be saved in hardware costs since much of the logic required to
+do operations can be collected into one box, instead of being replicated
+in each device.  Tape controllers are a good example of this.  A single
+TX02 can control many TU70 drives.  You might think that the RP06 has
+no controller, but that is not quite true.  It does have one, but it
+is inside the disk and handles only that one drive.
+
+A channel has only enough electronics to handle one transfer operation,
+however it can handle position operations at the same time.  The
+situation is worse for controllers.  They have to communicate with the
+device even during many positioning operations, and thus can only handle
+one of these at a time.  As an example, a tape controller can only do
+one skip operation at a time, since it must be examining the data coming
+back from the tape to know when the skip operation is done.  A controller
+is called active or busy when it doing such an operation.  In such a state,
+no operation can be initiated on any device that the controller owns,
+even if the channel is free.  The result of all this is that for a
+transfer operation, both the channel and the controller are active, and
+for most positioning operations, the channel is idle but the controller
+is active.
+
+There are a few operations which the device can handle on its own,
+and therefore the controller can become free while the device is still
+busy.  Examples of this are seeks for RP20 disks, and rewinds for
+magtapes.  The controller must talk to the device for a short while
+to give it the operation.  But then the controller can disconnect from
+the device, and the monitor can initiate another operation for another
+device that the controller controls.  When the device is done with its
+operation, it notifies the controller which will eventually interrupt
+the monitor so that another operation can be started for the device.
+The result of all this is that multiple seeks can be occurring for
+RP20s, and multiple rewinds for magtapes.
+
+Notice that if a controller is busy, nothing can be started for any
+unit under its control.  Therefore it is to the monitor's advantage
+to start all operations which take only a short time and will not
+tie up the controller or channel, before starting one which will.
+For example, for magtapes you want to start all rewinds before doing
+a transfer or skip operation, and for disks you want to start all seeks
+before starting any reading or writing.  In this way, by the time the
+transfer is complete, another drive might be ready for another operation.
+(The RP06 seems to be an exception to this, since the monitor will
+start a seek on a drive even when another one is transfering.  But this
+is possible because each drive has its own controller, so that one drive
+being busy cannot affect another drive.  But the monitor code still starts
+seeks first for them, since it doesn't hurt anything.)
+
+Disk and tape I/O is interrupt driven.  That is, when an operation
+is complete the hardware generates an interrupt, which cause the CPU
+to transfer control to the interrupt code.  There the I/O is marked as
+complete, and if another I/O request was queued, it will be initiated.
+This new operation will cause another interrupt eventually, at which
+time the monitor can start yet another operation.  If there are
+no more requests for I/O on a channel, then that channel becomes idle.
+
+If an I/O request appears when the channel is idle, the monitor must
+start it then without being at interrupt level.  Thus I/O operations
+can be started at JSYS level, or at interrupt level, depending on
+whether or not the channel is already free.  Since queues are manipulated
+and commands sent to devices, the monitor must disable interrupts when
+starting I/O requests at non-interrupt level, otherwise timing problems
+will occur.
+
+Interrupts come in two classes, which are labeled "attention" interrupts
+and "done" interrupts.  These two kinds of interrupts are distinguished
+from each other by examining the status of the channel.  A done
+interrupt can only be generated by one event, and that is the completion
+of a transfer operation with or without errors.  That is, when the channel
+makes the transition from active to idle, a done interrupt is generated.
+Thus on seeing done, the monitor can begin another transfer operation.
+Since only one device can be doing a transfer operation, there is no
+need for the channel to inform the monitor which device completed the
+transfer.  When the monitor starts a transfer operation, it simply remembers
+which device it is starting I/O on, and when the done interrupt occurs
+it knows it is for that device.
+
+Positioning operations are not so trivial, since more than one device on
+the channel can be doing an operation at the same time.  The time it takes
+a device to complete a position operation is variable, so that the monitor
+cannot simply remember the order in which it issued operations.  And so
+there is a way for the channel to indicate which devices are ready.
+This method is by causing an attention interrupt.  Essentially, an
+attention interrupt is a random event, a way of causing the monitor to
+notice a change in the status of some device the channel controls.  When
+an attention interrupt occurs, a register which the monitor reads from
+the channel contains a bit mask, indicating which of the units the
+channel controls wants attention.
+
+An attention interrupt can also be generated by an external event which
+the monitor did not generate.  Examples of this are devices coming on-line
+or going off-line.  Finally, to confuse the matter even more, if a transfer
+operation is in progress and an error occurs, an attention interrupt is
+generated in addition to the done interrupt.  The monitor can ignore
+attentions from a device which is doing a transfer, since when the done
+interrupt is handled, the error will be seen.  But in some cases the
+monitor remembers that an attention occurred for a transfering drive, so
+that the done routine can be speeded up.  (If no attention occurred, then
+you know that no errors occurred on the transfer, and so you don't have
+to read any registers to check for errors).
+
+Notice that an attention interrupt and a done interrupt both look the
+same to the CPU.  The only difference is in the status of the channel.
+On an interrupt, the monitor first checks the attention register to see
+if any devices have completed position operations, and then it checks
+the done status bit to see if a transfer completed.  Only after checking both
+of these conditions does the monitor normally dismiss an interrupt.
+
+Attention interrupts have one final complexity.  The register which tells
+the monitor which devices on the channel have attentions only holds eight
+bits.  That is, the RH20 and RH11 can only determine directly which unit
+they control has an attention.  For an RP06, this points to the disk unit
+itself, and so no more work is needed.  But for a controller for tapes or
+the RP20 disks, all you know is that the controller wants attention.  The
+actual tape or disk unit which wants attention is not immediately accessible.
+Therefore, when handling attention interrupts the monitor has to ask the
+controller which unit of the controller has the attention.
+
+There are two ways to know which unit has brought up an attention on
+a controller.  The first way is to poll all the units.  Here you ask
+the controller to return the status of each unit, and use that status
+operations to the drives are complete, and if errors occurred.  This
+mode is used for TM02 and TM03 controllers of tapes.  Drives are
+polled to look for off-line and on-line transitions, and for rewinds
+that are complete.
+
+The second way to handle attentions for devices that have a controller
+is by "asynchronous status" interrupts.  In this mode, the controller
+keeps track of which units want to give attentions, and presents them
+to you one at a time.  The monitor reads a register which gives both
+the drive number and the drive status.  Then the monitor clears the
+register and the attention flag, and the controller can then put more
+status in the register and cause another interrupt.  Controllers which
+do this are DX20-controlled devices like TX03/TU70 and 8000/RP20.
+
+The RH20 channel can do what is called "command stacking", or
+"read/next write/next".  This capability allows the channel to stay
+busy doing transfers, even though the monitor usually only requests
+one page at a time to be transferred.  Command stacking is simply the ability to
+tell the RH20 of a new I/O request even though it is already handling
+one.  This is simply a matter of loading two registers and changing
+the CCW starting address.  When the RH20 is done with a transfer and
+no errors occurred, it will immediately start the next operation.  The
+monitor gets the done interrupt for the first operation, and then knows
+that the channel can have yet another command stacked, and does it.
+Stacked commands are used to allow the reading of sequential sectors on
+a disk, since if the monitor had to wait for the done interrupt on a sector
+before starting the next transfer, the disk would have rotated too far to
+begin the transfer, and an extra disk revolution would be required.
+
+Error handling is handled as follows.  There are locations in the UDB
+which hold the current retry count, current SYSERR buffer, and the
+current function code, and flag bits.  These are all originally zero.
+On an error, the device routine reads all the device registers and
+stores them in the UDB or KDB, and sets an error flag in the IORB.
+PHYSIO then notices this, and allocates a SYSERR block and calls the
+device routine at a special entry point.  Here, the device driver
+increments the retry counter, and if it is the first call, copies the
+device registers into the SYSERR block as the initial status.  Then
+the routine decides how to recover the error based on the error status
+and the retry count.  To do a retry, the function code is placed in the
+UDB location for that purpose, and the operation is started.  This
+function code supersedes the normal function associated with an IORB.
+
+    

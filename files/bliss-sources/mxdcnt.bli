@@ -1,0 +1,408 @@
+MODULE dcnsrv =
+BEGIN
+
+!                    COPYRIGHT (c) 1985 BY
+!	      DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASS.
+!
+! THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND  COPIED
+! ONLY  IN  ACCORDANCE  WITH  THE  TERMS  OF  SUCH  LICENSE AND WITH THE
+! INCLUSION OF THE ABOVE COPYRIGHT NOTICE.  THIS SOFTWARE OR  ANY  OTHER
+! COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY
+! OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE  IS  HEREBY
+! TRANSFERRED.
+!
+! THE INFORMATION IN THIS SOFTWARE IS SUBJECT TO CHANGE  WITHOUT  NOTICE
+! AND  SHOULD  NOT  BE  CONSTRUED  AS  A COMMITMENT BY DIGITAL EQUIPMENT
+! CORPORATION.
+!
+! DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF  ITS
+! SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.
+!
+
+!++
+! Facility:     DECNET Servers and Spoolers
+!
+! Abstract:
+!
+!       This module contains utility routines for Listeners and Senders
+!
+! Environment:  TOPS-10/20 user mode under MX.
+!
+! Author:   Richard B. Waddington
+!
+!--
+
+
+
+!
+! Include files
+!
+
+LIBRARY 'mxnlib';                       ! Required definitions
+LIBRARY 'mxlib';
+
+%IF %SWITCHES(TOPS20) %THEN
+    library 'MONSYM';			! Monitor symbols
+
+    library 'MXJLNK';			! JSYS linkage definitions
+%FI
+
+
+
+!
+! Table of contents
+!
+FORWARD ROUTINE
+    mx$route_message: NOVALUE,
+    remove_recipients: NOVALUE;
+
+
+!
+! External references
+!
+
+! Routines
+EXTERNAL ROUTINE
+    smtpli,             !The SMTP LIstener
+    smtpsn,             !The SMTP SeNder
+    lisvax,
+    senvax,
+    copy_string,
+    nmu$text_manager,
+    nmu$memory_manager,
+    mx$release_asciz,
+    mx$file_routines,
+    mx$error_routines,
+    mx$database_routines,
+    nmu$table_routines,
+    nmu$queue_manager,
+    nmu$sched_manager;
+
+EXTERNAL
+        nettab: VECTOR[max_number_of_domains],
+        active_message_table,
+        uc_tab,
+	work_queue:	SQ_HEADER,
+        rtrynt;                     !Retry time in minutes
+
+
+!
+! Local macros
+!
+LITERAL
+    $noobj = -2;
+
+GLOBAL ROUTINE dcnsrv: NOVALUE =
+    BEGIN
+    BIND
+        domain = .nettab[1]: domain_data_block;
+
+    LOCAL
+        ptr;
+
+    STACKLOCAL
+        nambuf: VECTOR[CH$ALLOCATION(32)];
+
+    $TRACE('DCNSRV running');
+
+    INCR i FROM 1 TO .domain[dcn_smtp_servers] DO
+        BEGIN
+        ptr = CH$PTR(nambuf);
+        $nmu$text(ptr, 32, 'DCN-36-%D LISTENER', .i);
+        nmu$sched_create(smtpli, 500, 0, CH$PTR(nambuf));
+        END;
+
+    INCR i FROM 1 TO .domain[dcn_vm11_servers] DO
+        BEGIN
+        ptr = CH$PTR(nambuf);
+        $nmu$text(ptr, 32, 'DCN-32-%D LISTENER', .i);
+        nmu$sched_create(lisvax, 500, 0, CH$PTR(nambuf));
+        END;
+
+    nmu$sched_deschedule();
+    END;
+
+GLOBAL ROUTINE dcnspl: NOVALUE =
+    BEGIN
+    BIND
+        domain = .nettab[1]: domain_data_block;
+
+    LOCAL
+        state,
+        sleep_time,
+        data,
+        msg: REF message_table_entry,
+	entry: REF work_request_block;
+
+    WHILE 1 DO
+    	BEGIN
+	entry = nmu$squeue_remove(.domain[dom_spooler_queue]);
+	$TRACE('DCNSPL running...');
+        nmu$table_fetch(active_message_table, .entry[req_message_id], msg);
+
+        data = mx$data_validate(.entry[req_destination_node],
+                                  .msg[msg_sender_domain],
+                                  .entry[req_domain_id]);
+        IF NOT .data<0,18,1> GEQ 0
+        THEN
+            BEGIN
+            $error(
+                SEVERITY=$severe,
+                FACILITY=$message,
+                CODE=sl$nnk,
+                MESSAGE_DATA=CH$PTR(.entry[req_destination_node],3,8),
+                ID=.msg[msg_msg_id]);
+            $mx$change_state(.entry, $reject);
+            END
+        ELSE
+            BEGIN
+            IF (entry[req_state] = smtpsn(.entry, .msg)) EQL $noobj
+            THEN
+                BEGIN
+                $TRACE('$noobj returned from smtpsn');
+
+                data = .data<18,18,0>;
+                IF .data EQL $strip
+                THEN
+                    entry[req_state_specific_field] = $strip
+                ELSE
+                    IF .data NEQ 0
+                    THEN
+                        mx$route_message(.data, .entry);
+
+                entry[req_state] = senvax(.entry, .msg);
+
+!                entry[req_state] = $defer;
+                END;
+
+            IF .entry[req_state] NEQ $done
+            THEN
+                remove_recipients(.entry);
+
+            IF .entry[req_state] EQL $defer
+            THEN
+                BEGIN
+                time_current(RTRYNT*60, sleep_time);
+                entry[req_state_specific_field] = .sleep_time;
+                END;
+            $mx$change_state(.entry);
+	    END;
+        END;
+    nmu$sched_deschedule();
+
+    END;
+
+%GLOBAL_ROUTINE ('MX$ROUTE_MESSAGE', adr, req: REF work_request_block):NOVALUE=
+    BEGIN
+    BIND
+        list = .adr: list_blk,
+        route = .list[lst_data];
+
+    LOCAL
+        ptr,
+        pb,
+        len,
+        ch,
+        rc_list: REF list_blk;
+
+    STACKLOCAL
+        buf: VECTOR[CH$ALLOCATION(132)];
+
+    !First create a new destination node
+    len = 0;
+    ptr = CH$PTR(route,1);
+    pb = CH$PTR(buf);
+    WHILE $true DO
+        BEGIN
+        ch = CH$RCHAR_A(ptr);
+        SELECTONE .ch OF
+            SET
+            [%C':',%C',']: EXITLOOP
+            TES;
+        len = .len + 1;
+        CH$WCHAR_A(.ch,pb);
+        END;
+
+    !The new destination node is in BUF - make it the new destination node
+    mx$release_asciz(.req[req_destination_node]);
+    req[req_destination_node] = nmu$memory_get(CH$ALLOCATION(4 + .len, 8));
+    ptr = CH$PTR(.req[req_destination_node],0,8);
+    CH$WCHAR_A(0,ptr);
+    CH$WCHAR_A(0,ptr);
+    CH$WCHAR_A(.len,ptr);
+    CH$COPY(.len,CH$PTR(buf),
+            0,
+            .len+1,.ptr);
+
+    !Turn the old "user@node" into an smtp routing string i.e. 
+    ! "@nod1,@nodn:user@node".  "@nod...:" is what is stored at route.
+    rc_list = .req[req_recipient_list];
+    WHILE .rc_list NEQ 0 DO
+        BEGIN
+        BIND
+            rcptr = CH$PTR(.rc_list[lst_data]);
+
+        pb = CH$PTR(buf);
+        IF CH$RCHAR(rcptr) NEQ %C'@'
+        THEN
+            BEGIN
+            IF CH$RCHAR(rcptr) EQL %C'"'
+            THEN
+                BEGIN
+                ptr = CH$PLUS(rcptr,1);
+                WHILE CH$RCHAR_A(ptr) NEQ %C'"' DO ;
+                END
+            ELSE
+                ptr = CH$FIND_CH(132,rcptr,%C'@');
+
+            CH$WCHAR(0,.ptr);
+            len = $nmu$text(pb,132,'%I',
+                            CH$PTR(route), 
+                            rcptr);
+            CH$WCHAR(%C'@',.ptr);
+
+            mx$release_asciz(.rc_list[lst_data]);
+
+![309] CHANGE LENGTH FROM .LEN+1 TO .LEN
+            rc_list[lst_data] = copy_string(CH$PTR(buf),.len); ![309]
+            END;            
+
+        rc_list = .rc_list[lst_next];
+        END;
+
+    END;
+ROUTINE remove_recipients(req_):NOVALUE =
+    BEGIN
+    BIND req = .req_:work_request_block;
+
+    LOCAL
+        prev: REF list_blk,
+        list: REF list_blk,
+        next: REF list_blk;
+
+    IF .req[req_recipient_list] EQL 0
+    THEN
+        RETURN;
+
+    prev = 0;
+    list = .req[req_recipient_list];
+
+    WHILE .list NEQ 0 DO
+        BEGIN
+        IF .list[lst_stat] NEQ 0
+        THEN
+            BEGIN
+            mx$release_asciz(.list[lst_data]);
+            nmu$memory_release(.list[lst_xtra], rb_block_size);
+
+            IF .prev EQL 0
+            THEN
+                req[req_recipient_list] = .list[lst_next]
+            ELSE
+                prev[lst_next] = .list[lst_next];
+
+            nmu$memory_release(.list, list_block_size);
+            END
+        ELSE
+            prev = .list;
+
+        list = .list[lst_next];
+        END;            
+    END;
+GLOBAL ROUTINE getsub (filspec) =	
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       This routine returns the subject line from the message file.  The
+!   string "SUBJECT: " is stripped off, as is the CRLF at the end.  The memory
+!   manager is used to get memory to store this string.  Its address is
+!   returned to the caller.
+!
+! FORMAL PARAMETERS:
+!
+!       filspec:    A ch$ptr to the filespec
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!       The address of an ASCIZ string (the subject string)
+!       or 0 if no subject was found for some reason.
+!
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+    LITERAL
+        toknlen = %CHARCOUNT('Subject: ');
+
+    STACKLOCAL
+        toknbuf: VECTOR[CH$ALLOCATION(toknlen+1)],
+        linebuf: VECTOR[CH$ALLOCATION(max_string_length)];
+
+    BIND
+        subjptr = CH$PTR(UPLIT(%ASCIZ'SUBJECT: ')),
+        toknptr = CH$PTR(toknbuf),
+        lineptr = CH$PTR(linebuf);
+
+    LOCAL
+        msgfil,
+        found,
+        bcount,
+        error;
+
+    IF NOT (msgfil = mx$file_open(
+                        .filspec,
+                        file_access_read_only,
+                        error)) GTR 0
+    THEN
+        RETURN 0;
+
+    found = $false;
+    WHILE (bcount = mx$file_read(.msgfil,
+                        lineptr,
+                        max_string_length,
+                        error))             GTR 0 DO
+        BEGIN
+        CH$TRANSLATE(uc_tab,                        !Convert "subject" to upper
+                     toknlen, lineptr,
+                     0,
+                     toknlen+1, toknptr);
+
+        IF CH$EQL(toknlen, subjptr,
+                  toknlen, toknptr, 0)
+        THEN
+            BEGIN
+            found = $true;
+            EXITLOOP;
+            END;
+        END;
+
+    mx$file_close(.msgfil, file_abort, error);
+
+    IF .found
+    THEN
+        BEGIN
+        CH$WCHAR(0, CH$PTR(linebuf,.bcount-2));
+        RETURN copy_string(CH$PTR(linebuf,toknlen), .bcount - toknlen - 1);
+        END;
+
+    RETURN 0;
+
+    END;			!End of GETSUB
+end
+eludom

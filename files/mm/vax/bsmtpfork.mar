@@ -1,0 +1,1412 @@
+;	Start of WCC edit history
+
+;	[W1]	Provide for either BSMTP format or RFC822 format.
+;		The new routines attempts to deliver mail to the user 
+;		if there is no bsmtp envelope.
+;		In order to do this, it requires a valid RFC 822 header.
+;		[JGD 3-18-86]
+;
+;	[W2]	If the mail is not bsmtp format and there is not a valid
+;		RFC822 mail header try matching the rscs id to an ID in
+;		mailing-lists.txt before sending it to postmaster.
+;		[JGD 6-18-86]
+;
+;	[W3]	Unwrap mail headers [JGD 6-19-86]
+;
+;	[W4]	Log bounced mail [JGD 7-14-86]
+;
+;	[W5]	Allow RFC822 username to start anywhere in header line 
+;		[JGD 7-30-86]
+;
+;	[W6]	Correct foreign domain size var. [JGD 9-9-86]
+;
+;
+;	End of WCC edit history
+
+.psect	code,exe,nowrt
+.entry bsmtpfork,^m<>
+
+start:	bsbw	mapfil				;map the domains.txt file
+5$:	$parse	fab = rscfab			;parse the .rsc fab
+	blbc	r0,20$
+	$create fab = bsmtpfab			;[W4] open/create log file
+	$connect rab = bsmtprab			;[W4] connect ignore errors
+10$:	$search	fab = rscfab			;parse the .rsc fab
+	blbs	r0,30$
+20$:	$erase	fab = smtpfab			;erase it if it exists
+	$disconnect rab=bsmtprab		;[W4] break from log file
+	$close	fab=bsmtpfab			;[W4] close ignore errors
+25$:	bsbw	sleep				;goto sleep for a while
+	jmp	5$				;start all over again
+
+;[W1]	We have a .rsc file process it.  If the RSCS userid is addressed 
+;	to mailer it must be BSMTP if not addressed to mailer must be
+;	for a local user and have valid RFC822 headers.
+
+
+30$:	movc5	#0,#0,#0,#maxrcp*maxpth,fwdbuf	;[W4] zero the forward buffer
+	movc5	#0,#0,#0,#maxrcp*maxpth,rlybuf	;[W4] zero the known buffer
+	movc5	#0,#0,#0,#maxrcp*maxpth,kwnbuf	;[W4] zero the relay buffer
+	movc5	#0,#0,#0,#80,mbxbuf		;[W4] zero the mailbox buffer
+	$open	fab=rscfab			;[W1] now open the input file
+	blbc	r0,25$				;[W1] sleep on error
+	$connect rab=rscrab			;[W1] connect so we can do i/o
+	bsbw	errchk				;[W1] return on error
+
+
+;[W1]	Get my mailers name and the first record from the input file.
+
+	moval	errbuf,errptr			;[W1] reset the buffer pointer
+	bsbw	info				;[W1] do it
+
+;[W4]	Log the transaction
+
+	bsbw	w4time				;[W4] time of transaction
+	movzbw	w4fid,r7			;[W4] size of word from
+	movc3	r7,w4fid+1,mbuf			;[W4] save it
+	addw2	sndr,r7				;[W4] size of sender
+	movc3	sndr,sndr+2,(r3)		;[W4] save text
+	bsbw	w4copy				;[W4] output it
+	movzbw	w4tid,r7			;[W4] size of word to
+	movc3	r7,w4tid+1,mbuf			;[W4] save it
+	addw2	fwdbuf,r7			;[W4] size of recpient
+	movc3	fwdbuf,fwdbuf+2,(r3)		;[W4] save text
+	bsbw	w4copy				;[W4] output it
+	
+;[W1]	Close the file
+
+	$disconnect rab=rscrab			;[W1] break the stream
+	bsbw	errchk				;[W1] return on error
+	$close	fab=rscfab			;[W1] close the input file
+	bsbw	errchk				;[W1] return on error
+
+
+;[W1]	Check to for the mail systems name or possible users name
+
+	matchc	mynam,mynam+2,#destusrs,fwdbuf+2;[W1][W4] is this for mailer
+	beql	35$				;[W1] is this for mailer
+	bsbw	rfc822				;[W1] not for mailer assume RFC822
+	jmp	10$				;[[W1] get the next file
+
+
+;[w1]	Message is mailer assume BSMTP format
+
+35$:	movc5	#0,#0,#0,#blksiz,errbuf		;[W1] zero the error buffer
+	moval	errbuf,errptr			;reset the buffer pointer
+	clrb	f.verb				;assume verbose to start
+	bsbw	rmain				;process the file
+	tstb	f.err				;any bsmtp errors?
+	beql	40$				;if not check for a general error
+	moval	erfmt,r1			;point to the error in format msg
+	movzbw	(r1)+,r2			;get the size of the msg
+	movl	errptr,r3			;get the error buffer pointer
+	movw	r2,(r3)+			;save the size
+	movc3	r2,(r1),(r3)			;save the error msg
+	movl	r3,errptr			;restore the pointer
+40$:	tstw	errbuf				;any errors
+	bneq	50$				;no errors get the next file
+	$close	fab = smtpfab			;close the file
+	$erase	fab = smtpfab			;erase the file
+	jmp	10$				;get the next file
+50$:	bsbw	chkerr				;check for errors
+	jmp	10$				;get the next file
+
+
+.page
+rmain::	clrb	f.nic				;nickname flag
+	clrb	f.helo				;helo cmd flag
+	clrb	f.mail				;mail cmd flag
+	clrb	f.rcpt				;rcpt cmd flag
+	clrb	f.lcl				;local mail flag
+	clrb	f.del				;delivery options flag
+	clrb	f.kwn				;known site flag
+	clrb	f.rly				;relay site flag
+	clrb	f.data				;data cmd flag
+	clrb	f.quit				;quit cmd flag
+	clrb	f.err				;processing error flag
+	movc5	#0,#0,#0,#maxrcp*maxpth,fwdbuf	;[W4] zero the forward buffer
+	movc5	#0,#0,#0,#maxrcp*maxpth,rlybuf	;[W4] zero the known buffer
+	movc5	#0,#0,#0,#maxrcp*maxpth,kwnbuf	;[W4] zero the relay buffer
+	movc5	#0,#0,#0,#80,mbxbuf		;[W4] zero the mailbox buffer
+
+	bsbw	opnp				;open a passive connection
+	bsbw	info				;get info on this connection
+	bsbw	setup				;say we are ready
+10$:	bsbw	getcmd				;get a cmd
+	bsbw	parse				;check out the command
+	tstb	f.err				;was it a bsmtp error?
+	bneq	15$				;if not proceed
+	tstb	f.quit				;have we received the quit cmd?
+	beql	10$				;no so get the next cmd
+	jmp	30$
+
+;	Error handling here
+
+15$:	clrl	r7				;send a blank line
+	bsbw	snd
+	movzbl	rfcerr4,r7			;message
+	movc3	r7,rfcerr4+1,mbuf
+	bsbw	snd	
+	clrl	r7				;send a blank line
+	bsbw	snd
+20$:	bsbw	getcmd				;write out the log file
+	cmpl	r0,#rms$_eof			;hit the eof
+	bneq	20$	
+	bsbw	close
+30$:	rsb
+
+.page
+;	Open the input file.
+
+opnp::	$open	fab=rscfab			;now open the input file
+	bsbw	errchk				;return on error
+	$connect rab=rscrab			;connect so we can do i/o
+	bsbw	errchk				;return on error
+	$create	fab=smtpfab			;now create the bsmtp log file
+	bsbw	errchk				;return on error
+	$connect rab=smtprab			;connect so we can do i/o
+	bsbw	errchk				;return on error
+	rsb
+
+.page
+;	Find out who I am, who is sending the file and from where.  
+;	Also check the files class etc.
+
+;	Get my name. Build an ident string.
+
+
+info::	moval	ident,r1			;get the indenification keyword
+	movzbw	(r1)+,r6			;size of the keyword
+	movc3	r6,(r1),mbuf			;save the keyword	
+	moval	bitnet,r1			;known domain
+	movzbw	(r1)+,r2			;size of the domain
+	addw2	r2,r6				;save the domain size
+	movc3	r2,(r1),(r3)			;save the domain	
+
+;	Search the domains.txt file. (for the ident string)
+
+	movl	domst,r10			;get the start of the section
+	matchc	r6,mbuf,domsz,(r10)		;search the section
+	addl3	#1,r3,r6			;skip the space and save the host
+	matchc	#1,#58,#maxdom,(r6)		;find the end ":"
+	subl3	r6,r3,r7			;compute the length
+	decl	r7				;don't count the ":"
+
+;	Build the host string.
+
+	moval	host,r1				;get the host keyword
+	movzbw	(r1)+,r8			;size of the keyword
+	movc3	r8,(r1),mbuf			;save the keyword	
+	addw2	r7,r8				;size of the host name
+	movc3	r7,(r6),(r3)			;save the host name
+
+;	Search the domains.txt file. (for the host string)
+
+	movl	domst,r10			;get the start of the section
+	matchc	r8,mbuf,domsz,(r10)		;search the section
+	addl3	#1,r3,r8			;skip the space and save the pointer
+	matchc	#1,#44,#maxdom,(r8)		;find the end ","
+	subl3	r8,r3,r9			;compute the length
+	decl	r9				;don't count the ","
+
+;	Save my host name, domain name, and my mailer's name.
+
+	movw	r9,mynam			;size of mailer's name
+	movc3	r9,(r8),mynam+2			;save the mailer's name
+	matchc	#1,#46,r7,(r6)			;isolate the hostname
+	subl3	r6,r3,r2			;compute the size
+	decl	r2				;don't count the "."
+	movb	r2,lhnasz			;size of the hostname
+	movc3	r2,(r6),lhna			;save my host name
+	moval	bitnet,r1			;known domain
+	movzbw	(r1)+,r2			;size of the domain
+	movb	r2,lnnasz			;save the domain size
+	movc3	r2,(r1),lnna			;save the domain	
+
+;	Get the first record from the input file.
+
+	moval	mbuf,r8				;buffer for the read
+	bsbw	read				;the first record (control info)
+
+;	Check for a class M file
+
+	cmpb	#77,mbuf+class			;check the file's class
+	beql	30$				;is this class "M" (mail)
+	moval	ercla,r1			;point to the error in class msg
+	movzbw	(r1)+,r2			;get the size of the msg
+	movl	errptr,r3			;get the error buffer pointer
+	movw	r2,(r3)+			;save the size
+	movc3	r2,(r1),(r3)			;save the error msg
+	movl	r3,errptr			;restore the pointer
+
+;	Check to make sure it is for this host
+
+30$:	movzbw	lhnasz,r1			;get the host size
+	matchc	r1,lhna,#destnods,mbuf+destnod	;is this for my host
+	beql	40$				;well?
+	moval	erhst,r1			;point to the error in host msg
+	movzbw	(r1)+,r2			;get the size of the msg
+	movl	errptr,r3			;get the error buffer pointer
+	movw	r2,(r3)+			;save the size
+	movc3	r2,(r1),(r3)			;save the error msg
+	movl	r3,errptr			;restore the pointer
+
+;	Check to make sure it is for the mail system
+
+40$:	matchc	mynam,mynam+2,#destusrs,mbuf+destusr	;is this for mailer
+	beql	50$				;is this for mailer
+	moval	ernam,r1			;point to the error in name msg
+	movzbw	(r1)+,r2			;get the size of the msg
+	movl	errptr,r3			;get the error buffer pointer
+	movw	r2,(r3)+			;save the size
+	movc3	r2,(r1),(r3)			;save the error msg
+	movl	r3,errptr			;restore the pointer
+
+;[W4]	Save the recpients address
+
+50$:	movc3	#destusrs,mbuf+destusr,fwdbuf+2	;[W4] get the name
+
+;	Remove trailing spaces
+
+	movzwl	#destusrs,r2			;[W4] get the max username size
+	clrw	fwdbuf				;[W4] start with no size
+	moval	fwdbuf+2,r6			;[W4] point to the start of the name
+52$:	cmpb	(r6)+,#32			;[W4] is it a space
+	beql	54$				;[W4] if so thats the end
+	incw	fwdbuf				;[W4] not a space bump count
+	sobgtr	r2,52$				;[W4] don't go over the maximum	
+54$:	incw	fwdbuf				;[W4] add a seperator
+	decl	r6				;[W4] back up one
+	movb	#64,(r6)+			;[W4] add the seperator
+	movc3	#destnods,mbuf+destnod,(r6)	;[W4] add the node
+	movzwl	#destnods,r2			;[W4] get the max nodename size
+56$:	cmpb	(r6)+,#32			;[W4] is it a space
+	beql	58$				;[W4] if so thats the end
+	incw	fwdbuf				;[W4] not a space bump count
+	sobgtr	r2,56$				;[W4] don't go over the maximum	
+	
+;	Get the senders name and address
+
+58$:	moval	mbuf+orgcpu,r6			;get the start of senders name
+	matchc	#1,#32,#orgcpus,(r6)		;find the end string
+	subl3	r6,r3,r7			;compute the name size
+	decl	r7				;don't count the null
+
+	moval	mbuf+orgloc,r8			;get the start of senders node
+	matchc	#1,#32,#orglocs,(r8)		;find the end string
+	subl3	r8,r3,r9			;compute the node size
+	decl	r9				;don't count the null
+
+;	Save the senders name and address
+
+	movw	r7,sndr				;size of the name
+	movc3	r7,(r6),sndr+2			;senders name
+	addw2	#1,sndr				;size of a "@"
+	movb	#64,(r3)+			;seperator "@"
+	addw2	r9,sndr				;size of the node
+	movc3	r9,(r8),(r3)			;senders node
+	addw2	#1,sndr				;size of a period
+	movb	#46,(r3)+			;seperator "."
+	moval	bitnet,r1			;point to the domain name
+	movzbw	(r1)+,r2			;get the domain size
+	addw2	r2,sndr				;save the domain size
+	movc3	r2,(r1),(r3)			;save the domain
+
+	movb	r9,fhnasz			;size of the node
+	movc3	r9,(r8),fhna			;senders node
+	moval	bitnet,r1			;point to the domain name
+	movzbw	(r1)+,r2			;get the domain size
+	movb	r2,fnnasz			;[W6] save the domain size
+	movc3	r2,(r1),fnna			;save the domain
+	rsb
+
+
+.page
+;	Read a record from the file converting it from ebcdic to ascii.
+;	Output:	ascii text in mbuf
+;		length of record in piolen
+;		r0 = 0 on success text record, r0 = -1 success control record
+;		r0 = rms$_eof on end of file
+
+read::	$get	rab=rscrab			;read a line from the file 
+	blbs	r0,10$				;Check for a successful code
+	cmpl	r0,#rms$_eof			;Is it the eof?
+	bneq	5$
+
+;	We have hit the eof without receiving a quit.  Provide an artifical one.
+	
+	moval	quit,r1				;point to a quit cmd
+	movzbw	(r1)+,piolen			;size of the cmd
+	movc3	piolen,(r1),(r8)		;fake quit
+	movb	#cr,(r3)+			;cr
+	movb	#lf,(r3)+			;lf
+	addw2	#2,piolen			;size of crlf
+	moval	erfmt,r1			;point to the error in format msg
+	movzbw	(r1)+,r2			;get the size of the msg
+	movl	errptr,r3			;get the error buffer pointer
+	movw	r2,(r3)+			;save the size
+	movc3	r2,(r1),(r3)			;save the error msg
+	movl	r3,errptr			;restore the pointer
+	movb	#1,f.verb			;don't echo quit cmd
+	movl	#rms$_eof,r0			;provide eof marker
+	rsb
+
+5$:	jmp	exit				;else abort
+
+;	Convert the record from ebcdic to ascii modify the standard table
+
+10$:	pushr	#^m<r1,r2,r3,r4,r5,r6>
+	movl	oldtbl,r1
+	movc	#256,(r1),tbladd
+	movb	#33,tbladd+90
+	movb	#124,tbladd+79
+	popr	#^m<r1,r2,r3,r4,r5,r6>
+	pushal	bufout
+	pushal	tbled
+	pushal	filld
+	pushal	bufadd
+	calls	#4,g^lib$movtc			;convert the buffer
+	blbs	r0,15$
+	jmp	rmserr
+
+;	Move the buffer skipping the record control character
+;	Adding a crlf to the end
+
+15$:	movw	rscrab+rab$w_rsz,piolen		;size of the record
+	subw3	#1,piolen,r2			;set up for the movc5
+	movc5	r2,outbuf+1,#cr,piolen,(r8) 	;move the buffer 
+	movb	#lf,(r3)+			;add a lf
+	incw	piolen				;one for the lf
+
+;	Test if this is a control record or a text record
+
+	cmpb	#3,outbuf			;check first record for a control c
+	beql	20$
+	clrl	r0				;text record
+	rsb
+20$:	movl	#-1,r0				;control record
+	rsb
+
+.page
+errchk:	blbs	r0,10$				;Check for a successful code
+	jmp exit				;Not success signal error, exit
+10$:	rsb					;Success return to caller
+
+exit:	$exit_s r0				;End this program
+	ret
+
+
+.page
+
+getcmd::moval	mbuf,r8				;buffer for the read
+	bsbw	read				;read in a record
+	tstb	r0				;did we do it	
+	blss	getcmd				;negative = control get another
+	beql	10$				; zero success
+	
+;	Error reading jmp to badfile or something
+
+10$:	tstb	f.verb				;check verbose flag
+	bneq	20$				;if not zero don't echo command
+
+;	Echo the command.
+
+	movw	piolen,r7			;get the line size
+	matchc	#1,#cr,r7,mbuf			;don't output a crlf
+	bneq	15$				;if crlf down the cnt
+	subw2	#2,r7				;down the count
+15$:	movw	r7,smtprab+rab$w_rsz		;store the size
+	$put	rab = smtprab			;output the text
+20$:	rsb
+
+
+.page
+;	Send some information to the log file.
+;	The information is in mbuf
+;	R7 is the size of the buffer
+
+snd::	matchc	#1,#cr,r7,mbuf			;don't output a crlf
+	bneq	10$				;if crlf down the cnt
+	subw2	#2,r7				;down the count
+10$:	movzbw	r7,smtprab+rab$w_rsz		;store the size
+	$put	rab = smtprab			;output the text
+	rsb
+
+
+.page
+;	Close the input file.
+
+close::	$disconnect rab=rscrab			;disconnect from the record stream
+	bsbw	errchk				;return on error
+	$close	fab=rscfab			;now close the input file
+	bsbw	errchk				;return on error
+	$erase	fab= rscfab			;delete the input file
+	bsbw	errchk				;return on error
+	$disconnect rab=smtprab			;disconnect from the record stream
+	bsbw	errchk				;return on error
+	rsb
+
+rverb::	tstb	cmdsiz				;any parameter passed
+	bneq	10$				;if not return an error
+	moval	r500m,r1			;missing parameter message
+	movzbl	(r1)+,r7			;size of the mesage
+	movc3	r7,(r1),mbuf			;save 1st part
+	jmp	50$				;send the message
+
+;	We have a parameter. Check out the parameter.
+
+10$:	moval	on,r1				;check for on parameter
+	movzbw	(r1)+,r2			;size of the parameter
+	movl	cmdptr,r6			;address of the parameter
+	matchc	r2,(r1),cmdsiz,(r6)		;is it on?
+	beql	20$				;if so set the flag
+	moval	off,r1				;check for off parameter
+	movzbw	(r1)+,r2			;size of the parameter
+	matchc	r2,(r1),cmdsiz,(r6)		;is it off?
+	beql	30$				;if so turn the flag off
+
+;	Unknown parameter.
+
+	moval	r500,r1				;parameter syntax error
+	movzbl	(r1)+,r7			;size of the mesage
+	movc3	r7,(r1),mbuf			;save 1st part
+	jmp	50$				;send the message
+
+20$:	clrb	f.verb				;set the verbose flag
+	jmp	40$				;send a reply	
+30$:	movb	#1,f.verb			;turn the verbose flag off
+40$:	moval	r250,r1				;command executed
+	movzbl	(r1)+,r7			;size of the mesage
+	movc3	r7,(r1),mbuf			;save 1st part
+50$:	bsbw	snd				;send it
+	rsb
+
+;	Accept any parameter.
+
+rtick::	tstb	cmdsiz				;any parameter passed
+	bneq	10$				;if not return an error
+	moval	r500m,r1			;missing parameter message
+	movzbl	(r1)+,r7			;size of the mesage
+	movc3	r7,(r1),mbuf			;save 1st part
+	jmp	20$				;send the message
+10$:	moval	r250,r1				;command executed
+	movzbl	(r1)+,r7			;size of the mesage
+	movc3	r7,(r1),mbuf			;save 1st part
+20$:	bsbw	snd				;send it
+	rsb
+
+badfil:		ret
+
+
+.page
+
+;	Check for errors; if found return errors and log file.
+;
+;	Open the log file and create the queued_mail file.
+
+chkerr:	$create	fab=quefab			;create a queued_mail file
+	bsbw	errchk				;return on error
+	$connect rab=querab			;connect so we can do i/o
+	bsbw	errchk				;return on error
+	$open 	fab=smtpfab			;now open the bsmtp log file
+	$connect rab=smtprab			;connect so we can do i/o
+	bsbw	errchk				;return on error
+
+;	Set up the receiver and null sender.  Then write the mail headers.
+
+	movb	#1,f.del			;deliver it as mail
+	moval	sysnam,r1			;point to postmaster
+	movzbw	(r1)+,r2			;send it from postmaster
+	movb	r2,revbuf			;save the size
+	movc3	revbuf,(r1),revbuf+1		;store the sender
+	moval	sndr,r6				;point to recpients name	
+	movzwl	(r6)+,r7			;size of recpients name
+	bsbw	whdr				;write a header
+
+;	Output all the general error msgs.
+
+	moval	errbuf,r6			;point to the error buffer
+10$:	tstw	(r6)				;if non zero we have an error
+	beql	30$				;zero: no more error msgs
+	movw	(r6)+,querab+rab$w_rsz 		;get the size
+	movc3	querab+rab$w_rsz,(r6),mbuf	;save it
+	movl	r1,r6				;update pointer
+	$put	rab= querab			;write the error
+	jmp	10$
+
+;	Write out the log file.
+
+30$:	$get	rab=smtprab			;read a line from the log file 
+	blbs	r0,40$				;any errors?
+	jmp	50$				;error ignore type and close the file
+40$:	movw	smtprab+rab$w_rsz,querab+rab$w_rsz ;get the size: ignore errors
+	$put	rab= querab
+	jmp	30$				;get the next line
+
+;	Close the files.
+
+50$:	$disconnect rab=querab			;disconnect from the record stream
+	bsbw	errchk				;return on error
+	$close	fab=quefab			;now close the input file
+	bsbw	errchk				;return on error
+	$disconnect rab=smtprab			;disconnect from the record stream
+	bsbw	errchk				;return on error
+	$close	fab=smtpfab			;now close the input file
+	bsbw	errchk				;return on error
+	$erase	fab=smtpfab			;and delete it
+	bsbw	errchk				;return on error
+	clrb	f.err				;reset the flag
+	movzbw	w4r,r7				;[W4] write to the log
+	movc3	r7,w4r+1,mbuf			;[W4] the return notice
+	bsbw	w4copy				;[W4] do it
+	rsb
+
+
+.page
+
+;[W1]	Here if RSCS userid was not the mailers name.  Attempt
+;	to send the message using RFC 822 receiver field headers.  If the 
+;	message can not be delivered using rfc822 then send it to the
+;	postmaster.
+
+;	Convert the ebcdic file to ascii.
+
+rfc822:	bsbw	opnp				;open the files
+	moval	mbuf,r8				;buffer for the read
+	bsbw	read				;read a record
+
+;	Get the RSCS user id.  Use this to match the RFC822 header
+
+	matchc	#1,#64,fwdbuf,fwdbuf+2		;isolate the name
+	subw3	r2,fwdbuf,r2
+	subw3	#1,r2,mynam
+	movc3	mynam,fwdbuf+2,mynam+2		;get the name
+
+;	Write out the rscs file to an ascii text file
+
+5$:	moval	mbuf,r8				;buffer for the read
+	bsbw	read				;read a record
+	tstb	r0				;did we do it	
+	blss	5$				;negative = control get another
+	cmpl	r0,#rms$_eof			;Is it the eof?
+	beql	7$				;if so continue on
+	subw3	#2,piolen,smtprab+rab$w_rsz	;size of the record
+	$put	rab = smtprab			;write the record
+	jmp	5$				;get the entire file	
+
+;	Close and delete the rcscs file.
+
+7$:	$disconnect rab= rscrab			;break the input stream
+	$close 	fab= rscfab			;close the input file
+	$erase	fab= rscfab			;delete the input file
+
+;	Search the file for a valid RFC822 receiver field header
+;	These include (To, cc, Bcc, Resent-to, Resent-cc, Resent-Bcc)
+
+8$:	$disconnect rab = smtprab		;start at the top of the file
+	$connect rab = smtprab
+9$:	bsbw	gethdr				;get/unfold a header line
+	tstb	r0				;r0 = 0 means eoh reached
+	bneq	10$				;if eoh then send to postmaster
+	moval	rfcerr1,r1			;send an errmsg to the postman
+	jmp	postman				;error send to postmaster
+10$:	bsbw	ucase				;uppercase the header line
+	moval	rfc1,r1				;point to receiver headers
+	bsbw	chkrfc				;check for valid receiver header
+	tstb	r0				;r0 = 0 not valid receiver field
+	beql	9$				;get another line
+	
+;	Move the address into a general buffer.
+;	Here we have a valid receiver header line.  Get to the start of the address
+
+	movc3	r7,(r6),gbuf			;store in a general buffer
+	moval	gbuf,r6				;point to the buffer
+;[W5]	matchc	#1,#60,r7,(r6)			;do we have a mailbox?
+	matchc	mynam,mynam+2,r7,(r6)		;[W5] check username
+	bneq	9$				;[W5] get next header
+	movl	r2,r7				;adjust size and pointer
+	movl	r3,r6
+	
+;	Back up the pointer and increase the size by mynam
+
+	addw2	mynam,r7			;[W5] add the size
+	subw2	mynam,r6			;[W5] back up the pointer
+
+;	r6 points to the username and r7 is the size of whole address
+;	The address can be of two forms:
+;	USERname%local_host.local_domain*text
+;	USERname@local_host.local_domain*text
+;	where * can be any deliminator
+
+;	Seperate the (username) from the (local_host) 
+
+	clrb	r12				;[W5] clear a flag
+	matchc	#1,#64,r7,(r6)			;is there an @ seperator
+	bneq	21$				;[W5] ignore errors
+	movb	#1,r12				;[W5] flag success
+21$:	movq	r2,r8				;save these values
+	matchc	#1,#37,r7,(r6)			;is there a % seperator
+	bneq	22$				;[W5] test match
+	movb	#1,r12				;[W5] flag success
+22$:	tstb	r12				;[W5] did we find anything
+	beql	9$				;[W5] if no match get a header
+
+;	Use the first terminator found "@" or "%"
+
+	cmpl	r9,r3				;don't skip the host
+	bgtr	23$				;use the smaller pointer
+	movq	r8,r2				;found an @ first
+23$:	subl3	r6,r3,r11			;compute size of username
+	decl	r11				;skip terminator
+	movzwl	r6,r10				;save pointer to username
+
+;	r10 points to username, r11 is the size of the username
+
+	movzwl	r2,r7				;save size of host.domain*
+	movl	r3,r6				;save pointer to shot.domain*
+
+;	Seperate the (local_host) from the (local_domain*text)
+
+	matchc	#1,#46,r7,(r6)			;. seperator
+	beql	30$				;must be there
+	jmp	9$
+30$:	subl3	r6,r3,r9			;compute size of local_host
+	decl	r9				;skip terminator
+	movzwl	r6,r8				;save pointer to local_host
+
+;	r8 points to local_host r9 is the size of the local_host
+	
+	movl	r3,r6				;save pointer to domain*
+
+;	Seperate the domain from the *text
+
+	movzwl	r2,r1				;size of domain*text
+	clrl	r7				;size of domain only
+40$:	cmpb	(r3),#65			;domain is uppercase alpha
+	blss	50$				;if less than A exit
+	cmpb	(r3),#90			;if greate than Z exit
+	bgtr	50$				;else get next character
+	incl	r7				;count this character
+	incl	r3				;bump up the pointer
+	sobgtr	r1,40$				;see if any characters left
+	jmp	9$				;bad way to exit loop
+
+;	R6 points to the domain and r7 is the size of the domain
+
+;	We now have the username, local_host, and local_domain names
+;	seperated.  Make sure the host and domain are valid.
+;	Check for local network hosts. (tcp/ip) 
+
+50$:	$open	fab = hofab			;open the file
+	bsbw	errchk				;[W1] return on error
+	$connect rab = horab			;connect to record stream
+	bsbw	errchk				;[W1] return on error
+
+;	Search the file for the hostname.
+
+55$:	$get 	rab = horab			;get the local host info
+	blbs	r0,65$
+	cmpl	r0,#rms$_eof			;have we hit eof?
+	bneq	60$				;if so then its a bad host
+	$disconnect rab = horab			;disconnect from record stream
+	bsbw	errchk				;[W1] return on error
+	$close	fab = hofab			;close the hosts.txt file
+	bsbw	errchk				;[W1] return on error
+	moval	rfcerr2,r1			;send an errmsg to the postman
+	jmp	postman				;error send to postmaster
+60$:	bsbw	errchk				;[W1] return on error
+
+65$:	matchc	r9,(r8),horab+rab$w_rsz,mbuf	;this host?
+	bneq	55$				;no check next host
+	matchc	r7,(r6),horab+rab$w_rsz,mbuf	;this domain?
+	bneq	55$				;no check next host
+
+;	Matched a host and domain.
+
+	$disconnect rab = horab			;disconnect from record stream
+	bsbw	errchk				;[W1] return on error
+	$close	fab = hofab			;close the hosts.txt file
+	bsbw	errchk				;[W1] return on error
+	
+;	Write out the mailq: file.
+
+	$create	fab=quefab			;create a queued_mail file
+	bsbw	errchk				;return on error
+	$connect rab=querab			;connect so we can do i/o
+	bsbw	errchk				;return on error
+
+;	Get the rfc 822 originator.  If not there use postmaster
+
+	pushr	#^m<r6,r7,r8,r9,r10,r11>
+	$disconnect rab=smtprab			;start from scratch
+	bsbw	errchk				;return on error
+	$connect rab=smtprab			;connect so we can do i/o
+	bsbw	errchk				;return on error
+70$:	bsbw	gethdr				;get/unfold a header line
+	tstb	r0				;r0 = 0 means eoh reached
+	bneq	75$				;if eoh then send to postmaster
+	jmp	80$				;error send from postmaster
+75$:	bsbw	ucase				;uppercase the header line
+	moval	rfc2,r1				;point to receiver headers
+	bsbw	chkrfc				;check for valid receiver header
+	tstb	r0				;r0 = 0 not valid receiver field
+	beql	70$				;get another line
+
+;	Here we have a valid originator header.
+
+	matchc	#1,#60,r7,(r6)			;any mailbox?  "<"
+	bneq	78$				;in not use this name
+	subb3	#1,r2,revbuf			;mailbox: skip the ">"
+	movc3	r2,(r3),revbuf+1		;save the mailbox
+	jmp	85$				;and continue
+78$:	movb	r7,revbuf			;use the whole address line
+	movc3	r7,(r6),revbuf+1		;save the address
+	jmp	85$				;and continue
+
+;	Here we do not have a valid originator header.
+
+80$:	moval	sysnam,r1			;point to postmaster
+	movzbw	(r1)+,r2			;send it from postmaster
+	movb	r2,revbuf			;save the size
+	movc3	revbuf,(r1),revbuf+1		;store the sender
+
+
+85$:	popr	#^m<r6,r7,r8,r9,r10,r11>
+	$disconnect rab=smtprab			;start from scratch
+	bsbw	errchk				;return on error
+	$connect rab=smtprab			;connect so we can do i/o
+	bsbw	errchk				;return on error
+
+;	Now write the mail headers.
+
+	movb	#1,f.del			;deliver it as mail
+	movl	r10,r6				;point to recpients name	
+	addw2	r11,r9				;size of recpients name+host
+	addw2	r9,r7				;name+host+domain
+	addw2	#2,r7				;account for seperators
+	matchc	#1,#37,r7,(r6)			;replace the % with an @
+	bneq	87$
+	decl	r3				;back up to the %
+	movb	#64,(r3)			;do the exchange	
+87$:	bsbw	whdr				;write a header
+
+;	Write out the log file.
+
+90$:	$get	rab=smtprab			;read a line from the log file 
+	blbs	r0,100$				;any errors?
+	jmp	110$				;error ignore type and close the file
+100$:	movw	smtprab+rab$w_rsz,querab+rab$w_rsz ;get the size: ignore errors
+	$put	rab= querab
+	jmp	90$				;get the next line
+
+;	Close the files.
+
+110$:	$disconnect rab=querab			;disconnect from the record stream
+	bsbw	errchk				;return on error
+	$close	fab=quefab			;now close the input file
+	bsbw	errchk				;return on error
+	$disconnect rab=smtprab			;disconnect from the record stream
+	bsbw	errchk				;return on error
+	$close	fab=smtpfab			;now close the input file
+	bsbw	errchk				;return on error
+	$erase fab = smtpfab			;delete the log file
+	rsb
+
+.page
+
+;	Check for a valid rfc822 field.
+;	Input:	r6 points to line, r7 is the size of the line
+;		r1 points to the type of rfc822 field to parse
+
+;	Output:	If not found return r0 = 0.  If found r6 updated
+
+chkrfc:	movzbw	(r1)+,r2			;get the size of this field
+	movw	r2,r8				;save the size
+	tstb	r2				;any more fields to check?
+	beql	40$				;end of fields (not a receiver)
+	matchc	r2,(r1),r2,(r6)			;check for 822 receiver field
+	bneq	chkrfc				;not found check next field
+
+;	Success pass the header and white space and point to the username
+
+	subw3	r8,r7,r2			;compute the size
+20$:	cmpb	(r3),#9				;eat leading tabs and spaces
+	beql	30$				;is there a tab?
+	cmpb	(r3),#32			;or a space
+	bneq	35$				;if not continue.. if so trash 
+30$:	movb	(r3)+,r10			;trash this character (tab,sp)
+	decw	r2				;bump the line count down
+	jmp	20$				;check for another tab or space
+35$:	movl	r2,r7				;update the size and pointer
+	movl	r3,r6
+	movl	#1,r0				;signal success (receiver field)
+	jmp	50$				;and return
+
+;	Here on error
+
+40$:	clrl	r0				;signal error (not a receiver field)
+50$:	rsb
+
+
+.page
+;	Send the undeliverable mail message and the error to the postman.
+
+postman:pushr	#^m<r1>				;save the error pointer
+	$disconnect rab = smtprab		;start at the top of the file
+	bsbw	errchk				;return on error
+	$connect rab = smtprab
+	bsbw	errchk				;return on error
+	$create	fab = quefab			;create a queued_mail file
+	bsbw	errchk				;return on error
+	$connect rab = querab			;connect so we can do i/o
+	bsbw	errchk				;return on error
+
+;[W2]	Try matching the rscs id to an id in mailing lists.txt
+
+	movzwl	mynam,r7			;size
+	moval	mynam+2,r6			;pointer	
+	matchc	#1,#37,mynam,mynam+2		;use only the username
+	bneq	10$				
+	jmp	15$
+10$:	matchc	#1,#64,mynam,mynam+2		;use only the username
+	bneq	20$				
+15$:	incw	r2				;account for the seperator
+	subw3	r2,mynam,r7			;adjust the size
+20$:	movw	r7,mbxbuf
+	movc5	r7,(r6),#0,#mbxbufsz,mbxbuf+2
+	bsbw	mailbox				;try for a match
+	cmpb	#ss$_abort,r0			;error send to postmaster
+	beql	30$
+	popr	#^m<r1>				;trash the error pointer
+	pushr	#^m<r6,r7>
+	bsbw	getsndr				;send from postmaster
+	popr	#^m<r6,r7>
+	movb	#1,f.del			;deliver it as mail
+	bsbw	whdr				;write a header
+	movzbw	w4p,r8				;[W4] write to the log
+	movc3	r8,w4p+1,mbuf			;[W4] the postman notice
+	movc3	r7,(r6),(r3)			;[W4] add the recpients name
+	addw2	r8,r7				;[W4] and size
+	bsbw	w4copy				;[W4] do it
+	jmp	90$				;and add the data
+
+;[W2] end patch
+
+;	Set up new recpient and originator fields for postmaster.
+
+30$:	bsbw	getsndr				;get postmasters address
+	bsbw	getrcpt				;get the recpeints address
+
+;	Now write the mail headers.
+
+	movb	#1,f.del			;deliver it as mail
+	bsbw	whdr				;write a header
+	movzbw	w4p,r8				;[W4] write to the log
+	movc3	r8,w4p+1,mbuf			;[W4] the postman notice
+	movc3	r7,(r6),(r3)			;[W4] add the recpients name
+	addw2	r8,r7				;[W4] and size
+	bsbw	w4copy				;[W4] do it
+
+;	Create new RFC822 headers.
+
+	movzbw	rfcerr5,querab+rab$w_rsz 	;To: size
+	movc3	r1,rfcerr5+1,mbuf		;save the text
+	$put	rab= querab
+	movzbw	rfcerr6,querab+rab$w_rsz 	;From: size
+	movc3	r1,rfcerr6+1,mbuf		;save the text
+	$put	rab= querab
+	movzbw	rfcerr7,querab+rab$w_rsz 	;Subject: size
+	movc3	r1,rfcerr7+1,mbuf		;save the text
+	$put	rab= querab
+	clrw	querab+rab$w_rsz 
+	$put	rab= querab
+
+;	Write out the error then the log file.
+
+	popr	#^m<r1>				;get the error pointer
+	movzbw	(r1)+,querab+rab$w_rsz 		;get the error message size
+	movc3	querab+rab$w_rsz,(r1),mbuf	;get the error message
+
+;	Add the rscs id to the message
+
+	movzbw	rfcerr3,r1			;size
+	addw2	r1,querab+rab$w_rsz 		;save it
+	movc3	r1,rfcerr3+1,(r3)		;save the text
+	addw2	mynam,querab+rab$w_rsz 		;size of the name
+	movc3	mynam,mynam+2,(r3)		;save the name
+	$put	rab= querab
+
+90$:	$get	rab=smtprab			;read a line from the log file 
+	blbc	r0,100$				;any errors?
+	movw	smtprab+rab$w_rsz,querab+rab$w_rsz ;get the size: ignore errors
+	$put	rab= querab
+	jmp	90$				;get the next line
+
+;	Close the files.
+
+100$:	$disconnect rab=querab			;disconnect from the record stream
+	bsbw	errchk				;return on error
+	$close	fab=quefab			;now close the input file
+	bsbw	errchk				;return on error
+	$disconnect rab=smtprab			;disconnect from the record stream
+	bsbw	errchk				;return on error
+	$close	fab=smtpfab			;now close the input file
+	bsbw	errchk				;return on error
+	$erase fab = smtpfab			;delete the log file
+	rsb
+
+
+.page
+getrcpt:moval	revbuf,r6			;point to the address
+	movzbw	(r6)+,r7			;get the size
+	matchc	#1,#64,r7,(r6)			;use only my local name
+	subl3	r6,r3,r7			;compute size
+	decl	r7				;skip the "@"
+	matchc	#1,#37,r7,(r6)			;convert the % to an @
+	decl 	r3				;back up to the %
+	movb	#64,(r3)			;replace it
+	rsb
+
+
+
+
+
+.page
+;	Return this mail message from the postmaster.
+
+;	First get my local host name.
+
+getsndr:$open	fab = hofab			;open the file
+	bsbw	errchk				;[W1] return on error
+	$connect rab = horab			;connect to record stream
+	bsbw	errchk				;[W1] return on error
+
+;	The first record must be my hostname.
+
+	$get 	rab = horab			;get the local host info
+	bsbw	errchk				;[W1] return on error
+	$disconnect rab = horab			;break the record stream
+	bsbw	errchk				;[W1] return on error
+	$close	fab = hofab			;close the file
+	bsbw	errchk				;[W1] return on error
+
+;	Store userid%local_host.local_domain
+
+	moval	sysnam,r1			;point to postmaster
+	movzbw	(r1)+,r2			;size of postmaster
+	movb	r2,revbuf			;store the size
+	movc3	r2,(r1),revbuf+1		;store the name
+	movb	#37,(r3)+			;a seperator
+	incb	revbuf				;size of seperator
+	pushr	#^m<r3>				;save pointer
+	moval	mbuf,r6				;point to start of the record
+	matchc	#1,#58,horab+rab$w_rsz,(r6)	;find end of my local host name
+	subl3	r6,r3,r1			;compute hostname size
+	decl	r1				;don't count the ":"
+	popr	#^m<r3>				;get my pointer back
+	addb2	r1,revbuf			;add my hostname size
+	movc3	r1,(r6),(r3)			;add my hostname
+	movb	#46,(r3)+			;add a seperator "."
+	incb	revbuf				;account for the "."
+	pushr	#^m<r3>				;save pointer
+
+;	Get to my domain name
+
+	movl	#7,r7				;starts after 6th ":"
+	movzwl	horab+rab$w_rsz,r2		;size of record
+	moval	mbuf,r3				;pointer to record
+10$:	matchc	#1,#58,r2,(r3)			;find start of my domain name
+	sobgtr	r7,10$				;loop to domain name		
+	decl	r2				;don't count the ending ":"
+	movl	r3,r1				;shift the domain pointer
+	popr	#^m<r3>				;get my pointer back
+	addb2	r2,revbuf			;add the domain size
+	movc3	r2,(r1),(r3)			;add the domain
+	pushr	#^m<r3>				;save the pointer
+	
+;	Get my name as known on bitnet
+
+	moval	ident,r1			;get the indenification keyword
+	movzbw	(r1)+,r6			;size of the keyword
+	movc3	r6,(r1),mbuf			;save the keyword	
+	moval	bitnet,r1			;known domain
+	movzbw	(r1)+,r2			;size of the domain
+	addw2	r2,r6				;save the domain size
+	movc3	r2,(r1),(r3)			;save the domain	
+
+;	Search the domains.txt file. (for the ident string)
+
+	movl	domst,r10			;get the start of the section
+	matchc	r6,mbuf,domsz,(r10)		;search the section
+	addl3	#1,r3,r6			;skip the space and save the host
+	matchc	#1,#58,#maxdom,(r6)		;find the end ":"
+	subl3	r6,r3,r7			;compute the length
+	decl	r7				;don't count the ":"
+	popr	#^m<r3>				;get my pointer
+	movb	#64,(r3)+			;seperator
+	incb	revbuf				;account for the seperator "@"
+	movc3	r7,(r6),(r3)			;add my bitnet id
+	addb2	r7,revbuf			;add the size	
+	rsb	
+
+.page
+
+;	Get a mail header from the file.
+;	[W3] Unwrap it if necessary.
+;	Output:	r6 points to buffer
+;		r7 size of buffer
+;		r0 = 0 if error
+;		r0 = 1 if success
+
+gethdr:	pushr	#^m<r1,r2,r3,r4,r5,r8>
+	$get	rab=smtprab			;read a line from the log file 
+	blbs	r0,10$				;any errors?
+	clrl	r0				;error signal it
+	jmp	90$				;send it
+
+
+10$:	bsbw	tstwisvcm			;check for a wisconsin blank line
+	tstw	r0
+	bneq	15$
+	jmp	90$				;send it
+	
+
+;	Save pointer to this record
+
+15$:	moval	smtprab,r0			;point to the rab block
+	movl	rab$w_rfa(r0),rabrfa1		;save the three word address
+	movw	rab$w_rfa4(r0),rabrfa1+4
+
+;	Save the record in a temp buffer
+
+	movzwl	smtprab+rab$w_rsz,r8		;save the size
+	movc3	smtprab+rab$w_rsz,mbuf,buff	;save the buffer
+
+;	See if the next line is a continuation of this line
+
+20$:	$get	rab=smtprab			;read a line from the log file 
+	blbs	r0,25$				;if success add see if we add it
+	jmp	80$
+
+;	Save pointer to this record
+
+25$:	moval	smtprab,r0			;point to the rab block
+	movl	rab$w_rfa(r0),rabrfa1		;save the three word address
+	movw	rab$w_rfa4(r0),rabrfa1+4
+
+	bsbw	tstwisvcm			;check for a wisconsin blank line
+	tstw	r0
+	beql	28$
+
+;	White space means its a continuation.
+
+	cmpb	#9,mbuf				;is it a tab?
+	beql	70$
+	cmpb	#32,mbuf			;is it a space?
+	beql	70$
+
+;	If here not a line continuation.  So replace old pointer
+
+28$:	movb	smtprab+rab$b_rac,rabrac	;save the original rac
+	movb	#rab$c_rfa,smtprab+rab$b_rac	;set it for random access
+
+;	Point to the control record
+
+	moval	smtprab,r0			;point to the rab block
+	movl	rabrfa1,rab$w_rfa(r0)		;replace the three word address
+	movw	rabrfa1+4,rab$w_rfa4(r0)	;with the control record address
+	$find	rab = smtprab			;point to the record
+	blbs	r0,30$
+	clrl	r0				;signal error
+	jmp	90$				;return
+30$:	movb	rabrac,smtprab+rab$b_rac	;set it for original access mode
+	jmp	80$				;and return
+
+;	Line continuation add to the end of temp buffer
+
+70$:	moval	mbuf,r6
+	movzwl	smtprab+rab$w_rsz,r7		;make it long
+	bsbw	eatwht				;remove leading white space
+	moval	buff,r1				;point to start of the buffer
+	addl2	r8,r1				;point to the end
+	movc3	r7,(r6),(r1)			;tack it on the end
+	addl2	r7,r8
+	jmp	20$				;try the next line
+	
+
+;	Put the buffer in its rightful place
+
+80$:	movc3	r8,buff,mbuf			;replace the buffer
+	moval	mbuf,r6				;point to the buffer
+	movzwl	r8,r7				;get the size of the buffer
+	movl	#1,r0				;success signal it
+90$:	popr	#^m<r1,r2,r3,r4,r5,r8>
+	rsb
+
+.page
+tstwisvcm:
+	tstw	smtprab+rab$w_rsz		;are we past the headers?
+	beql	10$				;if not continue
+	matchc	wiscsz,wiscblk,wiscsz,mbuf	;test for a wiscvm blank line
+	bneq	20$				;not blank continue
+	cmpw	wiscsz,smtprab+rab$w_rsz	;must be exact
+	bneq	20$
+10$:	clrl	r0				;error signal it
+	rsb
+20$:	movb	#1,r0
+	rsb
+
+
+
+.page
+.subtitle Logging
+
+;[W4]	Special routines to write log file entries.
+
+;Write a note indicating the following message was a return
+
+W4Retmsg:
+	pushr	#^m<r1,r2,r3,r4,r5,r6,r7,r8,r9>
+	moval	w4r,r1				;get return note
+	movzbw	(r1)+,bsmtprab+rab$w_rsz	;message size
+	movc3	bsmtprab+rab$w_rsz,(r1),mbuf	;Store the message
+	$put	rab = bsmtprab			;output the text
+	popr	#^m<r1,r2,r3,r4,r5,r6,r7,r8,r9>
+	rsb
+
+
+;Copy a from/to line into log file
+
+W4Copy:	pushr	#^m<r1,r2,r3,r4,r5,r6,r7,r8,r9>
+	movw	r7,bsmtprab+rab$w_rsz 		;move size
+	$put	rab = bsmtprab			;output the text
+	popr	#^m<r1,r2,r3,r4,r5,r6,r7,r8,r9>
+	rsb
+
+
+;Put a timestamp in the log file
+
+W4Time:	pushr	#^m<r1,r2,r3,r4,r5,r6,r7,r8,r9>
+    	clrw	bsmtprab+rab$w_rsz	
+	$put	rab = bsmtprab			;blank line
+	moval	w4t,r1				;get time message
+ 	movzbw	(r1)+,bsmtprab+rab$w_rsz	;message size
+	movc3	bsmtprab+rab$w_rsz,(r1),mbuf	;Store the message
+	$asctim_s timbuf = dtime		;get the current time
+	movc3	dtime,time,(r3)			;save the time
+    	addw2	dtime,bsmtprab+rab$w_rsz	
+	$put	rab = bsmtprab			;output the text
+	popr	#^m<r1,r2,r3,r4,r5,r6,r7,r8,r9>
+	rsb
+
+
+
+.page
+.psect data,noexe,wrt
+
+$namdef						;Define the name block
+$ssdef						;Define system status values
+$fibdef						;Define the file information block
+$iodef						;Define the output information
+$rmsdef						;Define the rms fields
+
+	;	Version information
+
+vmajor::.ascii	/1/				;major version 1
+	.byte	46
+vminor::.ascii	/1/				;edit 1
+vend	==	.-vmajor
+
+;	Start of wisconsin blank line
+
+wiscsz:	.word	5
+wiscblk:.ascii	/     /
+
+;	End of wisconsin blank line
+
+
+;[W1]	Start of RFC 822 error messages.
+
+rfcerr1:.ascic	/? File not BSMTP format and unable to find valid RFC 822 Receiver Header/
+rfcerr2:.ascic	/? File not BSMTP format and unknown host or domain in RFC 822 Receiver Header/
+rfcerr3:.ascic	/ for rscs id /
+rfcerr4:.ascic	/****	Text of the unprocessed message follows.	****/
+rfcerr5:.ascic	/To: Postmaster/
+rfcerr6:.ascic	/From: Postmaster/
+rfcerr7:.ascic	/Subject: Delivery Problem/
+
+;[W1]	End of RFC 822 error messages.
+;[W3]	Random access addressing
+
+rabrac:	.blkb	1				;record access
+rabrfa1:.blkw	3				;record address pointer
+
+;[W3]	End of random access addressing
+
+bufadd:	.long	512
+	.address buff
+buff:	.blkb	512				;input buffer = 1 disk page 
+
+bufout:	.long	512
+	.address outbuf
+outbuf:	.blkb	512				;input buffer = 1 disk page 
+
+tbled:	.long	256
+	.address tbladd
+tbladd:	.blkb	256
+oldtbl:	.address lib$ab_ebc_asc_rev
+filld:	.ascid	/!/
+
+blksiz == 512					;size of a disk block
+
+f.verb:	.blkb	1				;verbose flag
+
+errbuf:	.blkb	blksiz				;error buffer
+errptr:	.blkl	1				;error buffer pointer
+
+
+sndr:	.blkb	blksiz				
+mynod:	.blkb	blksiz
+mynam:	.blkb	blksiz
+
+bitnet:	.ascic	/BITNET/
+
+erfmt:	.ascic	/A BSMTP format error was detected in processing the file.  /
+ercla:	.ascic	/The file sent was not class M.  /
+ernam:	.ascic	/The file sent was not addressed to mailer.  /
+erhst:	.ascic	/The file was not addressed to this node.  /
+
+;	[W4] log messages
+
+W4r:	.ascic	/% This message was returned to sender./
+W4p:	.ascic	/% This message was forwarded to /
+W4t:	.ascic	/* Message processed at /
+W4fid:	.ascic	/From rscs id: 	/
+W4tid:	.ascic	/To rscs id:	/
+
+;	[W4] End of log messages
+
+.page
+;	Supported SMTP command table.  The table structure is as follows::
+;	The first byte of the table contains the number of commands.
+;	The following lines contain an ascii counted string of a command (up case)
+;	Following each command is a execution routine address for that cmd.
+
+cmdtbl::.byte	16				;13 cmds supported/3 unsupported
+	.ascic	/HELO/				;Hello cmd
+	.address rhelo
+	.ascic	/MAIL/				;Mail cmd
+	.address rmail
+	.ascic	/RCPT/				;Receipt cmd
+	.address rrcpt
+	.ascic	/DATA/				;Data cmd
+	.address rdata
+	.ascic	/RSET/				;Reset cmd
+	.address rrset
+	.ascic	/HELP/				;Help cmd
+	.address rhelp
+	.ascic	/NOOP/				;Noop cmd 
+	.address rnoop
+	.ascic	/QUIT/				;Quit cmd
+	.address rquit
+	.ascic	/SEND/				;Send cmd
+	.address rsend				
+	.ascic	/SOML/				;Send or Mail cmd
+	.address rsoml				
+	.ascic	/SAML/				;Send and Mail cmd
+	.address rsaml				
+	.ascic	/VERB/				;Verb cmd
+	.address rverb				
+	.ascic	/TICK/				;Ticket cmd
+	.address rtick				
+
+;	This ends the currently supported commands.  Smtp commands not
+;	supported in this version include::
+
+	.ascic	/EXPN/				;Expand list cmd
+	.address unsup				
+	.ascic	/VRFY/				;Verify user cmd
+	.address unsup				
+	.ascic	/TURN/				;Exchange send/receive roles
+	.address unsup				
+
+
+;	Offsets/size in the tag queue element (1st record of rscs file)
+
+orgloc	=	8				;starting location (node)
+orglocs	=	8
+nxtloc	=	16				;next location
+nxtlocs	=	8
+orgcpu	=	32				;starting machine (user)
+orgcpus	=	8
+class	=	47				;file class
+classs	=	1
+fname	=	56				;file name
+fnames	=	12
+ftype	=	68				;file type
+ftypes	=	12
+destnod	=	88				;destination node
+destnods=	8
+destusr	=	96				;destination user
+destusrs=	8
+
+
+.page
+.psect	datfil0	pic,usr,con,rel,lcl,noshr,noexe,rd,wrt
+;
+
+hofab:	$fab	fna = honam,-			;address of the file name
+		fns = honamsz,-			;size of the file name
+		fac = get,-			;read the file
+		rfm = var,-			;variable length records
+		rat = cr,-			;use crlf
+		mrs = page			;maximum record one page
+horab:	$rab	fab = hofab,-			;address of the fab
+		ubf = mbuf,-			;buffer
+		usz = page			;buffer size
+
+
+.page
+.psect datfil1, noexe,wrt,pic,noshr
+
+rscfab:	$fab	fop = nam,-
+		nam = namrsc,-			;pointer to the name block
+		fna = rscnam,-			;parse the wild card dir
+		fns = rscnamsz,-		;the size of the wild card dir
+		fac = get,-			;read access
+		mrs = blksiz,-			;maximum record size
+		rat = cr,-			;use crlf
+		rfm = var			;variable length records
+rscrab:	$rab	bkt = 0,-			;start at the begining of file
+		fab = rscfab,-			;input file info
+		ubf = buff,-			;input buffer address
+		usz = blksiz			;buffer size = maxpkt size
+namrsc:	$nam	rsa = rsc_rstr,-		;result buffer address
+		rss = nam$c_maxrss,-		;result buffer size
+		esa = rsc_estr,-		;expanded buffer address
+		ess = nam$c_maxrss		;expanded buffer size
+
+
+bsmtpfab:$fab	fna = bsmtpnam,-		;address of the file name
+		fns = bsmtpnamsz,-		;size of the file name
+		fac = put,-			;write to the file
+		rfm = var,-			;variable length records
+		rat = cr,-			;use crlf
+		mrs = page,-			;maximum record one page
+		fop = cif			;create nonexisting file
+bsmtprab:$rab	fab = bsmtpfab,-		;address of the fab
+		rop = eof,-			;append to the log
+		rbf = mbuf			;address of the output buffer
+
+rsc_estr:.blkb	nam$c_maxrss			;expanded string buffer
+rsc_rstr:.blkb	nam$c_maxrss			;result string buffer
+
+rscnam:	.ascii	/dua0:<jan0.sys>wesleyan.rsc.*/
+rscnamsz	=.-rscnam
+honam:	.ascii	/tcp$prod:hosts.txt/
+honamsz		= .-honam
+bsmtpnam:.ascii /sys$mailq:bsmtpfork.log/
+bsmtpnamsz	= .-bsmtpnam
+
+.end bsmtpfork
+

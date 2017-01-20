@@ -1,0 +1,401 @@
+; GRIPE parses a topic name, and calls MM using RSCAN%, to mail to
+; BUG-<topic> with the subject TOPIC [GRIPE, TTYnn].  The list of topics
+; is built from the system mailing list file.  If invoked as SUGGEST
+; it will put "Suggestion" in the subject line, and mail to the same list.
+
+	TITLE GRIPE
+	SEARCH MONSYM,MACSYM
+	.TEXT "GRIPE/SAVE"
+	.TEXT "/NOINITIAL"	;Suppress loading of JOBDAT
+	ASUPPRESS
+
+A=:1				;Scratch registers
+B=:2
+C=:3
+D=:4
+
+GRIPTR=:7			;Pointer to gripe topic keyword
+GRIPNM=:10			;Pointer to subject line
+
+P=:17				;Main stack pointer
+
+DEFINE ERNOP <ERJMP .+1>
+
+; Constants and data for system mailing-list file
+; These must match the definitions in MMAILBOX!
+
+	BINPAG==100		;Where <SYSTEM>MAILING.LISTS-BIN mapped
+	FREPAG==200		;Where to start making strings
+BINADR=BINPAG*1000
+BINFID=BINADR			;Should contain SIXBIT /MMLBX/
+WRTTIM=BINFID+1			;Time of last write on text file
+HSHMOD=WRTTIM+1			;Hash modulus
+HSHTAB=HSHMOD+1			;The hash table itself
+HSHEND=BINADR+111777		;End of hash table
+
+; Impure data
+
+	PDLEN==10		;Length of the stack
+PDL:	BLOCK PDLEN		;The stack itself
+
+RBUF:	BLOCK 40		;RSCAN buffer for mail program
+
+NPAGES:	0			;Number of pages in MAILING-LISTS.BIN
+BINJFN:	0			;Place to save JFN on bin file
+FREPTR:	0			;Address of next word in string space
+
+	BUFLEN==20		;Length of main command buffer
+CSBUF:	BLOCK BUFLEN		;Command buffer
+ATMBF:	BLOCK BUFLEN		;Atom buffer
+
+CSB:	0			;COMND state block for gripe topics
+	.PRIIN,,.PRIOU		;Command JFNs
+	0			;Prompt - filled in later
+	POINT 7,CSBUF		;Command buffer
+	POINT 7,CSBUF		;Next input
+	BUFLEN*5		;Space left in buffer
+	0			;Unparsed input count
+	POINT 7,ATMBF		;Atom buffer pointer
+	BUFLEN*5		;Atom buffer size
+
+; COMND stuff for gripe topic
+; These topics will be filled in from the ones which appear
+; as Bug-TOPIC in MMAILBOX's forwarding file.
+
+	MAXG==200		;Maximum expected number of topics
+GRIPTB:	0,,MAXG			;No keys now, but expandable to MAXG
+	BLOCK MAXG		;Provide space for the table
+
+PNTAB:	NPNAM,,NPNAM		;Table of program names and strings for them
+	[ASCIZ/GRIPE/],,[ASCIZ/ [Gripe/]
+	[ASCIZ/SUGGEST/],,[ASCIZ/ [Suggestion/]
+NPNAM==.-PNTAB-1
+
+START:	RESET%			;Initialize the world
+	MOVE P,[IOWD PDLEN,PDL]	;Build a stack
+	CALL BLDTAB		;Build the table of gripe topics
+	CALL GETSUB		;Get the gripe topic.
+	CALL MAKHDR		;Make the RSCAN buffer to pass on to MM
+	TMSG <
+Enter your gripe, comment, or suggestion.
+>
+	JRST SNDMAI		;Send this mail by chaining to MM
+
+; Build the table of possible topics
+
+; Table of possible mailing-list binfile names
+; Luckily XMAILBOX format is the same as MMAILBOX format.
+BINFNS:	[ASCIZ/MAIL:MAILING.LISTS-BIN/]
+	[ASCIZ/SYSTEM:MAILING.LISTS-BIN/]
+	[ASCIZ/MAIL:MAILING-LISTS.BIN/]
+NBINFN==.-BINFNS
+
+BLDTAB:	MOVEI A,FREPAG*1000	;Get first free string word
+	MOVEM A,FREPTR		;Save it
+	MOVEI A,MAXG		;Get first word for gripe table
+	MOVEM A,GRIPTB		;Save it
+
+	MOVSI C,-NBINFN		;Set up AOBJN pointer over binfile names
+	DO.
+	  MOVX A,GJ%SHT!GJ%OLD	;Old file, short form JFN
+	  HRRO B,BINFNS(C)	;With the string at that table position
+	  GTJFN%		;Get a JFN on the binfile
+	  IFNSK.
+	    AOBJN C,TOP.	;Failed, try for another
+	    JRST NOBIN		;No more, make up small table
+	  ENDIF.
+	ENDDO.
+
+	MOVEM A,BINJFN		;Save the JFN
+	MOVX B,OF%RD		;Read access
+	OPENF%			;Open the file
+	 ERJMP NOBIN
+	SIZEF%			;Get the size (number of pages in C)
+	 ERJMP NOBIN
+	MOVEM C,NPAGES		;Save it for unmap
+	HRLZS A			;Move JFN to left half (file page in right)
+	MOVE B,[.FHSLF,,BINPAG]	;Process and process page in B
+	TXO C,PM%CNT!PM%RD	;Multiple page map, read access
+	PMAP%			;Map it in
+	 ERJMP NOBIN
+	MOVE A,BINFID		;Get file ID
+	CAMN A,[SIXBIT/MMLBX/]	;Is it MMAILBOX format?
+	IFSKP.
+	  TMSG <?Unknown format for binfile -- contact a wizard>
+	  JRST UNMAP		;Unmap binfile and go on without it
+	ENDIF.
+
+	MOVE D,[-<HSHEND-HSHTAB>,,HSHTAB] ;Make AOBJN pointer over hash table
+	DO.
+	  HRRZ B,(D)		;Get value at this hash
+	  IFN. B		;Make sure there is something there
+	    MOVE A,(B)		;Get first word of string
+	    TLZ A,201004	;Capitalize first three letters
+	    CAML A,[ASCII/BUG-/]  ;Is it in range
+	     CAML A,[ASCII/BUG./] ;to be a BUG-FOO name?
+	  ANSKP.
+	    HRLI B,(POINT 7,,27) ;Turn into a byte pointer
+	    HRRO A,FREPTR	;Get pointer to free string space
+	    CALL CPYSTR		;Copy it
+	    IBP A		;Make space for null
+	    MOVEI C,1(A)	;Save updated address
+	    HRL B,FREPTR	;Get table entry (string,,0)
+	    MOVEM C,FREPTR	;Save new string space pointer
+	    CALL ADDKEY		;Add key to topic table
+	  ENDIF.
+	  AOBJN D,TOP.		;If more, go back and do the next
+	ENDDO.
+
+	MOVEI A,GRIPTB		;Get address of table
+	HRROI B,[ASCIZ/Random-Program/]
+	TBLUK%			;Look up "Bug-Random-Program"
+	IFNJE.
+	  TXNN B,TL%EXM		;Was an exact match found?
+	ANSKP.
+	  MOVE B,A		;Move address into B
+	  MOVEI A,GRIPTB	;With table again
+	  TBDEL%		;Remove that keyword
+	   ERNOP
+	ENDIF.
+UNMAP:	SETO A,			;Unmapping
+	MOVE B,[.FHSLF,,BINPAG]	;From binfile page of our own fork
+	MOVE C,NPAGES		;Get number of pages to unmap
+	TXO C,PM%CNT		;Multiple-page unmap
+	PMAP%			;Do it
+	 ERNOP
+CLSBIN:	MOVE A,BINJFN		;Get JFN again
+	CLOSF%			;Close and release it
+	 ERNOP
+	HRLZI B,[ASCIZ/Other/]	;Always have "Bug-Other"
+				;Fall through to add it in
+ADDKEY:	MOVEI A,GRIPTB		;Get address of topic table
+	TBADD%			;Add it to the table
+	 IFNJE. <RET>
+	MOVX A,.FHSLF		;TBADD failed.  On ourself
+	GETER%			;Get error condition
+	 ERCAL ERROR
+	HRRZS B			;Flush fork handle
+	CAIN B,TADDX2		;Is the problem a duplicate entry?
+	 RET			;If so, just ignore the error
+	CAIE B,TADDX1		;Is it table full?
+	 CALL ERROR		;No, die horribly
+	TMSG <?Topic table full -- contact a wizard>
+	SETZ D,			;Make AOBJN fail next time
+	RET
+
+
+; Here when there was no mailing list file or we found an error in it
+
+NOBIN:	TMSG <?Couldn't find mailing-list binfile -- contact a wizard>
+	JRST CLSBIN
+
+; Get the gripe subject from the terminal
+; returns +1/always
+;    GRIPTR/ pointer to gripe-subject table
+;    table entry is of form:  addr(subject name),,addr(file name)
+
+GETSUB:	HRROI GRIPNM,[ASCIZ/ [Gripe/] ;Default topic.
+	MOVX A,.RSINI
+	RSCAN%			;Set up to read JCL
+	IFNJE.
+	ANDN. A			;Only read JCL if there are chars in buffer
+	  HRROI A,[ASCIZ//]	;Get null prompt
+	  CALL CMDINI		;Initialize command parsing
+	  MOVEI B,[FLDDB. .CMKEY,,PNTAB]
+	  CALL .COMND		;Parse table of possible program names
+	ANSKP.
+	  HRRO GRIPNM,(B)	;Yes, get string for topic
+	  MOVEI B,[FLDDB. .CMKEY,,GRIPTB]
+	  CALL .COMND		;Parse subject
+	ANSKP.
+	  MOVE GRIPTR,B		;Yes, save subject
+	  MOVEI B,[FLDDB. .CMCFM]
+	  CALL CONFRM		;Finish parse
+	   RET			;All done
+	ENDIF.
+
+	DO.
+	  HRROI A,[ASCIZ//]	;Point to an empty string
+	  RSCAN%		;Clear the RSCAN buffer
+	   ERNOP
+	  TMSG <
+Please enter the topic of your suggestion. (type ? for a list of choices)
+
+>
+	  HRROI A,[ASCIZ/Topic:  /] ;Point to prompt
+	  CALL CMDINI		;Initialize command parse
+	  MOVEI B,[FLDDB. .CMKEY,,GRIPTB,<
+(Just press the RETURN key if none of the topics seems suitable)
+>,OTHER]
+	  CALL .COMND		;Parse a topic
+	  IFSKP.
+	    MOVE GRIPTR,B	;Yes, save the pointer
+	    MOVEI B,[FLDDB. .CMCFM]
+	    CALL CONFRM		;Finish command parse
+	     RET		;All done
+	  ENDIF.
+	  TMSG <
+? No topic by that name; type a "?" for a list of topics,
+or just type RETURN if no topic is suitable.
+>				;Complain at user
+	  LOOP.			;and go re-ask question
+	ENDDO.
+
+; COMND jsys subroutines
+
+; Initialize command parse
+; Call with A/prompt string pointer
+
+CMDINI:	POP P,CSB+.CMFLG	;Save reparse address
+	MOVEM A,CSB+.CMRTY	;And prompt string
+	MOVEI B,[FLDDB. .CMINI]
+	CALL .COMND		;Initialize command parser
+	 CALL ERROR		;Can't get a misparse
+	JRST @CSB+.CMFLG	;Now go back and parse it
+
+
+; Here to finish command parse
+; Returns +1/success, +2/failure (note strange return convention)
+
+CONFRM:	MOVEI B,[FLDDB. .CMCFM]	;FDB to confirm
+	CALL .COMND		;Parse it
+	 RETSKP			;Not parsed, return +2
+	RET
+
+
+; Here to parse a random FDB
+; returns +1/misparse, +2/success
+
+.COMND:	MOVEI A,CSB		;Get CSB back
+	COMND%			;Parse the FDB
+	TXNE A,CM%NOP		;Parsed?
+	 RET			;No, fail
+	RETSKP
+
+; Build a mail command in rescan buffer
+
+MAKHDR:	GJINF%			;Tty # in D, job # in C, user # in A
+	PUSH P,D		;Save terminal #
+	HRROI A,RBUF
+	HRROI B,[ASCIZ/MAIL Bug-/]
+	CALL CPYSTR		;Put in first part
+	HLRO B,(GRIPTR)		;Get -1,,addr of topic data
+	CALL CPYSTR		;Put topic name after "BUG-"
+	HRROI B,[ASCIZ /
+/]
+	CALL CPYSTR		;Put in a new line
+	HLRO B,(GRIPTR)		;Point to topic name again
+	CALL CPYSTR		;Add it in as subject
+	MOVE B,GRIPNM		;" [Gripe" or " [Suggestion"
+	CALL CPYSTR
+	HRROI B,[ASCIZ/, TTY/]
+	CALL CPYSTR		;", TTY"
+	POP P,B			;Terminal # to B
+	MOVEI C,10		;Octal
+	NOUT%			;Add in tty number
+	 ERNOP
+	HRROI B,[ASCIZ/:]
+/]				;Close bracket, ^R so subject line is displayed
+	CALL CPYSTR
+	IDPB C,A		;Tie off with null
+	HRROI A,RBUF
+	RSCAN%			;Set it all up as JCL for MM
+	 ERCAL ERROR
+	RET
+
+; Send mail by chaining to MM at the ordinary entry point
+
+SNDMAI:	MOVX A,GJ%SHT!GJ%OLD	;Short form GTJFN on an old file
+	HRROI B,[ASCIZ/SYS:MM.EXE/]
+	GTJFN%			;Find MM.EXE
+	 ERCAL ERROR
+	HRLI A,.FHSLF
+	MOVE D,A		;Save pointer to ourself, JFN of program
+	MOVE B,[STRTCD,,5]
+	BLT B,5+LCD-1		;Get ready to run in the ACs
+	SETO A,			;Unmapping
+	MOVE B,[.FHSLF,,1]	;From our own first page
+	MOVE C,[PM%CNT!777]	;Multiple page unmap on all pages
+	JRST 5			;Go do it in ACs
+
+STRTCD:	PHASE 5
+	PMAP%			;  5  Do the unmap
+	MOVE A,D		;  6  Into ourself with the JFN on MM
+	GET%			;  7  Load core image into this fork
+	MOVEI A,.FHSLF		; 10 a := our frk handle
+	CLZFF%			; 11 Cleanup outstanding files
+	MOVEI B,0		; 12 Start at entry vec
+	SFRKV%			; 13
+	HALTF%			; 14 ???
+	DEPHASE
+LCD==.-STRTCD
+
+; CPYSTR -- copy a string.  Terminates on 0 byte
+; call:	A/ destination byte-pointer, or -1,,addr, or JFN
+;	B/ source byte-pointer, or -1,,addr
+; ret:	+1 always, with updated string pointers in A and B, and null in C
+
+CPYSTR:	TLNE A,-1		;Is left half zero?
+	IFSKP.			;Yes, must be a JFN
+	  SETZ C,		;End on a null
+	  SOUT			;Do SOUT
+	  RET
+	ENDIF.
+	TLC A,-1		;Convert to real byte pointer if necessary
+	TLCN A,-1
+	 HRLI A,(POINT 7,0)
+	TLC B,-1		;Same for source pointer
+	TLCN B,-1
+	 HRLI B,(POINT 7,0)
+	DO.
+	  ILDB C,B		;Get byte
+	  JUMPE C,R		;If null, done
+	  IDPB C,A		;Else drop it in
+	  LOOP.			;And go back for more
+	ENDDO.
+
+; Here on a fatal (i.e. totally unexpected) jsys error
+
+ERROR:	EXCH D,(P)		;Save D register, put pushed loc in D
+	PUSH P,A		;Save the other registers
+	PUSH P,B
+	PUSH P,C
+	HRROI A,[ASCIZ/Unexpected error in GRIPE!
+Please report this by sending MAIL to BUG-GRIPE-PROGRAM.
+Error was: /]
+	ESOUT%			;Start error message
+	MOVX A,.PRIOU		;To the terminal
+	HRLOI B,.FHSLF		;With last error on our own fork
+	SETZ C,			;No limit
+	ERSTR%			;Print error string
+	 ERJMP ERRERR		;Undefined error number
+	 ERJMP ERRERR		;Other error
+	TMSG < at location >
+	MOVX A,.PRIOU		;More terminal output
+	HRRZ B,D		;Get caller's address
+	SUBI B,2		;Subtract two from this to point to JSYS
+	MOVEI C,^D8		;Radix octal
+	NOUT%			;Output location
+	 ERJMP ERRERR
+	POP P,C			;Now restore all saved registers
+	POP P,B
+	POP P,A
+	POP P,D
+
+STOP:	HALTF%			;Stop
+	HRROI A,[ASCIZ/Can't continue/]
+	ESOUT%			;Complain if continued
+	JRST STOP		;Go back and stop again
+
+ERRERR:	HRROI A,[ASCIZ/Error within an error/]
+	ESOUT%			;Error handler couldn't do it
+	JRST STOP		;So complain again and die
+
+RSKP:	AOS (P)			;We don't have macrel, so add these labels
+R:	RET
+
+; Give literals nice disassembly
+
+LIT:	LIT
+
+	END START

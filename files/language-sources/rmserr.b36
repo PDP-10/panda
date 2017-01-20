@@ -1,0 +1,1249 @@
+%TITLE 'E R R O R S   -- Error processor'
+!<BLF/REQUIRE 'RMSBLF.REQ'>
+MODULE errors (IDENT = '3.0'
+		) =
+BEGIN
+!
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+
+!++
+! FACILITY:	RMS
+!
+! ABSTRACT:
+!
+!	ERRORS contains all routines which
+!	process user or system errors.
+!
+! ENVIRONMENT:	User mode, low level
+!
+! AUTHOR: Ron Lusk , CREATION DATE: 29-Mar-83
+!
+! MODIFIED BY:
+!
+!	Ron Lusk, 1-Jun-83 : VERSION 2
+! 01	-   Make PRICHK only allow messages to be printed 
+!	    when the debugging version of RMS is compiled.
+! 410	-   REMOVRECORD has been calling DELUDR with 3
+!	    arguments for years; DELUDR only takes 2 arguments,
+!	    however, and this shows up in XRMS.EXE.  Fix
+!	    REMOVRECORD.
+!       Andy Nourse, 6-Jun-83
+! 411   -   Implement new key datatypes
+! 502   -   Put in new-style names
+! 504   -   Allow 8 or 9 bit ASCII, and (1<n<36)-bit IMAGE
+! 607	-   Use FAB bsz instead of FST when checking DTP KEY XABs. NOTE:
+!	    CHECKXAB is now called before the FST is fully updated from
+!	    the user's FAB.
+!--
+
+!
+! TABLE OF CONTENTS
+!
+!
+!	DOEOF	    -	Process EOF condition
+!	CRASH	    -	Process internal RMS-20 error
+!	PRICHK	    -	Check if message should be output
+!	FERROR	    -	Check for $OPEN/$CREATE user errors
+!	OABORT	    -	Abort $OPEN/$CREATE processing and
+!			unwind all that has been done up to
+!			the point where error was detected.
+!	CHECKXAB    -	Scan XAB chain for errors during $CREATE
+!	CLEANUP	    -	Clean up after $PUT error for indexed file
+!	REMOVRECORD -	Similar to CLEANUP, but record must be
+!			removed from secondary indices.
+!	MAPCODES    -	Map system errors to RMS error codes
+!
+!
+! INCLUDE FILES:
+!
+
+REQUIRE 'rmsreq';
+
+!
+! MACROS:
+!
+!   None.
+!
+! EQUATED SYMBOLS:
+!
+!   See RMSSYS, RMSLIB
+!
+! OWN STORAGE:
+!
+!   See RMSGLB
+!
+! EXTERNAL REFERENCES:
+!
+!   Also See RMSEXT
+!
+EXTERNAL ROUTINE Dap$EndAccess;
+
+%SBTTL 'DOEOF - Handle EOF'
+
+GLOBAL ROUTINE doeof : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine is called whenever the End-of-File is
+!	reached on a sequential or a relative file.  Its
+!	function is to unlock the current record and perform any
+!	other clean-up operations which may be necessary.
+!
+! FORMAL PARAMETERS
+!
+!	None.
+!
+! IMPLICIT INPUTS
+!
+!	?
+!
+! ROUTINE VALUE:
+!
+!	None.
+!
+! SIDE EFFECTS:
+!
+!	?
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	crp;
+
+!+
+!   Unlock the current record.
+!-
+    crp = .rst [rstdatarfa];			! Get its address
+
+    IF datalocked THEN unlock (crp);		! Unlock it, if necessary
+
+    rab [rabrsz, 0] = 0;			! Tell him he has a null record
+    rst [rstdatarfa] = 0;			! Clear our knowledge
+    usererror (er$eof)				! Give user error
+    END;					! End of DOEOF
+
+%SBTTL 'CRASH - print internal error message'
+
+GLOBAL ROUTINE crash (rname, txtadr) : exitsub NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine is called whenever an internal
+!	consistency error is detected.  Its purpose is to
+!	print out a diagnostic message and to halt
+!	processing.  No attempt is made to recover from the
+!	problem.
+!
+!	Note:
+!	    This routine fetches the return PC by "indexing"
+!	off the last argument passed to the routine.
+!
+! FORMAL PARAMETERS
+!
+!
+!	RNAME	    -	presumably the routine name [RL, Mar-83]
+!
+!	TXTADR	    -	address of an n+1 word block:
+!			first word contains error code;
+!			second through n+1 contain message text.
+!
+! IMPLICIT INPUTS
+!
+!	?
+!
+! ROUTINE VALUE:
+!
+!	None.
+!
+! SIDE EFFECTS:
+!
+!	?
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	returnadr;				! Contains the return PC
+
+!++
+!   NOTE:
+!	This routine displays the PC. If more arguments
+!	are added to it, the value of RETURNADR must be
+!	recomputed; the existing formula will not work.
+!--
+
+    IF (.bugcod NEQ .txtadr) AND 		! Is this a new message?
+	(chkflag (rmssts, stsnomessage) EQL 0)	! Should we print messages?
+    THEN
+	BEGIN					! Yes -- go ahead
+	returnadr = .(txtadr + 1);		! Fetch return PC
+	txtout (				! Print message
+	    mf$ier, 				! Internal error format
+	    .rname, 				! Routine name
+	    .returnadr<rh> - 1, 		! Address we were called from
+	    .txtadr + 1);			! Address of message text
+	END;
+
+    bugcod = .txtadr;				! Save this address
+    usrsts = ..txtadr;				! Setup error code for user
+    usrstv = .txtadr + 1;			! Pointer to text message
+    usrerr ()					! Exit to user
+    END;					! End of CRASH
+
+%SBTTL 'PRICHK - should message be output'
+
+GLOBAL ROUTINE prichk (txtadr) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	PRICHK checks if message should be output to terminal.
+!	As of v2, PRICHK will never allow messages to be typed
+!	unless RMS is compiled with debugging code.
+!
+! FORMAL PARAMETERS
+!
+!	TXTADR	-   value of USRSTV, which should
+!		    be the address of a message.
+!
+! IMPLICIT INPUTS
+!
+!	None.
+!
+! COMPLETION CODES:
+!
+!	TRUE	-   output message
+!	FALSE	-   do not output message
+!
+! SIDE EFFECTS:
+!
+!	?
+!
+!--
+
+    BEGIN
+
+%IF NOT DBUG
+%THEN
+    RETURN false;
+%ELSE
+
+    IF .usrsts NEQ er$bug THEN RETURN false;	! Message N/A unless ER$BUG
+
+!+
+!   Check to see if the current bug is the same as the last one.
+!   If so, we will just exit and not do any useful work.  If not,
+!   we will print out the message for this bug and return to the user.
+!-
+
+    IF (.bugcod EQL .txtadr) THEN RETURN false;
+
+    bugcod = .txtadr;				! Save the new value
+
+    IF (chkflag (rmssts, stsnomessage) EQL 0)	!
+    THEN
+	RETURN true
+    ELSE
+	RETURN false;
+
+%FI						! End debugging code
+    END;					! End of PRICHK
+
+%SBTTL 'FERROR - check for errors opening file'
+
+GLOBAL ROUTINE ferror =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	FERROR analyzes the user's requests to $OPEN a file
+!	and checks it for errors.  When FERROR entered, the
+!	FAB and FPT must have been initialized.  On exit,
+!	the appropriate error code will have been set in
+!	USRSTS.  In general, this routine will always exit
+!	to the caller if an error is discovered.
+!
+! FORMAL PARAMETERS
+!
+!	None.
+!
+! IMPLICIT INPUTS
+!
+!	?
+!
+! COMPLETION CODES:
+!
+!	TRUE	-   No errors found.
+!
+!	FALSE	-   Error
+!		    ASCII files:
+!			1.  FB$BLK is illegal
+!			2.  Update and deletes are not allowed
+!			3.  Only one writer of the file is allowed
+!			4.  Byte size must be 7, 8, or 9
+!
+!		    IMAGE files:
+!			1.  FB$BLK is illegal
+!			2.  Update and deletes are not allowed
+!			3.  Only one writer of the file is allowed
+
+!		    RMS files:
+!			1.  Must be DASD (disk) if relative file
+!			2.  MRS must be nonzero for relative file
+!			3.  Device must be DASD (restriction on v1)
+!
+!		    All files:
+!			1.  Unused attributes must be zero
+!			2.  Various values must be within proper range
+!			3.  Record format must agree with file organization.
+!
+!
+! SIDE EFFECTS:
+!
+!	?
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	temp;
+
+    TRACE ('FERROR');
+!+
+!   Make sure that the record format agrees with the organization.
+!-
+
+    IF ((stream) OR (sequenced)) AND 		!
+	( NOT asciifile)			!
+    THEN
+	returnstatus (er$rfm);			! ASCII/LSA must be sequential
+
+!+
+!   Check ASCII file errors.
+!-
+
+    IF asciifile                        ! Non-RMS file
+    THEN
+	BEGIN
+        SELECT .Fst [Fst$h_Rfm] OF      ! RFM determines restriction   !a504
+            SET
+            [Fab$k_Lsa]:
+        	IF .fab [Fab$v_Bsz] NEQ asciibytesize	! Check byte size
+        	THEN
+	            returnstatus (er$bsz);
+
+            [Fab$k_Stm]:
+                IF (.Fab [Fab$v_Bsz] LSS 7)
+                OR (.Fab [Fab$v_Bsz] GTR 9)
+        	THEN
+	            returnstatus (er$bsz);
+
+            [Fab$k_Udf]:
+                IF (.Fab [Fab$v_Bsz] EQL 0)        ! There must be some
+                OR (.Fab [Fab$v_Bsz] GTR %BPUNIT)  ! limits.     
+        	THEN
+	            returnstatus (er$bsz);
+
+                TES;				
+
+	IF blocked				!
+	THEN
+	    returnstatus (er$rat);		! Records must span pages
+
+!+
+!   Don't allow multiple writers to disk.
+!-
+
+	IF (((.fab [fabfac, 0] AND 		! Is he...
+	    .fab [fabshr, 0] AND 		! ...and are others...
+	    axput) NEQ 0) AND 			! ...writing the file...
+	    dasd)				! ...to a disk device?
+	THEN
+	    returnstatus (er$fac);
+
+!+
+!   If this is a sequenced file on the TTY:, it cannot
+!   be opened for both input and output.
+!-
+
+	IF sequenced AND tty AND iomode		!
+	THEN
+	    returnstatus (er$fac)
+
+	END;
+
+!+
+!   RMS file errors
+!-
+
+    IF rmsfile
+    THEN
+	BEGIN
+!+
+!   Check that the MRS field is being used correctly.
+!-
+
+	IF .fab [fabmrs, 0] EQL 0
+	THEN
+	    BEGIN
+
+	    IF relfile OR fixedlength		! MRS needed for relative, fix
+	    THEN
+		returnstatus (er$mrs)
+
+	    END;
+
+	IF NOT dasd				! Must be disk
+	THEN
+	    returnstatus (er$dev);
+
+	END;
+
+!+
+!   Check various parameters.
+!-
+
+    IF fileorg GTR orgmax			! Check organization value
+    THEN
+	returnstatus (er$org);
+
+    IF (.fab [fabbsz, 0] GTR 36) OR 		! Reasonable bytesize
+	(.fab [fabbsz, 0] EQL 0)		! Cannot be zero
+    THEN
+	returnstatus (er$bsz);			! Check byte size
+
+!+
+!   For compatibility, make sure that the unused
+!   RAT bits are not set.
+!-
+
+    IF (.fab [fabrat, 0] AND ratunused) NEQ 0	! Check undefined RAT bits
+    THEN
+	returnstatus (er$rat);
+
+    IF .fab [fab$v_rfm] GTR Fab$k_Rfm_Max       ! Check record format !m504
+    THEN
+	returnstatus (er$rfm);
+
+    IF fileaccess EQL 0				! Don't allow null FAC
+    THEN
+	returnstatus (er$fac);
+
+    RETURN true
+    END;					! End of FERROR
+
+%SBTTL 'OABORT - unwind $OPEN/$CREATE operation'
+
+GLOBAL ROUTINE oabort (errorcode) : exitsub NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	OABORT processes the aborting of $OPEN or $CREATE.
+!	It is called whenever an error is found in the $OPEN
+!	processing.  This routine performs any necessary
+!	clean-up and exits directly to the user.  This
+!	technique is used to simplify the flow of the $OPEN
+!	processor.
+!
+! FORMAL PARAMETERS
+!
+!	ERRORCODE   -	value to return in USRSTS or, if 0,
+!			code that OABORT was called from
+!			USRRET code.
+!
+! IMPLICIT INPUTS
+!
+!	OAFLAGS		-   Flags for unwinding
+!	    ABRUNLOCK	-   Unlock file
+!	    ABRCLOSE	-   Close file
+!	    ABRFST	-   Release File Status Table
+!	    ABRPLOGPAGE	-   Release free page used for prologue
+!	    ABRADB	-   Release the Area Descriptor Block
+!
+! ROUTINE VALUE:
+!
+!	None.
+!
+! SIDE EFFECTS:
+!
+!	?
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	flags,
+	temp : REF BLOCK;
+
+    TRACE ('OABORT');
+    flags = .oaflags;				! Use local to avoid
+    oaflags = 0;				!  possible recursive
+    						!  error loop.
+!+
+!   Unlock file resources if locked.
+!-
+
+    IF (.flags AND abrunlock) NEQ 0 THEN fileq (deqcall, deqdr);
+
+!+
+!   Release core for File Prologue Table.
+!   Note that this page must be unmapped before the file is closed.
+!-
+
+    IF ((.flags AND abrplogpage) NEQ 0)		!
+    THEN
+	ppage (.plogpage, 1, true);
+
+!+
+!   Close file.
+!-
+
+    IF (.flags AND abrclose) NEQ 0
+    THEN
+	BEGIN
+	abortfile (.userjfn, .fab);		! User JFN and address of FAB
+	END;
+
+!+
+!   Release core for File-Status Table.
+!-
+
+    IF ((.flags AND abrfst) NEQ 0)
+    THEN
+	BEGIN
+!+
+!   First, we must release all key descriptors for this
+!   file.  For non-indexed files, there won't be any key
+!   descriptors.  For indexed files, the only situation in
+!   which there would be a KDB chain that we will have to
+!   flush is if the user gave an XAB chain on the $OPEN and
+!   there was an error during its processing, or if the file
+!   is remote (so we need the key datatypes even if the user doesn't)
+!-
+	undokdbs ();				! Flush all KDBs
+	temp = .fst [blocklength];
+
+        IF .Fst[Fst$v_Remote]           ! If the file is remote      !a521vv
+        THEN                            ! Make sure we close the link
+            BEGIN
+            Dap$EndAccess( .fab, Dap$k_Accomp_Purge, 0);
+            IF .Fst[Fst$v_Drj] EQL 0    ! If link not held open
+            THEN
+                BEGIN
+                Fab[Fab$a_Ifi] = 0;     ! Clear IFI for sure         !a577
+                pmem (.temp, fst)       ! Return memory 
+                END;
+            END                         			     !a521^^ 
+        ELSE
+            BEGIN
+            Fab[Fab$a_Ifi] = 0;         ! Clear IFI for sure         !a577
+            pmem (.temp, fst)
+            END;
+	END;
+
+!+
+!   Release core for Area Descriptor Block.
+!-
+
+    IF ((.flags AND abradb) NEQ 0)
+    THEN
+	BEGIN
+	temp = .adb [adb$h_bln];		! Get length of FST !m502
+	pmem (.temp, adb)			! Release core
+	END;
+
+    IF .errorcode EQL 0 THEN RETURN;		! Called from USRRET
+
+    usrsts = .errorcode;			! Store error code
+    usrerr ()
+    END;					! End of OABORT
+
+%SBTTL 'CHECKXAB -- Find XAB errors'
+
+GLOBAL ROUTINE checkxab =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine scans the XAbs of the user on a
+!	$CREATE.  It checks the following things:
+!	    1)	Block-type
+!	    2)	XAB code-type (Key, Allocation, etc.)
+!	    3)	Data-type
+!	    4)	Flags
+!	    5)	Key of reference value
+!	    6)	Key position and size
+!	    7)	Index and data fill offsets
+!	    8)	Order of the XABs
+!
+! FORMAL PARAMETERS
+!
+!	None.
+!
+! IMPLICIT INPUTS
+!
+!	?
+!
+! COMPLETION CODES:
+!
+!	TRUE	-   Success
+!	FALSE	-   Error code in USRSTS
+!
+! SIDE EFFECTS:
+!
+!	?
+!
+!--
+
+    BEGIN
+
+    REGISTER
+	xabptr : REF BLOCK;			! Pointer to the user XAB
+
+    LOCAL
+	temp,
+	krfcount,				! Counter used to insure
+						!   KRFs are in order
+	totalsize,				! Accumulator
+	keybytesize,				! Byte size of the key string
+	aidcount,				! Count for sequencing AIDs
+	ksdptr : REF BLOCK;			! Key Segment Descriptor
+
+    TRACE ('CHECKXAB');
+    !
+    !   Get the start of the XAB chain
+    !
+    xabptr = .fab [fabxab, 0];			! Fetch pointer from FAB
+    !
+    !   Initialize counter of current value of the key reference
+    !
+    krfcount = 0;
+    aidcount = 1;				! Use default area to start
+!+
+!   We must first find the area XABs and check them.
+!   Then, we will scan for the key XABs later.
+!-
+
+    WHILE .xabptr NEQ 0 DO
+	BEGIN
+	usrstv = .xabptr;			! Save address of bad XAB
+	xabptr = .xabptr OR .blksec;		! Get global address
+
+	IF .xabptr [blocktype] NEQ xabcode	! Is this a XAB?
+	THEN
+	    returnstatus (er$xab);		! No
+
+	IF .xabptr [xabcod, 0] GTR maxcod	! Valid COD field?
+	THEN
+	    returnstatus (er$cod);		! No
+
+	temp = .xabptr [xabnxt, 0];		! Get next XAB address
+
+	IF (.temp NEQ 0) AND 			! XAB in regs?
+	    (.temp LEQ minuserbuff)
+	THEN
+	    returnstatus (er$nxt);		! Bad next address
+
+	IF .xabptr [xabcod, 0] EQL codarea
+	THEN
+	    BEGIN
+	    !
+	    !   Check the size of this XAB.
+	    !
+
+	    IF .xabptr [blocklength] NEQ areaxabsize	!
+	    THEN
+		returnstatus (er$bln);
+
+	    IF .xabptr [xabaid, 0] NEQ .aidcount	!
+	    THEN
+		returnstatus (er$aid);
+
+	    IF (.xabptr [xabbkz, 0] GTR maxbkz) OR 	!
+		(.xabptr [xabbkz, 0] EQL 0)	!
+	    THEN
+		returnstatus (er$bkz);		! Check bucket size
+
+	    aidcount = .aidcount + 1
+	    END;
+
+	xabptr = .xabptr [xabnxt, 0]		! Go to next XAB
+	END;
+
+!+
+!   Now, we will start all over again and search for KEY XABs.
+!-
+    xabptr = .fab [fabxab, 0];			! Get XAB chain pointer
+
+    WHILE .xabptr NEQ 0 DO
+	BEGIN
+	usrstv = .xabptr;			! Save address of bad XAB
+	xabptr = .xabptr + .blksec;		! Get global address
+
+	IF .xabptr [xabcod, 0] EQL codkey	!
+	THEN
+	    BEGIN
+!+
+!   Check the size of the XAB.
+!-
+
+	    IF .xabptr [blocklength] NEQ keyxabsize	!
+	    THEN
+		returnstatus (er$bln);
+
+!+
+!   Check the data type of this key.
+!-
+
+	    IF .xabptr [xabdtp, 0] GTR maxdtp	!
+	    THEN
+		returnstatus (er$dtp);
+
+!+
+!   Check that the key of reference values are in order.
+!-
+
+	    IF .xabptr [xabref, 0] NEQ .krfcount	!
+	    THEN
+		returnstatus (er$ref);
+
+!+
+!   Find the byte size for this key.
+!-
+	    keybytesize = .dtptable [.xabptr [xabdtp, 0], dtpbytesize];
+
+	    IF (.keybytesize NEQ .Fab [Fabbsz, 0]) !Bsize must match    !M607
+            AND (.keybytesize LSS %BPVAL)       ! unless binary data     !A411
+	    THEN
+		returnstatus (er$dtp);
+
+!+
+!   Check that the flags don't contradict.
+!-
+
+	    IF ((.xabptr [xabflg, 0] AND flgchange) NEQ 0)
+	    THEN
+		BEGIN				! Keys can change, check more
+
+		IF .krfcount EQL refprimary	! Must not be primary key
+		THEN
+		    returnstatus (er$flg)
+
+		END;
+
+!+
+!   Check the index and data area numbers.
+!-
+
+	    IF .xabptr [xabian, 0] GEQ .aidcount	! Must be known area
+	    THEN
+		returnstatus (er$ian);
+
+	    IF .xabptr [xabdan, 0] GEQ .aidcount	! Must also exist
+	    THEN
+		returnstatus (er$dan);
+
+!+
+!   Set up pointer to key segment descriptors.
+!-
+	    ksdptr = .xabptr + xabksdoffset;
+	    totalsize = 0;
+
+	    INCR i FROM 0 TO maxkeysegs - 1 DO
+		totalsize = .totalsize + .ksdptr [.i, keysiz];
+
+!+
+!   Check the length of the key.
+!-
+
+            IF  (.keybytesize LSS %BPVAL)       ! If byte-oriented data !A411
+	    AND ((.totalsize GTR maxkeysize) OR !  Range Check          !M411
+	         (.totalsize EQL 0))            !   total key size      !M411
+	    THEN
+		returnstatus (er$siz);
+
+	    krfcount = .krfcount + 1		! Bump KRF total
+	    END;
+
+!+
+!   Check that this was a valid type of XAB.
+!-
+
+	IF .xabptr [xabcod, 0] GTR maxcod	!
+	THEN
+	    returnstatus (er$cod);
+
+	IF .xabptr [blocktype] NEQ xabcode	!
+	THEN
+	    returnstatus (er$xab);
+
+!+
+!   Fetch the address of the next XAB in the chain.
+!-
+	xabptr = .xabptr [xabnxt, 0]		! Next block
+	END;
+
+!+
+!   Now, check that there are not too many key or area XABs
+!-
+    usrstv = 0;					! These errors not XAB specific
+
+    IF .krfcount GTR maxkeys + 1 THEN returnstatus (er$imx);
+
+    IF .aidcount GTR maxareas THEN returnstatus (er$imx);
+
+    IF .krfcount EQL 0 THEN returnstatus (er$npk);	! No primary key
+
+    ! No error found.
+    RETURN true;
+    END;					! End of CHECKXAB
+
+%SBTTL 'CLEANUP - Clean up after failed $PUT'
+
+GLOBAL ROUTINE cleanup (bktdesc : REF BLOCK) : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	CLEANUP cleans up some operations after a $PUT has
+!	failed.  This routine must perform the folloing
+!	functions:
+!	    1)	Unlock the index structure
+!	    2)	Release the current bucket
+!
+!	The index structure is unlocked if the appropriate
+!	bit is set in the FST flags field.  The bucket
+!	descriptor is released if it is non-null.
+!
+!	USRSTS must be set up by the caller to reflect the
+!	correct error code.
+!
+!	This routine will return or not depending on the
+!	value of OAFLAGS.
+!
+! FORMAL PARAMETERS
+!
+!	BKTDESC	-   bucket to release
+!
+! IMPLICIT INPUTS
+!
+!	?
+!
+! ROUTINE VALUE:
+!
+!	None.
+!
+! SIDE EFFECTS:
+!
+!	?
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	indexnumber;				! Number of current index
+
+    TRACE ('CLEANUP');
+!+
+!   Check if we should unlock the index.
+!-
+
+    IF indexlocked THEN unlockindex;
+
+!+
+!   Should we release the current bucket.
+!-
+
+    IF NOT nullbd (bktdesc)			!
+    THEN
+	putbkt (false, 				! No update
+	    .bktdesc);				! Bucket pointer
+
+!+
+!   Should we return to the caller or to the user?
+!-
+
+    IF .oaflags NEQ 0				!
+    THEN
+	RETURN 					!
+    ELSE
+	usrerr ();				!
+
+    END;					! End of CLEANUP
+
+%SBTTL 'REMOVRECORD - Clean up secondary indexes'
+
+GLOBAL ROUTINE removrecord (			! Clean up indexes
+    recdesc : REF BLOCK, 			! User record
+    databd : REF BLOCK				! Record's bucket
+    ) : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Routine to clean up after a $PUT for an indexed file
+!	has failed in some way during processing of the
+!	secondary indexes.  This routine differs from
+!	CLEANUP in that it is more specialized--it must
+!	delete the date record from some of the secondary
+!	indexes.
+!
+!	Specifically, this routine does the following:
+!
+!	    1)	Delete the record from all previous
+!		secondary indexes.
+!	    2)	Compress the data record from the data
+!		bucket.
+!	    3)	Unlock the index structure of the file.
+!
+!	If any problem develops during the deletion of a
+!	SIDR record pointer, then the primary data record
+!	will be marked with the DELETED and NO-COMPRESS
+!	bits.  This means that the UDR will stay around
+!	forever if any of its secondary index entries cannot
+!	be deleted properly.
+!
+!	KDB must point to the secondary index KDB which failed.
+!
+!	The error code must already be set up in USRSTS.
+!
+!	<><><><>  This routine exits directly to the user.  <><><><><>
+!
+! FORMAL PARAMETERS
+!
+!	RECDESC	-   Record descriptor packet
+!	    RFA	-   RFA of record to compress out
+!
+!	DATABD	-   Descriptor of data bucket
+!
+! IMPLICIT INPUTS
+!
+!	?
+!
+! ROUTINE VALUE:
+!
+!	None.
+!
+! SIDE EFFECTS:
+!
+!	?
+!
+!--
+
+    BEGIN
+
+    LABEL
+	flushsidr;
+
+    LABEL
+	sidrloop;				! Loop for all SIDR records
+
+    LOCAL
+	failkdbaddress,				! Address of bad KDB
+	ourbuffer : BLOCK [maxkszw],		! Use as temp buffer
+	userrecordptr : REF BLOCK,		! User data record
+	savedstatus,				! Saved status code
+	savederrorcode,				! Error code on entry
+	fixsidrflag,				! True if all SIDRs deleted
+	savedrfa,				! Remember the RFA of UDR
+	sizeofthisrcrd,				! For compressing
+	amounttomove;
+
+    REGISTER
+	tempac,
+	bktptr : REF BLOCK,			! Data bucket
+	udrptr : REF BLOCK;			! User data record
+
+    TRACE ('REMOVRECORD');
+    savederrorcode = .usrsts;			! Save the proper code
+!+
+!   Save the bad KDB address and set up some miscellaneous things.
+!-
+    failkdbaddress = .kdb;
+    userrecordptr = .rab [rabrbf, 0];
+!+
+!   Incase he specified a local section address in "RBF"...
+!-
+
+    IF .userrecordptr<lh> EQL 0			!
+    THEN
+	userrecordptr = .userrecordptr OR .blksec;
+
+    recdesc [rduserptr] = ourbuffer;		! ADDR OF KEY
+!+
+!   Loop over all KDBs and delete the record in that index.
+!-
+    kdb = .fst [fstkdb];			! Primary index
+    kdb = .kdb [kdbnxt];			! First secondary index
+
+    IF .kdb [blocktype] NEQ kdbcode THEN rmsbug (msgkdb);
+
+    fixsidrflag = true;				! Assume we succeed
+
+!++
+!   This is the loop through the indexes.
+!--
+
+sidrloop :
+    BEGIN
+
+    UNTIL .kdb EQL .failkdbaddress DO
+	BEGIN
+!+
+!   Only delete the record if it was inserted.
+!-
+
+	IF .rab [rabrsz, 0] GEQ .kdb [kdbminrsz]	!
+!				%(AND)%
+!		%(THIS IS NOT THE NULL KEY VALUE)%
+	THEN
+flushsidr :
+	    BEGIN
+!+
+!   Move the secondary key into a temporary buffer.
+!-
+	    movekey (.userrecordptr, 		! From
+		ourbuffer);			! To
+!+
+!   Set up the key size.
+!-
+	    recdesc [rdusersize] = .kdb [kdbksz];
+!+
+!   Delete record from secondary index.  If it fails, stop deleting.
+!-
+
+	    IF delsidr (.recdesc) EQL false	!
+	    THEN
+		LEAVE sidrloop WITH (fixsidrflag = false)
+
+	    END;
+
+!+
+!   Advance to next KDB.
+!-
+	kdb = .kdb [kdbnxt]
+	END;
+
+    END;
+!+
+!   Now, go back and locate the user data record.
+!-
+    kdb = .fst [fstkdb];			! Set primary key
+    recdesc [rdrecptr] = 0;			! Start at top
+    recdesc [rdrfa] = .recdesc [rdrrv];		! Search for new UDR
+!+
+!   Locate the user data record with POSRFA, which will
+!   Search for the newly inserted record by RFA, which was
+!   Just placed in RECDESC [ RDRFA ].  SDATABKT was
+!   Originally used here, but when the new record went into a
+!   Separate bucket on a bucket split, SDATABKT would do an
+!   ID search of the current bucket and the wrong UDR would
+!   Be deleted by REMOVRECORD.
+!-
+
+    IF posrfa (.recdesc, 			! Record
+	    .databd) EQL false			! Bucket
+    THEN
+	rmsbug (msgfailure);
+
+!+
+!   If we didn't find it, there is a problem, because the
+!   bucket was never unlocked.
+!-
+!+
+!   ***TAKE BEFORE IMAGE HERE***
+!-
+!+
+!   Get the address of the data record.
+!-
+    udrptr = .recdesc [rdrecptr];
+    recdesc [rdlength] = sizeofudr (udrptr);
+!+
+!   If we successfully deleted all secondary data records,
+!   then we can squeeze out the primary data record.  If
+!   not, we can only delete if but must leave it intact so
+!   that an existing secondary index doesn't point to a
+!   non-existent data record.
+!-
+
+    IF .fixsidrflag NEQ false
+    THEN
+	deludr (.recdesc, 			! Record descriptor
+	    .databd) 				! Bucket descriptor	!M410
+!	    true)				! Lock it		!D410
+    ELSE 					! Mark the record as deleted
+	setflag (udrptr [drflags], flgdelete + flgnocompress);
+
+!+
+!   Now release the data bucket and update it to the disk
+!   (because we have already written it to the disk when we
+!   thought the operation would be a success.
+!-
+    putbkt (true, 				! Do update
+	.databd);				! Bucket to release
+!+
+!   Unlock the file index structure, if it was locked.
+!-
+
+    IF indexlocked THEN unlockindex;
+
+!+
+!   Exit to user.
+!-
+    usrsts = .savederrorcode;			! Restore correct error code
+    usrerr ();
+    END;					! End of REMOVRECORD
+
+%SBTTL 'MAPCODES - system errors to RMS errors'
+
+GLOBAL ROUTINE mapcodes (			! Sys errors to RMS errors
+    systemcode, 				! TOPS-20 code
+    defaultcode, 				! Default RMS code
+    maptable : REF BLOCK			! Address of mapping table
+    ) : exitsub NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	MAPCODES performs all mapping of TOPS-20 error codes
+!	(returned from monitor calls) to the appropriate
+!	RMS-20 error codes.  This routine simply takes the
+!	TOPS-20 code which was returned and searches an
+!	error-mapping table supplied by the caller to
+!	determine if the system error code is in the table.
+!	If so, the corresponding RMS-20 error code is
+!	substituted for the system error code.  If not, the
+!	default RMS-20 error code is stored in the user's
+!	STS field (USRSTS) and the system error code is
+!	stored in the STV field.
+!
+!	The format of the Error Mapping Table (EMT) is
+!
+!
+!       |-------------------------------------|
+!	| <Assoc RMS code> |  System Code 1   |
+!       |-------------------------------------|
+!	| <Assoc RMS code> |  System Code 2   |
+!       |-------------------------------------|
+!	|                  .                  |
+!       |-------------------------------------|
+!	|                  .                  |
+!       |-------------------------------------|
+!	|                  .                  |
+!       |-------------------------------------|
+!	| <Assoc RMS code> |  System Code n   |
+!       |-------------------------------------|
+!	|                  0                  |
+!       |-------------------------------------|
+!
+!
+!	The setting of OAFLAGS determines whether this
+!	routine returns to the caller or exits directly
+!	to the user.
+!
+! FORMAL PARAMETERS
+!
+!	SYSTEMCODE  -	Code returned by TOPS-20
+!	DEFAULTCODE -	RMS-20 error code to be used if
+!			SYSTEMCODE is not found in Error
+!			Mapping Table
+!	MAPTABLE    -	Address of Error Mapping Table
+!
+! IMPLICIT INPUTS
+!
+!	?
+!
+! IMPLICIT OUTPUTS
+!
+!	xxxSTS	    -	Modified to contain RMS code (xxx is FAB or RAB)
+!	xxxSTV	    -	Modified to contain System code
+!	USRSTS	    -	Modified to contain RMS code
+!
+! ROUTINE VALUE:
+!
+!	NONE.
+!
+! SIDE EFFECTS:
+!
+!	?
+!
+!--
+
+    BEGIN
+
+    REGISTER
+	mapindex,				! Used to index into table
+	tableptr : REF BLOCK;			! Pointer to mapping table
+
+    TRACE ('MAPCODES');
+!+
+!   Set up the default RMS-20 error code in user status field.
+!-
+    usrsts = .defaultcode;
+    usrstv = .systemcode;			! Save system code
+!+
+!   Initialize index variable.
+!-
+    mapindex = 0;
+    tableptr = .maptable;			! Get address of table
+!+
+!   Do this loop for each entry in the mapping table.  When
+!   the end of the table is reached, we can exit because we
+!   have already set up the default error code.
+!-
+
+    UNTIL .tableptr [.mapindex, wrd] EQL 0 DO
+	BEGIN
+!+
+!   Check if this error code is in the table and then add a
+!   lot of garbage to the comment.
+!-
+
+	IF .tableptr [.mapindex, emtsyscode] EQL .systemcode
+	THEN 					! We found the error code
+	    BEGIN
+	    usrsts = .tableptr [.mapindex, emtrmscode];
+	    EXITLOOP;
+	    END;
+
+!+
+!   Bump the table index.
+!-
+	mapindex = .mapindex + sizeofemtentry;
+	END;
+
+!+
+!   Return to user or caller.
+!-
+    usrerr ();
+    END;					! End of MAPCODES
+
+END						! End of Module ERRORS
+
+ELUDOM
+  

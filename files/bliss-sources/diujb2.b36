@@ -1,0 +1,788 @@
+%TITLE 'DIU Slave Job Control Routines'
+
+MODULE DIUJB2 (IDENT = '253',
+               ENTRY(j$start,           ! Start a subjob
+                     j$kill,            ! Kill a subjob
+                     j$death,           ! Process job death notice
+                     abort              ! Abort a chain of dependent requests
+                     )
+               ) =
+BEGIN
+!++
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+! FACILITY:
+!
+!       Data Interchange Utility.
+!
+! ABSTRACT:
+!
+!       This module  contains  the  job controller  for  DIU-20.   Each  queued
+!       request is processed by creating a job with the CRJOB JSYS, with DIU as
+!       the top  fork, loading  the request  number, job  handle and  a  unique
+!       number into  the job's  ACs, then  starting the  job at  the CCL  entry
+!       point.  This module handles job creation, deletion, and monitoring.
+!
+! ENVIRONMENT:
+!
+!       BLISS-36 V4  TOPS-20 V6.1  XPORT V4
+
+! HISTORY:
+!
+!  253  Change IPCF20 library to DIUIP2.
+!       Gregory A. Scott 1-Jul-86
+!
+!  200  If the IPCLO message specifies that a job that killed the slave job  is
+!       -1, then the job that killed the slave job has already logged out.
+!       Gregory A. Scott 22-May-86
+!
+!  154  Write better information in the user log when the job can't be created.
+!       Rename s$crejob  to  j$create (since  the  s$ prefix  implies  DIUT20).
+!       Rename kill_job  to  j$kill.   Rename  start_job  to  j$start.   Remove
+!       s$kiljob.  Rename s$death to j$death.
+!       Gregory A. Scott 12-May-86
+!
+!  152  Give error messages to user log file when the job is cancelled/aborts.
+!       Use new routines lj$event and lj$uevent. 
+!       Gregory A. Scott 11-May-86
+!
+!  147  Delete references to usrlog.
+!       Gregory A. Scott 8-May-86
+!
+!  134  Give a little better message when killing a job.
+!       Gregory A. Scott 30-Apr-86
+!
+!  126  Module name should match filename, so now this module is called DIUJB2.
+!       S$TIMINT was  being  called  without a  channel  argument,  making  the
+!       interrupt system goofy; S$TIMINT now uses t_channel always.
+!       Gregory A. Scott 26-Apr-86
+!
+!  122  Range of  error  messages checked  from  CRJOB in  S$CREJOB  should  be
+!       [OPNX12 TO OPNX1] rather than [OPNX12 TO 18].  Abort requests that have
+!       jobs that cannot be created.  Say  nothing about jobs not mine  logging
+!       out since this it is possible to get a CRJOB death interrupt on a CRJOB
+!       failure (this is apparently a monitor "feature").
+!       Gregory A. Scott 22-Apr-86
+!
+! 47	Make routine S$CREJOB return more intelligent messages after
+!	CRJOB JSYS call.  Also, make it return secondary error message.
+!	Sandy Clemens	4-Nov-85
+!--
+
+
+! TABLE OF CONTENTS:
+
+FORWARD ROUTINE
+    j$start : NOVALUE,                  ! Start a subjob
+    j$kill,                             ! Kill an active subjob
+    reljsb : NOVALUE,                   ! Release JOBSTATUS block
+    j$create,                           ! Create and start job
+    j$death : NOVALUE,                  ! Process job death notice
+    dispose : NOVALUE,                  ! Dispose of a job properly
+    abort : NOVALUE;                    ! Abort a chain of dependent requests
+
+! INCLUDE FILES:
+
+LIBRARY 'BLI:XPORT';
+LIBRARY 'TOPS20';
+LIBRARY 'DIU';
+LIBRARY 'DIUIP2';
+
+! EQUATED SYMBOLS:
+
+LITERAL
+    requeue_time = (%O'1000000' / (24 * 60)) * 10;      ! Ten minutes
+
+
+! OWN STORAGE:
+
+OWN
+    acjrequeue : INITIAL (1); ![5] PATCHABLE nonzero to requeue on ACJ failures
+
+GLOBAL
+    jobstatus : BLOCKVECTOR [DIU$K_MAX_MJOB, DIUJ$K_LEN]
+                FIELD (DIUJ$$JOBSTAT_FIELDS);
+
+OWN
+    serial_number : INITIAL (1);
+
+! EXTERNAL REFERENCES:
+
+EXTERNAL
+    njob,                               ! Number of jobs currently actice
+    shutdown,                           ! 1 if shutdown in progress
+    rcvpid;                             ! Spooler's named pid
+
+EXTERNAL ROUTINE
+    lj$event,                           ! Log an event about slave to sys log
+    l$event,                            ! Log an event to sys log
+    lj$uevent,                          ! Log an event about slave to user log
+    l$uevent,                           ! Log an event to user log
+    q$pick,                             ! Pick a request from the queue
+    q$modify,                           ! Modify a request
+    q$reque,                            ! Requeue a request
+    q$find,                             ! Find a chain of requests
+    q$delete,                           ! Delete a request
+    q$release_chain : NOVALUE,          ! Free memory returned by q$find
+    a$account : NOVALUE,                ! Perform usage accounting
+    s$time,                             ! Return system time
+    s$timint : NOVALUE,                 ! Set timer interrupt
+    s$noint : NOVALUE,                  ! Turn off interrupt system
+    s$okint : NOVALUE,                  ! Turn on interrupt system
+    s$jobno,                            ! Return the job number
+    s$jobusr,                           ! Get user number from job number
+    s$username : NOVALUE,               ! Get user name from user number
+    sp$shut : NOVALUE,                  ! shutdown the spooler
+    notify : NOVALUE,                   ! Notify the user of an event
+    sched : NOVALUE,                    ! Schedule jobs for running
+    q$req_block_init : NOVALUE;         ! Zero a fresh request block
+
+GLOBAL ROUTINE j$start (p_req_block) : NOVALUE =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Start a job.  Must be called with interrupts disabled (S$NOINT).
+!
+! FORMAL PARAMETERS:
+!
+!       p_req_block: pointer to request block
+!--
+BIND req_block = .p_req_block : $DIU_BLOCK;
+
+LOCAL job_handle,
+      job,
+      retcode,
+      fail_mess_desc : $STR_DESCRIPTOR(CLASS=DYNAMIC);
+
+! Find a free job status block.
+
+job_handle = (INCR index FROM 0 TO DIU$K_MAX_MJOB - 1
+              DO IF NOT .jobstatus[.index, DIUJ$V_INUSE]
+                 THEN EXITLOOP .index);
+
+IF .job_handle EQL -1                   ! We must be able to find one
+THEN SIGNAL (DIU$_BUG);
+
+! Assign and init job status block
+
+serial_number = .serial_number + 1;
+jobstatus[.job_handle, DIUJ$G_SERIAL_NUMBER] = .serial_number;
+jobstatus[.job_handle, DIUJ$V_BITS] = 0;
+jobstatus[.job_handle, DIUJ$V_INUSE] = 1;
+jobstatus[.job_handle, DIUJ$G_JOB_CREATE_TIME] = s$time();
+jobstatus[.job_handle, DIUJ$H_REQUEST_ID] = .req_block[DIU$H_REQUEST_ID];
+jobstatus[.job_handle, DIUJ$G_BLOCKS_READ] = 0;
+jobstatus[.job_handle, DIUJ$G_BLOCKS_WRITTEN] = 0;
+jobstatus[.job_handle, DIUJ$G_PACKETS_XFERRED] = 0;
+jobstatus[.job_handle, DIUJ$G_LAST_ERROR] = 0;
+jobstatus[.job_handle, DIUJ$G_2ND_CODE] = 0;
+jobstatus[.job_handle, DIUJ$A_REQ_BLOCK] = 0;
+jobstatus[.job_handle, DIUJ$G_JOB_RUNTIME] = 0; ![4] 
+$STR_DESC_INIT (DESCRIPTOR = jobstatus[.job_handle, DIUJ$T_EXTRA_TEXT],
+                CLASS = DYNAMIC);
+
+! Count this job as active for now.  If it doesn't get started we still get
+! a subjob death message from the monitor.
+
+njob = .njob + 1;           ! Count it as active please
+
+! Try to create and start the job
+
+IF retcode = j$create (.req_block[DIU$H_REQUEST_ID], job, .job_handle)
+THEN BEGIN
+     jobstatus[.job_handle, DIUJ$H_JOB_NUMBER] = .job;
+     RETURN(DIU$_NORMAL);
+     END;
+
+! Job creation failed.  Start a string to describe the failure
+
+$STR_DESC_INIT(DESC=fail_mess_desc, CLASS=DYNAMIC,
+               STRING=$STR_CONCAT('Request ',
+                                $STR_ASCII (.req_block[DIU$H_REQUEST_ID]),
+                                ' (',
+                                (.req_block[DIU$H_JOBNAME],
+                                 CH$PTR (req_block[DIU$T_JOBNAME])),
+                                ') '));
+
+! See if we are requeueing the request or cancelling it.  If we failed because
+! there was a serious CRJOB failure or acj denied access (and we are not
+! requeueing that), requeue the job; otherwise, cancel the the request.
+
+IF (.retcode EQL DIU$_CANT_CREATE_JOB)
+   OR (.retcode EQL DIU$_ACJ_DENIED_ACCESS AND .acjrequeue EQL 0)
+THEN BEGIN                              ! We want to cancel the request
+     jobstatus[.job_handle, DIUJ$V_FLUSH_REQUEST] = 1;
+     jobstatus[.job_handle, DIUJ$G_LAST_ERROR] = .retcode;
+     jobstatus[.job_handle, DIUJ$G_2ND_CODE] = .job;
+     $STR_APPEND(TARGET = fail_mess_desc,
+                 STRING = 'killed');
+     $STR_COPY(TARGET = jobstatus[.job_handle, DIUJ$T_EXTRA_TEXT],
+               STRING = fail_mess_desc);
+     dispose(.job_handle);         ! Get rid of this guy
+     END
+ELSE BEGIN                              ! we want to requeue the request
+     $STR_APPEND(TARGET = fail_mess_desc,
+                 STRING = 'requeued');
+     q$reque (.req_block[DIU$H_REQUEST_ID]);       ! Requeue
+     s$timint(s$time()+requeue_time);      ! Post timer interrupt
+     END;
+
+! Log what we were doing
+
+L$UEVENT(.retcode, .job, fail_mess_desc, req_block);    ! User log
+L$EVENT(.retcode, .job, fail_mess_desc);                ! System log
+
+! Clean up after ourselves and return
+
+$XPO_FREE_MEM(STRING=fail_mess_desc);   ! Thanks for the memory
+reljsb(.job_handle);                    ! Release job stg block stg
+
+END;                                    ! j$start
+
+GLOBAL ROUTINE j$kill (request_ID, reason) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Kill an active job.  This routine logs out the slave job, and sets
+!   some flags so that when the monitor's report of the job's logging
+!   out arrives, the request is deleted and the user notified.
+!
+! FORMAL PARAMETERS:
+!   request_ID          - obvious
+!
+! IMPLICIT INPUTS:
+!   jobstatus table
+!
+! IMPLICIT OUTPUTS:
+!   jobstatus table
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   The jobstatus handle is returned, or -1 if no entry exists.
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+    BEGIN
+
+    LOCAL
+	job_handle;
+
+    s$noint ();
+    job_handle =
+        (INCR index FROM 0 TO DIU$K_MAX_MJOB - 1
+         DO
+             IF .jobstatus[.index, DIUJ$H_REQUEST_ID] EQL .request_ID
+                 AND .jobstatus[.index, DIUJ$V_INUSE]
+             THEN
+                 EXITLOOP .index);
+    !
+    ! If we can't find it, maybe it already finished on its own.  If so,
+    ! or if logout already pending, just quit.
+    !
+    IF (.job_handle EQL -1)
+    THEN
+        BEGIN
+        s$okint ();
+        RETURN (-1)
+        END;
+    !
+    ! OK, zap the sucker.
+    !
+    jobstatus[.job_handle, DIUJ$V_FLUSH_REQUEST] = 1;
+    jobstatus[.job_handle, DIUJ$V_FORCED_LOGOUT_PENDING] = 1;
+    jobstatus[.job_handle, DIUJ$G_LAST_ERROR] = .reason;
+    LGOUT(.jobstatus[.job_handle, DIUJ$H_JOB_NUMBER]);
+    s$okint ();
+    RETURN (.job_handle)
+    END;                                ! End of j$kill
+
+ROUTINE reljsb (job_handle) : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Release job status block.
+!
+! FORMAL PARAMETERS:
+!   job_handle          - index into jobstatus table
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   NONE
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+    BEGIN
+
+    LOCAL req_block : REF $DIU_BLOCK;
+
+    IF .job_handle GTR DIU$K_MAX_MJOB - 1
+        OR NOT .jobstatus[.job_handle, DIUJ$V_INUSE]
+    THEN
+        SIGNAL (DIU$_BUG);
+    !
+    ! Release request block if we have one
+    !
+    IF (req_block = .jobstatus[.job_handle, DIUJ$A_REQ_BLOCK]) NEQ 0
+    THEN
+        $XPO_FREE_MEM (BINARY_DATA = (DIU$K_LEN, .req_block, UNITS));
+    jobstatus[.job_handle, DIUJ$A_REQ_BLOCK] = 0;
+    !
+    ! Release extra text string, if any
+    !
+    $XPO_FREE_MEM (STRING = jobstatus[.job_handle, DIUJ$T_EXTRA_TEXT]);
+    !
+    ! Free up this jobstatus slot
+    !
+    jobstatus[.job_handle, DIUJ$V_BITS] = 0;
+    jobstatus[.job_handle, DIUJ$H_REQUEST_ID] = 0;
+    jobstatus[.job_handle, DIUJ$H_JOB_NUMBER] = 0;
+    !
+    ! Decrement count of active streams.  If now zero, and shutdown pending,
+    ! finish the shutdown.
+    !
+    IF (njob = .njob - 1) EQL 0
+    THEN IF .shutdown
+         THEN SP$SHUT();
+    END;                                ! End of reljsb
+
+ROUTINE j$create (req_id, job, job_handle) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Create, log in, and start a job to process a specified request.
+!
+! FORMAL PARAMETERS:
+!   req_id      - request_ID to process
+!   job         - addr of cell in which to return job number of created job
+!   job_handle  - index into jobstatus table
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   The cell whose address is in JOB is updated with the job number of the
+!   created job.  We allocate dynamic memory for a request block and link
+!   it to the jobstatus block.  This block must be released (eventually)
+!   by the caller.
+!
+! COMPLETION CODES:
+!   DIU$_NORMAL                 - successful completion
+!   DIU$_NO_JOB_SLOTS           - system full
+!    or any error code returned from q$pick
+!
+! SIDE EFFECTS:
+!   Many.  A job is created and logged in.  The monitor is instructed
+!   to send an IPCF message to .rcvpid when the job is logged out.
+!
+!--
+    BEGIN
+    !  If DEBUG mode, don't start job until attached to (CJ_WTA)
+    !                 and use DIUDEB.EXE instead of DIU.EXE
+    BIND cjbits=UPLIT(%IF %SWITCHES (DEBUG) %THEN CJ_WTA OR %FI
+                      CJ_LOG OR CJ_NAM OR CJ_FIL OR CJ_ACS OR CJ_NPW
+                      OR CJ_NUD OR CJ_SLO OR CJ_CAM OR FLD($CJUAA, CJ_ACT)),
+         cjfile=UPLIT(%IF %SWITCHES (DEBUG)
+                      %THEN %ASCIZ 'SYS:DIUDEB.EXE'
+                      %ELSE %ASCIZ 'SYS:DIU.EXE'
+                      %FI);
+    LOCAL
+        retcode,
+	p_req_block,
+        crjob_args : VECTOR [$CJSLO + 1],
+        crjob_acs : VECTOR [16],
+        job_number;
+
+    $XPO_GET_MEM (UNITS = DIU$K_LEN, RESULT = p_req_block);
+        !
+        ! Block to hold bound value of req_block
+        !
+        BEGIN
+        BIND
+            req_block = .p_req_block : $DIU_BLOCK;
+        q$req_block_init (req_block);
+        !
+        ! Fetch request block and mark request as active
+        !
+        req_block[DIU$H_REQUEST_ID] = .req_ID;
+        IF NOT (retcode = q$pick (req_block))
+        THEN
+            BEGIN
+            $XPO_FREE_MEM (BINARY_DATA = (DIU$K_LEN, req_block, UNITS));
+            RETURN (.retcode);
+            END;
+        !
+        ! Link request block to jobstatus block
+        !
+        jobstatus[.job_handle, DIUJ$A_REQ_BLOCK] = req_block;
+        !
+        ! Set up CRJOB arguments
+        !
+        crjob_args[$CJNAM] = CH$PTR (req_block[DIU$T_USERNAME]);
+        crjob_args[$CJPSW] = 0;
+        crjob_args[$CJACT] = CH$PTR (req_block[DIU$T_ACCOUNT]);
+        crjob_args[$CJFIL] = CH$PTR (CjFile);
+        crjob_args[$CJSFV] = 1;
+        crjob_args[$CJTTY] = $NULIO;
+        crjob_args[$CJTIM] = 0;
+        crjob_args[$CJACS] = crjob_acs;
+        crjob_args[$CJEXF] = 0;
+        crjob_args[$CJPRI] = ($NULIO ^ 18) + $NULIO;
+        crjob_args[$CJCPU] = 0;
+        crjob_args[$CJCAM] = .req_block[DIU$G_CAPABILITIES];
+        crjob_args[$CJSLO] = .rcvpid;
+        !
+        ! Put the request-ID into AC15 of slave job (1st formal of main rtn),
+        !  the job handle into AC9 of slave job (2nd formal of main rtn),
+        !  and serial number into AC7 of slave job (3rd formal of main rtn)
+        !
+        crjob_acs[15] = .req_ID;
+        crjob_acs[9] = .job_handle;
+        crjob_acs[7] = .jobstatus[.job_handle, DIUJ$G_SERIAL_NUMBER];
+
+        !
+        ! Try to create the job.
+        !
+        IF CRJOB( .cjbits, crjob_args, 0; job_number )
+        THEN
+            BEGIN
+            (.job) = .job_number;
+            RETURN (DIU$_NORMAL)
+            END
+        ELSE
+            BEGIN
+            .job = .job_number;         ! Pass back the TOPS-20 error code
+            RETURN (                    ! Return DIU error code
+                    SELECTONE .job_number
+                    OF
+                    SET
+                    [GJFX1 TO GJFX24, GJFX27, GJFX28,   ! GTJFN/OPENF errors
+                     GJFX30 TO GJFX35, GJFX36, GJFX39,
+                     GJFX40, GJFX44, GJFX45 TO GJFX47,
+                     OPNX1 TO OPNX10, OPNX12 TO OPNX18]: DIU$_CANT_GET_DIU;
+                    [GOKER2] : DIU$_ACJ_DENIED_ACCESS;
+                    [CRJBX6] : DIU$_NO_JOB_SLOTS;
+                    [OTHERWISE] : DIU$_CANT_CREATE_JOB;
+                        TES
+                   );
+            END;
+        END;
+    END;                                ! End of j$create
+
+GLOBAL ROUTINE j$death (p_pdb) : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Process a  monitor-generated  subjob  death report.   This  routine  is
+!       always called at  interrupt level in  response to receipt  of the  IPCF
+!       message.  Note  that we  can  call the  Q$xxxx routines  with  impunity
+!       because the fact that we're running as an interrupt routine  guarantees
+!       no one else will simultaneously try to call them.
+!
+! FORMAL PARAMETERS:
+!
+!       p_pdb: pointer to packet descriptor block for death message
+!
+!--
+BEGIN
+
+BIND pdb = .p_pdb : $$PDB_DECL,         ! IPCF message data block pointer
+     msg = .pdb[PDB$$H_MESSAGE_ADDRESS] : VECTOR [9],   ! The message itself
+     flags = msg[2],
+     connect_time = msg[3],
+     runtime = msg[4],
+     killer = msg[6],
+     last_error = msg[8];
+
+LOCAL job,
+      job_handle,
+      oldest;
+
+job = .(msg[1])<rh>;
+
+! There may be more than one match.  By the time we get this message,
+! the old job is probably gone and the job number may have already been
+! recycled.  For this reason, we must assume duplicates possible, and
+! choose the one with the lower serial number (created earlier).
+
+job_handle = -1;
+INCR index FROM 0 TO DIU$K_MAX_MJOB - 1
+DO IF .jobstatus[.index, DIUJ$H_JOB_NUMBER] EQL .job
+      AND .jobstatus[.index, DIUJ$V_INUSE]
+   THEN IF .job_handle EQL -1           ! First candidate?
+        THEN BEGIN                      ! Yes, believe it
+             job_handle = .index;
+             oldest = .jobstatus[.index, DIUJ$G_SERIAL_NUMBER];
+             END
+        ELSE IF .jobstatus[.index, DIUJ$G_SERIAL_NUMBER] LSS .oldest
+             THEN BEGIN
+                  job_handle = .index;
+                  oldest = .jobstatus[.index, DIUJ$G_SERIAL_NUMBER];
+                  END;
+
+IF .job_handle EQL -1                   ! If we didn't find ethe job
+THEN RETURN (DIU$_NORMAL);              ! then it could be a CRJOB failure
+
+jobstatus[.job_handle, DIUJ$G_RUNTIME] = .runtime;
+
+! Write a entry to the log file if it was a forced logout
+
+IF (.flags AND SP_FLO) NEQ 0            ! Forced logout (because of error
+THEN BEGIN                              !  in job)?
+     lj$event(DIU$_SLAVE_ABNORMAL, .last_error, 0, .job_handle);        ! sys
+     lj$uevent(DIU$_SLAVE_ABNORMAL, .last_error, 0, .job_handle);       ! usr
+     END;
+
+! Write an event to the log file if it was a logout by another job.
+
+IF (.flags AND SP_OLO) NEQ 0            ! Forced logout by another job
+THEN BEGIN
+     IF .killer EQL s$jobno ()          ! Did I kill the job?
+     THEN BEGIN                         ! Yes, log the logout please
+          lj$event(DIU$_KILLED_BY_USER, 0, 
+                   jobstatus[.job_handle, DIUJ$T_EXTRA_TEXT], 
+                   .job_handle);
+          lj$uevent(DIU$_KILLED_BY_USER, 0,
+                    jobstatus[.job_handle, DIUJ$T_EXTRA_TEXT],
+                    .job_handle);
+          END
+     ELSE BEGIN
+          LOCAL user_descr : $STR_DESCRIPTOR (CLASS = DYNAMIC),
+                line_descr : $STR_DESCRIPTOR (CLASS = DYNAMIC);
+          $STR_DESC_INIT (DESCRIPTOR = user_descr, CLASS = DYNAMIC);
+          $STR_DESC_INIT (DESCRIPTOR = line_descr, CLASS = DYNAMIC);
+          IF .killer EQL -1             ! Job that killed us logged out?
+          THEN $STR_COPY (TARGET = line_descr,
+                          STRING = 'Request killed by job that logged out immediately')
+          ELSE BEGIN
+               s$username (s$jobusr(.killer), user_descr);
+               $STR_COPY (TARGET = line_descr,
+                          STRING = $STR_CONCAT ('Request killed by job ',
+                                                $STR_ASCII (.killer, BASE10),
+                                                ' user ',
+                                                user_descr));
+               END;
+          lj$event(DIU$_KILLED_BY_USER, 0, line_descr, .job_handle);    ! sys
+          lj$uevent(DIU$_KILLED_BY_USER, 0, line_descr, .job_handle);   ! usr
+          $XPO_FREE_MEM (STRING = user_descr);
+          $XPO_FREE_MEM (STRING = line_descr);
+          END;
+     END;
+
+! Dispose of the request
+
+dispose (.job_handle);
+
+! Release job-related storage, and call the scheduler to maybe start
+! next job
+
+reljsb(.job_handle);
+SCHED();
+END;                                    ! End of j$death
+
+
+ROUTINE dispose (job_handle) : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Dispose of a job that has been logged out, either voluntarily or
+!   involuntarily.
+!
+! FORMAL PARAMETERS:
+!   job_handle          - jobstatus index
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   NONE
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+    BEGIN
+
+    BIND
+        req_block = .jobstatus[.job_handle, DIUJ$A_REQ_BLOCK] : $DIU_BLOCK;
+
+    LOCAL
+        dependent;
+    !
+    ! If the job completed normally, delete it from the queue.
+    !
+    IF .jobstatus[.job_handle, DIUJ$V_REQ_COMPLETED]
+    THEN
+        BEGIN
+        !
+        ! Notify the user of job disposition and do resource accounting
+        !
+        notify (.jobstatus[.job_handle, DIUJ$G_LAST_ERROR],
+                .jobstatus[.job_handle, DIUJ$G_2ND_CODE],
+                jobstatus[.job_handle, DIUJ$T_EXTRA_TEXT],
+                req_block);
+        a$account (.job_handle, 'SUC');
+        !
+        ! If dependent request exists, clear its prerequisite field
+        !
+        IF (dependent = .req_block[DIU$H_DEPENDENT_ID]) NEQ 0
+        THEN q$modify (.dependent, DIUQ$K_PREREQUISITE_ID, 0);
+        ! Delete this completed request from the queue
+        q$delete (.req_block[DIU$H_REQUEST_ID]);
+        END
+    ELSE
+        BEGIN
+        IF .jobstatus[.job_handle, DIUJ$V_FLUSH_REQUEST]
+        THEN
+            BEGIN
+            !
+            ! Notify the user of job disposition if hasn't already been done.
+            !
+            IF NOT .jobstatus[.job_handle, DIUJ$V_ALREADY_NOTIFIED]
+            THEN
+                BEGIN
+                !
+                ! Notify the user of job disposition
+                !
+                notify (.jobstatus[.job_handle, DIUJ$G_LAST_ERROR],
+                        .jobstatus[.job_handle, DIUJ$G_2ND_CODE],
+                        jobstatus[.job_handle, DIUJ$T_EXTRA_TEXT],
+                        req_block);
+                END;
+            !
+            ! Do resource accounting
+            !
+            a$account (.job_handle, 'ERR');
+            !
+            ! If dependent request(s) exist, dispose of them also
+            !
+            IF (dependent = .req_block[DIU$H_DEPENDENT_ID]) NEQ 0
+            THEN
+                abort (.dependent);
+            IF NOT .jobstatus[.job_handle, DIUJ$V_ALREADY_DELETED]
+            THEN
+                q$delete (.req_block[DIU$H_REQUEST_ID]);
+            END
+        ELSE
+            BEGIN
+            !
+            ! Do resource accounting and requeue the request
+            !
+            a$account (.job_handle, 'REQ');
+            q$reque (.req_block[DIU$H_REQUEST_ID]);
+            lj$event(DIU$_REQUEUED, 0, 0, .job_handle);         ! System log
+            lj$uevent(DIU$_REQUEUED, 0, 0, .job_handle);        ! User log file
+            END
+        END;
+    END;                                ! End of dispose
+
+GLOBAL ROUTINE abort (req_ID) : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Abort a chain of dependent requests, unless continuation requested.
+!   We go down the chain deleting requests until the end of the chain
+!   is reached, or a continuable dependent is encountered.
+!
+! FORMAL PARAMETERS:
+!   req_ID      - request-ID of the first dependent in the chain
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   NONE
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+    BEGIN
+
+    LOCAL
+        chain_head,
+        req_block_template : $DIU_BLOCK,
+	req_block : REF $DIU_BLOCK,
+        bits,
+        jobname_descr : $STR_DESCRIPTOR ();
+
+    chain_head = 0;
+    DO
+        BEGIN
+        IF .chain_head NEQ 0
+        THEN
+            q$release_chain (.chain_head);
+        q$req_block_init (req_block_template);
+        req_block_template[DIU$H_REQUEST_ID] = .req_ID;
+        IF NOT q$find (req_block_template, chain_head)
+        THEN
+            EXITLOOP;
+        IF .chain_head EQL 0
+        THEN
+            EXITLOOP;
+        req_block = .chain_head + 1;
+        $STR_DESC_INIT (DESCRIPTOR = jobname_descr,
+                        STRING = (.req_block[DIU$H_JOBNAME],
+                                  CH$PTR (req_block[DIU$T_JOBNAME])));
+        IF .req_block[DIU$V_SEQ_CONTINUE]
+        THEN
+            BEGIN
+            !
+            ! This request is continuable.  Remove the dependency and quit:
+            ! we stop aborting at the first sign of willingness to continue.
+            !
+            q$modify (.req_ID, DIUQ$K_PREREQUISITE_ID, 0);
+            EXITLOOP;
+            END;
+        !
+        ! This request must be aborted.  Get the next dependent's ID and
+        ! delete this request, after notifying the user.
+        !
+        $DIU_LOG (($STR_CONCAT ('Req ',
+                                $STR_ASCII (.req_block[DIU$H_REQUEST_ID]),
+                                ' (',
+                                (.req_block[DIU$H_JOBNAME],
+                                 CH$PTR (req_block[DIU$T_JOBNAME])),
+                                ') killed, prerequisite request aborted')));
+        req_ID = .req_block[DIU$H_DEPENDENT_ID];
+        notify (DIU$_DEPENDENT_ABORTED,
+                0,
+                (UPLIT (0, 0)),
+                .req_block);
+        q$delete (.req_block[DIU$H_REQUEST_ID]);
+        END
+    UNTIL
+        .req_ID EQL 0;                  ! Means end of dependency chain
+    q$release_chain (.chain_head);      ! In case anything still there
+    END;                                ! End of abort
+
+END                                     ! End of module
+ELUDOM

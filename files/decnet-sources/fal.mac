@@ -1,0 +1,824 @@
+TITLE	FAL	Network file transfer utility for TOPS20 DECNET
+SUBTTL	D. Oran	- P.J. Taylor /POM/CLB/ 17-Nov-81
+
+;
+;
+;
+;	    COPYRIGHT (c) 1978,1979,1980,1985
+;           DIGITAL EQUIPMENT CORPORATION, MAYNARD, MA.
+;
+;     THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED
+;     AND COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE
+;     AND WITH THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS
+;     SOFTWARE  OR ANY OTHER COPIES THEREOF MAY NOT BE PROVIDED OR
+;     OTHERWISE MADE AVAILABLE TO ANY OTHER PERSON.  NO  TITLE  TO
+;     AND OWNERSHIP OF THE SOFTWARE IS HEREBY TRANSFERRED.
+;     
+;     THE INFORMATION  IN  THIS  SOFTWARE  IS  SUBJECT  TO  CHANGE
+;     WITHOUT  NOTICE  AND SHOULD NOT BE CONSTRUED AS A COMMITMENT
+;     BY DIGITAL EQUIPMENT CORPORATION.
+;     
+;     DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR RELIABILITY
+;     OF  ITS  SOFTWARE  ON  EQUIPMENT  WHICH  IS  NOT SUPPLIED BY
+;     DIGITAL.
+
+
+	SEARCH	GLXMAC			;Get Galaxy symbols
+	PROLOG	(FAL)
+
+	SEARCH DAPSYM			;Get DAPLIB symbols
+	SEARCH	QSRMAC			;Get quasars symbols
+
+;Version Information
+
+	FALVER==2			;MAJOR VERSION OF FAL
+	FALMIN==0			;MINOR VERSION OF FAL
+	FALEDT==32			;EDIT LEVEL
+	FALWHO==0			;WHO LAST EDITED (0=DEC DEVELOPMENT)
+
+	GLOB	DAPEDT
+
+	VFAL==<VRSN.(FAL)>+DAPEDT	;Get the version level
+
+	EXTERN	.JBFF			;ADDRESS OF FIRST FREE LOCATION
+SUBTTL	Table of contents
+
+;               TABLE OF CONTENTS FOR FAL
+;
+;
+;                        SECTION                                   PAGE
+;    1. Title page................................................   1
+;    2. Table of contents.........................................   2
+;    3. Revision History..........................................   3
+;    4. Constants and assembly parameters.........................   4
+;    5. LOCAL MACROS..............................................   5
+;    6. Job version and entry vector..............................   6
+;    7. Initialization blocks.....................................   6
+;    8. MAIN ENTRY POINT AND INITIALIZATION.......................   7
+;    9. CHKQUE  Routine to process IPCF messages..................   8
+;   10. LOG  message processing...................................   9
+;   11. CHKFRK  Routine to check fork status......................  10
+;   12. SERVER initializtion......................................  11
+;   13. SERVER Listening loop.....................................  12
+;   14. SERVER Connection verification routine....................  13
+;   15. CREFRK  Fork creation and initializtion...................  14
+;   16. KILFRK  Routine to kill a server..........................  15
+;   17. LOGSNM  Routine to log system name........................  16
+;   18. LOGMSG and LOGCHR Logfile output routines.................  17
+;   19. MSGCHR Text output routine for inferior servers...........  18
+;   20. SNDFAL  Routine to send IPCF packet to FAL................  19
+;   21. CLSJFN, RELJFN, CPYSTR....................................  19
+;   22. PSIINI  Software interrupt system initialization..........  20
+;   23. Interrupt service routines................................  20
+;   24. Pure data storage.........................................  21
+;   25. Interrupt tables..........................................  22
+;   26. Impure Data storage.......................................  23
+SUBTTL	Revision History
+
+COMMENT \
+
+Edit	Comment
+
+0020	First field test of FAL 2(20)
+0021	Fix FAL to check for network support before starting forks
+	Fix logging from forks
+0022	Add interrupt reason to D$INTR calls so it doesn't interrogate
+	link status for each interrupt
+0023	Make DIRPSW large enough to accommadate 39 character passwords
+	so stack won't get destroyed.  Also get default account for
+	login so that a null account string will be allowed.
+0024	Process all interrupts as level 1 and make LEV1PC global to
+	allow access from D$INTR in DAPLIB
+
+*** Edits for DECnet-20 V3.0 begin here
+	
+0025	Implement logging of activity in PS:<SPOOL>FAL.LOG. If this file
+	exists it will be appended to. If the file does not exist, no
+	logging will be done.
+0026	Make SRVUSR, SRVACT, and SRVPSW large enough to accommodate the
+	longest possible strings.
+0027	Add DI%PGM field to DAPLIB initialization block
+
+*** Changes for TOPS-20 V. 6.1 begin here ***
+
+0030	Add global entry .DNCON which will allow us to link without route-
+	through support (which we don't need/use anyhow).
+
+0031	Add new ACCES function for password checking with encrypted psw's
+
+0032	Change debugging object type to conform with updated standard
+
+\ ;end revision history
+SUBTTL	Constants and assembly parameters
+
+; ACCUMULATOR DEFINITIONS
+
+
+	P5==13				;EXTRA PERMANENT AC
+	M==14				;IPCF message address
+
+;Constants
+
+	XP	SRVLNK,1		;Server link index is 1
+
+	XP	MINSRV,3		;Minimum number of forks
+	XP	MAXSRV,4		;Maximum number of forks
+
+	XP	MAXNOD,20		;Maximum number of nodes
+	XP	PDLEN,MAXNOD*20		;Size of the stack
+	XP	GJFSIZ,20		;Size of the GTJFN block
+	XP	FILSIZ,20		;Maximum size of a file name
+	XP	CHKLEN,.CKAUD+1		;Length of CHKAC arg block
+
+	XP	MSGSIZ,^D500*5-1	;Maximum count of logcharacters
+
+
+;Interrupt channel assignments
+
+	XP	.ICIPC,0		;IPCF channel
+	XP	.ICDAV,1		;Data available
+	XP	.ICCDN,2		;Connect/Disconnect
+	XP	.ICIMA,3		;Interrupt message
+
+	GLOB	DATEND			;Last location of DAP storage
+
+	NFKPGS==<DATEND/1000>+1		;Number of fork pages
+SUBTTL LOCAL MACROS
+
+DEFINE TXT(TEXT) <POINT 7,[ASCIZ\TEXT\]>
+
+DEFINE $FD(NAME) <
+	XWD 10,0
+	ASCIZ\NAME\>
+
+SUBTTL	Job version and entry vector
+
+	LOC	137			;SET THE VERSION
+.JBVER:	EXP	VFAL
+	RELOC
+
+; ENTRY VECTOR DEFINITION
+
+ENTVEC:	JRST FAL			;MAIN ENTRY POINT
+	JRST FAL			;REENTER ENTRY POINT
+	EXP VFAL			;VERSION OF FAL PROGRAM
+
+SUBTTL	Initialization blocks
+
+FALIB:	$BUILD	(IB.SZ)
+	  $SET	(IB.PRG,,%%.MOD)	;Program name is FAL
+	  $SET	(IB.OUT,,LOGMSG)	;Default output routine
+	  $SET	(IB.INT,,<LEVTAB,,CHNTAB>)	;Point to PSI stuff
+	  $SET	(IB.PIB,,FALPIB)	;Point to IPCF stuff
+	$EOB
+
+FALPIB:	$BUILD	(PB.MXS)		;Pid info
+	  $SET	(PB.HDR,PB.LEN,PB.MXS)	;Length
+	  $SET	(PB.INT,IP.CHN,.ICIPC)	;IPCF channel
+	  $SET	(PB.FLG,IP.PSI,1)	;Use PSI for IPCF
+	  $SET	(PB.SYS,IP.MNP,MAXSRV)	;Number of pids required
+	  $SET	(PB.NAM,,<POINT 7,SRVOBJ>)
+	$EOB
+
+SRVIB:	$BUILD	(IB.SZ)
+	  $SET	(IB.PRG,,'FALSRV')	;Program name is FALSRV
+	  $SET	(IB.OUT,,MSGCHR)	;Default output routine
+	  $SET	(IB.INT,,<LEVTAB,,CHNTAB>)	;Point to PSI stuff
+	  $SET	(IB.PIB,,SRVPIB)	;Point to IPCF stuff
+	$EOB
+
+SRVPIB:	$BUILD	(PB.MXS)		;Pid info
+	  $SET	(PB.HDR,PB.LEN,PB.MXS)	;Length
+	  $SET	(PB.INT,IP.CHN,.ICIPC)	;IPCF channel
+	  $SET	(PB.FLG,IP.PSI,1)	;Use PSI for IPCF
+	$EOB
+
+LOGFOB:	$BUILD	(FOB.SZ)
+	  $SET	(FOB.FD,,[$FD(PS:<SPOOL>FAL.LOG)])
+	  $SET	(FOB.CW,FB.BSZ,7)
+	$EOB
+
+LOGDBG:	$BUILD	(FOB.SZ)
+	  $SET	(FOB.FD,,[$FD(DSK:FAL.LOG)])
+	  $SET	(FOB.CW,FB.BSZ,7)
+	$EOB
+
+.DNCON:: $RETF			;[0030] No route-through support !!!
+
+SUBTTL	MAIN ENTRY POINT AND INITIALIZATION
+
+FAL:	RESET				;Clean up from last start
+	MOVE P,[IOWD PDLEN,PDL]		;SET UP STACK
+	SETZM	DATORG			;Clear impure storage
+	MOVE	S1,[DATORG,,DATORG+1]
+	BLT	S1,DATEND-1
+	HRROI	S1,SRVOBJ		;Point to my object name
+	MOVX	S2,TXT(FAL)
+	SKIPE	DEBUGW
+	MOVX	S2,TXT(.FALDEBUG)	;[0032]Become debugging FAL
+	$CALL	CPYSTR			;Store the name
+	MOVEI	S1,IB.SZ
+	MOVEI	S2,FALIB		;POINT TO IB
+	$CALL	I%INIT			;GET THE LIBRARY
+	HRROI	S1,[ASCIZ/DCN:/]
+	STDEV
+	 ERJMP	[$FATAL (No network support)]
+	MOVE	S2,FALPIB+PB.PID	;Get my PIB
+	MOVEM	S2,FALPID		;Say I am FAL
+	HRRZI	S1,.MSIIC		;BYPASS MOUNT COUNTS
+	MSTR
+	 ERJMP	.+1
+	$CALL	PSIINI			;INITIALIZE PSI SYSTEM
+	MOVX	S1,GJ%SHT+GJ%OLD	;[0025]IS LOG FILE AROUND?
+	HRROI	S2,[ASCIZ/PS:<SPOOL>FAL.LOG/] ;[0025]
+	GTJFN				;[0025]
+	 ERJMP	NOLOG			;[0025] DON'T LOG ANYTHING
+	RLJFN				;[0025]RELEASE THE JFN
+	JFCL				;[0025]DONT CARE ABOUT ERRORS
+	MOVEI	S1,FOB.SZ		;[0025]LENGTH OF THE FOB
+	MOVEI	S2,LOGFOB		;[0025]ADDRESS OF THE FOB
+	SKIPE	DEBUGW			;[0025]DEBUGGING?
+	MOVEI	S2,LOGDBG		;[0025]ADDRESS OF DEBUG FOB
+	$CALL	F%AOPN			;[0025]APPEND OPEN
+	MOVEM	S1,LOGIFN		;[0025]SAVE THE NEW IFN
+	SKIPT				;[0025]FILE OPENED OK?
+NOLOG:	SETOM	LOGIFN			;[0025]NO, FORGET IT
+	SETOM	FRKFLG			;SET TO CREATE INITIAL FORKS
+	SKIPE	DEBUGW			;AM I DEBUGGING?
+	JRST	SRVINI			;YES..JUST BECOME LISTENER
+
+MAIN:	SETZM	SLPTIM			;ASSUME WE'LL WAIT FOR INTERRUPT
+	$CALL	CHKQUE			;PROCESS IPCF MESSAGES
+	AOSN	FRKFLG			;CHECK FORKS?
+	$CALL	CHKFRK			;YES..CHECK OUR FORKS
+	SKIPL	S1,LOGIFN		;GET LOGFILE IFN
+	$CALL	F%CHKP			;CHECK POINT IT
+	MOVE	S1,SLPTIM		;GET MAX SLEEP TIME
+	$CALL	I%SLP			;WAIT FOR INTERRUPT
+	JRST	MAIN
+SUBTTL	CHKQUE	Routine to process IPCF messages
+
+CHKQUE:
+
+CHKQ.1:	SETZB	M,MESSAG		;ZERO MESSAGE ADDRESS
+	$CALL	C%RECV			;RECEIVE A MESSAGE?
+	JUMPT	CHKQ.9			;[0025]YES..CHECK IT OUT
+	$RETF				;NO..NOTHING THERE
+
+CHKQ.9:	LOAD	M,MDB.MS(S1),MD.ADR	;GET THE MESSAGE ADDRESS
+	MOVEM	M,MESSAG		;SAVE ADDRESS
+	LOAD	S1,.MSTYP(M),MS.TYP	;GET THE MESSAGE TYPE
+	MOVSI	T2,-NMSGT		;NO -- SEARCH QUASAR TYPES
+
+CHKQ.3:	HRRZ	T1,MSGTBL(T2)		;GET A MESSAGE TYPE
+	CAMN	S1,T1			;MATCH?
+	JRST	CHKQ.4			;YES, WIN
+	AOBJN	T2,CHKQ.3		;NO, LOOP
+	JRST	CHKQ.5			;UNKNOWN TYPE -- IGNORE IT
+
+CHKQ.4:	HLRZ	T1,MSGTBL(T2)		;GET THE ROUTINE ADDRESS
+	PUSHJ	P,0(T1)			;DISPATCH
+
+CHKQ.5:	$CALL	C%REL			;RELEASE MESSAGE
+CHKQ.6:	JRST	CHKQ.1			;GET NEXT MESSAGE
+
+
+MSGTBL:	XWD	LOG,MT.TXT		;Log from FAL or QUASAR ACK
+
+	NMSGT==.-MSGTBL
+SUBTTL	LOG  message processing
+
+LOG:	$SAVE	<STREAM>		;Preserve our stream
+	MOVE	S1,.MSCOD(M)		;Get stream number from message
+	MOVEM	S1,STREAM
+	HRROI	S1,MSGTXT-MSGHDR(M)	;Point to text
+	HLRZ	S2,MSGARH-MSGHDR(M)	;Get argument length
+	CAIG	S2,1			;Any text to log?
+	 $RETT				;No..just return
+	$TEXT	(,<^Q/S1/^0>)	;Log it
+	$RETT
+
+SUBTTL	CHKFRK	Routine to check fork status
+
+CHKFRK:	$SAVE	<P1>
+	SETZM	FRKFLG			;Clear flag to say we've been here
+	MOVSI	P1,-MAXSRV		;Get maximum fork number
+CHKFR1:	HRRZ	S1,FRKTBL(P1)		;Get fork handle
+	JUMPE	S1,CHKFR2		;Next fork if handle is nill
+	RFSTS				;Read fork status
+	LOAD	T1,S1,RF%STS		;Get status field
+	CAIE	T1,.RFHLT		;Is fork halted
+	CAIN	T1,.RFFPT		; or forced to terminate?
+	SKIPA				;Yes..process the error
+	JRST	CHKFR2			;No..check next fork
+	$TEXT	(,<Abnormal process termination at PC ^O/S2,RHMASK/>)
+	$TEXT	(,<Status: ^O/S1/^0>)
+	HRRZ	S1,P1			;Get the fork index
+	$CALL	KILFRK			;Kill the dead fork
+CHKFR2:	AOBJN	P1,CHKFR1		;Check the next fork
+
+	MOVE	S1,FRKCNT		;Get active fork count
+CHKFR3:	CAIL	S1,MINSRV		;Do we have enough forks?
+	$RETT				;Yes..just return
+	$CALL	CREFRK			;No..create a fork
+	JUMPT	CHKFR3			;Check count again
+	MOVEI	S1,^D60			;Set sleep time to a minute
+	MOVEM	S1,SLPTIM
+	SETOM	FRKFLG			;Request another check
+	$RETF
+SUBTTL	SERVER initializtion
+
+DAPIB:	$BUILD	(.DISIZ)		;Dap initialization block
+	  $SET	(.DIFLG,DI%CNT,1)	;Request 1 link
+	  $SET	(.DIFLG,DI%PGM,%PGFAL)	;[0027]We are FAL
+	$EOB
+
+SRV:	RESET				;Clean up from last start
+	MOVE P,[IOWD PDLEN,PDL]		;SET UP STACK
+	SETZM	DATORG			;Clear impure storage
+	MOVE	S1,[DATORG,,DATORG+1]
+	BLT	S1,DATEND-1
+	HRRZM	T2,STREAM		;[0025]STREAM NUMBER-1
+	AOS	STREAM			;[0025]STREAM NUMBER
+	HRROI	S1,SRVOBJ		;Point to server name
+	MOVX	S2,TXT(FAL)		;GET OBJECT NAME
+	SKIPE	DEBUGW
+	MOVX	S2,TXT(.FALDEBUG)	;[0032]debugging FAL
+	$CALL	CPYSTR			;Copy the string
+	MOVEI	S1,IB.SZ
+	MOVEI	S2,SRVIB		;POINT TO IB
+	$CALL	I%INIT			;GET THE LIBRARY
+	HRRZI	S1,.MSIIC		;BYPASS MOUNTS
+	MSTR
+	 ERJMP	.+1
+	$CALL	PSIINI			;INITIALIZE PSI SYSTEM
+	SETOM	LOGIFN			;Not to write in logfile
+	SETZM	FRKCNT			;I don't have any inferiors
+
+SRVINI:	MOVEI	S1,.DISIZ
+	MOVEI	S2,DAPIB
+	$CALL	D$INIT			;Init DAPLIB
+	SKIPT
+	$FATAL	(Can't initialize DAPLIB)
+	JRST	LISTEN
+
+SUBTTL	SERVER Listening loop
+
+DAPOB:	$BUILD	(.DOSIZ)		;Dap link open block
+	  $SET	(.DOFLG,DO%SRV,1)	;Become server
+	  $SET	(.DOFLG,DO%WCN,1)	;Wait for connection
+	  $SET	(.DOFLG,DO%PSI,1)	;Use PSI
+	  $SET	(.DOFLG,DO%LNK,SRVLNK)	;Use servers link
+	  $SET	(.DOPSI,DO%CDN,.ICCDN)	;Connect/Disconnect channel
+	  $SET	(.DOPSI,DO%DAV,.ICDAV)	;Data available
+	  $SET	(.DOPSI,DO%INA,.ICIMA)	;Interrupt message
+	  $SET	(.DOCID,,CHKUSR)		;Connect verification
+	  $SET	(.DONOD,,<POINT 7,SRVNOD>)	;Remote node name
+	  $SET	(.DOOBJ,,<POINT 7,SRVOBJ>)	;Requested object name
+	  $SET	(.DOUSR,,<POINT 7,SRVUSR>)	;User string
+	  $SET	(.DOPSW,,<POINT 7,SRVPSW>)	;Password string
+	  $SET	(.DOACT,,<POINT 7,SRVACT>)	;Account string
+	  $SET	(.DOOPD,,<POINT 7,SRVOPD>)	;Optional data
+	$EOB
+
+DAPSRV:	$BUILD	(.DFSIZ)
+	  $SET	(.DFFLG,DF%LNK,SRVLNK)
+	  $SET	(.DFLFS,,<POINT 7,SRVFIL>)
+	$EOB
+
+LISTEN:	SKIPGE	LOGIFN			;Am I the master?
+	$CALL	CLSJFN			;Yes..close all JFN's
+	MOVEI	S1,SRVSIZ		;Get size of server data
+	MOVEI	S2,SRVBEG		;Get start of area to clear
+	$CALL	.ZCHNK			;Clear it
+	MOVEI	S1,.DOSIZ		;Get size of open block
+	MOVEI	S2,DAPOB		;Point to open block
+	$CALL	D$OPEN
+	JUMPF	LISTE5			;Close our end on failure
+	$TEXT	(,Connection from node ^T/SRVNOD/ for ^T/SRVUSR/)
+
+LISTE1:	$CALL	RELJFN			;Release unopen JFNS
+	MOVEI	S1,.DFSIZ
+	MOVEI	S2,DAPSRV
+	MOVEI	T1,^D5			;Timer retry to wait for access
+	$CALL	D$FUNC			;Do one function
+	JUMPF	LISTE3			;Check link status on failure
+LISTE2:	MOVEI	S1,^D20			;Wait twenty seconds
+	$CALL	I%SLP
+LISTE3:	MOVEI	S1,SRVLNK		;Get the link index
+	$CALL	D$STAT			;Check link status
+	TXNE	S1,MO%EOM		;Message available?
+	JUMPT	LISTE1			;Yes..go process it
+	TXNN	S1,MO%SYN!MO%ABT	;Disconnected or aborted?
+	TXNN	S1,MO%CON		; and still connected?
+	JRST	LISTE5			;No..close our end
+	TXNE	S1,MO%EOM		;Have a message available?
+	JRST	LISTE1			;Yes..process it
+	SOJG	T1,LISTE2		;No..try again
+LISTE5:	MOVEI	S1,SRVLNK		;Point to our link
+	MOVEI	S2,[.DCX38]		;Abort close
+	$CALL	D$CLOS			;Close or abort the link
+	$TEXT	(,^0)			;CLOSE THE LOG ENTRY
+	JRST	LISTEN			;Wait for new connection
+
+FNCTBL:	TXT(Unknown)
+	TXT(Read)
+	TXT(Write)
+	TXT(Rename)
+	TXT(Delete)			;Directory connect
+	TXT(Unknown)
+	TXT(Directory)
+	TXT(Submit)
+	TXT(Execute)
+
+SUBTTL	CHKUSR Connection verification routine
+
+;CHKUSR - Called at interrupt level from D$OPEN to validate connect
+
+;ACCEPTS	Connect info stored per pointers in D$OPEN request
+
+;Returns TRUE	S1/ User number
+;		S2/ Directory number
+
+;	 FALSE	S1/ NSP reason code
+;		S2/ Pointer to reason string
+
+CHKUSR:	STKVAR	<<ACBLK,3>,USRNUM,<DIRPSW,10>>	;[0031] Allocate local variables
+	MOVX	S1,RC%EMO		;Require exact match
+	HRROI	S2,SRVUSR		;POINT TO USER NAME GIVEN
+	SETZM	T1			;GOOD FORM
+	RCUSR				;CHECK USER NUMBER
+	  ERJMP	CKUER1			;BAD USER NAME
+	JUMPE	T1,CKUER1		;...
+	MOVEM	T1,USRNUM		;SAVE USER NUMBER FOR CHKACC
+	MOVE	S2,T1			;GET IN PROPER AC FOR RCDIR
+	SETZM	T1			;GOOD FORM
+	RCDIR				;GET DIRECTORY FOR THIS USER
+	  ERJMP	CKUER1			;CAN'T HAPPEN
+	JUMPE	T1,CKUER1		;BAD DIRECTORY HERE
+	MOVEM	T1,.ACDIR+ACBLK		;[0031] SAVE DIRECTORY NUMBER
+	MOVE	S1,.ACDIR+ACBLK		;[0031] GET DIRECTORY NUMBER
+	MOVEI	S2,DIRBLK		;POINT TO THE BLOCK
+	MOVEI	T1,.CDDAC+1		;GET LENGTH OF ARGUMENT BLOCK
+	MOVEM	T1,.CDLEN(S2)		;SAVE FOR THE CALL
+	HRROI	T1,SRVACT		;POINT TO ACCOUNT STRING
+	SKIPN	SRVACT			;ALREADY SPECIFIED?
+	MOVEM	T1,.CDDAC(S2)		;NO, GET DEFAULT FROM DIRECTORY IF ANY
+	HRROI	T1,DIRPSW		;POINT TO PASSWORD STRING
+	GTDIR				;GET ALL THE DIRECTORY STUFF
+	  ERJMP	CKUER1			;GIVE UP
+
+;HERE TO CHECK PASSWORD
+CHKUPW:	HRROI	S1,SRVPSW		;[0031] Get pointer to users password
+	MOVEM	S1,.ACPSW+ACBLK		;[0031] Save it for ACCES function
+	SETOM	.ACJOB+ACBLK		;[0031] Default to our job number
+	MOVX	S1,AC%PWD+3		;[0031] Want password validation fcn
+	MOVEI	S2,ACBLK		;[0031] Address of arg block
+	ACCES				;[0031] Validate the password
+	 ERJMP	CHKU.1			;[0031] Failed,,try string compare
+	JRST	CHKUAC			;[0031] Win,,compare account strings
+
+CHKU.1:	HRROI	S1,DIRPSW		;HERE IS ACCES FAILS SINCE THE
+	HRROI	S2,SRVPSW		;ACCES FUNCTION TO VALIDATE PSW'S
+	STCMP				;MAY NOT BE IMPLEMENTED IN THIS MONITOR
+	JUMPN	S1,CKUER2		;FAIL IF NOT EXACT
+
+;HERE IF PASSWORDS MATCH TO VALIDATE THE ACCOUNTING DATA
+CHKUAC:	MOVE	S1,.ACDIR+ACBLK		;[0031] GET DIRECTORY NUMBER
+	HRROI	S2,SRVACT		;POINT TO REMOTE ACCOUNT STRING
+	VACCT				;VALIDATE THE ACCOUNT
+	  ERJMP	CKUER3			;NOT VALID
+	MOVE	S1,USRNUM		;Return user number
+	MOVE	S2,.ACDIR+ACBLK		;[0031] Return directory number
+	$RETT				;Return success
+
+
+;HERE IF ERROR VALIDATING USER
+CKUER1:	SKIPA	S2,[TXT(Invalid user-id)]
+CKUER2:	MOVX	S2,TXT(Invalid password)
+	MOVX	S1,.DCX34		;Generic error type
+	$RETF				;Return the failure
+
+CKUER3:	MOVX	S1,.DCX36		;ERROR FOR BAD ACCOUNT
+	MOVX	S2,TXT(Invalid account)
+	$RETF				;Return the failure
+
+SUBTTL	CREFRK	Fork creation and initializtion
+
+;ACCEPTS	No arguments
+
+;RETURNS TRUE	S1/ Count of active forks
+;		    Fork has been started
+
+;	 FALSE	Server fork could not be started
+
+CREFRK:	MOVSI	T2,-MAXSRV
+	SKIPN	FRKTBL(T2)		;Fork available?
+	JRST	CREFR1			;Yes..use it
+	AOBJN	T2,.-2			;No..look at next slot
+	$RETF				;No more forks available
+
+CREFR1:	MOVX	S1,CR%CAP+CR%ACS	;[0025]Allow forks capabilities
+	SETZ	S2,			;[0025]POINT AT MY ACS
+	CFORK
+	 ERJMP	.RETF			;Give Up if CFORK fails
+	AOS	FRKCNT			;Bump active fork count
+	MOVEM	S1,FRKTBL(T2)		;Save fork handle
+	HRLZ	S2,S1			;Set up to Map my pages
+	MOVSI	S1,.FHSLF		;Map my address space
+	MOVX	T1,PM%RD!PM%EX!PM%CPY!PM%CNT!NFKPGS
+	PMAP
+	 ERJMP	CREFR2
+	HRRZ	S1,FRKTBL(T2)		;Start the fork as a server
+	MOVEI	S2,[JRST SRV]
+	SFORK
+	 ERJMP	CREFR2
+	MOVE	S1,FRKCNT		;Return count of active forks
+	$RETT
+
+CREFR2:	HRRZ	S1,T2			;Get fork index
+	$CALL	KILFRK			;Kill the fork
+	$RETF				;Return the failure
+
+SUBTTL	KILFRK	Routine to kill a server
+
+;ACCEPTS	S1/ index into FRKTBL
+
+;RETURNS TRUE	S1/ Number of active forks
+;		Fork has been killed
+
+KILFRK:	SETZ	T2,			;Set up to clear and fetch
+	EXCH	T2,FRKTBL(S1)		;Get the fork stuff
+	HRRZ	S1,T2			;Get the fork handle
+	HLRZ	S2,T2			;Get offset to page
+	KFORK
+	 ERJMP	.+1			;Can't happen
+KILFR1:	SOS	S1,FRKCNT		;Decr active fork count
+	$RETT				;Return
+SUBTTL	LOGSNM	Routine to log system name
+
+LOGSNM:	STKVAR	<<SYSNAM,20>>		;Get some space for system name
+	MOVX	S1,'SYSVER'		;NAME OF GETTAB FOR SYSNAME
+	SYSGT				;GET IT
+	HRLZ	T1,S2			;GET TABLE#,,0
+	MOVEI	T2,SYSNAM		;Point to name storage
+	HRLI	T2,-20			;GET COUNT
+LOGSN1:	MOVS	S1,T1			;GET N,,TABLE#
+	GETAB				;GET THE ENTRY
+	  MOVEI	S1,0			;USE ZERO IF LOSING
+	MOVEM	S1,(T2)			;STORE THE RESULT
+	ADDI	T1,1			;POINT TO NEXT ENTRY
+	AOBJN	T2,LOGSN1		;GET IT
+	HRROI	S1,SYSNAM		;POINT TO THE NAME
+	$TEXT	(,<^Q/S1/>)
+	$RETT				;RETURN TRUE
+SUBTTL	LOGMSG	Text output routine for Superior FAL
+
+LOGMSG:	SKIPE	LOGHDR			;First time here
+	JRST	LOGMS1			;No..proceed
+	$TEXT	(LOGCHR,<^H/[-1]/^A>)	;Yes..write the header
+	SKIPE	STREAM			;Am I inferior?
+	$TEXT	(LOGCHR,< SRV-^D1/STREAM/  ^A>) ;Yes..log srv-n
+	SKIPN	STREAM
+	$TEXT	(LOGCHR,<	^A>)	;No..display a tab
+	SETOM	LOGHDR
+LOGMS1:	JUMPE	S1,LOGMS2		;End of message?
+	SKIPL	LOGHDR			;Ready for indention?
+	$TEXT	(LOGCHR,<		^A>) ;yes..do it
+	SETOM	LOGHDR			;Clear indention flag
+	CAIN	S1,.CHLFD		;Unless this is a line feed
+	MOVNS	LOGHDR			; Store a +1
+	PJRST	LOGCHR			;Log the character and return
+
+LOGMS2:	SKIPG	LOGHDR			;Was the last thing a line feed?
+	$TEXT	(LOGCHR,<>)		;No..write one
+	SETZM	LOGHDR			;Clear the header flag
+	$RETT				;And return
+
+LOGCHR:	MOVE	S2,S1			;No..move character to S2
+	SKIPL	S1,LOGIFN
+	$CALL	F%OBYT			;Write the character
+	$RETT
+
+SUBTTL	MSGCHR	Text output routine routine for inferior servers
+
+MSGCHR:	SKIPE	LOGHDR			;First time here?
+	JRST	MSGCH1			;Store the character
+	MOVE	S2,[POINT 7,MSGTXT]	;Point to IPCF message block
+	MOVEM	S2,MSGPTR		;Store the pointer
+	MOVEI	S2,MSGSIZ		;Get max character count
+	MOVEM	S2,MSGCNT		;Store the count
+	SETOM	LOGHDR			;Flag headers set
+MSGCH1:	SOSLE	MSGCNT			;Bump character count
+	IBP	MSGPTR			;Bump the pointer
+	DPB	S1,MSGPTR		;Store the character
+	JUMPN	S1,.RETT		;Return if not null
+	IDPB	S1,MSGPTR		;Store the null
+	SETZM	LOGHDR			;Clear the log header flag
+MSGCH2:	MOVEI	S1,MT.TXT		;Get text message type
+	MOVEM	S1,MSGHDR		;Store it in header
+	MOVEI	S1,.CMTXT		;Get text argument type
+	MOVEM	S1,MSGARH		;Store in Argument header
+	MOVE	S1,MSGPTR		;Get message pointer
+	MOVEI	S1,-MSGARC(S1)		;Get argument length
+	HRLM	S1,MSGARH		;Save size in arg header
+	AOS	MSGARC			;Increment argument count
+	ADDI	S1,MSGARH-MSGHDR	;Get size of message
+	HRLM	S1,MSGHDR		;Save in the header
+	MOVEI	S2,MSGHDR		;Point to the message
+	PJRST	SNDFAL			;Send the message to FAL
+	$RETT
+SUBTTL	SNDFAL	Routine to send IPCF packet to FAL
+
+;ACCEPTS	S1/ Length of message
+;		S2/ Address of message
+
+SNDFAL:	MOVE	T1,FALPID
+	MOVEM	T1,SNDSAB+SAB.PD	;Send only to FAL
+SNDMSG:	MOVE	T1,STREAM		;Get my stream number
+	MOVEM	T1,.MSCOD(S2)		;Save in message
+	MOVEM	S1,SNDSAB+SAB.LN	;Store the length
+	MOVEM	S2,SNDSAB+SAB.MS	;Store the address
+	MOVEI	S1,SAB.SZ
+	MOVEI	S2,SNDSAB
+	$CALL	C%SEND
+	$RETT				;Don't care about failures
+	
+;RELJFN		QUICKY ROUTINE TO RELEASE ALL NON-OPEN JFNS
+;ACCEPTS	NO ARGUMENTS
+;RETURNS	TRUE ALWAYS
+
+CLSJFN::SKIPA	S1,[EXP CZ%ABT!.FHSLF]	;ABORT ALL FILE OPERATIONS
+RELJFN::MOVX	S1,CZ%NCL!.FHSLF	;RELEASE ALL NON-OPEN JFNS
+	CLZFF
+	 ERJMP	.+1			;Ignore any errors
+	$RETT				;RETURN
+
+;CPYSTR		QUICKY ROUTINE TO COPY ASCIZ TEXT
+
+;ACCEPTS	S1/ DESTINATION POINTER
+;		S2/ SOURCE POINTER
+
+CPYSTR:	SETZ	T1,			;Terminate on Null
+	SOUT
+	$RET
+SUBTTL	PSIINI	Software interrupt system initialization
+
+PSIINI:	MOVEI	S1,.FHSLF		;Initialize for me
+	MOVE	S2,[LEVTAB,,CHNTAB]	;Point to tables
+	SIR
+	MOVX	S2,1B<.ICIPC>!1B<.ICCDN>!1B<.ICDAV>!1B<.ICIMA>!1B<.ICIFT>
+	AIC				;Turn on selected channels
+	EIR				;Enable requests
+	$RETT
+
+SUBTTL	Interrupt service routines
+
+INTPSI:	$BGINT	1
+	$CALL	C%INTR			;Flag the message
+	$DEBRK
+
+INTCDN:	$BGINT	1
+	MOVEI	S1,SRVLNK		;POINT TO OUR LINK
+	MOVEI	S2,.DICDN		;Get interrupt cause
+	$CALL	D$INTR
+	$DEBRK
+
+INTDAV:	$BGINT	1
+	MOVEI	S1,SRVLNK		;POINT TO OUR LINK
+	MOVEI	S2,.DIDAV		;Get interrupt cause
+	$CALL	D$INTR
+	$DEBRK
+
+INTINA:	$BGINT	1
+	MOVEI	S1,SRVLNK		;POINT TO OUR LINK
+	MOVEI	S2,.DIINA		;Get interrupt cause
+	$CALL	D$INTR
+	$DEBRK
+
+INTIFT:	$BGINT	1			;Inferior fork termination
+	SETOM	FRKFLG			;Request fork status check
+	$DEBRK				;Dismiss for now
+
+SUBTTL	Literals
+
+;Dump the literals
+
+	LSTOF.
+	LIT
+	LSTON.
+
+SUBTTL	Interrupt tables
+
+	.PSECT	DATA			;Load into impure storage
+
+LEVTAB:	LEV1PC
+	EXP  0
+	EXP  0
+
+;INTERRUPT CHANNELS
+
+RADIX 5+5
+
+CHNTAB:
+ICHPSI:	1,,INTPSI			;PSI interrupts
+ICHDAV:	1,,INTDAV			;Data available
+ICHCDN:	1,,INTCDN			;Connect/Disconnect
+ICHINA:	1,,INTINA			;Interrupt message
+ICH004:	BLOCK 1				;ASSIGNABLE CHANNEL 4
+ICH005:	BLOCK 1				;ASSIGNABLE CHANNEL 5
+ICHAOV:	BLOCK 1				;ARITHMETIC OVERFLOW
+ICHFOV:	BLOCK 1				;FLOATING OVERFLOW
+ICH008:	BLOCK 1				;RESERVED
+ICHPOV:	BLOCK 1				;PDL OVERFLOW
+ICHEOF:	BLOCK 1				;END OF FILE
+ICHDAE:	BLOCK 1				;DATA ERROR
+ICHQTA:	BLOCK 1				;QUOTA EXCEEDED
+ICH013:	BLOCK 1				;RESERVED
+ICHTOD:	BLOCK 1				;TIME OF DAY (RESERVED)
+ICHILI:	BLOCK 1				;ILLEG INSTRUCTION
+ICHIRD:	BLOCK 1				;ILLEGAL READ
+ICHIWR:	BLOCK 1				;ILLEGAL WRITE
+ICHIEX:	BLOCK 1				;ILLEGAL EXECUTE (RESERVED)
+ICHIFT:	1,,INTIFT			;INFERIOR FORK TERMINATION
+ICHMSE:	BLOCK 1				;MACHINE SIZE EXCEEDED
+ICHTRU:	BLOCK 1				;TRAP TO USER (RESERVED)
+ICHNXP:	BLOCK 1				;NONEXISTENT PAGE REFERENCED
+ICH023:	BLOCK 1				;ASSIGNABLE CHANNEL 23
+ICH024:	BLOCK 1				;ASSIGNABLE CHANNEL 24
+ICH025:	BLOCK 1				;ASSIGNABLE CHANNEL 25
+ICH026:	BLOCK 1				;ASSIGNABLE CHANNEL 26
+ICH027:	BLOCK 1				;ASSIGNABLE CHANNEL 27
+ICH028:	BLOCK 1				;ASSIGNABLE CHANNEL 28
+ICH029:	BLOCK 1				;ASSIGNABLE CHANNEL 29
+ICH030:	BLOCK 1				;ASSIGNABLE CHANNEL 30
+ICH031:	BLOCK 1				;ASSIGNABLE CHANNEL 31
+ICH032:	BLOCK 1				;ASSIGNABLE CHANNEL 32
+ICH033:	BLOCK 1				;ASSIGNABLE CHANNEL 33
+ICH034:	BLOCK 1				;ASSIGNABLE CHANNEL 34
+ICH035:	BLOCK 1				;ASSIGNABLE CHANNEL 35
+
+RADIX 8
+
+	.ENDPS	DATA
+
+SUBTTL	IMPURE	Storage
+
+	.PSECT	DATA
+
+DEFINE	$DATA (NAME,SIZE<1>) <
+ NAME:	BLOCK SIZE
+	 ..LOC==.>
+
+
+$DATA	FRKTBL,MAXSRV			;LH offset to fork data pages
+$DATA	STREAM,1			;My stream number
+$DATA	FALPID,1			;Fal's pid
+$DATA	MESSAG,1			;Address of latest IPCF message
+$DATA	FRKFLG,1			;-1 to check fork status
+$DATA	FRKCNT,1			;Count of active forks
+$DATA	SLPTIM,1			;Max time to sleep in main loop
+$DATA	LOGIFN,1			;Logfile IFN
+					;RH fork handle
+
+$DATA	DATORG,0				;Start of area to clear
+
+;Interrupt PC locations
+
+$GDATA	LEV1PC,1			;RETURN PC FOR INTERRUPT LEVEL 1
+
+$DATA	PDL,PDLEN			;PUSH DOWN POINTER
+
+$DATA	SRVOBJ,5			;Requested object name
+
+$DATA	SRVBEG,0			;Start of area to clear for SRV
+$DATA	SRVNOD,2			;Remote node name
+$DATA	SRVUSR,^D8			;[0026]Remote user name
+$DATA	SRVPSW,^D8			;[0026]Remote password string
+$DATA	SRVACT,^D8			;[0026]Remote account string
+$DATA	SRVOPD,5			;Optional data
+$DATA	SRVFIL,FILSIZ			;Remote file spec
+$DATA	DIRBLK,.CDDAC+1			;Size of directory storage
+	SRVSIZ==.-SRVBEG
+
+$DATA	REMSWS,1			;Remote file switches
+
+
+$DATA	SNDSAB,SAB.SZ
+$DATA	MSGPTR,1			;Pointer to log message char
+$DATA	MSGCNT,1			;Remaining room in MSGTXT
+
+;IPCF message area
+
+$DATA	MSGHDR,MSHSIZ			;Message header area
+$DATA	MSGARF				;Message argument flags
+$DATA	MSGARC				;Message argument count
+$DATA	MSGARH				;Message argument header
+$DATA	MSGTXT,<MSGSIZ/5+1>		;Message body goes here
+$DATA	ERRTXT,^D30			;Room to store error text
+
+$DATA	LOGHDR,1			;LOG HEADER FLAG
+
+	.ENDPS	DATA			;End of Impure storage
+
+	END	<3,,ENTVEC>

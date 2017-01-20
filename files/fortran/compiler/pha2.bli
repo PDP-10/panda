@@ -1,0 +1,1065 @@
+
+!COPYRIGHT (c) DIGITAL EQUIPMENT CORPORATION 1972, 1987
+!ALL RIGHTS RESERVED.
+!
+!THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED
+!ONLY  IN  ACCORDANCE  WITH  THE  TERMS  OF  SUCH LICENSE AND WITH THE
+!INCLUSION OF THE ABOVE COPYRIGHT NOTICE.  THIS SOFTWARE OR ANY  OTHER
+!COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY
+!OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF THE  SOFTWARE  IS  HEREBY
+!TRANSFERRED.
+!
+!THE INFORMATION IN THIS SOFTWARE IS SUBJECT TO CHANGE WITHOUT  NOTICE
+!AND  SHOULD  NOT  BE  CONSTRUED  AS A COMMITMENT BY DIGITAL EQUIPMENT
+!CORPORATION.
+!
+!DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR RELIABILITY  OF  ITS
+!SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.
+
+!AUTHOR: NORMA ABEL/HPW/SRM/SJW/DCE/TFV/EGM/ALB/CDM
+
+MODULE PHA2(RESERVE(0,1,2,3),SREG=#17,VREG=#15,FREG=#16,DREGS=4,START)=
+BEGIN
+
+!	REQUIRES FIRST, TABLES,OPTMAC
+
+GLOBAL BIND PHA2V = #11^24 + 0^18 + #2521;	! Version Date:	8-MAR-85
+
+%(
+
+***** Begin Revision History *****
+
+94	-----	-----	CALL I/O OPTIMIZER TO FOLD OUTERMOST
+			LEVEL OF I/O LISTS
+95	-----	-----	REVISION TO ORIGINAL EDIT 94
+96	-----	-----	ADD REREDID TO IOCLEAR
+97	-----	-----	ADD SETTING/RESETTING OF GCALLSLFLG AND PARAMETER
+			TI IOCLEAR
+98	-----	-----	DO NOT SAVESPACE ON LOGICAL IF IF SRCOPT IS
+			ZERO. OCCURS IN ERROR CASE
+99	-----	-----	INSERT A CONTINUE AFTER EVERY DO NODE
+			TO BE ABLE TO SET BITS ON IT
+			AND STILL DO COMMON SUBS ON THE FIRST
+			STATEMENT IN THE LOOP
+100	-----	-----	ADJUST FOR NEW GRAPH STRUCTURE
+101	-----	-----	CALL DOTOPROPAGATE AND DO NOT ADJUST THE STACK
+102	-----	-----	FIX UP ERROR MESSAGE CALLS AND TESTREPLACEMENT
+			ON LOOPS WITH EXITS
+103	-----	-----	PUNT!
+104	-----	-----	SAVSPACE EXPRESSION HASH ENTRIES
+105	-----	-----	FIX ROTTEN TEST FOR SUPPLANTING AND
+			MAKE SPECIAL CASE IN CONTINUE
+			GENERATION THAT WILL NOT GENERATE SO MANY
+106	-----	-----	FIX SPECIAL CASE MENTIOMED IN 105
+107	-----	-----	FIX REFERENCE TO MAIN. AS NAME OF MAIN PROGRAM
+108	263	15865	FIX VALUE SAVED FOR STACK RESTORE
+
+***** Begin Version 5 *****
+
+109	VER5	-----	RECALL GLOBELIM WITH STARTING VALUE OF VERYFRST
+			  FOR GLOBDEP
+			CALL ZTREE TO ZERO DEFPTS & CLEAN UP .O SYMTBL
+			SET/RESET GLOBELIM2 TO FLAG 2ND GLOBELIM, (SJW)
+110	425	QA714	CALL ZTREE TO CLEAR DEFPTS IF OPTIMIZATIONS
+			  DISCONTINUED IN OPTERR, (SJW)
+
+***** Begin Version 5B *****
+
+111	720	27830	GIVE BETTER CODE FOR ASSIGNED GO TO STMNT /OPT, (DCE)
+
+***** Begin Version 6 *****
+
+112	760	TFV	1-Feb-80	-----
+	Fix edit 720 so it only throws away created lists
+
+113	1047	EGM	22-Jan-81	Q10-05325
+	Add support for TOPS-10 execute only.
+
+114	1066	EGM	12-May-81	Q10-05202
+	Do not use ISN in error messages if not pertinent.
+
+115	1105	DCE	26-Jun-81	-----
+	Correct label count for DO loops ending on same label.
+
+***** Begin Version 7 *****
+
+1633	TFV	1-Sep-82
+	Count number of executable statements.
+
+
+***** Begin Version 10 *****
+
+2474	TFV	21-Sep-84
+	Fix continuation processing to handle unlimited numbers of blank
+	and comment  lines between  continuation lines.   The lines  are
+	recorded in  a linked  list  of four  word entries,  defined  in
+	LEXAID.BLI.  If there are too many blank and comment lines,  the
+	buffer will get an overflow.   When this happens, the buffer  is
+	compacted using the information in the linked list.  The info is
+	also used  to speed  up continuation  processing in  the  lexeme
+	scan.
+
+2500	AlB	14-Nov-84
+	Change the list of entries for source lines from a linked list
+	in dynamic memory to a fixed-length list in static memory.
+
+	This edit blew away all that was done in edit 2474.
+
+2521	CDM	8-Mar-85
+	Correct call to SAVSPAC for returning hash table entries.  Size was
+	"magic number", rather than the symbol, the size of which has
+	grown.  One word too few was being returned for every hash table.
+
+***** End V10 Development *****
+
+***** End Revision History *****
+
+)%
+
+SWITCHES NOLIST;
+REQUIRE FIRST.BLI;
+REQUIRE TABLES.BLI;
+REQUIRE OPTMAC.BLI;
+SWITCHES LIST;
+SWITCHES NOSPEC;
+
+
+!++
+! 	OPTIMIZER OVERLAY
+! 
+! PHA2 contains MRP2, the controlling routine for FORTD.  It first makes a
+! pass over the entire source tree, performing skeleton optimizations for
+! each statement and global optimization for I/O lists.
+!
+! It then walks the the source tree one DO-loop at a time, from the inside
+! out, performing global optimization of each DO-loop.  This entails
+! building a graph of the statements in the DO-loop (GPHBLD), calculating
+! pre- and post-dominators (FLOOD), computing definition points (DEFDRIV),
+! performing global common sunexpression elimination and motion of
+! loop-invariant expressions and assignments out of the loop (GLOBELIM),
+! constant propagation and reduction in strength (PROPAGATE), test
+! replacement (TESTREPLACE and SUPPLANT), and a second pass at code motion
+! (GLOBELIM).
+!
+! After this has been done for each DO-loop, as well as the main proram
+! unit, an attempt is made to propagate .Onnnn variables (DOTOPROPAGATE).
+! Then definition points are cleared (ZTREE), I/O lists are folded into
+! IOLSTCALL, E1LISTCALL, and E2LISTCALL nodes (IOCLEAR), local common
+! subexpression elimination is performed (LOCELIM), and operations to
+! memory are detected (MEMCMCHK).
+!--
+
+EXTERNAL
+	BASE BACKST,
+	BASE QQ,
+	BOTTOM,
+	CDONODE,
+	CORMAN,
+	BASE CSTMNT,
+	DEFDRIV,
+	DLOOPTREE,
+	DOCNT,
+	DOCOLLAPSE,
+	DOPARMS,
+	DOTOPROPAGATE,
+	DWP,
+	EHASH,
+	FGRAPH,
+	FLOOD,
+	GLOBELIM,
+	GPHBLD,
+	GREGALC,
+	INDVAR,
+	INNERLOOP,
+	LEND,
+	BASE LENTRY,
+	LOCELIM,
+	LOCELMIO,
+	BASE LOOP,
+	LOOPNO,
+	LPRDCCT,
+	MAKASSOC,
+	MEMCMCHK,
+	P2SKSTMNT,
+	POOL,
+	PROGNAME,
+	PROPAGATE,
+	RDCCT,
+	RGRAPH,
+	SAVE17,		!TO SAVE STACK REGISTER IN CASE OF
+			!EMERGENCY EXIT
+	SAVSPACE,
+%1633%	STCNT,
+	SUPPLANT,
+	TESTREPLACE,
+	BASE TOP,
+	VERYFRST,
+	WALKER,
+	WARNERR,
+	WARNOPT,
+	ZTREE;
+
+
+	MACHOP POPJ=#263;
+
+
+FORWARD UNFUDGDO;
+FORWARD LABLADJ,DRIVDOALLOC,DOALLOCDECIDE;
+
+!**********************
+!EXIT MACRO
+!************************
+
+MACRO DEAD=
+	BEGIN
+		SREG<0,36>_.SAVE17<0,36>;
+		POPJ (#17,0);
+	END$;
+
+ROUTINE PASSOUT=
+!++
+! Make one more pass over the source tree (in SRCLINK order).  For each
+! statement it does the following:
+! 
+!      1.  It clears TARADDR for all statements
+! 
+!      2.  If the statement is an I/O statement which might have an  I/O
+!          list, it calls to  IOCLEAR to fold  I/O lists into  IOLSTCALL,
+!          E1LISTCALL, and E2LISTCALL nodes.
+! 
+!      3.  If the statement is not an I/O statement which might have  an
+!          I/O  list,  and is not optimizer-created, it calls LOCELIM to
+!          perform local common subexpression elimination.  These common
+!          subexpressions  are  CMNSUB  nodes,  and  are linked onto the
+!          statements that they came  from.
+! 
+!      4.  It clears the GOTOLIST  of  assigned  GOTO  statements  which
+!          didn't originally have a GOTOLIST (i.e., NOLBLLST is set).
+! 
+!      5.  MEMCMCHK  is  called  to  detect  operations  which  can   be
+!          performed to memory, just as MRP2S does.
+!--
+
+
+BEGIN
+	EXTERNAL IOCLEAR,IOPTFLG;
+	EXTERNAL CSTMNT,BACKST,LOCELIM,MEMCMCHK;
+	MAP BASE CSTMNT;
+	EXTERNAL CORMAN,LOCELMIO,LOCLNK;
+
+	!THIS ROUTINE CLEANS UP FOR A GRACEFULL EXIT FROM THE OPTIMIZER. IT
+	!IS USED IN THE NORMAL EXIT CASE AFTER THE MAIN CODE AND ALSO FOR
+	!ERRORS.
+
+	!THE SERVICES PERFORMED ARE:
+	!1.	DO LOCAL COMMON SUBS
+	!2.	CLEAR TARGET WORDS
+	!3.	CATCH COMPUTATIONS TO MEMORY
+
+	!FIND LOCAL COMMON-SUB EXPRESSIONS IN ALL I/O STATEMENTS
+	NAME<LEFT>_4;
+	BACKST_CORMAN();
+	!GO THROUGH ALL STATEMENTS AND AMKE SURE THAT THE
+	!TARGET WORD IS ZERO
+	!INITIALIZE THE GLOBAL LOCLNK
+	LOCLNK_0;
+
+	CSTMNT_.SORCPTR<LEFT>;
+	GCALLSLFLG_1;
+	FLGREG<OPTIMIZE>_0;
+	WHILE .CSTMNT NEQ 0 DO
+	BEGIN
+
+%1633%		STCNT = .STCNT + 1;	! Count executable statements
+
+		!ZERO TARGET FIELD
+		CSTMNT[TARGADDR]_0;
+		IF .CSTMNT[SRCISN] NEQ 0 THEN
+		IF .CSTMNT[SRCID] GEQ READID AND .CSTMNT[SRCID] LEQ REREDID THEN
+			IOCLEAR(.CSTMNT)
+		 ELSE
+![720] WE ARE DONE WITH ANY CREATED LISTS OF ASSIGNED GO TO
+![720] LABELS.  THROW AWAY THE POINTER TO THEM SO THAT
+![720] WE DO NOT THINK THERE IS AN EXPLICIT LIST IN CODE GENERATION!
+![720] THIS RESULTS IN MUCH BETTER CODE OPTIMIZED.
+![760] Only throw away list if it was created, not if used specified it
+%[760]%			(LOCELIM(.CSTMNT);
+%[760]%			IF .CSTMNT[SRCID] EQL AGOID AND .CSTMNT[NOLBLLST]
+%[760]%			THEN CSTMNT[GOTOLIST]_0);
+		MEMCMCHK();
+		CSTMNT_.CSTMNT[SRCLINK];
+	END;
+	FLGREG<OPTIMIZE>_1;
+	GCALLSLFLG_0;
+END;
+
+GLOBAL ROUTINE OPTERR(NUMB)=
+BEGIN
+	!ERROR ROUTINE CALLED BY THE OPTIMIZER.
+	!PRINT ERROR MESSAGE, RESTORE STACK TO VALUE IT
+	!HAD ON ENTRY TO THIS OVERLAY AND GET OUT******
+
+
+	EXTERNAL CSTMNT,LOOP;
+	MAP BASE CSTMNT;
+	EXTERNAL ENTRY,ISN,WARNERR;
+
+	EXTERNAL  ZTREE;
+
+
+	WARNERR(.ISN,.NUMB);
+	!CLEANUP GRAPH POINTERS LEFT IN STATEMENT NODES,ELSE
+	!THE REGISTER ALLOCATOR WILL THINK THEY ARE POINTERS TO
+	!LOCAL COMMON SUB-EXPRESSIONS.
+
+	ZTREE ();		! CLEAR DEFPTS BEFORE LEAVING
+
+	!IF THIS IS A MAIN CODE SEGMENT  THEN FIX UP
+	!THE DO LOOP WE INSERTED SO THAT THE GLOBAL REGISTER
+	!ALLOCATOR WILL NOT DIE
+	IF .LOOP EQL 0 THEN UNFUDGDO();
+
+	PASSOUT();
+
+	DEAD;
+END;
+
+!********************************************
+
+!TWO LOCAL ROUTINES TO KLUDGE A PSEUDO DO-LOOP FOR THE MAIN PROGRAM
+
+	ROUTINE FUDGDO=
+	BEGIN
+		LOCAL BASE P:T:DL;
+	EXTERNAL CORMAN,TOP,LEND,QQ,NAME,GENLAB;
+		MAP BASE TOP:QQ;
+
+	!	1. THE DUMMY CONTINUE IN FRONT AS LENTRY
+	!	2. THE FUDGED DO LOOP NEXT AS TOP
+	!	3. BOTTOM WILL POINT TO THE END STATEMENT
+	!	4. LEND WILL POINT TO THE FUDGED CONTINUE
+
+		NAME_0;
+		NAME<LEFT>_DOSIZ+SRCSIZ;
+		TOP_
+		P_CORMAN();
+		!THIS WILL LOOK LIKE A DO LOOP IN THE SIZE
+		!FLAGS AND LABEL FIELD. IT WILL HAVE A SRCID
+		!OF A CONTINUE TO PREVENT PHASE 2 SKELETON
+		!OPTIMIZATIONS ON IT
+
+		P[SRCID]_CONTID;
+		P[OPRCLS]_STATEMENT;
+		DL_
+		P[DOLBL]_GENLAB();
+		!SET SNREFNO SO LABEL WILL BE CONSIDERED LOCAL
+		DL[SNREFNO]_2;
+		T_.SORCPTR<LEFT>;
+		!FOR A SUBPROGRAM, MAKE THE ENTRY STATEMENT LENTRY
+		!AND PUT TOP RIGHT AFTER IT, ELSE IF WE MOVE
+		!ANYTHING TO LENTRY IT WOULD BE INACCESSIBLE CODE.
+		!OPTIMIZING A BLOCK DATA PROGRAM IS ILLEGAL
+		IF .FLGREG<PROGTYP> NEQ MAPROG THEN
+		BEGIN
+			T_.T[SRCLINK];
+			WHILE .T[SRCID] EQL ENTRID DO
+			BEGIN
+				LENTRY_.T;
+				IF .T[SRCLINK] EQL 0 THEN
+					(PASSOUT(); DEAD;);
+				T_.T[SRCLINK];
+			END;
+		END;
+		P[SRCLINK]_.LENTRY[SRCLINK];
+		LENTRY[SRCLINK]_.P;
+		!GO THROUGH THE WHOLE THING LOOKING FOR
+		!THE STATEMENT BEFORE THE LAST TO LINK INTO
+		!THE CONTINUE WE WILL MAKE
+
+		!A HALF SPECIAL CASE
+		!SUBROUTINE SUB
+		!END
+		IF .T[SRCLINK] EQL 0 THEN
+			(PASSOUT();DEAD;);
+
+		WHILE .T[SRCLINK] NEQ .SORCPTR<RIGHT> DO
+			T_.T[SRCLINK];
+		!NOW MAKE THE CONTINUE TO GO WITH IT
+		NAME<LEFT>_SRCSIZ;
+		QQ_CORMAN();
+		T[SRCLINK]_.QQ;
+		QQ[OPRCLS]_STATEMENT;
+		QQ[SRCID]_CONTID;
+		QQ[SRCLBL]_.DL;
+		QQ[OPTCONFLG]_1;
+		!USE T AS A TEMP
+		T_.P[DOLBL];
+		T[SNHDR]_.QQ;
+		BOTTOM_QQ[SRCLINK]_.SORCPTR<RIGHT>;
+		!ALSO SET UP LEND
+		LEND_.QQ;
+	END;
+
+	ROUTINE UNFUDGDO=
+	BEGIN
+		!UNDO THE DO LOOP FUDGE SO NO ATTEMPT WILL BE MADE TO
+		!GENERATE CODE FOR IT
+
+		EXTERNAL SAVSPACE,QQ;
+		MAP BASE QQ;
+		LOCAL BASE T;
+		MAP BASE TOP;
+
+		!UNFORTUNATELY, WE HAVE TO LEAVE THE DUMMY CONTINUE
+		!IN THE PROGRAM TREE. BUT IT WILL NOT DEGRADE THE CODE.
+
+		!ALSO GO THROUGH THE REMAINING STATEMENTS AND
+		!RETURN THE OPTIMIZERS CORE TO THE FREE LIST
+		!AND ZERO SRCOPT (ELSE THE REGISTER ALLOCATOR
+		!ETC WILL THINK IT IS A POINTER TO A LOCAL COMNSUB
+		!WATCH OUT !********
+
+		T_.TOP;
+		WHILE .T NEQ .BOTTOM DO
+		BEGIN
+			IF .T[SRCOPT] NEQ 0 THEN
+			BEGIN
+				SAVSPACE(4,.T[SRCOPT]);
+				T[SRCOPT]_0;
+				IF .T[SRCID] EQL IFLID THEN
+				BEGIN
+					!LOGICAL IF STATEMENT
+					LOCAL BASE T1;
+					T1_.T[LIFSTATE];
+					IF .T1[SRCOPT] NEQ 0 THEN
+					BEGIN
+						SAVSPACE(4,.T1[SRCOPT]);
+						T1[SRCOPT]_0;
+					END;
+				END;
+			END;
+			T_.T[SRCLINK];
+		END;
+		!LOOK FOR THE STATMENT IN FRONT OF TOP
+		!SO TOP CAN BE SWAPPED WITH THE FIRST STATEMENT
+		!SO THAT THE REGISTER ALLOCATOR CAN FIND THE
+		!BOUNDS OF THE PROGRAM IF REQUIRED
+		T_.SORCPTR<LEFT>;
+		!LOOK FOR TOP (CODE MAY HAVE BEEN MOVED TO LENTRY)
+
+		WHILE .T[SRCLINK] NEQ .TOP DO
+			T_.T[SRCLINK];
+		!SWITCH THEM AROUND
+		T[SRCLINK]_.TOP[SRCLINK];
+		TOP[SRCLINK]_.SORCPTR<LEFT>;
+		SORCPTR<LEFT>_.TOP;
+	END;
+
+%[1047]% PORTAL ROUTINE MRP2 =
+!++
+! MRP2 is the controlling routine for FORTD.  This phase is by far the most
+! extensive part of the optimizer.  Unlike the global register allocator,
+! which is relatively self-contained, it includes a considerable amount of
+! code unique to the optimizer and spread out over several modules.
+!
+! MRP2 may be thought of as having three phases: a pre-optimization phase,
+! the main phase of the global optimizer, and a post-optimization phase.
+!--
+
+
+BEGIN
+
+	LOCAL CURVERYFRST;		! VERYFRST SIXBIT VALUE BEFORE GLOBELIM
+
+	!GET OUT IF THIS IS BLOCK DATA
+	IF .FLGREG<PROGTYP> EQL BKPROG THEN RETURN;
+
+	DWP_-1;
+	ISN_1;
+
+	!IF PHASE 1 ISSUED WARNINGS THAT MAY HURT OPTIMIZATION, GIVE A
+	!WARNING OF THAT FACT NOW
+
+%[1066]% IF .WARNOPT THEN WARNERR(0,E78);
+
+	INNERLOOP_FALSE;
+	DOCNT_0;
+
+	RGRAPH_0;
+	FGRAPH_0;
+
+	!INITAILIZE A VARIBALE TO STOP RANDOM USE. IT IS USED IN
+	!P2REGCNTS, A PART OF PHASE 2 SKELETON
+	NAME<LEFT>_DOSIZ+SRCSIZ;
+	CDONODE_CORMAN();
+
+	!MAKE LIST OF ASSOCIATE (RANDOM ACCESS I/O) VARIABLE
+	MAKASSOC();
+
+	!CREATE UNIQUE LABELS FOR ALL DO TERMINATIONS AND QUESTIONABLE
+	!STATEMENTS.
+	!ALSO CAUSE LOCAL OPTIMIZATIONS TO HAPPEN ON ALL STATEMENTS IN THE
+	!PROGRAM
+	LABLADJ();
+
+	!DECIDE ON GLOBAL ALLOCATION POSSIBILITIES
+	IF .DLOOPTREE NEQ 0 THEN DRIVDOALLOC(.DLOOPTREE);
+
+
+	!CHECK FOR MAIN PROGRAM WITH NO LOOPS
+	IF .DLOOPTREE NEQ 0 THEN
+	BEGIN
+		LOOPNO_1;			!INITIALIZE LOOPNO
+
+		! Get a pointer to the next DO-loop to process.  This is a
+		! destructive walk; WALKER destroys the structure of
+		! DLOOPTREE, although pointers to the nodes in the tree are
+		! still used later during graph building.  It is important
+		! to understand the order in which DO-loops are walked.
+
+		LOOP_WALKER();			!GET A DO LOOP
+
+		WHILE .LOOP NEQ 0 DO
+		BEGIN
+			!INDICATE COUNT OF LOOPS FOUND
+			DOCNT_.DOCNT+1;
+
+			!SAVE REDUCTION VARIABLE COUNTER SO WE KNOW HOW MANY
+			!WERE DONE
+			LPRDCCT_.RDCCT;
+
+			! Call DOPARMS to set up the globals LENTRY, TOP,
+			! LEND, BOTTOM, and INDVAR.  LENTRY points to the
+			! statement before the DO statement, TOP points to
+			! the DO statement, LEND points to the last
+			! statement of the DO-loop (a CONTINUE), BOTTOM
+			! points to the first statement after the DO-loop,
+			! and INDVAR points to the DO-variable.  These are
+			! used throughout the optimizer.
+
+			DOPARMS(.LOOP);
+
+			!PICK UP THE GLOBAL INFO USED
+
+			! Build the graph of the current loop.  Allocate
+			! extra optimizer words for each statement and
+			! build linked lists of predecessor and successor
+			! pointers for each statement.  Note that all loops
+			! contained in the current loop have been collapsed
+			! after being processed and are treated as single
+			! nodes in the graph.
+
+			GPHBLD();			!BUILD DIRECTED GRAPH
+
+			!SAVE LOTS OF USELESS WORK BY
+			!LOOKING FOR
+			!DO 10
+			!DO 10
+			!AS A SPECIAL, OFT OCCURRING CASE
+			QQ_.TOP[SRCLINK];
+			IF .QQ[SRCID] EQL DOID AND
+			.QQ[DOLBL] EQL .TOP[DOLBL] THEN
+			BEGIN
+				!ADD THE INDEX VARIABLE FOR THE LOOP
+				!TO THE DOCHNGL LIST OF THE INNER MORE
+				!LOOP
+				MAP PHAZ2 QQ:TOP;
+				LOCAL BASE TMP;
+				EXTERNAL NAME,CORMAN;
+				!GET CORE FOR ENTRY
+				NAME<LEFT>_1;
+				TMP_CORMAN();
+				!THE LEFTP FIELD POINTS TO THE INDEX
+				!VARIABLE FOR THIS LOOP
+				TMP[LEFTP]_.TOP[DOSYM];
+				!THE RIGHTP FIELD IS THE LINK TO 
+				!THE PREVIOUS DOCHNGL LIST. NOTE:
+				!THIS WORKS EVEN IF THE PREVIOUS DOCHNGL IS 0.
+				TMP[RIGHTP]_.QQ[DOCHNGL];
+				TOP[DOCHNGL]_.TMP;
+			END
+			ELSE
+			BEGIN
+				! Compute the pre- and post-dominator
+				! chains for each statement.
+
+				FLOOD();		!MOORE FLOOD
+
+				DEFDRIV();		!GET DEFINITION POINTS
+				CURVERYFRST _ MAKNAME (VERYFRST);	! TO BE PASSED TO GLOBDEP
+
+				! Eliminate global common subexpressions,
+				! move loop-invariant expressions out of
+				! the loop, and move loop-invariant
+				! assignment statements out of the loop (if
+				! the loop is not MAYBEZTRIP).  Note that
+				! global common subexpressions and
+				! loop-invariant expressions become
+				! assignment statements whose left hand
+				! sides are .Onnnn variables; CMNSUB nodes
+				! aren't used here.
+
+				GLOBELIM(.CURVERYFRST);	!COMMON SUBS AND
+							!CODE MOTION
+
+				PROPAGATE();		!CONSTANT PROPAGATION
+							!AND REDUCTION IN STRENGTH
+
+				!DO TESTREPLACEMENT IF POSSIBLE.
+				!REDUCTIONS WERE MADE REPLACING ALL
+				!OCCURRENCES OF THE INDEX AND THERE WERE NO
+				!LOOP EXITS (REQUIRING THE ACTUAL INDEX TO
+				!BE IN CORE).
+
+				IF ((TESTREPLACE() NEQ 0) 
+					AND NOT .TOP[HASEXIT]) THEN SUPPLANT();
+
+				! GLOBELIM is called again to make a second
+				! pass over the loop.  GLOBELIM2 is set to
+				! 1 to indicate that this is a second pass.
+
+				GLOBELIM2 _ 1;			! FLAG 2ND CALL
+				GLOBELIM(.CURVERYFRST);		! RECALL COMMON SUB ELIM 
+				GLOBELIM2 _ 0;
+			END;
+
+			DOCOLLAPSE();			!REDUCE LOOP TO A
+							!SINGLE NODE FOR GRAPH
+							!OF NEXT OUTER LOOP
+			LOOP_WALKER();
+			LOOPNO_.LOOPNO+1;
+		END;
+	END;
+
+	!NOW WE ARE UP TO THE MAIN PROGRAM
+	LENTRY_.SORCPTR<LEFT>;
+
+	!LOOK FOR A DO LOOP AS THE FIRST STATEMENT AND QUIT HERE
+	TOP_.LENTRY[SRCLINK];
+
+	!FOR GLOBAL ALLOCATION NEED TO FUDGE AND UNFUDGE A DO
+
+	! Create a CONTINUE statement at the beginning of the program unit
+	! and a CONTINUE statement at the end of the program unit.  The
+	! first CONTINUE is made to look somewhat like a DO statement, and
+	! is used to make the entire program unit look like one big
+	! DO-loop, so that the rest of the optimizer can deal with it.
+
+	FUDGDO();
+
+	IF .TOP[SRCID] EQL DOID AND .DOCNT EQL 1 
+	THEN	! Already optimized
+	ELSE
+	BEGIN	! First statement not DO, optimize entire program
+
+		!INDVAR IS USED AS A POINTER. WE MUST MAKE IT SOMETHING
+		!THAT WILL NOT BLOW UP WHEN USED AS A POINTER POOL HAS A
+		!ZERO IN IT, SO WE WILL USE POOL
+
+		INDVAR_POOL<0,0>;
+
+		! Compute the pre- and post-dominator chains for each
+		! statement.
+
+		GPHBLD();		! Build graph
+
+		FLOOD();		!MOORE FLOOD
+
+		DEFDRIV();		!DEFINITION POINT
+
+		! Eliminate global common subexpressions, move
+		! loop-invariant expressions out of the loop, and move
+		! loop-invariant assignment statements out of the loop (if
+		! the loop is not MAYBEZTRIP).  Note that global common
+		! subexpressions and loop-invariant expressions become
+		! assignment statements whose left hand sides are .Onnnn
+		! variables; CMNSUB nodes aren't used here.
+
+		CURVERYFRST _ MAKNAME (VERYFRST);
+		GLOBELIM(.CURVERYFRST);	!CODE MOTION AND COMMON SUBS
+
+		PROPAGATE();		!CONSTANT PROPAGATION AND REDUCTION IN STRENGTH
+
+		! GLOBELIM is called again to make a second pass over the
+		! loop.  GLOBELIM2 is set to 1 to indicate that this is a
+		! second pass.
+
+		GLOBELIM2 _ 1;		! FLAG 2ND CALL
+		GLOBELIM(.CURVERYFRST);	! COMMON SUBS ELIM AGAIN
+		GLOBELIM2 _ 0;
+
+	END;	! First statement not DO, optimize entire program
+
+	!UNFUDG THE DO LOOP
+
+	! Clean up the pointers around the bogus CONTINUE statement (which
+	! looks like a DO statement).  Also deallocate the extra words
+	! created by the optimizer.  Note that the added CONTINUE
+	! statements are never removed.
+
+	UNFUDGDO();
+
+
+	!TRY TO PROPAGATE .O VARS
+
+	! Look for assignments of DATAOPRs to .O, .S, and .I variables.  If
+	! the assignments meet certain conditions, the statements are
+	! removed and all references to the left hand side are replaced
+	! with the right hand side.
+
+	DOTOPROPAGATE();
+
+	ZTREE ();		! ZERO DEFPTS BEFORE LEAVE
+
+	!GET OUT SMOOTHLY
+	PASSOUT();
+
+	FLGREG<OPTIMIZE>_1;
+
+	!***********************************!*!*!*!*!*!*!**!*!*!*!
+	!NOTE:
+	!	MAY WANT TO DO THIS INSTEAD OF SETINF EMPTY BIT
+	!!!*!*!*!*!*!*!*!*!*!*!*!*!*!*!*!*!*!*!*!*!*!*!*!*!*!*!*!*
+
+	! Step through the hash table, deallocating all entries.
+
+	INCR I FROM 0 TO EHSIZ-1 
+	DO
+	BEGIN	! Each hash bucket
+
+		REGISTER BASE T:GP;
+	
+		T_.EHASH[.I];		! Contents of bucket
+
+		WHILE .T NEQ 0 		! Test for existance of entry
+		DO
+		BEGIN	! Each hash entry
+
+			GP_.T[CLINK];	! Next entry, save before returning
+%2521%			SAVSPACE(HSHSIZ-1, .T);
+			T_.GP;
+
+		END;	! Each hash entry
+
+	END;	! Each hash bucket
+
+END;	! of MRP2
+
+ROUTINE LABLADJ=
+!++
+! GIVE EACH LABEL A UNIQUE CONTINUE STATEMENT AND ADJUST ALL DO LOOPS TO
+! END ON THEIR OWN LABELED CONTINUE. AT THE SAME TIME ELIMINATE REFERENCES
+! TO UNREFERENCED LABELS BY ZEROING THE SRCLBL FIELD OF THE NODE AT WHICH
+! THEY ARE DEFINED.
+!
+! THIS PROCESS SAVES MANY SPECIAL CONTEXT CHECKS AND ADJUSTMENTS. IT THUS
+! ELIMINATES HIGH SEG CODE AT THE EXPENSE OF EXPANDING THE LOW SEGMENT. IT
+! REQUIRES ABOUT 106 NEW LABELS TO BE AT THE BREAK EVEN POINT IN SIZE.
+!
+! SOME OF THE SPECIAL CONTEXTS HELPED BY THIS DEVICE ARE:
+! 	1.DO LOOP ENDINGS WITH REDUCTIONS IN STRENGTH
+! 	2.COMMON SUB-EXPRESSIONS
+! 	3.RECOMPUTING LABLE INFORMATION FOR GLOBAL REG. ALLOC
+! 	4.SPECIAL CASING IN GLOBAL ALLOCATION FOR FUNCTION SAVE/RESTORE
+! 	5.DO LOOPS ENDING ON A LOGICAL IF
+!
+! IT ALSO PERMITS ADDITIONAL INFORMATION TO BE KEPT WITH THE DATA STRUCTURE
+! THAT IS PASSED BETWEEN OPTIMIZATION AND GLOBAL ALLOCATION AND ADDITIONAL
+! INFORMATION ABOUT DO LOOPS WITHIN THE OPTIMIZER ITSELF. THIS HAPPENS
+! BECAUSE OF THE UNIQUENESS OF THE DO LOOP ENDING AND ITS LABEL.
+!
+! ALSO CALL FOR LOCAL OPTIMIZATIONS ON EACH STATEMENT.
+!--
+
+
+BEGIN
+	! LABLADJ walks all statements in the source tree in SRCLINK order.
+
+	EXTERNAL MAKCONTINUE,GENLAB;
+	EXTERNAL P2SKSTMN,ISN;
+	OWN BASE PREV:MADLBL:FIRSTCONT;
+	MAP BASE PREV:CSTMNT;
+	OWN BASE STMTLBL:NEWCONT:DONODECHAIN:DONODE;
+	LABEL PROCSLAB,NEWC;
+
+	!GO THROUGH THE ENCODED SOURCE TREE
+
+	PREV_CSTMNT_.SORCPTR<LEFT>;
+	WHILE .CSTMNT NEQ 0 DO
+	BEGIN	! For each statement
+
+		ISN_.CSTMNT[SRCISN];
+
+		! Call P2SKSTMN to perform skeleton optimizations for each
+		! statement, just as MRP2S does.  This includes
+		! canonicalizing and simplifying expressions, constant
+		! folding, marking DO-loops which shouldn't be AOBJN loops,
+		! etc.  However, there is one important difference:
+		! skeleton optimization of I/O lists is done through a
+		! macro called SKIOLST, which checks FLGREG<OPTIMIZE> and
+		! calls SKIOLIST if not optimizing and SKOPTIO if
+		! optimizing.
+
+		P2SKSTMN();		!CALL FOR LOCAL OPTIMIZATIONS
+
+		!INSERT A CONTINUE AFTER EACH DO LOOP NODE
+		!SO WE CAN SET BITS ON IT IN THE DEFPT
+		!ALGORITHM
+
+		IF .CSTMNT[SRCID] EQL DOID THEN
+		BEGIN
+			NEWCONT_MAKCONTINUE();
+			NEWCONT[SRCLINK]_.CSTMNT[SRCLINK];
+			CSTMNT[SRCLINK]_.NEWCONT;
+		END;
+
+
+		!IS THE STATEMENT LABELED WITH A REFERENCED LABEL
+		PROCSLAB:
+		IF .CSTMNT[SRCLBL] NEQ 0 THEN
+		BEGIN
+			!GET THE LABLE TABLE ENTRY
+			STMTLBL_.CSTMNT[SRCLBL];
+			FIRSTCONT_0;
+
+			!1. DELETE IT IF UNREFERENCED
+			IF .STMTLBL[SNREFNO] EQL 1 AND .CSTMNT[SRCID] NEQ FORMID THEN
+			BEGIN
+				CSTMNT[SRCLBL]_0;
+				LEAVE PROCSLAB;
+			END;
+
+		!FOR ALL LABELLED DO LOOPS INSERT
+		!A CONTINUE IN FRONT OF THE DO AND
+		!MOVE THE LABEL TO THE CONTINUE
+		IF .CSTMNT[SRCID] EQL DOID THEN
+		BEGIN
+			NEWCONT_PREV[SRCLINK]_MAKCONTINUE();
+			NEWCONT[SRCLBL]_.STMTLBL;
+			CSTMNT[SRCLBL]_0;
+			STMTLBL[SNHDR]_.NEWCONT;
+			NEWCONT[SRCLINK]_.CSTMNT;
+			CSTMNT[DOPRED]_.NEWCONT;	!POINTER TO PREDECESSOR
+			LEAVE PROCSLAB
+		END;
+
+			!LINK ANY FORMATS OUT. EVENTUALLY PHASE 1 WILL
+			!DO THIS AND THERE WILL BE NONE TO LINK OUT
+			IF .CSTMNT[SRCID] EQL FORMID THEN
+			BEGIN
+				PREV[SRCLINK]_.CSTMNT[SRCLINK];
+				!IF THIS IS DIRECTLY INFRONT OF
+				!A DO LOOP THEN WE HAVE TO
+				!ADJUST THE DOPRED FIELD OF THE LOOP
+				DONODE_.CSTMNT[SRCLINK];
+				IF .DONODE[SRCID] EQL DOID AND
+					.CSTMNT EQL .DONODE[DOPRED] THEN
+						DONODE[DOPRED]_.PREV;
+
+				CSTMNT_.PREV;
+				LEAVE PROCSLAB;
+			END;
+
+			!2. ITS ALREADY A CONTINUE WITH A SINGLE DO ENDING AT IT
+			IF .CSTMNT[SRCID] EQL CONTID AND (.STMTLBL[SNDOLVL] LEQ 1)
+			THEN
+				LEAVE PROCSLAB;
+
+			!3. ITS AN ASSIGNMENT STATEMENT WITH:
+			!	A. NO USER FUNCTION REFERENCES
+			!	B. NO DO LOOPS END AT IT
+			IF .CSTMNT[SRCID] EQL ASGNID AND
+			NOT .CSTMNT[USRFNREF] AND
+			.STMTLBL[SNDOLVL] EQL 0 THEN
+				LEAVE PROCSLAB;
+
+			NEWC:
+			IF .CSTMNT[SRCID] NEQ CONTID THEN
+			BEGIN
+				!SPECIAL CASE EXACTLY 1 DO LOOP ENDING
+				!HERE WHOSE TERMINATION LABEL
+				!IS NOT THE OBJECT OF A TRANSFER
+
+				IF (.STMTLBL[SNREFNO] EQL 2)
+				   AND
+				   (.STMTLBL[SNDOLVL] EQL 1) THEN
+				BEGIN
+					FIRSTCONT_1;
+					LEAVE NEWC;
+				END;
+				FIRSTCONT_0;
+
+				!HERE WE HAVE AT A MINIMUM TO MOVE THE
+				!LABEL BACK (BETWEEN PREV AND CSTMNT)
+				!TO A DUMMY CONTINUE
+
+				!MAKE THE DUMMY CONTINUE
+				NEWCONT_PREV[SRCLINK]_MAKCONTINUE();
+	
+				!ADJUST ALL THE CROSS POINTERS
+				!AND FINISH LINKING IT IN
+				NEWCONT[SRCLBL]_.STMTLBL;
+				CSTMNT[SRCLBL]_0;
+				STMTLBL[SNHDR]_.NEWCONT;
+				NEWCONT[SRCLINK]_.CSTMNT;
+				!FIX REFERENCE COUNT ON LABEL
+				IF .STMTLBL[SNDOLVL] NEQ 0 THEN
+![1105] Get label count exactly right
+%[1105]%			STMTLBL[SNREFNO]_.STMTLBL[SNREFNO]
+%[1105]%			  -.STMTLBL[SNDOLVL];
+			END;
+
+
+			!WE CAN QUIT IF NO DO LOOPS END HERE
+			IF .STMTLBL[SNDOLVL] EQL 0 THEN
+				LEAVE PROCSLAB;
+
+
+			!CHECK FOR SPECIAL CASE (FIRSTCONT=1)
+			IF .FIRSTCONT THEN
+			BEGIN
+				!GENERATE A CONTIUE AND MOVE STMTLBL TO
+				!IT
+				NEWCONT_MAKCONTINUE();
+				NEWCONT[SRCLBL]_.STMTLBL;
+				STMTLBL[SNHDR]_.NEWCONT;
+				CSTMNT[SRCLBL]_0;
+				NEWCONT[SRCLINK]_.CSTMNT[SRCLINK];
+				CSTMNT_CSTMNT[SRCLINK]_.NEWCONT;
+				LEAVE PROCSLAB;
+			END;
+
+			!NO, SORRY, THERE ARE DO LOOPS
+
+			! FOLLOW THE LINKED LIST OF DO LOOPS THAT END
+			!HERE MAKING A CONTINUE FOR EACH ONE.
+
+			DONODECHAIN_.STMTLBL[SNDOLNK];
+
+			FIRSTCONT_0;
+
+
+			WHILE .DONODECHAIN NEQ 0 DO
+			BEGIN
+				!IF THE STATEMENT IS QUESTION IS A 
+				!CONTINUE WE WILL SPECIAL CASE OUT
+				!MAKING TWO FOR THE SAME PURPOSE
+				IF .CSTMNT[SRCID] NEQ CONTID OR .FIRSTCONT THEN
+				BEGIN
+					!LOOK AT THE NODE ITSELF
+					DONODE_.DONODECHAIN[LEFTP];
+					!MAKE A LABEL
+					MADLBL_GENLAB();
+					DONODE[DOLBL]_.MADLBL;
+					NEWCONT_MADLBL[SNHDR]_MAKCONTINUE();
+					NEWCONT[SRCLINK]_.CSTMNT[SRCLINK];
+					MADLBL[SNREFNO]_2;
+					NEWCONT[SRCLBL]_.MADLBL;
+					!NO DOES NOW END ON STMTLBL
+					!SO ZERO THE SNDOLVL FIELD
+					!IF ITS NOT ON A CONTINUE THAT
+					!STAYS AROUND
+					IF .CSTMNT[SRCID] NEQ CONTID THEN
+						STMTLBL[SNDOLVL]_0;
+
+					!NOTE THAT CSTMNT IS UPDATED TO POINT TO
+					!THE NEW CONTINUE
+					CSTMNT_CSTMNT[SRCLINK]_.NEWCONT;
+					FIRSTCONT_1;
+				END ELSE
+				BEGIN
+					MADLBL_.STMTLBL;
+					MADLBL[SNREFNO]_.MADLBL[SNREFNO]-.STMTLBL[SNDOLVL]+1;
+					FIRSTCONT_1;
+				END;
+
+				MADLBL[SNDOLVL]_1;
+				MADLBL[SNDOLNK]_.DONODECHAIN;
+
+				!UPDATE TO THE NEXT LOOP IN THE CHAIN.
+				!ZERO THE LINK FIELD OF THE OLD CHAIN
+				!SO THAT THE SNDOLNK JUST MADE TERMINATES
+				!WITH A ZERO.
+				NEWCONT_.DONODECHAIN;
+				DONODECHAIN_.NEWCONT[RIGHTP];
+				NEWCONT[RIGHTP]_0;
+			END;	!WHILE ON DONODECHAIN
+		END;	!THE STATEMENT IS LABELED
+
+		PREV_.CSTMNT;
+		CSTMNT_.CSTMNT[SRCLINK];
+
+	END;	! For each statement
+
+END;	! of LABLADJ
+
+ROUTINE DOALLOCDECIDE(DODEPTHNODE)=
+BEGIN
+	!ROUTINE CALLED BY DRIVDOALLOC TO TEST ACTUAL DO LOOPS
+	!FOR THE PROPERTIES THAT ALLOW EXTENDED GLOBAL REGISTER
+	!ALLOCATION TO OCCUR ON THEM.
+	!THESE CONDITIONS ARE:
+	!	1. IT IS A SECOND LEVEL LOOP
+	!	2. IT CONTAINS ONLY ONE INNER LOOP.
+
+	!DODEPTHNODE POINTS AT A NODE OF THE DO DEPTH ANALYSIS TREE
+
+	MAP BASE DODEPTHNODE;
+	LOCAL BASE DONODE:INNERSON;
+
+	!LOOP AT THE DO LOOP NODE ITSELF
+	DONODE_.DODEPTHNODE[DOSRC];
+	!IF IT IS NOT ITSELF INNERMOST
+	IF NOT .DONODE[INNERDOFLG] THEN
+	BEGIN
+		!LOOK AT THE INNERMORE SON
+		INNERSON_.DODEPTHNODE[NEXTDO];
+		!NOTE THAT WE ARE SURE THIS FIELD IS NOT ZERO
+
+		!IF, ON THE OTHERHAND, INNERSON IS AN INNERDO
+		IF .INNERSON[NEXTDO] EQL 0 THEN
+		BEGIN
+			!IF THERE ARE NODE PARALLEL TO IT
+			!DONODE MEETS THE CRITERIA AND GETS THE FLAG SET
+
+			IF .INNERSON[PARLVL] EQL 0 THEN
+				DONODE[EXTALLOC]_1
+				ELSE
+				DRIVDOALLOC(.INNERSON);
+		END ELSE
+		!THERE ARE MORE FURTHER IN. LOOK AT THEM BY
+		!RECURSING ON THE DRIVER
+			DRIVDOALLOC(.INNERSON);
+	END;
+END;
+ROUTINE DRIVDOALLOC(DODEPTHNODE)=
+!++
+! DRIVE A SEPARATE WALK OF THE DO DEPTH ANALYSIS TREE TO FIND AND MARK
+! LOOPS THAT POTENTIALLY CAN HAVE GLOBAL ALLOCATION EXTENDED TO THEM.
+!
+! Walk the DO-loop tree (DLOOPTREE), setting EXTALLOC in all DO nodes to be
+! considered for extended global register allocation during MRP3G.  These
+! are merely those DO-loops which contain exactly one nested DO-loop, which
+! in addition is an innermost DO-loop.
+!--
+
+BEGIN
+
+	MAP BASE DODEPTHNODE;
+
+	!ITERATE ON THE PARALLEL LOOPS. IF THERE ARE NONE
+	!THE INITIAL CALL TO DRIVDOALLOC IS WITH  DLOOPTREE
+	!SO IT WONT BE ZERO AND WE WILL JUST WALK DOWN
+	WHILE .DODEPTHNODE NEQ 0 DO
+	BEGIN
+		DOALLOCDECIDE(.DODEPTHNODE);
+		DODEPTHNODE_.DODEPTHNODE[PARLVL];
+	END;
+END;
+
+SAVE17_.SREG<0,36>;	! SAVE STACK VALUE FOR EXITS
+MRP2();
+POPJ(#17,0)
+
+END ELUDOM
+    

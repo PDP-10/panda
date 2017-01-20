@@ -1,0 +1,1795 @@
+!<BLF/REQUIRE 'RMSBLF.REQ'>
+!<BLF/SYNONYM $FIELD = FIELD>
+!<BLF/SYNONYM $LITERAL = LITERAL>
+!<BLF/SYNONYM $DISTINCT = 1>
+MODULE fffisa =
+BEGIN
+!
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1985, 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+!
+! 10/3/85 asp - add Doug Rayner's Tops 10/20 conditionals
+
+REQUIRE 'fffreq';
+
+REQUIRE 'rmsosd';				! For JSYSes
+
+%IF %SWITCHES(TOPS10)
+%THEN
+LIBRARY 'BLI:UUOSYM';
+%FI
+
+LIBRARY 'bli:xport';				! For block formats
+
+COMPILETIME
+    Load_with_RMS = ((%Variant AND 1) NEQ 0),
+    Section_Zero = ((%Variant AND 2) NEQ 0);
+
+FORWARD ROUTINE
+    openisam,					! $OPEN an ISAM file
+    do_stat_blk,				! Read in the stat block
+    get_ida_name : NOVALUE,			! Get .IDA name from stat block
+    do_fab,					! Allocate/initialize FAB
+    do_fst,					! Allocate/initialize FST
+    do_rab,					! Allocate/initialize RAB
+    do_rst,					! Allocate/initialize RST
+    do_path,					! Allocate path vector
+    unwind_open,				! Clean up bombed open
+    openerror,					! Map an OPEN error
+    cncisam,					! $CONNECT to ISAM file
+    getisam,					! $GET an ISAM record
+    findisam,					! $FIND an ISAM record
+    dscisam,					! $DISCONNECT from ISAM file
+    clsisam,					! $CLOSE an ISAM file
+    get_block,					! Get a specific block
+    put_block,					! Free up a block
+    newidx,					! Initialize index path
+    newdat,					! Initialize data position
+    nxtidx,					! Find next index path
+    nxtdat;					! Find next data position
+
+EXTERNAL ROUTINE
+    uaddr;					! Set up a user address
+
+%IF NOT Section_Zero
+%THEN
+EXTERNAL ROUTINE
+    ea_ch$move;					! CH$MOVE for ext. addressing
+%FI
+
+    $literal
+    !
+    !	Bits in flag word to keep track of OPEN status
+    !
+    stat_page_allocated = $distinct,
+    fab_allocated = $distinct,
+    fst_allocated = $distinct,
+    rab_allocated = $distinct,
+    rst_allocated = $distinct,
+    buffers_allocated = $distinct,
+    path_allocated = $distinct;
+
+LITERAL
+    isam$k_index_code = %O'401',		! Code in IDX header
+    isam$k_eof = %O'377777377777',
+    page_size = %O'1000',
+    block_size = page_size / 4,
+    isam$k_max_levels = 10;			! Max index levels for ISAM
+
+!<BLF/PAGE>
+!
+!   ISAM data record header
+!
+
+    $field
+    ida$r_fields = 				! Data record fields
+	SET
+	ida$h_size = [$bytes (2)],		! Size of record (SIX or EBC)
+	$overlay (ida$h_size)			!
+	ida$v_ascii_bit = [$bit],		! Bit always on for ASCII
+	ida$h_asc_siz = [$bits (17)],		! Size of ASCII record
+	$continue				!
+	ida$h_version = [$bytes (2)],		! Version number
+	ida$t_data = [$sub_block (0)]		! Beginning of data
+	TES;
+
+LITERAL
+    ida$k_bln = 1;
+
+%IF Section_Zero
+%THEN
+
+!+
+! Since one word global byte pointers will not work in section zero
+! (at least not on a 2020), change the calls to ea_ch$ptr and ea_ch$move
+! to the normal BLISS defined ones
+!-
+
+UNDECLARE
+    %Quote ea_ch$ptr;
+
+MACRO
+    ea_ch$ptr = ch$ptr %,
+    ea_ch$move = ch$move %;
+
+%FI
+
+MACRO
+    $isam_data_record =
+ BLOCK [ida$k_bln] FIELD (ida$r_fields) %;
+
+!<BLF/PAGE>
+!
+!   ISAM index block header
+!
+
+    $field
+    ibk$r_fields = 				! Index block fields
+	SET
+	ibk$h_size = [$bytes (2)],		! Size in SIXBIT bytes
+	ibk$h_level = [$bytes (2)],		! Index level of block
+	ibk$g_version = [$bytes (4)]		! Version of this block
+	TES;
+
+LITERAL
+    ibk$k_bln = 2;
+
+MACRO
+    $isam_index_block =
+ BLOCK [ibk$k_bln] FIELD (ibk$r_fields) %;
+
+!<BLF/PAGE>
+!
+!   ISAM index record
+!
+
+    $field
+    iidx$r_fields = 				! Index entry fields
+	SET
+	iidx$g_down = [$bytes (4)],		! Pointer to next level
+	iidx$g_version = [$bytes (4)],		! Version of block down
+	iidx$t_key = [$sub_block (0)]		! Beginning of key
+	TES;
+
+LITERAL
+    iidx$k_bln = 2;
+
+MACRO
+    $isam_index_record =
+ BLOCK [iidx$k_bln] FIELD (iidx$r_fields) %;
+
+!<BLF/PAGE>
+!
+!   ISAM statistics block format
+!
+
+    $field
+    stat$r_fields =
+	SET
+	stat$g_header = [$bytes (4)],		! Header word
+	stat$g_dev = [$bytes (4)],		! Device name
+	stat$g_nam = [$bytes (4)],		! File name
+	stat$g_ext = [$bytes (4)],		! Extension
+	stat$g_cre = [$bytes (4)],		! Creation date
+	stat$g_acc = [$bytes (4)],		! Access date
+	stat$g_lvls = [$bytes (4)],		! Number of index levels
+	stat$g_d_blk_fac = [$bytes (4)],	! Blocking factor of data file
+	stat$g_d_empty = [$bytes (4)],		! Empty records per data block
+	stat$g_i_blk_fac = [$sub_block (isam$k_max_levels)],	! Entries per index block
+	stat$g_i_empty = [$sub_block (isam$k_max_levels)],	! Empty entries per index blk
+	stat$g_d_blocks = [$bytes (4)],		! Data blocks in file
+	stat$g_d_emp_blk = [$bytes (4)],	! Empty data blocks
+	stat$g_i_sectors = [$bytes (4)],	! Sectors in index file
+	stat$g_i_emp_sec = [$bytes (4)],	! Empty sectors in index file
+	stat$g_first_emp = [$bytes (4)],	! First empty index sector
+	stat$g_recsiz = [$bytes (4)],		! Largest data rec (words)
+	stat$g_reckey = [$bytes (4)],		! Pointer to record key
+	stat$g_numops = [$bytes (4)],		! Number of I/O operations
+	stat$g_numuuo = [$bytes (4)],		! IN/OUT UUOs executed
+	stat$g_satadr = [$bytes (4)],		! Address of first SAT block
+	stat$g_numsat = [$bytes (4)],		! Number of SAT blocks
+	stat$g_idxsec = [$bytes (4)],		! Sectors in index block
+	stat$g_satbit = [$bytes (4)],		! Bits in all SAT blocks
+	stat$g_keydes = [$bytes (4)],		! Key descriptor
+	stat$g_idxsiz = [$bytes (4)],		! Size of index entry
+	stat$g_idxadr = [$bytes (4)],		! Number of root block
+	stat$g_pctdat = [$bytes (4)],		! % data file to leave free
+	stat$g_pctidx = [$bytes (4)],		! % index file to leave free
+	stat$g_recbyt = [$bytes (4)],		! Largest data rec size (bytes)
+	stat$g_maxsat = [$bytes (4)],		! Max # of records in file
+	stat$g_isaver = [$bytes (4)],		! ISAM version #
+	stat$g_pagbuf = [$bytes (4)],		! I/O switch
+	stat$g_name20 = [$STRING (200)]		! T-20 file name, 50 words
+	TES;
+
+LITERAL
+    stat$k_bln = $field_set_size;
+
+MACRO
+    $isam_stat_block =
+ BLOCK [stat$k_bln] FIELD (stat$r_fields) %;
+
+!<BLF/PAGE>
+!
+!   ISAM key descriptor
+!
+
+    $field
+    keydsc$r_fields =
+	SET
+	keydsc$v_siz = [$bits (12)],		! Size of key
+	keydsc$v_filler = [$bits (3)],		! Nothing
+	keydsc$v_sign = [$bit],			! Field is signed
+	keydsc$v_mode = [$bits (2)],		! Mode of key
+	keydsc$h_type = [$bytes (2)]		! Type of key
+	TES;
+
+!<BLF/PAGE>
+!+
+!	BLOCK DESCRIPTOR
+!
+!	BLD... symbols
+!
+!	This is a modified RMS bucket descriptor.  Two
+!	more words are added to the bucket descriptor,
+!	and contain the block number (within the file)
+!	and the address of the block (within this bucket).
+!-
+
+FIELD
+    bld$r_fields =
+	SET
+	bld$a_address = [0, 0, 18, 0],		! Bucket in-core
+	bld$a_buffer_desc = [0, 18, 18, 0],	! Buffer descriptor
+	bld$h_number = [1, 0, 18, 0],		! Bucket number
+	bld$v_flags = [1, 18, 6, 0],		! Flags
+	bld$v_locked = [1, 18, 1, 0],		! Bucket is locked
+	bld$v_size = [1, 24, 8, 0],		! Bucket size (in blocks?)
+	!   Bits 32-35 of word 1 are free
+	bld$a_block = [2, 0, 36, 0],		! Address of block
+	bld$h_block = [3, 0, 18, 0]		! Block number in file
+	TES;
+
+LITERAL
+    bld$k_bln = 4;				! Length
+
+MACRO
+    $isam_block_descriptor =
+		! Define a block descriptor
+BLOCK [bld$k_bln] FIELD (bld$r_fields) %;
+
+!<BLF/PAGE>
+!
+!   Path block structure
+!
+
+FIELD
+    path$r_fields =
+	SET
+	path$h_block = [0, 0, 18, 0],		! Block number
+	path$h_offset = [0, 18, 18, 1],		! Offset in words w/i block
+	path$g_word = [0, 0, 36, 0]		! Whole word
+	TES;
+
+LITERAL
+    path$k_bln = 1;
+
+MACRO
+    $path_word =
+ BLOCK [path$k_bln] FIELD (path$r_fields) %,
+    $path_block (len) =
+ BLOCKVECTOR [len, path$k_bln] FIELD (path$r_fields) %;
+
+!<BLF/PAGE>
+
+EXTERNAL
+    fab : REF $fab_decl,
+    rab : REF $rab_decl,
+    fst : REF $rms_fst,
+    rst : REF $rms_rst,
+    kdb : REF $rms_kdb,
+    cbd : REF $rms_bucket_descriptor,
+    adb : REF $rms_adb [8],
+    fpt : REF $rms_fpt,
+    uab : BLOCK [],				! $UTLINT argument block
+    stksec,					! Section of stack locals
+    fffsec,					! Our section
+    rmssec,					! RMS's section
+    blksec;					! User's xAB section
+
+
+OWN
+    open_status : BITVECTOR [%BPVAL] VOLATILE,	! Flags for $OPEN status
+    jserr : VOLATILE,				! Error from JSYS
+    idxfab : REF $fab_decl,
+    idxrab : REF $rab_decl,
+    idxfst : REF $rms_fst,
+    idxrst : REF $rms_rst,
+    idxcbd : REF $rms_bucket_descriptor,
+    stat_page,
+    stat_blk : REF $isam_stat_block,
+    idafab : REF $fab_decl,
+    idarab : REF $rab_decl,
+    idafst : REF $rms_fst,
+    idarst : REF $rms_rst,
+    idacbd : REF $rms_bucket_descriptor,
+    idafna : VECTOR [CH$ALLOCATION (18)],
+    path : REF $path_block (isam$k_max_levels + 1);
+
+GLOBAL ROUTINE openisam =
+    BEGIN
+
+    LOCAL
+	keyptr : $byte_pointer;
+
+    open_status = 0;				! Clear status
+    !
+    !	Store away the addresses of the blocks for the IDX file
+    !
+    idxfab = .fab;				! Store .IDX blocks
+    idxrab = .rab;				! ...
+    idxfst = .fst;				! ...
+    idxrst = .rst;				! ...
+    idxcbd = .cbd;				! ...
+    !
+    !	Start by getting a page for the ISAM statistics block,
+    !	so we can have information ready when we need it here.
+    !
+
+    IF NOT do_stat_blk () THEN RETURN false;
+
+    !
+    !	Before we go further, let's tell the .IDX FST that
+    !	we will want as many buffers as there are levels in
+    !	the .IDX file.
+    !
+    idxfst [fst$v_number_buffers] = 		!
+    idxfst [fst$v_minimum_buffers] = .stat_blk [stat$g_lvls];
+    !
+    !	Translate the SIXBIT name of the .IDA file.
+    !
+    get_ida_name ();
+    !
+    !	Allocate and initialize a FAB for the .IDA file.
+    !
+
+    IF NOT do_fab () THEN RETURN false;
+
+    !
+    !	Allocate and initialize the FST (and point the FAB at it)
+    !
+
+    IF NOT do_fst () THEN RETURN false;
+
+    !
+    !	Allocate and initialize the RAB
+    !
+
+    IF NOT do_rab () THEN RETURN false;
+
+    !
+    !	We will need to know the size of our buffers, so now
+    !	figure out the size in physical blocks of index blocks
+    !	and data blocks.  We have to use a BIND here to access
+    !	STAT$G_I_BLK_FAC, which is a zero-size field defined
+    !	by a sub-block.  This also determines the buffer size for
+    !	the .IDX file (as the corresponding value does for .IDA).
+    !
+    BEGIN
+
+    BIND
+	index_blocking_factor = stat_blk [stat$g_i_blk_fac];
+
+    idxfab [fab$v_bls] = ((((.idxfst [fst$h_mrs]*	!
+    .index_blocking_factor) + ibk$k_bln) + 127)^-7);
+    idxfst [fst$v_buffer_size] = (.idxfab [fab$v_bls] + 3)/4;
+    END;
+    !
+    !	Size of data block
+    !
+    idafab [fab$v_bls] = ((((.idafst [fst$h_mrs] + 	!
+    ida$k_bln)*.stat_blk [stat$g_d_blk_fac]) + 127)^-7);
+    idafst [fst$v_buffer_size] = (.idafab [fab$v_bls] + 3)/4;
+    !
+    !	Allocate and initialize the RST
+    !
+
+    IF NOT do_rst () THEN RETURN false;
+
+    !
+    !	Put the address of the .IDA FAB/RAB/FST/RST/PATH structure
+    !	where we can get it -- the user's FAB (the JNL field).
+    !	(We must remember, though, that the .IDA FAB, etc.,
+    !	are all located in RMS's section, rather than in the
+    !	user's section.)
+    !
+    idxfab [fab$a_jnl] = .idarab;		! Store it away
+    !
+    !	Finally, we want to allocate a PATH block to be associated
+    !	with this file.  It is a VECTOR or BLOCKVECTOR of length
+    !	number-of-index-levels + 1-for-data-level + 1-for-EOF.
+    !
+
+    IF NOT do_path () THEN RETURN false;
+
+    !
+    !	Get some information from the stat block.
+    !
+    idxfst [fst$h_mrs] = .stat_blk [stat$g_idxsiz];	! Size of index entry
+    idafst [fst$h_mrs] = .stat_blk [stat$g_recsiz];	! Size of data record
+    idxfst [fst$h_bsz] = 36;			!
+    keyptr = .stat_blk [stat$g_reckey];		! Fetch IDA byte size
+    idxfab [fab$v_bsz] = 			! Let user know the byte size
+    idafab [fab$v_bsz] = idafst [fst$h_bsz] = .keyptr [ptr$v_byte_size];
+    idxfab [fab$h_mrs] = .stat_blk [stat$g_recbyt];	! Data record length
+    idxfab [fab$v_rfm] = fab$k_var;		! Perhaps variable
+    !
+    !	Hide the address of the statistics block.
+    !
+    idarab [rab$a_kbf] = .stat_blk;
+    RETURN true;
+    END;					! End OPENISAM
+
+ROUTINE do_stat_blk =
+    BEGIN
+
+    LOCAL
+	stat_header;				! First word of header
+
+    stat_page = get_page (page_count = 1);	! Get a page
+
+    IF .stat_page EQL 0				! Allocation failure?
+    THEN
+	BEGIN
+	unwind_open ();
+	idxfab [fab$h_sts] = rms$_dme;
+	RETURN false;
+	END
+    ELSE
+	open_status [stat_page_allocated] = 1;
+
+    stat_blk = .rmssec OR (.stat_page*page_size);	! Get address
+
+%IF %SWITCHES(TOPS20)
+%THEN
+
+    stat_page = .stat_blk/page_size;		! Make global page number
+
+    IF NOT pmap (xwd (.fst [fst$h_jfn], 0), 	! Map in first page ...
+	    xwd ($fhslf, .stat_page), 		!   putting it here
+	    pm_rd OR pm_epn)			! Read access, extended section
+    THEN
+	BEGIN
+	idxfab [fab$h_sts] = rms$_cof;
+	geter ($fhslf; jserr);
+	idxfab [fab$h_stv] = .jserr<rh>;
+	RETURN false;
+	END;
+
+%ELSE	! TOPS-10
+
+    BEGIN
+
+    !+
+    ! Read in the first page of the file into stat_blk
+    !-
+
+	LOCAL
+	    block_number,
+	    io_command_list : VECTOR[2],
+	    filop_arg_blk : VECTOR[3];
+
+	REGISTER
+	    t1;
+
+	io_command_list[0] = ( - block_size) ^ 18 + .stat_blk - 1;
+	io_command_list[1] = 0;
+
+	block_number = 1;
+
+	filop_arg_blk[0] = .idxfst[fst$h_jfn] ^ 18 + $FOINP;
+	filop_arg_blk[1] = io_command_list[0];
+	filop_arg_blk[2] = block_number;
+
+	t1 = 3 ^ 18 + filop_arg_blk[0];
+
+	IF NOT FILOP$_UUO(t1)
+	THEN
+	    BEGIN
+	    idxfab[fab$h_sts] = rms$_cof;
+	    idxfab[fab$h_stv] = .t1;
+	    RETURN false;
+	    END;
+
+    END;
+
+%FI
+
+    !+
+    !	Check to make sure that we are dealing with a
+    !	real ISAM .IDX file by checking the header.
+    !-
+
+    stat_header = .stat_blk [stat$g_header];	! Header word
+
+    IF .stat_header<lh> NEQ isam$k_index_code	! Not the right file?
+    THEN
+	BEGIN
+	idxfab [fab$h_sts] = rms$_udf;
+	idxfab [fab$h_stv] = rms$_plg;
+	RETURN false;
+	END;
+
+    RETURN true;
+    END;					! End DO_STAT_BLK
+ROUTINE get_ida_name : NOVALUE =
+    BEGIN
+
+    LOCAL
+	char,
+	fnptr,					! Pointer to FNA buffer
+	sixptr;					! Pointer to SIXBIT filename
+
+    fnptr = ea_ch$ptr (.fffsec OR idafna);
+    sixptr = ea_ch$ptr (stat_blk [stat$g_dev], 0, 6);	! Point at device
+
+    INCR cnum FROM 1 TO 6 DO
+	BEGIN
+	char = CH$RCHAR_A (sixptr);		! Get a character
+
+	IF .char EQL 0 THEN EXITLOOP;		! Exit on first space
+
+	char = .char + %O'40';			! Make it ASCII
+	CH$WCHAR_A (.char, fnptr);		! Write it out
+	END;
+
+    !
+    !	Put in a ":" and get the file name the same way
+    !
+    CH$WCHAR_A (%C':', fnptr);
+    sixptr = ea_ch$ptr (stat_blk [stat$g_nam], 0, 6);	! Point at filename
+
+    INCR cnum FROM 1 TO 6 DO
+	BEGIN
+	char = CH$RCHAR_A (sixptr);		! Get a character
+
+	IF .char EQL 0 THEN EXITLOOP;		! Exit on first space
+
+	char = .char + %O'40';			! Make it ASCII
+	CH$WCHAR_A (.char, fnptr);		! Write it out
+	END;
+
+    !
+    !	Put in the requisite "." and get the extension
+    !
+    CH$WCHAR_A (%C'.', fnptr);
+    sixptr = ea_ch$ptr (stat_blk [stat$g_ext], 0, 6);	! Point at extension
+
+    INCR cnum FROM 1 TO 3 DO
+	BEGIN
+	char = CH$RCHAR_A (sixptr);		! Get a character
+
+	IF .char EQL 0 THEN EXITLOOP;		! Exit on first space
+
+	char = .char + %O'40';			! Make it ASCII
+	CH$WCHAR_A (.char, fnptr);		! Write it out
+	END;
+
+    !
+    !	Follow it all with a NUL
+    !
+    CH$WCHAR_A ($chnul, fnptr);
+    END;					! End GET_IDA_NAME
+ROUTINE do_fab =
+    BEGIN
+    idafab = get_memory (length = fab$k_bln);
+
+    IF .idafab EQL 0				! Allocation failure?
+    THEN
+	BEGIN
+	unwind_open ();
+	idxfab [fab$h_sts] = rms$_dme;
+	RETURN false;
+	END
+    ELSE
+	open_status [fab_allocated] = 1;
+
+    idafab = .rmssec OR .idafab;
+    $fab_init (fab = .idafab, 			! Initialize the FAB
+	fac = get, 				! ...
+	fna = ea_ch$ptr (.fffsec OR idafna));	! ...
+    !
+    !	Get the JFN for the .IDA file.
+    !
+
+%IF %SWITCHES(TOPS20)
+%THEN
+    IF NOT gtjfn (gj_old OR gj_sht, .idafab [fab$a_fna]; idafab [fab$h_jfn])
+    THEN
+	BEGIN
+	jserr = .idafab [fab$h_jfn];		! Isolate JSYS error
+	idafab [fab$h_jfn] = 0;			! Clear field
+	idxfab [fab$h_sts] = openerror (.jserr);
+	idxfab [fab$h_stv] = .jserr;
+	RETURN false;
+	END;
+
+    !
+    !	Open the file now.
+    !
+
+    IF NOT openf (.idafab [fab$h_jfn], of_rd OR of_rdu; jserr)	! Open it
+    THEN
+	BEGIN
+	idxfab [fab$h_sts] = openerror (.jserr);
+	idxfab [fab$h_stv] = .jserr;
+	RETURN false;
+	END;
+
+%ELSE	! TOPS-10
+
+    BEGIN
+    !+
+    ! Open the IDA file.  Get the device, file name, and extension
+    ! from the stat block.  Get the path from the monitor, i.e. the
+    ! path for the IDX file.
+    !-
+
+	LOCAL
+	    file_spec_blk : VECTOR[$FOFSF + 1 + 5],
+	    filop_arg_blk : VECTOR[$FOLEB + 1],
+	    lookup_blk : VECTOR[$RBEXT + 1];
+
+	REGISTER
+	    t1;
+
+	filop_arg_blk[0] = .idxfst[fst$h_jfn] ^ 18 + $FOFIL;
+	filop_arg_blk[1] = ($FOFSF + 1 + 5) ^ 18 + file_spec_blk[0];
+
+	t1 = 2 ^ 18 + filop_arg_blk[0];
+
+	IF NOT FILOP$_UUO(t1)
+	THEN
+	    BEGIN
+	    idxfab[fab$h_sts] = openerror(.t1);
+	    idxfab[fab$h_stv] = .t1;
+	    RETURN false;
+	    END;
+
+	!+
+	! Fill in the LOOKUP block from the stat block.  Fill in
+	! the FILOP. block.  Open the file for read.  Save the channel
+	! number assigned in the IDX FAB.
+	!-
+
+	lookup_blk[$RBCNT] = $RBEXT;
+	lookup_blk[$RBNAM] = .stat_blk[stat$g_nam];
+	lookup_blk[$RBEXT] = .stat_blk[stat$g_ext];
+	lookup_blk[$RBPPN] = file_spec_blk[$FOFPP - $PTPPN];
+
+	filop_arg_blk[$FOFNC] = FO$PRV + FO$ASC + $FORED;
+	filop_arg_blk[$FOIOS] = $IODMP;
+	filop_arg_blk[$FODEV] = .stat_blk[stat$g_dev];
+	filop_arg_blk[$FOBRH] = filop_arg_blk[$FONBF] = 0;
+	filop_arg_blk[$FOLEB] = lookup_blk[0];
+
+	t1 = ($FOLEB + 1) ^ 18 + filop_arg_blk[0];
+
+	IF NOT FILOP$_UUO(t1)
+	THEN
+	    BEGIN
+	    idxfab[fab$h_sts] = openerror(.t1);
+	    idxfab[fab$h_stv] = .t1;
+	    RETURN false;
+	    END;
+
+	idafab[fab$h_jfn] = .POINTR(filop_arg_blk[$FOFNC], FO$CHN);
+
+    END;
+
+%FI
+    RETURN true;
+    END;					! End DO_FAB
+ROUTINE do_fst =
+    BEGIN
+    idafst = get_memory (length = fst$k_bln);
+
+    IF .idafst EQL 0				! Error?
+    THEN
+	BEGIN
+	unwind_open ();
+	idxfab [fab$h_sts] = rms$_dme;
+	RETURN false;
+	END
+    ELSE
+	open_status [fst_allocated] = 1;
+
+    idafst = .rmssec OR .idafst;		! Make global
+    idafst [fst$h_bln] = fst$k_bln;		! Header
+    idafst [fst$h_bid] = fst$k_bid;		! ...
+    idafst [fst$h_jfn] = .idafab [fab$h_jfn];	! Move the JFN
+    idafst [fst$v_number_buffers] = 		! Set these for good measure
+    idafst [fst$v_minimum_buffers] = rms$k_number_buffers;
+    idafab [fab$a_ifi] = .idafst;		! Point FAB at FST
+    RETURN true;
+    END;					! End DO_FST
+ROUTINE do_rab =
+    BEGIN
+    idarab = get_memory (length = rab$k_bln);
+
+    IF .idarab EQL 0				! Error?
+    THEN
+	BEGIN
+	unwind_open ();
+	idxfab [fab$h_sts] = rms$_dme;
+	RETURN false;
+	END
+    ELSE
+	open_status [rab_allocated] = 1;
+
+    idarab = .rmssec OR .idarab;
+    $rab_init (rab = .idarab, 			! Initialize the RAB
+	fab = .idafab, rac = seq);		! ...
+    RETURN true;
+    END;					! End DO_RAB
+ROUTINE do_rst =
+    BEGIN
+
+    LOCAL
+	cur_bfd : REF $rms_buffer_descriptor,	! Buffer descriptor pointer
+	actual_rst_size,			! Allocated size of RST
+	buffer_page,				! Beginning of contig. buf's
+	total_pages,				! Total size of buffers
+	number_of_buffers;			! Buffer count
+
+    !
+    !	We stored the buffer count away in the FST
+    !
+    number_of_buffers = .idafst [fst$v_number_buffers];
+    actual_rst_size = rst$k_bln + (.number_of_buffers*2);
+    idarst = get_memory (length = .actual_rst_size);
+
+    IF .idarst EQL 0				! Allocation failure
+    THEN
+	BEGIN
+	unwind_open ();
+	idxfab [fab$h_sts] = rms$_dme;
+	RETURN false;
+	END
+    ELSE
+	open_status [rst_allocated] = 1;
+
+    idarst = .idarst OR .rmssec;		! Make global
+    idarst [rst$h_bln] = .actual_rst_size;	! Header
+    idarst [rst$h_bid] = rst$k_bid;		! ...
+    idarst [rst$v_bfd_count] = .number_of_buffers;
+!
+!	Allocate the buffers
+!
+    total_pages = .number_of_buffers*.idafst [fst$v_buffer_size];
+    buffer_page = get_page (page_count = .total_pages);
+
+    IF .buffer_page EQL 0			! Failure?
+    THEN
+	BEGIN
+	unwind_open ();
+	idxfab [fab$h_sts] = rms$_dme;
+	RETURN false;
+	END
+    ELSE
+	open_status [buffers_allocated] = 1;
+
+!
+!	Initialize the buffer descriptors
+!
+    cur_bfd = idarst [rst$g_buffer_desc];
+
+    INCR buf_ctr FROM 1 TO .number_of_buffers DO
+	BEGIN
+	cur_bfd [buf$b_buffer_page] = .buffer_page;
+	cur_bfd = cur_bfd + buf$k_bln;
+	buffer_page = .buffer_page + .idafst [fst$v_buffer_size];
+	END;
+
+!
+!	Link RST to the rest of the world
+!
+    idarst [rst$a_fst] = .idafst;
+    idarst [rst$a_flink] = .idafst;		! Link to the FST
+    idarst [rst$a_blink] = .idafst;		! ...
+    idarab [rab$a_isi] = .idarst;		! Point RAB at RST
+    idafst [fst$a_flink] = .idarst;		! Link to the FST
+    idafst [fst$a_blink] = .idarst;		! ...
+    RETURN true;
+    END;					! End DO_RST
+ROUTINE do_path =
+    BEGIN
+    path = get_memory (length = (.stat_blk [stat$g_lvls] + 2));
+
+    IF .path EQL 0				! Memory exhausted?
+    THEN
+	BEGIN
+	unwind_open ();
+	idxfab [fab$h_sts] = rms$_dme;
+	RETURN false;
+	END
+    ELSE
+	open_status [path_allocated] = 1;
+
+    path = .rmssec OR .path;
+    idafab [fab$a_jnl] = .path;			! Store path address
+    RETURN true;
+    END;					! End DO_PATH
+ROUTINE unwind_open =
+    BEGIN
+
+    IF .open_status EQL 0 THEN RETURN true;	! Nothing to do
+
+    !
+    !	Zero the left half of the block pointers
+    !	so that PMEM doesn't do obscure things.
+    !
+    path<lh> = idafab<lh> = idarab<lh> = idarst<lh> = idafst<lh> = 0;
+
+    !+
+    !	Deallocate the path vector if need be
+    !-
+
+    IF .open_status [path_allocated]		!
+    THEN
+	put_memory (length = (.stat_blk [stat$g_lvls] + 2), 	! Free path
+	    address = .fffsec OR path);
+
+    !+
+    !	Deallocate the buffers in the RST for the .IDA file.
+    !-
+
+    IF .open_status [buffers_allocated]		!
+    THEN
+	BEGIN
+
+	LOCAL
+	    total_pages,
+	    first_bfd : REF $rms_buffer_descriptor,
+	    first_page;
+
+	!
+	!	De-allocate the buffers
+	!
+	total_pages = .idarst [rst$v_bfd_count]*.idafst [fst$v_buffer_size];
+	first_bfd = idarst [rst$g_buffer_desc];
+	first_page = .first_bfd [buf$b_buffer_page];
+	put_page (page_number = .first_page, page_count = .total_pages);
+	END;
+
+    !+
+    !	Deallocate the RST.
+    !-
+
+    IF .open_status [rst_allocated]		!
+    THEN
+	put_memory (length = rst$k_bln, address = .fffsec OR idarst);
+
+    !+
+    !	Deallocate the RAB.
+    !-
+
+    IF .open_status [rab_allocated]		!
+    THEN
+	put_memory (length = rab$k_bln, address = .fffsec OR idarab);
+
+    !+
+    !	Deallocate the FST.
+    !-
+
+    IF .open_status [fst_allocated]		!
+    THEN
+	put_memory (length = fst$k_bln, address = .fffsec OR idafst);
+
+    !+
+    !	Deallocate the FAB.
+    !-
+
+    IF .open_status [fab_allocated]		!
+    THEN
+	put_memory (length = fab$k_bln, address = .fffsec OR idafab);
+
+    !
+    !	Get rid of the page for the statistics block
+    !
+
+    IF .open_status [stat_page_allocated]	!
+    THEN
+	put_page (page_number = .stat_page AND %O'777');
+
+    RETURN true;
+    END;					! End UNWIND_OPEN
+ROUTINE openerror (monitor_error) =
+    BEGIN
+
+%IF %SWITCHES(TOPS20)
+%THEN
+
+    SELECTONE .monitor_error OF
+	SET
+
+	[gjfx4, gjfx5, gjfx6, gjfx8, gjfx9, 	! RMS$_FSI : invalid file spec
+	    gjfx10, gjfx11, gjfx12, gjfx13] : 	! ...
+	    RETURN rms$_fsi;
+
+	[gjfx16, gjfx17, gjfx18, gjfx19, 	! RMS$_FNF : file not found
+	    gjfx20, gjfx24] : 			! ...
+	    RETURN rms$_fnf;
+
+	[gjfx3, gjfx22] : 			! RMS$_CGJ : cannot get JFN
+	    RETURN rms$_cgj;
+
+	[OTHERWISE] : 				! RMS$_COF : cannot open file
+	    RETURN rms$_cof;
+	TES;
+
+%ELSE	! TOPS-10
+
+    SELECTONE .monitor_error OF
+	SET
+	[ERFNF_, ERIPP_, ERSNF_, ERSLE_]:
+			RETURN(rms$_fnf);		! File not found
+	[ERPRT_, ERDNE_]: RETURN(rms$_prv);	! Protection error
+	[OTHERWISE]:  RETURN(rms$_cof);
+	TES
+
+%FI
+    END;					! End OPENERROR
+
+GLOBAL ROUTINE cncisam =
+    BEGIN
+
+    LOCAL
+	root;
+
+    !
+    !	Store away the addresses of the blocks for the IDX file
+    !
+    idxfab = .fab;				! Store .IDX blocks
+    idxrab = .rab;				! ...
+    idxfst = .fst;				! ...
+    idxrst = .rst;				! ...
+    idxcbd = .cbd;				! ...
+    !
+    !	Fetch out the structures for the IDA file
+    !
+    idarab = .rmssec OR .idxfab [fab$a_jnl];
+    idafab = .rmssec OR .idarab [rab$a_fab];
+    idafst = .rmssec OR .idafab [fab$a_ifi];
+    idarst = .rmssec OR .idarab [rab$a_isi];
+    path = .rmssec OR .idafab [fab$a_jnl];
+    stat_blk = .rmssec OR .idarab [rab$a_kbf];
+    !
+    !	Let us now trace our way through the abyss
+    !	of the IDX file (without benefit of Virgil
+    !	or Beatrice) and leave a path behind us.
+    !
+    root = .stat_blk [stat$g_idxadr];		! Fetch the root
+
+    IF NOT newidx (.stat_blk [stat$g_lvls], .root)	! Build the path
+    THEN
+	BEGIN					! No records here at all
+	idxrst [rst$g_next_record_pointer] = isam$k_eof;
+	END
+    ELSE
+	BEGIN
+	!
+	!	Set the NRP to point at the first data record.
+	!
+	idxrst [rst$g_next_record_pointer] = .path [0, path$g_word];
+	END;
+
+    RETURN 1;
+    END;					! End CNCISAM
+
+GLOBAL ROUTINE getisam =
+    BEGIN
+
+    STACKLOCAL
+	dummy_blk_desc : $isam_block_descriptor;
+
+    LOCAL
+	current_rfa : $path_word,		! RFA of input record
+	bytes_to_move,				! Length to move
+	byte_size,				! We refer to this a lot
+	record_size,				! Length of record
+	blk_desc : REF $isam_block_descriptor,
+	data_block,
+	data_record : REF $isam_data_record,
+	file_pointer,				! Pointer to file buffer
+	user_buffer,				! Address of user's buffer
+	user_pointer,				! Pointer to user's buffer
+	user_size;				! Size of user's buffer
+
+    !
+
+    !	Set up the descriptor pointers.  This unusual arrangement is
+    !	necessary because the descriptor is on the stack and
+    !	is therefore in another section.  This works around the
+    !	attempts of BLISS to be devious and efficient.
+    !
+    blk_desc = .stksec OR dummy_blk_desc;	! Set pointer
+    !
+    !	Store away the addresses of the blocks for the IDX file
+    !
+    idxfab = .fab;				! Store .IDX blocks
+    idxrab = .rab;				! ...
+    idxfst = .fst;				! ...
+    idxrst = .rst;				! ...
+    idxcbd = .cbd;				! ...
+    !
+    !	Fetch out the structures for the IDA file
+    !
+    idarab = .rmssec OR .idxfab [fab$a_jnl];
+    idafab = .rmssec OR .idarab [rab$a_fab];
+    idafst = .rmssec OR .idafab [fab$a_ifi];
+    idarst = .rmssec OR .idarab [rab$a_isi];
+    path = .rmssec OR .idafab [fab$a_jnl];
+    stat_blk = .rmssec OR .idarab [rab$a_kbf];
+    !
+    !	Set up to get the record with the current RFA:
+    !	    1)	Calculate the size of the user buffer;
+    !	    2)	Get the buffer's address; and
+    !	    3)  Make a global pointer thereto.
+    !
+    byte_size = .idxfab [fab$v_bsz];
+    user_size = .idxrab [rab$h_usz]*(%BPVAL/.byte_size);
+    user_buffer = uaddr (.idxrab [rab$a_ubf]);
+    user_pointer = ea_ch$ptr (.user_buffer, 0, .byte_size);
+
+    !+
+    !	Using the current RFA, read in the current
+    !	block and build a pointer to the current record.
+    !-
+
+    current_rfa = .idxrst [rst$g_data_rfa];
+    get_block (.current_rfa [path$h_block], 	! Get this block
+	.idafab [fab$v_bls], 			! It's this big (in blocks)
+	.blk_desc, 				! And we want it put here
+	0);					! This is the data level
+    data_block = .blk_desc [bld$a_block];	! Point to the block
+    data_record = .data_block + .current_rfa [path$h_offset];
+
+    !+
+    !	Fetch the record size
+    !-
+
+    IF .byte_size EQL 7				! ASCII file?
+    THEN
+	record_size = .data_record [ida$h_asc_siz]	! Yes - shifted size
+    ELSE
+	record_size = .data_record [ida$h_size];	! No - normal size
+
+    !
+    !	Build a pointer to the record in the file buffer
+    !
+    file_pointer = ea_ch$ptr (data_record [ida$t_data], 0, .byte_size);
+    !
+    !	Move the data
+    !
+    bytes_to_move = MIN (.user_size, .record_size);
+    ea_ch$move (.bytes_to_move, .file_pointer, .user_pointer);
+    !
+    !	Toss the block
+    !
+    put_block (.stksec OR .blk_desc, 0);	! Throw it away
+
+    !+
+    !	Finish appropriately
+    !-
+
+    %IF Load_with_RMS
+    %THEN
+
+    !+
+    ! Since we share these locations with RMS, and since they may have
+    ! been changed to point to the IDA file, restore the correct values.
+    !-
+
+    fab = .idxfab;				! Restore .IDX blocks
+    rab = .idxrab;
+    fst = .idxfst;
+    rst = .idxrst;
+    cbd = .idxcbd;
+
+    %FI
+
+    IF .record_size GTR .user_size		! RTB error?
+    THEN
+	BEGIN					! Yes - report RTB
+	idxrab [rab$h_sts] = rms$_rtb;
+	idxrab [rab$h_stv] = .record_size;
+	idxrab [rab$h_rsz] = .bytes_to_move;
+	idxrab [rab$a_rbf] = .idxrab [rab$a_ubf];
+	RETURN false;
+	END
+    ELSE
+	BEGIN					! No - all normal
+	idxrab [rab$h_sts] = rms$_normal;
+	idxrab [rab$h_stv] = 0;
+	idxrab [rab$h_rsz] = .record_size;
+	idxrab [rab$a_rbf] = .idxrab [rab$a_ubf];
+	RETURN true;
+	END;
+
+    END;					! End GETISAM
+
+GLOBAL ROUTINE findisam =
+    BEGIN
+
+    LOCAL
+	root;
+
+    !
+    !	Store away the addresses of the blocks for the IDX file
+    !
+    idxfab = .fab;				! Store .IDX blocks
+    idxrab = .rab;				! ...
+    idxfst = .fst;				! ...
+    idxrst = .rst;				! ...
+    idxcbd = .cbd;				! ...
+    !
+    !	Fetch out the structures for the IDA file
+    !
+    idarab = .rmssec OR .idxfab [fab$a_jnl];
+    idafab = .rmssec OR .idarab [rab$a_fab];
+    idafst = .rmssec OR .idafab [fab$a_ifi];
+    idarst = .rmssec OR .idarab [rab$a_isi];
+    path = .rmssec OR .idafab [fab$a_jnl];
+    stat_blk = .rmssec OR .idarab [rab$a_kbf];
+    !
+    !	Set up the RFA for the current record.  If the RFA is
+    !	EOF, then we have reached EOF.
+    !
+    idxrst [rst$g_data_rfa] = .idxrst [rst$g_next_record_pointer];
+
+    IF .idxrst [rst$g_data_rfa] EQL isam$k_eof	! Are we now at EOF?
+    THEN
+	BEGIN					! Return EOF
+	idxrab [rab$h_sts] = rms$_eof;
+	idxrab [rab$h_rsz] = 0;
+	idxrab [rab$g_rfa] = 0;
+	RETURN false;
+	END;
+
+    !+
+    !	Follow the index down to the current record and then
+    !	find the next record from that one.  If we fail, our
+    !	next record will actually be EOF.  Otherwise, NRP
+    !	will point at the data record shown by the PATH.
+    !-
+
+    root = .stat_blk [stat$g_idxadr];		! Get root pointer
+
+    IF nxtidx (.stat_blk [stat$g_lvls], .root)	! Get next path
+    THEN
+	idxrst [rst$g_next_record_pointer] = .path [0, path$g_word]
+    ELSE
+	idxrst [rst$g_next_record_pointer] = isam$k_eof;
+
+
+    %IF Load_with_RMS
+    %THEN
+
+    !+
+    ! Since we share these locations with RMS, and since they may have
+    ! been changed to point to the IDA file, restore the correct values.
+    !-
+
+    fab = .idxfab;				! Restore .IDX blocks
+    rab = .idxrab;
+    fst = .idxfst;
+    rst = .idxrst;
+    cbd = .idxcbd;
+
+    %FI
+
+    !
+    !   All OK, return same
+    !
+    idxrab [rab$g_rfa] = .rst [rst$g_data_rfa];
+    idxrab [rab$h_sts] = rms$_normal;
+    idxrab [rab$h_stv] = 0;			! Nothing special
+    idxrst [rst$v_last_operation] = op$k_find;
+    RETURN true
+    END;					! End FINDISAM
+
+GLOBAL ROUTINE dscisam =
+    BEGIN
+    !
+    !	Store away the addresses of the blocks for the IDX file
+    !
+    idxfab = .fab;				! Store .IDX blocks
+    idxrab = .rab;				! ...
+    idxfst = .fst;				! ...
+    idxrst = .rst;				! ...
+    idxcbd = .cbd;				! ...
+    !
+    !	Fetch out the structures for the IDA file
+    !
+    idarab = .rmssec OR .idxfab [fab$a_jnl];
+    idafab = .rmssec OR .idarab [rab$a_fab];
+    idafst = .rmssec OR .idafab [fab$a_ifi];
+    idarst = .rmssec OR .idarab [rab$a_isi];
+    path = .rmssec OR .idafab [fab$a_jnl];
+    stat_blk = .rmssec OR .idarab [rab$a_kbf];
+    RETURN 1;
+    END;					! End DSCISAM
+
+GLOBAL ROUTINE clsisam =
+    BEGIN
+    LOCAL
+	idajfn;					! JFN for .IDA file
+    !
+    !	Store away the addresses of the blocks for the IDX file
+    !
+    idxfab = .fab;				! Store .IDX blocks
+    idxrab = .rab;				! ...
+    idxfst = .fst;				! ...
+    idxrst = .rst;				! ...
+    idxcbd = .cbd;				! ...
+    !
+    !	Fetch out the structures for the IDA file
+    !
+    idarab = .rmssec OR .idxfab [fab$a_jnl];
+    idafab = .rmssec OR .idarab [rab$a_fab];
+    idafst = .rmssec OR .idafab [fab$a_ifi];
+    idarst = .rmssec OR .idarab [rab$a_isi];
+    path = .rmssec OR .idafab [fab$a_jnl];
+    stat_blk = .rmssec OR .idarab [rab$a_kbf];
+    stat_page = .stat_blk/%O'1000';
+    !
+    !	Save the JFN of the .IDA file.
+    !
+    idajfn = .idafab [fab$h_jfn];
+    !
+    !	Zero the left half of the block pointers
+    !	so that PMEM doesn't do obscure things.
+    !
+    path<lh> = idafab<lh> = idarab<lh> = idarst<lh> = idafst<lh> = 0;
+    !
+    !	Return memory used by the path vector.
+    !
+    put_memory (length = (.stat_blk [stat$g_lvls] + 2), 	! Free path
+	address = .fffsec OR path);
+
+    !+
+    !	Get rid of the buffers we've allocated
+    !-
+
+    BEGIN
+
+    LOCAL
+	total_pages,
+	first_bfd : REF $rms_buffer_descriptor,
+	first_page;
+
+    !
+    !	De-allocate the buffers
+    !
+    total_pages = .idarst [rst$v_bfd_count]*.idafst [fst$v_buffer_size];
+    first_bfd = idarst [rst$g_buffer_desc];
+    first_page = .first_bfd [buf$b_buffer_page];
+    put_page (page_number = .first_page, page_count = .total_pages);
+    END;
+    !
+    !	Deallocate the other blocks
+    !
+    put_memory (length = rst$k_bln, address = .fffsec OR idarst);
+    put_memory (length = rab$k_bln, address = .fffsec OR idarab);
+    put_memory (length = fst$k_bln, address = .fffsec OR idafst);
+    put_memory (length = fab$k_bln, address = .fffsec OR idafab);
+    !
+    !	Get rid of the page for the statistics block
+    !
+    put_page (page_number = .stat_page AND %O'777');
+    !
+    !	Close the .IDA file
+    !
+
+%IF %SWITCHES(TOPS20)
+%THEN
+
+    RETURN closf (.idajfn);
+
+%ELSE	! TOPS-10
+
+    BEGIN
+
+	LOCAL
+	    filop_arg_blk;
+
+	REGISTER
+	    t1;
+
+	filop_arg_blk = .idajfn ^ 18 + $FOREL;
+
+	t1 = 1 ^ 18 + filop_arg_blk;
+
+	FILOP$_UUO(t1);
+
+    END;
+
+%FI
+
+    END;					! End CLSISAM
+
+ROUTINE get_block (block_no, count, desc : REF $isam_block_descriptor, level) =
+    BEGIN
+
+    LOCAL
+	page_count,
+	block_within_page,
+	page_to_get;
+
+    MACRO 					! DEBUG
+	st$ptr (data) =
+				! DEBUG
+     CH$PTR(UPLIT(%ASCIZ %STRING(data, %REMAINING))) %;	! DEBUG
+
+    IF .block_no LEQ 0				! Bad block
+    THEN
+	RETURN 0;
+
+    IF .count LEQ 0				! Bad count
+    THEN
+	RETURN 0;
+
+    desc [bld$h_block] = .block_no;		! Number of block
+    block_within_page = (.block_no - 1) MOD 4;
+    page_count = (.block_within_page + .count + 3)/4;
+    page_to_get = (.block_no - 1)/4;		! Page to get
+
+    !+
+    !	What RAB do we use?  What level are we on?
+    !-
+
+    IF .level EQL 0				! Data level or index level
+    THEN
+	set_environment (rab = .idarab)		! Data file is used
+    ELSE
+	set_environment (rab = .idxrab);	! Index file is used
+
+    get_bucket (bucket_size = .page_count, 	! Size to get
+	bucket = .page_to_get, 			! ... which page
+	desc = .desc);				! ... descriptor for return
+    desc [bld$a_block] = (.rmssec OR 		! Section
+    .desc [bld$a_address]) + 			! Base of bucket
+    (.block_within_page*%O'200');		! Offset to block
+    RETURN 1;
+    END;					! End GET_BLOCK
+ROUTINE put_block (desc : REF $isam_block_descriptor, level) =
+    BEGIN
+
+    !+
+    !	What RAB do we use?  What level are we on?
+    !-
+
+    IF .level EQL 0				! Data level or index level
+    THEN
+	set_environment (rab = .idarab)		! Data file is used
+    ELSE
+	set_environment (rab = .idxrab);	! Index file is used
+
+    RETURN put_bucket (desc = .desc, 		! Return this bucket
+	    update = 0);			! ... with no updating
+    END;					! End PUT_BLOCK
+ROUTINE newidx (level, next_block) =
+    BEGIN
+
+    STACKLOCAL
+	dummy_blk_desc : $isam_block_descriptor;
+
+    LOCAL
+	search_status,				! Status of loop search
+	max_offset,				! Maximum offset for this block
+	blk_desc : REF $isam_block_descriptor,
+	index_block : REF $isam_index_block,
+	index_record : REF $isam_index_record;
+
+    !
+    !	Set up the descriptor pointers.  This unusual arrangement is
+    !	necessary because the descriptor is on the stack and
+    !	is therefore in another section.  This works around the
+    !	attempts of BLISS to be devious and efficient.
+    !
+    blk_desc = .stksec OR dummy_blk_desc;	! Set pointer
+    !
+    !	Clear the PATH entry.
+    !
+    path [.level, path$g_word] = 0;
+    !
+    !	Get the required block
+    !
+    get_block (.next_block, 			! Block to get
+	.idxfab [fab$v_bls], 			! It's this big (in blocks)
+	.blk_desc, 				! And we want it put here
+	.level);				! What level of logical file?
+    !
+    !	Set up pointers to the block
+    !
+    index_block = .blk_desc [bld$a_block];	! Point at block
+    !
+    !	The maximum entry offset in this block is
+    !	the size of the block less the size of an entry.
+    !	Notice that since the size of a block is given
+    !	ala SIXBIT, the size of the header is not included in
+    !	the block.  Ergo, add 1 to the computed size.
+    !
+    max_offset = (.index_block [ibk$h_size]/6) + 1 - .stat_blk [stat$g_idxsiz];
+
+    !+
+    !	We may be successful finding a valid path on the through
+    !	the first entry, but there is always a chance that the first
+    !	15,999 records of a 16000 record file have been deleted,
+    !	so we will loop through the entries in this block until
+    !	one of the following occurs:
+    !	    1)	a call to NEWIDX/NEWDAT (as appropriate) returns TRUE;
+    !	    2)	we find an entry pointing to block 0 (non-existent entry);
+    !	    3)	we exceed what should be the offset of the last entry.
+    !
+    !	In case 1, we have succeeded: store the path data and return TRUE.
+    !	In cases 2 and 3, the path does not go through this block, so we
+    !	should give back the block and return FALSE to our caller.
+    !-
+
+    search_status = false;
+
+    INCR offset FROM ibk$k_bln TO .max_offset BY .stat_blk [stat$g_idxsiz] DO
+	BEGIN
+
+	LOCAL
+	    down_status;			! Status of search downward
+
+	index_record = .index_block + .offset;
+
+	!+
+	!   If there is no block specified, we
+	!   have an empty index entry.
+	!-
+
+	IF .index_record [iidx$g_down] EQL 0 THEN EXITLOOP;	! We're done
+
+	!+
+	!   Get the result of looking down a bit further.
+	!-
+
+	IF .level GTR 1				! Index level or data level
+	THEN
+	    down_status = newidx (.level - 1, .index_record [iidx$g_down])
+	ELSE
+	    down_status = newdat (.index_record [iidx$g_down]);
+
+	IF .down_status				! Success?
+	THEN
+	    BEGIN				! Save the path
+	    path [.level, path$h_offset] = .offset;
+	    path [.level, path$h_block] = .next_block;
+	    search_status = true;
+	    EXITLOOP;
+	    END;
+
+	END;
+
+    !
+    !	Put away the block we got.
+    !
+    put_block (.stksec OR .blk_desc, .level);	! Toss the block
+    !
+    !	Return the state of the world.
+    !
+    RETURN .search_status;
+    END;					! End NEWIDX
+ROUTINE newdat (next_block) =
+    BEGIN
+
+    STACKLOCAL
+	dummy_blk_desc : $isam_block_descriptor;
+
+    LOCAL
+	search_status,				! Status of loop search
+	blk_desc : REF $isam_block_descriptor,
+	data_block,
+	data_record : REF $isam_data_record;
+
+    !
+
+    !	Set up the descriptor pointers.  This unusual arrangement is
+    !	necessary because the descriptor is on the stack and
+    !	is therefore in another section.  This works around the
+    !	attempts of BLISS to be devious and efficient.
+    !
+    blk_desc = .stksec OR dummy_blk_desc;	! Set pointer
+    !
+    !	Clear the PATH entry.
+    !
+    path [0, path$g_word] = 0;
+    !
+    !	Get the required block
+    !
+    get_block (.next_block, 			! Block to get
+	.idafab [fab$v_bls], 			! It's this big (in blocks)
+	.blk_desc, 				! And we want it put here
+	0);					! Level 0 for data
+    !
+    !	Set up pointers to the block
+    !
+    data_block = .blk_desc [bld$a_block];	! Point at block
+    data_record = .data_block;
+    !
+    !	See if we have a record here or not (zero in the first
+    !	word says no record exists).
+    !
+
+    IF .data_record [ida$h_size] EQL 0		! Length determines existence
+    THEN
+	search_status = false			! No record here
+    ELSE
+	BEGIN
+	path [0, path$h_block] = .next_block;	! Set this block
+	path [0, path$h_offset] = 0;		! With offset of zero
+	search_status = true;			! Yes, we have one.
+	END;
+
+    !
+    !	Put away the block we got.
+    !
+    put_block (.stksec OR .blk_desc, 0);	! Toss the block
+    !
+    !	Return the state of the world.
+    !
+    RETURN .search_status;
+    END;					! End NEWDAT
+ROUTINE nxtidx (level, this_block) =
+    BEGIN
+
+    STACKLOCAL
+	dummy_blk_desc : $isam_block_descriptor;
+
+    LOCAL
+	search_status,				! Status of loop search
+	max_offset,				! Maximum offset for this block
+	blk_desc : REF $isam_block_descriptor,
+	index_block : REF $isam_index_block,
+	index_record : REF $isam_index_record;
+
+    !
+    !	Set up the descriptor pointers.  This unusual arrangement is
+    !	necessary because the descriptor is on the stack and
+    !	is therefore in another section.  This works around the
+    !	attempts of BLISS to be devious and efficient.
+    !
+    blk_desc = .stksec OR dummy_blk_desc;	! Set pointer
+    !
+    !	Get the required block
+    !
+    get_block (.this_block, 			! Block to get
+	.idxfab [fab$v_bls], 			! It's this big (in blocks)
+	.blk_desc, 				! And we want it put here
+	.level);				! Level of logical file to get
+    !
+    !	Set up pointers to the block
+    !
+    index_block = .blk_desc [bld$a_block];	! Point at block
+    !
+    !	The maximum entry offset in this block is
+    !	the size of the block less the size of an entry.
+    !	Notice that since the size of a block is given
+    !	ala SIXBIT, the size of the header is not included in
+    !	the block.  Ergo, add 1 to the computed size.
+    !
+    max_offset = (.index_block [ibk$h_size]/6) + 1 - .stat_blk [stat$g_idxsiz];
+
+    !+
+    !	Starting at the current entry in the block (as recorded
+    !	in PATH), loop through the entries in this block until
+    !	one of the following occurs:
+    !	    1)	a call to NXTIDX/NXTDAT (as appropriate) returns TRUE;
+    !	    2)	we find an entry pointing to block 0 (non-existent entry);
+    !	    3)	we exceed what should be the offset of the last entry.
+    !
+    !	In case 1, we have succeeded: store the path data and return TRUE.
+    !	In cases 2 and 3, the path does not go through this block, so we
+    !	should give back the block and return FALSE to our caller.
+    !-
+
+    search_status = false;
+
+    INCR offset					! Scan forward through block
+	FROM .path [.level, path$h_offset]	!   from the current entry
+	TO .max_offset				!   to the last entry,
+	BY .stat_blk [stat$g_idxsiz] DO 	!   entry by entry
+	BEGIN
+
+	LOCAL
+	    down_status;			! Status of search downward
+
+	index_record = .index_block + .offset;
+
+	!+
+	!   If there is no block specified, we
+	!   have an empty index entry.
+	!-
+
+	IF .index_record [iidx$g_down] EQL 0 THEN EXITLOOP;	! We're done
+
+	!+
+	!   Get the result of looking down a bit further.
+	!-
+
+	IF .level GTR 1				! Index level or data level
+	THEN
+	    down_status = nxtidx (.level - 1, .index_record [iidx$g_down])
+	ELSE
+	    down_status = nxtdat (.index_record [iidx$g_down]);
+
+	IF .down_status				! Success?
+	THEN
+	    BEGIN				! Save the path
+	    path [.level, path$h_offset] = .offset;
+	    path [.level, path$h_block] = .this_block;
+	    search_status = true;
+	    EXITLOOP;
+	    END;
+
+	END;
+
+    !
+    !	Put away the block we got.
+    !
+    put_block (.stksec OR .blk_desc, .level);	! Toss the block
+
+    !+
+    !	If we did not find an entry in this block, reset
+    !	this level's offset (in PATH) so we will start
+    !	in the right place when we are called again.
+    !-
+
+    IF .search_status				! How did we fare?
+    THEN
+	RETURN true				! OK
+    ELSE
+	BEGIN
+	path [.level, path$h_offset] = ibk$k_bln;
+	RETURN false;
+	END;
+
+    END;					! End NXTIDX
+ROUTINE nxtdat (check_block) =
+    BEGIN
+
+    STACKLOCAL
+	dummy_blk_desc : $isam_block_descriptor;
+
+    LOCAL
+	record_size,				! Length of record
+	record_words,				! Length of record in words
+	search_status,				! Status of loop search
+	bytes_per_word,				! Bytes per word in this file
+	offset,
+	blk_desc : REF $isam_block_descriptor,
+	data_block,
+	data_record : REF $isam_data_record;
+
+    !
+
+    !	Set up the descriptor pointers.  This unusual arrangement is
+    !	necessary because the descriptor is on the stack and
+    !	is therefore in another section.  This works around the
+    !	attempts of BLISS to be devious and efficient.
+    !
+    blk_desc = .stksec OR dummy_blk_desc;	! Set pointer
+    !
+    !	Get the required block
+    !
+    get_block (.check_block, 			! Block to get
+	.idafab [fab$v_bls], 			! It's this big (in blocks)
+	.blk_desc, 				! And we want it put here
+	0);					! Data level
+    !
+    !	Set up pointers to the block
+    !
+    data_block = .blk_desc [bld$a_block];	! Point at block
+
+    !+
+    !	The offset in PATH may be negative, meaning that
+    !	we are to take the first record in this block,
+    !	if there is one.  Otherwise, we find
+    !	the current record and skip to the next.
+    !-
+
+    IF (offset = .path [0, path$h_offset]) LSS 0	! Negative
+    THEN
+	BEGIN
+	offset = 0;				! Use first record
+	data_record = .data_block;		! ...
+	END
+    ELSE
+	BEGIN
+	!
+	!	Point at the current data record.
+	!
+	offset = .path [0, path$h_offset];
+	data_record = .data_block + .offset;
+
+	!+
+	!	Get length of record (in bytes) as appropriate
+	!	for this type of data.
+	!-
+
+	IF .idafab [fab$v_bsz] EQL rms$k_asc_size	!
+	THEN
+	    BEGIN
+	    record_size = .data_record [ida$h_asc_siz];
+	    bytes_per_word = 5;			! Really shouldn't use constant
+	    END
+	ELSE
+	    BEGIN
+	    record_size = .data_record [ida$h_size];
+	    bytes_per_word = %BPVAL/.idafab [fab$v_bsz];
+	    END;
+
+	!
+	!	Save record length away (for no good reason)
+	!
+	idxrab [rab$h_rsz] = idxrst [rst$h_record_size] = .record_size;
+	!
+	!   Figure length of record in words
+	!
+	record_words = (.record_size + (.bytes_per_word - 1))/	!
+	.bytes_per_word;
+	offset = .offset + ida$k_bln + .record_words;
+	data_record = .data_block + .offset;
+	END;
+
+    !
+
+    !	See if we have a record here or not (zero in the first
+    !	word says no record exists).
+    !
+
+    IF .data_record [ida$h_size] EQL 0		! Length determines existence
+    THEN
+	BEGIN
+	search_status = false;			! No record here
+	path [0, path$h_offset] = -1;		! Take first of next block
+	END
+    ELSE
+	BEGIN
+	path [0, path$h_block] = .check_block;	! Set this block
+	path [0, path$h_offset] = .offset;	! Using correct offset
+	search_status = true;			! Yes, we have one.
+	END;
+
+    !
+    !	Put away the block we got.
+    !
+    put_block (.stksec OR .blk_desc, 0);	! Toss the block
+    !
+    !	Return the state of the world.
+    !
+    RETURN .search_status;
+    END;					! End NXTDAT
+END
+
+ELUDOM

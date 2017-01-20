@@ -1,0 +1,44 @@
+/*
+**	MKTEMP	- find name for temporary file
+**
+**	(c) Copyright Ken Harrenstien 1989
+**
+** Original version by David Eppstein / Stanford University / 9-Aug-84
+** TENEX additions by Ken Harrenstien, SRI 1-Jun-85
+** Re-written to use PIDs etc by KLH.
+*/
+
+#include <c-env.h>
+#include <stdioi.h>
+#include <sys/file.h>
+#include <unistd.h>
+
+char *
+mktemp(buf)
+char *buf;
+{
+    char *s = buf;
+    int pid, i;
+
+    pid = getpid();
+#if CPU_PDP10
+    pid += (unsigned)pid>>18;		/* Add LH to RH for more hashing */
+#endif
+    if (pid < 0) pid = -pid;		/* Ensure positive just in case */
+
+    while (*s) s++;			/* skip to end of string */
+    while (*--s == 'X') {		/* while in X's of target */
+	*s = (pid%10) + '0';		/* add bottom digit */
+	pid /= 10;			/* and move back in pid digits */
+    }
+    if (access(buf, F_OK) == -1)	/* file exist? */
+	return buf;			/* nope, so we won! */
+    while (*++s) {
+	for (i = 'a'; i <= 'z'; i++) {	/* loop from 'a' to 'z' */
+	    *s = i;			/* try replacing old with letter */
+	    if (access(buf, F_OK) == -1)	/* look again.  file there? */
+		return buf;		/* no, so won, return buf ptr */
+	}				/* else loop and try next letter */
+    }					/* all in use, try next position */
+    return NULL;			/* lost our ass!! */
+}

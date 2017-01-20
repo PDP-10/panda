@@ -1,0 +1,3897 @@
+SUBTTL	RMTCNM
+
+DECVER==0
+MCNVER==1
+
+
+	XLIST
+DEFINE NAME	(MCNVER,DECVER),<
+
+TITLE	RMTCNM DECSYSTEM KL10 NETWORK INTERCONNECT SERVER, VERSION MCNVER'.'DECVER>
+	LIST
+	LALL
+
+NAME	\MCNVER,\DECVER
+
+;#**********************************************************************
+; This "NI SERVER" runs under "TOPS20" only.
+;#**********************************************************************
+
+;COPYRIGHT 1985
+;LARGE SYSTEMS DIAGNOSTICS GROUP
+;DIGITAL EQUIPMENT CORPORATION
+;MARLBORO, MASS. 01752
+
+;GARY PAPAZIAN
+
+	NOSYM
+SEARCH	KCUNV,MONSYM,MACSYM,UUOSYM
+	SALL
+
+INTERN	LOGFLG,SPRFLG,TRCFLG,DBGFLG,RRID,SPR1,SPR4
+INTERN	HEX,PRHEX,PRTNBR,TARADH,TARADL,TTEXIT,$REMOTE,CTRSTR
+INTERN	RESCON,RELCON,RRCT,RCADR,SALLAD,NODSEL
+INTERN	PWFLG,PWORDH,PWORDL
+
+EXTERN	TESTPC,ATOM,C$QUIT,CONSW,P%T20,P%T20P,C%FIRST,START
+EXTERN	P%DJFN
+
+;Note: Z:<CUSP10>PARAM.KLM contains equates such as CR, XON, XOFF etc.
+
+;Data stack definitions
+
+	DP=16				;Define dp as data stack pointer
+
+DEFINE	PUSHD	(ARG),<			;Push data on data stack
+	IRP	ARG
+<	PUSH	DP,ARG>>
+
+DEFINE	POPD	(ARG),<			;Pop data from data stack
+	IRP	ARG
+<	POP	DP,ARG>>
+
+OPDEF	ERJSYS	[ERCAL	$ERJSYS]	;Jsys error reporter
+
+
+BUFSIZ=^D2000				;Max Command/Response buffer size
+
+SUBTTL	INITIAL START UP
+;#****************************************************************************
+;  Set up "C%FIRST" so that kcsub will execute "INITIA" code before prompting.
+;#****************************************************************************
+
+SETUP:	MOVE	AC0,[GO	INITIA]		;Get initialization address
+	MOVEM	AC0,C%FIRST		;Store it where kcsub can find it
+	JRST	START			;Do the initialization
+
+; This code is executed in startup before prompting occurs.
+
+INITIA:	MOVE	DP,[IOWD STKLEN,DSTK]	;Set up the data stack pointer
+
+	SKIPE	ONETIM			;Skip if first through this code
+	 JRST	INPEX			; Not first time
+	SETOM	ONETIM			;Mark that this code is executed
+	SETOM	P%T20
+	MOVEI	AC0,LOGNAM		;Get address of the logname to use
+	MOVEM	AC0,P%T20P		;Save it
+
+INPEX:	PMSG	<F[OR HELP, TYPE "[HELP" [AFTER THE PROGRAM PROMPT^>
+	GO	CTSAVE			;Save controlling terminal parameters
+	MOVEI	AC1,.FHSLF		;Process handle
+	MOVE	AC2,[1B<.TICTI>]	;Enable all type-in
+	STIW				;Set Terminal Interrupt Word to
+	RTN				; allow ^C exit at any time to monitor
+
+LOGNAM:	ASCIZ/DSK:REMOTE.LOG/
+
+T=SIXBTZ<NI SERVER>
+
+PWFLG:	0				;When set, "HEX" will rejustify for
+					;PASSWORD & not for ADDRESS
+
+;#**********************************************************************
+; If data stack push down overflow occurs, program will come here.
+;#**********************************************************************
+
+DSERR:	FATALP	<^DATA STACK PUSH DOWN LIST OVERFLOW^>
+
+$ERJSYS:	PMSG	<^? JSYS E[RROR AT >
+	GETIT	AC0
+	PNT6
+	PMSG	< - >
+
+	HRROI	AC1,ATOM
+	HRLOI	AC2,.FHSLF		;Get system error string
+	SETZ	AC3,
+	ERSTR
+	 HALTF
+	 HALTF
+
+	PNTMSG	ATOM
+	PCRLF
+	HALTF
+	JRST	START
+
+SUBTTL	REMOTE TERMINAL OPERATION
+;#****************************************************************************
+; $REMOTE subroutine - Entered from "CONNECT" in RMTCNP.
+;#****************************************************************************
+
+$REMOTE:SETZM	IBUFCT			;Init terminal input buffer char ctr
+	SETZM	OBUFCT			;Init terminal output buffer char ctr
+
+	SETZM	TTIBUF			;Clear buffers (helps debug)
+	MOVE	AC1,[TTIBUF,,TTIBUF+1]	;Source,,Dest
+	BLT	AC1,TABLEN
+
+	SETZM	XOFFLG			;XOFF flag
+	SETZM	BRKFLG			;BREAK flag
+	SETZM	CHRFLG			;Character received flag
+	SETZM	TIMINT			;Timer interrupt
+	SETZM	EXTFLG			;Exit character received flag
+	SETZM	MNOFLG			;Msg number flag used in RCSND & RCPOL
+	SETZM	CMDPND			;Command pending flag
+
+	GO	INITIM			;Initialize reservation timer
+
+; SETUP TERMINAL
+;#**************************
+
+REM1:	MOVEI	AC1,.CTTRM		;Specified termimal
+	RFMOD				; read its JFN mode word
+	MOVEM	AC2,TTMOD		; & save it (restored in REMX)
+	TRZ	AC2,1B24!3B29		;change to: 7 bit in/out, echos off,
+					; no format control, no translation
+	SFMOD				;Set program related modes for
+					; specified terminal
+REM3:	MOVEI	AC1,.FHSLF		;Process handle
+	RTIW				;Read terminal interrupt word
+	MOVEM	AC2,TTIWD		; & save it (restored in REMX)
+	MOVEI	AC1,.FHSLF		;Process handle
+	MOVE	AC2,[1B<.TICTI>]	;All type in
+	STIW				;Set modified terminal interr word
+
+; SETUP INTERRUPTS
+;#***********************
+
+REM6:	MOVEI	AC1,.FHSLF		;Current process handle
+	MOVE	AC2,[LEVTAB,,CHNTAB]	;interrupt tables
+	SIR				;Set chan & priority level table addr
+					; for current process
+	EIR				;Enable interrupt system
+
+	MOVE	AC1,[.TICTI,,2]		;Assign terminal intr for ALL TYPE-IN
+	ATI				; for chan 2
+
+	MOVEI	AC1,.FHSLF		;Current process handle
+	MOVE	AC2,[17B3]		;Chan 0,1,2,3
+	AIC				;Activate specified channels only
+
+;#*************************************************************************
+; Loop & wait for characters from TTY input
+;#*************************************************************************
+
+	MOVE	AC5,[POINT 8,TTIBUF]	;Init input buffer pointer
+
+LOOP:	SKIPE	CHRFLG			;Have a char?
+	 JRST	LOOP1			; yes, process it
+	SKIPN	TIMINT			;Reservation timer up yet?
+	 JRST	LOOP			; No, try all over
+	SKIPE	TRCFLG			;Yes, force RCPOLL
+	 PMSG	<^S[ENDING NULL [RCSEND [TO FORCE [RCPOLL [TO NOT LOOSE CONNECTION^>
+	JRST	LOOP2
+
+LOOP1:	SETZM	CHRFLG
+	SKIPE	EXTFLG			;Was it "EXIT CHAR"?
+	 JRST	LOOPX			; Yes, restore all & return
+
+LOOP2:	SKIPE	CMDPND			;No, command pending?
+	 JRST	LOOP			; Yes, RCSEND denied
+
+	AOS	MNOFLG			;Complement msg number
+	SETOM	CMDPND			;Set command pending
+	SETZM	TIMINT
+	GO	INITIM			;Initialize reservation timer
+
+				; *** MUST TRANSACT ***
+
+	MOVEI	AC1,.FHSLF		;Invoke RCSEND: Current process handle
+	MOVE	AC2,[1B0]		;Channel 0
+	IIC				;Initiate interrupt on chan 0 (RCSEND)
+
+	SKIPN	DBGFLG			;Debug?
+	 JRST	LOOP			; no, repeat all
+	MOVEI	AC1,.FHSLF		;Invoke RCPOLL: Current process handle
+	MOVE	AC2,[1B1]		;Channel 1
+	IIC				;Initiate interrupt on chan 1 (RCPOLL)
+	JRST	LOOP			;Repeat all
+
+; We got EXIT CHAR...reset stuff & go back to command mode
+;#*********************************************************
+
+LOOPX:	GO	RELCON			;Release console
+	 NOP				; Unsucessful release
+	MOVE	AC1,[.TICTI]		;Clear interrupts
+	DTI				;De-assign all type-in
+
+	MOVEI	AC1,.FHSLF
+	MOVE	AC2,[17B3]
+	DIC				;De-activate chan 0,1,2,3
+	DIR				;Disable system
+	CIS				;Clear interrupt system
+
+; RESTORE TERMINAL
+;#************************
+
+LOOPX1:	MOVEI	AC1,.CTTRM		; Specified terminal
+	MOVE	AC2,TTMOD		; get orig JFN mode word
+	SFMOD				; restore program related modes
+	STPAR				; restore device  related modes
+
+	MOVEI	AC1,.FHSLF		;Process handle
+	MOVE 	AC2,TTIWD		;Get orig terminal interr word
+	STIW				; & restore orig terminal int word
+
+	PCRLF
+
+	RTN				; & return to Parser in RMTCNP
+
+SUBTTL	TERMINAL INPUT INTERRUPT HANDLER
+;#***************************************************************************
+;Input chars from the TTY & set various flags depending on character.
+;Other routines/interrupt handlers will key off the flags.
+;Put all other chars into TTIBUF.
+; (See P.2-59 TOPS-20 MONITOR CALLS REFERENCE MANUAL)
+;#***************************************************************************
+
+TTYINP:	PUTIT	<AC1,AC0>		;Save some ac's
+TTIN7:	MOVEI	AC1,.CTTRM		;TTY source designation
+	SIBE				;TTY input buffer empty?
+	 JRST	TTIN2			; no, get character
+	JRST	TTINX			;yes, dismiss interrupt
+
+TTIN2:	PBIN				;Get character from terminal
+	CAME	AC1,TTEXIT		;Match exit character ?
+	 JRST	TTIN1			; no, continue
+	SETOM	EXTFLG			;Yes, set flag for use in $REMOTE
+	SETOM	CHRFLG
+	JRST	TTINX			;& exit
+
+TTIN1:	CAIE	AC1,"B"-100		;Control-B ?
+	 JRST	TTIN6
+	SETOM	BRKFLG			;Yes, set flag for use in RCSND
+	SETOM	CHRFLG
+	JRST	TTINX
+
+TTIN6:	CAIE	AC1,XOFF		;XOFF ?
+	 JRST	TTIN3
+	SETOM	XOFFLG			;Yes, stop output
+	JRST	TTINX
+
+TTIN3:	CAIE	AC1,XON			;Xon ?
+	 JRST	TTIN5
+	SETZM	XOFFLG			;Yes, allow output
+	JRST	TTINX
+
+TTIN5:	MOVE	AC0,IBUFCT		;Get terminal input pointers
+	CAMG	AC0,CBUFSZ		;Pointer beyond buff size?
+	 JRST	TTIN4			; no
+	PMSG	<^WARNING...INPUT BUFFER POINTER BEYOND BUFF LENGTH^>
+	JRST	TTINX
+
+TTIN4:	IDPB	AC1,AC5			;Deposit byte in TTIBUF
+	AOS	IBUFCT			;bump pointer
+	SETOM	CHRFLG
+	JRST	TTIN7			;see if tty buffer empty
+
+TTINX:	GETIT	<AC0,AC1>		;Restore ac's
+	DEBRK				;dismiss interrupt
+
+SUBTTL	RCSND INTERRUPT HANDLER
+;#*****************************************************************************
+; Take chars from the input buffer (TTIBUF) & pass them to PLUTO
+; via the RCSND LLMOP.
+; RCSND sets the argument block (RCSNDB+.LMREQ) to interrupt when RCPOL arrives
+;#*****************************************************************************
+
+RCSEND:	PUTIT	<AC1,AC0>		;Save some ac's
+	SKIPN	DBGFLG			;Debug?
+	 JRST	RCS4			; no
+
+	MOVE	AC5,[POINT 8,TTIBUF]	;Yes, fake it!
+	MOVE	AC6,[POINT 8,TTOBUF]
+
+	MOVE	AC0,IBUFCT
+	MOVEM	AC0,OBUFCT		;For later use by RCPOLL
+
+	SKIPN	IBUFCT			;Any input?
+	 JRST	RCSX			; no, dismiss interrupt
+
+RCS2:	ILDB	AC0,AC5			;Yes, put TTIBUF char in ac0
+	IDPB	AC0,AC6			;then to TTOBUF
+
+	SOSE	IBUFCT			;any chars left?
+	 JRST	RCS2			; yes, do again
+
+	MOVE	AC5,[POINT 8,TTIBUF]	;No, init input buffer pointer
+	JRST	RCSX			; & dismiss interrupt
+
+RCS4:	MOVE	AC0,[POINT 8,TTIBUF]
+	MOVE	AC1,IBUFCT
+	PUSHD	<AC0,AC1>		;Buffer ptr & Byte Count for RCSND
+	GO	RCSND			;Do Send Console Command jsys
+	 JRST	RCS6			; Jsys error return
+	POPD	SREQN			;Save req # (not used)
+
+	SETZM	IBUFCT			;re-init byte counter
+	MOVE	AC5,[POINT 8,TTIBUF]	; & init input buffer pointer
+
+RCSX:	GETIT	<AC0,AC1>		;Restore ac's
+	DEBRK				;dismiss interrupt
+
+
+RCS6:	PMSG	<^.RCSND JSYS F[AILURE - ^>
+	GO	FJSYS			;Go report jsys error
+	JRST	RCSX			;dismiss interrupt
+
+SUBTTL	RCPOL INTERRUPT HANDLER
+;#**************************************************************************
+; Do RCPOL, put response into output buffer (TTOBUF) & display it.
+;#**************************************************************************
+
+RCPOLL:	PUTIT	<AC2,AC1,AC0>		;Save some ac's
+	SKIPN	DBGFLG			;Debug?
+	 JRST	RCP7			; no
+	SETZM	CMDPND			;Yes, clear flag
+	JRST	RCP5			; & skip RCPOLL
+
+RCP7:	SKIPN	CMDPND			;Command pending?
+	 JRST	RCPX			; No, unrecognized request...exit
+
+	MOVE	AC0,[POINT 8,TTOBUF]	;Yes
+	MOVE	AC1,RBUFSZ		;Response buffer size
+	PUSHD	<AC0,AC1>		;Buff ptr & useable buff len for RCPOL
+	GO	RCPOL			;Do Console Response Poll jsys
+	 JRST	RCP2			; jsys error return
+	MOVE	AC0,RCPOLB+.LMCID	;Get flags
+
+	MOVE	AC1,MNOFLG		;Get Msg # flag
+	TRNN	AC1,1B35		;Skip if should test for LM%MNO = 1
+	 JRST	RCP1			; else test for LM%MNO = 0
+
+	TLNN	AC0,(LM%MNO)
+	 JRST	RCP6			;Invoke RCSEND again (must transact)
+	JRST	RCP3
+
+RCP1:	TLNE	AC0,(LM%MNO)
+	 JRST	RCP6			;Invoke RCSEND again (must transact)
+
+RCP3:	SETZM	CMDPND			;Clear command pending
+	TLNE	AC0,(LM%CDL)
+	 PMSG	<^RCPOL S[TATUS - [C[OMMAND [D[ATA [L[OST^>
+	TLNE	AC0,(LM%RDO)
+	 PMSG	<^RCPOL S[TATUS - [R[ESPONSE [D[ATA [L[OST^>
+	TLNE	AC0,(LM%RDL)
+	 PMSG	<^RCPOL S[TATUS - [R[ECEIVE [D[ATA [L[OST^>
+	HLRZ	AC0,RCPOLB+.LMRBL	;Get returned message length
+	MOVEM	AC0,OBUFCT		; & put in output buff char count
+
+	CAMLE	AC0,RBUFSZ		;Pointer beyond buffer size?
+	 PMSG	<^WARNING...RCPOLL RET MSG LEN GREATER THAN AVAIL RESP BUFF SIZE...PGM MAY BE OVERLAID^>
+	JRST	RCP5
+				; *** MUST TRANSACT ***
+
+RCP6:	MOVEI	AC1,.FHSLF		;Repeat RCSEND
+	MOVE	AC2,[1B0]		; on channel 0
+	IIC				;Initiate Interrupt
+	JRST	RCPX			; & exit
+
+;#****************************************************************************
+; Display TTOBUF
+;#****************************************************************************
+
+RCP5:	MOVE	AC6,[POINT 8,TTOBUF]	;Init output buffer pointer
+
+RCP4:	MOVEI	AC1,.PRIOU		;Do actual display
+	SOBF				;Is output buffer full? (def by .PRIOU)
+	SKIPA				;No
+	 JRST	RCP4			; Yes, have to wait
+
+	SOSGE	OBUFCT			;Decr & see if any chars to display?
+	 JRST	RCPX			; no, exit
+	ILDB	AC1,AC6			;Yes, put char in ac1
+	JUMPE	AC1,RCP4		;Ignore nulls
+
+	SKIPE	XOFFLG			;XOFF set?
+	 JRST	.-1			; yes, loop until cleared by TTYINP
+					; (priority 1)
+	PBOUT				;No, print (ac1) on users terminal
+
+	MOVE	AC2,AC1			;Byte to output
+	MOVE	AC1,P%DJFN		;Dest designation
+	SKIPE	LOGFLG
+	BOUT				;Put in log (def by P%DJFN)
+	 ERCAL	TTBERR
+	JRST	RCP4			;Do next char
+
+RCPX:	GETIT	<AC0,AC1,AC2>		;Restore ac's
+	DEBRK				;dismiss interrupt
+
+
+RCP2:	PMSG	<^.RCPOL JSYS F[AILURE - ^>
+	GO	FJSYS			;Go report jsys error
+	JRST	RCPX			;dismiss interrupt
+
+
+TTBERR:	TMSG	<
+LOG OUTPUT ERROR - LOGGING STOPPED
+>
+	SETZM	LOGFLG
+	SETZM	CONSW
+	DROPDV
+	RTN
+
+SUBTTL	SAVE/RESTORE TERMINAL PARAMETERS
+;#************************************************************************
+
+;Save original controlling terminal parameters
+;Called from beginning of RMTCNM
+
+CTSAVE:	MOVEI	AC1,.CTTRM		;get specified terminal
+	RFMOD				;get its JFN mode word
+	 ERJSYS
+	MOVEM	AC2,CTMOD		; & save it for restore below
+
+	RFCOC				;get control char output (cont words)
+	 ERJSYS
+	DMOVEM	AC2,CTCOC		; & save 'em for restore below
+	RTN
+
+;Restore original controlling terminal parameters
+;Called from "QUIT" in RMTCNP
+
+CTRSTR:	MOVEI	AC1,.CTTRM		;get specified terminal
+	MOVE	AC2,CTMOD		;get saved JFN mode word
+	SFMOD				; restore orig program related modes
+	STPAR				; restore orig device  related modes
+
+	DMOVE	AC2,CTCOC		;get saved control char output
+	SFCOC				; restore orig back
+	RTN
+
+
+; TIMER INTERRUPT HANDLER
+;#**************************************************************************
+
+ETIME:	AOS	TIMINT			;Set reservation time up flag
+	GO	INITIM			;Init reservation timer
+	DEBRK				;Dismiss interrupt
+
+
+; INITIALIZE RESERVATION TIMER
+;#****************************************************************************
+
+INITIM:	PUTIT	<AC3,AC2,AC1>		;Save some ac's
+	MOVE	AC1,[.FHSLF,,.TIMAL]	;Process handle,,reset timer interrupt
+	TIMER
+	 PMSG	<^ERROR IN TIMER JSYS^>
+	MOVE	AC1,[.FHSLF,,.TIMEL]	;Process handle,,do elapsed time
+	MOVE	AC2,RESTIM		;Reservation timer from SYS-ID (RESCON)
+	MOVEI	AC3,3			;Interrupt on channel 3
+	TIMER				;Invoke timer jsys
+	 PMSG	<^ERROR IN TIMER JSYS^>
+	GETIT	<AC1,AC2,AC3>		;Restore ac's
+	RTN
+
+SUBTTL	REMOTE TERMINAL STORAGE
+;#*************************************************************************
+
+CTMOD:	0				;Controlling terminal parameters
+CTCOC:	0				;Controlling terminal coc
+	0				; "
+TTMOD:	0				;Terminal parameters
+TTIWD:	0				;Terminal interrupt word
+
+XOFFLG:	0				;Xoff flag. enabled = -1
+BRKFLG:	0				;Break flag. enabled = -1
+CHRFLG:	0				;Received character flag
+TIMINT:	0				;Timer interrupt counter
+EXTFLG:	0				;Received exit character flag
+MNOFLG:	0				;Message Number flag
+					;Alternate between 0 & 1 in RCSND
+					;Should receive same sense in RCPOL
+RESTIM:	0				;Reservation timer from SYS-ID (RESCON)
+
+TO$FORK:0				;Terminal output fork handle
+NI$FORK:0				;"NI" Fork handle
+
+IBUFCT:	0				;Terminal input buffer char counter
+OBUFCT:	0				;Terminal output buffer char counter
+
+TTIBUF:	BLOCK	BUFSIZ			;Terminal input buffer (command buffer)
+TTOBUF:	BLOCK	BUFSIZ			;Terminal output buffer (response buff)
+TABLEN= .-1				;Table length
+
+CBUFSZ:	^D400				;Default values...will be modified
+RBUFSZ:	^D1000				; in RESCON
+
+SUBTTL	INTERRUPT CHANNEL & LEVEL TABLES
+;#****************************************************************************
+
+CHNTAB:	1,,RCSEND			;Chan 0 priority 1,,service routine
+	3,,RCPOLL			;Chan 1 priority 3
+	2,,TTYINP			;Chan 2 priority 2
+	3,,ETIME			;Chan 3 priority 3
+	REPEAT ^D32,<0>			;Zero rest of table
+
+LEVTAB:	0,,PCSND			;Addr to save PC for priority lev 1
+	0,,PCTTY			;  ditto for lev 2
+	0,,PCPOLL			;  ditto for lev 3
+
+PCSND:	0				;Ret addr for lev 1 - RCSEND
+	0				; use 2 words for possible ext address
+PCTTY:	0				;Ret addr for lev 2 - TTYINP
+	0
+PCPOLL:	0				;Ret addr for lev 3 - RCPOLL & ETIME
+	0
+
+SUBTTL	RCRID SUBROUTINE
+;#*************************************************************************
+;* RCRID subroutine
+;  
+; Send a Request Identity LLMOP to the dest address node on the Ethernet.
+;
+; Return +1 if a jsys error occurs.
+; Return +2 if successful...the data stack will contain the Request Number
+;			     for later .RCRPY/.RCABT/.RCSTS calls.
+;#**********************************************************************
+
+RCRID:	PUTIT	<AC2,AC1,AC0>		;Save some acs
+;Fill .rcrid jsys arg block
+
+	MOVE	PRTNBR			;Selected port number
+	MOVEM	RCRIDB+.LMCID
+
+	DMOVE	AC0,NODADH		;Put hi/lo dest addr in
+	DMOVEM	AC0,RCRIDB+.LMDST	; jsys arg block
+
+	SKIPN	TRCFLG			;Tracing enabled ?
+	 JRST	RCRID1			; No
+
+;Print the node address 
+
+	PMSG	<R[EQUESTING [ID[ OF NODE ADDRESS: >
+	PUSHD	<NODADH>	 	;Push hex digits 1-8
+	PUSHD	<NODADL> 		;Push hex digits 9-12
+	GO	PRHEX			;Print the hex node address
+	PCRLF
+
+RCRID1:	MOVEI	AC1,.RCRID		;Get function code
+	MOVEI	AC2,RCRIDB		;Set up pointer to .Rcrid jsys block
+	GO	$LLMOP			;Do "LLMOP"
+	 JRST	RCRID4			;Error return
+	AOS	-3(P)			;Bump return address for success return
+
+	SKIPN	TRCFLG			;Tracing enabled ?
+	 JRST	RCRID2			; No
+
+	PMSG	<.....R[EQUEST # >
+	HRRZ	AC0,RCRIDB+.LMREQ	;Get request number
+	PNTDEC
+	PCRLF
+
+RCRID2:	HRRZ	AC0,RCRIDB+.LMREQ
+	PUSHD	<AC0>			;Push Req # on data stack
+
+RCRID3:	GETIT	<AC0,AC1,AC2>		;Restore acs
+	RTN
+
+;Jsys failure comes here
+
+RCRID4:	PMSG	<^.RCRID JSYS F[AILURE - ^>
+	GO	FJSYS			;Go report jsys error
+	JRST	RCRID3			;Take jsys error return
+
+;.Rcrid jsys argument block
+
+RCRIDB:	0				;Channel id (port number)
+	0				;Dest addr (hi = byte 0,1,2,3,z)
+	0				;Dest addr (lo = byte 4,5,z,z,z)
+	0				;Int chan #,,Request number ret by jsys
+					;Int chan #...0 = no interrupt
+					;Req # for .RCRPY/.RCABT/.RCSTS
+
+SUBTTL	RCRCT SUBROUTINE
+;#*************************************************************************
+;* RCRCT subroutine
+;  
+;  Send a Read Counters LLMOP to the dest address node on the Ethernet.
+;
+;  Return +1 if a jsys error occurs.
+;  Return +2 if successful...the data stack will contain the Request Number
+;			     for later .RCRPY/.RCABT/.RCSTS calls.
+;#**********************************************************************
+
+RCRCT:	PUTIT	<AC2,AC1,AC0>		;Save some acs
+;Fill .rcrct jsys arg block
+
+	MOVE	PRTNBR			;Selected port number
+	MOVEM	RCRCTB+.LMCID
+
+	DMOVE	AC0,NODADH		;Put hi/lo dest addr in
+	DMOVEM	AC0,RCRCTB+.LMDST	; jsys arg block
+
+	SKIPN	TRCFLG			;Tracing enabled ?
+	 JRST	RCRCT1			; No
+
+;Print the node address 
+
+	PMSG	<R[EADING [C[OUNTERS OF NODE ADDRESS: >
+	PUSHD	<NODADH>	 	;Push hex digits 1-8
+	PUSHD	<NODADL> 		;Push hex digits 9-12
+	GO	PRHEX			;Print the hex node address
+	PCRLF
+
+RCRCT1:	MOVEI	AC1,.RCRCT		;Get function code
+	MOVEI	AC2,RCRCTB		;Set up pointer to .rcrct jsys block
+	GO	$LLMOP			;Do "LLMOP"
+	 JRST	RCRCT4			;Error return
+	AOS	-3(P)			;Bump return address for success return
+
+	SKIPN	TRCFLG			;Tracing enabled ?
+	 JRST	RCRCT2			; No
+
+	PMSG	<.....R[EQUEST # >
+	HRRZ	AC0,RCRCTB+.LMREQ	;Get request number
+	PNTDEC
+	PCRLF
+
+RCRCT2:	HRRZ	AC0,RCRCTB+.LMREQ
+	PUSHD	<AC0>			;Push Req # on data stack
+
+RCRCT3:	GETIT	<AC0,AC1,AC2>		;Restore acs
+	RTN
+
+;Jsys failure comes here
+
+RCRCT4:	PMSG	<^.RCRCT JSYS F[AILURE - ^>
+	GO	FJSYS			;Go report jsys error
+	JRST	RCRCT3			;Take jsys error return
+
+;.rcrct jsys argument block
+
+RCRCTB:	0				;Channel id (port number)
+	0				;Dest addr (hi = byte 0,1,2,3,z)
+	0				;Dest addr (lo = byte 4,5,z,z,z)
+	0				;Int chan #,,Request number ret by jsys
+					;Int chan #...0 = no interrupt
+					;Req # for .RCRPY/.RCABT/.RCSTS
+SUBTTL	RCRBT SUBROUTINE
+;#*************************************************************************
+;* RCRBT subroutine 
+;  
+;  Send a Remote Boot LLMOP to the dest address node on the Ethernet
+;  to load Console Carrier ucode into PLUTO
+;  
+;  Return +1 if a jsys error occurs.
+;  Return +2 if successful
+;#**********************************************************************
+
+RCRBT:	PUTIT	<AC2,AC1,AC0>		;Save some acs
+;Fill .rcrbt jsys arg block
+
+	MOVE	PRTNBR			;Selected port number
+	MOVEM	RCRBTB+.LMCID
+
+	DMOVE	AC0,TARADH		;Put hi/lo dest addr in
+	DMOVEM	AC0,RCRBTB+.LMDST	; jsys arg block
+
+	DMOVE	AC0,PWORDH		;Put password in
+	DMOVEM	RCRBTB+.LMPWD		; jsys arg block
+
+	MOVE	AC0,[1B35]		;Put control info - boot comm proc
+	MOVEM	AC0,RCRBTB+.LMCIF	; in jsys arg block
+
+	SETZM	RCRBTB+.LMDID		;Device ID
+
+	MOVE	AC0,[POINT 8,RBTSID]	;Put pointer to Software ID
+	MOVEM	AC0,RCRBTB+.LMSID	; in jsys arg block
+
+	SKIPN	TRCFLG			;Trace enabled ?
+	 JRST	RCRBT1			; No
+
+;Print the node address 
+
+	PMSG	<B[OOT [I[SSUED TO [TARGET NODE ADDRESS: >
+	PUSHD	<TARADH>	 	;Push hex digits 1-8
+	PUSHD	<TARADL> 		;Push hex digits 9-12
+	GO	PRHEX			;Print the hex node address
+	PCRLF
+
+RCRBT1:	MOVEI	AC1,.RCRBT		;Get function code
+	MOVEI	AC2,RCRBTB		;Set up pointer to .RCRBT jsys block
+	GO	$LLMOP			;Do "LLMOP"
+	 JRST	RCRBT4			;Error return
+	AOS	-3(P)			;Bump return address for success return
+
+RCRBT3:	GETIT	<AC0,AC1,AC2>		;Restore acs
+	RTN
+
+;Jsys failure comes here
+
+RCRBT4:	PMSG	<^.RCRBT JSYS F[AILURE - ^>
+	GO	FJSYS			;Go report jsys error
+	JRST	RCRBT3			;Take jsys error return
+
+;.RCRBT jsys argument block
+
+RCRBTB:	0				;Channel id (port number)
+	0				;Dest addr (hi = byte 0,1,2,3,z)
+	0				;Dest addr (lo = byte 4,5,z,z,z)
+	0				;PLUTO password (hi bytes 7,6,5,4,z)
+	0				;PLUTO password (lo bytes 3,2,1,0,z)
+	0				;Control information
+	0				;Pointer to Device-id
+	0				;Pointer to Software-id
+
+RBTDID:	0				;8 bit byte string for Device   ID
+RBTSID:	377B7				; "     "     "    "   Software ID
+
+SUBTTL	RCRPY SUBROUTINE
+;#****************************************************************************
+;* RCRPY subroutine
+;
+;  Do REMOTE CONSOLE REPLY to a REQUEST-ID or READ COUNTERS LLMOP.
+;  
+;  1. Push the Request Number on the data stack (from .RCRID/.RCRCT).
+;  2. Call this routine via "GO RCRPY".
+;  3. Return +1 If a jsys error occured.
+;     Return +2 If successful.
+;  4. If successful, RCRPYB+.LMRBL will contain the Remote Console Buffer
+;     Message Length returned by the jsys.
+;#****************************************************************************
+
+RCRPY:	PUTIT	<AC2,AC1,AC0>		;Save some acs
+;Fill .rcrpy jsys arg block
+
+	MOVE	PRTNBR			;Selected port number
+	MOVEM	RCRPYB+.LMCID
+
+	POPD	<RCRPYB+.LMREQ>		;Req # from .RCRID/.RCRCT
+
+	MOVE	AC0,RBUFSZ		;Get response buffer size
+	MOVEM	AC0,RCRPYB+.LMRBL	; Put in .Rcrpy jsys block
+
+	MOVE	AC0,[POINT 8,TTOBUF]	;Get console output buffer ptr
+	MOVEM	AC0,RCRPYB+.LMRBP	; Put in .Rcrpy jsys block
+
+	SKIPN	TRCFLG			;Tracing enabled ?
+	 JRST	RCRPY1			; No
+
+	PMSG	<^ R[EAD [CONSOLE REPLY [FOR REQUEST # >
+	MOVE	AC0,RCRPYB+.LMREQ	;Get request number
+	PNTDEC
+	PCRLF
+
+RCRPY1:	MOVEI	AC1,.RCRPY		;Get function code
+	MOVEI	AC2,RCRPYB		;Set up pointer to .Rcrpy jsys block
+	GO	$LLMOP			;Do "LLMOP"
+	 JRST	RCRPY4			;Jsys error return
+	AOS	-3(P)			;Bump return address for success return
+
+	SKIPN	TRCFLG			;Tracing enabled ?
+	 JRST	RCRPY3			; No
+
+	PMSG	<.....R[ETURNED MESSAGE LENGTH = >
+	HLRZ	AC0,RCRPYB+.LMRBL 	;Get message length
+	PNTDEC
+	PCRLF
+
+RCRPY3:	GETIT	<AC0,AC1,AC2>		;Restore acs
+	RTN
+
+;Jsys failure comes here
+
+RCRPY4:	PMSG	<^.RCRPY JSYS F[AILURE - ^>
+	GO	FJSYS			;Go report jsys error
+	JRST	RCRPY3			;Take jsys error return
+
+;.Rcrpy jsys argument block
+
+RCRPYB:	0				;Channel-id (port number)
+	0				;Source addr ret from BCAST/MCAST
+	0				;  "     "
+	0				;Request # from .RCRID/.RCRCT jsys ret.
+	0				;Ret msg len,,Response Buffer Length
+	0				;Response Buffer Pointer
+
+SUBTTL	RCRSV SUBROUTINE
+;#*****************************************************************************
+;* RCRSV subroutine
+;
+;  Send a RESERVE REMOTE CONSOLE LLMOP to the dest address node on the Ethernet
+;  
+;  Return +1 if a jsys error occurs.
+;  Return +2 if successful.
+;#*****************************************************************************
+
+RCRSV:	PUTIT	<AC2,AC1,AC0>		;Save some acs
+;Fill .rcrsv jsys arg block
+
+	MOVE	PRTNBR			;Selected port number
+	MOVEM	RCRSVB+.LMCID
+
+	DMOVE	AC0,TARADH		;Put hi/lo dest addr in
+	DMOVEM	AC0,RCRSVB+.LMDST	; jsys arg block
+
+	DMOVE	AC0,PWORDH		;Get password, hi/lo bytes
+	DMOVEM	RCRSVB+.LMPWD
+
+	SKIPN	TRCFLG			;Tracing enabled ?
+	 JRST	RCRSV1			; No
+
+;Print the node address 
+
+	PMSG	<R[ESERVING [R[EMOTE [C[ONSOLE OF TARGET NODE ADDRESS: >
+	PUSHD	<TARADH>	 	;Push hex digits 1-8
+	PUSHD	<TARADL> 		;Push hex digits 9-12
+	GO	PRHEX			;Print the hex node address
+	PCRLF
+
+RCRSV1:	MOVEI	AC1,.RCRSV		;Get function code
+	MOVEI	AC2,RCRSVB		;Set up pointer to .Rcrsv jsys block
+	GO	$LLMOP			;Do "LLMOP"
+	 JRST	RCRSV4			;Error return
+	AOS	-3(P)			;Bump return address for success return
+
+	SKIPN	TRCFLG			;Tracing enabled ?
+	 JRST	RCRSV3			; No
+
+	PMSG	<.....P[ORT [ID # >
+	MOVE	AC0,RCRSVB+.LMCID	;Get port id number
+	PNTDEC
+	PCRLF
+
+RCRSV3:	GETIT	<AC0,AC1,AC2>		;Restore acs
+	RTN
+
+;Jsys failure comes here
+
+RCRSV4:	PMSG	<^.RCRSV JSYS F[AILURE - ^>
+	GO	FJSYS			;Go report jsys error
+	JRST	RCRSV3			;Take jsys error return
+
+;.Rcrsv jsys argument block
+
+RCRSVB:	0				;Channel id (Port #)
+	0				;Dest addr (hi = byte 0,1,2,3,z)
+	0				;Dest addr (lo = byte 4,5,z,z,z)
+	0				;PLUTO password (hi = bytes 7,6,5,4,z)
+	0				;PLUTO password (lo = bytes 3,2,1,0,z)
+
+SUBTTL	RCREL SUBROUTINE
+;#*****************************************************************************
+;* RCREL subroutine
+;
+;  Send a RELEASE REMOTE CONSOLE LLMOP to the dest address node on the Ethernet
+;
+;  Return +1 if a jsys error occurs.
+;  Return +2 if successful
+;#*****************************************************************************
+
+RCREL:	PUTIT	<AC2,AC1,AC0>		;Save some acs
+;Fill .rcrel jsys arg block
+
+	MOVE	PRTNBR			;Selected port number
+	MOVEM	RCRELB+.LMCID
+
+	DMOVE	AC0,TARADH		;Put hi/lo dest addr in
+	DMOVEM	AC0,RCRELB+.LMDST	; jsys arg block
+
+	SKIPN	TRCFLG			;Tracing enabled ?
+	 JRST	RCRSV1			; No
+
+;Print the node address 
+
+	PMSG	<R[ELEASING [R[EMOTE [C[ONSOLE OF TARGET NODE ADDRESS: >
+	PUSHD	<TARADH>	 	;Push hex digits 1-8
+	PUSHD	<TARADL> 		;Push hex digits 9-12
+	GO	PRHEX			;Print the hex node address
+	PCRLF
+
+RCREL1:	MOVEI	AC1,.RCREL		;Get function code
+	MOVEI	AC2,RCRELB		;Set up pointer to .Rcrel jsys block
+	GO	$LLMOP			;Do "LLMOP"
+	 JRST	RCREL4			;Error return
+	AOS	-3(P)			;Bump return address for success return
+
+	SKIPN	TRCFLG			;Tracing enabled ?
+	 JRST	RCREL3			; No
+
+	PMSG	<.....P[ORT [ID # >
+	MOVE	AC0,RCRELB+.LMCID	;Get port id number
+	PNTDEC
+	PCRLF
+
+RCREL3:	GETIT	<AC0,AC1,AC2>		;Restore acs
+	RTN
+
+;Jsys failure comes here
+
+RCREL4:	PMSG	<^.RCREL JSYS F[AILURE - ^>
+	GO	FJSYS			;Go report jsys error
+	JRST	RCREL3			;Take jsys error return
+
+;.Rcrel jsys argument block
+
+RCRELB:	0				;Channel-id (Port #)
+	0				;Dest addr (hi = byte 0,1,2,3,z)
+	0				;Dest addr (lo = byte 4,5,z,z,z)
+
+
+SUBTTL	RCSND SUBROUTINE
+;#**********************************************************************
+;* RCSND subroutine - SEND CONSOLE COMMAND
+;  
+;  This function sends ASCII console command data to the remote console
+;  & polls for response data. With no command data, this function may be
+;  used to poll for more response data without sending a command.
+;
+;  1. Put the Response Buffer Ptr & Response Buffer Length on the data stack.
+;  2. Call this routine via "GO RCSND". 
+;  3. Return +1 if a jsys error occurs.
+;     Return +2 if successful...The data stack will contain the Request Number
+;     for later .RCPOL/.RCABT/.RCSTS calls.
+;#**********************************************************************
+
+RCSND:	PUTIT	<AC2,AC1,AC0>		;Save some acs
+;Fill .rcsnd jsys arg block
+
+	MOVE	PRTNBR			;get selected port number
+	SKIPE	BRKFLG			;command break flag set?
+	 TLO	AC0,(LM%CBF)		; yes, set B1 for arg block
+	TLO	AC0,(LM%MNO)		;assume flag = 1 for now
+	MOVE	AC1,MNOFLG		;get message number flag
+	TRNN	AC1,1B35		;skip if = 1
+	 TLZ	AC0,(LM%MNO)		; else we assumed wrong
+	MOVEM	RCSNDB+.LMCID		;put in arg block
+	SETZM	BRKFLG			;clear flag for next time
+
+	DMOVE	AC0,TARADH		;Put hi/lo dest addr in
+	DMOVEM	AC0,RCSNDB+.LMDST	; jsys arg block
+
+	SETZ	AC0,			;Assign interrupt channel (AIC) &
+	TLO	AC0,(LM%AIC ! 1B17)	; response (RCPOLL) to interr on chan 1
+	MOVEM	AC0,RCSNDB+.LMREQ	; & put in jsys arg block
+
+	POPD	<RCSNDB+.LMRBL,RCSNDB+.LMRBP>
+	SKIPN	TRCFLG			;Tracing enabled ?
+	 JRST	RCSND1			; No
+
+;Print the target node address 
+
+	PMSG	<S[ENDING TO [R[EMOTE [C[ONSOLE OF TARGET NODE ADDRESS: >
+	PUSHD	<TARADH>	 	;Push hex digits 1-8
+	PUSHD	<TARADL> 		;Push hex digits 9-12
+	GO	PRHEX			;Print the hex node address
+	PCRLF
+
+RCSND1:	MOVEI	AC1,.RCSND		;Get function code
+	MOVEI	AC2,RCSNDB		;Set up pointer to .Rcsnd jsys block
+	GO	$LLMOP			;Do "LLMOP"
+	 JRST	RCSND4			;Error return
+	AOS	-3(P)			;Bump return address for success return
+
+	SKIPN	TRCFLG			;Tracing enabled ?
+	 JRST	RCSND2			; No
+
+	PMSG	<.....R[EQUEST # >
+	HRRZ	AC0,RCSNDB+.LMREQ	;Get request number
+	PNTDEC
+	PCRLF
+
+RCSND2:	HRRZ	AC0,RCSNDB+.LMREQ
+	PUSHD	<AC0>			;Push Req # on data stack
+
+RCSND3:	GETIT	<AC0,AC1,AC2>		;Restore acs
+	RTN
+
+;Jsys failure comes here
+
+RCSND4:	PMSG	<^.RCSND JSYS F[AILURE - ^>
+	GO	FJSYS			;Go report jsys error
+	JRST	RCSND3			;Take jsys error return
+
+;.Rcsnd jsys argument block
+
+RCSNDB:	0				;Cmd break flag,,Chan-id (port #)
+	0				;Dest addr (hi = byte 0,1,2,3,z)
+	0				;Dest addr (lo = byte 4,5,z,z,z)
+	0				;Int chan #,,Req # ret by jsys
+					 ;Int chan #... 0 = no interrupt
+					 ;req # for .RCPOL/.RCABT/.RCSTS calls
+	0				;Response Buffer Length
+	0				;Response Buffer Pointer
+SUBTTL	RCPOL SUBROUTINE
+;#**********************************************************************
+;* RCPOL subroutine - CONSOLE RESPONSE POLL
+;
+;  This function polls for completion of the SEND CONSOLE COMMAND fuction.
+;  
+;  1. Put the Response Buffer Ptr & Response Buffer Length on the data stack.
+;  2. Call this routine via "GO RCPOL". 
+;  3. Return +1 if a jsys error occurs.
+;     Return +2 if successful.
+;  4. Upon successful ret, RCPOLB+.LMRBL will contain the Remote Console Buffer
+;     Message Length returned by the jsys.
+;#**********************************************************************
+
+RCPOL:	PUTIT	<AC2,AC1,AC0>		;Save some acs
+;Fill .rcpol jsys arg block
+
+	MOVE	PRTNBR			;Selected port number
+	MOVEM	RCPOLB+.LMCID
+
+	HRRZ	RCSNDB+.LMREQ		;Req # from .RCSND
+	HRRZM	RCPOLB+.LMREQ		; to .RCPOL jsys block
+
+	POPD	<RCPOLB+.LMRBL,RCPOLB+.LMRBP>
+	SKIPN	TRCFLG			;Tracing enabled ?
+	 JRST	RCPOL1			; No
+
+;Print the target node address 
+
+	PMSG	<P[OLLING [R[EMOTE [C[ONSOLE OF TARGET NODE ADDRESS: >
+	PUSHD	<TARADH>	 	;Push hex digits 1-8
+	PUSHD	<TARADL> 		;Push hex digits 9-12
+	GO	PRHEX			;Print the hex node address
+	PCRLF
+
+RCPOL1:	MOVEI	AC1,.RCPOL		;Get function code
+	MOVEI	AC2,RCPOLB		;Set up pointer to .Rcpol jsys block
+	GO	$LLMOP			;Do "LLMOP"
+	 JRST	RCPOL4			;Error return
+	AOS	-3(P)			;Bump return address for success return
+
+	SKIPN	TRCFLG			;Tracing enabled ?
+	 JRST	RCPOL3			; No
+
+	PMSG	<.....R[EQUEST # >
+	HRRZ	AC0,RCPOLB+.LMREQ	;Get request number
+	PNTDEC
+	PCRLF
+
+	PMSG	<.....R[ETURNED MESSAGE LENGTH = >
+	HLRZ	AC0,RCPOLB+.LMRBL 	;Get message length
+	PNTDEC
+	PCRLF
+
+RCPOL3:	GETIT	<AC0,AC1,AC2>		;Restore acs
+	RTN
+
+;Jsys failure comes here
+
+RCPOL4:	PMSG	<^.RCPOL JSYS F[AILURE - ^>
+	GO	FJSYS			;Go report jsys error
+	JRST	RCPOL3			;Take jsys error return
+
+;.Rcpol jsys argument block
+
+RCPOLB:	0				;Ret Data Lost Flags,,Chan-id (port #)
+	0				;not used
+	0				;not used
+	0				;Request # from .RCSND jsys ret.
+	0				;Ret msg len,,Response Buffer Length
+	0				;Response Buffer Pointer
+
+SUBTTL	RCABT SUBROUTINE
+;#***************************************************************************
+;* RCABT subroutine - ABORT OUTSTANDING REMOTE CONSOLE REQUEST.
+;
+;  1. Push the Request Number on the data stack (from .RCRID/.RCRCT/.RCSND)
+;  2. Call this routine via "GO RCABT"
+;  3. Return +1 If a jsys error occured.
+;     Return +2 If successful.
+;#***************************************************************************
+
+RCABT:	PUTIT	<AC2,AC1,AC0>		;Save some ac's
+;Fill .rcabt jsys arg block
+
+	MOVE	PRTNBR			;Selected port number
+	MOVEM	RCABTB+.LMCID
+
+	POPD	<RCABTB+.LMREQ>		;Put Req # in jsys arg block
+	
+	MOVEI	AC1,.RCABT		;Get function code
+	MOVEI	AC2,RCABTB		;Set up pointer to .RCABT jsys block
+	GO	$LLMOP			;Do "LLMOP"
+	 JRST	RCABT4			;Error return
+	AOS	-3(P)			;Bump return address for success return
+
+	SKIPN	TRCFLG			;Tracing enabled ?
+	 JRST	RCABT3			; No
+
+	PMSG	<^A[BORTED [R[EQUEST # >
+	MOVE	AC0,RCABTB+.LMREQ	;Get request number
+	PNTDEC
+	PCRLF
+
+RCABT3:	GETIT	<AC0,AC1,AC2>		;Restore acs
+	RTN
+
+;Jsys failure comes here
+
+RCABT4:	PMSG	<^.RCABT JSYS F[AILURE - ^>
+	GO	FJSYS			;Go report jsys error
+	JRST	RCABT3			;Take jsys error return
+
+;.rcabt jsys argument block
+
+RCABTB:	0				;Channel-id
+	0				;Not used
+	0				;Not used
+	0				;Req # from .RCRID/.RCRCT/.RCSND
+
+SUBTTL	RCSTS SUBROUTINE
+;#**********************************************************************
+;* RCSTS - OBTAIN REMOTE CONSOLE REQUEST STATUS
+;  
+;  1. Put request number on the data stack from .RCRID/.RCRCT/.RCSND
+;  2. Call this routine via "GO RCSTS". 
+;  3. Return +1 If a jsys error occured.
+;     Return +2 If successful
+;  4. Upon successful return from the jsys, RCSTSB+.LMSTF will contain
+;     the status from the previous request.
+;#**********************************************************************
+
+RCSTS:	PUTIT	<AC2,AC0>		;Save some ac's
+;Fill .rcsts jsys arg block
+
+	MOVE	PRTNBR			;Selected port number
+	MOVEM	RCSTSB+.LMCID
+
+	POPD	RCSTSB+.LMREQ		;Request number to .Rcsts jsys block
+
+	SKIPN	TRCFLG			;Tracing enabled ?
+	 JRST	RCSTS1			; No
+
+	PMSG	<C[HECKING REQUEST # >
+	MOVE	AC0,RCSTSB+.LMREQ	;Get request number
+	PNTDEC
+	PCRLF
+
+RCSTS1:	MOVEI	AC1,.RCSTS		;Get function code
+	MOVEI	AC2,RCSTSB		;Set up pointer to .Rcsts jsys block
+	GO	$LLMOP			;Do "LLMOP"
+	 JRST	RCSTS4			;Error return
+	AOS	-2(P)			;Bump return address for success return
+
+	SKIPN	TRCFLG			;Tracing enabled ?
+	 JRST	RCSTS3			; No
+
+	PMSG	<.....S[TATUS = >
+	MOVE	AC0,RCSTSB+.LMSTF	;Get request status
+	PNTDEC				; & print it
+
+	MOVE	AC0,RCSTSB+.LMSTF	;Get again
+	CAIE	AC0,.LMPND		;Pending?
+	 JRST	RCSTS5			; no
+	PMSG	< = P[ENDING>
+	JRST	RCSTS2
+
+RCSTS5:	CAIE	AC0,.LMSUC		;Success?
+	 JRST	RCSTS6			; no
+	PMSG	< = S[UCCESS>
+	JRST	RCSTS2
+
+RCSTS6:	CAIE	AC0,.LMABT		;Aborted?
+	 JRST	RCSTS7			; no
+	PMSG	< = A[BORTED>
+	JRST	RCSTS2
+
+RCSTS7:	CAIE	AC0,.LMTXF		;Transmit failed?
+	 JRST	RCSTS8			; no
+	PMSG	< = T[RANSMIT [F[AILED>
+	JRST	RCSTS2
+
+RCSTS8:	CAIE	AC0,.LMCCE		;Channel communication error?
+	 JRST	RCSTS9			; no
+	PMSG	< = C[HANNEL [C[OMMUNICATION [E[RROR>
+	JRST	RCSTS2
+
+RCSTS9:	PMSG	< = U[NKNOWN [S[TATUS [T[YPE>
+RCSTS2:	PCRLF
+
+RCSTS3:	GETIT	<AC0,AC2>		;Restore AC's
+	RTN
+
+RCSTS4:	PMSG	<^.RCSTS JSYS F[AILURE - ^>
+	GO	FJSYS			;Go report jsys error
+	JRST	RCSTS3			;Take jsys error return
+
+;.Rcsts jsys argument block
+
+RCSTSB:	0				;Channel-id
+	0				;Status flags upon jsys return
+	0				;Channel status upon jsys return
+	0				;Req # from .RCRID/.RCRCT/.RCSND
+
+SUBTTL	RCADR SUBROUTINE
+;#***************************************************************************
+;* RCADR subroutine - READ LOCAL ADDRESS
+;
+;  1. Call this routine via "GO RCADR"
+;  2. Return +1 If a jsys error occured.
+;     Return +2 If successful.
+;  3. Return is immediate.
+;     Hardware & physical address will appear in the argument block upon
+;     successful return & the physical address stored in LOCADH/L.
+;#***************************************************************************
+
+RCADR:	PUTIT	<AC2,AC1,AC0>		;Save some ac's
+	MOVE	PRTNBR			;Selected port number
+	MOVEM	RCADRB+.LMCID
+
+	MOVEI	AC1,.RCADR		;Get function code
+	MOVEI	AC2,RCADRB		;Set up pointer to .rcadr arg block
+	GO	$LLMOP			;Do "LLMOP"
+	 JRST	RCADR4			;Error return
+	AOS	-3(P)			;Bump return address for success return
+
+	DMOVE	AC0,RCADRB+.LMPYA	;Put returned physical addr in LOCADH/L
+	DMOVEM	AC0,LOCADH
+
+	SKIPN	TRCFLG			;Trace enabled ?
+	 JRST	RCADR3			; No
+
+	PMSG	<L[OCAL [P[HYSICAL [A[DDRESS = >
+	PUSHD	<LOCADH,LOCADL>
+	GO	PRHEX
+	PCRLF
+
+	PMSG	<L[OCAL [H[ARDWARE [A[DDRESS = >
+	PUSHD	<RCADRB+.LMHWA,RCADRB+.LMHWA+1>
+	GO	PRHEX
+	PCRLF
+
+RCADR3:	GETIT	<AC0,AC1,AC2>		;Restore acs
+	RTN
+
+;Jsys failure comes here
+
+RCADR4:	PMSG	<^.RCADR JSYS F[AILURE - ^>
+	GO	FJSYS			;Go report jsys error
+	JRST	RCADR3			;Take jsys error return
+
+;.RCADR jsys argument block
+
+RCADRB:	0					;Channel-id
+	44321,,263600	;hex 1-8,z  (for debug)	;Ret local hardware addr
+	465360,,0	;hex 9-C,z (for debug)	;  "	    "      "      "
+	44321,,263600	;for debug		;Ret local physical addr
+	465360,,0	;for debug		;  "        "      "      "
+
+SUBTTL	LLMOP SUBROUTINE
+;#**************************************************************************
+; This subroutine does the actual LLMOP% JSYS.
+; 
+; Enter with AC1 = function code
+;	     AC2 = address of arg block
+; If DEBUG is enabled, simulate the LLMOP.
+; Return +1 if jsys error
+; Return +2 if successful
+;#***************************************************************************
+
+$LLMOP:	SKIPE	DBGFLG			;Do real or fake ?
+	 JRST	$LLM5			; Simulate "LLMOP" for debug
+
+	LLMOP%				;Do "LLMOP" jsys
+	 ERJMP	$LLM3			;Failed
+	JRST	$LLM2			;Passed
+
+$LLM5:	CAIE	AC1,.RCSTS		;Doing "OBTAIN STATUS" ?
+	 JRST	$LLM4			; no
+
+	MOVEI	AC2,.LMSUC		;Yes, set success bit
+	MOVEM	AC2,RCSTSB+.LMSTF	; Make successful
+	JRST	$LLM2			; Exit
+
+$LLM4:	CAIE	AC1,.RCRID		;Doing "REQUEST-ID" ?	
+	 JRST	$LLM1			; no
+	AOS	RCRIDB+.LMREQ		;Yes, fake by increment request number
+	 JRST	$LLM2			; Exit
+
+$LLM1:	CAIE	AC1,.RCRPY		;Doing "READ REMOTE CONSOLE REPLY" ?
+	 JRST	$LLM2			; no
+	MOVEI	AC2,^D100		;Yes, get ret message length in bytes
+	HRLM	AC2,RCRPYB+.LMRBL	;Put in .Rcrpy jsys block
+
+$LLM2:	AOS	(P)			;Skip return if ok
+$LLM3:	RTN
+
+SUBTTL	RDSTIM SUBROUTINE
+;#**********************************************************************
+;* Rdstim subroutine
+;
+;  Read the current time since last time system was restarted.
+;  Save that value and calculate and save a value of time 5 seconds later.
+;#**********************************************************************
+
+RDSTIM:	PUTIT	<AC1,AC2>		;Save some acs
+
+	TIME				;Do time jsys
+	MOVEM	AC1,TIMST		;Save it
+
+	ADDI	AC1,^D5000		;Add 5 seconds to the current time
+
+	SKIPE	TRCFLG			;Tracing enabled ?
+	 ADDI	AC1,^D<1000*60>		; Yes, 60 seconds more for typeouts
+
+	MOVEM	AC1,TIMEND		;Save it	
+	GETIT	<AC2,AC1>		;Restore acs
+	RTN
+
+;#**********************************************************************
+;* OTIME subroutine
+;
+;  This subroutine reads the current time and compares that value with
+;  TIMEND that was calculated in the RDSTIM  subroutine.
+;  This is used to determine if 5 seconds has elapsed since calling
+;  the RDSTIM subroutine.
+;  
+;  Return +1 if time exceeded
+;  Return +2 if time not exceeded.
+;#**********************************************************************
+
+OTIME:	PUTIT	<AC1,AC2>		;Save some acs
+
+	TIME				;Do time jsys
+
+	CAMG	AC1,TIMEND		;Has current time exceeded timend ?
+	 AOS	-2(P)			; No, bump for skip return
+
+	GETIT	<AC2,AC1>		;Restore acs
+	RTN
+
+SUBTTL	HEX SUBROUTINE
+;#**********************************************************************
+;* HEX subroutine
+;
+;  This subroutine is called from SELECT, DESELECT, REQ-ID & READ COUNTERS
+;  from DNISP to read in a 12 digit hex node address.
+;  When inputting the 12 digit address the digits will be in the form:
+;  
+;  AC10 = Hi addr = z,z,z,z,z,z,1,2,3     ==>  rejust to: 1,2,3,4,5,6,7,8,z 
+;  AC11 = Lo addr = 4,5,6,7,8,9,10,11,12  ==>  rejust to: 9,10,11,12,z,z,z,z,z
+;
+;  The bytes will then be in the form:	Hi = 0,1,2,3,z
+;					Lo = 4,5,z,z,z
+;
+;  This subroutine is also called to read in a 16 digit PASSWORD from RMTCNP
+;  When inputting the 16 digit password, the digits will be in the form:
+;
+;  AC10 = Hi = z,z,1,2,3,4,5,6,7	==> rejust to: 1,2,3,4,5,6,7,8,z
+;  AC11 = Lo = 8,9,10,11,12,13,14,15,16 ==> rejust to: 9,10,11,12,13,14,15,16,z
+;
+;  PWSWAP will then re-arrange the digits to be:
+;
+;  AC10 = Hi = 15,16,13,14,11,12,9,10,z	 =  bytes 7,6,5,4,z
+;  AC11 = Lo = 7,8,5,6,3,4,1,2,z         =  bytes 3,2,1,0,z
+;
+;  Hyphens will be ignored.
+;  Any other non hex digit will cause this subroutine to exit.
+;#**********************************************************************
+
+HEX:	SETZB	AC10,AC11		;Clear ac10 and ac11 
+	SETZM	AC4			;Set digit count to 0
+	MOVE	AC5,[POINT 7,ATOM]	;Set up byte pointer atom buffer
+
+HEXA:	ILDB	AC0,AC5			;Read in a char
+	JUMPE	AC0,HEXC		; 0 = end of field, rejustify it
+	CAIL	AC0,60			;Less than a 0 ?
+	CAILE	AC0,71			;Greater than a 9 ?
+	 JRST	HEXD			; Yes check for a-f
+
+	SUBI	AC0,60			;No, so convert char to hex
+
+HEXB:	ROTC	AC10,4			;Left 4 places (combined ac10/11)
+	ADD	AC11,AC0		;Add new number to ac11
+	AOJA	AC4,HEXA		;Bump digit counter and go get next
+
+HEXD:	CAIL	AC0,"A"			;Less than an "A"
+	CAILE	AC0,"F"			;Greater than an "F"
+	 JRST	HEXE			; Yes, see if lower case characters
+	SUBI	AC0,67			;Convert char into hex number
+	JRST	HEXB			;Pack it into the hex node number
+
+HEXE:	CAIL	AC0,"A"+40		;Less than an a
+	CAILE	AC0,"F"+40		;Greater than an f
+	 JRST	HEXG			; Yes, see if hyphen
+	SUBI	AC0,40+67		;Make lower case into hex
+	JRST	HEXB			;Pack it into the hex node number
+
+HEXG:	CAIE	AC0,"-"			;hyphen?
+	 JRST	HEXX			; no, error...exit
+	JRST	HEXA			;yes, ignore & input next char
+
+HEXC:	SKIPN	PWFLG			;Doing PASSWORD?
+	 JRST	HEXF			; No, do ADDRESS
+	ROTC	AC10,4			;Yes, left 4 places combined
+	ROT	AC10,4
+	GO	PWSWAP			;Swap password bytes around
+	JRST	HEXX			;Exit
+
+HEXF:	GO	REJUS			;Rejustify address
+
+HEXX:	RTN
+
+SUBTTL	REJUS SUBROUTINE
+;#**********************************************************************
+;* REJUS  subroutine
+;
+;  Rejustifies a node address to the standard format used by 
+;  LLMOP jsys's arg block.
+;
+;  1. Enter with the Hi address in AC10
+;		   & Lo address in AC11
+;  2. Call this subroutine via GO REJUS.
+;  
+;  Upon return, AC10 & AC11 will be in the following format:
+;
+;  AC10 = Hi addr = x,x,x,x,x,x,1,2,3     ==>  rejust to: 1,2,3,4,5,6,7,8,z 
+;  AC11 = Lo addr = 4,5,6,7,8,9,10,11,12  ==>  rejust to: 9,10,11,12,z,z,z,z,z
+;#**********************************************************************
+
+REJUS:	PUTIT	<AC3,AC2,AC1>		;Save some ac's 
+	SETZM	AC1			;Clear ac1
+	LDB	AC2,[POINT 8,AC11,^D27]	;Get hex digits 9 and 10
+	DPB	AC2,[POINT 8,AC1,7]	;Put it in ac1  
+
+	LDB	AC2,[POINT 8,AC11,^D35]	;Get hex digits 11 and 12
+	DPB	AC2,[POINT 8,AC1,^D15]	;Put it in ac1  
+	MOVEM	AC1,AC3			;Store rejustified lo address
+
+	SETZM	AC1			;Clear ac1
+	LDB	AC2,[POINT 8,AC10,^D31] ;Get hex digits 1 and 2
+	DPB	AC2,[POINT 8,AC1,7]	;Put them in ac1
+
+	LDB	AC2,[POINT 4,AC10,^D35] ;Get hex digit 3
+	DPB	AC2,[POINT 4,AC1,^D11]	;Put it in ac1  
+
+	LDB	AC2,[POINT 4,AC11,^D3]  ;Get hex digit 4
+	DPB	AC2,[POINT 4,AC1,^D15]	;Put it in ac1  
+
+	LDB	AC2,[POINT 8,AC11,^D11] ;Get hex digits 5 and 6
+	DPB	AC2,[POINT 8,AC1,^D23]	 ;Put it in ac1  
+
+	LDB	AC2,[POINT 8,AC11,^D19] ;Get hex digits 7 and 8
+	DPB	AC2,[POINT 8,AC1,^D31]	;Put it in ac1  
+
+	MOVEM	AC1,AC10		;Put rejustified Hi addr back in AC10
+	MOVEM	AC3,AC11		;Put rejustified Lo addr back in AC11
+
+	GETIT	<AC1,AC2,AC3>		;Restore the ac's 
+	RTN
+SUBTTL	PWSWAP SUBROUTINE
+;#**********************************************************************
+;* PWSWAP  subroutine
+;
+;  Swaps the password bytes as shown below:
+;
+;  1. Enter with the Hi password in AC10
+;		   & Lo password in AC11
+;
+;  2. Call this subroutine via GO PWSWAP
+;  
+;  Upon return, AC10 & AC11 will be in the following format:
+;
+;  AC10 = Hi bytes = 0,1,2,3,z	==>  rejust to: 7,6,5,4,z
+;  AC11 = Lo bytes = 4,5,6,7,z	==>  rejust to: 3,2,1,0,z
+;#**********************************************************************
+
+PWSWAP:	SETZB	AC0,AC1
+	MOVE	AC6,[POINT 8,AC10]	;Set byte pointer
+
+	ILDB	AC5,AC6			;Get byte 0
+	DPB	AC5,[POINT 8,AC1,31]	; & put in AC1
+	ILDB	AC5,AC6			;Get byte 1
+	DPB	AC5,[POINT 8,AC1,23]	; & put in AC1
+	ILDB	AC5,AC6			;Get byte 2
+	DPB	AC5,[POINT 8,AC1,15]	; & put in AC1
+	ILDB	AC5,AC6			;Get byte 3
+	DPB	AC5,[POINT 8,AC1,7]	; & put in AC1
+	ILDB	AC5,AC6			;Get byte 4
+	DPB	AC5,[POINT 8,AC0,31]	; & put in AC0
+	ILDB	AC5,AC6			;Get byte 5
+	DPB	AC5,[POINT 8,AC0,23]	; & put in AC0
+	ILDB	AC5,AC6			;Get byte 6
+	DPB	AC5,[POINT 8,AC0,15]	; & put in AC0
+	ILDB	AC5,AC6			;Get byte 7
+	DPB	AC5,[POINT 8,AC0,7]	; & put in AC0
+
+	DMOVE	AC10,AC0		;AC0,1 to AC10,11
+	RTN
+SUBTTL	PRINT 12 DIGIT HEX NUMBER SUBROUTINE
+;#**********************************************************************
+;* PRHEX prints a 12 digit hex node address.
+;
+;  1. Put the Hi address (hex digits 1 - 8)
+;     followed by the Lo address (hex digits 9 - 12) on the data stack.
+;  2. Call this subroutine by "GO PRHEX".
+;  3. A hyphen will be printed between every 2 hex digits.
+;#**********************************************************************
+
+PRHEX:	PUTIT	<AC0,AC1,AC3,AC4,AC5>	;Save acs
+
+	POPD	<AC4,AC3>		;Get lo,hi hex addr
+	MOVEI	AC5,^D12		;Initialize 12 digits to type
+	ROT	AC3,-^D4		;Right justify Hi address
+	SETZ	AC1,			;Char counter for hyphens
+
+PRHEXA:	ROTC	AC3,^D4			;Put digit to be printed at far left
+	LDB	AC0,[POINT 4,AC3,3]	;Copy hex digit to ac0
+	ADDI	AC0,60			;Make an ascii character
+
+	CAILE	AC0,"9"			;Less than a "9" ?
+	 ADDI	AC0,7			; No, add 7 more to get a-f
+
+	PNTCHR				;Print the hex digit
+	AOJ	AC1,			;Bump char ctr
+	CAIE	AC1,2			;2nd char?
+	 JRST	PRHEXB			; No
+	CAIN	AC5,1			;Last char?
+	 JRST	PRHEXB			; Yes
+	MOVEI	AC0,"-"			;Yes, print hyphen
+	PNTCHR
+	SETZ	AC1,			;Reset ctr
+PRHEXB:	SOJG	AC5,PRHEXA		;Do next digit
+
+	GETIT	<AC5,AC4,AC3,AC1,AC0>	;Restore acs
+	RTN
+
+SUBTTL	ASCIZ A 12 DIGIT HEX NUMBER SUBROUTINE
+;#**********************************************************************
+;* UHEX subroutine
+;
+;  1. Asciz a 12 digit hex node address & put the 3 words on the data stack.
+;  2  Put the hi address (hex digits 1,2,3).
+;  3. Put the lo address (hex digits 4 thru 12) on the data stack.
+;  4. Call this subroutine by "GO UHEX".
+;  5. To remove the data do "POPD <X,Y,Z>
+;     WHERE "X" IS ASCII DIGITS 1,2,3,4,5,
+;           "Y" Is ascii digits 6,7,8,9,10
+;	    "Z" is asciz digits 11,12 .
+;#**********************************************************************
+
+UHEX:	PUTIT	<AC0,AC1,AC3,AC4,AC5>	;Save acs
+	POPD	<AC4,AC3>		;Get hex word from data stack
+	MOVEI	AC5,^D12		;Initialize 12 digits to type
+	ROTC	AC3,-^D12		;Rotate 3 digits out of ac3
+	MOVE	AC1,[POINT 7,UHEXB]	;Get initial byte pointer
+
+UHEXA:	ROTC	AC3,^D4			;Rotate digit into ac3
+	LDB	AC0,[POINT 4,AC3,35]	;Copy hex digit to ac0
+	ADDI	AC0,60			;Make an ascii character
+	CAILE	AC0,"9"			;Less than a "9" ?
+	 ADDI	AC0,7			; No, add 7 more to get a-f
+	IDPB	AC0,AC1			;Save the hex digit
+	SOJG	AC5,UHEXA		;Do next digit
+
+	PUSHD	<UHEXB+2,UHEXB+1,UHEXB>	;Put asciz'd node name on data stack
+	GETIT	<AC5,AC4,AC3,AC1,AC0>	;Restore acs
+	RTN
+
+UHEXB:	BLOCK	3			;Storage for asciz'd node name
+
+;#**********************************************************************
+; Wait1 waits 250 milli seconds
+;#**********************************************************************
+
+WAIT1:	PUTIT	AC1			;Save ac1
+	SKIPN	TRCFLG			;Tracing enabled ?
+	 JRST	WAIT1A			; No
+
+	MOVEI	AC1,^D250		;Setup for 250 milli seconds
+	DISMS				;Dismiss process for 250 milli seconds
+
+WAIT1A:	GETIT	AC1			;Restore ac1
+	RTN
+
+
+
+
+
+
+;#**********************************************************************
+;  Some ERROR and ERROR1 calls use the following subroutines as
+;  Additional  error print routines.
+;#**********************************************************************
+
+ER01:	PMSG	<^T[HE [TARGET NODE[ ADDRESS IS >
+	PUSHD	<TARADH>		;Push hex digits 1-8
+	PUSHD	<TARADL>	 	;Push hex digits 9-12
+	GO	PRHEX			;Print the hex node address
+	PCRLF
+
+	PMSG	<^T[HE [NODE [ADDRESS FOR [REQ-ID & READ COUNTERS [IS >
+	PUSHD	<NODADH>		;Push hex digits 1-8
+	PUSHD	<NODADL>	 	;Push hex digits 9-12
+	GO	PRHEX			;Print the hex node address
+	PCRLF
+	RTN
+
+SUBTTL	SPEAR SUBROUTINES
+;#**********************************************************************
+; SPRS subroutine:
+;
+;  1. Reads the current date and time into location "SPRSX"
+;  2. Reads the current spear entry packet count into location "SCNTS".
+;#**********************************************************************
+
+SPRS:	SKIPN	SPRFLG			;Skip if spear reporting is enabled
+	 RTN				; Return to code that called this code
+
+	PUTIT	<AC1>			;Save an ac 
+	GO	SPRP			;Go read spear entry packet count
+	POPD	<SCNTS>			;Save current spear count in "SCNTS"
+
+	GTAD				;Get time and day 
+	MOVEM	AC1,SPRSX		;Save time and day
+	GETIT	<AC1>			;Restore ac 
+	RTN				;Return to code that called this code
+
+SCNTS:	0				;Spear error entry count 
+SPRSX:	0				;Start date and time stored here
+
+;#**********************************************************************
+; SPRP subroutine
+;
+;  Read the current spear packet count, and put the value on
+;  The data stack.
+;  If the jsys fails, a message is typed and a fatal error occurs.
+;  Call this subroutine via "GO SPRP".
+;  When this subroutine returns, the current
+;  Spear packet count is on the data stack.
+;  To get the count, use "POPD <X>, 
+;  Where "X" is the location you want the spear packet count to go to.
+;#**********************************************************************
+
+SPRP:	PUTIT	<AC1>			;Save an ac
+	MOVE	AC1,[XWD -2,SPRPB]	;Set up pointer
+	SKIPE	DBGFLG			;Bypass if debugging
+	 JRST	SPRPA
+
+	DIAG				;Do diag jsys
+	FATALP	<^DIAG JSYS FAILED IN SPRP SUBROUTINE.^>
+
+SPRPA:	GETIT	<AC1>			;Restore ac
+	PUSHD	<SPRPC>			;Put current spear count on data stack
+	RTN
+
+SPRPB:	.DGRSC				;Read spear packet count 
+SPRPC:	Z				;Jsys writes spear packet count here
+
+
+;#**********************************************************************
+; SPRE subroutine:
+;
+;  1. Reads the current date and time into location "SPRSE"
+;  2. Reads the current spear entry packet count into location "SCNTE".
+;  3. Does a skip return if the spear entry packet count is different than 
+;     When subroutine sprs was executed.
+;
+;  Subroutine "SPRS", which reads the current spear packet entry count must be
+;  Executed before this subroutine.
+;#**********************************************************************
+
+SPRE:	SKIPN	SPRFLG			;Skip if spear reporting is enabled
+	 RTN
+
+	PUSHD	<AC1>			;Save an ac 
+	GTAD				;Get time and day 
+	MOVEM	AC1,SPRSE		;Save time and day
+
+	GO	SPRP			;Go read spear entry packet count
+	POPD	<AC1>			;Get current spear count
+
+	CAME	AC1,SCNTS		;Skip if count the same as when started
+	AOS	(P)			;Skip return. Error return. 
+
+	POPD	<AC1>			;Restore ac 
+	RTN
+
+SCNTE:	0				;Spear error entry count 
+SPRSE:	0				;Start date and time stored here
+
+;#**********************************************************************
+; FJSYS subroutine
+;
+;  Reports a jsys failure.
+;  The monitor error message is stored in buffer fjsybf and then printed.
+;#**********************************************************************
+
+FJSYS:	PUTIT	<AC3,AC2,AC1,AC0> 	;Save some acs
+	SETZM	FJSYBF			;Zero first word of buffer
+	MOVEI	AC1,.FHSLF		;Get the process handle
+	GETER				;Return with ac2 = (.Fhslf,,error code)
+	 ERJMP	[RTN]			;
+
+	HRROI	AC1,FJSYBF		;Get a pointer to store error text 
+	HRLZI	AC3,-^D500		;Set 500 byte limit on size of string
+	ERSTR				;Get the last jsys error string
+	 ERJMP	[RTN]			;Undefined error
+	 ERJMP	[RTN]			;Too large a string
+
+	PNTMSG	FJSYBF			;Print the monitor message
+	PCRLF
+	GETIT	<AC0,AC1,AC2,AC3> 	;Restore acs
+	RTN
+
+FJSYBF:	BLOCK	^D201			;Storage for monitor error text
+
+SUBTTL	RESERVE CONSOLE
+;#**************************************************************************
+;  1. Do Read Local address jsys & put the physical address in LOCADH/L.
+;  2. Do a REQ-ID & put the SYS-ID into TTOBUF.
+;  3. If FUNCTION indicates no "console carrier", boot via "NICE" protocol
+;     & re-enter again.
+;  4. If FUNCTION indicates "console carrier" & "not reserved", do 
+;     a RESERVE CONSOLE jsys & re-enter again.
+;  5. If FUNCTION indicates "console carrier" & "reserved", read the
+;     CONSOLE USER & check that it's our "local-address".
+;  6. Check that the HARDWARE ADDRESS returned in SYS-ID is the desired
+;     "target" node address.
+;  7. Check that the CONSOLE COMMAND SIZE & CONSOLE RESPONSE SIZE returned
+;     in SYS-ID is consistent with buffer sizes allotted in the program.
+;  8. Read the Reservation Timer, reduce it by 2 secs & store it in RESTIM.
+;     To be used by LOOP to send RCPOLL's so that we dont timeout
+;     & loose connection
+;
+;  Return+1 if unsuccessful
+;  Return+2 if successful
+;#***************************************************************************
+
+RESCON:	PUTIT	<AC7,AC6,AC5,AC4,AC3,AC2,AC1,AC0>	;Save some ac's
+	SETZM	RBTCTR			;Clear remote boot counter
+	GO	RCADR			;Read local hardware & physical addr
+	 JRST	RESX			; & put physical addr in LOCADH/L
+
+	SETZM	PASCT			;For debug
+
+RES1:	SKIPN	DBGFLG			;Debug?
+	 JRST	RES1D			;No
+
+	SKIPE	PASCT			;1'st pass?
+	 JRST	RES9			; no
+
+	MOVEI	AC0,177			;Yes, clear "RESERVED" in FUNCTION
+	MOVEM	AC0,REQT1
+
+	MOVEI	AC3,5			;Clear "CONSOLE USER" in SYS-ID
+	SETZM	REQT2(AC3)
+	SOJGE	AC3,.-1
+	JRST	RES4
+
+RES9:	MOVEI	AC0,377			;Set "RESERVED" in FUNCTION
+	MOVEM	AC0,REQT1
+
+	MOVEI	AC3,6			;Set "CONSOLE USER" in SYS-ID to
+	SETZ	AC4,			; 123456789ABC
+	MOVE	AC5,[POINT 8,SLOCH]
+	MOVE	AC6,[POINT 36,REQT2]
+RES9A:	ILDB	AC4,AC5			;Get SLOCH/L
+	IDPB	AC4,AC6			; & put it in REQT2
+	SOJG	AC3,RES9A		; repeat 6 times
+
+RES4:	MOVE	AC0,[RTEND-REQTAB]	;Get table byte count
+	HRLM	AC0,RCRPYB+.LMRBL	; & fake the ret msg len
+
+; Do a REQ-ID & put the SYS-ID into TTOBUF
+
+RES1D:	GO	RRID
+
+; Reset pointer to look for FUNCTION (info type 2)
+; If no "console carrier", boot via RCRBT & re-enter again.
+; If "console carrier" & "not reserved", do RESERVE CONSOLE & re-enter again.
+
+	MOVE	AC2,[POINT 8,TTOBUF]	;Set buffer ptr
+	HLRZ	AC7,RCRPYB+.LMRBL	;Get SYS-ID byte count
+
+RES1A:	JUMPE	AC7,RES10		;Exit if byte count = 0
+	ILDB	AC1,AC2			;Put 1'st INFO TYPE lo byte in AC1
+	ILDB	AC0,AC2			;Put 2'nd INFO TYPE hi byte in AC0
+	DPB	AC0,[POINT 8,AC1,35-8]	; Construct the info type word
+	SUBI	AC7,2			;Decrement byte count
+
+	CAIE	AC1,0			;Info type = 0? (padding)
+	 JRST	RES1B			; No, see if FUNCTION
+	IBP	AC2			;Yes, jump over msg length
+	SOJN	AC7,RES1A		;Try next info type if byte count not 0
+RES10:	PMSG	<^C[ANNOT FIND [FUNCTION [IN [SYS-ID, E[XITING^>
+	JRST	RESX
+
+RES1B:	CAIN	AC1,2			;Is it FUNCTION?
+	 JRST	RES1C			; yes
+					; no, go to next info type
+	ILDB	AC0,AC2			;Get data length
+	SOJ	AC7,			;Decr byte count
+RES11:	IBP	AC2			;Skip over data
+	SOJ	AC7,			;Decr byte count
+	SOJG	AC0,RES11		;Done?
+	JRST	RES1A			;Yes, try over
+
+RES1C:	ILDB	AC1,AC2			;Go get the length
+	CAIN	AC1,2			;Is it 2 ?
+	JRST	RES2			; Yes
+
+	PMSG	<^ F[UNCTION [I[NFO LENGTH IN ERROR, SHOULD BE 2, WAS >
+	MOVE	AC0,AC1			;Copy the length
+	PNTDEC				;Print ac0 and exit
+	PCRLF
+	JRST	RESX
+
+RES2:	ILDB	AC1,AC2			;Get the data for lo byte
+
+	TRNN	AC1,1B30		;Console Carrier set?
+	 JRST	RES8			; No,I have to issue RCRBT
+	TRNE	AC1,1B28		;Console Reservation set?
+	 JRST	RES2A			; Yes, see by who
+	GO	RCRSV			;No, do Reserve Console Jsys
+	 JRST	RESX			; Jsys error return...exit
+	AOS	PASCT			;For debug
+	JRST	RES1			;See if we got it
+
+;Reset pointer to look for CONSOLE USER (info type 3)
+; & check to see if it is our "local address".
+
+RES2A:	MOVE	AC2,[POINT 8,TTOBUF]	;Set buffer ptr
+	HLRZ	AC7,RCRPYB+.LMRBL	;Get SYS-ID byte count
+
+RES2B:	JUMPE	AC7,RES12		;Exit if byte count = 0
+	ILDB	AC1,AC2			;Put 1'st INFO TYPE lo byte in AC1
+	ILDB	AC0,AC2			;Put 2'nd INFO TYPE hi byte in AC0
+	DPB	AC0,[POINT 8,AC1,35-8]	; Construct the info type word
+	SUBI	AC7,2			;Decrement byte count
+
+	CAIE	AC1,0			;Info type = 0? (padding)
+	 JRST	RES2C			; No, see if CONSOLE USER
+	IBP	AC2			;Yes, jump over msg length
+	SOJN	AC7,RES2B		;Try next info type if byte count not 0
+RES12:	PMSG	<^C[ANNOT FIND [CONSOLE USER [IN [SYS-ID, E[XITING^>
+	JRST	RESX
+
+RES2C:	CAIN	AC1,3			;Is it CONSOLE USER?
+	 JRST	RES2D			; yes
+					; no, go to next info type
+	ILDB	AC0,AC2			;Get data length
+	SOJ	AC7,			;Decr byte count
+RES13:	IBP	AC2			;Skip over data
+	SOJ	AC7,			;Decr byte count
+	SOJG	AC0,RES13		;Done?
+	JRST	RES2B			;Yes, try over
+
+RES2D:	ILDB	AC1,AC2			;Go get the length
+	CAIN	AC1,6			;Is it 6 ?
+	 JRST	RES3			; Yes, see if it's me
+
+	PMSG	<^ C[ONSOLE [U[SER [I[NFO LENGTH IN ERROR, SHOULD BE 6, WAS >
+	MOVE	AC0,AC1			;Copy the byte
+	PNTDEC				;Print ac0
+	PCRLF
+	JRST	RESX			; and exit
+
+RES3:	MOVEM	AC2,TEMP1		;save pointer for error printout
+
+	MOVEI	AC3,6			;Compare 6 bytes to see if it's us
+	MOVE	AC6,[POINT 8,LOCADH]	;Set byte pointer
+RES5:	ILDB	AC0,AC2			;Get console user address byte 0-5
+	ILDB	AC1,AC6			;Get local   node address byte 0-5
+
+	CAME	AC0,AC1			;Same?
+	 JRST	RES7			; No, console not avail... exit
+	SOJG	AC3,RES5		; Yes, repeat
+
+	SKIPE	TRCFLG			;Trace on?
+	 PMSG	<^C[ONSOLE [R[ESERVATION [S[UCCESSFUL^>	; Yes
+	SETOM	NODSEL			;Set node selected flag
+	AOS	-10(P)			;Do ret+2
+
+
+; Reset pointer to look for RESERVATION TIMER (info type 4)
+; Reduce it by 2 & store it in RESTIM.
+; If Reservation Timer not in SYS-ID, default to 10 sec.
+
+	MOVE	AC2,[POINT 8,TTOBUF]	;Set buffer ptr
+	HLRZ	AC7,RCRPYB+.LMRBL	;Get SYS-ID byte count
+
+RES6:	JUMPE	AC7,RES6A		;Exit if byte count = 0
+	ILDB	AC1,AC2			;Put 1'st INFO TYPE lo byte in AC1
+	ILDB	AC0,AC2			;Put 2'nd INFO TYPE hi byte in AC0
+	DPB	AC0,[POINT 8,AC1,35-8]	; Construct the info type word
+	SUBI	AC7,2			;Decrement byte count
+
+	CAIE	AC1,0			;Info type = 0? (padding)
+	 JRST	RES6B			; No, see if RESERVATION TIMER
+	IBP	AC2			;Yes, jump over msg length
+	SOJN	AC7,RES6		;Try next info type if byte count not 0
+RES6A:	PMSG	<^C[ANNOT FIND [RESERVATION TIMER [IN [SYS-ID, E[XITING^>
+	MOVEI	AC0,10000
+	MOVEM	AC0,RESTIM		;Default to 10 sec
+	JRST	RESX
+
+RES6B:	CAIN	AC1,4			;Is it RESERVATION TIMER?
+	 JRST	RES6D			; yes
+					; no, go to next info type
+	ILDB	AC0,AC2			;Get data length
+	SOJ	AC7,			;Decr byte count
+RES6C:	IBP	AC2			;Skip over data
+	SOJ	AC7,			;Decr byte count
+	SOJG	AC0,RES6C		;Done?
+	JRST	RES6			;Yes, try over
+
+RES6D:	ILDB	AC1,AC2			;Go get the length
+	CAIN	AC1,2			;Is it 2 ?
+	JRST	RES6E			; Yes
+
+	PMSG	<^ R[ESERVATION [T[IMER [I[NFO LENGTH IN ERROR, SHOULD BE 2, WAS >
+	MOVE	AC0,AC1			;Copy the length
+	PNTDEC				;Print ac0 and exit
+	PCRLF
+	JRST	RESX
+
+RES6E:	ILDB	AC1,AC2			;Get the data for lo byte
+	SOJ	AC7,			;Decr byte count
+	CAILE	AC1,2			;More than 2 sec?
+	 SUBI	AC1,2			; Yes, decr by 2 sec
+;;;	IMULI	AC1,^D1000		;Get it in ms (NOP for now)
+;;;mult by 1000 causes too long time between data transmissions
+	MOVEM	AC1,RESTIM		; & store it
+
+
+;Reset pointer to look for CONSOLE COMMAND SIZE (info type 5)
+
+	MOVE	AC2,[POINT 8,TTOBUF]	;Set buffer ptr
+	HLRZ	AC7,RCRPYB+.LMRBL	;Get SYS-ID byte count
+
+RES20B:	JUMPE	AC7,RES16		;Exit if byte count = 0
+	ILDB	AC1,AC2			;Put 1'st INFO TYPE lo byte in AC1
+	ILDB	AC0,AC2			;Put 2'nd INFO TYPE hi byte in AC0
+	DPB	AC0,[POINT 8,AC1,35-8]	; Construct the info type word
+	SUBI	AC7,2			;Decrement byte count
+
+	CAIE	AC1,0			;Info type = 0? (padding)
+	 JRST	RES20C			;No, see if CONSOLE CMD SIZE
+	IBP	AC2			;Yes, jump over msg length
+	SOJN	AC7,RES20B		;Try next info type if byte count not 0
+RES16:	PMSG	<^C[ANNOT FIND [CONSOLE COMMAND SIZE [IN [SYS-ID, E[XITING^>
+	JRST	RESX
+
+RES20C:	CAIN	AC1,5			;Is it CONSOLE COMMAND SIZE?
+	 JRST	RES20D			; yes
+					; no, go to next info type
+	ILDB	AC0,AC2			;Get data length
+	SOJ	AC7,			;Decr byte count
+RES17:	IBP	AC2			;Skip over data
+	SOJ	AC7,			;Decr byte count
+	SOJG	AC0,RES17		;Done?
+	JRST	RES20B			;Yes, try over
+
+RES20D:	ILDB	AC1,AC2			;Go get the length
+	CAIN	AC1,2			;Is it 2 ?
+	 JRST	RES20E			; Yes, get size
+
+	PMSG	<^ C[ONSOLE [C[OMMAND [S[IZE [I[NFO LENGTH IN ERROR, SHOULD BE 2, WAS >
+	MOVE	AC0,AC1			;Copy the byte
+	PNTDEC				;Print ac0
+	PCRLF
+	JRST	RESX			; and exit
+
+;Modify CBUFSZ so that it is always less than Console Command Size
+;Check to see that CBUFSZ is less than the max allotted buffer size BUFSIZ.
+
+RES20E:	ILDB	AC1,AC2			;Get lo byte of console command size
+	ILDB	AC0,AC2			;Get hi byte
+	DPB	AC0,[POINT 8,AC1,35-8]	;Construct console command size in AC1
+	SOJ	AC1,			;Decrement by 1
+	MOVEM	AC1,CBUFSZ		;Modify size
+
+	CAIG	AC1,BUFSIZ		;CBUFSZ > BUFSIZ ?
+	 JRST	RES20A			; No, continue
+	PMSG	<^W[ARNING...[CBUFSZ [GREATER THAN [BUFSIZ^>
+	PMSG	<^CBUFSZ = >
+	MOVE	AC0,CBUFSZ
+	PNTDEC
+
+	PMSG	<^BUFSIZ = >
+	MOVEI	AC0,BUFSIZ
+	PNTDEC
+	PCRLF
+
+
+;Reset pointer to look for CONSOLE RESPONSE SIZE (info type 6)
+
+RES20A:	MOVE	AC2,[POINT 8,TTOBUF]	;Set buffer ptr
+	HLRZ	AC7,RCRPYB+.LMRBL	;Get SYS-ID byte count
+
+RES30B:	JUMPE	AC7,RES18		;Exit if byte count = 0
+	ILDB	AC1,AC2			;Put 1'st INFO TYPE lo byte in AC1
+	ILDB	AC0,AC2			;Put 2'nd INFO TYPE hi byte in AC0
+	DPB	AC0,[POINT 8,AC1,35-8]	; Construct the info type word
+	SUBI	AC7,2			;Decrement byte count
+
+	CAIE	AC1,0			;Info type = 0? (padding)
+	 JRST	RES30C			;No, see if CONSOLE RESP SIZE
+	IBP	AC2			;Yes, jump over msg length
+	SOJN	AC7,RES30B		;Try next info type if byte count not 0
+RES18:	PMSG	<^C[ANNOT FIND [CONSOLE RESPONSE SIZE [IN [SYS-ID, E[XITING^>
+	JRST	RESX
+
+RES30C:	CAIN	AC1,6			;Is it CONSOLE RESPONSE SIZE?
+	 JRST	RES30D			; yes
+					; no, go to next info type
+	ILDB	AC0,AC2			;Get data length
+	SOJ	AC7,			;Decr byte count
+RES19:	IBP	AC2			;Skip over data
+	SOJ	AC7,			;Decr byte count
+	SOJG	AC0,RES19		;Done?
+	JRST	RES30B			;Yes, try over
+
+RES30D:	ILDB	AC1,AC2			;Go get the length
+	CAIN	AC1,2			;Is it 2 ?
+	 JRST	RES30E			; Yes, get size
+
+	PMSG	<^ C[ONSOLE [R[ESPONSE [S[IZE [I[NFO LENGTH IN ERROR, SHOULD BE 2, WAS >
+	MOVE	AC0,AC1			;Copy the byte
+	PNTDEC				;Print ac0
+	PCRLF
+	JRST	RESX			; and exit
+
+;Modify RBUFSZ so that it is always greater than Console Response Size
+;Check to see that RBUFSZ is less than the max allotted buffer size BUFSIZ.
+
+RES30E:	ILDB	AC1,AC2			;Get lo byte of CONSOLE RESPONSE SIZE
+	ILDB	AC0,AC2			;Get hi byte
+	DPB	AC0,[POINT 8,AC1,35-8]	; Construct CONSOLE COMMAND SIZE in AC1
+	AOJ	AC1,			;Make larger by 1
+	MOVEM	AC1,RBUFSZ		; & modify size
+
+	CAIG	AC1,BUFSIZ		;RBUFSZ > BUFSIZ ?
+	 JRST	RESX			; no, continue
+	PMSG	<^W[ARNING...[RBUFSZ [GREATER THAN [BUFSIZ^>
+
+	PMSG	<^RBUFSZ = >
+	MOVE	AC0,RBUFSZ
+	PNTDEC
+
+	PMSG	<^BUFSIZ = >
+	MOVEI	AC0,BUFSIZ
+	PNTDEC
+	PCRLF
+	JRST	RESX			;Exit
+
+RES7:	PMSG	<C[ONSOLE [N[OT [A[VAILABLE [F[OR [R[ESERVATION^>
+
+	MOVE	AC2,TEMP1		;restore pointer
+	MOVEI	AC3,6			;for 6 bytes
+	MOVE	AC5,[POINT 8,AC0]	;set up pointer
+
+	PMSG	<^   C[ONSOLE [U[SER     >
+RES7A:	ILDB	AC4,AC2			;get byte
+	IDPB	AC4,AC5			;set up pointer
+	SOJG	AC3,RES7A		;done?
+	PUSHD	<AC0,AC1>
+	GO	PRHEX
+
+	PMSG	<^   L[OCAL [A[DDRESS    >	;yes
+	PUSHD	<LOCADH,LOCADL>
+	GO	PRHEX			;print it
+	PCRLF
+	JRST	RESX
+
+RES8:	MOVE	AC0,RBTCTR		; *** DO REMOTE BOOT ***
+	JUMPG	AC0,RES8A		;Do remote boot only once
+
+	SKIPE	TRCFLG			;Skip if no trace
+	 PMSG	<^C[ONSOLE [C[ARRIER NOT SET...TRYING [RCRBT^>
+	GO	RCRBT			;Do remote boot
+	 JRST	RESX			; error return
+
+RES8A:	SKIPE	TRCFLG			;Skip if no trace
+	 PMSG	<^W[AITING 5 SECONDS...^>
+	MOVEI	AC1,^D5000		;Wait 5 sec
+	DISMS
+
+	AOS	RBTCTR
+	MOVE	AC0,RBTCTR
+	CAIE	AC0,^D12		;60 sec up?
+	 JRST	RES1			; no, try all over again
+	PMSG	<^RCRBT [CANNOT SET [C[ONSOLE [C[ARRIER AFTER 60 SEC...>
+	PMSG	<^C[ONSOLE [R[ESERVATION UNSUCCESSFUL...EXITING^>
+	PMSG	<^H[AS PASSWORD BEEN SET BY [SET PASSWORD [COMMAND?^>
+
+RESX:	GETIT	<AC0,AC1,AC2,AC3,AC4,AC5,AC6,AC7>
+	RTN
+SUBTTL	RELEASE CONSOLE
+;#**************************************************************************
+;  1. Do a REQ-ID & read the SYS-ID "function" & "console user".
+;  2. If FUNCTION indicates "not reserved", do a Return+2 exit.
+;  3. If FUNCTION indicates "reserved", read the CONSOLE USER & check if
+;     it's reserved by us.
+;  4. If it's reserved by us, do a RELEASE CONSOLE Jsys & re-enter again.
+;  5. If it's reserved by another user, exit.
+;  6. Return+1 if unsuccessful
+;     Return+2 if successful
+;#***************************************************************************
+
+RELCON:	PUTIT	<AC7,AC6,AC5,AC4,AC3,AC2,AC1,AC0>	;Save some ac's
+REL1:	GO	RRID			;Do Req-ID & put Sys-ID to TTOBUF
+
+;Reset pointer to look for FUNCTION (info type 2)
+
+	MOVE	AC2,[POINT 8,TTOBUF]	;Look for FUNCTION
+	HLRZ	AC7,RCRPYB+.LMRBL	;Get SYS-ID byte count
+
+REL1A:	JUMPE	AC7,REL10		;Exit if byte count = 0
+	ILDB	AC1,AC2			;Put 1'st INFO TYPE lo byte in AC1
+	ILDB	AC0,AC2			;Put 2'nd INFO TYPE hi byte in AC0
+	DPB	AC0,[POINT 8,AC1,35-8]	; Construct the info type word
+	SUBI	AC7,2			;Decrement byte count
+
+	CAIE	AC1,0			;Info type = 0? (padding)
+	 JRST	REL1B			;No, see if FUNCTION
+	IBP	AC2			;Yes, jump over msg length
+	SOJN	AC7,REL1A		;Try next info type if byte count not 0
+REL10:	PMSG	<^C[ANNOT FIND [FUNCTION [IN [SYS-ID, E[XITING>
+	JRST	RELX
+
+REL1B:	CAIN	AC1,2			;Is it FUNCTION?
+	 JRST	REL1C			; yes
+					; no, go to next info type
+	ILDB	AC0,AC2			;Get data length
+	SOJ	AC7,			;Decr byte count
+REL11:	IBP	AC2			;Skip over data
+	SOJ	AC7,			;Decr byte count
+	SOJG	AC0,REL11		;Done?
+	JRST	REL1A			;Yes, try over
+
+REL1C:	ILDB	AC1,AC2			;Go get the length
+	CAIN	AC1,2			;Is it 2 ?
+	JRST	REL2			; Yes
+
+	PMSG	<^ F[UNCTION [I[NFO LENGTH IN ERROR, IT SHOULD BE 2, IT WAS >
+	MOVE	AC0,AC1			;Copy the length
+	PNTDEC				;Print ac0 and exit
+	JRST	REL9
+
+REL2:	ILDB	AC1,AC2			;Get the data for lo byte
+
+	TRNE	AC1,1B28		;Console Reservation set?
+	 JRST	REL2A			; Yes, see by who
+
+	SETZM	TARADH			;clear target addr
+	SETZM	TARADL
+
+	SKIPE	TRCFLG			;Trace on?
+	 PMSG	<^C[ONSOLE [R[ELEASE [S[UCCESSFUL^>	; Yes
+	SETZM	NODSEL			;Clear node selected flag
+	AOS	-10(P)			;Do ret+2
+	JRST	RELX
+
+;Reset pointer to look for CONSOLE USER (info type 3)
+
+REL2A:	MOVE	AC2,[POINT 8,TTOBUF]	;Look for CONSOLE USER
+	HLRZ	AC7,RCRPYB+.LMRBL	;Get SYS-ID byte count
+
+REL2B:	JUMPE	AC7,REL12		;Exit if byte count = 0
+	ILDB	AC1,AC2			;Put 1'st INFO TYPE lo byte in AC1
+	ILDB	AC0,AC2			;Put 2'nd INFO TYPE hi byte in AC0
+	DPB	AC0,[POINT 8,AC1,35-8]	; Construct the info type word
+	SUBI	AC7,2			;Decrement byte count
+
+	CAIE	AC1,0			;Info type = 0? (padding)
+	 JRST	REL2C			;No, see if CONSOLE USER
+	IBP	AC2			;Yes, jump over msg length
+	SOJN	AC7,RES2B		;Try next info type if byte count not 0
+REL12:	PMSG	<^C[ANNOT FIND [CONSOLE USER [IN [SYS-ID, E[XITING>
+	JRST	REL9
+
+REL2C:	CAIN	AC1,3			;Is it CONSOLE USER?
+	 JRST	REL2D			; yes
+					; no, go to next info type
+	ILDB	AC0,AC2			;Get data length
+	SOJ	AC7,			;Decr byte count
+REL13:	IBP	AC2			;Skip over data
+	SOJ	AC7,			;Decr byte count
+	SOJG	AC0,REL13		;Done?
+	JRST	REL2B			;Yes, try over
+
+REL2D:	ILDB	AC1,AC2			;Go get the length
+	CAIN	AC1,6			;Is it 6 ?
+	 JRST	REL3			; Yes, see if it's me
+
+	PMSG	<^ C[ONSOLE [U[SER [I[NFO LENGTH IN ERROR, IT SHOULD BE 6, IT WAS >
+	MOVE	AC0,AC1			;Copy the byte
+	PNTDEC				;Print ac0
+	JRST	REL9			; and exit
+
+REL3:	MOVEI	AC3,6			;Compare 6 bytes to see if it's us
+	MOVE	AC6,[POINT 8,LOCADH]	;Set byte pointer
+REL5:	ILDB	AC0,AC2			;Get console user byte 0-5
+	ILDB	AC1,AC6			;Get node address byte 0-5
+
+	CAME	AC0,AC1			;Same?
+	 JRST	REL4			; No, exit
+	SOJG	AC3,REL5		; Yes, repeat
+
+	GO	RCREL			;Do RELEASE CONSOLE jsys
+	 JRST	REL9			; Error return
+
+	SKIPN	DBGFLG			;Debug?
+	 JRST	REL1			; No
+	MOVEI	AC0,177			;Clear "RESERVED" in FUNCTION
+	MOVEM	AC0,REQT1
+
+	MOVEI	AC3,5			;Clear "CONSOLE USER" in SYS-ID
+	SETZM	REQT2(AC3)
+	SOJGE	AC3,.-1
+	JRST REL1			;See if released
+
+REL4:	PMSG	<^C[ONSOLE ALREADY RESERVED BY ANOTHER USER^>
+	JRST	RELX
+
+REL9:	PMSG	<^C[ANNOT [R[ELEASE [R[EMOTE [C[ONSOLE>
+RELX:	PCRLF
+	GETIT	<AC0,AC1,AC2,AC3,AC4,AC5,AC6,AC7>
+	RTN
+
+SUBTTL	SHOW ALL NODE ADDRESSES ON NETWORK
+;#***************************************************************************
+;*  SALLAD subroutine	Called from SALLNO (Show all Nodes) in RMTCNP
+;
+;  1. Set NODADH/L for BROADCAST: FF-FF-FF-FF-FF-FF (SKIP OVER THIS FOR NOW)
+;  2. Send Request-ID to receive all broadcast replys (SYS-ID's)
+;  3. Display all Source Address's from the READ REPLY argument block.
+;  4. Test the "More Reply Flag" in word 0 of the arg block.
+;      & if set, do another READ REPLY & repeat.
+;  5. Repeat all the above for MULTICAST ADDRESSES: AB-00-00-02-00-00
+;#***************************************************************************
+
+SALLAD:	SETZM	PASCT			;Dont do BCAST for now
+	JRST	SAD5
+
+	PMSG	<^P[HYSICAL ADDRESSES OF ALL NODES RESPONDING TO [BROADCAST:^>
+	PCRLF
+
+	SETZM	PASCT
+	DMOVE	AC0,BCASTH		;Set up NODADH/L for RCRID
+	DMOVEM	AC0,NODADH
+
+;Do Request-Id jsys
+
+SAD1:	GO	RCRID			;Do REQ-ID
+	 JRST	SADX			; Jsys error return
+
+	POPD	SREQN			;Save request #
+	GO	RDSTIM			; & read current time
+
+;Do Read Status jsys
+
+SAD2:	PUSHD	SREQN			;Push saved request number
+	GO	RCSTS			;Do READ STATUS
+	 JRST	SADX			; Jsys error return
+
+	GO	RDFLGS			;Read status flags
+	 JRST	SAD5			; Ret+1 Error or timeout return
+	 JRST	SAD2			; Ret+2 Still pending, read again
+	 NOP				; Ret+3 Successful
+
+;Do Read Remote Console Reply for SYS-ID
+
+	SETZ	AC2,			;For debug
+
+SAD3:	PUSHD	SREQN			;Get Req #
+	GO	RCRPY			;Do READ REPLY (SYS-ID)
+	 JRST	SADX			; Jsys error return
+
+	PMSG	<  >
+
+	SKIPN	DBGFLG			;Debug?
+	 JRST	SAD4			; no
+
+	DMOVE	AC0,TABL(AC2)		;Yes, get fake addresses
+	DMOVEM	AC0,RCRPYB+.LMSRC	; & stick it in arg block
+
+	ADDI	AC2,2			;Bump table index
+	MOVE	AC0,RCRPYB+.LMCID
+	TLO	AC0,(LM%MRF)		;Set "More Reply Flag"
+	CAIN	AC2,6
+	TLZ	AC0,(LM%MRF)		;Unless all 3 node addresses displayed
+	MOVEM	AC0,RCRPYB+.LMCID	; & stick it in arg block
+
+SAD4:	PUSHD	<RCRPYB+.LMSRC,RCRPYB+.LMSRC+1>	;Get returned source address
+	GO	PRHEX
+	PCRLF
+
+	MOVE	AC0,RCRPYB+.LMCID	;Get flag
+	TLNE	AC0,(LM%MRF)		;More Reply Flag set?
+	 JRST	SAD3			; Yes, do again
+
+SAD5:	SKIPE	PASCT			;No, done MCAST yet?
+	 JRST	SADX			; Yes, exit
+
+	PMSG	<^P[HYSICAL ADDRESSES OF ALL NODES RESPONDING TO [MCAST:^>
+	PCRLF
+
+	DMOVE	AC0,MCASTH
+	DMOVEM	AC0,NODADH
+	AOS	PASCT
+	JRST	SAD1			;Do again for MCAST
+
+SADX:	RTN
+
+TABL:	123456,,123460			;debug BCAST/MCAST Address 1
+	654324,,0
+	123123,,456460			;Address 2
+	234234,,0
+	654654,,765760			;Address 3
+	213244,,0
+
+SUBTTL	REQUEST ID DECODING AND REPORTING OF MESSAGE SUBROUTINES
+;#***************************************************************************
+;* RRID subroutine     Called from REQU (Req-ID command) in RMTCNP.
+;
+;  Sends a REQ-ID message to the selected node and reports SYS-ID returned.
+;  The hi/lo address are in AC10/11 resp. from GO HEX & are saved in
+;  NODADH/NODADL resp.
+;
+;  The byte format for the request id message returned:
+;
+;  B1,B2,B3,B4,B5,B6 =    destination address
+;  B7,B8,B9,B10,B11,B12 = source address (physical)
+;  B13 =		  protocol type 07 = code
+;  B14 =		  0		   = reserved
+;  B15,B16 =		  receipt number (3rd and 4th bytes of received
+;			  Request id message)
+;
+;  The information that the the request id mechanism returns is:
+;
+;  B18	 + 1st byte = information type
+;	   2nd byte = information length, value = x
+;	   x   bytes = specified bytes of information value
+;
+;	Where:
+;
+;  Info  Info     Info
+;  Type	length	description
+;
+;  1	3	MAINTENANCE: version ver:3  eco:0  user eco:0
+;  2	2	FUNCTIONS: bit 0=loop, bit1=dump, bit2=primary loader, bit3=
+;		 Multi-block loader, bit4=boot, bit5=console carrier, bit6=
+;		 Data link counters, bit7=console carrier reservation
+;  3	6	CONSOLE USER: system address of the system that has the console
+;		 Reserved.
+;  4	2	RESERVATION TIMER: the maximum value, in seconds, of the timer
+;		 Used to clear unused console reservations.
+;  5	2	CONSOLE COMMAND SIZE: the maximum size of the console command
+;		 Buffer.
+;  6	2	CONSOLE RESONSE SIZE: the maximum size of the console response
+;		 Buffer.
+;  7	6	HARDWARE ADDRESS, contents of physical address rom on nia link
+;		 Module.
+;  8    10	SYSTEM TIME: the segmented system time.
+;#**********************************************************************
+
+;#****************************************************************************
+;  100	    1	COMMUNICATION DEVICE:
+;		 0 = Dp, dp11-da	 1 = una, deuna
+;		 2 = Du, du11-da	 3 = cna	 
+;		 4 = dl, dl11-c/e/wa	 5 = qna
+;		 6 = Dq, dq11-da	 7 = ci, computer interconnect interf.
+;		 8 = da, da11-b or -al	 9 = pcl, pcl11-b
+;		 10= Dup, dup11-da	 12= dmc, dmc11-da/ar,-ma/al or -fa/ar
+;		 14= Dn, dn11-ba	 16= dlv, dlv11-e
+;		 18= Dmp,		 20= dte20, dte20
+;		 22= Dv, dv11-aa/ba	 24= dz, dz11-a or -b
+;		 28= Kdp, kmc11/dup11-da 30= kdz, kmc11/dz11-a
+;		 32= Kl, kl8-j		 34= dmv, dmv11
+;		 36= Dpv, dpv11		 38= dmf, dmf-32
+;		 40= Dmr, dmr11-aa	 42= kmy, kms11-px
+;		 44= Kmx, kms11-bd/be
+;  101-199 I-16	COMMUNICATION DEVICE RELATED:
+;  200	  C-17	SOFTWARE ID:
+;		 0 = No software id
+;		 >0= The length of the id field
+;		 -1= Standard operating system
+;		 -2= Maintenance system
+;  201-299 I-16	SOFTWARE ID RELATED: a specific sofware id. Present only if
+;		   Form >0. Interpretation is specific to the receiving system.
+;  300	    1	SYSTEM PROCESSOR: 1= pdp-11, 2= pluto
+;  301-399 I-16	SYSTEM PROCESSOR RELATED: information specific to the
+;		 Particular system processor.
+;  400	    1	DATA LINK TYPE: 1= ETHERNET, 2= DDCMP, 3=LAPB
+;  401	    2	DATA LINK BUFFER SIZE: default = 262
+;  402-499 I-16	DATA LINK RELATED: information specific to the
+;		 Particular data link.
+;
+;  All unknown types are reported as such and no further processing is done.
+;#**************************************************************************
+
+RRID:	PUTIT	<AC11,AC10,AC7,AC4,AC3,AC2,AC1,AC0> ;Save some acs
+	MOVEM	AC10,NODADH		;Save hi hex address (from GO HEX)
+	MOVEM	AC11,NODADL		;Save lo hex address
+
+;Do Request-Id jsys
+
+	GO	RCRID			;Do REQ-ID
+	 JRST	RRIDX			; Jsys error return
+
+	POPD	SREQN			;Save request #
+	GO	RDSTIM			; & read current time
+
+;Do Read Status jsys
+
+RRIH:	PUSHD	SREQN			;Push saved request number
+	GO	RCSTS			;Do READ STATUS
+	 JRST	RRIDX			; Jsys error return
+
+	GO	RDFLGS			;Read status flags
+	 JRST	RRIDX			; Ret+1 Error or timeout return
+	 JRST	RRIH			; Ret+2 Still pending, read again
+	 NOP				; Ret+3 Successful
+
+;Do Read Remote Console Reply for SYS-ID
+
+	PUSHD	SREQN			;Get Req #
+	GO	RCRPY			;Do READ REPLY (SYS-ID)
+	 JRST	RRIDX			; Jsys error return
+
+	SKIPN	TRCFLG			;Trace enabled?
+	 JRST	RRIH2			; No
+
+	PMSG	<^R[EQUEST [ID[ FOR NODE ADDRESS:]>
+	PUSHD	<NODADH,NODADL>
+	GO	PRHEX
+	PCRLF
+
+	MOVE	AC2,[POINT 8,TTOBUF]	;Set output buffer pointer to 1'st
+	HLRZ	AC7,RCRPYB+.LMRBL	;Function byte & get SYS-ID byte count
+
+RRIH2:	SKIPN	DBGFLG			;Debug ?
+	 JRST	RRIDA			; No
+
+	DMOVE	AC0,SLOCH		;Make LOCAL ADDR = 123456789ABC
+	DMOVEM	AC0,LOCADH
+
+	MOVEI	AC3,6			;Make sys-id HRDWR ADDR = NODADH/L
+	SETZ	AC4,
+	MOVE	AC5,[POINT 8,NODADH]
+	MOVE	AC6,[POINT 36,REQT3]
+RRIH3:	ILDB	AC4,AC5			;Get NODADH/L
+	IDPB	AC4,AC6			; put it in REQT3
+	SOJG	AC3,RRIH3		; repeat 6 times
+
+	MOVE	AC6,[POINT 8,TTOBUF]	;Yes
+	SETZ	AC3,
+
+RRIH1:	MOVE	AC0,REQTAB(AC3)		;Deposit fake debug data in TTOBUF
+	IDPB	AC0,AC6
+	CAIE	AC3,200
+	 AOJA	AC3,RRIH1
+
+	MOVE	AC7,[RTEND-REQTAB]	;Fake the byte count
+
+;  Dispatch to a particular information type routine.
+
+RRIDA:	SKIPN	TRCFLG			;Trace enabled?
+	 JRST	RRIDX			; no, exit
+
+	JUMPE	AC7,RRIDX		;Exit if byte count = 0
+	ILDB	AC1,AC2			;Put 1'st INFO TYPE byte in AC1
+	ILDB	AC0,AC2			;Put 2'nd INFO TYPE byte in AC0
+	DPB	AC0,[POINT 8,AC1,35-8]	; Construct the info type word
+	SUBI	AC7,2			;Decrement byte count
+
+	CAIE	AC1,0			;INFO TYPE = 0 ?  (padding)
+	 JRST	RRA1			; No, see what it is
+	IBP	AC2			;Yes, skip over zero data length
+	SOJ	AC7,			;Decrement byte count
+	JRST	RRIDA			;& try again
+
+RRA1:	CAIN	AC1,^D1			;Is it maintenance ?
+	 JRST	RI1			; Yes
+	CAIN	AC1,^D2			;Is it functions ?
+	 JRST	RI2			; Yes
+	CAIN	AC1,^D3			;Is it console user ?
+	 JRST	RI3			; Yes
+	CAIN	AC1,^D4			;Is it reservation timer ?
+	 JRST	RI4			; Yes
+	CAIN	AC1,^D5			;Is it console command size ?
+	 JRST	RI5			; Yes
+	CAIN	AC1,^D6			;Is it console response size ?
+	 JRST	RI6			; Yes
+	CAIN	AC1,^D7			;Is it hardware address ?
+	 JRST	RI7			; Yes
+	CAIN	AC1,^D8			;Is it system time ?
+	 JRST	RI8			; Yes
+
+	CAIN	AC1,^D100		;Is it communication device ?
+	 JRST	RI100			; Yes
+	CAIGE	AC1,^D101		;Is it communication device related ?
+	 JRST	RRA2			; No
+	CAIG	AC1,^D199
+	 JRST	RI101			; Yes
+RRA2:	CAIN	AC1,^D200		;Is it software id ?
+	 JRST	RI200			; Yes
+	CAIGE	AC1,^D201		;Is it software id related ?
+	 JRST	RRA3			; No
+	CAIG	AC1,^D299
+	 JRST	RI201			; Yes
+RRA3:	CAIN	AC1,^D300		;Is it system processor ?
+	 JRST	RI300			; Yes
+	CAIGE	AC1,^D301		;Is it system processor related ?
+	 JRST	RRA4			; No
+	CAIG	AC1,^D399
+	 JRST	RI301			; Yes
+RRA4:	CAIN	AC1,^D400		;Is it data link type ?
+	 JRST	RI400			; Yes
+	CAIN	AC1,^D401		;Is it data link buffer size ?
+	 JRST	RI401			; Yes
+	CAIGE	AC1,^D402		;Is it data link type related ?
+	 JRST	RRA5			; No
+	CAIG	AC1,^D499
+	 JRST	RI402			; Yes
+
+; If the code got here, it must be unknown information type !
+
+RRA5:	PMSG	<^U[NKNOWN SYSTEM TYPE CODE: >
+	MOVE	AC0,AC1			;Copy ac1 
+	JRST	RI997			;Print ac0 and exit
+
+;  Type 1, length 3 = maintenance:
+; Value = ver:, eco:, user eco:
+
+RI1:	PMSG	<M[AINTENANCE>
+	ILDB	AC1,AC2			;Go get the length
+	CAIN	AC1,3			;Is it 3 ?
+	 JRST	RI1A			; Yes
+
+	PMSG	<^I[NFORMATION LENGTH IN ERROR, IT SHOULD BE 3, IT WAS >
+	MOVE	AC0,AC1			;Copy the length
+	JRST	RI997			;Print ac0 and exit
+
+RI1A:	PMSG	<]VER:]]>
+	ILDB	AC0,AC2			;Get the data
+	PNTDEC				;Print it
+
+	PMSG	<^]]ECO:]]>
+	ILDB	AC0,AC2			;Get the data
+	PNTDEC				;Print it
+
+	PMSG	<^]]U[SER [ECO:]>
+	ILDB	AC0,AC2			;Get the data
+	PNTDEC				;Print it
+	PCRLF
+	SUBI	AC7,4			;Decrement byte count
+	JRST	RRIDA
+
+;  Type 2, length 2 = functions:
+; Bit 0=loop, bit1=dump, bit2=primary loader, bit3= multi-block loader,
+; Bit4=boot, bit5=console carrier, bit6= data link counters,
+; Bit7=console carrier reservation
+
+RI2:	PMSG	<F[UNCTIONS SUPPORTED:>
+	ILDB	AC1,AC2			;Go get the length
+	CAIN	AC1,2			;Is it 2 ?
+	 JRST	RI2A			; Yes
+
+	PMSG	<^ I[NFORMATION LENGTH IN ERROR, IT SHOULD BE 2, IT WAS >
+	MOVE	AC0,AC1			;Copy the length
+	JRST	RI997			;Print ac0 and exit
+
+RI2A:	ILDB	AC1,AC2			;Get the data for lo byte
+	TRNE	AC1,1B35		;Loop ?
+	PMSG	<^]]]]L[OOP>		; Yes
+
+	TRNE	AC1,1B34		;Dump ?
+	PMSG	<^]]]]D[UMP>		; Yes
+
+	TRNE	AC1,1B33		;Primary loader ?
+	PMSG	<^]]]]P[RIMARY [L[OADER>	; Yes
+
+	TRNE	AC1,1B32		;Multi-block loader ?
+	PMSG	<^]]]]M[ULTI-[B[LOCK [L[OADER>	; Yes
+
+	TRNE	AC1,1B31		;Boot ?
+	PMSG	<^]]]]B[OOT>		; Yes
+
+	TRNE	AC1,1B30		;Console carrier ?
+	PMSG	<^]]]]C[ONSOLE [C[ARRIER>	;Yes
+
+	TRNE	AC1,1B29		;Data link counters ?
+	PMSG	<^]]]]D[ATA [L[INK [C[OUNTERS>	; Yes
+
+	TRNE	AC1,1B28		;Console carrier reservation ?
+	PMSG	<^]]]]C[ONSOLE [C[ARRIER [R[ESERVATION> ; Yes
+
+	PMSG	<^^ 0[THER FUNCTIONS:]]>
+	ILDB	AC0,AC2			;Get the data for hi byte
+	PNTOCS
+	PCRLF
+	SUBI	AC7,3			;Decrement byte count
+	JRST	RRIDA			;Go do next info type 
+
+;  Type 3, length 6 = console user:
+; System address of the system that has the console reserved.
+
+RI3:	PMSG	<C[ONSOLE USER:]]]>
+	ILDB	AC1,AC2			;Go get the length
+	CAIN	AC1,6			;Is it 6 ?
+	 JRST	RI3A			; Yes
+
+	PMSG	<^ I[NFORMATION LENGTH IN ERROR, IT SHOULD BE 6, IT WAS >
+	MOVE	AC0,AC1			;Copy the byte
+	JRST	RI997			;Print ac0 and exit
+
+RI3A:	MOVEI	AC3,6			;Get a 6
+	MOVE	AC5,[POINT 8,AC0]	;Set up byte pointer
+
+RI3B:	ILDB	AC4,AC2			;Get the data for a byte
+	IDPB	AC4,AC5			;Load up ac0, ac1	
+	SOJG	AC3,RI3B		;Repeat for 6 bytes
+	TRZ	AC0,17			;Clear unused bits 32-35
+	TRZ	AC1,17
+	CAIE	AC0,0			;Zero?
+	 JRST	RI3C			; No, print node number
+	CAIE	AC1,0			;Also zero?
+	 JRST	RI3C			; No, print node number
+	PMSG	<N[ONE^>		;Yes
+	JRST	RI3D
+
+RI3C:	PUSHD	<AC0,AC1>
+	GO	PRHEX
+	PCRLF
+RI3D:	SUBI	AC7,7			;Decrement byte count
+	JRST	RRIDA			;Go do next info type 
+
+;  Type 4, length 2 = reservation timer:
+; The maximum value, in seconds, of the timer used to clear unused
+; Console reservations.
+
+RI4:	PMSG	<R[ESERVATION TIMER:]]>
+	ILDB	AC1,AC2			;Go get the length
+	CAIN	AC1,2			;Is it 2 ?
+	 JRST	RI4A			; Yes
+
+	PMSG	<^ I[NFORMATION LENGTH IN ERROR, IT SHOULD BE 2, IT WAS >
+	MOVE	AC0,AC1			;Copy the byte
+	JRST	RI997			;Print ac0 and exit
+
+RI4A:	ILDB	AC0,AC2			;Get the data for lo byte
+	ILDB	AC1,AC2			;Get the data for hi byte
+	DPB	AC1,[POINT 8,AC0,35-8]	;Justify hi byte to ac0
+	PNTDEC				;Print it
+	PMSG	<. S[ECONDS^>
+	SUBI	AC7,3			;Decrement byte count
+	JRST	RRIDA			;Go do next info type 
+
+;  Type 5, length 2 = console command size:
+; The maximum size of the console command buffer.
+
+RI5:	PMSG	<C[ONSOLE COMMAND SIZE:]]>
+	ILDB	AC1,AC2			;Go get the length
+	CAIN	AC1,2			;Is it 2 ?
+	 JRST	RI5A			; Yes
+
+	PMSG	<^ I[NFORMATION LENGTH IN ERROR, IT SHOULD BE 2, IT WAS >
+	MOVE	AC0,AC1			;Copy the length
+	JRST	RI997			;Print ac0 and exit
+
+RI5A:	ILDB	AC0,AC2			;Get the data for lo byte
+	ILDB	AC1,AC2			;Get the data for hi byte
+	DPB	AC1,[POINT 8,AC0,35-8]	;Justify hi byte to ac0
+	PNTDEC				;Print it
+	PMSG	<. B[YTES^>
+	SUBI	AC7,3			;Decrement byte count
+	JRST	RRIDA			;Go do next info type 
+
+;  Type 6, length 2 = console response size:
+; The maximum size of the console response buffer.
+
+RI6:	PMSG	<C[ONSOLE RESPONSE SIZE:]]>
+	ILDB	AC1,AC2			;Go get the length
+	CAIN	AC1,2			;Is it 2 ?
+	 JRST	RI6A			; Yes
+
+	PMSG	<^ I[NFORMATION LENGTH IN ERROR, IT SHOULD BE 2, IT WAS >
+	MOVE	AC0,AC1			;Copy the byte
+	JRST	RI997			;Print ac0 and exit
+
+RI6A:	ILDB	AC0,AC2			;Get the data for lo byte
+	ILDB	AC1,AC2			;Get the data for hi byte
+	DPB	AC1,[POINT 8,AC0,35-8]	;Justify hi byte to ac0
+	PNTDEC				;Print it
+	PMSG	<. B[YTES^>
+	SUBI	AC7,3			;Decrement byte count
+	JRST	RRIDA			;Go do next info type 
+
+;  Type 7, length 6 = hardware address:
+; Contents of physical address rom on nia link module.
+
+RI7:	PMSG	<H[ARDWARE ADDRESS:]]>
+	ILDB	AC1,AC2			;Go get the length
+	CAIN	AC1,6			;Is it 6 ?
+	 JRST	RI7A			; Yes
+
+	PMSG	<^ I[NFORMATION LENGTH IN ERROR, IT SHOULD BE 6, IT WAS >
+	MOVE	AC0,AC1			;Copy the byte
+	JRST	RI997			;Print ac0 and exit
+
+RI7A:	MOVEI	AC3,6			;Get a 6
+	MOVE	AC5,[POINT 8,AC0]	;Set up byte pointer
+
+RI7B:	ILDB	AC4,AC2			;Get the data for a byte
+	IDPB	AC4,AC5			;Load ac0, ac1
+	SOJG	AC3,RI7B		;Repeat for 6 bytes
+	PUSHD	<AC0,AC1>
+	GO	PRHEX
+	PCRLF
+	SUBI	AC7,7			;Decrement byte count
+	JRST	RRIDA			;Go do next info type 
+
+;  Type 8, length 10 = system time:
+; Segmented binary system time
+
+RI8:	PMSG	<S[YSTEM TIME:]]]>
+	ILDB	AC1,AC2			;Go get the length
+	CAIN	AC1,^D10		;Is it 10 ?
+	 JRST	RI8A			; Yes
+
+	PMSG	<^ I[NFORMATION LENGTH IN ERROR, IT SHOULD BE 10, IT WAS >
+	MOVE	AC0,AC1			;Copy the byte
+	JRST	RI997			;Print ac0 and exit
+
+RI8A:	ILDB	AC0,AC2			;Get century	(19)
+	PNTDEC
+	ILDB	AC0,AC2			;Get year	(84)
+	PNTDEC
+	PMSG	<]>
+
+	ILDB	AC0,AC2			;Get month	(2)
+	PNTDEC
+	PMSG	</>
+	ILDB	AC0,AC2			;Get day	(7)
+	PNTDEC
+	PMSG	<]>
+
+	ILDB	AC0,AC2			;Get hour	(5)
+	PNTDEC
+	PMSG	<:>
+	ILDB	AC0,AC2			;Get min	(30)
+	PNTDEC
+	PMSG	<:>
+	ILDB	AC0,AC2			;Get sec	(20)
+	PNTDEC
+	PCRLF
+
+	IBP	AC2			;Skip over rest
+	IBP	AC2
+	IBP	AC2
+	SUBI	AC7,13			;Decrement byte count
+	JRST	RRIDA			;Go do next info type 
+
+;  Type 100, length 1 = communication device:
+; Where data is:
+;	 0 = Dp, dp11-da	 1 = una, una
+;	 2 = Du, du11-da	 3 = cna
+;	 4 = dl, dl11-c or -e	 5 = qna
+;	 6 = Dq, dq11-da	 7 = ci
+;	 8 = da, da11-b or -al	 9 = pcl, pcl11-b
+;	 10= Dup, dup11-da	 12= dmc, dmc11-da/ar,-ma/al or -fa/ar
+;	 14= Dn, dn11-ba	 16= dlv, dlv11-e
+;	 18= Dmp,		 20= dte20, dte20
+;	 22= Dv, dv11-aa/ba	 24= dz, dz11-a or -b
+;	 28= Kdp, kmc11/dup11-da 30= kdz, kmc11/dz11-a
+;	 32= Kl, kl8-j		 34= dmv, dmv11
+;	 36= Dpv, dpv11		 38= dmf,
+;	 40= Dmr,		 42= kmy, kms11-px
+;	 44= Kmx, kmx11-bd/be
+
+RI100:	PMSG	<C[OMMUNICATION DEVICE:]]>
+	ILDB	AC1,AC2			;Go get the length
+	CAIN	AC1,1			;Is it 1 ?
+	 JRST	RI100A			; Yes
+
+	PMSG	<^ I[NFORMATION LENGTH IN ERROR, IT SHOULD BE 1, IT WAS >
+	MOVE	AC0,AC1			;Copy the byte
+	JRST	RI997			;Print ac0 and exit
+
+RI100A:	ILDB	AC1,AC2			;Get the data
+	MOVE	AC0,AC1			;Copy the byte
+	PNTDEC				;Print it
+	PMSG	<. >
+
+	CAIN	AC1,^D0			;Dp ?
+	 PMSG	<DP>			; Yes
+	CAIN	AC1,^D1			;Una ?
+	 PMSG	<UNA>			; Yes
+	CAIN	AC1,^D2			;Du ?
+	 PMSG	<DU>			; Yes
+	CAIN	AC1,^D3			;Cna ?
+	 PMSG	<CNA>			; Yes
+	CAIN	AC1,^D4			;Dl ?
+	 PMSG	<DL>			; Yes
+	CAIN	AC1,^D5			;Qna ?
+	 PMSG	<QNA>			; Yes
+	CAIN	AC1,^D6			;Dq ?
+	 PMSG	<DQ>			; Yes
+	CAIN	AC1,^D7			;Ci ?
+	 PMSG	<CI>			; Yes
+	CAIN	AC1,^D8			;Da ?
+	 PMSG	<DA>			; Yes
+	CAIN	AC1,^D9			;Pcl ?
+	 PMSG	<PCL>			; Yes
+	CAIN	AC1,^D10		;Dup ?
+	 PMSG	<DUP>			; Yes
+	CAIN	AC1,^D12		;Dmc ?
+	 PMSG	<DMC>			; Yes
+	CAIN	AC1,^D14		;Dn ?
+	 PMSG	<DN>			; Yes
+	CAIN	AC1,^D16		;Dlv ?
+	 PMSG	<DLV>			; Yes
+	CAIN	AC1,^D18		;Dmp ?
+	 PMSG	<DMP>			; Yes
+	CAIN	AC1,^D20		;Dte20 ?
+	 PMSG	<DTE20>			; Yes
+	CAIN	AC1,^D22		;Dv ?
+	 PMSG	<DV>			; Yes
+	CAIN	AC1,^D24		;Dz ?
+	 PMSG	<DZ>			; Yes
+	CAIN	AC1,^D28		;Kdp ?
+	 PMSG	<KDP>			; Yes
+	CAIN	AC1,^D30		;Kdz ?
+	 PMSG	<KDZ>			; Yes
+	CAIN	AC1,^D32		;Kl ?
+	 PMSG	<KL>			; Yes
+	CAIN	AC1,^D34		;Dmv ?
+	 PMSG	<DMV>			; Yes
+	CAIN	AC1,^D36		;Dpv ?
+	 PMSG	<DPV>			; Yes
+	CAIN	AC1,^D38		;Dmf ?
+	 PMSG	<DMF>			; Yes
+	CAIN	AC1,^D40		;Dmr ?
+	 PMSG	<DMR>			; Yes
+	CAIN	AC1,^D42		;Kmy ?
+	 PMSG	<KMY>			; Yes
+	CAIN	AC1,^D44		;Kmx ?
+	 PMSG	<KMX>			; yes
+	PCRLF
+	SUBI	AC7,2			;Decrement byte count
+	JRST	RRIDA			;Go do next info type
+
+;  Type 101-199, length I-16 = communication device related:
+
+RI101:	PMSG	<C[OMM. DEVICE RELATED VALUE:]>
+	MOVE	AC0,AC1			;Copy the information type number
+	PNTDEC				;Print it
+	PNTCI	"."
+
+	ILDB	AC1,AC2			;Go get the length
+	SOJ	AC7,			;Decrement byte count
+	CAIG	AC1,0			;Greater than 0 ?
+	 JRST	RI101A			; No. Error.
+
+	CAIG	AC1,^D16		;Greater than 16 ?
+	 JRST	RI101B			; No
+
+RI101A:	PMSG	<^ I[NFORMATION LENGTH IN ERROR, IT SHOULD BE BETWEEN 1 AND 16, IT WAS >
+	MOVE	AC0,AC1			;Copy the length
+	JRST	RI997			;Print ac0 and exit
+
+RI101B:	PMSG	<^ I[NFORMATION:]]]>
+	SKIPA
+RI101C:	PMSG	<, >
+	ILDB	AC0,AC2			;Go get data
+	SOJ	AC7,			;Decrement byte count
+	PNTOCS				;Print it
+	SOJG	AC1,RI101C		;Print until no more data
+	PCRLF
+	JRST	RRIDA			;Go do next info type 
+
+;  Type 200, length C-17 = software id:
+;	0 = No software id	 	>0= the length of the info field
+;      -1= Standard operating system    -2= maintenance system
+
+RI200:	PMSG	<S[OFTWARE [ID:]]]>
+	ILDB	AC1,AC2			;Go get the length
+	SOJ	AC7,			;Decrement byte count
+	CAIE	AC1,0			;Is it 0 ?
+	 JRST	RI200A			; No
+	PMSG	<NO S[OFTWARE [ID>	; Yes
+	JRST	RI200Z
+
+RI200A:	CAIE	AC1,377			;Is it 377 (-1) ?
+	 JRST	RI200B			; No
+	PMSG	<S[TANDARD OPERATING SYSTEM> ; Yes
+	JRST	RI200Z
+
+RI200B:	CAIE	AC1,376			;Is it 376 (-2) ?
+	 JRST	RI200C			; No
+	PMSG	<M[AINTENANCE SYSTEM>	; Yes
+	JRST	RI200Z
+
+RI200C:	CAIG	AC1,0			;> 0 ?
+	 JRST	RI200D			; No. Error
+	CAIG	AC1,^D17		;> 17 ?
+	JRST	RI200E			; No.
+
+RI200D:	PMSG	<^ E[RROR - LENGTH FIELD NOT BETWEEN 1 AND 17, IT WAS >
+	MOVE	AC0,AC1			;Copy the length
+	JRST	RI997			;Print ac0 and exit
+
+RI200E:	PMSG	<^ I[NFORMATION: >
+	SKIPA
+RI200F:	PMSG	<, >
+	ILDB	AC0,AC2			;Go get data
+	SOJ	AC7,			;Decrement byte count
+	PNTOCS				;Print it
+	SOJG	AC1,RI200F		;Print until no more data
+
+RI200Z:	PCRLF
+	JRST	RRIDA			;Go do next info type 
+
+;  Type 201-299, length I-16 = software id related:
+; A specific software id. Present only if form >0. Interpretation is
+; Specific to the receiving system.
+
+RI201:	PMSG	<S[OFTWARE [ID[ RELATED VALUE:]>
+	MOVE	AC0,AC1			;Copy the information type
+	PNTDEC				;Print it
+	PMSG	<.^>
+
+	ILDB	AC1,AC2			;Go get the length
+	SOJ	AC7,			;Decrement byte count
+	CAIG	AC1,0			;Greater than 0 ?
+	 JRST	RI201A			; No. Error.
+	CAIG	AC1,^D16		;Greater than 16 ?
+	 JRST	RI201B			; No
+
+RI201A:	PMSG	<^ I[NFORMATION LENGTH IN ERROR, IT SHOULD BE BETWEEN 1 AND 16, IT WAS >
+	MOVE	AC0,AC1			;Copy the length
+	JRST	RI997			;Print ac0 and exit
+
+RI201B:	PMSG	< I[NFORMATION:]]]>
+	SKIPA
+RI201C:	PMSG	<, >
+	ILDB	AC0,AC2			;Go get data
+	SOJ	AC7,			;Decrement byte count
+	PNTOCS				;Print it
+	SOJG	AC1,RI201C		;Print until no more data
+
+	PCRLF
+	JRST	RRIDA			;Go do next info type 
+
+;  Type 300, length 1 = system processor:
+; 1= Pdp-11, 2= pluto
+
+RI300:	PMSG	<S[YSTEM [P[ROCESSOR:]]>
+	ILDB	AC1,AC2			;Go get the length
+	CAIN	AC1,1			;Is it 1 ?
+	 JRST	RI300A			; Yes
+	PMSG	<^ I[NFORMATION LENGTH IN ERROR, IT SHOULD BE 1, IT WAS >
+	MOVE	AC0,AC1			;Copy the length
+	JRST	RI997			;Print ac0 and exit
+
+RI300A:	ILDB	AC1,AC2			;Get the data
+	MOVE	AC0,AC1			;Copy the type
+	PNTDEC				;Print it
+	PMSG	<. >
+
+	CAIN	AC1,^D1			;Pdp-11 ?
+	PMSG	<PDP-11>		; Yes
+	CAIN	AC1,^D2			;Pluto ?
+	 PMSG	<PLUTO>			; Yes
+	PCRLF
+	SUBI	AC7,2			;Decrement byte count
+	JRST	RRIDA			;Go do next info type 
+
+; Type 301-399, length I-16, = system processor related:
+; Information specific to the particular system processor.
+
+RI301:	PMSG	<S[YSTEM [P[ROCESSOR RELATED VALUE:]>
+	MOVE	AC0,AC1			;Copy the type #
+	PNTDEC				;Print which one
+	PMSG	<.^>
+
+	ILDB	AC1,AC2			;Go get the length
+	SOJ	AC7,			;Decrement byte count
+	CAIG	AC1,0			;Greater than 0 ?
+	 JRST	RI301A			; No. Error.
+	CAIG	AC1,^D16		;Greater than 16 ?
+	 JRST	RI301B			; No
+RI301A:	PMSG	<^ I[NFORMATION LENGTH IN ERROR, IT SHOULD BE BETWEEN 1 AND 16, IT WAS >
+	MOVE	AC0,AC1			;Copy the length
+	JRST	RI997			;Print ac0 and exit
+
+RI301B:	PMSG	< I[NFORMATION:]]]>
+	SKIPA
+RI301C:	PMSG	<, >
+	ILDB	AC0,AC2			;Go get data
+	SOJ	AC7,			;Decrement byte count
+	PNTOCS				;Print it
+	SOJG	AC1,RI301C		;Print until no more data
+
+	PCRLF
+	JRST	RRIDA			;Go do next info type 
+
+;  Type 400, length 1 = data link type:
+; 1= Ethernet, 2= ddcmp, 3=lapb
+
+RI400:	PMSG	<D[ATA [L[INK TYPE:]]]>
+	ILDB	AC1,AC2			;Go get the length
+	CAIN	AC1,1			;Is it 1 ?
+	 JRST	RI400A			; Yes
+	PMSG	<^ I[NFORMATION LENGTH IN ERROR, IT SHOULD BE 1, IT WAS >
+	MOVE	AC0,AC1			;Copy the length
+	JRST	RI997			;Print ac0 and exit
+
+RI400A:	ILDB	AC1,AC2			;Get the data
+	MOVE	AC0,AC1			;Retrieve the byte
+	PNTDEC				;Print it
+	PMSG	<. >
+
+	CAIN	AC1,^D1			;Ethernet ?
+	 PMSG	<ETHERNET>		; Yes
+	CAIN	AC1,^D2			;Ddcmp ?
+	 PMSG	<DDCMP>			; Yes
+	CAIN	AC1,^D3			;Lapb ?
+	 PMSG	<LAPB>			; Yes
+	PCRLF
+	SUBI	AC7,2			;Decrement byte count
+	JRST	RRIDA			;Go do next info type 
+
+
+;  Type 401, length 2 = data link buffer size
+; default = 262
+
+RI401:	PMSG	<D[ATA LINK BUFFER SIZE:]]>
+	ILDB	AC1,AC2			;Go get the length
+	CAIN	AC1,2			;Is it 2 ?
+	 JRST	RI401A			; Yes
+	PMSG	<^ I[NFORMATION LENGTH IN ERROR, IT SHOULD BE 2, IT WAS >
+	MOVE	AC0,AC1			;Copy the length
+	JRST	RI997			;Print ac0 and exit
+
+RI401A:	ILDB	AC0,AC2			;Get the data for lo byte
+	ILDB	AC1,AC2			;Get the data for hi byte
+	DPB	AC1,[POINT 8,AC0,35-8]	;Justify hi byte to ac0
+	PNTDEC				;Print it
+	PMSG	<. B[YTES^>
+	SUBI	AC7,3			;Decrement byte count
+	JRST	RRIDA			;Go do next info type 
+
+;  Type 402-499, length I-16 = data link related:
+; Information specific to the particular data link.
+
+RI402:	PMSG	<D[ATA [L[INK RELATED VALUE:]>
+	MOVE	AC0,AC1			;Copy the type #
+	PNTDEC				;Print which one
+	PMSG	<.^>
+
+	ILDB	AC1,AC2			;Go get the length
+	SOJ	AC7,			;Decrement byte count
+	CAIG	AC1,0			;Greater than 0 ?
+	 JRST	RI402A			; No. Error.
+	CAIG	AC1,^D16		;Greater than 16 ?
+	 JRST	RI402B			; No
+RI402A:	PMSG	<^ I[NFORMATION LENGTH IN ERROR, IT SHOULD BE BETWEEN 1 AND 16, IT WAS >
+	MOVE	AC0,AC1			;Copy the length  
+	JRST	RI997			;Print ac0 and exit
+
+RI402B:	PMSG	< I[NFORMATION:]]]>
+	SKIPA
+RI402C:	PMSG	<, >
+	ILDB	AC0,AC2			;Go get data
+	SOJ	AC7,			;Decrement byte count
+	PNTOCS				;Print it
+	SOJG	AC1,RI402C		;Print until no more data
+
+	PCRLF
+	JRST	RRIDA			;Go do next info type 
+
+;#**********************************************************************
+;  The following is jrst to when either the length field of type is 
+;  Incorrect or a data field is not what was expected. This is
+;  Considered an error, and further reporting of system id information
+;  Would be futile.
+;  Any additions or changes to the system id message in future hardware
+;  May cause this to occur.
+;#**********************************************************************
+
+RI997:	PNTDEC				;Print what it is
+	PNTCI	"."
+
+	PMSG	<^S[YSTEM [ID[ FORMAT OR DATA IS UNKNOWN!^>
+	PMSG	<N[O FURTHER REPORTING WILL BE DONE FOR THIS NODE!^>
+
+; The following is the common return for this subroutine. 
+
+RRIDX:	GETIT	<AC0,AC1,AC2,AC3,AC4,AC7,AC10,AC11> ;Restore acs
+	RTN
+
+;#**********************************************************************
+;  RIZ subroutine
+; 
+; The following takes a right justified eight bit byte from the data
+; Stack and prints the two hex digits.
+; The first digit printed is in bits 28-31 and the
+; Second digit printed is in bits 32-35.
+; To use this routine put the byte on the data stack by using
+; "PUSHD <X>" Where x is the source address of the data byte,
+; Then use "GO RIZ" to call this subroutine.
+;#**********************************************************************
+
+RIZ:	PUTIT	<AC0>			;Save ac0
+
+	POPD	<AC0>			;Get the byte
+	PUSHD	<AC0>			;Save the byte again
+
+	LSH	AC0,-4			;Justify hi hex digit
+	GO	RIZ1			;Go print it
+
+	POPD	<AC0>			;Get the byte again
+	GO	RIZ1			;Go print it
+
+	GETIT	<AC0>			;Restore the original ac0
+	RTN
+
+RIZ1:	ANDI	AC0,17
+	ADDI	AC0,60			;Make an ascii character
+	CAILE	AC0,"9"			;Less than a "9" ?
+	 ADDI	AC0,7			; No, add 7 more to get a-f
+	PNTCHR				;Print the hex digit
+	RTN
+
+SUBTTL	DEBUG TABLE FOR PRINTING SYS-ID INFO
+;#****************************************************************************
+;Fake SYS-ID information
+;
+; This tests the previous printout routine if DEBUG is enabled.
+; For debug:	LOCAL ADDRESS    = 123456789ABC
+;		CONSOLE USER     = 123456789ABC (hex)
+;		HARDWARE ADDRESS = NODADH/L
+;
+;Format
+;	Info type   - 2 bytes
+;	Info length - 1 byte, value = x
+;	Info values - x bytes (lo byte to hi bytes)
+;#***********************************************************************
+
+REQTAB:	1		;Info type = Maintenance version
+	0		;Info type
+	3		;Info length = 3 bytes
+	4		;Info value, version
+	5		;Info value, eco
+	6		;Info value, user eco
+
+	2		;Functions
+	0
+	2
+REQT1:	177		;177 = not reserved, 377 = reserved
+	123
+
+	3		;Console user
+	0
+	6
+REQT2:	0		;For debug, LOCADH/L is set to 123456789ABC in RRID.
+	0		;  CONSOLE USER will be set to 123456789ABC in RESCON
+	0		; & cleared in RELCON.
+	0
+	0
+	0
+
+	4		;Reservation timer
+	0
+	2
+	10		;lo byte, default to 10 sec
+	0		;hi byte
+
+	5		;Console command size
+	0
+	2
+	111		;lo
+	0		;hi
+
+	6		;Console response size
+	0
+	2
+	333		;lo
+	0		;hi
+
+	7		;Hardware address
+	0
+	6
+REQT3:	0		; make same as NODADH/L in RRID
+	0
+	0
+	0
+	0
+	0
+
+	^D8		;System time
+	0
+	^D10
+	^D19
+	^D84
+	2
+	7
+	5
+	^D30
+	^D20
+	0
+	0
+	0
+
+	^D100		;Communication device
+	0
+	1
+	^D12
+
+	^D142		;Communication device related
+	0
+	^D10
+	1
+	2
+	3
+	4
+	5
+	6
+	7
+	10
+	11
+	12
+
+	^D200		;Software id
+	0
+	-2&377
+
+	^D211		;Software related
+	0
+	4
+	111
+	222
+	333
+	123
+
+	54		;^D300	;system processor
+	1
+	1
+	2
+
+	217		;^D399	;system processor related
+	1
+	3
+	1
+	2
+	3
+
+	220		;^D400	;data link
+	1
+	1
+	3
+
+
+	221		;^D401	;data link buffer size
+	1
+	2
+	321
+	456
+
+	302		;^D450	;data link related
+	1
+	2
+	321
+	321
+	
+RTEND:	0
+	0
+	0
+	0		;EOF
+
+SUBTTL	READ COUNTERS REPORTING
+;#**********************************************************************
+; RRCT Subroutine
+;
+;This routine will read the counters which are in the following format:
+;
+; byte		counter
+; length	value
+; ------	-------
+;  2		Seconds since last zeroed
+;  4		Bytes received
+;  4		Bytes sent
+;  4		Frames received
+;  4		Frames sent
+;  4		Multicast bytes received
+;  4		Multicast frames received
+;  4		Frames sent, initially deferred
+;  4		Frames sent, single collision
+;  4		Frames sent, multiple collision
+;  2		Send failure
+;  2		Send failure reason bitmap
+;
+;			Bit	Reason
+;			---	------
+;			0	Excessive collisions
+;			1	Carrier check failed
+;			2	Short circuit
+;			3	Open circuit
+;			4	Frame too long
+;			5	Remote failure to defer
+;
+;  2		Receive failure
+;  2		Receive failure reason bitmap
+;
+;			Bit	Reason
+;			---	------
+;			0	Block check error
+;			1	Framing error
+;			2	Frame too long
+;
+;  2		Unrecognized frame destination
+;  2		Data overrun
+;  2		System buffer unavailable
+;  2		User buffer unavailable
+;
+;#**********************************************************************
+
+RRCT:	PUTIT	<AC11,AC10,AC4,AC3,AC2,AC1,AC0> ;Save some acs
+	MOVEM	AC10,NODADH		;Save hi hex address (from GO HEX)
+	MOVEM	AC11,NODADL		;Save lo hex address
+
+;Do Read Counters jsys
+
+	GO	RCRCT			;Do Read Counters
+	 JRST	RRCTX			; Jsys error return
+
+	POPD	SREQN			;Save request #
+	GO	RDSTIM			; & read current time
+
+;Do Read Status jsys
+
+RRCT1:	PUSHD	SREQN			;Push saved request number
+	GO	RCSTS			;Do READ STATUS
+	 JRST	RRCTX			; Jsys error return
+
+	GO	RDFLGS			;Read status flags
+	 JRST	RRCTX			; Ret+1 Error or timeout return
+	 JRST	RRCT1			; Ret+2 Still pending, read again
+	 NOP				; Ret+3 Successful
+
+;Do Read Remote Console Reply for READ COUNTERS
+
+	PUSHD	SREQN			;Get Req #
+	GO	RCRPY			;Do READ REPLY (counters)
+	 JRST	RRCTX			; Jsys error return
+
+	PMSG	<^R[EAD [C[OUNTERS FOR NODE ADDRESS:]>
+	PUSHD	<NODADH,NODADL>
+	GO	PRHEX
+	PCRLF
+
+	MOVE	AC2,[POINT 8,TTOBUF]	;Set output buffer pointer
+
+	SKIPN	DBGFLG			;Debug ?
+	 JRST	RRCT3			; No
+
+	MOVE	AC6,[POINT 8,TTOBUF]	;Yes, set output buffer byte pointer
+	SETZ	AC3,
+
+RRCT2:	MOVE	AC0,CTRTAB(AC3)		;Deposit fake debug data in TTOBUF
+	IDPB	AC0,AC6
+	CAIE	AC3,100
+	 AOJA	AC3,RRCT2
+
+;Printout all counters
+
+RRCT3:	PMSG	<S[ECONDS SINCE LAST ZEROED:]>
+	SETZ	AC3,			;Read 2 bytes
+	GO	PNTNUM			;Get bytes & print
+
+	PMSG	<B[YTES RECEIVED:]]]>
+	SETO	AC3,			;Read 4 bytes
+	GO	PNTNUM			;Get bytes & print
+
+	PMSG	<B[YTES SENT:]]]>
+	GO	PNTNUM
+
+	PMSG	<F[RAMES RECEIVED:]]>
+	GO	PNTNUM
+
+	PMSG	<F[RAMES SENT:]]]>
+	GO	PNTNUM
+
+	PMSG	<M[ULTICAST BYTES RECEIVED:]>
+	GO	PNTNUM
+
+	PMSG	<M[ULTICAST FRAMES RECEIVED:]>
+	GO	PNTNUM
+
+	PMSG	<F[RAMES SENT, INITIALLY DEFERRED:>
+	GO	PNTNUM
+
+	PMSG	<F[RAMES SENT, SINGLE COLLISION:]>
+	GO	PNTNUM
+
+	PMSG	<F[RAMES SENT, MULTIPLE COLLISION:>
+	GO	PNTNUM
+
+	PMSG	<S[END FAILURE:]]]>
+	SETZ	AC3,			;Read 2 bytes
+	GO	PNTNUM
+
+	PMSG	<S[END FAILURE REASON BITMAP:^>
+	SETZ	AC0,
+	ILDB	AC0,AC2			;Get the data for lo byte
+	ILDB	AC1,AC2			;Get the data for hi byte
+	DPB	AC1,[POINT 8,AC0,35-8]	;Justify it to ac0
+
+	TRNE	AC0,1B35		;Exessive collisions ?
+	 PMSG	<]]]]E[XCESSIVE COLLISIONS^> ; Yes
+
+	TRNE	AC0,1B34		;Carrier check failed ?
+	 PMSG	<]]]]C[ARRIER CHECK FAILED^> ; Yes
+
+	TRNE	AC0,1B33		;Short circuit ?
+	 PMSG	<]]]]S[HORT CIRCUIT^>	; Yes
+
+	TRNE	AC0,1B32		;Open circuit ?
+	 PMSG	<]]]]O[PEN CIRCUIT^>	; Yes
+
+	TRNE	AC0,1B31		;Frame too long ?
+	 PMSG	<]]]]F[RAME TOO LONG^>	; Yes
+
+	TRNE	AC0,1B30		;Remote failure to defer ?
+	 PMSG	<]]]]R[EMOTE FAILURE TO DEFER^> ;Yes
+
+	PMSG	<R[ECEIVE FAILURE:]]>
+	GO	PNTNUM
+
+	PMSG	<R[ECEIVE FAILURE REASON BITMAP:^>
+	SETZ	AC0,
+	ILDB	AC0,AC2			;Get the data for lo byte
+	ILDB	AC1,AC2			;Get the data for hi byte
+	DPB	AC1,[POINT 8,AC0,35-8]	;Justify it to ac0
+
+	TRNE	AC0,1B35		;Block check error ?
+	 PMSG	<]]]]B[LOCK CHECK ERROR^> ; Yes
+
+	TRNE	AC0,1B34		;Framing error ?
+	 PMSG	<]]]]F[RAMING ERROR^>	; Yes
+
+	TRNE	AC0,1B33		;Frame too short ?
+	 PMSG	<]]]]F[RAME TOO SHORT^>	; Yes
+
+	PMSG	<U[NRECOGNIZED FRAME DESTINATION:]>
+	GO	PNTNUM
+
+	PMSG	<D[ATA OVERRUN:]]]>
+	GO	PNTNUM
+
+	PMSG	<S[YSTEM BUFFER UNAVAILABLE:]>
+	GO	PNTNUM
+
+	PMSG	<U[SER BUFFER UNAVAILABLE:]>
+	GO	PNTNUM
+
+RRCTX:	GETIT	<AC0,AC1,AC2,AC3,AC4,AC10,AC11>	;Restore ac's
+	RTN
+
+SUBTTL	READ COUNTER BYTES & PRINT
+;#*********************************************************************
+; Enter with AC2 pointing to the correct byte in TTOBUF
+;	     AC3 = 0  to take 2 bytes from TTOBUF
+;	     AC3 = -1 to take 4 bytes from TTOBUF
+;
+; Assemble the bytes in AC0 & print it.
+;#***********************************************************************
+
+PNTNUM:	SETZ	AC0,
+	ILDB	AC0,AC2			;Get the data for lo byte
+	ILDB	AC1,AC2			;Get the data for 2'nd byte
+	DPB	AC1,[POINT 8,AC0,35-8]	;Justify it to ac0
+	JUMPE	AC3,PN1			;Jump if only need 2 bytes
+
+	ILDB	AC1,AC2			;Get the data for 3'rd byte
+	DPB	AC1,[POINT 8,AC0,35-16]	;Justify it to ac0
+	ILDB	AC1,AC2			;Get the data for 4'th byte
+	DPB	AC1,[POINT 8,AC0,35-24]	;Justify it to ac0
+
+PN1:	PNTDEC				;Print it
+	PCRLF
+	RTN
+
+SUBTTL	DEBUG TABLE FOR PRINTING READ COUNTERS INFORMATION
+;#**************************************************************************
+; Dummy READ COUNTERS information
+;
+; This is a test of the previous printout routine to be used if the
+; debug EXIT is enabled.
+; Bytes are in the order of low to high
+;#**************************************************************************
+
+CTRTAB:	10		;Seconds since last zeroed	(lo byte)
+	0		;				(hi byte)
+
+	12		;Bytes received
+	0
+	0
+	0
+
+	14		;Bytes sent
+	0
+	0
+	0
+
+	16		;Frames received
+	0
+	0
+	0
+
+	20		;Frames sent
+	0
+	0
+	0
+
+	22		;Multicast bytes received
+	0
+	0
+	0
+
+	24		;Multicast frames received
+	0
+	0
+	0
+
+	26		;Frames sent, initially deferred
+	0
+	0
+	0
+
+	30		;Frames sent, single collision
+	0
+	0
+	0
+
+	32		;Frames sent, multiple collision
+	0
+	0
+	0
+
+	34		;Send failure
+	0
+
+	377		;Send failure reason bitmap
+	0
+
+	36		;Receive failure
+	0
+
+	377		;Receive failure reason bitmap
+	0
+
+	40		;Unrecognized frame destination
+	0
+
+	42		;Data overrun
+	0
+
+	44		;System buffer unavailable
+	0
+
+	46		;User buffer unavailable
+	0
+
+SUBTTL	STATUS FLAG REPORTING
+;#**********************************************************************
+;* RDFLGS Subroutine - Come here after doing "GO RCSTS"
+;
+;  Enter with STATUS in AC1
+;  Return +1 if error or timeout
+;  Return +2 if status pending & time not up.
+;  Return +3 if successful
+;#**********************************************************************
+
+RDFLGS:	HRRZ	AC1,RCSTSB+.LMSTF	;Get status from check status jsys
+	CAIE	AC1,.LMPND		;Request pending ?
+	 JRST	RDFL1			; No, check the other flags
+
+;The request is pending. See if 5 seconds have elapsed since the
+; Operation was started. If it has, report it. If not read the status again.
+
+	GO	OTIME			;See if 5 seconds have elapsed
+	SKIPA				;Error - time has elapsed
+	JRST	RDFL2			; Ret+2, to read status again
+	PMSG	<^STATUS [MESSAGE NOT RETURNED WITHIN 5 SECONDS^>
+	JRST	RDFL5
+
+RDFL1:	CAIE	AC1,.LMABT		;Aborted ?
+	 JRST	RDFL6			; No
+	ERROR1	(0,0,0,REQUEST ABORTED,
+REQUEST ID MESSAGE WAS ABORTED,ER01)
+
+RDFL6:	CAIE	AC1,.LMTXF		;Transmit failed ?
+	 JRST	RDFL7			; No
+	ERROR1	(0,0,0,TRANSMIT FAILED,
+TRANSMIT FAILURE OCCURED,ER01)
+
+RDFL7:	CAIE	AC1,.LMCCE		;Channel communication error ?
+	 JRST	RDFL8			; No
+	ERROR1	(0,0,0,CHANNEL COMMUNICATION ERROR,
+CHANNEL COMMUNICATION ERROR OCCURED,ER01)
+
+RDFL8:	CAIG	AC1,.LMCCE		;Unknown status type ?
+	 JRST	RDFL4			; No
+	PMSG	<^U[NKNOWN STATUS CODE RETURNED FROM^[REMOTE CONSOLE CHECK STATUS JSYS.>
+	PMSG	<^R[ETURNED CODE = >
+	MOVE	AC0,AC1			;Copy status	
+	PNTOCS				;Print the status
+	PCRLF
+	FATAL
+
+RDFL4:	CAIN	AC1,.LMSUC		;Successful ?
+	 JRST	RDFL3			; Yes, ret+3
+
+;Do Abort Outstanding command
+
+RDFL5:	PUSHD	SREQN			;Get Req#
+	GO	RCABT			;Do ABORT
+	 JRST	RDFLX			; Jsys error return
+	PMSG	<^A[BORTING [A[FTER [U[NSUCCESSFUL [READ STATUS^>
+	JRST	RDFLX
+
+RDFL3:	AOS	(P)			;Do return +3
+RDFL2:	AOS	(P)			;Do return +2
+RDFLX:	RTN				;Do return +1
+
+SUBTTL	SPEAR REPORTING SUBROUTINES
+;#**********************************************************************
+; SPR1 - print initial spear report 'diagnostic started'
+;
+;  This subroutine makes a "DIAGNOSTIC STARTED" spear report.
+;  It determines if it should be made by looking at "SPRFLG" and "SPEAR1".
+;  "SPEAR1" Is initially loaded as 0.
+;  When a  "DIAGNOSTIC STARTED" spear report is made it is set to -1.
+;  "SPRFLG" Is is a flag word that is toggled by the commands
+;  Enable/disable spear-reporting.
+;#**********************************************************************
+
+SPR1:	PUTIT	<AC2,AC1,AC0>		;Save some ac's
+	SKIPE	SPRFLG			;Spear reporting enabled ?
+	SKIPE	SPEAR1			;Diagnostic started spear entry made ?
+	 JRST	SPR1X			;Bypass spear report
+
+; Get ppn and build entry / get time and insert it
+
+	GO	GETPP			;Get user's ppn
+	POPD	<SENT10+8>		;Save in spear entry block
+	GTAD				;Get time and day
+	MOVEM	AC1,SENT10+5		;Save it
+
+; Make the entry
+
+	MOVEI	AC1,SENT10		;Get address of argument block
+	MOVEI	AC2,^D10		;Get length
+	SKIPN	DBGFLG
+	SYERR				;Write to syserr file
+
+	SETOM	SPEAR1			;Set 'spear initial msg done' flag
+SPR1X:	GETIT	<AC0,AC1,AC2>		;Restore ac's
+	RTN
+
+; Spear entry block 10
+
+SENT10:	250000,,0			;Event type
+	0				;Zero
+	0				;Zero
+	0				;Zero
+	20002				;Time of occurence block
+	0				;Time
+	4010,,0				;4 Words, type 10 code
+	SIXBIT	/RMTCON/			;Diagnostic name
+	MCNVER,,DECVER			;Diagnostic version
+	0				;User ppn
+
+;#**********************************************************************
+; SPR2 - makes either:
+;
+;   1. An error spear report.
+;   2. A successful completion spear report.
+;   3. Or a spear packet count incremented spear report
+;      (The spear queue entry count changed during execution of an ni packet).
+;
+;  Put a word on the data stack via "PUSHD <X>" where x is:
+;  1. A 0 for a successful completion spear report.
+;  2. For an error spear report: a postive number where bits 1-35
+;     Contains the address of an asciz message.
+;  3. For a spear packet count incremented spear report:
+;      A negative number where bit 0 is the negative sign and
+;     Bits 1-35 contains the address of an asciz message.
+;#**********************************************************************
+
+SPR2:	POPD	<SPR2D>			;Get the code word.
+	PUTIT	<AC0,AC1,AC2,AC3,AC4>	;Save some ac's
+
+; First check if spear reporting is enabled and that we haven't
+; Exceeded the spear error reporting threshold.
+				
+	SKIPN	SPRFLG			;Spear reporting enabled ?
+	 JRST	SPR2X			; It isn't. Exit this subroutine
+
+	MOVE	AC0,SPRCNT		;Get the # of error spear entries made
+	CAMLE	AC0,SERTH#		;Have we exceeded spear threshold ?
+	 JRST	SPR2X			; Yes. Exit this subroutine.
+
+; Initialize entry
+
+	SETZM	SENT11+7		;Clear test name
+	SETZM	SENT11+8		;Clear test description length
+	MOVEI	AC2,3			;Set block length to 3 words
+	DPB	AC2,[POINT 9,SEN11L,35]	;Save length
+
+; Make the spear entry
+
+SPR2E:	GTAD				;Get time and day
+	MOVEM	AC1,SENT11+5		;Save it
+	LDB	AC2,[POINT 9,SEN11L,35]	;Get length
+	ADDI	AC2,6			;Calculate total block length
+	MOVEI	AC1,SENT11		;Get address of argument block
+	SKIPN	DBGFLG
+	SYERR				;Write to syserr file
+
+	AOS	SPRCNT			;Increment spear error entries made
+
+SPR2X:	GETIT	<AC4,AC3,AC2,AC1,AC0>	;Restore ac's
+	RTN
+
+SPR2D:	0				;Code word stored here
+
+; Spear entry block 11
+
+SENT11:	250000,,0			;Event type
+	0				;Zero
+	0				;Zero
+	0				;Zero
+	20002				;Time of occurence block
+	0				;Time
+SEN11L:	11,,0				;Type 11 code
+	0				;Failing test name
+	0				;Failing test description length
+	BLOCK	^D20			;Ascii test description
+
+;#**********************************************************************
+; SPR3 subroutine
+;
+;  Used to make a spear entry when the spear queue entry
+;  Number has changed but no error was detected by the diagnostic.
+;#**********************************************************************
+
+SPR3:	PUTIT	<AC0>			;Save an ac
+
+	MOVEI	AC0,SPR3E		;Get address of asciz message
+	TLO	AC0,(1B0)		;Set bit 0
+	PUSHD	<AC0>			;Put the address on the data stack
+	GO	SPR2			;Call spear error reporter subroutine
+
+	GETIT	<AC0>			;Restore ac
+	RTN
+
+SPR3E:	ASCIZ/
+THE SPEAR QUEUE ENTRY COUNTER HAS CHANGED DURING EXECUTION OF THIS TEST.
+NO ERROR WAS DETECTED BY THIS TEST.
+/
+
+;#**********************************************************************
+; SPR4 subroutine
+;
+;  Used to make a successful completion spear report.
+;#**********************************************************************
+
+SPR4:	PUTIT	<AC0>			;Save an ac
+
+	SETZM	AC0			;Get a 0 word
+	PUSHD	<AC0>			;Put the zero on the data stack
+	GO	SPR2			;Call spear error reporter subroutine
+
+	GETIT	<AC0>			;Restore ac
+	RTN
+
+;#**********************************************************************
+; GETPP - find out ppn number
+;
+;  This subroutine will return with the ppn on the data stack.
+;  To get the ppn after this subroutine returns,
+;  Use  "POPD <X>" where "X" is the location you want the ppn to go to.
+;#**********************************************************************
+
+GETPP:	PUTIT	<AC1,AC2,AC3>		;Save some ac's
+	SETOM	AC1			;Indicate current job
+	MOVE	AC2,[-1,,AC1]		;Place 1 word into ac1
+	MOVEI	AC3,3			;Point to connected directory number
+
+	GETJI				;Get job information
+	SKIPA				;Error 
+	JRST	GETPP1			;Good return
+
+	SETZM	AC1			;Error - just clear ac1
+
+GETPP1:	PUSHD	<AC1>			;Put ppn on data stack
+	GETIT	<AC3,AC2,AC1>		;Restore ac's
+	RTN
+
+SUBTTL	GENERAL STORAGE
+;#**********************************************************************
+;*  General Program Storage 
+;#**********************************************************************
+
+PRTNBR:	0				;Storage for selected port number
+
+TARADH:	0				;Hi address for TARGET NODE
+TARADL:	0				;Lo
+
+LOCADH:	0				;Hi address for LOCAL NODE
+LOCADL:	0				;Lo
+
+NODADH:	0				;Hi hex NODE address for REQ-ID cmd 
+NODADL:	0				;Lo   & READ-COUNTERS command
+
+SLOCH:	44321,,263600			;For debug, set LOCADH = 1-8,z hex
+SLOCL:	465360,,0			;		LOCADL = 9-C,z hex in RRID
+
+PWORDH:	0				;Hi hex password verification code
+PWORDL:	0				;Lo
+
+TIMST:	0				;Start time of an event
+TIMEND:	0				;End time, contents of TIMST +5 seconds
+
+SPEAR1:	0				;Used as a flag for determining whether
+					; To make a diagnostic started spear
+					; Entry. Initially 0, make spear entry
+SPRCNT:	0				;Holds the number of spear entries made
+
+TEMP1:	0				;Temporary storage
+TEMP2:	0
+TEMP3:	0
+TEMP4:	0
+TEMP5:	0
+
+TRCFLG:	0				;Trace enabled flag = -1
+LOGFLG:	0				;Logging enabled = -1
+SPRFLG:	0				;Spear enabled = -1
+DBGFLG:	0				;Debug enabled flag = -1
+TTEXIT:	"D"-100				;TTY "exit" character
+					;Default to "Control-D" to Disconnect
+SREQN:	0				;Save Request number
+
+ONETIM:	0				;0 At initial start up, -1 otherwise 
+UNAME:	BLOCK	^D20			;Storage for user name
+
+  
+DSTKER:	JRST	DSERR		;Data stack error trap
+
+DSTK:	BLOCK	200		;Data stack pushdown list
+STKLEN= .-DSTK
+
+PASCT:	0			;Pass count
+RBTCTR:	0			;Remote boot counter
+NODSEL:	0			;Node selected flag
+CMDPND:	0			;Command pending flag
+
+BCASTH:	777777,,777760		;BCAST address used in DALLAD  (byte 0,1,2,3,z)
+BCASTL:	777774,,0		;FF-FF-FF-FF-FF-FF	       (byte 4,5,z,z,z)
+
+MCASTH:	526000,,40		;MCAST address used in DALLAD  (byte 0,1,2,3,z)
+MCASTL:	0			;AB-00-00-02-00-00	       (byte 4,5,z,z,z)
+
+PATCH:	BLOCK ^D200		;My DDT patch area 
+
+	END	JRST SETUP

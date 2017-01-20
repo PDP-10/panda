@@ -1,0 +1,1080 @@
+;;; This is a -*-Lisp-*- file.
+
+;;; **********************************************************************
+;;; This code was written as part of the Spice Lisp project at
+;;; Carnegie-Mellon University, and has been placed in the public domain.
+;;; If you want to use this code or any part of Spice Lisp, please contact
+;;; Scott Fahlman (FAHLMAN@CMUC). 
+;;; **********************************************************************
+
+;;; This file contains the macros that are part of the standard
+;;; Spice Lisp environment.
+
+;;; Written and maintained by Scott Fahlman.
+
+;;; *******************************************************************
+
+(in-package 'lisp)
+
+(export '(defvar defparameter defconstant when unless loop setf defsetf
+	  psetf shiftf rotatef push pushnew pop incf decf putf remf case
+	  typecase with-open-file with-open-stream with-input-from-string
+	  with-output-to-string locally etypecase ecase dotimes dolist do*
+	  ldb mask-field char-bit 
+	  ccase ctypecase get-setf-method get-setf-method-multiple-value
+	  define-modify-macro define-setf-method))
+
+;;;; DEFVAR, etc.
+
+(defmacro defvar (var &optional (val nil valp) (doc nil docp))
+  "For defining global variables at top level.  Declares the variable
+  SPECIAL and, optionally, initializes it.  If the variable already has a
+  value, the old value is not clobbered.  The third argument is an optional
+  documentation string for the variable."
+  `(progn
+    (proclaim '(special ,var))
+    ,@(cond (valp `((or (boundp ',var) (setq ,var ,val))))
+	    (t nil))
+    ,@(cond (docp `((%put ',var '%var-documentation ',doc)))
+	    (t nil))
+    ',var))
+
+(defmacro defparameter (var val &optional (doc nil docp))
+  "Defines a parameter that is not normally changed by the program,
+  but that may be changed without causing an error.  Declares the
+  variable special and sets its value to VAL.  The third argument is
+  an optional documentation string for the parameter."
+  `(progn
+    (proclaim '(special ,var))
+    (setq ,var ,val)
+    ,@(cond (docp `((%put ',var '%var-documentation ',doc)))
+	    (t nil))
+    ',var))
+
+
+(defmacro defconstant (var val &optional (doc nil docp))
+  "For defining global constants at top level.  Declares the variable
+  SPECIAL and initializes it.  The DEFCONST says that the value is
+  constant and may be compiled into code.  If the variable already has a
+  value, and this is not equal to the init, an error is signalled.
+  The third argument is an optional documentation string for the variable."
+  `(progn
+    (proclaim '(special ,var))
+    (remprop ',var '%constant)
+    (cond ((boundp ',var)
+	   (unless (equalp ,var ,val)
+		   (cerror "Go ahead and change the value."
+			   "Constant ~S being redefined." ',var)
+		   (setq ,var ,val)))
+	  (t (setq ,var ,val)))
+    (%put ',var '%constant t)
+    ,@(cond (docp `((%put ',var '%var-documentation ',doc)))
+	    (t nil))
+    ',var))
+
+
+;;;; ASSORTED CONTROL STRUCTURES
+
+(defmacro when (&rest forms)
+  "First arg is a predicate.  If it is non-null, the rest of the forms are
+  evaluated as a PROGN."
+  `(cond (,(car forms) nil ,@(cdr forms))))
+
+(defmacro unless (test &rest forms)
+  "First arg is a predicate.  If it is null, the rest of the forms are
+  evaluated as a PROGN."
+  `(cond ((not ,test) nil ,@forms)))
+
+
+;;;; DO AND FRIENDS
+
+;20; DO is in the kernel
+
+(defmacro do* (varlist endlist &body body)
+  "Iteration construct.  Like DO, but does inits and steps in serial,
+  not all at once."
+  (let ((decl nil) (inits nil) (steps nil) (tag (gensym)))
+    ;; Check for illegal old-style do.
+    (if (or (and varlist (atom varlist))
+	    (and endlist (atom endlist)))
+	(error "Ill-formed DO -- possibly illegal old style DO?" nil))
+    ;; Dig out the declarations.
+    (do ((b body (cdr b)))
+	((or (atom b)
+	     (not (and b (car b) (listp (car b))
+		       (eq (caar b) 'declare))))
+	 (setq decl (nreverse decl))
+	 (setq body b))
+      (setq decl (cons (car b) decl)))
+    ;; Parse the varlist to get inits and steps.
+    (do ((vl varlist (cdr vl))
+	 (v))
+	((atom vl))
+      (setq v (car vl))
+      (cond ((atom v)
+	     (setq inits (cons v inits)))
+	    ((and (= (length v) 1) (symbolp (car v)))
+	     (setq inits (cons (car v) inits)))
+	    ((and (= (length v) 2) (symbolp (car v)))
+	     (setq inits (cons v inits)))
+	    ((and (= (length v) 3) (symbolp (car v)))
+	     (setq inits (cons (list (car v) (cadr v)) inits))
+	     (setq steps (cons (caddr v) (cons (car v) steps))))
+	    (t (error "~S is illegal form in a DO varlist." v))))
+    ;; And finally construct the new form.
+    `(block nil
+       (let* ,(nreverse inits)
+	 ,@decl
+	 (tagbody ,tag
+	   (and ,(car endlist)
+		(return (progn ,@(cdr endlist))))
+		,@body
+		(setq ,@(nreverse steps))
+		(go ,tag))))))
+
+
+(defmacro dotimes ((var count &optional (result nil)) &body body)
+  "Syntax is (DOTIMES (var count [result]) . body).
+  Do body COUNT times with VAR increasing from 0 to COUNT - 1.
+  Return result form or NIL."
+  (cond ((numberp count)
+	 `(do ((,var 0 (1+ ,var)))
+	      ((>= ,var ,count) ,result)
+	    ,@body))
+	(t (let ((v1 (gensym)))
+	     `(do ((,var 0 (1+ ,var)) (,v1 ,count))
+		  ((>= ,var ,v1) ,result)
+		,@body)))))
+
+
+(defmacro dolist ((var list &optional (result nil)) &body body)
+  "Syntax is (DOLIST (var list [result]) . body).
+  Do body with VAR bound to each member of LIST, then return result
+  form or NIL."
+  (let ((v1 (gensym)))
+    `(do* ((,v1 ,list (cdr ,v1))
+	   (,var (car ,v1) (car ,v1)))
+	  ((atom ,v1) ,result)
+	,@body)))
+
+
+;;;; SETF AND FRIENDS
+;;; Note: The expansions for SETF and friends sometimes create needless
+;;; LET-bindings of argument values.  The compiler will remove most of
+;;; these spurious bindings, so SETF doesn't worry too much about creating
+;;; them. 
+
+;;; The inverse for a generalized-variable reference function is stored in
+;;; one of two ways:
+;;;
+;;; A SETF-INVERSE property corresponds to the short form of DEFSETF.  It is
+;;; the name of a function takes the same args as the reference form, plus a
+;;; new-value arg at the end.
+;;;
+;;; A SETF-METHOD-EXPANDER property is created by the long form of DEFSETF or
+;;; by DEFINE-SETF-METHOD.  It is a function that is called on the reference
+;;; form and that produces five values: a list of temporary variables, a list
+;;; of value forms, a list of the single store-value form, a storing function,
+;;; and an accessing function.
+
+(proclaim '(special *in-the-compiler*))
+
+(defun get-setf-method (form)
+  "Returns five values needed by the SETF machinery: a list of temporary
+  variables, a list of values with which to fill them, the temporary for the
+  new value in a list, the setting function, and the accessing function."
+  (let (temp)
+    (cond ((symbolp form)
+	   (let ((new-var (gensym)))
+	     (values nil nil (list new-var) `(setq ,form ,new-var) form)))
+	  ((atom form)
+	   (error "~S illegal atomic form for GET-SETF-METHOD." form))
+	  ((setq temp (get (car form) 'setf-inverse))
+	   (let ((new-var (gensym))
+		 (vars nil)
+		 (vals nil))
+	     (dolist (x (cdr form))
+	       (push (gensym) vars)
+	       (push x vals))
+	     (setq vals (nreverse vals))
+	     (values vars vals (list new-var)
+		     `(,temp ,@vars ,new-var)
+		     `(,(car form) ,@vars))))
+	  ((setq temp (get (car form) 'setf-method-expander))
+	   (funcall temp form))
+	  ((and (boundp '*in-the-compiler*) *in-the-compiler*)
+	   (if (eq (setq temp (compiler-macroexpand-1 form)) form)
+	       (error "~S is not a known location specifier for SETF."
+		      (car form))
+	       (get-setf-method temp)))
+	  (t
+	   (if (eq (setq temp (macroexpand-1 form)) form)
+	       (error "~S is not a known location specifier for SETF."
+		      (car form))
+	       (get-setf-method temp))))))
+
+
+;;; The following is like macroexpand, but looks for MACRO-IN-COMPILER
+;;; properties as well.
+
+(proclaim '(special *macroexpand-hook*))
+
+(defun compiler-macroexpand-1 (form)
+  (let (temp)
+    (cond ((not (listp form)) (values form nil))
+	  ((not (symbolp (car form))) (values form nil))
+	  ((or (setq temp (get (car form) 'macro-in-compiler))
+	       (setq temp (macro-function (car form))))
+	   (values (funcall *macroexpand-hook* temp form) t))
+	  (t (values form nil)))))
+
+(defun compiler-macroexpand (form)
+  (prog (flag)
+    (multiple-value-setq (form flag) (compiler-macroexpand-1 form))
+    (or flag (return (values form nil)))
+    loop
+    (multiple-value-setq (form flag) (compiler-macroexpand-1 form))
+    (if flag (go loop) (return (values form t)))))
+
+
+(defun get-setf-method-multiple-value (form)
+  "Like Get-Setf-Method, but may return multiple new-value variables."
+  (get-setf-method form))
+
+
+(defmacro define-setf-method (access-fn lambda-list &body body)
+  "Syntax like DEFMACRO, but creates a Setf-Method generator.  The body
+  must be a form that returns the five magical values."
+  (prog ((local-decs nil)
+	 (doc nil)
+	 (arg-test nil)
+	 (%arg-count 0)
+	 (%min-args 0)
+	 (%restp nil)
+	 (%let-list nil)
+	 (%keyword-tests nil))
+    (declare (special %arg-count %min-args %restp %let-list %keyword-tests))
+    (cond ((not (symbolp access-fn))
+	   (error
+	    "~S -- Access-function name not a symbol in DEFINE-SETF-METHOD."
+	    access-fn)))
+    ;; Check for local declarations and documentation string.
+   LOOP
+    (cond ((atom body)
+	   (setq body '(nil)))
+	  ((and (not (atom (car body))) (eq (caar body) 'declare))
+	   (setq local-decs (append local-decs (cdar body)))
+	   (setq body (cdr body))
+	   (go loop))
+	  ((and (stringp (car body)) (not (null (cdr body))))
+	   (setq doc (car body))
+	   (setq body (cdr body))
+	   (go loop)))
+    ;; Analyze the lambda list.
+    (analyze1 lambda-list '(cdr %lambda-list) access-fn '%lambda-list)
+    (setq arg-test
+	  (cond ((and (zerop %min-args) %restp) nil)
+		((zerop %min-args)
+		 `(> (length %lambda-list) ,(1+ %arg-count)))
+		(%restp
+		  `(< (length %lambda-list) ,(1+ %min-args)))
+		((= %min-args %arg-count)
+		 `(not (= (length %lambda-list) ,(1+ %min-args))))
+		(t
+		 `(or (> (length %lambda-list) ,(1+ %arg-count))
+		      (< (length %lambda-list) ,(1+ %min-args))))))
+    ;; Now build the body of the macro.
+    (when (null lambda-list) (push '(ignore %lambda-list) local-decs))
+    (setq body `(let* ,(nreverse %let-list)
+		  ,@ (and local-decs (list (cons 'declare local-decs)))
+		  ,@ %keyword-tests
+		  ,@ body))
+    (and arg-test
+	 (setq body
+	       `(cond (,arg-test
+		       (error
+			"Setf expander for ~S cannot be called with ~S args."
+			',access-fn (1- (length %lambda-list))))
+		      (t ,body))))
+    (return `(eval-when (load compile eval)
+	       (remprop ',access-fn 'setf-inverse)
+	       (%put ',access-fn
+		     'setf-method-expander
+		     #'(lambda (%lambda-list) ,body))
+	      ,@(if doc
+		    `((%put ',access-fn '%setf-documentation ',doc)))
+	      ',access-fn))))
+
+(eval-when (compile load eval)
+
+(defun defsetter (fn rest)
+  (let ((arglist (car rest))
+	(new-var (car (cadr rest)))
+	(body (cddr rest))
+	(local-decs nil)
+	(%arg-count 0)
+	(%min-args 0)
+	(%restp nil)
+	(%let-list nil)
+	(%keyword-tests nil))
+    (declare (special %arg-count %min-args %restp %let-list %keyword-tests))
+    ;; Check for local declarations and documentation string.
+    (tagbody
+     LOOP
+     (cond ((atom body)
+	    (setq body '(nil)))
+	   ((and (not (atom (car body))) (eq (caar body) 'declare))
+	    (setq local-decs (append local-decs (cdar body)))
+	    (setq body (cdr body))
+	    (go loop))
+	   ((and (stringp (car body)) (not (null (cdr body))))
+	    (setq body (cdr body))
+	    (go loop))))
+    ;; Analyze the defmacro argument list.
+    (analyze1 arglist '(cdr %access-arglist) fn '%access-arglist)
+    ;; Now build the body of the transform.
+    (when (null arglist) (push '(ignore %access-arglist) local-decs))
+    (setq body `(let* ,(nreverse %let-list)
+		  ,@ (and local-decs (list (cons 'declare local-decs)))
+		  ,@ %keyword-tests
+		  ,@ body))
+    `(lambda (%access-arglist ,new-var) ,body)))
+
+) ; End of Eval-When.
+
+(defmacro defsetf (access-fn &rest rest)
+  "Associates a SETF update function or macro with the specified access
+  function or macro.  The format is complex.  See the manual for
+  details."
+  (cond ((not (listp (car rest)))
+	 `(eval-when (load compile eval)
+	    (remprop ',access-fn 'setf-method-expander)     ; SKH 4/17/84
+	    (%put ',access-fn 'setf-inverse ',(car rest))
+	    ,@(if (and (car rest) (stringp (cadr rest)))
+		  `((eval-when (load eval)
+		      (%put ',access-fn '%setf-documentation ,(cadr rest)))))
+	    ',access-fn))
+	((and (listp (car rest)) (cdr rest) (listp (cadr rest)))
+	 (if (not (= (length (cadr rest)) 1))
+	     (cerror "Ignore the extra items in the list."
+		     "Only one new-value variable allowed in DEFSETF."))
+	 (let* ((doc (do ((x (cddr rest) (cdr x)))
+			 ((or (atom x) (atom (cdr x))) nil)
+		       (cond ((stringp (car x)) (return (car x)))
+			     ((and (listp (car x))
+				   (eq (caar x) 'declaration)))
+			     (t (return nil)))))
+		(setting-form-generator (defsetter access-fn rest))) 
+	   `(eval-when (load compile eval)
+	      (remprop ',access-fn 'setf-inverse)     ;SKH 4/17/84
+	      (%put ',access-fn 'setf-method-expander
+		    #'(lambda (access-form)
+		       (do* ((args (cdr access-form) (cdr args))
+			     (dummies nil (cons (gensym) dummies))
+			     (newval-var (gensym))
+			     (new-access-form nil))
+			    ((atom args)
+			     (setq new-access-form 
+				   (cons (car access-form) dummies))
+			     (values
+			      dummies
+			      (cdr access-form)
+			      (list newval-var)
+			      (funcall (function ,setting-form-generator)
+				       new-access-form newval-var)
+			      new-access-form)))))
+	      ,@(if doc
+		    `((eval-when (load eval)
+			(%put ',access-fn '%setf-documentation ',doc)))
+		    `((eval-when (load eval)             ;SKH 4/17/84
+			(remprop ',access-fn '%setf-documentation))))
+	      ',access-fn)))
+	(t (error "Ill-formed DEFSETF for ~S." access-fn))))
+
+
+
+(defmacro setf (&rest args)
+  "Takes pairs of arguments like SETQ.  The first is a place and the second
+  is the value that is supposed to go into that place.  Returns the last
+  value.  The place argument may be any of the access forms for which SETF
+  knows a corresponding setting form."
+  (let ((temp (length args)))
+    (cond ((= temp 2)
+	   (cond ((atom (car args))
+		  `(setq ,(car args) ,(cadr args)))
+		 ((setq temp (get (caar args) 'setf-inverse))
+		  `(,temp ,@(cdar args) ,(cadr args)))
+		 (t (multiple-value-bind (dummies vals newval setter getter)
+					 (get-setf-method (car args))
+		      (declare (ignore getter))
+		      (do* ((d dummies (cdr d))
+			    (v vals (cdr v))
+			    (let-list nil))
+			   ((null d)
+			    (setq let-list
+				  ;;; Next form munged and put back SKH 5/26
+				  (nreverse (cons (list (car newval)
+							(cadr args))
+						  let-list)))
+			    `(let* ,let-list ,setter))
+			(setq let-list
+			      (cons (list (car d) (car v)) let-list)))))))
+	  ((oddp temp) 
+	   (error "Odd number of args to SETF."))
+	  (t (do ((a args (cddr a)) (l nil))
+		 ((null a) `(progn ,@(nreverse l)))
+	       (setq l (cons (list 'setf (car a) (cadr a)) l)))))))
+
+(defmacro psetf (&rest args)
+  "This is to SETF as PSETQ is to SETQ.  Args are alternating place
+  expressions and values to go into those places.  All of the subforms and
+  values are determined, left to right, and only then are the locations
+  updated.  Returns NIL."
+  (do ((a args (cddr a))
+       (let-list nil)
+       (setf-list nil))
+      ((atom a)
+       `(let* ,(nreverse let-list) ,@(nreverse setf-list) nil))
+    (if (atom (cdr a))
+	(error "Odd number of args to PSETF."))
+    (multiple-value-bind (dummies vals newval setter getter)
+      (get-setf-method (car a))
+      (declare (ignore getter))
+      (do* ((d dummies (cdr d))
+	    (v vals (cdr v)))
+	   ((null d))
+	(push (list (car d) (car v)) let-list))
+      (push (list (car newval) (cadr a)) let-list)
+      (push setter setf-list))))
+
+
+(defmacro shiftf (&rest args)
+  "One or more SETF-style place expressions, followed by a single
+  value expression.  Evaluates all of the expressions in turn, then
+  assigns the value of each expression to the place on its left,
+  returning the value of the leftmost."
+  (if (< (length args) 2)
+      (error "Too few argument forms to a SHIFTF."))
+  (let ((leftmost (gensym)))
+    (do ((a args (cdr a))
+	 (let-list nil)
+	 (setf-list nil)
+	 (next-var leftmost))
+	((atom (cdr a))
+	 (push (list next-var (car a)) let-list)
+	 `(let* ,(nreverse let-list) ,@(nreverse setf-list) ,leftmost))
+      (multiple-value-bind (dummies vals newval setter getter)
+	(get-setf-method (car a))
+	(do* ((d dummies (cdr d))
+	      (v vals (cdr v)))
+	     ((null d))
+	  (push (list (car d) (car v)) let-list))
+	(push (list next-var getter) let-list)
+	(push setter setf-list)
+	(setq next-var (car newval))))))
+
+
+(defmacro rotatef (&rest args)
+  "Takes any number of SETF-style place expressions.  Evaluates all of the
+  expressions in turn, then assigns to each place the value of the form to
+  its right.  The rightmost form gets the value of the leftmost.  Returns NIL."
+  (cond ((null args) nil)
+	((null (cdr args)) `(progn ,(car args) nil))
+	(t (do ((a args (cdr a))
+		(let-list nil)
+		(setf-list nil)
+		(next-var nil)
+		(fix-me nil))
+	       ((atom a)
+		  (rplaca fix-me next-var)
+		  `(let* ,(nreverse let-list) ,@(nreverse setf-list) nil))
+	       (multiple-value-bind (dummies vals newval setter getter)
+                 (get-setf-method (car a))
+		 (do ((d dummies (cdr d))
+		      (v vals (cdr v)))
+		     ((null d))
+		   (push (list (car d) (car v)) let-list))
+		 (push (list next-var getter) let-list)
+		 ;; We don't know the newval variable for the last form yet,
+		 ;; so fake it for the first getter and fix it at the end.
+		 (unless fix-me (setq fix-me (car let-list)))
+		 (push setter setf-list)
+		 (setq next-var (car newval)))))))
+
+
+(defmacro define-modify-macro (name lambda-list function &optional doc-string)
+  "Creates a new read-modify-write macro like PUSH or INCF."
+  (let ((other-args nil)
+	(rest-arg nil))
+    ;; Parse out the variable names and rest arg from the lambda list.
+    (do ((ll lambda-list (cdr ll))
+	 (arg nil))
+	((null ll))
+      (setq arg (car ll))
+      (cond ((eq arg '&optional))
+	    ((eq arg '&rest)
+	     (if (symbolp (cadr ll))
+		 (setq rest-arg (cadr ll))
+		 (error "Non-symbol &rest arg in definition of ~S." name))
+	     (if (null (cddr ll))
+		 (return nil)
+		 (error
+		  "Illegal stuff after &rest arg in Define-Modify-Macro.")))
+	    ((memq arg '(&key &allow-other-keys &aux))
+	     (error "~S not allowed in Define-Modify-Macro lambda list." arg))
+	    ((symbolp arg)
+	     (push arg other-args))
+	    ((and (listp arg) (symbolp (car arg)))
+	     (push (car arg) other-args))
+	    (t (error
+		"Illegal stuff in lambda list of Define-Modify-Macro."))))
+    (setq other-args (nreverse other-args))
+    `(defmacro ,name (%reference ,@lambda-list)
+       ,doc-string
+       (multiple-value-bind (dummies vals newval setter getter)
+	 (get-setf-method %reference)
+	 (do ((d dummies (cdr d))
+	      (v vals (cdr v))
+	      (let-list nil (cons (list (car d) (car v)) let-list)))
+	     ((null d)
+	      (push 
+	       (list (car newval)
+		     ,(if rest-arg
+			  `(list* ',function getter ,@other-args ,rest-arg)
+			  `(list ',function getter ,@other-args)))
+	       let-list)
+	      `(let* ,(nreverse let-list)
+		 ,setter)))))))
+
+
+(defmacro push (obj place)
+  "Takes an object and a location holding a list.  Conses the object onto
+  the list, returning the modified list."
+  (if (symbolp place)
+      `(setq ,place (cons ,obj ,place))
+      (multiple-value-bind (dummies vals newval setter getter)
+	(get-setf-method place)
+	(do* ((d dummies (cdr d))
+	      (v vals (cdr v))
+	      (let-list nil))
+	     ((null d)
+	      (push (list (car newval) `(cons ,obj ,getter))
+		    let-list)
+	      `(let* ,(nreverse let-list)
+		 ,setter))
+	  (push (list (car d) (car v)) let-list)))))
+
+
+(defmacro pushnew (obj place &rest keys)
+  "Takes an object and a location holding a list.  If the object is already
+  in the list, does nothing.  Else, conses the object onto the list.  Returns
+  NIL.  If there is a :TEST keyword, this is used for the comparison."
+  (if (symbolp place)
+      `(setq ,place (adjoin ,obj ,place ,@keys))
+      (multiple-value-bind (dummies vals newval setter getter)
+	(get-setf-method place)
+	(do* ((d dummies (cdr d))
+	      (v vals (cdr v))
+	      (let-list nil))
+	     ((null d)
+	      (push (list (car newval) `(adjoin ,obj ,getter ,@keys))
+		    let-list)
+	      `(let* ,(nreverse let-list)
+		 ,setter))
+	  (push (list (car d) (car v)) let-list)))))
+
+
+(defmacro pop (place)
+  "The argument is a location holding a list.  Pops one item off the front
+  of the list and returns it."
+  (if (symbolp place)
+      `(prog1 (car ,place) (setq ,place (cdr ,place)))
+      (multiple-value-bind (dummies vals newval setter getter)
+			   (get-setf-method place)
+	(do* ((d dummies (cdr d))
+	      (v vals (cdr v))
+	      (let-list nil))
+	     ((null d)
+	      (push (list (car newval) getter) let-list)
+	      `(let* ,(nreverse let-list)
+		 (prog1 (car ,(car newval))
+			(setq ,(car newval) (cdr ,(car newval)))
+			,setter)))
+	  (push (list (car d) (car v)) let-list)))))
+
+
+(define-modify-macro incf (&optional (delta 1)) +
+  "The first argument is some location holding a number.  This number is
+  incremented by the second argument, DELTA, which defaults to 1.")
+
+(define-modify-macro decf (&optional (delta 1)) -
+  "The first argument is some location holding a number.  This number is
+  decremented by the second argument, DELTA, which defaults to 1.")
+
+
+(defmacro putf (place indicator value)
+  "Place may be any place expression acceptable to SETF, and is expected
+  to hold a property list or ().  This list is destructively altered so
+  that (GETF place indicator) will find the specified newvalue.  Returns
+  the new value."
+  (multiple-value-bind (dummies vals newval setter getter)
+    (get-setf-method place)
+    (do* ((d dummies (cdr d))
+	  (v vals (cdr v))
+	  (let-list nil)
+	  (ind-temp (gensym))
+	  (val-temp (gensym)))
+	 ((null d)
+	  (push (list (car newval) getter) let-list)
+	  (push (list ind-temp indicator) let-list)
+	  (push (list val-temp value) let-list)
+	  `(let* ,(nreverse let-list)
+	     (setq ,(car newval) (%sp-putf ,(car newval) ,ind-temp ,val-temp))
+	     ,setter
+	     ,val-temp))
+      (push (list (car d) (car v)) let-list))))
+
+(defun %sp-putf (place indicator value)
+   (do* ((local1 place (cddr local1)))
+	((atom local1)
+	 (list* indicator value place))
+     (cond ((atom (cdr local1))
+	    (error "Odd length property list in PUTF"))
+	   ((eq (car local1) indicator)
+	    (rplaca (cdr local1) value)
+	    (return place)))))
+
+(defmacro remf (place indicator)
+  "Place may be any place expression acceptable to SETF, and is expected
+  to hold a property list or ().  This list is destructively altered to
+  remove the property specified by the indicator.  Returns T if such a
+  property was present, NIL if not."
+  (multiple-value-bind (dummies vals newval setter getter)
+    (get-setf-method place)
+    (do* ((d dummies (cdr d))
+	  (v vals (cdr v))
+	  (let-list nil)
+	  (ind-temp (gensym))
+	  (local1 (gensym))
+	  (local2 (gensym)))
+	 ((null d)
+	  (push (list (car newval) getter) let-list)
+	  (push (list ind-temp indicator) let-list)
+	  `(let* ,(nreverse let-list)
+	     (do ((,local1 ,(car newval) (cddr ,local1))
+		  (,local2 nil ,local1))
+		 ((atom ,local1) nil)
+	       (cond ((atom (cdr ,local1))
+		      (error "Odd-length property list in REMF."))
+		     ((eq (car ,local1) ,ind-temp)
+		      (cond (,local2
+			     (rplacd (cdr ,local2) (cddr ,local1))
+			     (return t))
+			    (t (setq ,(car newval) (cddr ,(car newval)))
+			       ,setter
+			       (return t))))))))
+      (push (list (car d) (car v)) let-list))))
+
+
+;;; The built-in DEFSETFs.
+
+(defsetf car %rplaca)
+(defsetf cdr %rplacd)
+(defsetf caar (x) (v) `(%rplaca (car ,x) ,v))
+(defsetf cadr (x) (v) `(%rplaca (cdr ,x) ,v))
+(defsetf cdar (x) (v) `(%rplacd (car ,x) ,v))
+(defsetf cddr (x) (v) `(%rplacd (cdr ,x) ,v))
+(defsetf caaar (x) (v) `(%rplaca (caar ,x) ,v))
+(defsetf cadar (x) (v) `(%rplaca (cdar ,x) ,v))
+(defsetf cdaar (x) (v) `(%rplacd (caar ,x) ,v))
+(defsetf cddar (x) (v) `(%rplacd (cdar ,x) ,v))
+(defsetf caadr (x) (v) `(%rplaca (cadr ,x) ,v))
+(defsetf caddr (x) (v) `(%rplaca (cddr ,x) ,v))
+(defsetf cdadr (x) (v) `(%rplacd (cadr ,x) ,v))
+(defsetf cdddr (x) (v) `(%rplacd (cddr ,x) ,v))
+(defsetf caaaar (x) (v) `(%rplaca (caaar ,x) ,v))
+(defsetf cadaar (x) (v) `(%rplaca (cdaar ,x) ,v))
+(defsetf cdaaar (x) (v) `(%rplacd (caaar ,x) ,v))
+(defsetf cddaar (x) (v) `(%rplacd (cdaar ,x) ,v))
+(defsetf caadar (x) (v) `(%rplaca (cadar ,x) ,v))
+(defsetf caddar (x) (v) `(%rplaca (cddar ,x) ,v))
+(defsetf cdadar (x) (v) `(%rplacd (cadar ,x) ,v))
+(defsetf cdddar (x) (v) `(%rplacd (cddar ,x) ,v))
+(defsetf caaadr (x) (v) `(%rplaca (caadr ,x) ,v))
+(defsetf cadadr (x) (v) `(%rplaca (cdadr ,x) ,v))
+(defsetf cdaadr (x) (v) `(%rplacd (caadr ,x) ,v))
+(defsetf cddadr (x) (v) `(%rplacd (cdadr ,x) ,v))
+(defsetf caaddr (x) (v) `(%rplaca (caddr ,x) ,v))
+(defsetf cadddr (x) (v) `(%rplaca (cdddr ,x) ,v))
+(defsetf cdaddr (x) (v) `(%rplacd (caddr ,x) ,v))
+(defsetf cddddr (x) (v) `(%rplacd (cdddr ,x) ,v))
+
+(defsetf first %rplaca)
+(defsetf second (x) (v) `(%rplaca (cdr ,x) ,v))
+(defsetf third (x) (v) `(%rplaca (cddr ,x) ,v))
+(defsetf fourth (x) (v) `(%rplaca (cdddr ,x) ,v))
+(defsetf fifth (x) (v) `(%rplaca (cddddr ,x) ,v))
+(defsetf sixth (x) (v) `(%rplaca (cdr (cddddr ,x)) ,v))
+(defsetf seventh (x) (v) `(%rplaca (cddr (cddddr ,x)) ,v))
+(defsetf eighth (x) (v) `(%rplaca (cdddr (cddddr ,x)) ,v))
+(defsetf ninth (x) (v) `(%rplaca (cddddr (cddddr ,x)) ,v))
+(defsetf tenth (x) (v) `(%rplaca (cdr (cddddr (cddddr ,x))) ,v))
+(defsetf rest %rplacd)
+
+(defsetf elt %setelt)
+(defsetf aref %aset)
+(defsetf svref %svset)
+(defsetf char %charset)
+(defsetf bit %bitset)
+(defsetf schar %scharset)
+(defsetf sbit %sbitset)
+(defsetf symbol-value set)
+(defsetf symbol-function %sp-set-definition)
+(defsetf symbol-plist %set-plist)
+(defsetf documentation %set-documentation)
+(defsetf nth %setnth)
+(defsetf %sp-svref %sp-svset)
+(defsetf %sp-schar %sp-scharset)
+(defsetf %sp-sbit %sp-sbitset)
+(defsetf %sp-saref1 %sp-saset1)
+(defsetf %sp-cvref %sp-cvset)
+(defsetf %sp-cchar %sp-ccharset)
+(defsetf %sp-cbit %sp-cbitset)
+(defsetf %sp-caref1 %sp-caset1)
+(defsetf fill-pointer %set-fill-pointer)
+
+
+(define-setf-method getf (place prop &optional default)
+  (multiple-value-bind (temps values stores set get)
+		       (get-setf-method place)
+    (let ((newval (gensym))
+	  (ptemp (gensym))
+	  (def-temp (gensym)))
+      (values `(,@temps ,(car stores) ,ptemp ,@(if default `(,def-temp)))
+	      `(,@values ,get ,prop ,@(if default `(,default)))
+	      `(,newval)
+	      `(progn (setq ,(car stores)
+			    (%sp-putf ,(car stores) ,ptemp ,newval))
+		      ,set
+		      ,newval)
+	      `(getf ,(car stores) ,ptemp ,@(if default `(,def-temp)))))))
+
+(define-setf-method get (symbol prop &optional default)
+  "Get turns into %put. Don't put in the default unless it really is
+  supplied and non-nil, so that we can transform into the get
+  instruction whenever possible."
+  (let ((symbol-temp (gensym))
+	(prop-temp (gensym))
+	(def-temp (gensym))
+	(newval (gensym)))
+    (values `(,symbol-temp ,prop-temp ,@(if default `(,def-temp)))
+	    `(,symbol ,prop ,@(if default `(,default)))
+	    (list newval)
+	    `(%put ,symbol-temp ,prop-temp ,newval)
+	    `(get ,symbol-temp ,prop-temp ,@(if default `(,def-temp))))))
+
+
+
+(defsetf macro-function (symbol) (def)
+  `(cdr (%sp-set-definition ,symbol (cons 'macro ,def))))
+
+(define-setf-method gethash (key hashtable &optional default)
+  (let ((key-temp (gensym))
+	(hashtable-temp (gensym))
+	(default-temp (gensym))
+	(new-value-temp (gensym)))
+    (values
+     `(,key-temp ,hashtable-temp ,@(if default `(,default-temp)))
+     `(,key ,hashtable ,@(if default `(,default)))
+     `(,new-value-temp)
+     `(%puthash ,key-temp ,hashtable-temp ,new-value-temp)
+     `(gethash ,key-temp ,hashtable-temp ,@(if default `(,default-temp))))))
+
+(defsetf subseq (sequence start &optional (end nil)) (v)
+  `(progn (replace ,sequence ,v :start1 ,start :end1 ,end)
+	  ,v))
+
+
+;;; Evil hack invented by the gnomes of Vassar Street.  The function
+;;; arg must be constant.  Get a setf method for this function, pretending
+;;; that the final (list) arg to apply is just a normal arg.  If the
+;;; setting and access forms produced in this way reference this arg at
+;;; the end, then just splice the APPLY back onto the front and the right
+;;; thing happens.
+
+(define-setf-method apply (function &rest args)
+  (if (and (listp function)
+	   (= (list-length function) 2)
+	   (eq (car function) 'function)
+	   (symbolp (second function)))
+      (setq function (second function))
+      (error
+       "Setf of Apply is only defined for function args of form #'symbol."))
+  (multiple-value-bind (dummies vals newval setter getter)
+    (get-setf-method (cons function args))
+    ;; Make sure the place is one that we can handle.
+    (cond ((and (eq (car (last args)) (car (last vals)))
+		 (eq (car (last getter)) (car (last dummies)))
+		 (eq (car (last setter)) (car (last dummies))))
+	   (values dummies vals newval
+	    `(apply (function ,(car setter)) ,@(cdr setter))
+	    `(apply (function ,(car getter)) ,@(cdr setter))))
+	  ((and (eq (car (last args)) (car (last vals)))
+	        (eq (car (last getter)) (car (last dummies)))
+	        (eq (penult setter) (car (last dummies))))
+	   (values dummies vals newval
+	    `(apply-but-last (function ,(car setter)) ,@(cdr setter))
+	    `(apply (function ,(car getter)) ,@(cdr setter))))
+	  (t (error "Apply of ~S not understood as a location for Setf."
+		   function)))))
+
+(defun penult (x)
+  (if (null (cddr x))
+      (car x)
+      (penult (cdr x))))
+
+(define-setf-method ldb (bytespec place)
+  "The first argument is a byte specifier.  The second is any place form
+  acceptable to SETF.  Replaces the specified byte of the number in this
+  place with bits from the low-order end of the new value."
+  (multiple-value-bind (dummies vals newval setter getter)
+    (get-setf-method place)
+    (let ((btemp (gensym))
+	  (gnuval (gensym)))
+      (values (cons btemp dummies)
+	      (cons bytespec vals)
+	      (list gnuval)
+	      `(let ((,(car newval) (dpb ,gnuval ,btemp ,getter)))
+		 ,setter
+		 ,gnuval)
+	      `(ldb ,btemp ,getter)))))
+
+
+(define-setf-method mask-field (bytespec place)
+  "The first argument is a byte specifier.  The second is any place form
+  acceptable to SETF.  Replaces the specified byte of the number in this place
+  with bits from the corresponding position in the new value."
+  (multiple-value-bind (dummies vals newval setter getter)
+    (get-setf-method place)
+    (let ((btemp (gensym))
+	  (gnuval (gensym)))
+      (values (cons btemp dummies)
+	      (cons bytespec vals)
+	      (list gnuval)
+	      `(let ((,(car newval) (deposit-field ,gnuval ,btemp ,getter)))
+		 ,setter
+		 ,gnuval)
+	      `(mask-field ,btemp ,getter)))))
+
+
+(define-setf-method char-bit (place bit-name)
+  "The first argument is any place form acceptable to SETF.  Replaces the
+  specified bit of the character in this place with the new value."
+  (multiple-value-bind (dummies vals newval setter getter)
+    (get-setf-method place)
+    (let ((btemp (gensym))
+	  (gnuval (gensym)))
+      (values `(,@dummies ,btemp)
+	      `(,@vals ,bit-name)
+	      (list gnuval)
+	      `(let ((,(car newval)
+		      (set-char-bit ,getter ,btemp ,gnuval)))
+		 ,setter
+		 ,gnuval)
+	      `(char-bit ,getter ,btemp)))))
+
+
+(define-setf-method the (type place)
+  (multiple-value-bind (dummies vals newval setter getter)
+    (get-setf-method place)
+      (values dummies
+	      vals
+	      newval
+	      (subst `(the ,type ,(car newval)) (car newval) setter)
+	      `(the ,type ,getter))))
+
+
+
+;;;; MAP AND FRIENDS  Moved to LIST.CLISP  6-sep-85  DKS
+
+
+;;;; CASE, TYPECASE, & Friends.
+
+
+;;; Case-Body  --  Internal
+;;;
+;;;    This function is used to implement all of the case-like macros.
+;;;
+
+(eval-when (compile load eval)
+(defun case-body (name keyform cases multi-p test error-string proceed-string)
+  (let ((kv (gensym)) (AGAIN (gensym)) (BLOCK (gensym))
+	(clauses ())
+	(keys ()))
+    (dolist (case cases)
+      (cond ((atom case)
+	     (error "~S -- Bad clause in ~S." case name))
+	    ((memq (car case) '(t otherwise))
+	     (if error-string
+		 (error "No default clause allowed in ~S: ~S" name case)
+		 (push `(t nil ,@(cdr case)) clauses)))
+	    ((and multi-p (listp (car case)))
+	     (setq keys (append (car case) keys))
+	     (push `((member ,kv ',(car case) :test #',test)
+		     nil ,@(cdr case))
+		   clauses))
+	    (t
+	     (push (car case) keys)
+	     (push `((,test ,kv ',(car case)) nil ,@(cdr case)) clauses))))
+    (if proceed-string
+	`(let ((,kv ,keyform))
+	   (block ,BLOCK
+	     (tagbody
+	      ,AGAIN
+	      (return-from
+	       ,BLOCK
+	       (cond ,@(nreverse clauses)
+		     (t
+		      (cerror proceed-string error-string ,kv ',keys)
+		      (write-string "Expression for new key value: "
+				    *query-io*)
+		      (setq ,kv (setf ,keyform (eval (read *query-io*))))
+		      (go ,AGAIN)))))))
+	`(let ((,kv ,keyform))
+	   (cond ,@(nreverse clauses)
+		 ,@(if error-string
+		       `((t (error ,error-string ,kv ',keys)))))))))
+
+); Eval-When (Compile Load Eval)
+
+(defmacro case (keyform &body cases)
+  "CASE Keyform {({(Key*) | Key} Form*)}*
+  Evaluates the Forms in the first clause with a Key EQL to the value of
+  Keyform.  If a singleton key is T then the clause is a default clause."
+  (case-body 'case keyform cases t 'eql nil nil))
+
+(defmacro ccase (keyform &body cases)
+  "CCASE Keyform {({(Key*) | Key} Form*)}*
+  Evaluates the Forms in the first clause with a Key EQL to the value of
+  Keyform.  If none of the keys matches then a correctable error is
+  signalled."
+  (case-body 'ccase keyform cases t 'eql
+	     "CCASE key ~S is not any of the following:~% ~S"
+	     "prompt for a new key value to use in its place."))
+
+(defmacro ecase (keyform &body cases)
+  "ECASE Keyform {({(Key*) | Key} Form*)}*
+  Evaluates the Forms in the first clause with a Key EQL to the value of
+  Keyform.  If none of the keys matches then an error is signalled."
+  (case-body 'ecase keyform cases t 'eql
+	     "ECASE key ~S is not any of the following:~% ~S"
+	     nil))
+
+(defmacro typecase (keyform &body cases)
+  "TYPECASE Keyform {(Type Form*)}*
+  Evaluates the Forms in the first clause for which TYPEP of Keyform and Type
+  is true."
+  (case-body 'typecase keyform cases nil 'typep nil nil))
+
+(defmacro ctypecase (keyform &body cases)
+  "CTYPECASE Keyform {(Type Form*)}*
+  Evaluates the Forms in the first clause for which TYPEP of Keyform and Type
+  is true.  If no form is satisfied then a correctable error is signalled."
+  (case-body 'ctypecase keyform cases nil 'typep
+	     "CTYPECASE key ~S is not of any of the following types:~% ~S."
+	     "prompt for a new object to use in its place."))
+
+(defmacro etypecase (keyform &body cases)
+  "ETYPECASE Keyform {(Type Form*)}*
+  Evaluates the Forms in the first clause for which TYPEP of Keyform and Type
+  is true.  If no form is satisfied then an error is signalled."
+  (case-body 'etypecase keyform cases nil 'typep
+	     "ETYPECASE key ~S is not of any of the following types:~% ~S."
+	     nil))
+
+
+(defmacro with-open-file (bindspec &rest forms)
+  "Bindspec is of the form (Stream File-Name . Options).  The file whose name
+  is File-Name is opened using the Options and bound to the variable Stream.
+  The Forms are executed, and when they terminate, normally or otherwise,
+  the file is closed."
+  `(let ((,(car bindspec) (open ,@(cdr bindspec))))
+     (unwind-protect
+      (progn ,@forms)
+      (close ,(car bindspec)))))
+
+
+(defmacro with-open-stream ((var stream) . body)
+  "The form STREAM is evaluated and must produce a stream.  The variable VAR
+  is bound with the stream as its values.  The body is executed (as an implicit
+  Progn), and when it terminates, normally or otherwise, the stream is closed."
+  (do ((forms body (cdr forms))
+       (declarations ()))
+      ((not (and (listp (car forms))
+		 (eq (caar forms) 'declare)))
+       (let ((temp (gensym)))
+	 `(let ((,var ,stream)
+		,temp)
+	    ,@declarations
+	    (unwind-protect
+	     (setq ,temp (progn ,@forms))
+	     (close ,var))
+	    ,temp)))))
+
+
+(defmacro with-input-from-string ((var string &key index start end) . body)
+  "Binds the Var to an input stream that returns characters from String and
+  executes the body.  See manual for details."
+  (do ((forms body (cdr forms))
+       (declarations ()))
+      ((not (and (listp (car forms))
+		 (eq (caar forms) 'declare)))
+       (let ((temp (gensym)))
+	 `(let ((,var
+		 ,(if end
+		      `(make-string-input-stream ,string ,(or start 0) ,end)
+		      `(make-string-input-stream ,string ,(or start 0))))
+		,temp)
+	    ,@declarations
+	    (unwind-protect
+	     (setq ,temp (progn ,@forms))
+	     ,@(if index `((setf ,index (file-position ,var))))
+	     (close ,var))
+	    ,temp)))))
+
+
+(defmacro with-output-to-string ((var &optional string) . body)
+  "Binds the Var to a string output stream that puts characters into String
+  and executes the body.  See manual for details."
+  (do ((forms body (cdr forms))
+       (declarations ()))
+      ((not (and (listp (car forms))
+		 (eq (caar forms) 'declare)))
+       (if string
+	   (let ((temp (gensym)))
+	     `(let ((,var (make-fill-pointer-output-stream ,string))
+		    ,temp)
+		,@declarations
+		(unwind-protect
+		 (setq ,temp (progn ,@forms))
+		 (close ,var))
+		,temp))
+	   `(let ((,var (make-string-output-stream)))
+	      ,@declarations
+	      (unwind-protect
+	       (progn ,@forms	;[Victor] Do get-o-s-s BEFORE closing!
+		      (get-output-stream-string ,var))
+	       (close ,var)))))))
+
+
+(defmacro locally (&rest forms)
+  "A form providing a container for locally-scoped variables."
+  `(let () ,@forms))
+
+
+(defmacro loop (&rest body)
+  "Executes the body repeatedly until the form is exited by a Throw or
+  Return.  The body is surrounded by an implicit block with name NIL."
+  (let ((tag (gensym)))
+    `(block nil (tagbody ,tag ,@body (go ,tag)))))
+

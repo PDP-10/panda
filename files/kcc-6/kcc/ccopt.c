@@ -1,0 +1,2258 @@
+/*	CCOPT.C - Peephole Optimizer - miscellaneous optimizations
+**
+**	(c) Copyright Ken Harrenstien 1989
+**		All changes after v.328, 3-Feb-1989
+**	(c) Copyright Ken Harrenstien, SRI International 1985, 1986
+**		All changes after v.218, 8-Aug-1985
+**
+**	Original version (C) 1981  K. Chen
+*/
+/*
+** This collects the peephole optimizations that have not been
+** classified into other files, and which are not still integrated
+** with generation of code into the peephole buffer (in cccode) or
+** emission of it from there into the assembly language output file
+** (in ccout).
+**
+** Other modules containing peephole optimization routines include:
+**    cccreg - propagation of P_MOVE R,S back through peephole buffer
+**    cccse  - finding registers already containing calculated value
+**    ccjskp - rearrangement of jump and skip instructions
+*/
+
+#include "cc.h"
+#include "ccgen.h"
+
+/* Local prototypes */
+#ifdef __STDC__
+#define P_(a) a
+#else
+#define P_(a) ()
+#endif
+
+static void foldinc P_((PCODE *p));
+static PCODE *findmove P_((PCODE *b,PCODE *p));
+static int snglop P_((int op));
+static int makepop P_((PCODE *p));
+static int adjstack P_((int n,PCODE *p));
+
+#undef P_
+
+/* LOCALBYTE(p, np) - Optimize usage of local byte pointer.
+**	P points to either an IOR S, or ADJBP S,.
+**	NP points to a succeeding instr, either a LDB R,S or DPB R,S.
+**
+**	There may be several instructions in between.  We know however
+** that S is not used or referenced in between.
+**
+**	The byte pointer will not be saved, so it is
+** safe to make it a literal local-format BP.  The return value
+** is 1 if the op could be folded into the previous instructions,
+** and 0 otherwise.
+**	This is only called from one place, in CCCODE.
+*/
+
+int
+localbyte(p, np)
+PCODE *p, *np;
+{
+    int op = np->Pop;
+    int r = np->Preg;
+    int s = np->Pr2;
+    int b, i;
+    PCODE *q;
+
+    if (p
+	&& p->Pop == P_IOR
+	&& p->Ptype == PTA_PCONST /* && !prevskips(p) */
+	&& p->Preg == s
+	&& p->Pptr == NULL) {
+	/*
+	** fold:  p->	IOR S,[<pconst>]
+	**		...
+	**        np->	DPB  R,S
+	**
+	** into:  np->	DPB  R,[ppss00,,(S)]
+	**
+	** and perhaps fold further with previous ops...
+	*/
+
+	b = TGSIZ_WORD - p->Pbsize * (p->Poffset+1);	/* P field */
+	b = ((b&077)<<6) | (p->Pbsize & 077);		/* add S field */
+	b <<= 6;					/* shift into place */
+
+	dropinstr(p);			/* drop the IOR from peephole buffer */
+	dropinstr(np);			/* Drop the LDB/DPB too */
+	codebp(op, r, b, s, (SYMBOL *)NULL, 0);	/* make new op */
+	return 1;				/* folded, say so */
+
+    } else if (p->Pop == P_ADJBP		/* Check for ADJBP S,I */
+		&& p->Ptype == PTA_REGIS
+		&& p->Preg != p->Pr2		/* Avoid ADJBP S,S */
+		&& (q = findrset(before(p), p->Pr2)) != NULL
+		&& q->Pop == P_IOR	/* Check for IOR I,[<pconst>] */
+		&& q->Ptype == PTA_PCONST
+		&& q->Pptr == NULL) {
+
+	PCODE *rp;
+	i = p->Pr2;		/* Pick up I holding wordptr index */
+
+	/* Must verify that I is not used anywhere between the LDB and
+	** the IOR, except for the ADJBP itself.
+	*/
+	for (rp = before(np); rp && rp != q; rp = before(rp))
+	    if (rincode(rp, i))			/* Halt if ref seen */
+		if (rp != p) break;		/* unless it's the ADJBP */
+	if (rp != q)
+	    return 0;		/* Ref seen or something, forget it. */
+	
+	/*
+	** fold:
+	** q->	IOR I,[<pconst>]
+	**		...
+	** p->	ADJBP S,I
+	**		...
+	** np->	LDB/DPB R,S
+	**
+	** into: P_ADJBP S,[ppss00,,(I)]
+	**	 P_DPB R,S
+	*/
+
+	b = TGSIZ_WORD - q->Pbsize * (q->Poffset+1);	/* P field */
+	b = ((b&077)<<6) | (q->Pbsize & 077);	/* add S field */
+	b <<= 6;				/* shift into place */
+
+	dropinstr(q);		/* drop IOR */
+	dropinstr(p);		/* and drop ADJBP */
+	dropinstr(np);		/* and the LDB/DPB */
+	codebp(P_ADJBP, s, b, i, (SYMBOL *)NULL, 0);	/* Make new ADJBP */
+	code00(op, r, s);	/* and new LDB/DPB */
+	return 1;
+    }
+    return 0;
+}
+
+/* FOLDBP(p) - Optimize a byte pointer operand.
+**	Called with p pointing to a instr with a PTA_BYTEPOINT operand,
+** and if it uses an index register tries to improve things.
+**	May drop a previous instr if its action on the index reg can
+** be folded into the byte pointer, either by changing the offset or
+** using indirection.
+*/
+void
+foldbp(p)
+PCODE *p;
+{
+    PCODE *q;
+    int soff;
+
+    /* Look for a previous instruction that sets the index register */
+    if (!p->Pindex || !(q = findrset(before(p), p->Pindex)))
+	return;			/* No index reg or can't find an instr */
+
+    switch (q->Pop) {		/* Found one, examine it */
+    case P_ADD:
+	if (q->Ptype == PTV_IMMED) {
+	    p->Poffset += q->Pvalue;	/* this BP has an offset */
+	    dropinstr(q);			/* drop the ADDI */
+	}
+	break;
+
+    case P_SUB:
+	if (q->Ptype == PTV_IMMED) {
+	    p->Poffset -= q->Pvalue;	/* this BP has an offset */
+	    dropinstr(q);			/* drop the SUBI */
+	}
+	break;
+
+    case P_MOVE:	/* MOVE or MOVEI */
+	if (p->Pptr != NULL) break;	/* don't double up symbol */
+	if (chkmref(q, p, &soff))	/* Verify OK to steal addr */
+	    break;
+	if (q->Ptype == PTA_MINDEXED) {
+	    /* See if can use indirection */
+	    if (  soff			/* Cannot use offset */
+	      || p->Poffset != 0	/* of any kind */
+	      || p->Pop == P_ADJBP	/* Cannot adj an indirect BP */
+	      || p->Pop == P_IBP	/* Cannot bump it either */
+	      || p->Pop == P_ILDB
+	      || p->Pop == P_IDPB)
+			break;
+	    p->Ptype |= PTF_IND;	/* Indirect OK, set @ bit! */
+	} else if (q->Ptype != PTV_IINDEXED)
+	    break;
+	p->Pptr = q->Pptr;			/* new addr symbol */
+	p->Pindex = q->Pindex;			/* index */
+	p->Poffset += q->Poffset - soff;	/* and offset */
+	dropinstr(q);			/* drop the move */
+	break;
+    }
+}
+
+/* FOLDBYTE(p) - Optimize LDB/DPB instructions.
+**	Called with p pointing to a LDB or DPB.
+**	First checks to see if a halfword instruction can replace it, then
+**	just invokes cse to combine with a previous IBP if any.
+*/
+void
+foldbyte(p)
+PCODE *p;
+{
+    int op;
+
+    switch (op = p->Pop) {		/* No POF_ flags shd be set */
+    case P_LDB:
+    case P_DPB:
+	switch (p->Ptype & PTF_ADRMODE) {	/* OK if instr skipped */
+	    case PTA_BYTEPOINT:
+		switch (p->Pbsize) {
+		/* fold:
+		**	LDB R,[2200,,x]	=>	HRRZ R,x
+		**	DPB R,[2200,,x] =>	HRRM R,x
+		**	LDB R,[222200,,x] =>	HLRZ R,x
+		**	DPB R,[222200,,x] =>	HLRM R,x
+		*/
+		case 02200:	/* Right half? */
+		    op = (op == P_LDB) ? P_HRRZ : P_HRRM;
+		    break;
+		case 0222200:	/* Left half? */
+		    op = (op == P_LDB) ? P_HLRZ : P_HRLM;
+		    break;
+		}
+	    case PTA_PCONST:
+		if (p->Pbsize == TGSIZ_HALFWD) {
+		    /* Fold LDB/DPB R,[<pconst>] into halfword instruction */
+		    p->Pindex = 0;		/* Never any index */
+		    if (p->Poffset & 01)	/* Right half? */
+			op = (op == P_LDB) ? P_HRRZ : P_HRRM;
+		    else op = (op == P_LDB)? P_HLRZ : P_HRLM;
+		    p->Poffset /= 2;		/* Make word offset */
+		}
+		break;
+	}
+	if (op != p->Pop) {
+	    p->Ptype &= ~PTF_ADRMODE;
+	    p->Ptype |= PTA_MINDEXED;
+	    p->Pop = op;
+	}
+	break;
+    }
+
+    /* Whether instr was an optimized byte op or not, always
+    ** invoke foldmove.  This can combine IBP + LDB => ILDB.
+    */
+    foldmove(p);
+}
+
+/* FOLDADJBP(p) - Optimize P_ADJBP instruction.
+**
+**    takes an P_ADJBP instruction in the peephole buffer,
+**    and tries to fold it out (e.g. by turning it into an P_ADDI).
+*/
+
+void
+foldadjbp(p)
+PCODE *p;
+{
+    PCODE *q, *n;
+    int r, s;
+    int a, boff, woff, bsiz;
+
+    /* Make sure we're looking at an unskipped P_ADJBP */
+    if (p->Pop != P_ADJBP || prevskips(p)) {
+	foldmove(p);			/* just run cse */
+	return;
+    }
+
+    /*
+    ** Find the instruction that sets R.
+    */
+    if (rinaddr(p, p->Preg))	/* Make sure R not otherwise used in ADJBP! */
+	return;
+
+    if ((n = findrset(before(p), p->Preg)) == NULL) {
+	foldmove(p);		/* Nothing to fold into, try cse */
+	return;
+    }
+
+    /*
+    ** Found it, now see what kind of op we have.
+    **
+    ** If it is a SETZ, we simply turn the ADJBP into a MOVE.
+    ** If it is a MOVNI or SETO or SUBI, we turn it into a MOVEI or ADDI.
+    ** Otherwise, if it is not a MOVEI or ADDI we give up.
+    */
+    switch (n->Pop) {			/* make sure we can hack it */
+    case P_SETZ:
+	n->Pop = P_NOP;
+    case P_SETZ+POF_BOTH:
+	n->Preg = R_SCRREG;		/* take out reg if not whole op */
+	p->Pop = P_MOVE;		/* change null ADJBP into MOVE */
+	foldmove(p);			/* try further optimizations */
+	return;				/* all done */
+
+    case P_MOVN: case P_SUB: case P_SETO: case P_MOVE: case P_ADD:
+	if (unsetz (n) && n->Ptype == PTV_IMMED) break;
+    default:
+	foldmove(p);
+	return;
+    }
+
+    /* Now if instr is an ADJBP R,S (register-register) then we may be
+    ** able to do further optimizations depending on how S is set.
+    */
+    q = NULL;			/* Initialize, no byte-pointer construction */
+    if (p->Ptype == PTA_REGIS			/* If ADJBP R,S then */
+	&& (q = findrset(before(p), p->Pr2))	/* find instr that sets S */
+	&& q->Pop == P_MOVE) {			/* Check for simple setup */
+
+	/* Change MOVE S,x  /.../  ADJBP R,S   into   ADJBP R,x
+	** Note that x may be a pointer constant, which allows following
+	** optimization to win big.
+	*/
+	r = p->Preg;		/* Save R */
+	*p = *q;		/* Copy the MOVE instruction onto ADJBP */
+	p->Pop = P_ADJBP;	/* Make it an ADJBP again */
+	p->Preg = r;		/* with proper register */
+	q->Pop = P_NOP;		/* and flush old MOVE instruction */
+	q = NULL;		/* Say no byte-pointer construct instr */
+    }
+
+    /* Check for ADJBP R,[pconst].
+    ** We can simply fiddle with the pointer-constant parameters to
+    ** accomplish the effect of the ADDI/MOVEI that n points to.
+    ** If it was a MOVEI (thus completely determining the new pointer)
+    ** then the ADJBP can be flushed and replaced with a MOVE!
+    */
+    if (p->Ptype == PTA_PCONST) {
+	p->Poffset += n->Pvalue;	/* Add together the byte offsets */
+	if (n->Pop == P_MOVE)		/* Was R set by a MOVEI? */
+	    p->Pop = P_MOVE;		/* Yes, turn ADJBP R,x into MOVE R,x */
+	n->Pop = P_NOP;			/* Now flush the ADDI or MOVEI */
+	return;				/* Win, win! */
+    }
+
+    /* Now see if there is a byte-pointer construction instruction
+    ** before an ADJBP R,S in which case we may also be able to flush
+    ** the ADJBP (and a MOVEI if that is what sets R) by changing the
+    ** way the pointer is constructed.
+    */
+    if (q && q->Pop == P_IOR		/* Check for IOR S,[pconst] */
+	&& q->Ptype == PTA_PCONST
+	&& q->Pptr == NULL) {		/* Better not have any symbol! */
+
+	/* If found a byte-pointer construction:
+	**
+	** fold: n-> MOVEI/ADDI  R,n
+	**		...
+	**	 q-> IOR S,[pconst + byteoffset]
+	**		...
+	**	 p-> ADJBP  R,S
+	**
+	** into:  ADDI   S,i 		(can flush if i == 0)
+	**        IOR    S,[pconst + new byteoffset]
+	**        MOVE/ADJBP   R,S	(MOVE if n was MOVEI; else ADJBP)
+	*/
+	bsiz = q->Pbsize;			/* Save bytesize */
+	boff = adjboffset(n->Pvalue+q->Poffset,	/* Get sum of byte offsets */
+			&woff,			/* and set woff/boff */
+			(TGSIZ_WORD/bsiz));
+
+	a = n->Pop;		/* Remember the op that set R */
+	r = p->Preg;		/* Remember regs of P_ADJBP for later */
+	s = p->Pr2;
+
+	/* Flush old instructions */
+	n->Pop = P_NOP;		/* Flush MOVEI/ADDI */
+	q->Pop = P_NOP;		/* Flush IOR */
+	p->Pop = P_NOP;		/* Flush ADJBP */
+	fixprev();
+
+	/* Make new instructions */
+	if (woff) codr1(P_ADD, s, woff);		/* New ADDI */
+	codr10(P_IOR, s, (SYMBOL *)NULL, bsiz, boff);	/* New IOR */
+ 	code00((a==P_MOVE ? P_MOVE : P_ADJBP), r, s);	/* New MOVE or ADJBP */
+	return;
+    }
+
+    /* That lost.  Last possibility to check for is simply adding 1 to the
+    ** pointer, which can be done with a simple IBP.
+    */
+    if (n->Pop == P_MOVE && n->Pvalue == 1) {
+	n->Pop = P_NOP;			/* change P_MOVEI R,1 + P_ADJBP R,x */
+	p->Pop = P_MOVE;		/* into P_MOVE R,x + P_IBP R */
+	r = p->Preg;
+	foldmove(p);			/* optimize the P_MOVE */
+
+	/* make P_IBP without optimization */
+	p = newcode(PTA_REGIS, P_IBP, 0);
+	p->Pr2 = r;
+	return;
+    }
+
+    foldplus(n);	/* all optimization failed, fix up the # */
+    foldmove(p);	/* and try to improve the ADJBP memory reference */
+}
+
+/* OPTLSH(p)	- Attempt to optimize LSH usage.
+**	We often get combinations of LSH and AND when dealing with
+**	PDP10 compability code.  Someday this could be spiffed up to
+**	do LDBs or DPBs.
+*/
+void
+optlsh(p)
+PCODE *p;
+{
+    PCODE *q;
+    unsigned long mask;
+
+    if (p->Pop == P_LSH		/* Must be a LSH */
+      /* && !prevskips(p) */	/* that isn't skipped */
+      && p->Ptype == PTA_RCONST	/* and has constant operand */
+      && p->Pvalue < 0		/* and is doing right shift */
+      && (q = findrset(before(p), p->Preg))) {	/* Find instr that sets R */
+
+	if (q->Pop == P_AND		/* If it's AND (we know not skipped) */
+	  && q->Ptype == PTV_IMMED	/* with immediate const operand */
+	  && (mask = ((unsigned)q->Pvalue >> (-p->Pvalue))) <= 0777777) {
+
+	    /* Fold:			into:
+	    **		AND R,[const]		LSH R,-n
+	    **		...			...
+	    **		LSH R,-n		AND R,[const>>n]
+	    ** If const>>n will be small enough to fit in the RH, so we can
+	    ** generate ANDI instead of AND.
+	    */
+	    swappseudo(p,q);		/* Swap AND with LSH */
+	    p->Pvalue = mask;		/* Make AND's mask be shifted one */
+	}
+    }
+}
+
+/* FOLDINC(p)	- Push P_AOS up into the loop it comes from.
+**
+** Often a for() loop will have a AOS/SOS (and possibly a test) at the bottom.
+** The variable is likely to be used in the body of the loop, so for simple
+** loops we can merge the AOS in with a previous P_MOVE of the same variable
+** (sort of like a reverse common subexpression elimination).
+**
+**	Fold:	MOVE R,<E>	to:	AOS/SOS R,<E>
+**		...			...
+**		AOS/SOS S,<E>		--
+**
+** Intervening instructions must be checked to make sure that
+** they do not modify the variable at <E> or the register R,
+** and if R is used as an index reg, the offsets need to be fixed up.
+** Stack level changes must be tracked so we can be sure whether an
+** address reference is to <E> or not.
+*/
+
+static void
+foldinc(p)
+PCODE *p;
+{
+    int i;
+    int usedreg;
+    int stkoff;
+    PCODE *q, *b;
+    
+    if (prevskips(p)) return;
+
+    /* <E> must be something plausible.  Initialize the used-reg mask;
+    ** bits which are 0 are safe for use as R.
+    */
+    switch (p->Ptype & PTF_ADRMODE) {
+#if 0	/* This isn't supported (probably never called with this anyway) */
+    case PTA_REGIS:	usedreg = rbits[p->Pr2];	break;
+#endif
+    case PTA_MINDEXED:	usedreg = rbits[p->Pindex];	break;
+    default: return;
+    }
+
+    switch (p->Pop) {
+    case P_AOS:	i = -1;	break;
+    case P_SOS:	i = 1;	break;
+    default:	return;
+    }
+
+    stkoff = 0;
+    q = p;
+    while ((q = before(q)) != NULL) switch (q->Pop) {
+	case P_PUSH:
+	    if (q->Preg != R_SP) return;
+	    ++stkoff;
+	    break;
+	case P_ADJSP:		/* Stack adjustment */
+	    if (q->Preg == R_SP)
+		stkoff += q->Pvalue;
+	    break;
+
+	case P_MOVE:
+	    if (sameaddr(p, q, stkoff)) {	/* found what we want? */
+		if (prevskips(q) || (usedreg&(rbits[q->Preg])))
+		    return;
+		q->Pop = p->Pop;
+		b = q;
+		do {
+		    b = after(b);
+		    if ((b->Ptype&PTF_ADRMODE) == PTA_MINDEXED
+		      && b->Pindex == q->Preg)
+			b->Poffset += i;
+		    else if (b->Ptype == PTV_IMMED
+			  && b->Preg == q->Preg
+			  && b->Pop == P_IMUL)
+				i *= b->Pvalue;
+		} while (b != p);
+		i = p->Preg;
+		dropinstr(p);		/* drop extra P_AOS and fix up */
+		code00(P_MOVE, i, q->Preg);
+		return;
+	    }
+	    if (q->Preg == p->Pindex) return;
+	    usedreg |= rbits[q->Preg];
+	    continue;
+
+	/* Ops that change a register (or two) */
+	case P_DFAD:	case P_DFSB:	case P_DFMP:	case P_DFDV:
+	case P_DMOVE:	case P_DMOVN:	case P_IDIV:	case P_UIDIV:
+	case P_DFIX:	case P_UDFIX:	case P_SUBBP:	case P_MUL:
+	case P_FADR:	case P_FSBR:	case P_FMPR:	case P_FDVR:
+	case P_ADD:	case P_IMUL:	case P_SUB:	case P_AND:
+	case P_IOR:	case P_XOR:	case P_ADJBP:	case P_LSH:
+	case P_SETCM:	case P_MOVN:	case P_SETO:	case P_SETZ:
+	case P_HRRZ:	case P_HLRZ:	case P_FIX:	case P_FLTR:
+	case P_LDB:
+	    if ((q->Ptype & PTF_ADRMODE) != PTA_MINDEXED) {
+		usedreg |= rbincode(q);
+		continue;
+	    }
+	    if (q->Preg == p->Pindex || sameaddr(p, q, stkoff))
+		return;
+	    usedreg |= rbinreg(q);
+	    continue;
+
+	/* Ops that change memory */
+	case P_POP:
+	    if (q->Preg != R_SP) return;
+	    --stkoff;
+	    /* Fall thru since op changes mem */
+	case P_MOVEM:
+	case P_DPB:	case P_ILDB:	case P_IDPB:	case P_IBP:
+	case P_FADR+POF_BOTH:	case P_FSBR+POF_BOTH:
+	case P_FMPR+POF_BOTH:	case P_FDVR+POF_BOTH:
+ 	case P_ADD+POF_BOTH: 	case P_IMUL+POF_BOTH:
+	case P_AND+POF_BOTH:	case P_XOR+POF_BOTH: 	case P_IOR+POF_BOTH:
+	case P_AOS:	case P_SOS:
+	case P_HRRM:	case P_HRLM:
+  	case P_MOVN+POF_BOTH:	case P_MOVE+POF_BOTH:
+	case P_SETZ+POF_BOTH:	case P_SETO+POF_BOTH:	case P_SETCM+POF_BOTH:
+	    if ((q->Ptype & PTF_ADRMODE) != PTA_MINDEXED) {
+		usedreg |= rbincode(q);
+		continue;
+	    }
+	    if (q->Preg == p->Pindex
+	      || sameaddr(p, q, stkoff) || alias (p, q, stkoff))
+		return;
+	    usedreg |= rbinreg(q);
+	    continue;
+
+	/* Some op type we don't know?
+	** Jumps, in particular, come here to simply return and give up the
+	** optimization attempt.
+	*/
+	default:
+	    return;
+    }
+}
+
+/* FOLDPLUS(p) - Improve instruction used to do addition.
+**
+**    takes an addition operation (P_ADD, P_ADDB, etc) in the peephole buffer
+**    and folds it in with previous instructions, as well as just improving
+**    it in itself.
+*/
+
+void
+foldplus(p)
+PCODE *p;
+{
+    PCODE *q, *b;
+    int r;
+
+    if (p->Pop == P_ADD && p->Ptype == PTA_REGIS /* !prevskips */ &&
+	(q = before(p)) != NULL && q->Preg == p->Pr2 && !prevskips (q))
+    switch (q->Pop) {
+    case P_SUB:
+	if (q->Ptype == PTV_IMMED) {
+	    q->Pop = P_ADD;		/* make P_SUBI R,i into P_ADDI R,-i */
+	    q->Pvalue = - q->Pvalue;	/* so it can be folded later */
+	}				/* in any case treat like P_ADD here */
+    case P_ADD:
+	/*
+	** fold:  P_ADD S,x
+	**        P_ADD R,S
+	**
+	** into:  P_ADD R,S
+	**        P_ADD R,x
+	*/
+
+	if ((q->Ptype&PTF_ADRMODE) == PTA_MINDEXED
+	  && q->Preg == q->Pindex) return;
+	q->Preg = p->Preg;		/* fix up operation */
+	swappseudo(p,q);		/* swap the two */
+	foldplus(q);			/* optimize earlier code some more */
+	q = before(p);			/* pick it up again */
+	if (q != NULL && q->Pop == P_MOVE && q->Ptype == PTA_REGIS &&
+	    q->Preg == p->Preg) {
+
+	    /*
+	    ** fold:  P_MOVE R,S
+	    **        P_ADD  R,x
+	    **
+	    ** into:  P_ADD  S,x
+	    **        P_MOVE R,S
+	    */
+
+	    p->Preg = q->Pr2;		/* fix up register again */
+	    swappseudo(p,q);		/* switch them around again */
+	    p = q;			/* forget the move, hack the add */
+	}
+	break;				/* end case P_ADD, P_SUB */
+
+    case P_AOS:
+    case P_SOS:
+    case P_MOVE:
+    case P_MOVN:
+	if (((q->Ptype & PTF_ADRMODE) == PTA_MINDEXED
+	  && q->Pindex == p->Preg) ||
+	    (q->Ptype & PTF_IND) || (b = before(q)) == NULL ||
+	    ((r = rchange (b->Pop)) != PRC_RCHG && r != PRC_RSET) ||
+	    b->Preg != p->Preg || !(b->Ptype & PTF_IMM) || prevskips (b) ||
+	    ((b->Ptype & PTF_ADRMODE) == PTA_MINDEXED && q->Preg == b->Pindex)) break;
+
+	/*
+	** fold:  P_ADDI R,x
+	**        P_AOS  S,y
+	**        P_ADD  R,S
+	**
+	** into:  P_AOS  S,y
+	**        P_ADDI R,x
+	**        P_ADD  R,S
+	**
+	** so the immediate add can propagate to the list start...
+	*/
+
+	swappseudo (b, q);		/* thats all folks! */
+    }					/* end switch(q->Pop) */
+
+    r = p->Preg;			/* remember register */
+    q = p;				/* start up just before op */
+    if (!prevskips (p))
+	while ((q = before(q)) != NULL
+	    && !prevskips (q)
+	    && q->Preg == r
+	    && p->Pop == P_ADD) {
+	switch (q->Pop) {
+	case P_MOVN:  case P_SUB:
+	case P_SETO:  case P_SETZ:
+	    if (!unsetz (q)) break;	/* turn into P_MOVE or P_ADD */
+
+	case P_MOVE:
+	case P_ADD:
+	    switch (p->Ptype) {
+	    case PTV_IMMED:
+		switch (q->Ptype) {
+		case PTV_IINDEXED:
+		case PTV_IMMED:
+
+		    /*
+		    ** fold:  P_MOVEI R,addr(i)
+		    **        P_ADDI  R,c
+		    **
+		    ** into:  P_MOVEI R,addr+c(i)
+		    */
+
+		    q->Poffset += p->Pvalue;
+		    dropinstr(p);	/* poof! */
+		    p = q;
+		    continue;
+
+		case PTA_REGIS:
+		    if (q->Pop == P_MOVE) {
+
+			/*
+			** fold:  P_MOVE  R,S
+			**        P_ADDI  R,x
+			**
+			** into:  P_ADDI  S,x
+			**        P_MOVE  R,S
+			*/
+
+		    if ((q->Ptype&PTF_ADRMODE) == PTA_MINDEXED
+		      && q->Preg == q->Pindex)
+			return;
+
+			swappseudo(p, q); /* swap the ops */
+			r = q->Preg = p->Pr2; /* fix reg in P_ADDI */
+			p = q;	/* move back over it */
+		    }
+		default: if (q->Pop == P_ADD) continue;
+		}			/* end switch(q->Ptype) */
+		break;			/* propagate break to escape loop */
+
+	    case PTV_IINDEXED:
+		switch (q->Ptype) {
+		case PTV_IINDEXED:
+		    if ((q->Pptr != NULL && p->Pptr != NULL) ||
+			(q->Pindex != 0 && p->Pindex != 0)) continue;
+		case PTV_IMMED:
+
+		    /*
+		    ** fold:  P_MOVEI R,c
+		    **        P_ADDI  R,addr(i)
+		    **
+		    ** into:  P_MOVEI R,addr+c(i)
+		    */
+
+		    p->Pop = q->Pop;
+		    q->Pop = P_NOP;
+		    p->Poffset += q->Poffset;
+		    if (q->Ptype == PTV_IINDEXED) {
+			if (p->Pptr == NULL) p->Pptr = q->Pptr;
+			if (p->Pindex == 0) p->Pindex = q->Pindex;
+		    }
+		    continue;
+
+		case PTA_REGIS:
+		    if (q->Pop == P_MOVE) {
+
+			/*
+			** fold:  P_MOVE  R,S
+			**        P_ADDI  R,x
+			**
+			** into:  P_ADDI  S,x
+			**        P_MOVE  R,S
+			*/
+
+			swappseudo(p, q); /* swap the ops */
+			r = q->Preg = p->Pr2; /* fix reg in P_ADDI */
+			p = q;	/* move back over it */
+		    }
+		    continue;
+
+		default:
+		    if ((q->Ptype&PTF_ADRMODE) == PTA_MINDEXED
+		      && q->Preg == q->Pindex)
+			return;
+		    if (q->Pop != P_MOVE || p->Pindex == 0) continue;
+		    p->Pop = q->Pop;	/* turn P_MOVE+XP_ADDI into */
+		    q->Pop = P_ADD;	/* P_XMOVEI+P_ADD to save one */
+		    swappseudo(p, q);	/* instruction... */
+		    p = q;		/* look at correct one next loop */
+		}
+		continue;		/* fall through goes back */
+
+	    case PTA_REGIS:
+	        if (q->Ptype == PTV_IINDEXED && q->Pindex == 0) {
+
+		    /*
+		    ** fold:  P_XMOVEI R,x
+		    **        P_ADD    R,S
+		    **
+		    ** into:  P_XMOVEI R,x(S)
+		    */
+
+		    q->Pindex = p->Pr2;	/* new index */
+		    foldidx(q);		/* Attempt to optimize index reg */
+		    dropinstr(p);	/* drop now useless move */
+		    return;		/* not likely any more to do */
+		}
+		if ((q->Ptype & PTF_ADRMODE) == PTA_MINDEXED
+		  && q->Pindex == r) {
+		    if (!(q->Ptype & PTF_IMM) || q->Pop != P_MOVE) break;
+
+		    /*
+		    ** fold:  P_XMOVEI R,x(R)
+		    **        P_ADD    R,S
+		    **
+		    ** into:  P_ADD    R,S
+		    ** 	      P_XMOVEI R,x(R)
+		    **
+		    ** (avoid silly checks and opcode switches below
+		    */
+
+		} else if (q->Ptype == PTA_REGIS && q->Pop == P_MOVE) {
+
+		    /*
+		    ** fold:  P_MOVE  R,S
+		    ** 	      P_ADD   R,T
+		    **
+		    ** into:  P_ADD   S,T
+		    ** 	      P_MOVE  R,S
+		    */
+
+		    if (q->Pr2 == R_SP) return; /* don't break stack */
+		    p->Preg = q->Pr2;	/* set register */
+
+		} else {
+
+		    /*
+		    ** fold:  P_MOVE R,x
+		    **        P_ADD  R,S
+		    **
+		    ** into:  P_MOVE R,S
+		    **        P_ADD  R,x
+		    */
+
+		    if ((q->Ptype&PTF_ADRMODE) == PTA_MINDEXED
+		      && q->Preg == q->Pindex)
+			return;
+		    p->Pop = q->Pop;	/* set opcode */
+		    q->Pop = P_ADD;	/* to swap them */
+		}
+		swappseudo(p,q);	/* opcodes hacked, swap ops */
+		foldplus (q);		/* try again lower down */
+		if (p->Ptype == PTA_REGIS) return; /* avoid infinite loop */
+		q = p;			/* start after the swap */
+		continue;		/* try loop again */
+
+	    default:
+		switch (q->Ptype) {
+		case PTV_IINDEXED:
+		    if (q->Pindex != 0) continue; /* bad swap */
+		case PTV_IMMED:		/* swap order of immed and */
+		    p->Pop = q->Pop;	/* memory P_MOVE/P_ADD so that */
+		    q->Pop = P_ADD;	/* P_ADDI can be optimized */
+		    swappseudo(p, q);	/* even further. */
+		    break;		/* not likely to find any more */
+
+		case PTA_REGIS:
+		    if (q->Pop == P_MOVE) {
+
+			/*
+			** fold:  P_MOVE  R,S
+			**        P_ADDI  R,x
+			**
+			** into:  P_ADDI  S,x
+			**        P_MOVE  R,S
+			*/
+
+			swappseudo(p, q); /* swap the ops */
+			r = q->Preg = p->Pr2; /* fix reg in P_ADDI */
+			p = q;	/* move back over it */
+		    }			/* end PTA_REGIS: if (q->Pop==P_MOVE) */
+
+		default: if (q->Pop == P_ADD) continue;
+		}			/* end default: switch(q->Ptype) */
+	    }				/* end switch(p->Ptype) */
+	}				/* end switch(p->Pop) */
+	break;				/* default: dont keep looping */
+    }					/* end while(q->Preg == p->Preg) */
+
+    switch (p->Ptype &~ (PTF_IND + PTF_SKIPPED)) {
+    case PTV_IMMED:
+
+	/*
+	** fold:  P_ADDI  R,[-n]
+	** into:  P_SUBI  R,n
+	*/
+
+	if (p->Pvalue < 0) {
+	    switch (p->Pop) {
+	    case P_ADD:
+		p->Pop = P_SUB;
+		break;
+
+	    case P_MOVE:
+		p->Pop = P_MOVN;
+		break;
+
+	    case P_SUB:
+		p->Pop = P_ADD;
+		break;
+
+	    case P_MOVN:
+		p->Pop = P_MOVE;
+		break;
+
+	    default: return;
+	    }
+	    p->Pvalue = - p->Pvalue;
+	} else if (p->Pvalue == 0) {
+	    switch (p->Pop) {
+	    case P_ADD:
+	    case P_SUB:
+		dropinstr(p);		/* fold: P_ADDI R,0 */
+		return;			/* into: nothing */
+
+	    case P_MOVN:
+	    case P_MOVE:
+		p->Pop = P_SETZ;		/* fold: P_MOVEI R,0 */
+		p->Ptype = PTA_ONEREG;	/* into: P_SETZ  R, */
+		return;
+	    }
+	}
+	if (p->Pvalue == 1 && p->Pop == P_MOVN) {
+	    p->Pop = P_SETO;		/* fold: P_MOVNI R,1 */
+	    p->Ptype = PTA_ONEREG;		/* into: P_SETO  R, */
+	    return;
+	}
+	break;
+
+    case PTV_IINDEXED:
+	if (p->Pop == P_ADD && p->Pindex == 0) {
+
+	    /*
+	    ** fold:  P_ADDI   R,addr
+	    ** into:  P_MOVEI  R,addr(R)
+	    */
+
+	    p->Pop = P_MOVE;		/* make P_XMOVEI */
+	    p->Pindex = p->Preg;	/* with index same as reg */
+	    if ((q = before(p)) != NULL && q->Ptype == PTA_REGIS
+	      && q->Pop == P_MOVE
+		/* !prevskips (p or q) */ && q->Preg == p->Pindex) {
+
+		/*
+		** fold:  P_MOVE  R,S
+		**        P_MOVEI R,addr(R)
+		**
+		** into:  P_MOVEI R,addr(S)
+		*/
+
+		p->Pindex = q->Pr2;	/* flatten index calculation */
+		q->Pop = P_NOP;		/* flush useless P_MOVE */
+	    }
+	    foldidx(p);			/* try to optimize index reg */
+	}
+	break;
+
+    case PTA_MINDEXED:
+	if (p->Pop != P_ADD+POF_BOTH || (q = before (p)) == NULL ||
+	    prevskips (p) || prevskips (q) || q->Preg != p->Preg) break;
+	if (unsetz(q)) {
+	    if (q->Pop != P_MOVE || q->Ptype != PTV_IMMED) {
+		foldplus(q);		/* Restore more efficient op */
+		break;			/* (ie undo what unsetz did) */
+	    }
+	    /* Previous instr should now be a P_MOVEI */
+	    switch (q->Pvalue) {
+		case -1:
+		    q->Pop = P_NOP;		/* fold:  P_MOVNI R,1 */
+		    p->Pop = P_SOS;		/*        P_ADDB  R,x */
+		    foldinc(p);			/* into:  P_SOS   R,x */
+		    break;
+		case 0:
+		    q->Pop = P_NOP;		/* fold:  P_MOVEI R,0 */
+		    p->Pop = P_MOVE;		/*        P_ADDB  R,x */
+		    foldmove(p);		/* into:  P_MOVE  R,x */
+		    break;
+		case 1:
+		    q->Pop = P_NOP;		/* fold:  P_MOVEI R,1 */
+		    p->Pop = P_AOS;		/*        P_ADDB  R,x */
+		    foldinc(p);			/* into:  P_AOS   R,x */
+		    break;
+		default:
+		    foldplus (q);	/* put back more efficient op */
+	    }
+	}
+    }
+}
+
+/* FINDRSET(p, r) - Find the instruction that sets R, searching backwards
+**	starting at P.  It is OK to attempt starting at NULL; this
+**	facilitates constructs like findrset(before(p),r).
+**
+**	NOTE: the instruction found may not actually SET the register
+** or alter its value; it only USES it in its AC field.  Thus the caller
+** must apply further checks on the exact opcode.
+**
+**	The instr is assumed to be the most recent one with the register
+** field set to R, provided R is not referenced in any way by intervening
+** instructions.  This includes being used in an address calculation,
+** or being the 2nd reg of a double-word op, or finding a PUSHJ.
+**	Note that the instruction found may be either a double-word or
+** single-word op.  Also, we don't bother checking the skipped flag while
+** moving back, as whether an instr is skipped is irrelevant to whether it
+** might use or set the register in question.  The instr found (if any) is
+** checked for this, however.
+*/
+PCODE *
+findrset(p, reg)
+PCODE *p;		/* Start looking here */
+int reg;		/* Register to look for */
+{
+    /* Loop until break out or no instrs left */
+    for (; p; p = before(p)) {
+	switch (rinreg(p, reg)) {
+	    default:		/* Unknown changes, give up */
+		return NULL;
+	    case 0:		/* Not used in this instr, continue loop */
+		break;
+
+	    case 1:		/* Win, found single-word op that uses it */
+	    case 2:		/* Win, found double-word op that uses it */
+	    /* Found an op that uses this register!  Done, unless this instr
+	    ** might be skipped over (in which case we can't be sure what it
+	    ** will contain and must give up).
+	    */
+		if (prevskips(p))	/* Is prev instr a skip? */
+		    return NULL;	/* Sigh */
+		return p;		/* Won, found instr that sets reg! */
+	}
+	if (rinaddr(p, reg))	/* If reg used in address somehow, */
+	    return NULL;	/* stop looking immediately */
+    }
+    return NULL;			/* No more instrs to look at */
+}
+
+/* FINDCONST(p) - Turn register to register op into register immediate.
+**	Looks back through peephole buffer for op setting second
+** register to a constant value.  If found, replaces the register reference
+** with an immediate operand.
+** Only called by rrpop2() in CCCODE, after instruction added to buffer.
+** Does not flush the instruction, although it may modify it and may
+** flush a preceding instruction.
+*/
+int
+findconst(p)
+PCODE *p;
+{
+    PCODE *q;
+    int op, rused;
+
+    if (p->Ptype != PTA_REGIS) return 0;	/* Verify is reg-reg op */
+    rused = 0;				/* Clear flag */
+    for (q = before (p); q != NULL; q = before (q)) { /* look back in buf */
+	switch (q->Pop) {			/* see what op is */
+	case P_MOVE:			/* Move, */
+	case P_CAI+POF_ISSKIP+POS_SKPE: /* or compare acting like move */
+	    if ((q->Ptype & PTF_ADRMODE) != PTA_RCONST)
+		break;			/* must be immediate */
+
+	case P_SETZ:			/* Zero makers */
+	case P_JUMP+POS_SKPN:
+	case P_AOJ+POS_SKPN: case P_SOJ+POS_SKPN:
+	case P_SKIP+POF_ISSKIP+POS_SKPE:
+	    if (q->Preg != p->Pr2) break;	/* but not the reg we want */
+	    if ((isskip (q->Pop) || prevskips (q)) && !dropsout (after (q)))
+		break;				/* or skips, or skipped */
+
+	    /* Won!  Found constant value for this reg */
+	    p->Ptype = PTV_IMMED;		/* set immediate instruction */
+	    if (op = immedop (p->Pop)) {	/* except for P_CAM */
+		p->Pop = op;		/* which becomes P_CAI */
+		p->Ptype = PTA_RCONST;	/* with constant type */
+	    }
+	    p->Pvalue = (q->Ptype & PTF_ADRMODE) == PTA_RCONST
+			? q->Pvalue : 0;	/* Set to value or zero */
+
+	    if (q->Pop == P_MOVE && rused == 0)	/* If simple set, and safe, */
+		q->Pop = P_NOP;		/* Simply flush the setting instr. */
+
+	    return 1;			/* made const, win! */
+	}
+
+	/* Not found, make sure reg not munged */
+	if (rrchg(q, p->Pr2)) return 0;	/* Fail if reg modified */
+
+	/* See if our reg is used for anything within an instruction,
+	** so we know whether it's OK to flush the
+	** instruction that sets it (if we find one)
+	*/
+	switch (p->Ptype & PTF_ADRMODE) {
+	    case PTA_MINDEXED:		/* These two use index reg */
+	    case PTA_BYTEPOINT:
+		if ((p->Pindex == q->Pindex)
+		    || (p->Pindex == q->Preg)) rused++;
+		break;
+	    case PTA_REGIS:
+		if (p->Pr2 == q->Pr2) rused++;	/* Drop thru */
+	    default:
+		if (p->Pr2 == q->Preg) rused++;
+	}
+    }
+    return 0;
+}
+
+/* FOLDBOTH() - Make ops of type POF_BOTH.
+**
+**    looks at the last instruction in the peephole buffer,
+**    and if it is a MOVEM tries to fold it into an opB.
+**
+** KLH: This is yet another BIG MESS that badly needs to be cleaned up
+**	someday!!
+*/
+
+void
+foldboth()
+{
+    PCODE *p, *b, *q;
+    int badidx;
+    int ramask_p, rrmask_p;
+
+    foldmove(previous);			/* maybe it's a P_MOVE or P_LDB */
+    if (prevskips (previous)) return;	/* skipped over, can't hack */
+    if (previous->Pop == P_ADD+POF_BOTH) /* try += into ++ */
+	foldplus (previous);
+
+    /*
+    ** fold:  P_ADJSP 17,n
+    ** 	      ...
+    ** 	      P_MOVEM R,1-n(17)
+    **
+    ** into:  ...
+    ** 	      P_PUSH  17,R
+    ** 	      P_ADJSP 17,n-1
+    */
+
+    if ( previous->Pop == P_MOVEM
+      && previous->Ptype == PTA_MINDEXED
+      && previous->Pindex == R_SP)		/* if P_MOVEM onto stack */
+    for (p = before (previous); p != NULL; p = before (p)) /* looking back */
+    switch (p->Pop & POF_OPCODE) {		/* through opcodes... */
+
+    case P_JRST: case P_JUMP:
+    case P_AOJ: case P_SOJ:			/* control flow mungage */
+    case P_PUSH: case P_POP: case P_POPJ:	/* or stack mungage */
+	p = NULL;				/* give up */
+	break;
+
+    case P_ADJSP:			/* the one we want */
+	if (prevskips (p) || previous->Poffset != 1 - p->Pvalue) {
+	    p = NULL;			/* wrong number or skipped */
+	    break;			/* lose lose */
+	}
+
+	while ((q = after(p)) != previous) { /* until right before it */
+	    if (q->Pindex == R_SP) switch (q->Ptype & PTF_ADRMODE) {
+	    case PTA_MINDEXED: case PTA_BYTEPOINT: /* indexed types */
+		q->Poffset += p->Pvalue; /* adjust for hacked stack */
+	    }
+	    swappseudo (p, q);		/* bubble P_ADJSP forward */
+	    p = q;			/* point to where it is now */
+	}
+	swappseudo (p, previous);	/* now swap P_MOVEM and P_ADJSP */
+	p->Pop = P_PUSH;		/* make P_PUSH in place of P_MOVEM */
+	p->Ptype = PTA_REGIS;		/* this is now a register op */
+	p->Pr2 = p->Preg;		/* with second reg old first */
+	p->Preg = R_SP;			/* and first reg stack */
+
+	if ((-- previous->Pvalue) == 0)	/* diminish P_ADJSP by one; if gone, */
+	    dropinstr(previous);	/* flush it and fix up "previous" */
+
+	if ((q = before (p)) != NULL && q->Preg == p->Pr2 && !prevskips (q))
+	switch (q->Pop) {
+	case P_SETZ: case P_SETO: case P_MOVN:
+	    if (!unsetz (q)) break;	/* turn P_SETZ into P_MOVE */
+	case P_MOVE:
+
+	    /*
+	    ** fold:  P_MOVE  R,x
+	    ** 	      P_PUSH  17,R
+	    **
+	    ** into:  P_PUSH  17,x
+	    **	      P_MOVE  R,0(17)
+	    **
+	    ** in hope that genrelease() will flush the P_MOVE.
+	    */
+
+	    if (q->Ptype == PTV_IINDEXED) break; /* no XP_PUSHI */
+	    p->Pop = P_MOVE;		/* get different P_MOVE instr */
+	    p->Ptype = PTA_MINDEXED;	/* from memory, no indirection */
+	    p->Preg = q->Preg;		/* into destination register */
+	    p->Pindex = R_SP;		/* from stack */
+	    p->Pptr = 0;		/* not global variable space */
+	    p->Poffset = 0;		/* top of stack */
+	    q->Pop = P_PUSH;		/* now make old P_MOVE into P_PUSH */
+	    q->Preg = R_SP;		/* onto stack */
+	}
+	return;				/* no more to do here */
+
+    default:
+	switch (p->Ptype & PTF_ADRMODE) {
+	case PTA_MINDEXED:
+	case PTA_BYTEPOINT:
+	    if (p->Pindex == R_SP) {
+		if (p->Poffset < previous->Poffset)
+		    continue;		/* arg, safe */
+		p = NULL;		/* Not safe */
+	    }
+	    break;
+	case PTA_REGIS:
+	    if (p->Pr2 == R_SP)
+		p = NULL;			/* OP R,17 loses big */
+	    break;
+	}
+    }
+
+    /*--------------------------------------*/
+
+    if ((b = before(previous)) != NULL
+	&& b->Ptype == PTA_REGIS /* !prevskips */
+	&& b->Pop == P_MOVE && b->Preg == previous->Preg
+	&& rfree(b->Pr2)		/* Ensure OK to clobber S */
+	&& snglop(previous->Pop)) {	/* Single-word op */
+/*
+	&& p->Pop != P_IDIV && p->Pop != P_UIDIV) {
+*/
+/* BUG!  This call is known to swap an IDIVI and zap its reg!
+*/
+	/*
+	** fold:  MOVE  R,S
+	**        OP    R,x
+	**
+	** into:  OP    S,x
+	**        MOVE  R,S
+	*/
+
+	previous->Preg = b->Pr2;	/* flatten the register change */
+	swappseudo(b, previous);	/* switch the two ops */
+	p = b;				/* forget about the P_MOVE */
+    } else b = p = previous;		/* no move, start at the top */
+
+    if (p->Ptype != PTA_MINDEXED) return;
+    switch (p->Pop) {
+    case P_AOS:
+    case P_SOS:
+#if 0	/* BAD STUFF!  KLH: This code loses (and has caused actual lossage in
+	** compiled code of the form "++I * ++I") because it generates a
+	** MOVE S,R which causes the peepholer to think that it is safe
+	** to throw R away completely -- which is NOT what the original code
+	** wanted to do or imply!
+	*/
+	if ((b = before (p)) != NULL && b->Pop == P_MOVEM &&
+	    b->Ptype == PTA_MINDEXED /* !prevskips */ && b->Pptr == p->Pptr &&
+	    b->Pindex == p->Pindex && b->Poffset == p->Poffset) {
+
+	    /*
+	    ** fold:  P_MOVEM R,x
+	    **        P_AOS   S,x
+	    **
+	    ** into:  P_ADDI  R,1
+	    **        P_MOVEM R,x
+	    **        P_MOVE  S,R
+	    */
+
+	    b->Pop = P_ADD;		/* make P_ADD */
+	    b->Ptype = PTV_IMMED;		/* immediate quantity */
+	    b->Pvalue = (p->Pop == P_AOS)? 1 : -1; /* by one */
+	    s = p->Preg;		/* remember the reg we want */
+	    p->Pop = P_MOVEM;		/* now make P_MOVEM */
+	    r = p->Preg = b->Preg;	/* using old register */
+	    foldplus(b);		/* fix up addition */
+	    code00(P_MOVE, s, r);		/* and fix up registers */
+	} else
+#endif /* End of bad stuff */
+		foldinc(p);
+
+    default: return;
+    case P_MOVEM: break;
+    }
+
+    /*
+    ** At this point we know that p = previous points to a MOVEM R,X.
+    ** Search back to find the last instruction that uses R, to see if we
+    ** can fold it with the MOVEM.
+    */
+    badidx = 0;
+    ramask_p = rbinaddr(p);		/* Remember regs used in X */
+    rrmask_p = rbits[p->Preg];		/* And in R (for completeness) */
+    while (1) {
+	int rrmask_b;
+
+	b = before(b);			/* skip over unlikely candidate */
+	if (b == NULL) return;		/* ran out of them */
+	if (rbinaddr(b) & rrmask_p)	/* Can't hack if its addr uses R */
+	    return;
+	rrmask_b = rbinreg(b);		/* Find mask of regs that Preg uses */
+	if (rrmask_b & ramask_p)	/* If reg used in X, then */
+	    badidx = 1;			/* can't fold unless SETZ */
+	if (rrmask_b & rrmask_p)	/* If both use same Preg, */
+	    break;			/* done with loop! */
+    }
+    if (prevskips(b)) return;		/* skipped over, lose */
+
+    switch (b->Pop) {
+    case P_FMPR:
+    case P_IMUL:
+	if ((q = findmove(b, p)) && q->Pop == P_MOVN && !badidx) {
+	    /*
+	    ** fold:  P_MOVN  R,x
+	    **        P_IMUL  R,y
+	    **        P_MOVEM R,x
+	    **
+	    ** into:  P_MOVN  R,y
+	    **        P_IMULB R,x
+	    */
+
+	    p->Pop = b->Pop | POF_BOTH;	/* move mply op over */
+	    b->Pop = P_MOVN;		/* make old add into negated move */
+	    q->Pop = P_NOP;		/* flush the first move */
+	    foldplus(p);		/* maybe we can turn it into an AOS */
+	    break;
+	}
+
+    case P_FADR:   case P_FSBR:
+    case P_ADD:    case P_SUB:
+    case P_AND:    case P_IOR:    case P_XOR:
+	if ((q = findmove(b, p)) && q->Pop == P_MOVE && !badidx) {
+	    /* fold:	MOVE R,x
+	    **		ADD R,y
+	    **		MOVEM R,x
+	    ** into:
+	    **		MOVE R,y
+	    **		ADDB R,x
+	    */
+	    if (b->Pop == P_SUB) {
+		p->Pop = P_ADD+POF_BOTH;	/* make ADDB */
+		b->Pop = P_MOVN;		/* and MOVN */
+	    } else if (b->Pop == P_FSBR) {
+		p->Pop = P_FADR+POF_BOTH;	/* make floating add */
+		b->Pop = P_MOVN;		/* and floating MOVN (same as int) */
+	    } else {
+		p->Pop = b->Pop | POF_BOTH;	/* move add op over */
+		b->Pop = P_MOVE;		/* make old add into move */
+	    }
+	    q->Pop = P_NOP;		/* flush the first move */
+	    if (b->Ptype == PTA_REGIS
+		&& (b->Pop == P_MOVE || pushneg(b->Pr2, before (b)))) {
+		b->Pop = P_NOP;
+		p->Preg = b->Pr2;
+		code00(P_MOVE, b->Preg, b->Pr2);
+	    }
+	    foldplus(p);		/* maybe we can turn it into an AOS */
+	    break;
+	}
+	/* If didn't have preceding MOVE, check following optimization */
+
+    case P_MOVE:    case P_MOVN:    case P_MOVM:    case P_SETCM:
+    case P_FDVR:    case P_IDIV:		/* yes, P_IDIVB works */
+	if (b->Ptype == p->Ptype
+	  && b->Poffset == p->Poffset
+	  && b->Pindex == p->Pindex
+	  && b->Pptr == p->Pptr
+	  && !badidx) {
+
+	    /*
+	    ** fold:  OP    R,addr
+	    **        MOVEM R,addr
+	    **
+	    ** into:  OPB   R,addr
+	    */
+
+	    p->Pop = b->Pop;		/* move opcode across */
+	    if (b->Pop != P_MOVE) p->Pop |= POF_BOTH;
+	    b->Pop = P_NOP;		/* flush old instruction */
+	    foldplus(p);		/* maybe we can turn it into an AOS */
+	}
+	break;
+
+    case P_SETZ:
+    case P_SETO:
+	if (b->Ptype == PTA_ONEREG) {
+
+	    /*
+	    ** fold:  SETZ  R,
+	    **        MOVEM R,x
+	    **
+	    ** into:  SETZB R,x
+	    */
+
+	    p->Pop = b->Pop+POF_BOTH;	/* move opcode across, make both */
+	    b->Pop = P_NOP;		/* flush old instruction */
+	}
+    }
+}
+
+#if 0 /* Old stuff from last part of foldboth() */
+    {
+	switch (rchange (b->Pop)) {
+	case PRC_RSAME:		 /* nice single word op? */
+	case PRC_RSET:
+	case PRC_RCHG:
+	case PRC_RCHG_DSAME:
+	    if (b->Preg == p->Preg) break; /* the one we want */
+	    continue;			/* else look back some more */
+
+	case PRC_DSAME:		/* nasty double word op? */
+	case PRC_DSET:
+	case PRC_DSET_RSAME:
+	case PRC_DCHG:
+	case PRC_DCHG_RSAME:
+	    if (!prevskips(b)
+	      && (b->Pop == P_DFMP || b->Pop == P_DFDV)
+	      && b->Preg == p->Preg
+	      && (q = before(b))
+	      && !prevskips(q)
+	      && q->Pop == P_SETZ
+	      && q->Preg == p->Preg + 1) {
+
+		/*
+		** fold:  SETZ  R+1,
+		**  	  DFMP R,y	(or DFDV R,y)
+		**  	  MOVEM R,x
+		**
+		** into:  FMPR  R,y	(or FDVR R,y)
+		**  	  MOVEM R,x
+		**
+		** so that later optimization can turn it into a FMPRB.
+		** The low order word of the double can't affect the result,
+		** but only for multiply -- this is not safe for DFAD and DFSB!
+		*/
+		if (q->Ptype == PTA_ONEREG) q->Pop = P_NOP; /* drop P_SETZ */
+		b->Pop = ((b->Pop == P_DFMP)? P_FMPR : P_FDVR); /* make singleword */
+		/* Fix up operand if a constant */
+		if ((b->Ptype&PTF_ADRMODE) == PTA_DCONST) {
+		    b->Ptype = (b->Ptype& ~PTF_ADRMODE) | PTA_FCONST;
+		    b->Pfloat = (float)b->Pdouble;
+		}
+		break;			/* escape loop */
+	    }
+	    if ((b->Preg + 1) == p->Pindex)
+		badidx = 1;
+	    if (b->Preg != p->Preg && (b->Preg + 1) != p->Preg)
+		continue;
+	default:			/* P_PUSHJ? */
+	    return;			/* give up */
+	}
+	break;
+    }
+#endif
+
+static PCODE *
+findmove(b, p)
+PCODE *b, *p;
+{
+    PCODE *q = b;
+
+    /* Scan back from potentially foldable op (B) to set Q for some
+    ** cases that might need it.  (KLH: seems dumb)
+    */
+    while ((q = before(q))
+      && q->Preg != b->Preg
+      && q->Preg != p->Preg
+      && q->Preg != p->Pindex) {
+	switch (q->Pop) {
+	case P_FADR:	case P_FSBR:	case P_FDVR:	case P_FMPR:
+	case P_ADD:	case P_IMUL:	case P_SUB:	case P_MOVE:
+	case P_MOVN:	case P_SETZ:	case P_SETO:	case P_FLTR:
+	case P_FIX:	case P_AND:	case P_IOR:	case P_SETCM:
+	    continue;
+	}
+	return NULL;			/* unknown op, stop */
+    }
+    if (q
+      && q->Preg == p->Preg
+      && q->Ptype == p->Ptype /* !prevskips */
+      && q->Pptr == p->Pptr
+      && q->Poffset == p->Poffset
+      && q->Pindex == p->Pindex)
+	return q;
+    return NULL;
+}
+
+
+static int
+snglop(op)
+int op;
+{
+    switch (rchange(op)) {
+	case PRC_RSAME:
+	case PRC_RSET:
+	case PRC_RCHG:
+	case PRC_RCHG_DSAME:
+	    return 1;		/* OK single-word operation */
+	default:
+	    return 0;		/* Anything else is assumed not OK */
+    }
+}
+
+/* FOLDSTACK(n) - Optimize previous instructions into P_ADJSP.
+**
+**    Attempts to pull previous P_ADJSPs, P_PUSHs, etc into a new P_ADJSP
+** which would, if no such optimization occurred, have constant n.
+** The return value is what the constant should be, taking into
+** account any optimization which has been done.
+**	This is only called by code8 in CCCODE when about to generate
+** an ADJSP.  This is also invoked via code8 when code0 generates
+** a PUSH P,R.
+**	It is ALWAYS safe to flush an ADJSP P,-n because that just
+** leaves some extra junk on the stack and doesn't invalidate any
+** following references.
+**	The thing to beware of is flushing positive adjustments
+** (ADJSP P,+n) because this could leave following code referencing
+** places beyond the end of the stack (i.e. indexing through P with
+** a positive offset), unless we are careful and
+** have made sure that no such references exist.
+**	The "maxfold" variable is to ensure that we don't accidentally
+** do this.  It is set to the largest positive N that it is safe to
+** flush (if an ADJSP P,+N is encountered); this means that no code
+** has been seen which references a location higher than -maxfold(P).
+** That is, -maxfold(P) is assumed to have a reference.
+** Note that 0(P) is a valid reference.  maxfold should never be
+** negative!
+**	Finally, if we know from "stackrefs" that the current function
+** generates an address pointing to something on the stack, then it is
+** never safe to flush a positive ADJSP, since we can't tell just from
+** the instruction memory references whether a portion of the stack is
+** really being used or not.  This is why maxfold is set to 0 in that
+** case, which means that as far as is known, all of the current stack is
+** referenced.
+*/
+
+int
+foldstack(n)
+{
+    PCODE *p = previous;		/* Start from end of buffer */
+    int maxfold = (stackrefs ? 0 : 1000000);	/* limit on pos ADJSP fold */
+
+    while (p != NULL) switch (p->Pop & POF_OPCODE) {
+    case P_ADJSP:
+	/* See if safe to merge this ADJSP in with current one (at end),
+	** and if so adjust stack to account for its flushage, and
+	** then flush it.
+	*/
+	if (p->Preg != R_SP		/* Must be ADJSP 17, */
+	  || prevskips(p)		/* and not skipped over */
+	  || p->Pvalue > maxfold)	/* and not about to invalidate refs */
+		return n;		/* Failed one of above, quit. */
+	n += adjstack(p->Pvalue, p);	/* Won, adjust all following refs */
+	n += p->Pvalue;
+	maxfold -= p->Pvalue;
+	dropinstr(p);			/* Flush that ADJSP */
+	p = previous;			/* Start loop over */
+	break;
+
+    case P_PUSH:
+	/* If this PUSH is the last instruction, and "n" is negative
+	** (meaning stack being reduced) then we can simply flush the PUSH
+	** since the value pushed is never used.
+	** Otherwise, OK to look past a PUSH P,[0]/[-1] because
+	** adjstack() knows how to convert those to a SETZB/SETOB -n(P)
+	** which is more efficient.
+	** Likewise, PUSH P,R is ok because adjstack() can change it to
+	** a MOVEM R,-n(P).
+	**	 A PUSH of anything else would
+	** take 2 instructions to replace the PUSH if the stack pointer
+	** was different, so it does us no good to continue looking back.
+	*/
+	if (p->Preg != R_SP || prevskips(p))	/* Fail if skipped */
+	    return n;				/* or not a stack instr */
+	if (n < 0 && p == previous) {	/* If stk being flushed & last instr */
+	    dropinstr(p);		/* can just flush the PUSH! */
+	    ++n;			/* Account for flushed instr */
+	    p = previous;		/* Get new previous, restart loop */
+	    break;
+	}
+	if (((p->Ptype == PTV_IMMED && p->Pvalue >= -1 && p->Pvalue <= 0)
+	     || p->Ptype == PTA_REGIS)) {
+	    maxfold = 0;	/* This referenced top of stack */
+	    p = before(p);
+	    break;		/* Continue looking back */
+	}
+	return n;
+
+    case P_POP:
+	/* OK to look past a POP if it is a POP P,R
+	** since adjstack() can replace that with MOVE R,-n(P) if the
+	** stack pointer is changed.
+	** Otherwise, as for PUSH, we stop since it would take 2 instrs
+	** (a MOVE and MOVEM) to replace the POP; settle for what we have
+	** now.
+	*/
+	if ( p->Preg == R_SP		/* Must be POP 17, */
+	  && p->Ptype == PTA_REGIS	/* and a POP 17,R */
+	  /* && !prevskips(p) */  ) {	/* and not skipped over */
+		maxfold = 0;		/* This is a ref to top of stack */
+		p = before(p);		/* continue looking back */
+		break;
+	}
+	return n;
+
+#if 0	/* Should never have positive index to stack like this! */
+    case P_MOVEM:
+	if (p->Ptype == PTA_MINDEXED
+	    && p->Pindex == R_SP
+	    && p->Poffset == 1 && n > 0 && !prevskips (p)) {
+
+	    /*
+	    ** fold:  P_MOVEM R,1(17)
+	    ** into:  P_PUSH  17,R
+	    */
+
+	    p->Ptype = PTA_REGIS;
+	    p->Pr2 = p->Preg;
+	    p->Preg = R_SP;
+	    p->Pop = P_PUSH;
+	    n += adjstack(-1, p);
+	    n--;
+	    p = previous;
+	    maxfold = (stackrefs? 0 : 1000000); /* start again */
+	    break;
+	}
+	/* Can't fold, check for stack ref */
+	if (( (p->Ptype & PTF_ADRMODE) == PTA_MINDEXED
+	    ||(p->Ptype & PTF_ADRMODE) == PTA_BYTEPOINT)
+	  && p->Pindex == R_SP
+	  && p->Poffset > - maxfold)
+	    maxfold = - p->Poffset;
+	p = before(p);
+	break;
+#endif
+
+    case P_MOVE:
+	if ( p->Ptype == PTA_MINDEXED /* && !prevskips(p) */
+	  && p->Pindex == R_SP
+	  && p->Poffset == 0		/* MOVE R,0(17) */
+	  && n < 0			/* Want stuff popped off */
+	  && (maxfold > 0		/* No other ref to top of stack */
+	    || p == previous)) {	/*   or no other instrs in between */
+	    /*
+	    ** fold:  P_MOVE  R,0(17)
+	    ** into:  P_POP   17,R
+	    */
+	    n += makepop(p);		/* turn into P_POP */
+	    p = previous;
+	    maxfold = (stackrefs ? 0 : 1000000);	/* Start again */
+	    break;
+	}
+	/* Can't fold, drop thru to normal check for stack ref */
+    case P_MOVEM:
+
+    case P_ADD:	    case P_SUB:	    case P_IMUL: case P_IDIV: case P_UIDIV:
+    case P_FADR:    case P_FSBR:    case P_FDVR:	case P_FMPR:
+    case P_AND:	    case P_IOR:	    case P_XOR:		case P_CAI:
+    case P_MOVN:    case P_SETCM:   case P_SETZ:	case P_CAM:
+    case P_SETO:    case P_AOS:	    case P_SOS:		case P_LSH:
+    case P_ADJBP:   case P_SUBBP:   case P_IBP:
+    case P_ILDB:    case P_IDPB:    case P_LDB:	    case P_DPB:
+    case P_HLRZ:    case P_HRLM:    case P_HRRZ:    case P_HRRM:
+    case P_TDC:	    case P_TDN:	    case P_TDO:	    case P_TDZ:
+    case P_TLC:	    case P_TLN:	    case P_TLO:	    case P_TLZ:
+    case P_TRC:	    case P_TRO:	    case P_TRN:	    case P_TRZ:
+    case P_SKIP:
+    case P_SMOVE:
+	/* If instr is one we understand, can check it for stack ref */
+	if (rinreg(p, R_SP))		/* If used as OP 17,x */
+	    return n;			/* then always give up. */
+	if (rinaddr(p, R_SP)) {		/* If used in address, */
+	    /* it better be as an index reg, or we can't handle it. */
+	    if ( ((p->Ptype & PTF_ADRMODE) != PTA_MINDEXED
+		&&(p->Ptype & PTF_ADRMODE) != PTA_BYTEPOINT)
+	      || p->Pindex != R_SP)
+		return n;		/* Can't grok this address ref */
+	    /* Indexing through stack ptr, can handle it! */
+	    if (p->Poffset > -maxfold)	/* See if ref is higher on stk */
+		maxfold = - p->Poffset;	/* Yes, remember as highest so far */
+	}
+	p = before(p);
+	break;
+
+    default:
+	/* Instr we don't understand, don't try to optimize back over it */
+	return n;
+    }
+    return n;
+}
+
+/* MAKEPOP(p) - Turn P_MOVE instruction into P_POP
+**
+**	This is only called by foldstack().
+**	This is the only place in KCC where a P_POP pseudo-code instruction
+** is generated.
+**
+** This turns the given MOVE R,0(17) into POP 17,R and fixes up
+** the surrounding instructions.  It returns the result of
+** adjstack() + 1 (for the new extra pop).
+*/
+
+static int
+makepop(p)
+PCODE *p;
+{
+    PCODE *q, *b;
+
+    /* First make the pop */
+    p->Pop = P_POP;
+    p->Ptype = PTA_REGIS;
+    p->Pr2 = p->Preg;	/* Copy R into 2nd reg */
+    p->Preg = R_SP;
+
+    /* Now see if we can further fold it.
+    ** Attempt to turn:		into:
+    **	p->	POP P,R		--
+    **	q->	MOVEM R,X	POP P,X
+    */
+    if (p->Pr2 != R_RETVAL
+      && (q = after(p))
+      && q->Pop == P_MOVEM
+      && q->Preg == p->Pr2
+      && !rinaddr(q, p->Pr2)) {		/* Ensure R not used in X */
+	/* Have a MOVEM R,X -- scan forward to ensure that the value of R
+	** isn't needed by any following instructions.
+	*/
+	for (b = q; b = after(b); )
+	    if (rincode(b, p->Pr2)) {	/* Found an instr that hacks R? */
+		if (rruse(b, p->Pr2))	/* Yep, see if it uses val in R */
+		    q = NULL;		/* Yes, must leave it alone */
+		break;
+	    }
+	if (q) {			/* OK to go ahead? */
+	    q->Pop = P_POP;		/* Yes, make P_POP */
+	    q->Preg = p->Preg;		/* from stack reg */
+	    p->Pop = P_NOP;		/* drop register P_POP */
+	    p = q;			/* Start adjust from this instr */
+	}
+    }
+
+    return adjstack(1, p) + 1;
+}
+
+/* ADJSTACK(n, p) - Fix up old ops after stack change shifts.
+**
+**	The section of the buffer from P (exclusive) to the end
+** ("previous") has all references to the stack adjusted as if an
+** ADJSP 17,N at P had vanished.  Thus the effect on the instructions
+** is as if the stack pointer had changed by -N from what it used to be.
+**
+** This is an auxiliary routine used by foldstack() (and its auxiliary
+** makepop(); these are the only 2 routines which call it.
+**
+** The section of the buffer changed is assumed to be safe, i.e. checked
+** over by foldstack().
+** It returns the net change to the stack offset as a result of
+** turning PUSH/POP instructions into ones which don't change the stack
+** pointer.
+*/
+
+static int
+adjstack(n, p)
+PCODE *p;
+{
+    PCODE *q;
+    int c = 0;				/* how much we changed it */
+
+    /* Loop back until we hit the changed op, and then return. */
+    for (q = previous; q != p; q = before(q)) {
+	switch (q->Ptype & PTF_ADRMODE) {
+
+	case PTA_MINDEXED:
+	case PTA_BYTEPOINT:		/* If an indexed instruction */
+	    if (q->Pindex == R_SP)	/* uses the stack ptr as index */
+		q->Poffset += n;	/* then need to adjust it. */
+	    break;
+
+	case PTA_REGIS:		/* POP/PUSH P,R turns into MOVE/M R,-n(P) */
+	    if (q->Preg == R_SP) switch (q->Pop) {
+	    case P_POP:
+		c += adjstack(-1, q);
+		q->Pop = P_MOVE;
+		q->Preg = q->Pr2;
+		q->Ptype = PTA_MINDEXED;
+		q->Pptr = NULL;
+		q->Pindex = R_SP;
+		q->Poffset = n;
+		c--;
+		break;
+	    case P_PUSH:
+		c += adjstack(1, q);
+		q->Pop = P_MOVEM;
+		q->Preg = q->Pr2;
+		q->Ptype = PTA_MINDEXED;
+		q->Pptr = NULL;
+		q->Pindex = R_SP;
+		q->Poffset = n + 1;
+		c++;
+		break;
+	    }			/* end case PTA_REGIS: switch(q->Pop) */
+
+	case PTA_RCONST:	/* PUSH P,[0/-1] becomes SETZB/OB 16,-n(P) */
+	    if (q->Pop == P_PUSH) {
+		c += adjstack(1, q);
+		q->Pop = (q->Pvalue == 0)? P_SETZ+POF_BOTH : P_SETO+POF_BOTH;
+		q->Preg = R_SCRREG;	/* have to have some reg here */
+		q->Ptype = PTA_MINDEXED;
+		q->Pptr = NULL;
+		q->Pindex = R_SP;
+		q->Poffset = n + 1;
+		c++;
+		break;
+	    }
+	}				/* end switch(q->Ptype) */
+    }
+
+    return c;
+}
+
+/* HACKSTACK(label) - Pull beginning-of-routine P_ADJSP across label
+**
+** Often some code will start out with  if (cond) return;
+** if there are local variables in the routine they will be made
+** and unmade unnecessarily while the condition is checked.
+** Here we attempt to fix that up by pulling the P_ADJSP for the
+** local variables across the  if  and  return.
+** This also works for some cases where there is a JRST instead of a POPJ.
+**
+** Our argument is the label we are about to emit;
+** the return value is the P_ADJSP that must be done
+** after the label is (or is not) emitted.
+*/
+#if 0	/* COMMENT */
+	The algorithm used here is a little non-obvious and needs some
+words of explanation.
+	Basically, we are looking backwards from our current location
+(marked by "label") to see if we can find an ADJSP with a positive
+value N.  If we find one, we see if it can be flushed entirely or not;
+only flushing it partially is no good, since the instruction takes
+just as much time regardless of N.
+	To see whether it can be flushed, we have to know two things:
+ FIRST, does the stack size change between the ADJSP and our label?  If
+new cells are added in some way (PUSH is the only way, as an ADJSP
+would have been caught) then they must have been flushed off before
+reaching our label.  We check this by making sure the current stack
+offset ("spos") after the ADJSP is the same as that of the stack
+offset at our label ("stackoffset").  Only if they are the same is it
+safe to move this ADJSP to our label.
+
+ SECOND, are any of the N stack cells the ADJSP creates referenced
+between there and our label?  As we go back, we check each instruction
+for a stack reference; but since we don't know beforehand how large N
+is, we cannot easily know which references are significant.  We only
+know two things: (1) Refs with a negative overall stack offset are to
+the function arguments and thus are okay, and (2) Refs with a positive
+offset higher than "stackoffset" refer to places above N which are
+temporary (created by PUSH, removed by POP or ADJSP) and will not
+exist by the time we are at our label, and thus are also OK.
+	To keep track of positive-offset references the same or lower
+than "stackoffset", we keep a count "nrefs" of such references, and a
+variable "ceiling" which remembers the offset of the largest such
+reference seen.  It is important to remember that "ceiling" is NOT the
+largest positive-offset reference; it is only the largest one that is
+at or below "stackoffset".
+
+	Thus, when we find the positive ADJSP, first we check "nrefs"; if
+there were no qualifying references, we are safe.  But otherwise the N
+tells us where the N cells started; if our "ceiling" is below this start,
+then none of those cells were referenced and we are also safe.  If on the
+other hand the "ceiling" is above the start of the N cells, then it marks
+a reference to one of the N cells and we dare not touch the ADJSP.
+
+	Note that if the global "stackrefs" is set, there is at least one
+automatic variable address somewhere in the function, which prevents us from
+ever flushing a positive ADJSP.  At least not without even hairier checking
+to ensure that no such address is generated within the range of instructions
+between the ADJSP and the label.  For the time being, we try to do this
+hairy checking, assuming that only three kinds of instructions can possibly
+generate such addresses: XMOVEI, MOVE [bp], and ADJBP [bp].
+
+#endif
+
+int
+hackstack (lab)
+SYMBOL *lab;
+{
+    int spos;			/* Current stack offset */
+    int ceiling;		/* Largest "affected" stack offset ref */
+    int nrefs;			/* # of such stack references seen */
+    PCODE *lastadj, *p;
+    int newtop, adjres;
+
+#if 0	/* We try to check for generated addrs... */
+    if (stackrefs) return 0;		/* Too risky */
+#endif
+    if (isskip(previous->Pop)) return 0;
+
+    spos = stackoffset;			/* Set current stack offset */
+    nrefs = 0;				/* No refs yet */
+    lastadj = NULL;			/* haven't found an ADJSP yet */
+
+    for (p = previous; p != NULL; p = before (p))
+	switch (p->Pop & POF_OPCODE) {
+
+    case P_JRST:  case P_JUMP:		/* A jump to someplace */
+    case P_AOJ:   case P_SOJ:		/* had better be to our label */
+	if (p->Pptr == NULL) return 0;	/* Make sure it has a label */
+	if (p->Pptr->Sclass == SC_ILABEL) {	/* If it's an internal lab, */
+	    if (p->Pptr != lab)		/* and not to our label, */
+		return 0;		/* then must fail, can't track code */
+	    if (spos != stackoffset)	/* To our label.  Offset gotta match */
+		return 0;		/*  Ugh.  Probably an error. */  
+	    continue;			/* OK, can continue. */
+	}
+	/* Jump to an external label.  This is assumed to be a tail
+	** recursion optimization (where a PUSHJ + POPJ is replaced by a
+	** JRST), and so we interpret the jump like a POPJ by dropping
+	** through.
+	*/
+
+    case P_POPJ:		/* Handle POPJ (also fall thru from above) */
+	spos = 0;		/* stack can't exist here */
+	lastadj = NULL;		/* so don't remember ADJSP after */
+	continue;
+
+    case P_PUSH:
+	/* PUSH of something onto the stack must check two things:
+	**	the address pushed into (top of stack), and
+	**	the address pushed from (address ref).
+	** We do the top of stack first.  This involves two checks of its own;
+	**	First we make sure the object pushed is later removed (by
+	**	seeing whether the current stack offset is smaller than the
+	**	original one farther down in the code).
+#if 0
+	**	Second we do an address ref check similar to that done for
+	**	memory operands, except that Poffset is known to be 0.
+#endif
+	**
+	*/
+	if (p->Preg == R_SP) {		/* If pushing onto stack, check it */
+	    if (spos < stackoffset)	/* If putting stuff on stack that */
+		return 0;		/* isn't removed later, give up. */
+#if 0
+	    if (nrefs++ == 0
+	      || spos < ceiling) {	/* Update lowest cell reffed */
+		ceiling = spos;	
+		if (ceiling <= 1)	/* If 1st cell or worse, */
+		    return 0;		/* quit. */
+	    }
+#endif
+	    spos--;	/* See comment below */
+	}
+	/* PUSH of something onto the stack must bump down the stack offset
+	** prior to checking address ref, as when the instr is executed
+	** the address is computed before the stack is bumped.  But our
+	** current stack offset value is that AFTER the push was done.
+	** So, we decrement the current stack offset and then fall thru into
+	** the normal address ref checking.
+	*/
+
+    case P_LDB:  case P_ADJBP: case P_PUSHJ:
+    case P_MOVE: case P_MOVN: case P_MOVM: case P_MOVEM:
+    case P_SETZ: case P_SETO:
+    case P_AND:  case P_IOR: case P_XOR:
+    case P_ADD:  case P_SUB:  case P_IMUL: case P_IDIV: case P_UIDIV:
+    case P_FADR: case P_FSBR: case P_FMPR: case P_FDVR:
+    case P_DFAD: case P_DFSB: case P_DFMP: case P_DFDV:
+    case P_SKIP: case P_CAI: case P_CAM:
+    case P_TRO:  case P_TRN: case P_TRC:
+    case P_TLO: case P_TLZ:
+    case P_TDO: case P_TDN: case P_TDZ: case P_TDC:
+    case P_AOS:	case P_SOS:
+    case P_SMOVE:
+	/* Check out addressing of normal instruction to see if it references
+	** stack, and if so, where.
+	** A reference to the args of the current function is OK and can be
+	** ignored.  Otherwise, it is a reference to some local stack cell
+	** and we check to find whether it is a cell that still exists
+	** at our label (i.e. ref is same or lower than "stackoffset").
+	** Then we check to remember the highest such reference.  See
+	** comments at top of page.
+	** NOTE: if the "stackrefs" global indicates that the function makes
+	** use of auto variable addresses, we have to make sure that this
+	** instruction doesn't generate such an address.  If it does, we
+	** punt completely as there's no telling what it may be used for.
+	*/
+#if 1	/* 1st gen, revised to make 3rd gen stuff */
+	if ( ((p->Ptype & PTF_ADRMODE) != PTA_MINDEXED		/* Indexed? */
+	     && (p->Ptype & PTF_ADRMODE) != PTA_BYTEPOINT)
+	  || p->Pindex != R_SP)				/* Yes, stack idx? */
+	    continue;				/* Nope to either, ignore. */
+
+	/* Check for generating an auto variable address.  Of the ops
+	** we recognize, only three things (XMOVEI, MOVE, ADJBP) should
+	** be able to generate such addresses.
+	*/
+	if (stackrefs) {
+	    if ((p->Pop&POF_OPCODE) == P_MOVE
+	      && ((p->Ptype&PTF_IMM)				/* XMOVEI */
+		|| ((p->Ptype&PTF_ADRMODE)==PTA_BYTEPOINT))) /* MOVE R,[bp] */
+		return 0;
+	    if ((p->Pop&POF_OPCODE) == P_ADJBP
+	      && (p->Ptype&PTF_ADRMODE)==PTA_BYTEPOINT)	/* ADJBP R,[bp] */
+		return 0;
+	}
+
+	/* Instruction's E uses stack reg as index.  Check the reference. */
+	if (p->Poffset + spos < 0)	/* Refers to our fn's args, OK */
+	    continue;
+	/* Refers to local vars, see if below stackoffset (ok to remember) */
+	if (p->Poffset + spos > stackoffset)
+	    continue;			/* Above, so ignore it */
+
+	/* Local var, not a temp, so remember the reference */
+	if (nrefs++ == 0 || (p->Poffset + spos) > ceiling) {
+	    ceiling = p->Poffset + spos;	/* Remember new highest ref */
+	    if (ceiling == stackoffset)	/* If ref is to highest possible var */
+		return 0;		/* then even ADJSP 1 would fail. */
+	}
+	continue;
+#endif
+
+#if 0 /* 2nd gen stuff */
+	if ( ((p->Ptype & PTF_ADRMODE) == PTA_MINDEXED		/* Indexed? */
+	     || (p->Ptype & PTF_ADRMODE) == PTA_BYTEPOINT)
+	  && p->Pindex == R_SP			/* Yes, stack idx? */
+	  && (p->Poffset + spos) >= 0		/* Refers to local vars? */
+	  && (nrefs++ == 0			/* If ref is first */
+	     || (p->Poffset + spos) < ceiling)) {	/* or lowest so far */
+	    ceiling = p->Poffset + spos;	/* Remember new lowest ref */
+	    if (ceiling <= 1)		/* If first var (== 1) or worse, */
+		return 0;			/* give up. */
+	}
+	continue;
+#endif
+
+    case P_ADJSP:
+	if (p->Pvalue < 0) {
+	    if (lastadj == NULL && spos == 0)
+		lastadj = p;		/* If we win, can stop fixup here */
+	    spos -= p->Pvalue;		/* change stack offset */
+	    continue;
+	}
+
+	/*
+	** If we got here, we've finally found our positive P_ADJSP.
+	**
+	** First check it against the ceiling we've calculated;
+	** if any reference was seen to something that the ADJSP grabbed,
+	** then we cannot flush the ADJSP.  See comments at top of page.
+	**
+	** Likewise, if any reference was made to something put on the stack
+	** with a PUSH then it must have been taken off later with a POP
+	** (not handled -- always fails) or an ADJSP with negative operand.
+	** This means the stack offset at this point (spos) must match that
+	** which was originally in effect (stackoffset).
+	**
+	** Then we run through the ops between here and the final P_ADJSP
+	** (the one before the P_POPJ) or the end of the buffer, adjusting
+	** all stack references to account for the variables being
+	** dropped out of the middle like the tablecloth trick.
+	*/
+
+	if (stackoffset != spos)
+	    return 0;		/* Make sure stack offsets come out even */
+	if (nrefs
+	  && ceiling > (spos - p->Pvalue))	/* Ref to any of N cells? */
+	    return 0;				/* Yes, fail */
+
+	adjres = p->Pvalue;		/* Won!  Remember how much to move */
+	spos -= p->Pvalue;		/* Adjust current stack offset */
+	newtop = spos;			/* Remember that as new top of stk */
+	p->Pop = P_NOP;			/* drop the P_ADJSP */
+
+	/* Now move forward through stack, adjusting all stack refs
+	** Note loop stops when hit lastadj (which may be NULL)
+	*/
+	while ((p = after (p)) != lastadj) {
+	    if ((    (p->Ptype & PTF_ADRMODE) == PTA_MINDEXED
+		  || (p->Ptype & PTF_ADRMODE) == PTA_BYTEPOINT)
+		&& p->Pindex == R_SP
+		&& (p->Poffset + spos) <= newtop) /* If refs stk below gap */
+		    p->Poffset += adjres;	/* adjust it */
+	    switch (p->Pop) {
+	    case P_PUSH:
+		spos++;
+		break;
+
+	    case P_ADJSP:
+		spos += p->Pvalue;	/* Account for ADJSP change to stack */
+		if (spos < newtop)	/* Ensure it didn't take off too much*/
+		    int_error("hackstack: foulup");
+		break;
+	    }
+	}
+	if (p != NULL) {		/* still have to deal with the ADJSP */
+	    p->Pvalue += adjres;	/* take out the variable part */
+	    if (p->Pvalue == 0)
+		p->Pop = P_NOP;		/* or drop the whole thing */
+	}
+	return adjres;			/* this is how much we adjusted */
+
+    default: return 0;			/* some strange opcode */
+    }
+    return 0;			/* broke out means no P_ADJSP in block */
+}
+
+/* KILLSTACK() - Get rid of unused locals on return.
+**
+** Often code before a return will contain stores to local variables
+** that are no longer used because of common subexpression elimination.
+** Here we eliminate those stores as well.
+*/
+
+#define MAXSTACK 100			/* largest expected stack var */
+
+void
+killstack()
+{
+    PCODE *p, *q;
+    int stkused[MAXSTACK + 1], i, i2, op, r, s;
+
+    if (stackrefs != 0) return;		/* funny stack usage, give up */
+    for (i = 0; i <= MAXSTACK; i++) stkused[i] = 0; /* no stack usage yet */
+
+    p = previous;			/* start at the top */
+    while (p != NULL) switch (p->Pop & POF_OPCODE) {
+    case P_MOVEM:	case P_AOS:	case P_SOS:    	case P_DMOVEM:
+    case P_SETCM:	case P_MOVN:	case P_SETO:	case P_SETZ:
+    case P_FADR:	case P_FSBR:	case P_FMPR:	case P_FDVR:
+    case P_ADD:		case P_IMUL:	case P_SUB:	case P_AND:
+    case P_IOR:		case P_XOR:	case P_IBP:	case P_ADJBP:
+    case P_DPB:		case P_LDB:	case P_IDPB:	case P_ILDB:
+    case P_MOVE:	case P_LSH:	case P_FIX:	case P_FLTR:
+    case P_HRRZ:	case P_HRRM:	case P_HLRZ:	case P_HRLM:
+    case P_DFAD:	case P_DFSB:	case P_DFMP:	case P_DFDV:
+    case P_TDO:		case P_TDZ:   	case P_TDN:   	case P_TDC:
+    case P_TRO:		case P_TRZ:   	case P_TRN:   	case P_TRC:
+    case P_TLO:		case P_TLZ:   	case P_TLN:   	case P_TLC:
+    case P_CAI:		case P_CAM:   	case P_SKIP:
+
+	/*
+	** Found an op that we know is safe for stack var elimination.
+	** First, see if it is really a stack variable reference.
+	*/
+	switch (p->Ptype & PTF_ADRMODE) {
+	case PTA_BYTEPOINT:
+	case PTA_MINDEXED:
+	    if (p->Pindex == R_SP) break;
+	default:
+	    p = before(p);		/* not stack ref, ignore */
+	    continue;
+	}
+
+	/*
+	** It is a stack reference.  See where on the stack it is.
+	** If out of our range, throw it in one catchall heap.
+	** Now check if we've seen that offset already.
+	*/
+	i = - p->Poffset;		/* get negated offset from stack */
+	if (i < 0 || i > MAXSTACK) i = MAXSTACK; /* fold range */
+
+	i2 = i;
+	switch (rchange(p->Pop&POF_OPCODE)) {	/* Check for double word ops */
+	    case PRC_DSAME:
+	    case PRC_DSET:
+	    case PRC_DCHG:
+	    case PRC_DSET_RSAME:
+	    case PRC_DCHG_RSAME:
+		--i2;			/* Bump to account for 2nd word */
+					/* (Note inverted value!) */
+		if (i2 < 0)		/* Fold range */
+		    i2 = MAXSTACK;
+		break;
+	}
+
+	if (stkused[i] || stkused[i2]) {	/* already used that offset? */
+	    p = before(p);		/* yes, back up */
+	    continue;			/* and try for more */
+	}
+
+	/*
+	** Haven't seen that offset, so if it is an assignment
+	** we can safely throw it away.
+	*/
+	if (!(p->Ptype & PTF_IND)) switch (p->Pop&POF_OPCODE) {
+	case P_MOVEM:
+	case P_HRRM:
+	case P_HRLM:
+	case P_DMOVEM:
+	    p->Pop = P_NOP;		/* drop losing P_MOVEM */
+	    fixprev();			/* make sure fully gone */
+	    p = before(p);		/* skip back to avoid remembering */
+	    continue;			/* this as a stack ref */
+
+	case P_SETO:
+	case P_SETZ:
+	    p->Ptype = PTA_ONEREG;		/* ignore all memory in op */
+	default:
+	    if ((op = (p->Pop &~ POF_BOTH)) == p->Pop)
+		break;			/* nothing to do */
+	    /* Have an opB instr, so mem is used and set.
+	    ** Attempt to transform "opB r,-n(P)" into either
+	    ** "op r,-n(P)" or "op r,s"
+	    */
+	    p->Pop = P_MOVE;		/* Make op MOVE for cse check */
+	    s = foldrcse(r = p->Preg, p); /* look for it in another reg */
+	    if (!s) {
+		p->Pop = op;		/* not found, put op back w/o "B" */
+		break;			/* leave switch to mark offset used */
+	    }
+	    /* Found a reg with mem value already in it, so use register op */
+	    p->Ptype = PTA_REGIS;
+	    p->Pop = op;		/* restore opcode */
+	    p->Preg = r;		/* register */
+	    p->Pr2 = s;			/* and other new register */
+	    if ((q = before(p)) && isskip(q->Pop))
+	        p->Ptype |= PTF_SKIPPED;
+	    inskip(p);			/* fold into previous SKIPA+MOVE */
+	    p = before(p);		/* get before to avoid stkused set */
+	    continue;			/* on with the show */
+	}
+
+	/*
+	** If we got this far, we are keeping at least some of the op.
+	** So remember that we need the memory kept for previous ops.
+	*/
+
+	stkused[i] = 1;			/* this stack var is now active */
+	stkused[i2] = 1;		/* May be double-word op */
+	p = before(p);			/* move back over op */
+	continue;			/* and try for more stack kills */
+
+    case P_PUSH:
+
+	/*
+	** We found a PUSH, and since we can't handle ADJSP this must
+	** have been a MOVEM to the then top of the stack.
+	**
+	** What we do is turn it into an ADJSP 17,1, and then return.
+	** What we want to do is go back doing the same for previous
+	** pushes, and then do a foldstack() so that they all get
+	** collapsed into one ADJSP.  But that would take more work
+	** than I care to do right now.
+	*/
+
+	if (!stkused[0]) {		/* has top of stack been used? */
+	    p->Pop = P_ADJSP;		/* no, turn into ADJSP */
+	    p->Ptype = PTA_RCONST;	/* of constant amount */
+	    p->Pvalue = 1;		/* one word no longer pushed */
+	}				/* then fall into unknown */
+    default:
+	return;				/* unknown op, give up on it */
+    }
+}
+
+/* UNSETZ(p) - Turn SETZ R, back into MOVEI R,0.
+**
+** Used by optimizations that want to only deal with P_MOVEs.
+** Also inverts MOVNI to MOVEI and SUBI to ADDI.
+**
+** Returns 1 if the op is now a MOVE or ADD of some sort.
+*/
+
+int
+unsetz(p)
+PCODE *p;
+{
+    switch (p->Pop) {
+    case P_MOVN:
+    case P_SUB:
+	if ((p->Ptype &~ PTF_SKIPPED) != PTV_IMMED) return 0;
+	p->Pvalue = - p->Pvalue;
+	p->Pop = (p->Pop == P_MOVN? P_MOVE : P_ADD);
+    case P_MOVE:
+    case P_ADD:
+	return 1;
+
+    case P_SETZ:
+    case P_SETO:
+	if ((p->Ptype &~ PTF_SKIPPED) != PTA_ONEREG) return 0;
+	p->Ptype ^= (PTA_ONEREG ^ PTV_IMMED);
+	p->Pvalue = (p->Pop == P_SETZ? 0 : -1);
+	p->Pop = P_MOVE;
+	return 1;
+
+    default:
+	return 0;
+    }
+}

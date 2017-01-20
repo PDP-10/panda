@@ -1,0 +1,1496 @@
+%TITLE 'F N D X   -- Indexed $FIND support'
+!<BLF/REQUIRE 'RMSBLF.REQ'>
+MODULE fndx (IDENT = '2.0'
+		) =
+BEGIN
+
+GLOBAL BIND
+    fndxv = 2^24 + 0^18 + 616;			! Edit date: 30-Apr-86
+
+!+
+!
+!
+!    FUNCTION:	THIS MODULE CONTAINS ALL ROUTINES WHICH PROCESS
+!    THE $FIND MACRO FOR INDEXED FILES.
+!    AUTHOR:	S. BLOUNT
+!
+!
+!
+!    !	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1977, 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+!
+!
+!
+!    **********	TABLE OF CONTENTS	**************
+!
+!
+!
+!
+!    ROUTINE			FUNCTION
+!    =======			========
+!
+!    FIDXSEQ			FIND NEXT SEQUENTIAL RECORD
+!
+!    FBYKEY			FIND A RECORD BY KEY ACCESS
+!
+!    FRECRFA			FIND A RECORD BY RFA ACCESS
+!
+!    POSRP			ATTEMPT TO POSITION TO RP
+!
+!    POSRFA			ATTEMPT TO POSITION TO RP BY RFA ADDRESS
+!
+!    POSNEXT			POSITION TO NEXT RECORD
+!
+!
+!
+!
+!    REVISION HISTORY:
+!
+!    RMS
+!    EDIT	EDIT	DATE		WHO			PURPOSE
+!    ====	====	====		===			=======
+!
+!    1	10-DEC-76	SB	FIX BUG IF GET SEQ TO
+!    EMPTY FILE
+!    2	13-DEC-76	SB	RETURN ER$EOF FOR EDIT 1
+!    3	22-DEC-76	SB	CHANGE ER$RNF TO ER$DEL
+!    4	3-MAY-77	SB	ADD SUPPORT FOR SIDRELEMENT FIELD
+!    5	22-JUN-77	SB	FIX POSRP SO IT RELEASES THE CURRENT
+!    BUCKET EVEN IF IT DIDNT CALL POSRFA
+!    (FOR FIND-GET ON SECONDARY KEYS)
+!    5	6	1-JAN-78	SB	FIX FBYKEY SO SIDRELEMENT IS RIGHT
+!    IF 1ST SIDR PTR IS DELETED.
+!
+!    *************************************************
+!    *						*
+!    *		NEW REVISION HISTORY		*
+!    *						*
+!    *************************************************
+!
+!    PRODUCT	MODULE	 SPR
+!    EDIT	 EDIT	 QAR		DESCRIPTION
+!    ======	======	=====		===========
+!
+!
+!    ***** END OF REVISION HISTORY *****
+!
+!    ***** Start version 2 development *****
+!
+!    PRODUCT	MODULE	 SPR
+!    EDIT	 EDIT	 QAR		DESCRIPTION
+!    ======	======	=====		===========
+!
+!    300	300	XXXXX		MAKE DBUG=1 WORK.
+!
+!    301	301	XXXXX		SUPPORT EXTENDED ADDRESSING.
+!
+!    400	400	xxxxx		Cleanup BLISS code
+!
+!   404		--	xxxxx		Fix XCOPY typo, where a "." is
+!					incorrectly placed in front of
+!					TUBUFF. (RL, 11-May-83)
+!-
+
+REQUIRE 'RMSREQ';
+
+%SBTTL 'FIDXSEQ -- find next sequential record'
+
+GLOBAL ROUTINE fidxseq (recdesc, databd) =
+! FIDXSEQ
+! =======
+! ROUTINE TO FIND THE NEXT SEQUENTIAL RECORD IN
+!	AN INDEXED FILE.  THIS ROUTINE MUST DETERINE
+!	THE CURRENT POSITION IN THE FILE AND THEN ATTEMPT
+!	TO LOCATE THE NEXT SEQUENTIAL RECORD.  ALL ERROR
+!	CODES ARE GENERATED WITHIN THIS ROUTINE (OR THE
+!	ROUTINES IT CALLS).
+! INPUT:
+!	RECDESC		RECORD DESCRIPTOR PACKET
+!		<NO FIELDS USED AS INPUT>
+!
+!	DATABD		BUCKET DESCRIPTOR OF CURRENT BUCKET (IF ANY)
+! OUTPUT:
+!	TRUE:	RECORD LOCATED WITHIN BUCKET
+!	FALSE:	ERROR
+!		BUSY
+!		NO MEMORY AVAILABLE
+!		END-OF-FILE
+! ROUTINES CALLED:
+!	POSCUR
+!	GETKDB
+! INPUT ARGUMENTS MODIFIED:
+!	RECORD DESCRIPTOR:
+!		RECPTR		ADDRESS OF RECORD IN BUCKET
+!		RFA		RFA OF CURRENT RECORD
+!		RRV		RRV ADDRESS OF CURRENT RECORD
+! NOTES:
+!
+!	1.	THE BUCKET DESCRIPTOR (DATABD) WHICH IS PASSED TO THIS
+!		ROUTINE MAY NOT BE NULL. IN THIS CASE, FBYRFA MUST DETERMINE
+!		IF THE NEW RECORD IS ON THE SAME BUCKET AS THE CURRENT
+!		RECORD AND IF NOT, RELEASE THE CURRENT BUCKET.
+    BEGIN
+
+    MAP
+	recdesc : REF BLOCK,
+	databd : REF BLOCK;
+
+    REGISTER
+	tempac;					! TEMP REGISTER
+
+    LOCAL
+	nrpkeyofref,
+	recordptr : REF BLOCK;			! PTR TO DATA RECORD
+
+    TRACE ('FIDXSEQ');
+
+    !+
+    !    FIRST, WE MUST SET UP OUR KEY DESCRIPTOR BLOCK
+    !-
+
+    nrpkeyofref = .rst [rstnrpref];		! GET NRP KEY OF REF
+
+    IF (kdb = getkdb (.nrpkeyofref)) EQL false	! LOCATE THE KDB
+    THEN
+	rmsbug (msgkdb);			! BAD KRF
+
+!+
+!    NOW, WE MUST SET UP THE RP RFA, RRV ADDRESS, AND
+!    KEY STRING DESCRIPTOR FOR THE CURRENT RECORD
+!-
+    recdesc [rdrrv] = .rst [rstnrprrv];		! RRV FORMAT
+    recdesc [rdrfa] = .rst [rstnrp];		! RFA FORMAT
+    recdesc [rdusersize] = .kdb [kdbksz];	! USE FULL KEY SIZE
+    recdesc [rduserptr] = .rst [rstkeybuff];	! ADDR OF KEY
+    recdesc [rdsidrelement] = .rst [rstsidrelement];
+!+
+!    INDICATE THAT THE LAST OPERATION WAS NOT A $FIND
+!    SO THAT WE WILL PROCEED TO THE NEXT RECORD AFTER
+!    THE NRP
+!-
+    rst [rstlastoper] = 0;
+
+    !+
+    !    POSITION TO THE CORRECT RECORD
+    !-
+
+    tempac = posnext (%(RD)%.recdesc, %(BKT)%.databd);
+!+
+!    ON RETURN, WE MAY HAVE TO FLUSH THE BUCKET THAT WAS
+!    ALLOCATED IN THE ROUTINE, SO WE MUST CHECK TO SEE
+!    IF THE BUCKET DESCRIPTOR IS NULL.
+!-
+
+    IF (.tempac EQL false) AND ( NOT nullbd (databd))
+    THEN
+	%(FLUSH THE BUCKET)%
+	BEGIN
+	putbkt (%(NO UPDATE)%false, %(BUCKET)%.databd);
+	tempac = false
+	END;%(OF IF FAILED AND THERE WAS A BKT DESC)%
+
+    !+
+    !    SET UP THE RRV VALUE FOR THE CURRENT RECORD POSITION
+    !-
+
+    recordptr = .recdesc [rdrecptr];		! GET PTR TO RECORD
+    recdesc [rdrrv] = .recordptr [drrrvaddress];
+
+    !+
+    !    RETURN THE STATUS TO FINDIDX
+    !-
+
+    RETURN .tempac
+    END;
+
+%(OF FIDXSEQ)%
+%SBTTL 'FBYKEY - Find indexed record by key'
+
+GLOBAL ROUTINE fbykey (recdesc, databd) =
+! FBYKEY
+! ======
+! ROUTINE TO PROCESS THE $FIND MACRO WITH KEY ACCESS IN
+!	AN INDEXED FILE. THIS ROUTINE PERFORMS THE FOLLOWING
+!	FUNCTIONS:
+!
+!	1.	LOCATE THE DATA RECORD BY TRAVERSING THE INDEX
+!	2.	CHECK THAT THE RECORD FOUND HAS KEY ATTRIBUTES
+!		WHICH THE USER WANTED.
+! INPUT:
+!	RECDESC		RECORD DESCRIPTOR PACKET
+!		FLAGS		<NULL>
+!
+!	DATABD		BUCKET DESCRIPTOR OF DATA LEVEL (RETURNED)
+! OUTPUT:
+!	TRUE:	RECORD FOUND
+!	FALSE:	ERROR
+!		RECORD NOT FOUND
+! INPUT ARGUMENTS MODIFIED:
+!	RECORD DESCRIPTOR:
+!		RECPTR		ADDRESS OF USER DATA RECORD
+!		SIDRELEMENT	OFFSET INTO CURRENT SIDR OF RECORD POINTER
+! NOTES:
+!
+!	1.	ON ERROR RETURN, THE ERROR CODE WILL BE SET UP
+!
+!	2.	NOTE THAT THIS ROUTINE DOES NOT LOCK THE INDEX.
+!
+!	3.	ON INPUT TO THIS ROUTINE, THE INDEX IS ALREADY LOCKED.
+    BEGIN
+
+    MAP
+	recdesc : REF BLOCK,
+	databd : REF BLOCK;
+
+    EXTERNAL
+	tubuff;					! TEMP IN-SECTION BUFFER FOR USER KEY...
+
+    ! ...(KBF moved here if not in RMS's section)
+
+    LABEL
+	loop,
+	iteration;
+
+    REGISTER
+	tempac;
+
+    LOCAL
+	savekdb,
+	temp,
+	lencopy,                        ! NUMBER OF WORDS IN KEY BUFFER
+	recordptr : REF BLOCK,          ! TEMP PTR TO DATA RECORD
+	savedstatus,                    ! TEMP STORAGE FOR STATUS
+	errorcode,                      ! (SAVEDSTATUS COPIED FOR ERROR MACRO)
+	keyofreference,
+	rprfa,                          ! RFA OF CURRENT RECORD
+	arrayptr : REF BLOCK,           ! PTR TO CURRENT POINTER ARRAY
+	udrptr : REF BLOCK,             ! PTR TO USER DATA RECORD
+	sidrptr : REF BLOCK,            ! PTR TO CURRENT SIDR
+	rfaofudr,                       ! RFA OF USER DATA RECORD
+	rfaofsidr,                      ! RFA OF SECONDARY DATA RECORD
+	udrbd : BLOCK [bdsize];         ! BKT DESC FOR UDR BUCKET
+                                        
+    TRACE ('FBYKEY');
+    savedstatus = true;                 ! INIT STATUS INDICATOR
+
+    !+
+    !    SET UP THE CORRECT KEY DESCRIPTOR
+    !-
+
+    keyofreference = .rab [rabkrf, 0];
+
+    IF (kdb = getkdb (.keyofreference)) EQL false THEN returnstatus (er$krf);
+
+!
+!	Check the key size and set it up
+!
+
+    recdesc [rdusersize] = 
+                         (tempac =
+                                  MIN (.rab [rabksz, 0], .kdb[kdbksz])); !616
+
+    IF (.tempac GTR .kdb [kdbksz])
+    OR (.tempac EQL 0)
+    THEN        ! KSZ is invalid, complain if byte-oriented datatype
+        IF .dtptable [.kdb [kdbdtp], dtpbytesize] NEQ %BPVAL      !A411
+        THEN returnstatus (er$ksz);
+
+!
+!	Set up the search key in the Record Descriptor packet
+!
+
+    IF (recdesc [rduserptr] = (tempac = .rab [rabkbf, 0])) LSS minuserbuff
+    THEN returnstatus (er$kbf);
+
+    IF .rmssec NEQ 0
+    THEN
+	BEGIN
+
+	IF .tempac<lh> EQL 0			!Default to RAB's section
+	THEN
+	    tempac = .tempac OR .blksec;
+
+	IF .tempac<lh> NEQ .rmssec<lh>		!If not in RMS's section,
+	THEN 					! copy the key to this section.
+	    BEGIN
+	    lencopy = sizeinwords (.recdesc [rdusersize], .kdb [kdbkbsz]);
+	    xcopy (.tempac,			! Source		!M405
+		tubuff,				! Destination		!M405
+		.lencopy);			! Length in words	!M405
+	    recdesc [rduserptr] = tubuff	! Point to in-section key buffer
+	    END;
+
+	END;					!Of .RMSSEC ISNT ZERO
+
+    !+
+    !    USER KEY SPEC IS OK...GO DO THE FIND.
+    !-
+
+    !+
+    !    SEARCH THE INDEX STRUCTURE FOR THE TARGET RECORD
+    !-
+
+    recdesc [rdlevel] = datalevel;		! SEARCH TO DATA LEVEL
+
+    IF (tempac = fnddata (.recdesc, 		! TRAVERSE INDEX TO DATA
+	    .databd)) EQL false
+    THEN
+
+    !+
+    !    HOW DID WE DO?
+    !-
+
+	RETURN .tempac;
+
+!+
+!    WE SUCCEEDED IN GETTING TO THE DATA LEVEL. WE MUST NOW
+!    CHECK TO SEE IF THE KEY MEETS THE USER'S SPECIFICATIONS.
+!    ALSO, IT COULD BE DELETED OR ALL THE RFA PTRS IN THE
+!    SIDR COULD BE EMPTY.
+!
+!    THIS LOOP IS VERY LARGE AND IS EXECUTED UNTIL WE FIND A
+!    RECORD WHICH MEETS THE USER'S CRITERIA
+!-
+    loop :
+    BEGIN
+    repeat
+
+    %(FOREVER)%iteration :
+	BEGIN
+!+
+!    IF WE ARE POSITIONED PAST THE LAST RECORD IN
+!    THE FILE, OR IF THE BUCKET WAS EMPTY,
+!    THEN THE RECORD WAS NOT FOUND.
+!-
+
+	IF chkflag (recdesc [rdstatus], rdflgpst + rdflgempty) NEQ 0
+	THEN
+	    LEAVE loop WITH (savedstatus = er$rnf);
+
+	!+
+	!    IS THE KEY WE FOUND .GTR. THAN OUR SEARCH KEY?
+	!-
+
+	IF (lssflag (recdesc) NEQ 0)
+	THEN
+	    %(WE MUST CHECK FOR APPROX SEARCH)%
+	    BEGIN
+!+
+!    DID THE USER SPECIFY APPROX SEARCH? IF
+!    BOTH ROPKGT AND ROPKGE ARE OFF THEN HE
+!    WANTED AN EXACT MATCH AND WE DIDN'T FIND ONE
+!-
+	    rtrace (%STRING ('	K(S) < K(I)...', %CHAR (13), %CHAR (10)));
+
+	    IF (chkflag (rab [rabrop, 0], ropkgt + ropkge) EQL 0)
+	    THEN
+		%(HE WANTED AN EXACT MATCH)%LEAVE loop WITH (savedstatus = er$rnf)
+
+	    END %(OF IF LSSFLAG IS ON)%
+	ELSE
+	%(THIS WAS AN EXACT MATCH)%
+	    BEGIN
+!+
+!    DID HE WANT A RECORD WITH A KEY THAT
+!    WAS .GTR. THAN THIS ONE?
+!-
+
+	    IF (chkflag (rab [rabrop, 0], ropkgt) NEQ 0)
+	    THEN
+		BEGIN
+!+
+!    WE MUST SKIP A RECORD UNTIL WE
+!    FIND ONE THAT IS GREATER
+!-
+
+		UNTIL lssflag (recdesc) NEQ 0 DO
+		    BEGIN
+
+		    IF skiprecord (.recdesc, .databd, false) EQL false
+		    THEN
+			LEAVE loop WITH (savedstatus = er$rnf)
+
+		    END;%(OF UNTIL LSSFLAG IS ON)%
+
+		lookat ('	TARGET REC AT: ', recdesc [rdrecptr]);
+		END %(OF IF HE WANTED A GREATER THAN KEY)%
+
+	    END;%(OF ELSE THIS WAS AN EXACT MATCH)%
+
+!+
+!    WE ARE NOW POSITIONED AT THE CORRECT
+!    RECORD. IF THIS IS THE PRIMARY KEY,
+!    ALL WE MUST CHECK IS THAT THE RECORD
+!    ISNT'T DELETED
+!-
+!+
+!    FIRST, COMPUTE THE RFA OF THE CURRENT RECORD
+!    (UDR OR SIDR) FOR USE LATER.
+!-
+	recordptr = .recdesc [rdrecptr];	! RECORD PTR
+	rprfa = makerfa (.databd [bkdbktno], .recordptr [drrecordid]);
+
+	IF (.keyofreference EQL refprimary) AND (chkflag (recdesc [rdstatus], rdflgdelete) EQL 0)
+	THEN
+	    LEAVE loop WITH (savedstatus = true);
+
+!+
+!    EITHER THIS IS A DELETED PRIMARY
+!    KEY OR A SECONDARY KEY.
+!-
+
+	IF .keyofreference NEQ refprimary
+	THEN
+	    BEGIN
+!+
+!    THIS IS A SECONDARY KEY. WE
+!    MUST SCAN THE SIDR ARRAY, LOOKING
+!    FOR A NON-DELETED RECORD POINTER (RFA).
+!    IF WE FIND ONE, WE CAN GO ACCESS
+!    THE RECORD. IF NOT, WE CAN CHECK
+!    FOR A CONTINUATION SIDR RECORD
+!    AND CONTINUE PROCESSING IT.
+!-
+	    sidrptr = .recdesc [rdrecptr];
+
+	    !+
+	    !    COMPUTE # OF RECORD PTRS IN ARRAY
+	    !-
+
+	    tempac = .sidrptr [sidrrecsize] - .kdb [kdbkszw];
+	    lookat ('	SCANNING SIDR AT: ', sidrptr);
+	    lookat ('	# OF PTRS: ', tempac);
+	    arrayptr = (recordptr = .sidrptr + sidrhdrsize + .kdb [kdbkszw]);
+
+	    !+
+	    !    SCAN ALL RECORD POINTERS
+	    !-
+
+	    INCR j FROM 0 TO .tempac - 1 DO
+		BEGIN
+		rfaofudr = .recordptr [.j, wrd] AND ( NOT allrfaflags);
+
+		IF (.rfaofudr NEQ nullrfa)
+		THEN
+		    BEGIN
+
+		    !+
+		    !    WE FOUND AN RFA
+		    !-
+
+		    lookat ('	RFA FOUND: ', rfaofudr);
+!+
+!    SET UP THE INPUT RFA SO WE CAN
+!    LOCATE THE DATA RECORD BY RFA
+!-
+
+		    !+
+		    !    WE MUST FIRST SET UP THE PRIMARY KDB
+		    !-
+
+		    savekdb = .kdb;		! SAVE CURRENT KDB
+		    kdb = .fst [fstkdb];	! GET PRIMARY
+		    recdesc [rdrfa] = .rfaofudr;
+		    temp = fbyrrv (%(RD)%.recdesc, %(BKT)%udrbd);
+		    kdb = .savekdb;		! RESTORE KDB
+
+		    IF .temp EQL false
+		    THEN
+			BEGIN
+			rtrace (%STRING ('	**RRV NOT FOUND', %CHAR (13), %CHAR (10)));
+
+			IF .usrsts NEQ su$suc THEN LEAVE loop WITH (savedstatus = .usrsts)
+
+			END %(OF IF .TEMP IS FALSE)%
+		    ELSE
+			BEGIN
+!+
+!    WE FOUND THE USER DATA RECORD.
+!    WE MUST NOW CHECK TO
+!    SEE IF IT IS DELETED
+!-
+			udrptr = .recdesc [rdrecptr];
+
+			!+
+			!    IS THIS RECORD DELETED?
+			!-
+
+			IF deleteflag (udrptr) EQL 0
+			THEN
+			    %(THIS RECORD IS OK)%
+			    BEGIN
+			    lookat ('	FOUND UDR AT: ', udrptr);
+
+			    !+
+			    !    FLUSH THE SIDR BKT
+			    !-
+
+			    putbkt (false, .databd);
+
+			    !+
+			    !    COMPUTE OFFSET INTO THIS ARRAY
+			    !-
+
+			    recdesc [rdsidrelement] = .recordptr - .arrayptr + .j + 1;	!**[5]**
+!+
+!    MAKE THE USER DATA BKT THE
+!    CURRENT BKT TO BE RETURNED.
+!-
+			    movebktdesc (%(FROM)%udrbd, %(TO)%databd);
+			    LEAVE loop WITH (savedstatus = true)
+			    END;%(OF IF UDR WASNT DELETED)%
+
+!+
+!    AT THIS POINT, THE UDR WAS DELETED,
+!    SO WE MUST RELEASE IT AND GO BACK
+!    AND FINISH OUR SIDR SCAN
+!-
+			rtrace (%STRING ('	UDR EQL DELETED', %CHAR (13), %CHAR (10)));
+
+			!+
+			!    RELEASE IT'S BUCKET
+			!-
+
+			putbkt (false, udrbd);
+			END;			!END OF "ELSE UDR FND"
+
+		    END;%(OF IF NULLSIDRFLAG IS OFF)%
+
+		END;%(OF IF SIDR POINTER SCAN LOOP)%
+
+	    !+
+	    !    RESTORE THE PTR TO THE CURRENT SIDR
+	    !-
+
+	    recdesc [rdrecptr] = .sidrptr
+	    END;%(OF IF THIS IS A SECONDARY KEY)%
+
+!+
+!    AT THIS POINT, WE HAVE LOCATED A DELETED
+!    PRIMARY DATA RECORD OR A SECONDARY DATA RECORD
+!    WHICH CONTAINS ONLY DELETED RECORD POINTERS.
+!    WE THEREFORE MUST SKIP OVER THE CURRENT RECORD
+!    AND POSITION TO THE NEXT ONE.
+!-
+	rtrace (%STRING ('	SKIPPING TO NEXT REC...', %CHAR (13), %CHAR (10)));
+
+	IF skiprecord (.recdesc, .databd, false) EQL false
+	THEN
+
+	!+
+	!    DID WE DO IT?
+	!-
+
+	    LEAVE loop WITH (savedstatus = er$rnf);
+
+!+
+!    WE HAVE NOW SKIPPED THE CURRENT RECORD
+!    SO WE CAN GO BACK AND SEE IF WE CAN USE
+!    THIS NEW RECORD.
+!-
+	rtrace (%STRING ('	**NEW INTERATION...', %CHAR (13), %CHAR (10)))
+	END;%(OF  REPEAT FOREVER)%
+
+    END;%( OF LOOP: )%
+!+
+!    COME HERE WHEN WE HAVE FINISHED THE OPERATION.
+!    HOWEVER, WE MUST CHECK IF IT WAS SUCCESFUL.
+!    NOTE THAT WHEN WE GET HERE, VREG WILL CONTAIN EITHER
+!    "TRUE" OR THE ERROR CODE.
+!-
+
+    IF .savedstatus NEQ true
+    THEN
+	BEGIN
+
+	!+
+	!    FLUSH THE DATA BUCKET
+	!-
+
+	putbkt (%(NO)%false, %(BKT)%.databd);
+	lookat ('	ERROR CODE FROM FBYKEY: ', savedstatus);
+	errorcode = .savedstatus;%( This variable for MACRO )%
+	returnstatus (.errorcode)
+	END;%(OF IF THERE WAS AN ERROR)%
+
+!+
+!    COME HERE IF THERE WAS NO ERROR DURING THE
+!    "FINDING" OF THE RECORD. WE MUST NOW SET UP
+!    THE RFA OF THE CURRENT RECORD (UDR OR SIDR) AND
+!    THE RRV ADDRESS (ONLY UDR).
+!-
+    recordptr = .recdesc [rdrecptr];		! PTR TO UDR
+    recdesc [rdrrv] = .recordptr [drrrvaddress];
+
+    !+
+    !    NOW, FORM THE ID OF THE RP
+    !-
+
+    recdesc [rdrfa] = .rprfa;
+    RETURN true
+    END;
+
+%(OF FBYKEY)%
+%SBTTL 'FRECRFA - find record at RFA'
+
+GLOBAL ROUTINE frecrfa (recdesc, databd) =
+! FRECRFA
+! =======
+! ROUTINE TO FIND A SPECIFIED RECORD BY ITS RFA ADDRESS.
+!	THIS ROUTINE IS CALLED ONLY DIRECTLY FROM FINDIDX.
+!	IT IS NOT CALLED INTERNALLY WHEN A RECORD NEEDS TO FOUND
+!	BY THE RFA ADDRESS. THIS ROUTINE IS A SEPARATE ONE MERELY
+!	TO AVOID CLUTTERING UP THE MAIN PROGRAM WITH SPECIAL ERROR
+!	MESSAGE MANIPULATIONS.
+! INPUT:
+!	RECDESC		RECORD DESCRIPTOR PACKET
+!
+!	DATABD		BUCKET DESCRIPTOR OF DATA BUCKET (RETURNED)
+! OUTPUT:
+!	TRUE:		RECORD WAS FOUND
+!	FALSE:		ERROR
+!			RECORD NOT FOUND
+!			BAD RFA
+! ROUTINES CALLED:
+!	FBYRRV
+    BEGIN
+
+    MAP
+	recdesc : REF BLOCK,
+	databd : REF BLOCK;
+
+    REGISTER
+	reg2 = 2,
+	savedstatus;				! SAVE THE RESULTS HERE
+
+    TRACE ('FRECRFA');
+
+    !+
+    !    SET UP THE USER'S RFA IN THE PACKET
+    !-
+
+    IF (recdesc [rdrfa] = .rab [rabrfa, 0]) EQL 0 THEN returnstatus (er$rfa);	! DONT ALLOW BAD RFA'S
+
+!+
+!    WE MUST NOW CHECK TO SEE IF THIS PAGE EVEN EXISTS. THIS
+!    IS BECAUSE IF THE FILE IS ONLY BEING READ, THE MONITOR
+!    WON'T LET US CREATE A NEW PAGE (I.E., MAP A NON-EXISTENT
+!    PAGE AND TOUCH IT).
+!-
+
+    !+
+    !    DOES THIS PAGE EXIST?
+    !-
+
+    IF pagexist (.fst [fstjfn], bucketofrfa (.rab [rabrfa, 0])) EQL false THEN returnstatus (er$rfa);
+
+    !+
+    !    TRY TO LOCATE THE RECORD
+    !-
+
+    IF (savedstatus = fbyrrv (.recdesc, .databd)) EQL false
+    THEN
+
+    !+
+    !    WHAT HAPPENED?
+    !-
+
+	returnstatus (er$rnf);			! RECORD NOT FOUND ERROR
+
+!+
+!    AT THIS POINT, FBYRRV MIGHT HAVE SUCCEEDED BUT THE
+!    RECORD HAS BEEN DELETED. THEREFORE, WE MUST MAKE
+!    A SPECIAL CHECK FOR THIS CONDITION.
+!-
+
+    IF (chkflag (recdesc [rdstatus], rdflgdelete) NEQ 0)
+    THEN
+	BEGIN
+	putbkt (%(NO UPDATE)%false, %(BKT)%.databd);
+	returnstatus (er$del)			! RECORD IS DELETED
+	END;
+
+    !+
+    !    RETURN THE STATUS PASSED BACK TO US FROM FBYRRV
+    !-
+
+    RETURN .savedstatus;
+    END;
+
+%(OF FRECRFA)%
+%SBTTL 'POSRP - position to current record'
+
+GLOBAL ROUTINE posrp (recdesc, databd) =
+! POSRP
+! =====
+! ROUTINE TO POSITION TO THE CURRENT RECORD IN AN INDEXED FILE.
+!	THE CURRENT RECORD IS DENOTED BY A 3-TUPLE AS FOLLOWS:
+!
+!		1.	ADDRESS OF DATA RECORD (RFA)
+!		2.	ADDRESS OF RRV RECORD (RRV)
+!		3.	KEY STRING OF CURRENT RECORD
+!
+!	THE CURRENT POSITION IN THE FILE IS LOCATED ACCORDING
+!	TO THE ABOVE PARAMETERS IN THE GIVEN ORDER. THAT IS,
+!	WE TRY TO LOCATE THE DATA RECORD BY ITS RFA, THEN WE
+!	TRY THE RRV ADDRESS, THEN THE KEY STRING. IF ALL FAILS,
+!	THEN THE ORIGINAL POSITION AND EVERYTHING BEYOND IT HAS
+!	BEEN DELETED OR OTHERWISE REMOVED SOMEHOW.
+!
+!	FOR SECONDARY KEYS, WE MUST ATTEMPT TO LOCATE THE SIDR
+!	BY ITS RFA VALUE. HOWEVER, IF THAT FAILS, WE CAN ONLY
+!	RESORT TO THE ORIGINAL KEY STRING TO TRY TO LOCATE THE RECORD.
+! INPUT:
+!	RECDESC		RECORD DESCRITOR PACKET
+!		<NO FIELDS USED AS INPUT>
+!
+!	DATABD		BUCKET DESCRIPTOR OF CURRENT BUCKET (IF ANY)
+! OUTPUT:
+!	TRUE:		RECORD LOCATED
+!	FALSE:		RECORD COULD NOT BE FOUND
+! INPUT ARGS MODIFIED:
+!	RECORD DESCRIPTOR:
+!		RECPTR		ADDRESS OF RECORD IN BUCKET
+!
+! NOTES:
+!
+!	1.	IF THE INPUT BUCKET DESCRIPTOR (DATABD) IS NON-NULL,
+!		THEN IT IS USED AS THE CURRENT BUCKET TO SEE IF THE
+!		RECORD CAN BE LOCATED. IF THE RECORD IS NOT FOUND
+!		BY RFA, THE BUCKET IS FLUSHED AND A NEW ONE IS USED.
+!		HOWEVER, ALL OF THIS IS ACTUALLY DONE IN POSRFA.
+!
+!	2.	IF WE CANNOT LOCATE THE CURRENT RECORD BY ITS RFA
+!		AND IF IT IS A PRIMARY KEY, THEN WE MUST LOCATE IT
+!		BY IT'S RRV ADDRESS. NOTE THAT WE HAVE 2 CHOICES FOR
+!		LOCKING--WE CAN LOCK BOTH THE RRV AND THE UDR BUCKETS,
+!		OR WE CAN SIMPLY LOCK THE ENTIRE INDEX FOR THE DURATION
+!		OF THE OPERATION. THE SECOND APPROACH IS BETTER SINCE
+!		WE WILL HAVE TO LOCK THE INDEX ANYWAY IF WE CAN'T FIND
+!		THE RECORD BY ITS RRV AND MUST USE THE KEY, AND SINCE
+!		IT WILL TAKE 2 LOCKS IN EITHER CASE.
+    BEGIN
+
+    MAP
+	recdesc : REF BLOCK,
+	databd : REF BLOCK;
+
+    REGISTER
+	tempac,					! TEMP REGISTER
+	rfa : BLOCK [1];			! RFA OF CURRENT RECORD
+
+    TRACE ('POSRP');
+!+
+!    DO WE HAVE AN RFA? IF SO, WE MUST LOCATE THE
+!    APPROPRIATE DATA RECORD.
+!-
+
+    IF .recdesc [rdrfa] NEQ 0
+    THEN
+	%(TRY TO USE THE RFA)%
+	BEGIN
+
+	IF posrfa (%(RD)%.recdesc, %(BKT)%.databd) NEQ false
+	THEN
+
+	!+
+	!    DID WE FIND THE RECORD?
+	!-
+
+	    RETURN true;			! YES
+
+	rtrace (%STRING ('	DIDNT FIND BY RFA', %CHAR (13), %CHAR (10)))
+	END;%(OF IF RFA ISNT ZERO)%
+
+!+
+!    AT THIS POINT, WE MAY HAVE A CURRENT BUCKET WHICH WE
+!    MUST FLUSH. THIS COULD OCCUR IN TWO CASES:
+!
+!    1. WE CALLED POSRFA AND IT DIDNT FLUSH THE BUCKET (NORMAL)
+!    2. WE HAD A CURRENT BUCKET BUT THE NRP RFA (RDRFA) WAS ZERO
+!    THIS WOULD HAPPEN IF WE DID A $FIND-$GET ON A
+!    SECONDARY KEY SINCE THE RFA OF THE SIDR IS NOT
+!    KEPT ACROSS CALLS OF THIS KIND.
+!
+!-
+
+    IF NOT nullbd (databd) THEN putbkt (%(NO)%false, %(BKT)%.databd);
+
+    !+
+    !    IF WE HAD AN UNEXPECTED LOCKING ERROR, EXIT NOW
+    !-
+
+    IF .usrsts NEQ su$suc THEN RETURN false;
+
+!+
+!    WE NOW HAVE FAILED TO FIND THE CURRENT RECORD BY ITS RFA.
+!    SO, WE MUST TRY TO LOCATE IT BY ITS RRV ADDRESS
+!    OR MAYBE EVEN BY KEY. IF WE ARE LOCKING, THEN WE MUST ATTEMPT TO LOCK THE
+!    INDEX STRUCTURE.
+!-
+
+    IF locking AND ( NOT indexlocked)
+    THEN
+	BEGIN
+
+	IF lockindex (enqblk, enqshr) EQL false
+	THEN 					! WAIT FOR IT
+	    returnstatus (er$edq)		! SHOULD NOT FAIL
+	END;%(OF IF LOCKING)%
+
+!+
+!    HMMM...WE COULDN'T FIND THE RECORD BY ITS RFA VALUE.
+!    LET'S TRY THE RRV ADDRESS (IF THIS SUCCEEDS, THEN WE
+!    KNOW THAT THE DATA RECORD HAS MOVED TO A NEW BUCKET
+!    SINCE WE LAST ACCESSED IT) . NOTE THAT THIS IS DONE
+!    ONLY FOR PRIMARY KEYS.
+!-
+    recdesc [rdrfa] = .recdesc [rdrrv];
+
+    IF primarykey AND (.recdesc [rdrrv] NEQ 0)
+    THEN
+	%(TRY TO LOCATE BY RRV)%
+	BEGIN
+
+	IF fbyrrv (%(RD)%.recdesc, %(BKT)%.databd) NEQ false
+	THEN
+
+	!+
+	!    DID WE GET IT?
+	!-
+
+	    RETURN true;
+
+	rtrace (%STRING ('	COULDNT FIND REC BY RRV...', %CHAR (13), %CHAR (10)))
+	END;%(OF IF SEARCH FOR THE RRV)%
+
+!+
+!    AT THIS POINT, WE COULDN'T LOCATE THE RECORD
+!    EITHER BY ITS RFA OR BY ITS RRV ADDRESS (PRIMARY
+!    KEY ONLY). THEREFORE, WE MUST ATTEMPT THE LAST
+!    RESORT OF POSITIONING BY KEY.
+!-
+    rtrace (%STRING ('	POSITIONING BY KEY...', %CHAR (13), %CHAR (10)));
+    recdesc [rdlevel] = datalevel;		! GO ALL THE WAY
+    tempac = fnddata (%(RD)%.recdesc, %(BKT)%.databd);
+!+
+!    IF WE ARE PAST THE END OF A BUCKET, THEN WE KNOW THAT
+!    WE ARE AT THE EOF. SO, LET'S SET A FALSE VALUE AND RETURN.
+!-
+
+    IF pastlastflag (recdesc) NEQ 0 THEN returnstatus (er$eof);
+
+!+
+!    RETURN WITH THE RESULTS AND LET POSNEXT FIGURE
+!    OUT WHAT TO DO WITH IT.
+!-
+    RETURN .tempac
+    END;
+
+%(OF POSRP)%
+%SBTTL 'POSRFA - Find record by RFA'
+
+GLOBAL ROUTINE posrfa (recdesc, databd) =
+! POSRFA
+! ======
+! ROUTINE TO ATTEMPT TO FIND THE CURRENT RECORD BY ITS RFA
+!	ADDRESS. THIS ROUTINE MAY BE CALLED WITH A "CURRENT
+!	BUCKET". IT WILL USE THAT BUCKET IF POSSIBLE. IF NOT,
+!	IT WILL RELEASE IT AND GET A NEW BUCKET TO USE TO SEARCH
+!	FOR THE RECORD.
+!
+!	THIS ROUTINE MUST NOT ONLY LOCATE THE RECORD BY ITS RFA,
+!	BUT IT MUST ALSO CHECK TO INSURE THAT THE RECORD IS, IN FACT,
+!	THE ONE REPRESENTED BY THE "CURRENT-RECORD". FOR PRIMARY
+!	KEYS, THIS MEANS THE RRV ADDRESS MUST ALSO AGREE. FOR
+!	SECONDARY KEYS, THE KEY STRING MUST BE COMPARED (NOTE THAT
+!	THIS KEY COMPARISON COULD ONLY FAIL IF THE SIDR RECORD MOVED,
+!	THE ORIGINAL BUCKET RAN OUT OF ID'S, AND A NEW SIDR RECORD
+!	WAS INSERTED WHICH GOT THE SAME ID AS THE ORIGINAL SIDR THAT
+!	MOVED EARLIER. SINCE THIS IS AN EXTREMELY RARE OCCURANCE, WE WILL
+!	OPTIMIZE THIS ALGORITHM BY NOT CHECKING THE KEY STRING
+!	FOR EQUALITY. WHEN A BUCKET RUNS OUT OF ID'S, WE WILL TELL
+!	THE USER TO RE-ORGANIZE THE FILE.
+! INPUT:
+!	RECDESC		RECORD DESCRIPTOR PACKET
+!		RFA		RFA OF TARGET RECORD
+!
+!	DATABD		BUCKET DESCRIPTOR OF CURRENT BUCKET(IF ANY)
+! OUTPUT:
+!	TRUE:		RECORD FOUND
+!	FALSE:		RECORD NOT FOUND
+!			BUCKET IS BUSY
+!			ENQ/DEQ ERROR
+!
+! INPUT ARGS MODIFIED:
+!	RECORD DESCRIPTOR:
+!		RECPTR		ADDRESS OF TARGET RECORD
+! ROUTINES CALLED:
+!	FBYRFA
+!	CKEYKK
+!	PUTBKT
+! NOTES:
+!
+!	1.	THE INPUT BUCKET DESCRIPTOR (DATABD) MAY BE NON-NULL,
+!		IN WHICH CASE WE CAN GET THE NEXT RECORD WITHOUT
+!		RELEASING THE CURRENT BUCKET.
+!
+!	2.	THIS ROUTINE MAY RETURN (ONLY ON AN ERROR) THE INPUT
+!		BUCKET DESCRIPTOR WITHOUT RELEASING IT. IT IS THEREFORE
+!		THE RESPONSIBILITY OF "POSRP" TO FLUSH THE CURRENT
+!		BUCKET.
+!
+!	3.	IT MAY BE TRUE THAT THIS ROUTINE WILL POSITION TO
+!		A RECORD WHICH IS IN THE SAME BUCKET AS THE CURRENT
+!		RECORD. IN FACT, IT WILL ALWAYS BE TRUE EXCEPT IN THE
+!		CASE OF A $FIND RANDOM/$FIND SEQUENTIAL SEQUENCE (BECAUSE
+!		THE $FIND SEQ OPERATES ON THE NRP, NOT THE RP). IF SO,
+!		THEN THIS ROUTINE WILL ATTEMPT NOT TO UNLOCK THE CURRENT
+!		BUCKET IN THE PROCESS OF ACCESSING THE "NRP" RECORD.
+    BEGIN
+
+    MAP
+	recdesc : REF BLOCK,
+	databd : REF BLOCK;
+
+    REGISTER
+	tempac,					! TEMP REGISTER
+	rfa : BLOCK [1],			! TARGET RFA
+	recordptr : REF BLOCK;			! PTR TO TARGET RECORD
+
+    LOCAL
+	currentbucket,				! # OF CURRENT BUCKET
+	lockflag,				! TRUE IF WE LOCK EACH BUCKET
+	savedstatus,				! SAVE RESULTS OF LAST ROUTINE
+	foundrfa,				! TRUE IF WE FOUND RECORD BY RFA
+	keypointer : REF BLOCK;			! PTR TO SIDR KEY
+
+    TRACE ('POSRFA');
+
+    !+
+    !    FETCH THE RFA VALUE FROM THE RECORD DESCRIPTOR
+    !-
+
+    rfa = .recdesc [rdrfa];
+    lookat ('	TRY TO LOCATE RFA: ', rfa);
+    recdesc [rdrecptr] = 0;
+!+
+!    IF WE HAVE A CURRENT BUCKET, AND IF THE RFA WE ARE TRYING
+!    TO LOCATE IS IN IT, THEN WE DON'T WANT TO UNLOCK THE BUCKET.
+!    IF THERE IS NO CURRENT BUCKET, WE MUST LOCATE THE RFA AND
+!    LOCK THE BUCKET WHEN WE DO SO.
+!-
+    foundrfa = false;				! ASSUME WE DON'T FIND IT
+
+    IF ( NOT nullbd (databd))			! IS THERE A CURRENT BUCKET?
+	AND (bucketofrfa (.rfa) EQL .databd [bkdbktno])
+    THEN
+    %(WE ALREADY HAVE THE CORRECT BUCKET)%
+	BEGIN
+	rtrace (%STRING ('	RFA 1 CURRENT BKT...', %CHAR (13), %CHAR (10)));
+
+	!+
+	!    NOW, TRY TO LOCATE THE RFA ON THE CURRENT BUCKET
+	!-
+
+	IF sdatabkt (%(RD)%.recdesc, %(BKT)%.databd) NEQ false
+	THEN
+	    foundrfa = 1			! GOT IT
+	END;%(OF IF WE HAVE THE RIGHT BUCKET)%
+
+!+
+!    AT THIS POINT, ONE OF THE FOLLOWING IS TRUE:
+!
+!    1.	WE LOCATED THE RFA ON THE CURRENT BUCKET (FOUNDRFA=1)
+!    2.	THERE WAS NO CURRENT BUCKET
+!    3.	THE CURRENT BUCKET DID NOT CONTAIN THE RFA
+!
+!    FOR THE LAST 2 CONDITIONS, WE MUST RELEASE THE CURRENT BUCKET,
+!    IF ANY, AND ATTEMPT TO LOCATE THE RFA DIRECTLY.
+!-
+
+    IF .foundrfa EQL false
+    THEN
+	%(KEEP LOOKING)%
+	BEGIN
+
+	!+
+	!    RELEASE CURRENT BUCKET
+	!-
+
+	IF NOT nullbd (databd) THEN putbkt (%(NO)%false, %(BKT)%.databd);
+
+!+
+!    WE NOW MUST LOCATE THE RFA RECORD. IF WE ARE LOCKING,
+!    THEN WE MUST ALSO INSURE THAT WE CAN SEARCH THE
+!    BUCKET SAFELY. FOR PRIMARY KEYS, WE WILL LOCK THE
+!    BUCKET BEFORE WE SEARCH IT. FOR SECONDARY KEYS, WE MUST
+!    LOCK THE FILE'S INDEX STRUCTURE SINCE WE WILL BE
+!    SEARCHING ONE OF THE SIDR BUCKETS.
+!-
+	lockflag = false;			! ASSUME NO LOCKING
+
+	IF locking
+	THEN
+	    BEGIN
+
+	    IF primarykey
+	    THEN
+		lockflag = true
+	    ELSE
+		BEGIN
+
+		IF lockindex (enqblk, enqshr) EQL false
+		THEN 				! LOCK INDEX
+		    returnstatus (er$edq)
+
+		END %(OF ELSE SECONDARY KEY)%
+
+	    END;%(OF IF LOCKING)%
+
+	!+
+	!    LOCATE THE RECORD
+	!-
+
+	recdesc [rdrecptr] = 0;			! START AT TOP
+
+	IF (tempac = fbyrfa (%(RD)%.recdesc, %(BKT)%.databd, %(LOCK)%.lockflag)) EQL false
+	THEN
+	    RETURN .tempac
+
+	END;%(OF IF FOUNDRFA IS FALSE)%
+
+!+
+!    WE HAVE NOW LOCATED THE CORRECT RFA. HOWEVER,
+!    FOR PRIMARY KEYS, WE MUST CHECK THE RRV ADDRESS ALSO.
+!    FOR SECONDARY KEYS, WE MUST COMPARE THE KEY STRING
+!    TO INSURE THAT A NEW ID HASN'T BEEN ALLOCATED SINCE
+!    WE LAST ACCESSED THIS RECORD (WHICH HAS NOW MOVED)
+!-
+    recordptr = .recdesc [rdrecptr];		! GET PTR TO RECORD
+
+    IF primarykey
+    THEN
+	%(PRIMARY KEY)%
+	BEGIN
+
+	!+
+	!    CHECK FOR CORRECT RRV
+	!-
+
+	IF rrvflag (recordptr) EQL 0		! THIS CAN'T BE AN RRV
+	THEN
+
+	    IF .recdesc [rdrrv] EQL .recordptr [drrrvaddress] THEN %(THIS IS THE PLACE)%RETURN true;
+
+	END
+    ELSE
+    %(SECONDARY KEYS)%
+	BEGIN
+!+
+!    THIS NEXT COMPARISON IS NECESSARY <<<ONLY>>>
+!    IF THE ID'S IN THE SIDR BUCKET RUN OUT AND
+!    THE FILE IS NOT RE-ORGANIZED. OTHERWISE,
+!    IT IS SUPERFLUOUS. THUS, FOR NOW, WE WILL COMMENT
+!    OUT THE CODE FOR SPEED.
+!-
+!		RTRACE ('	COMPARING KEY...?M?J');
+!		KEYPOINTER = .RECORDPTR + SIDRHDRSIZE;
+!		IF CKEYKK (	%RD%	.RECDESC,   ! ARE THE KEYS EQUAL?
+!				%PTR%	.KEYPOINTER ) ISNT FALSE
+!
+!				AND
+!
+!			( LSSFLAG ( RECDESC ) IS OFF )
+!		THEN	%WE FOUND IT%
+	RETURN true
+	END;%(OF ELSE IF SECONDARY KEY)%
+
+!+
+!    WE COULDN'T FIND THE RECORD BY ITS RFA FOR SOME
+!    REASON. SO, FLUSH THE BUCKET AND EXIT
+!-
+    rtrace (%STRING ('	COULDNT FIND RFA RECORD...', %CHAR (13), %CHAR (10)));
+    putbkt (%(NO)%false, %(BKT)%.databd);
+    RETURN false
+    END;
+
+%(OF POSRFA)%
+%SBTTL 'POSNEXT - position to next record'
+
+GLOBAL ROUTINE posnext (recdesc, databd) =
+! POSNEXT
+! =======
+! ROUTINE TO POSITION AN INDEXED FILE TO THE "NEXT" RECORD
+!	TO BE ACCESSED. THIS ROUTINE IS CALLED PRIMARILY
+!	WHEN A $FIND OR $GET SEQUENTIAL HAS BEEN DONE.
+!	IT THEN MUST POSITION TO THE CURRENT RECORD-POINTER
+!	POSITION IN THE FILE, AND THEN LOCATE THE FOLLOWING
+!	RECORD IN SEQUENCE.
+!
+!	THERE IS A SPECIAL CASE CONDITION WHEN THE NRP
+!	IS ZERO (I.E., THIS IS THE FIRST $GET DONE AFTER
+!	THE CONNECT TO THE FILE). IN THAT CASE, THE FIRST
+!	NON-DELETED RECORD IN THE FILE SHOULD BE LOCATED
+!	AND RETURNED AS THE CURRENT POSITION. THE KEY
+!	STRING WHICH IS USED IN THIS CASE IS ALL ZERO (SINCE
+!	THE KEY BUFFER WAS CLEARED WHEN IT WAS ALLOCATED).
+! INPUT:
+!	RECDESC		RECORD DESCRIPTOR PACKET
+!		RFA		RFA OF NRP DATA RECORD
+!		RRV		ADDRESS OF DATA RECORD RRV
+!		USERPTR		ADDRESS OF KEY STRING FOR CURRENT RECORD
+!		USERSIZE	SIZE OF KEY STRING FOR CURRENT RECORD
+!		SIDRELEMENT	OFFSET INTO CURRENT SIDR OF RECORD POINTER
+!
+!	DATABD		BUCKET DESCRIPTOR OF CURRENT BUCKET (IF ANY)
+! OUTPUT:
+!	TRUE:		RECORD LOCATED
+!	FALSE:		NO RECORD POSITION FOUND
+!			BUSY
+!			NO MEMORY FOR BUCKETS
+!			NO NEXT RECORD FOUND (ALL DELETED)
+!
+! INPUT ARGUMENTS MODIFIED:
+!	RECORD DESCRIPTOR:
+!		RFA	RFA OF CURRENT RECORD (UDR OR SIDR)
+! NOTES:
+!
+!	1.	THIS ROUTINE MAY RETURN A FALSE VALUE AND AN
+!		ALLOCATED BUCKET. IF SO, IT IS THE CALLER'S
+!		RESPONSILBILITY TO FLUSH THE BUCKET WHICH IS
+!		RETURNED.
+!
+!	2.	PRIMARY DATA BUCKETS ARE LOCKED AS THEY ARE SKIPPED
+!		IF WE ARE USING THE PRIMARY KEY. SIDR BUCKETS ARE NOT
+!		LOCKED AND THE PRIMARY DATA BUCKETS POINTED TO BY THE
+!		THE SIDR'S AREN'T LOCKED EITHER (TO AVOID UNNECESSARY
+!		LOCKING) SINCE THE ENTIRE INDEX IS ALREADY LOCKED.
+! ROUTINES CALLED:
+!	POSRP
+    BEGIN
+
+    MAP
+	recdesc : REF BLOCK,
+	databd : REF BLOCK;
+
+    REGISTER
+	tempac,					! TEMPORARY AC
+	recordptr : REF BLOCK;			! POINTER TO CURRENT RECORD
+
+    LOCAL
+	pointercount,				! # OF ELEMENTS IN SIDR ARRAY
+	sidrptr : REF BLOCK,			! PTR TO CURRENT SIDR
+	arrayptr : REF BLOCK,			! PTR TO CURRENT POINTER ARRAY
+	currentoffset,				! OFFSET INTO CURRENT ARRAY
+	udrbd : BLOCK [bdsize],			! BKT DESC FOR UDR BUCKET
+	rfaofudr,				! ADDRESS OF UDR
+	savedstatus;				! RESULTS OF LAST SUBROUTINE CALL
+
+    LITERAL
+	lockprimary = 1,			! LOCK THE PRIMARY BUCKETS
+	dontlock = false;			! DON'T LOCK SECONDARY BUCKETS
+
+    LABEL
+	scansidr,
+	loop2;
+
+    TRACE ('POSNEXT');
+!+
+!    FIRST, POSITION TO THE RECORD WHICH REPRESENTS
+!    THE NRP. IN OTHER WORDS, ATTEMPT TO POSITION TO THE
+!    LOCATION WITHIN THE FILE AT WHICH WE CAN BEGIN OUR
+!    SCAN OF THE DATA RECORDS.
+!-
+
+    IF (tempac = posrp (%(RD)%.recdesc, %(BKT)%.databd)) EQL false THEN RETURN .tempac;
+
+!+
+!    SINCE SIDR'S NEVER ARE ACTUALLY DELETED, WE MUST HAVE
+!    FOUND THE CORRECT SIDR EITHER BY RFA OR BY KEY. THUS,
+!    LET'S DO A QUICK CHECK TO MAKE SURE WE AREN'T AT THE END
+!    OF A BUCKET
+!-
+
+%IF dbug
+%THEN
+
+    IF pastlastflag (recdesc) NEQ 0 THEN rmsbug (msgflags);
+
+!+
+!    IF THE LAST OPERATION WAS A $FIND,
+!    THEN WE SHOULDN'T BE HERE
+!-
+
+    IF .rst [rstlastoper] EQL c$find THEN rmsbug (msgcantgethere);	!*********
+
+%FI
+
+    !+
+    !    SET UP THE RFA VALUE OF THE CURRENT RECORD
+    !-
+
+    recordptr = .recdesc [rdrecptr];		! FETCH PTR TO RECORD
+    recdesc [rdrfa] = makerfa (.databd [bkdbktno], .recordptr [drrecordid]);
+!+
+!    WE ARE NOW POSITIONED AT THE RECORD WHICH MEETS THE
+!    USER KEY SPECIFICATION. FOR PRIMARY KEYS, WE MUST POSITION
+!    THRU THE RECORDS UNTIL WE GET AN RRV ADDRESS MATCH.
+!    FOR SECONDARY KEYS, WE MUST SIMPLY COMPUTE THE OFFSET
+!    INTO THE POINTER ARRAY WHERE OUR RFA IS
+!-
+
+    IF primarykey
+    THEN
+	%(THIS IS A PRIMARY KEY)%
+	BEGIN
+	rtrace (%STRING ('	SCANNING UDRS...', %CHAR (13), %CHAR (10)));
+!+
+!    AT THIS POINT, THE RECORD WE FOUND HAS THE
+!    KEY WHICH IS GREATER THAN OR EQUAL TO THE
+!    KEY OF THE CURRENT RECORD. IF THE FILE
+!    HAS DUPLICATES ALLOWED, THEN WE KNOW THAT THE
+!    RFA'S MUST ALSO AGREE BECAUSE RECORDS ARE NEVER
+!    SQUEEZED OUT FROM A FILE WITH DUPLICATES.
+!    FOR NON-DUPLICATES FILES, WE KNOW THAT WE
+!    HAVE FOUND A RECORD WITH THE SAME KEY VALUE
+!    AS OUR LAST POSITION IN THE FILE. EVEN IF THIS
+!    IS NOT THE ACTUAL RECORD THAT WE WERE POSITIONED
+!    AT, (THE REAL ONE GOT DELETED AND A NEW ONE
+!    WITH THE SAME KEY WAS INSERTED), IT IS STILL
+!    THE ONE WE WANT BECAUSE A RECORD IS DENOTED
+!    ONLY BY ITS KEY, NOT BY THE REST OF ITS CONTENTS.
+!-
+!+
+!    THE LAST OPERATION WAS NOT A $FIND.
+!    WE MUST CONTINUE TO SKIP RECORDS UNTIL
+!    WE GET A NON-DELETED ONE. HOWEVER, IF
+!    THIS IS THE FIRST TIME THRU THE LOOP
+!    AND THE FIRST $FIND WE HAVE DONE (NRP=0),
+!    THEN WE DONT WANT TO SKIP THE INITIAL
+!    RECORD.
+!-
+
+	INCR j FROM 1 TO plusinfinity DO
+	    BEGIN
+!+
+!    THIS MUST NOT BE THE FIRST ITERATION THRU
+!    THE LOOP IF THERE IS NO NRP, AND WE MUST
+!    NOT HAVE REACHED A RECORD WITH A KEY .GTR.
+!    THAN OUR SEARCH KEY. IF THIS IS TRUE, THEN
+!    WE CAN SKIP THE CURRENT RECORD.
+!-
+
+	    IF (((.j NEQ 1) OR (.recdesc [rdrrv] NEQ 0)) AND (lssflag (recdesc) EQL 0))
+	    THEN
+		BEGIN
+		lookat ('	SKIPPING REC AT: ', recdesc [rdrecptr]);
+
+		IF (tempac = skiprecord (.recdesc, .databd, lockprimary)) EQL false THEN RETURN .tempac
+
+		END;%(OF SKIPPING A RECORD)%
+
+	    !+
+	    !    CHECK THIS RECORD TO SEE IF DELETED
+	    !-
+
+	    IF chkflag (recdesc [rdstatus], rdflgdelete) EQL 0 THEN %(USE THIS RECORD)%RETURN true;
+
+!+
+!    CLEAR THE LESS-THAN FLAG SO WE WILL CONTINUE
+!    WITH THE NEXT RECORD
+!-
+	    clrflag (recdesc [rdstatus], rdflglss)
+	    END %(INCR J LOOP)%
+
+	END;%(IF PRIMARY KEY)%
+
+!+
+!    AT THIS POINT, WE MUST PROCESS THE SECONDARY KEY.
+!    WE HAVE LOCATED THE SIDR EITHER BY ITS RFA OR BY ITS KEY VALUE.
+!    WE MUST NOW SEARCH IT FOR THE RP WHICH WE HAVE.
+!    NOTE THAT WE MUST FIND THIS RP (FOR DUPLICATE SIDR'S) BECAUSE A RECORD
+!    POINTER IN A SIDR RECORD IS NEVER FLUSHED AWAY.
+!-
+
+    !+
+    !    START OUR SEARCH AT THE APPROPRIATE RECORD POINTER
+    !-
+
+    currentoffset = .recdesc [rdsidrelement];
+!+
+!    IF THE CORRECT SIDR HAS BEEN COMPRESSED, THEN WE WILL
+!    START AT THE TOP OF THE NEW SIDR (WHICH HAS A KEY GREATER
+!    THAN THE OLD SIDR)
+!-
+
+    IF lssflag (recdesc) NEQ 0 THEN currentoffset = 0;
+
+    !+
+    !    SET UP SOME PTRS, CTRS, ETC.
+    !-
+
+    sidrptr = .recdesc [rdrecptr];		! PTR TO SIDR
+    pointercount = .sidrptr [sidrrecsize] - .kdb [kdbkszw] - .currentoffset;
+
+    !+
+    !    CREATE A POINTER TO THE START -1 OF THE SIDR ARRAY
+    !-
+
+    arrayptr = .sidrptr + sidrhdrsize + .kdb [kdbkszw] - 1;	! PTR TO ARRAY
+    recordptr = .arrayptr + .currentoffset;
+    lookat ('	SIDRPTR: ', sidrptr);
+    lookat ('	POINTERCOUNT: ', pointercount);
+!+
+!    HERE, WE HAVE LOCATED THE RFA IN THE SERIES OF SIDR
+!    RECORDS. WE HAVE THE FOLLOWING VALUES:
+!
+!    RECORDPTR	=>	CURRENT ARRAY ELEMENT
+!    SIDRPTR		=>	CURRENT SIDR
+!    POINTERCOUNT	=	# OF PTRS REMAINING IN SIDR
+!
+!
+!-
+!+
+!    THE LAST OPERATION WAS NOT A $FIND, SO LOCATE THE
+!    NEXT NON-DELETED POINTER IN THE SIDR ARRAY
+!-
+    loop2 :
+    BEGIN
+    repeat
+
+    %(UNTIL WE GET A UDR)%
+	BEGIN
+
+	INCR j FROM 1 TO .pointercount DO
+	    BEGIN
+
+	    !+
+	    !    INCREMENT PTR NOW
+	    !-
+
+	    recordptr = .recordptr + 1;
+	    lookat ('	CHECKING SIDR AT: ', recordptr);
+
+	    !+
+	    !    IS THE POINTER DELETED?
+	    !-
+
+	    IF NOT deletedrfa (recordptr)
+	    THEN
+		BEGIN
+		rtrace (%STRING ('	RFA EQL NOT DELETED...', %CHAR (13), %CHAR (10)));
+
+		!+
+		!    GET THE RFA FROM THE ARRAY FOR THE UDR
+		!-
+
+		rfaofudr = .recordptr [wholeword] AND ( NOT allrfaflags);
+		recdesc [rdrfa] = .rfaofudr;
+
+		IF fbyrrv (.recdesc, udrbd) NEQ false
+
+		    !+
+		    !    COULD WE GET THIS UDR?
+		    !-
+
+		THEN
+		    BEGIN
+		    lookat ('	FOUND UDR AT: ', recdesc [rdrecptr]);
+
+		    !+
+		    !    BUT, IS IT DELETED?
+		    !-
+
+		    IF chkflag (recdesc [rdstatus], rdflgdelete) EQL 0
+		    THEN
+			BEGIN
+			lookat ('	UDR EQL AT: ', recdesc [rdrecptr]);
+
+			!+
+			!    SET UP THE RFA OF THE CURRENT SIDR RECORD
+			!-
+
+			recdesc [rdrfa] = makerfa (.databd [bkdbktno], .sidrptr [drrecordid]);
+
+			!+
+			!    FLUSH THE SIDR BUCKET
+			!-
+
+			putbkt (%(NO)%false, %(BKT)%.databd);
+
+			!+
+			!    COMPUTE OFFSET OF POINTER
+			!-
+
+			recdesc [rdsidrelement] = .recordptr - .arrayptr;
+
+			!+
+			!    MAKE THIS BKT CURRENT
+			!-
+
+			movebktdesc (%(FROM)%udrbd, %(TO)%databd);
+			RETURN true
+			END;%(OF IF NOT DELTED)%
+
+		    !+
+		    !    RECORD WAS DELETED..
+		    !-
+
+		    rtrace (%STRING ('	UDR EQL DELETED', %CHAR (13), %CHAR (10)));
+		    putbkt (false, udrbd)
+		    END %(OF IF FBYRRV SUCCEEDED)%
+
+		END %(OF IF NOT DELETEDRFA)%
+!+
+!    WE COULDN'T GET THE UDR FOR SOME REASON.
+!    WE SHOULD GO TO THE NEXT ELEMENT
+!    IN THE SIDR.
+!-
+	    END;%(OF INCR J FROM 1 TO .POINTERCOUNT)%
+
+!+
+!    AT THIS POINT, WE WENT THRU THE ENTIRE
+!    REST OF THE SIDR AND COULDN'T GET A
+!    USEABLE DATA RECORD. SO, WE MUST SKIP TO
+!    THE NEXT SIDR. NOTE THAT THIS MAY FAIL
+!    IF ITS THE EOF, ETC.
+!-
+	recdesc [rdrecptr] = .sidrptr;		! RESTORE PTR TO SIDR
+
+	IF (tempac = skiprecord (.recdesc, .databd, dontlock)) EQL false THEN RETURN .tempac;
+
+	!+
+	!    NOW, SET UP SOME COUNTERS ETC.
+	!-
+
+	sidrptr = .recdesc [rdrecptr];
+	pointercount = .sidrptr [sidrrecsize] - .kdb [kdbkszw];
+	arrayptr = (recordptr = .sidrptr + sidrhdrsize - 1 + .kdb [kdbkszw])	! **START AT 1ST RFA -1
+	END;%(OF REPEAT)%
+
+    END;%( OF LOOP2 )%
+    rmsbug (msgcantgethere);
+    RETURN false;
+    END;
+
+%(OF POSNEXT)%
+END
+
+ELUDOM
+  

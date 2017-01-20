@@ -1,0 +1,901 @@
+%TITLE 'Execute Tranforms'
+MODULE DIUETR(
+       IDENT='253'
+       %BLISS32 (,
+                 ADDRESSING_MODE(EXTERNAL=GENERAL,NONEXTERNAL=LONG_RELATIVE)
+                )
+       %BLISS36 (,
+                 ENTRY (updffd, chkdep, prodmn, exetra)
+                )
+                      ) = 
+BEGIN
+!++
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+! FACILITY:	DIU    Data Interchange Utility
+!
+! ABSTRACT:	Routines to process the DIU transform structure for
+!               data conversion / transformation.  These routines
+!               extract the appropriate information out of each
+!               transform node and perform the data conversion
+!               specified by that information.  The data conversion
+!               is performed by the DIL data conversion routines.
+!
+! AUTHOR:	Sandy Clemens, Creation Date:  20-Apr-85
+!
+! EDIT HISTORY:
+!
+!       14      Add transform execution code and conversion warnings report
+!               code.  FILES:  DIUETR.BLI (NEW), DIUCSR.BLI (NEW), DIUDMP.BLI,
+!               DIUABO.B36, INTFAC.BLI, DIUTLB.BLI.
+!               Sandy Clemens	15-Jul-85
+!
+!       22	Made routine SINGLE_FQN_NAME get the entire field name string
+!               out of the record description tree (not just the partial name
+!               from the transform).  Make DIU$$GET_BYTSIZ in DIUETR module
+!               NOT global.  Fix bug DIU$UPDATE_FFD: in the call to
+!               DIX$$CHECK_ALIGNMENT the data type within class code was
+!               passed, rather than the entire data type code. 
+!               Sandy Clemens	18-Jul-85
+!
+!	25	Allow initial values of dimensionned fields.
+!		Charlotte Richardson	13-Aug-85
+!
+!  236  Change library of DIXLIB to DIUDIX.
+!       Sandy Clemens  19-Jun-86
+!
+!  253  Change libraries to new names.
+!       Gregory A. Scott 1-Jul-86
+!
+!--
+!********************************************************************
+!           L I B R A R Y   A N D   R E Q U I R E    F I L E S
+!********************************************************************
+%IF %BLISS (BLISS32)
+%THEN
+     LIBRARY 'SYS$LIBRARY:XPORT';       ! XPORT definitions
+     UNDECLARE %QUOTE $STRING;
+     LIBRARY 'SYS$LIBRARY:STARLET';     ! VMS System Services
+     LIBRARY 'DIU$SOURCE_LIB:DIUVMS';	! DIU VMS Specifics
+     LIBRARY 'DIU$SOURCE_LIB:DIUMSG';	! DIU MESSAGE Literals
+%FI
+
+%IF %BLISS (BLISS36)
+%THEN
+     LIBRARY 'BLI:XPORT';               ! XPORT definitions
+     LIBRARY 'FAOPUT';                  ! Defines $FAO_PUT macro
+     LIBRARY 'FAO';
+     LIBRARY 'DIU';
+%FI
+
+UNDECLARE %QUOTE $DESCRIPTOR;
+LIBRARY 'DIUCRX';                       ! CRX data structures
+UNDECLARE %QUOTE $DESCRIPTOR;
+LIBRARY 'DIUTLB';			! DIU Transform structure
+UNDECLARE %QUOTE $DESCRIPTOR;
+UNDECLARE %QUOTE STS$K_SEVERE, %QUOTE STS$K_ERROR, %QUOTE STS$K_WARNING,
+          %QUOTE STS$K_SUCCESS, %QUOTE SS$_NORMAL, %QUOTE STS$K_INFO;
+LIBRARY 'DIUDIX';			! DIX/DIL specific things
+LIBRARY 'DIUMLB';			! DIU Mapping routines library
+
+%IF %BLISS (BLISS32)
+%THEN
+     UNDECLARE %QUOTE $DESCRIPTOR;
+%FI
+
+LIBRARY 'DIUACTION';
+
+EXTERNAL ROUTINE SINGLE_FQN_NAME,
+                 DIX$$COPY_STRUCTURE,
+                 DIX$$CON_GEN,
+                 DIX$$CHECK_ALIGNMENT,
+                 DIX$$DES_BY_DET,
+                 DIX$$CON_GEN,
+                 DIU$DIXERR_HANDLER;
+
+EXTERNAL
+	dix$adtt_st	: dtt_st,	! String datatype table
+	dix$adtt_fbin	: dtt_fbin,	! Fixed-point binary datatype table
+	dix$adtt_fp	: dtt_fp,	! Floating-point datatype table
+	dix$adtt_dn	: dtt_dn,	! Display-numeric datatype table
+	dix$adtt_pd	: dtt_pd;	! Packed decimal datatype table
+
+OWN
+   sys_bpunit : VECTOR [sys_max + 1]        ! Really wanted 1-origin.
+	PRESET ( [sys_lcg] = 36, [sys_8bit] = 8);
+
+LITERAL
+       this_sys = %BLISS36 (sys_lcg) %BLISS32 (sys_8bit);
+
+!******************************************************************
+!            D I U $ C O N V _ E R R _ C O U N T
+!******************************************************************
+ROUTINE DIU$CONV_ERR_COUNT (p_trans, cond, recnum) : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION
+!
+!       This routine is called when DIX$$CON_GEN returns a non-success
+!       status (during transform execution).  This routine keeps track
+!       of the number of each different kind of error on each different
+!       pair of fields in the transform.  If the error count is less
+!       than or equal to the global warnings count then this routine
+!       signals with a DIU informational message and lets the top level
+!       handler write the message to the users log file and then continues
+!       here.
+!
+! FORMAL PARAMETERS
+!
+!       p_trans    address of the transform node which contains the FFDs
+!                  for which the conversion error occurred
+!
+!       cond       the error condition value
+!
+!       recnum     the number of the record for which this error occurred
+!
+! ROUTINE VALUE
+!
+!       NONE
+!--
+BEGIN
+
+LOCAL err_count : INITIAL (0),
+      cond_loc : condition_value,
+      worst : condition_value,
+      trans : REF transform_str;
+
+EXTERNAL warnings_count;                ! hopefully this will have the same
+                                        ! names in both DIU-20 and DIU-VMS...
+cond_loc = .cond;
+trans = .p_trans;
+worst = .trans [tra_worst];
+
+IF .worst [STS$V_SEVERITY] LSS .cond_loc [STS$V_SEVERITY]
+THEN trans [tra_worst] = .cond;
+
+! errors are stored in the transform structure based on the data class
+! of the conversion (either fixed-point data, floating-point or string)...
+
+CASE .trans [tra_src$v_dt_class] FROM 1 TO dix$k_max_class OF
+SET
+   [dt_string] :
+
+      SELECTONE .cond OF
+      SET
+      [DIX$_ROUNDED] :
+            (trans [tra_str_rounded] = .trans [tra_str_rounded] + 1;
+             err_count = .trans [tra_str_rounded];);
+      [DIX$_UNIMP] :
+            (trans [tra_str_unimp] = .trans [tra_str_unimp] + 1;
+             err_count = .trans [tra_str_unimp];);
+      [DIX$_GRAPHIC] :
+            (trans [tra_str_graphic] = .trans [tra_str_graphic] + 1;
+             err_count = .trans [tra_str_graphic];);
+      [DIX$_FMTLOST] :
+            (trans [tra_str_fmtlost] = .trans [tra_str_fmtlost] + 1;
+             err_count = .trans [tra_str_fmtlost];);
+      [DIX$_NONPRINT] :
+            (trans [tra_str_nonprint] = .trans [tra_str_nonprint] + 1;
+             err_count = .trans [tra_str_nonprint];);
+      [DIX$_TRUNC] :
+            (trans [tra_str_trunc] = .trans [tra_str_trunc] + 1;
+             err_count = .trans [tra_str_trunc];);
+      [DIX$_INVALCHAR] :
+            (trans [tra_str_invalchar] = .trans [tra_str_invalchar] + 1;
+             err_count = .trans [tra_str_invalchar];);
+      TES;
+
+   [dt_fbin, dt_dnum, dt_pdec] :
+
+      SELECTONE .cond OF
+      SET
+      [DIX$_ROUNDED] :
+            (trans [tra_fix_rounded] = .trans [tra_fix_rounded] + 1;
+             err_count = .trans [tra_fix_rounded];);
+      [DIX$_UNIMP] :
+            (trans [tra_fix_unimp] = .trans [tra_fix_unimp] + 1;
+             err_count = .trans [tra_fix_unimp];);
+      [DIX$_TOOBIG] :
+            (trans [tra_fix_toobig] = .trans [tra_fix_toobig] + 1;
+             err_count = .trans [tra_fix_toobig];);
+      [DIX$_IMPOSSIBLE] :
+            (trans [tra_fix_impossible] = .trans [tra_fix_impossible] + 1;
+             err_count = .trans [tra_fix_impossible];);
+      [DIX$_UNSIGNED] :
+            (trans [tra_fix_unsigned] = .trans [tra_fix_unsigned] + 1;
+             err_count = .trans [tra_fix_unsigned];);
+      [DIX$_INVDNUMCHR] :
+            (trans [tra_fix_invdnumchr] = .trans [tra_fix_invdnumchr] + 1;
+             err_count = .trans [tra_fix_invdnumchr];);
+      [DIX$_INVDNUMSGN] :
+            (trans [tra_fix_invdnumsgn] = .trans [tra_fix_invdnumsgn] + 1;
+             err_count = .trans [tra_fix_invdnumsgn];);
+      [DIX$_INVPDDGT] :
+            (trans [tra_fix_invpddgt] = .trans [tra_fix_invpddgt] + 1;
+             err_count = .trans [tra_fix_invpddgt];);
+      [DIX$_INVPDSGN] :
+            (trans [tra_fix_invpdsgn] = .trans [tra_fix_invpdsgn] + 1;
+             err_count = .trans [tra_fix_invpdsgn];);
+      TES;
+
+   [dt_fp] :
+
+      SELECTONE .cond OF
+      SET
+      [DIX$_ROUNDED] :
+            (trans [tra_fp_rounded] = .trans [tra_fp_rounded] + 1;
+             err_count = .trans [tra_fp_rounded];);
+      [DIX$_UNIMP] :
+            (trans [tra_fp_unimp] = .trans [tra_fp_unimp] + 1;
+             err_count = .trans [tra_fp_unimp];);
+      [DIX$_TOOBIG] :
+            (trans [tra_fp_toobig] = .trans [tra_fp_toobig] + 1;
+             err_count = .trans [tra_fp_toobig];);
+      [DIX$_UNNORM] :
+            (trans [tra_fp_unnorm] = .trans [tra_fp_unnorm] + 1;
+             err_count = .trans [tra_fp_unnorm];);
+      [DIX$_IMPOSSIBLE] :
+            (trans [tra_fp_impossible] = .trans [tra_fp_impossible] + 1;
+             err_count = .trans [tra_fp_impossible];);
+      TES;
+
+TES;
+
+!++
+! If the number of the current type of error for the current conversion
+! (for the pair of fields specified in this transform node) is less than
+! or equal to the global warnings_count value then print the error to the
+! terminal or log file.
+!--
+
+!++
+! format of error would be nice:
+!
+!      %DIU20: DIU event 99: Record 777777: Error converting FIELD.A to FIELD.B
+!      -       DIX event 888888888: Invalid alignment
+!--
+IF .err_count LEQ .warnings_count
+THEN                                    ! pass error to upper handler
+     BEGIN
+
+     LOCAL src_nam : $STR_DESCRIPTOR(),
+           dst_nam : $STR_DESCRIPTOR();
+
+     SINGLE_FQN_NAME (.trans [tra_src_addr], src_nam);
+     SINGLE_FQN_NAME (.trans [tra_dst_addr], dst_nam);
+     SIGNAL (DIU$_CONVERR, 3, .recnum, src_nam, dst_nam, .cond);
+     END;
+
+END;
+
+!******************************************************************
+!                 D I U $ $ G E T _ B Y T S I Z
+!******************************************************************
+ROUTINE DIU$$GET_BYTSIZ (dattyp) =
+!++
+!
+! FUNCTIONAL DESCRIPTION
+!
+!       This routine returns the correct byte size for the data
+!       type passed by looking up the byte size field in the DIL
+!       data type tables.
+!
+! FORMAL PARAMETERS
+!
+!       dattyp          integer data type of the field
+!
+! IMPLICIT PARAMETERS
+!
+!	None
+!
+! ROUTINE VALUE
+!
+!       the byte size for the data type passed
+!
+!--
+BEGIN
+
+LOCAL data_type : data_type_sep,
+      bytsiz : INITIAL (0);
+
+data_type = .dattyp;
+
+CASE .data_type [dt_class_sep] FROM 1 TO dix$k_max_class OF
+
+SET
+
+[dt_string] :
+    bytsiz = .dix$adtt_st [.data_type [dt_code_sep], std$v_byt_siz];
+
+[dt_dnum] :
+    bytsiz = .dix$adtt_dn [.data_type [dt_code_sep], dnd$v_byt_siz];
+
+[dt_pdec] :
+    bytsiz = .dix$adtt_pd [.data_type [dt_code_sep], pdd$v_byt_siz];
+
+[dt_fbin] :
+    bytsiz = .dix$adtt_fbin [.data_type [dt_code_sep], fbd$v_siz];
+
+[dt_fp] :
+    bytsiz = .dix$adtt_fp [.data_type [dt_code_sep], fpd$v_siz];
+
+TES;
+
+.bytsiz                                 ! return byte size for this field
+
+END;
+
+!******************************************************************
+!                 D I U $ U P D A T E _ F F D
+!******************************************************************
+GLOBAL ROUTINE DIU$UPDATE_FFD (p_ffd, offset, stride, buff, bytsiz) =
+!++
+!
+! FUNCTIONAL DESCRIPTION
+!
+!       This routine increments dimensioned field FFDs.  The offset
+!       passed is the offset to the current cell of the array.  Given
+!       this offset and the array stride (found in the dimension) it
+!       is possible to find the offset of the next cell.
+!
+! FORMAL PARAMETERS
+!
+!       p_ffd           address of the ffd to update
+!
+!       offset          address of the offset from the beginning of the
+!                       field to the most recently processed array cell;
+!                       updated to the next cell to process
+!
+!       stride          stride for each cell of this array;  this value
+!                       may not be reliable if the data type is 7-bit
+!                       ascii or display-7 due to the slack bit at then
+!                       end of each word in 36-bit memory when 7-bit data
+!                       is used
+!
+!       buff            address of the record buffer which contains the
+!                       field in question
+!
+!       bytsiz          the byte size (from the DIL data type tables) of
+!                       the field
+!
+! IMPLICIT PARAMETERS
+!
+!	None
+!
+! ROUTINE VALUE
+!
+!       OFFSET parameter is updated to reflect stride (plus slack bits)
+!
+!       DIU$_NORMAL (normal successful completion)
+!       or
+!       DIX$_ALIGN (if final alignment is erroneous)
+!
+!--
+BEGIN
+
+LOCAL ffd : REF forgn_descr,
+      bit_disp : INITIAL (0),
+      new_offset : INITIAL (0);
+
+ENABLE DIU$DIXERR_HANDLER;
+
+ffd = .p_ffd;
+
+CASE .ffd [ffd$v_sys_orig] FROM 1 TO sys_max OF
+      SET                               ! set new_offset
+
+      [sys_lcg] : 
+           BEGIN
+           ! add the stride and field offset to figure the new offset
+           new_offset = ..offset + .stride;
+           ! For 7-bit data, the stride may be incorrect if a word
+           ! boundary is crossed (due to the "slack bit").  This could
+           ! cause alignment to be set wrong, so check for that and make
+           ! corrections as necessary...
+           IF .bytsiz EQL 7
+           THEN IF ((.new_offset MOD 36) MOD 7) NEQ 0
+                THEN new_offset = 7 + 36 * (.new_offset / 36)
+                                   + 7 * ((.new_offset MOD 36) / 7);
+
+
+           .offset = .new_offset;       ! reset the offset parameter passed
+
+           ! finally, add field bytsiz less one for DIL/sys_lcg idiosyncrasy
+           new_offset = .new_offset + .bytsiz - 1;
+           END;
+
+      [sys_8bit] :
+           BEGIN
+           ! add the stride and field offset to figure the new offset
+           new_offset = ..offset + .stride;
+           .offset = .new_offset;       ! reset the offset parameter passed
+           END;
+
+      TES;
+
+!++
+! Once the field offset is correctly set (and since we know the byte
+! size) we can correct the ffd for the new offset.  This code closely
+! resembles DIX$$DES_BY_DET (except that the byte size is always set
+! to 1 and the bit offset is zero since the byte offset = bit offset).
+!--
+bit_disp = (CASE .ffd [ffd$v_sys_orig] FROM 1 TO sys_max OF
+            SET
+            [sys_8bit] :
+               .new_offset;           ! On VAX simply return new offset
+            [sys_lcg] :
+               ((.sys_bpunit [sys_lcg] - 1) + 
+                .sys_bpunit [sys_lcg] * (.new_offset / .sys_bpunit [sys_lcg])
+                - (.new_offset MOD .sys_bpunit [sys_lcg]));
+            TES);
+
+ffd [ffd$v_unit] = .buff + .bit_disp / %BPUNIT;
+ffd [ffd$v_offset] = .bit_disp MOD %BPUNIT;
+ffd [ffd$v_align] = .bit_disp MOD .sys_bpunit [.ffd [ffd$v_sys_orig]];
+
+dix$$check_alignment (.ffd [ffd$v_type], .ffd [ffd$v_sys_orig],
+                      .ffd [ffd$v_align]);
+
+RETURN DIU$_NORMAL;                     ! return normal stat if we get here...
+
+END;
+
+!******************************************************************
+!               D I U $ C H E C K _ D E P _ I T M
+!******************************************************************
+GLOBAL ROUTINE DIU$CHECK_DEP_ITM (dep_itm) =
+!++
+! FUNCTIONAL DESCRIPTION
+!
+!       This routine examines the depend item (which has been modified.
+!       by the transform loading code so that it is now the address of
+!       a CRX_TAG_FFD structure) to see if the depend item can be used.
+!       If the CRT$V_SUSPICIOUS_TAG flag is set then return zero.  Call
+!       DIX$$DES_BY_DET to convert the tag value into a single signed 
+!       fixed-point binary longword.  If an error is signalled then
+!       return zero, otherwise return the signed longword tag value.
+!
+! FORMAL PARAMETERS
+!
+!       dep_itm         Address of a crx_tag_ffd field which is the
+!                       ffd for the depend item.
+!
+! ROUTINE VALUE
+!
+!       0 if the tag value is not usable
+!       Otherwise the tag value
+!--
+BEGIN
+
+ENABLE DIU$DIXERR_HANDLER;
+
+LOCAL
+     tag : REF crx_tag_ffd,
+     tag_ffd : REF forgn_descr,
+     new_ffd : forgn_descr,
+     new_tag_val : INITIAL (0),
+     status : INITIAL (0),
+     retstat : INITIAL (0);
+
+tag = .dep_itm;
+
+IF .tag [CRT$V_SUSPICIOUS_TAG]          ! already discovered that the tag field
+THEN RETURN (0);                        ! is no good so tell the caller this...
+
+tag_ffd = tag [CRT$V_FFD];
+
+retstat = DIX$$DES_BY_DET (new_ffd, new_tag_val, this_sys,
+                           %BLISS36 (36) %BLISS32 (32), 0, 0,
+                           %BLISS36 (dix$k_dt_sbf36) %BLISS32 (dix$k_dt_sbf32),
+                           0, 0);
+IF NOT .retstat
+THEN BEGIN
+     %IF diu$k_tra_debug
+     %THEN
+          $FAO_PUT (1, '**DIX$$DES_BY_DET ERROR -- tag field not usable**');
+     %FI
+     RETURN (0);
+     END;
+
+retstat = DIX$$CON_GEN (tag [CRT$V_FFD], new_ffd);
+
+IF NOT .retstat
+THEN BEGIN
+     %IF diu$k_tra_debug
+     %THEN
+          $FAO_PUT (1, '**DIX$$DES_BY_DET ERROR -- tag field not usable**');
+     %FI
+     RETURN (0);
+     END;
+
+.new_tag_val                            ! return tag value;  all errors return
+                                        ! zero above...
+END;
+
+!******************************************************************
+!               D I U $ P R O C E S S _ D I M E N S
+!******************************************************************
+GLOBAL ROUTINE DIU$PROCESS_DIMENS (snode, dnode, sffd, dffd, opcode,
+                                   soffset, doffset, src_buff, dst_buff,
+                                   trans, rec_no) =
+                                   
+!++
+!
+! FUNCTIONAL DESCRIPTION
+!
+!       This routine performs data conversions for fields which are
+!       within array structures.  It walks the DIMS and CRX_DIMENSION
+!       nodes recursively; the recursion being driven by the
+!       destination dimension information, since we know that the
+!       destination dimensions are greater than or equal to the source
+!       dimensions.  Recall that we also know that the two fields have
+!       the same number of dimensions!
+!
+! FORMAL PARAMETERS
+!
+!       snode           Address of the source node to be processed (either
+!                       a DIMS or CRX dimension node)
+!
+!       dnode           Address of the destination node to be processed
+!                       (either a DIMS or CRX dimension node)
+!
+!       sffd            Address of the source FFD
+!
+!       dffd            Address of the destination FFD
+!
+!       opcode          Value if set to DIU$K_INITIAL, the source FFD
+!                       points to an initial value field rather than to
+!                       a field in the source record
+!
+!       soffset         value of source member offset (extracted from the
+!                       source member node) which is the offset to the first
+!                       cell in the array
+!
+!       doffset         value of destination member offset (extracted from
+!                       the destination member node) which is the offset to
+!                       the first cell in the array
+!
+!       src_buff        Address of the source record buffer (needed to update
+!                       source ffd correctly)
+!
+!       dst_buff        Address of the destination record buffer (needed to
+!                       update destination ffd correctly)
+!
+!       trans           Address of the transform node which is being executed
+!                       (needed only for error reporting)
+!
+!       rec_no          Integer value indicating record number which is being
+!                       processed
+!
+! IMPLICIT PARAMETERS
+!
+!	None
+!
+! ROUTINE VALUE
+!
+!       DIU$_NORMAL    Normal successful completion
+!
+!--
+BEGIN
+
+LOCAL
+     retstat : INITIAL (0),
+     status : INITIAL (0),
+     dims_src : REF dims,
+     dims_dst : REF dims,
+     crx_src : REF crx_dimension,
+     crx_dst : REF crx_dimension;
+
+IF .dnode EQL 0                         ! sub traversal finished...
+  THEN RETURN (DIU$_NORMAL);
+
+dims_src = .snode;                      ! addressibilty via REFs
+dims_dst = .dnode;
+crx_src = .snode;
+crx_dst = .dnode;
+
+!++
+! Both the DIMS node and the CRX_DIMENSION node have ID fields which
+! are at the same offset, so it is easy to examine the ID field and
+! proceed based on the node type...
+!--
+SELECTONE .dims_dst [dims$b_id] OF
+
+SET
+   [DIU$K_DIMSNODE] :                   ! process DIMS information
+
+          BEGIN
+          !++
+          ! If this is a DIMS node, then first recurse on the next DIMS
+          ! nodes; then recurse on the CRX_DIMENSION nodes...
+          !--
+
+          retstat = DIU$PROCESS_DIMENS ((IF .dims_src NEQ 0
+					    THEN .dims_src [dims$a_next]
+					    ELSE 0),
+                                        .dims_dst [dims$a_next],
+                                        .sffd, .dffd, .opcode,
+                                        .soffset, .doffset,
+                                        .src_buff, .dst_buff,
+                                        .trans, .rec_no
+                                       );
+
+          IF NOT .retstat THEN RETURN (.retstat);
+
+          retstat = DIU$PROCESS_DIMENS ((IF .dims_src NEQ 0
+					    THEN .dims_src [dims$a_list]
+					    ELSE 0),
+                                        .dims_dst [dims$a_list],
+                                        .sffd, .dffd, .opcode,
+                                        .soffset, .doffset,
+                                        .src_buff, .dst_buff,
+                                        .trans, .rec_no
+                                       );
+
+          IF NOT .retstat THEN RETURN (.retstat);
+
+          END;
+
+   [CRX$K_DIMENSION] :                  ! process CRX_DIMENSION information
+
+          BEGIN
+          !++
+          ! If this is a CRX_DIMENSION node, then the fun begins.
+          !--
+
+          LOCAL
+               count : INITIAL (0),
+               sbytsiz : INITIAL (0),
+               dbytsiz : INITIAL (0),
+               lower_bound : INITIAL (0),
+               upper_bound : INITIAL (0),
+               src_upper : INITIAL (0),
+               src_lower : INITIAL (0),
+               soff_loc : INITIAL (0),  ! local modifiable copy of src offset
+               doff_loc : INITIAL (0),  ! local modifiable copy of dst offset
+               src_pnt : forgn_descr,   ! modifiable copy of the source
+                                        ! ffd to be used as a byte pointer
+               dst_pnt : forgn_descr;   ! modifiable copy of the destination
+                                        ! ffd to be used as a byte pointer
+
+          ! make modifiable copies of ffds to use as byte pointers
+          dix$$copy_structure (.sffd, ffd$k_size, src_pnt);
+          dix$$copy_structure (.dffd, ffd$k_size, dst_pnt);
+
+          ! initialize local (modifiable) offset values
+          soff_loc = .soffset;
+          doff_loc = .doffset;
+
+          !++ 
+          ! Determine the destination bounds.  Always set the lower
+          ! bound to CRD$L_LOWER_BOUND.  The upper bound (only) may be
+          ! dependent on a "depend item."  If a depend item exists,
+          ! call DIU$CHECK_DEP_ITM to see whether the depend item is
+          ! valid.  The routine DIU$CHECK_DEP_ITM returns either the
+          ! value of a valid depend item or zero if the depend item
+          ! was invalid.  If a depend item is invalid, use the
+          ! CRD$L_MIN_OCCURS value for the upper bounds.  If there is
+          ! no depend item, use CRD$L_UPPER_BOUNDS for the upper
+          ! bounds!
+          !--
+
+          lower_bound = .crx_dst [CRD$L_LOWER_BOUND];
+          IF .crx_dst [CRD$A_DEPEND_ITEM] NEQ 0 ! if a depend item exists
+          THEN BEGIN
+               ! DIU$CHECK_DEP_ITM returns zero if the depend item is invalid
+               upper_bound = DIU$CHECK_DEP_ITM (.crx_dst [CRD$A_DEPEND_ITEM]);
+               IF .upper_bound EQL 0    ! dep item invalid -- use min occurs
+               THEN
+                   BEGIN
+                   LOCAL dst_nam : $STR_DESCRIPTOR(),
+                         trans_loc : REF transform_str;
+                   trans_loc = .trans;
+                   SINGLE_FQN_NAME (.trans_loc [tra_dst_addr], dst_nam);
+                   SIGNAL (DIU$_DEPITMINV, dst_nam, .rec_no);
+                   upper_bound = .crx_dst [CRD$L_MIN_OCCURS];
+                   END
+               END
+          ELSE upper_bound = .crx_dst [CRD$L_UPPER_BOUND];      ! no dep item
+
+          !++
+          ! Set the source bounds.  If the transform field TRA_OPCODE
+          ! (passed to this routine in parameter OPCODE) is set to
+          ! DIU$K_INITIAL then the source FFD is an initial value FFD
+          ! which points to an initial value field rather than to a
+          ! field in the source record.  In this case, each
+          ! destination cell should be set to the initial value,
+          ! therefore, set src_lower & src_upper to the same values as
+          ! the destination bounds (upper_bound & lower_bound).
+          !--
+          IF .opcode EQL DIU$K_INITIAL
+          THEN BEGIN
+               src_lower = .lower_bound;
+               src_upper = .upper_bound;
+               END
+          ELSE BEGIN
+               src_lower = .crx_src [CRD$L_LOWER_BOUND];
+               IF .crx_src [CRD$A_DEPEND_ITEM] NEQ 0    ! if depend item exists
+               THEN BEGIN
+                    ! DIU$CHECK_DEP_ITM returns 0 if the depend item is invalid
+                    src_upper =
+                              DIU$CHECK_DEP_ITM (.crx_src [CRD$A_DEPEND_ITEM]);
+                    ! if depend item is invalid use min occurs value and
+                    ! inform the user of this!
+                    IF .src_upper EQL 0
+                    THEN BEGIN
+                         LOCAL src_nam : $STR_DESCRIPTOR(),
+                               trans_loc : REF transform_str;
+                         trans_loc = .trans;
+                         SINGLE_FQN_NAME (.trans_loc [tra_src_addr], src_nam);
+                         SIGNAL (DIU$_DEPITMINV, src_nam, .rec_no);
+                         src_upper = .crx_src [CRD$L_MIN_OCCURS];
+                         END
+                    END
+               ELSE src_upper = .crx_src [CRD$L_UPPER_BOUND];   ! no depend itm
+               END;
+
+          ! set the byte size for each of the fields...
+          sbytsiz = DIU$$GET_BYTSIZ (.src_pnt [ffd$v_type]);
+          dbytsiz = DIU$$GET_BYTSIZ (.dst_pnt [ffd$v_type]);
+
+          INCR count FROM .lower_bound TO .upper_bound DO
+               BEGIN
+               
+               ! make sure we are within the source bounds
+               IF (.count GEQ .src_lower) AND (.count LEQ .src_upper)
+               THEN BEGIN
+                    ! if there are sibling dimension nodes, process them
+                    IF .crx_dst [CRD$A_NEXT] NEQ 0
+                    THEN BEGIN
+                         retstat = diu$process_dimens ((IF .crx_src NEQ 0 THEN
+							  .crx_src [CRD$A_NEXT]
+							  ELSE 0),
+                                                       .crx_dst [CRD$A_NEXT],
+                                                       .sffd, .dffd, .opcode,
+                                                       .soff_loc, .doff_loc,
+                                                       .src_buff, .dst_buff,
+                                                       .trans, .rec_no
+                                                      );
+
+                         IF NOT .retstat THEN RETURN (.retstat);
+                         END
+
+                    ELSE
+                        ! convert the data specified and update the source FFD
+                        BEGIN
+                        retstat = dix$$con_gen (src_pnt, dst_pnt);
+                        IF .retstat NEQ SS$_NORMAL
+                        THEN            ! call error processing routine
+                            DIU$CONV_ERR_COUNT(.trans, .retstat, .rec_no);
+                        END;
+
+                    IF .opcode NEQ DIU$K_INITIAL
+                    THEN BEGIN
+                         retstat =  DIU$UPDATE_FFD (src_pnt, soff_loc,
+                                                    .crx_src [CRD$L_STRIDE],
+                                                    .src_buff, .sbytsiz);
+                         IF NOT .retstat 
+                         THEN SIGNAL (DIU$_BUG);
+                         END;
+
+                    END;
+
+               ! always update the destination FFD
+               retstat = DIU$UPDATE_FFD (dst_pnt, doff_loc,
+                                         .crx_dst [CRD$L_STRIDE],
+                                         .dst_buff, .dbytsiz);
+               IF NOT .retstat
+               THEN SIGNAL (DIU$_BUG);
+
+               END;                     ! end INCR loop
+
+          END;                          ! end case CRX_DIMENSION node
+
+TES;
+
+RETURN (DIU$_NORMAL);
+
+END;
+!******************************************************************
+!               D I U $ E X E C U T E _ T R A N S
+!******************************************************************
+GLOBAL ROUTINE DIU$EXECUTE_TRANS (trans, src_buff, dst_buff, rec_no) =
+!++
+!
+! FUNCTIONAL DESCRIPTION
+!	
+!	This routine reads through the transform structure, node by
+!	node.  Each node contains information to perform data
+!	conversion.  If "dimension" information is present, the call
+!	DIU$PROCESS_DIMENS which handles the conversion of a field
+!	which is "dimensioned."  If there is no dimension information,
+!	then simply call DIL routine DIX$$CON_GEN to perform the
+!	conversion.
+!
+! FORMAL PARAMETERS
+!
+!	trans		(address) root of the transform structure
+!
+!       src_buff        (address) the source record buffer (may be
+!                       needed to process dimension information)
+!
+!       dst_buff        (address) the destination record buffer (may
+!                       be needed to process dimension information)
+!
+!       rec_no          (integer) record number
+!
+! IMPLICIT PARAMETERS
+!
+!	None
+!
+! ROUTINE VALUE
+!
+!	DIU$_NORMAL    Normal successful completion
+!
+!--
+BEGIN
+
+LOCAL trans_loc : REF transform_str,
+      conv_status : REF condition_value,
+      src_mem : REF crx_member,
+      dst_mem : REF crx_member,
+      status : INITIAL (0);
+
+trans_loc = .trans;
+
+IF .trans_loc NEQ 0
+THEN DO BEGIN
+        IF (.trans_loc [tra_src_dims] EQL 0) AND        ! only need to
+            (.trans_loc [tra_dst_dims] EQL 0)           !  check dst?
+        THEN BEGIN
+             conv_status = DIX$$CON_GEN (trans_loc [tra_src_ffd],
+                                         trans_loc [tra_dst_ffd]
+                                        );
+             IF .conv_status NEQ SS$_NORMAL
+             THEN ! call error processing routine
+                  DIU$CONV_ERR_COUNT(.trans_loc, .conv_status, .rec_no);
+             END
+        ELSE                            ! process dimensions info
+             BEGIN
+             src_mem = .trans_loc [tra_src_addr];
+             dst_mem = .trans_loc [tra_dst_addr];
+             diu$process_dimens (.trans_loc [tra_src_dims],
+                                 .trans_loc [tra_dst_dims],
+                                 trans_loc [tra_src_ffd],
+                                 trans_loc [tra_dst_ffd],
+                                 .trans_loc [tra_opcode],
+				 (IF .src_mem NEQ 0
+                                     THEN  .src_mem [CRM$L_MEMBER_OFFSET]
+				     ELSE 0),
+                                 .dst_mem [CRM$L_MEMBER_OFFSET],
+                                 .src_buff, .dst_buff,
+                                 .trans_loc, .rec_no
+                                );
+             END;
+
+        trans_loc = .trans_loc [tra_next];
+
+        END
+
+     UNTIL .trans_loc EQL 0;
+
+RETURN (DIU$_NORMAL);
+
+END;
+
+END
+ELUDOM

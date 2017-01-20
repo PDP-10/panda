@@ -1,0 +1,6385 @@
+;<ISTAR:<CUSPS.USER-SOURCES>JSTRAP.MAC.45>  2-Dec-82 09:35:50, Edit by ALIFF
+; Operational version with symbolic values for register values.
+
+	TITLE	JSTRAP	PROGRAM TO WATCH JSYSES OF AN INFERIOR FORK
+
+
+;NOTE:  THIS PROGRAM CAN ONLY RUN UNDER RELEASE 3 OR LATER.
+;WRITTEN BY DAVID I. BELL, AT DIGITAL IN MARLBORO.
+;THIS PROGRAM WILL WATCH THE JSYSES WHICH SOME INFERIOR FORK
+;DOES, AND LOG THEM TO A LOG FILE.  THE LOG FILE CAN CONTAIN THE
+;JSYS, THE PC IT WAS EXECUTED AT, AND THE ARGUMENTS TO THE JSYS.
+
+
+	SEARCH	MACSYM,MONSYM	;GET SYMBOLS
+	SALL			;NICE LOOKING MACROS
+
+
+;VERSION INFORMATION:
+
+
+	VMAJOR==1		;MAJOR VERSION
+	VMINOR==0		;MINOR VERSION
+	VEDIT==104		;EDIT NUMBER
+	VWHO==4			;(DoD Computer Security Evaluation Center)
+
+
+
+;ACCUMULATORS:
+
+a=1
+b=2
+c=3
+d=4
+e=5
+f=6
+g=7
+	Fl=0			;FLAGS
+	T1=1			;TEMPORARY AC'S
+	T2=2
+	T3=3
+	T4=4
+	T5=5
+	Ch=10			;CHARACTER HOLDING
+	P=17			;STACK
+
+other==677
+ovflow==1B0			; name the bits in the program counter
+carry0==1B1
+carry1==1B2
+fltovf==1B3
+fpd==1B4
+user==1B5
+userio==1B6
+public==1B7
+afi==1B8
+trap2==1B9
+trap1==1B10
+fltund==1B11
+nodiv==1B12
+
+
+;FLAGS
+
+
+	FR.INT==1		;USER HAS INTERRUPTED US
+	FR.HDR==2		;HEADER LINE HAS BEEN TYPED
+	FR.SAM==4		;ALL FORKS HAVE THE SAME ADDRESS SPACE
+	fr.sym==10		;include symbols in log file
+
+;JSYS CATAGORIES:
+
+
+	JS.PRI==1		;JSYSES DOING PRIMARY I/O
+	JS.FRK==2		;JSYSES HANDLING FORKS
+	JS.FIL==4		;JSYSES HANDLING ANY FILE
+	JS.INP==10		;JSYSES HANDLING INPUT
+	JS.OUT==20		;JSYSES HANDLING OUTPUT
+	JS.INT==40		;JSYSES HANDLING INTERRUPTS
+	JS.SET==100		;JSYSES WHICH SET SOMETHING
+	JS.STS==200		;JSYSES WHICH GET INFO
+	JS.IPC==400		;JSYSES WHICH DO IPCF FUNCTIONS
+	JS.ALL==1000		;ANY JSYS
+
+
+;DEFAULT PARAMETERS:
+
+
+	TXTLEN==^D100		;SIZE OF COMMAND BUFFERS
+	PDLSIZ==40		;SIZE OF PUSHDOWN STACK
+	SYMLEN==10000		;MAXIMUM NUMBER OF WORDS FOR SYMBOLS
+	TTCHN==0		;CHANNEL FOR TTY INTERRUPTS
+	JSCHN==1		;CHANNEL FOR JS TRAPPING INTERRUPTS
+	BITSIZ==<1000+^D35>/^D36	;WORDS NEEDED FOR 1000 BITS
+
+
+
+
+;MACROS AND OPDEFS:
+
+
+	OPDEF	PJRST	[JRST]			;PUSHJ/POPJ
+	OPDEF	PUTCHR	[PUSHJ	P,CHROUT]	;STORE A CHARACTER
+
+
+
+	DEFINE	AA(NAME,DATA,FLAGS),<		;;MACRO FOR COMMAND TABLES
+	XWD	[IFNB <FLAGS>,<EXP CM%FW!<FLAGS>>
+		 ASCIZ/NAME/],DATA
+>
+
+
+
+	DEFINE	TEXT(STRING),<		;;MACRO FOR ASCIZ TEXT
+	XLIST
+	ASCIZ	@STRING@
+	LIST
+>
+; FUNCT - MACRO TO WRITE OUT BIT FIELDS
+
+define funct (bits,%lab1,%lab2),<
+	movei	c,0
+	irp	bits,<
+	cain	b,bits
+	hrroi	c,[asciz/bits/]
+>
+	jumpe	c,%lab1
+	move	b,c
+	movei	c,0
+	call	.sout
+	jrst	%lab2
+%lab1:	movx	c,no%mag+no%oov+no%ast+10
+	call	.nout
+%lab2:
+
+>
+; FLAGS - MACRO TO TEST FOR FLAG BITS.
+
+	define	flags(bits,type),<
+	irp	bits,<
+	test	(bits)
+>
+ifn type,<
+	movx	c,type
+	move	b,d
+	skipe	b
+	call	.nout
+ife type-^D10,<
+	movei	b,"."
+	idpb	b,a
+>
+>
+>
+
+; TEST - MACRO TO TEST AND "WRITE" BIT FLAGS
+
+	define	test(bits),<
+..a=wid(bits)
+..b=pos(bits)
+ife ..a-1,<
+	hrroi	b,[asciz/bits/]
+	txze	d,bits
+	pushj	p,[movei c,0
+		call	.sout
+		movei	b,"+"
+		skipe	d
+		idpb	b,a
+		popj	p,]
+>
+ifn ..a-1,<
+	ldb	b,[point ..a,d,..b]
+	jumpe	b,.+^D13
+	movei	c,10
+	call	.nout
+	movei	b,"B"
+	idpb	b,a
+	movei	b,..b
+	movei	c,^D10
+	call	.nout
+	movei	b,0
+	dpb	b,[point ..a,d,..b]
+	movei	b,"+"
+	skipe	d
+	idpb	b,a
+>
+>
+
+	SUBTTL	COMMAND SCANNER AND INITIALIZATION
+
+
+
+
+ENTRY:	JRST	START		;NORMAL ENTRY
+	JRST	START		;REENTER
+	BYTE 	(3)VWHO(9)VMAJOR(6)VMINOR(18)VEDIT
+
+
+START:	RESET			;CLEAR EVERYTHING
+	MOVE	P,[IOWD PDLSIZ,PDL]	;SET UP A STACK
+	movei	t1,^D512
+	movem	t1,jstab2
+	movsi	t3,-^D512
+set.1:	move	t4,@jstab(t3)	; what is stored here?
+	camn	t4,[ascii/JSYS /] ; skip these
+	jrst	set.2
+	hrlz	t2,jstab(t3)
+	movei	t1,jstab2
+	tbadd
+set.2:	aobjn	t3,set.1
+	movsi	t2,[asciz/ALL/]
+	movei	t1,jstab2
+	tbadd
+	SETZB	Fl,JFN		;CLEAR FLAGS AND INPUT JFN
+	SETZM	JFNOUT		;AND OUTPUT JFN
+	SETZM	HANDLE		;AND HANDLE OF INFERIOR
+	SETZM	MAPCNT		;CLEAR NUMBER OF MAPPED PAGES
+	MOVEI	T1,.JBSYM##	;GET NORMAL ADDRESS OF SYMBOLS
+	MOVEM	T1,SYMADR	;AND SAVE IT
+	MOVEI	T1,CORE		;GET ADDRESS OF PMAP BLOCK
+	hrrz	t1,.jbsym##	; address of our symbols
+	hlre	t2,.jbsym##	; number of words in our symbol table
+	sub	t1,t2		; address of end of our symbol table
+	ADDI	T1,777		;ROUND UP TO NEXT PAGE
+	ANDCMI	T1,777		;AND PUT ON EXACT BOUNDARY
+	MOVEM	T1,PAGADR	;THEN SAVE POINTER
+	MOVEI	T1,^D1000	;GET DEFAULT REPETITION COUNT
+	MOVEM	T1,REPMAX	;AND INITIALIZE IT
+	SETOM	BITS		;SET ALL THE BITS ON
+	MOVE	T1,[BITS,,BITS+1]	;FOR DEFAULT CASE
+	BLT	T1,BITS+BITSIZ-1	;WHICH IS TRAPPING OF ALL JSYSES
+	MOVEI	T1,.TICCP	;GET DEFAULT TRAPPING CODE
+	MOVEM	T1,INTCHR	;AND INITIALIZE IT
+	MOVEI	T1,.FHSLF	;GET READY
+	MOVE	T2,[LEVTAB,,CHNTAB]	;TO SET INTERRUPTS
+	SIR			;TELL MONITOR WHERE THEY ARE
+	MOVX	T2,1B<TTCHN>	;GET CHANNEL FOR TTY INTERRUPT
+	AIC			;TURN IT ON
+	MOVX	T2,1B<JSCHN>	;GET CHANNEL FOR JSYS TRAPPING
+	AIC			;TURN IT ON
+	EIR			;ENABLE THE INTERRUPTS
+
+;HERE TO PROCESS A NEW COMMAND.  THIS IS ALSO THE PLACE THAT CONTROL
+;IS PASSED WHEN WE ARE RUNNING AN INFERIOR FORK, AND A TERMINAL
+;INTERRUPT OCCURRS.
+
+
+
+NEWCMD:	MOVEI	T1,CMDBLK	;POINT TO COMMAND BLOCK
+	MOVEI	T2,[FLDDB. (.CMINI)]	;INITIALIZATION FUNCTION
+	PUSHJ	P,COMMND	;GO DO IT
+	MOVEM	P,SAVEP		;SAVE STACK FOR REPARSING
+
+
+NEWPAR:	MOVE	P,SAVEP		;RESTORE THE STACK
+	MOVEI	T1,CMDBLK	;POINT TO THE COMMAND BLOCK
+	MOVEI	T2,[FLDDB. (.CMKEY,,CMDTAB)]	;POINT TO COMMAND TABLE
+	PUSHJ	P,COMMND	;READ THE COMMAND
+	MOVE	T2,(T2)		;GET ADDRESS OF ROUTINE
+	PUSHJ	P,(T2)		;CALL IT
+	JRST	NEWCMD		;AND GET A NEW COMMAND
+
+
+
+
+;TABLE OF COMMANDS:
+
+
+CMDTAB:	CMDLEN,,CMDLEN			;HEADER
+	AA	ALLOW,CMDALW		;ALLOW TRAPPING FOR JSYSES
+	AA	CLOSE,CMDCLS		;CLOSE LOG FILE
+	AA	DISALLOW,CMDDIS		;DISALLOW TRAPPING
+	AA	EXIT,CMDXIT		;LEAVE PROGRAM
+	AA	FORKS,CMDFRK		;FORKS HAVE SAME ADDRESS SPACE
+	AA	GET,CMDGET		;READ IN THE PROGRAM TO WATCH
+	AA	HELP,CMDHLP		;TYPE HELP MESSAGE
+	aa	INCLUDE,CMDSON		;include symbols in log list
+	AA	INTERRUPT,CMDINT	;SET INTERRUPT CHARACTER
+	AA	LOG,CMDLOG		;BEGIN LOGGING JSYSES
+	AA	MAXIMUM,CMDMAX		;SET MAXIMUM REPETITIONS
+	aa	PRECLUDE,CMDSOF		;preclude symbols from log list
+	AA	PROCEED,CMDPRO		;CONTINUE FROM INTERRUPT
+	AA	RESET,CMDRES		;RESET EVERYTHING
+	aa	RUN,cmdrun
+	AA	S,STABBR,CM%ABR+CM%INV	;ABBREVIATION OF START
+STABBR:	AA	START,CMDST		;START THE PROGRAM
+	AA	SYMBOLS,CMDSYM		;GET SYMBOLS
+	AA	TELL,CMDTEL		;TELL STATUS OF A JSYS
+
+	CMDLEN==.-CMDTAB-1		;NUMBER OF COMMANDS
+
+	SUBTTL	COMMAND TO SET WHAT ADDRESS TO GET SYMBOL TABLE FROM
+
+
+
+
+;HERE TO READ IN THE ADDRESS OF THE SYMBOL POINTER TO USE IN
+;READING IN THE SYMBOLS.  THE SYMBOLS ARE ALSO READ IN IF THE
+;PROGRAM IS CURRENTLY IN CORE.
+
+
+
+
+CMDSYM:	MOVEI	T2,[ASCIZ/READ USING POINTER AT LOCATION/]
+	PUSHJ	P,NOISE		;PARSE NOISE
+	MOVEI	T2,[FLDDB. (.CMNUM,,^D8,,<116>)]	;GET FUNCTION
+	PUSHJ	P,COMMND	;READ NUMBER
+	MOVE	T4,T2		;SAVE IT
+	PUSHJ	P,CONFRM	;AND CONFIRM THE LINE
+	CAIL	T4,20		;MAKE SURE NOT IN THE AC'S
+	CAILE	T4,777777	;AND MAKE SURE NOT TOO LARGE
+	  JRST	BADSYA		;BAD ADDRESS
+	MOVEM	T4,SYMADR	;OK, SAVE THE ADDRESS
+	SKIPN	HANDLE		;DO WE HAVE A FORK THERE?
+	  POPJ	P,		;NO, THEN RETURN
+	PJRST	GETSYM		;YES, THEN GET THE SYMBOLS
+
+
+
+BADSYA:	HRROI	T1,[ASCIZ/
+? Illegal address specified/]	;GET ERROR TEXT
+	PSOUT			;OUTPUT IT
+	JRST	LOSFIN		;AND FINISH UP
+
+	SUBTTL	ROUTINE TO BEGIN LOGGING OF JSYSES
+
+
+
+
+;HERE IS THE COMMAND WHICH DETERMINES THE OUTPUT SPEC FOR THE LOGGING,
+;AND SETS UP THE TRAPPING FOR JSYSES.  USUALLY THE PROGRAM TO BE
+;TRAPPING HASN'T STARTED YET, BUT IT COULD BE IF IT WAS INTERRUPTED.
+
+
+
+
+CMDLOG:	MOVEI	T2,[ASCIZ/JSYSES TO FILE/]	;GET NOISE
+	PUSHJ	P,NOISE		;PARSE NOISE TEXT
+	HRROI	T2,[ASCIZ/JSTRAP/]	;GET DEFAULT FILE
+	MOVEM	T2,JFNBLK+.GJNAM	;SAVE IT
+	HRROI	T2,[ASCIZ/LOG/]		;GET DEFAULT EXTENSION
+	MOVEM	T2,JFNBLK+.GJEXT	;SAVE IT TOO
+	MOVX	T2,GJ%FOU+GJ%MSG	;GET FLAGS
+	MOVEM	T2,JFNBLK	;AND SET THEM
+	MOVEI	T2,[FLDDB. (.CMFIL)]	;GET READY
+	PUSHJ	P,COMMND	;READ OUTPUT SPEC
+	MOVE	T4,T2		;SAVE THIS JFN
+	PUSHJ	P,CONFRM	;CONFIRM THE LINE
+	PUSHJ	P,CLSLOG	;CLOSE ANY OLD LOG FILE
+	HRRZM	T4,JFNOUT	;THEN SAVE AWAY THIS NEW ONE
+	MOVE	T1,JFNOUT	;GET READY TO OPEN THE FILE
+	MOVX	T2,7B5+OF%APP	;WANT TO APPEND TO THE FILE
+	OPENF			;OPEN IT UP
+	  ERJMP	LOSE		;CAN'T
+	SETZM	REPCNT		;CLEAR THE REPEAT COUNT
+	SETZM	JSJSYS		;AND PREVIOUS JSYS
+	ANDCMI	Fl,FR.HDR	;REMEMBER WE NEED A NEW HEADER LINE
+	POPJ	P,		;AND RETURN
+
+	SUBTTL	SIMPLE COMMANDS
+
+
+
+;HERE TO DO A RESET.  THIS IS ESSENTIALLY JUST THE SAME THING
+;AS RESTARTING THE PROGRAM.
+
+
+
+CMDRES:	PUSHJ	P,CONFRM	;CONFIRM THE COMMAND FIRST
+	PUSHJ	P,CLRADR	;UNDO ANY MAPPINGS
+	PUSHJ	P,CLSLOG	;CLOSE THE LOG FILE
+	JRST	START		;THEN START THE PROGRAM OVER
+
+
+
+
+;here to turn on 'symbols in log file' flag
+cmdson:	movei	t2,[asciz/symbols in log file/]
+	call	noise
+	call	confrm
+	txz	fl,fr.sym
+	popj	p,
+;here to turn off 'symbols in log file' flag
+cmdsof:	movei	t2,[asciz/symbols from log file/]
+	call	noise
+	call	confrm
+	txo	fl,fr.sym
+	popj	p,
+
+;here to run a program - get then start a program
+cmdrun:	movei	t2,[asciz/PROGRAM/] ; get noise
+	call	noise
+	SETZM	JFNBLK+.GJNAM	;CLEAR ANY DEFAULT FILE NAME
+	HRROI	T2,[ASCIZ/EXE/]	;GET DEFAULT EXTENSION
+	MOVEM	T2,JFNBLK+.GJEXT	;AND SAVE IT
+	hrroi	t2,[asciz/SYS/]
+	movem	t2,jfnblk+.gjdev
+	MOVX	T2,GJ%OLD	;GET FLAGS
+	MOVEM	T2,JFNBLK	;SET THEM FOR GTJFN
+	MOVEI	T2,[FLDDB. (.CMFIL)]	;GET READY
+	PUSHJ	P,COMMND	;READ THE SPEC
+	HRRZ	T4,T2		;SAVE IT
+	movei	t2,[flddb. (.cmtxt,,,<Data line to be sent to program>)]
+	PUSHJ	P,COMMND	;READ THE SPEC
+	push	p,t1
+	move	t1,[point 7,cmdlin]
+	hrrz	t2,t4		; file name jfn
+	movx	t3,fld(.jsaof,js%nam) ; file name only
+	jfns
+	movei	t2," "
+	idpb	t2,t1
+	move	t2,[point 7,atmbuf]
+	skipn	atmbuf
+	jrst	.+4
+	ildb	t3,t2
+	idpb	t3,t1
+	jumpn	t3,.-2
+	movei	t3,12
+	dpb	t3,t1
+	movei	t3,0
+	idpb	t3,t1
+	move	t1,[point 7,cmdlin]
+	rscan
+	  haltf
+	pop	p,t1
+	PUSHJ	P,CONFRM	;CONFIRM THE COMMAND
+	TRNE	Fl,FR.INT	;DURING AN INTERRUPT?
+	  JRST	NOGET		;YES, LOSE
+	PUSHJ	P,CLRADR	;REMOVE ANY MAPPING FROM BEFORE
+	SKIPE	T1,HANDLE	;GET FORK HANDLE IF HAVE ONE
+	KFORK			;RELEASE IT, AND CLOSE JFN
+	  ERJMP	.+1		;CAN'T, IGNORE
+	SETZM	HANDLE		;CLEAR HANDLE
+	MOVEM	T4,JFN		;SAVE THE NEW JFN
+	MOVX	T1,CR%CAP	;GET READY
+	CFORK			;CREATE AN INFERIOR FORK
+	  ERJMP	LOSE		;FAILED
+	MOVEM	T1,HANDLE	;OK, SAVE HANDLE AWAY
+	MOVSI	T1,(T1)		;PUT JFN IN RIGHT PLACE
+	IOR	T1,JFN		;AND ADD IN JFN
+	GET			;READ IN THE PROGRAM
+	  ERJMP	LOSE		;FAILED
+	SETZM	JSJSYS		;CLEAR OLD JSYS
+	SETZM	REPCNT		;AND THE COUNTER
+	call	GETSYM		;READ IN SYMBOL TABLE
+	pjrst	cmdst1
+
+
+
+;HERE TO EXIT FROM PROGRAM.  THE OUTPUT FILE IS CLOSED IF NECESSARY.
+
+
+CMDXIT:	MOVEI	T2,[ASCIZ/FROM PROGRAM/]	;GET NOISE
+	PUSHJ	P,NOISE		;EAT NOISE WORDS
+	PUSHJ	P,CONFRM	;THEN CONFIRM THE COMMAND
+	PUSHJ	P,CLRADR	;UNDO ANY MAPPING
+	PUSHJ	P,CLSLOG	;CLOSE UP THE LOG FILE
+	RESET			;RESET EVERYTHING
+	HALTF			;QUIT FOR NOW
+	JRST	START		;AND RESTART IF CONTINUED
+
+
+
+
+;HERE TO GET THE NUMBER OF DUPLICATIONS OF A JSYS WHICH OCCUR
+;IN A ROW.  LISTING OF THE JSYS AFTER THIS MANY TIMES IN A ROW
+;WILL BE SUPPRESSED (SUCH AS BOUTS, PBOUTS, ETC.).
+
+
+
+
+CMDMAX:	MOVEI	T2,[ASCIZ/NUMBER OF REPETITIONS IS/]
+	PUSHJ	P,NOISE		;PARSE THE NOISE
+	MOVEI	T2,[FLDDB. (.CMNUM,,^D10,,<1000>)]
+	PUSHJ	P,COMMND	;READ THE NUMBER
+	MOVE	T4,T2		;SAVE IT
+	PUSHJ	P,CONFRM	;CONFIRM THE LINE
+	SKIPG	T4		;IS THE RESULT NEGATIVE?
+	HRLOI	T4,377777	;YES, MAKE IT LARGE AND POSITIVE
+	MOVEM	T4,REPMAX	;SAVE THE VALUE
+	POPJ	P,		;AND RETURN
+
+;HERE TO STOP LOGGING OF JSYSES.  AS LONG AS WE DO NOT LOG THE
+;JSYSES, NO JSYS TRAPPING CAN OCCUR, SINCE THAT IS USELESS.
+;THE "CLOSE" COMMAND.
+
+
+
+
+CMDCLS:	MOVEI	T2,[ASCIZ/LOG FILE AND STOP TRAPPING JSYSES/]
+	PUSHJ	P,NOISE		;PARSE NOISE
+	PUSHJ	P,CONFRM	;CONFIRM THE COMMAND
+
+CLSLOG:	SKIPE	T1,JFNOUT	;GET OUTPUT JFN
+	CLOSF			;CLOSE THE FILE IF IT WAS OPEN
+	  ERJMP	.+1		;SHOULDN'T FAIL
+	SETZM	JFNOUT		;CLEAR OUTPUT JFN
+	POPJ	P,		;AND RETURN
+
+
+
+
+;HERE TO SET WHETHER OR NOT ALL FORKS WILL HAVE THE SAME ADDRESSING
+;SPACE OR NOT.  NEEDED FOR US TO KNOW WHETHER OR NOT TO GIVE SYMBOLS
+;FOR LOWER FORKS.
+
+
+
+CMDFRK:	MOVEI	T2,[ASCIZ/HAVE/]	;GET NOISE
+	PUSHJ	P,NOISE		;PARSE IT
+	MOVEI	T2,[FLDDB. (.CMKEY,,FRKTAB,,<DIFFERENT>)]
+	PUSHJ	P,COMMND	;READ THE KEYWORD
+	MOVE	T4,(T2)		;GET THE OFFSET
+	MOVEI	T2,[ASCIZ/CORE IMAGES/]	;GET MORE NOISE
+	PUSHJ	P,NOISE		;PARSE IT
+	PUSHJ	P,CONFRM	;THEN CONFIRM IT
+	XCT	[IORI	Fl,FR.SAM	;DO PROPER THING
+		 ANDCMI	Fl,FR.SAM](T4)	;DEPENDING ON KEYWORD
+	POPJ	P,		;THEN RETURN
+
+
+FRKTAB:	FRKLEN,,FRKLEN		;NUMBER OF KEYWORDS
+	AA	DIFFERENT,1	;DIFFERENT CORE IMAGES
+	AA	IDENTICAL,0	;SAME CORE IMAGES
+
+	FRKLEN==.-FRKTAB-1	;NUMBER OF KEYWORDS
+
+	SUBTTL	THE HELP COMMAND
+
+
+CMDHLP:	PUSHJ	P,CONFRM	;CONFIRM THE LINE
+	HRROI	T1,HLPTXT	;POINT TO HELP MESSAGE
+	PSOUT			;TYPE IT
+	POPJ	P,		;AND RETURN
+
+
+HLPTXT:	TEXT	<
+Commands are the following:
+
+  ALLOW arg		Add the set of JSYSes specified to the set
+			which is being trapped and logged.
+
+  DISALLOW arg		Remove the set of JSYSes specified from the
+			set which is being trapped and logged.
+
+  CLOSE			Close the log file and stop trapping of JSYSes.
+
+  EXIT			Close log file and exit from program.
+
+  FORKS arg		Tell whether or not you expect the core image
+			of all forks to be the same.  This command only
+			affects the symbolic listing in the log file.
+
+  GET program		Read the specified program into an inferior fork.
+			The program is not started.
+
+  INTERRUPT char	Set which control character to use to interrupt
+			the program being run.  The default is ^P.
+
+  LOG spec		Begin logging of the JSYSes to the specified
+			file.  The default file is JSTRAP.LOG.
+
+  MAXIMUM number	Set how many identical JSYSes in a row can be
+			logged.  Any further identical JSYSes are
+			ignored.  Default value is 1000.
+
+  PROCEED		Return from a terminal interrupt.
+
+  RESET			Close the log file and restart the program.
+
+  START			Begin execution of the program being watched.
+
+  SYMBOLS addr		Set what address to use for reading in symbols.
+			The default address is .JBSYM (116).
+
+  TELL jsys		Tell whether or not a particular JSYS is being
+			trapped.  The argument ALL will list all JSYSes
+			which are being trapped.
+
+>				;HELP MESSAGE
+
+	SUBTTL	COMMAND TO TELL ABOUT WHICH JSYSES WE ARE TRAPPING
+
+
+
+;THIS IS THE "TELL" COMMAND, WHICH WILL TELL THE STATUS OF A JSYS.
+;IF THE ARGUMENT IS "*", WE TELL ABOUT ALL JSYSES.
+
+
+
+CMDTEL:	MOVEI	T2,[ASCIZ/ABOUT JSYS/]	;GET NOISE
+	PUSHJ	P,NOISE		;PARSE IT
+	PUSHJ	P,READJS	;INPUT JSYS NAME AND VALUE
+	JUMPL	T1,TELWLD	;TELL ABOUT THEM ALL IF WILDCARD
+	MOVE	T5,JSTAB(T1)	;GET POINTER TO JSYS NAME
+	IDIVI	T1,^D36		;SPLIT UP
+	MOVNI	T2,(T2)		;GET READY
+	MOVSI	T3,400000	;GET A BIT READY
+	LSH	T3,(T2)		;SHIFT IT
+	AND	T3,BITS(T1)	;SEE IF THIS JSYS IS BEING TRAPPED
+	HRROI	T1,[ASCIZ/
+/]				;GET A CRLF
+	PSOUT			;PRINT IT
+	HRROI	T1,(T5)		;POINT TO JSYS NAME
+	PSOUT			;OUTPUT IT
+	HRROI	T1,[ASCIZ/ is /]	;MORE
+	PSOUT			;PRINT IT
+	HRROI	T1,[ASCIZ/not /]	;GET TEXT
+	SKIPN	T3		;ARE WE TRAPPING THIS JSYS?
+	PSOUT			;NO, SAY SO
+	HRROI	T1,[ASCIZ/being trapped
+
+/]				;GET FINAL STUFF
+	PSOUT			;TYPE IT
+	POPJ	P,		;AND RETURN
+
+;HERE WHEN HE WANTS TO HAVE A LIST OF ALL THE JSYSES WE ARE
+;TRAPPING FOR.
+
+
+
+TELWLD:	MOVE	T4,[POINT 1,BITS]	;GET A BYTE POINTER
+	MOVSI	T5,-1000	;AND AN AOBJN POINTER
+	SETZ	Ch,		;AND A COUNTER
+
+TELLOP:	ILDB	T1,T4		;GET NEXT BIT
+	JUMPN	T1,TELNXT	;JUMP IF ARE TRAPPING IT
+	HRROI	T1,[ASCIZ/
+The following JSYSes are not being trapped:
+/]				;GET TEXT READY
+	SKIPN	Ch		;FIRST TIME?
+	PSOUT			;YES, PRINT THE HEADER
+	HRROI	T1,[ASCIZ/
+/]				;GET A CRLF READY
+	TRNN	Ch,7		;TIME FOR A NEW LINE?
+	PSOUT			;YES, DO A CRLF FIRST
+	MOVEI	T1,"	"	;GET A TAB
+	TRNE	Ch,7		;AT FRONT OF A LINE?
+	PBOUT			;NO, THEN TYPE THE TAB
+	MOVE	T3,JSTAB(T5)	;GET POINTER TO NAME
+	MOVE	T2,(T3)		;GET NAME
+	CAMN	T2,[ASCII/JSYS /]	;IS THIS JSYS UNNAMED?
+	MOVE	T2,1(T3)	;YES, GET SECOND PART OF NAME
+	SETZ	T3,		;MAKE IT ASCIZ
+	HRROI	T1,T2		;POINT TO IT
+	PSOUT			;TYPE IT
+	ADDI	Ch,1		;ADD TO COUNT OF JSYSES
+TELNXT:	AOBJN	T5,TELLOP	;LOOP OVER ALL BITS
+	HRROI	T1,[ASCIZ/
+All JSYSes are being trapped/]	;GET TEXT READY
+	SKIPN	Ch		;NO JSYSES AT ALL?
+	PSOUT			;RIGHT, TELL SO
+	HRROI	T1,[ASCIZ/
+
+/]				;GET A FINAL CRLF
+	PSOUT			;OUTPUT IT
+	POPJ	P,		;AND RETURN
+
+	SUBTTL	COMMANDS TO SET WHAT CLASS OF JSYSES TO TRAP
+
+
+
+;HERE ARE THE "ALLOW" AND "DISALLOW" COMMANDS, TO SET OR CLEAR TRAPS
+;FOR PARTICULAR CLASSES OF JSYSES.  THIS ACTION IS JUST DIDDLING
+;THE BIT TABLE OF JSYSES.
+
+
+
+CMDDIS:	TDZA	T4,T4		;SET AC ZERO AS A FLAG
+CMDALW:	MOVSI	T4,-1		;SET AC NEGATIVE AS A FLAG
+	MOVEI	T2,[ASCIZ/TRAPS FOR/]	;GET NOISE
+	PUSHJ	P,NOISE		;PARSE IT
+	MOVEI	T2,[FLDDB. (.CMKEY,,CLSTAB,,<ALL>)]	;GET SET
+	PUSHJ	P,COMMND	;LOOK FOR KEYWORD
+	CAIN	T2,SPCLCL	;IS IT THE SPECIAL KEYWORD?
+	JRST	SETSPL		;YES, HANDLE SPECIALLY
+	HRR	T4,(T2)		;NO, NORMAL CASE, SAVE TABLE ADDRESS
+	MOVEI	T2,[ASCIZ/CLASS OF JSYSES/]	;MORE NOISE
+	PUSHJ	P,NOISE		;PARSE IT
+	PUSHJ	P,CONFRM	;COMFIRM THE COMMAND
+CLSAOB:	MOVSI	T1,-BITSIZ	;GET AN AOBJN POINTER
+
+CLSLOP:	MOVE	T2,(T4)		;GET WORD OF BITS
+	SKIPL	T4		;CLEARING BITS?
+	ANDCAM	T2,BITS(T1)	;YES, DO SO
+	SKIPGE	T4		;SETTING BITS?
+	IORM	T2,BITS(T1)	;YES, DO SO
+	ADDI	T4,1		;MOVE TO NEXT WORD
+	AOBJN	T1,CLSLOP	;LOOP OVER ALL WORDS
+	POPJ	P,		;DONE, RETURN
+
+
+;HERE WHEN THE KEYWORD WAS "JSYS".  WE LOOK FOR A PARTICULAR NAME,
+;OR A PARTICULAR NUMBER.
+
+
+SETSPL:	PUSHJ	P,READJS	;READ THE JSYS NAME
+	JUMPL	T1,[	HRRI	T4,BT.ALL	;IF WILDCARD, GET TABLE
+			JRST	CLSAOB	]	;AND SET THEM BITS
+	IDIVI	T1,^D36		;DIVIDE BY BITS TO A WORD
+	MOVNI	T2,(T2)		;GET SHIFT VALUE READY
+	MOVSI	T3,400000	;AND BIT
+	LSH	T3,(T2)		;POSITION IT
+	SKIPL	T4		;CLEARING THE BIT?
+	ANDCAM	T3,BITS(T1)	;YES, DO IT
+	SKIPGE	T4		;SETTING THE BIT?
+	IORM	T3,BITS(T1)	;YES, DO IT
+	POPJ	P,		;THEN RETURN
+
+;SUBROUTINE TO READ IN A JSYS NAME, OR THE OCTAL VALUE OF A JSYS.
+;LEFT HALF OF AC T4 IS PRESERVED, THE NAME OF THE JSYS IS IN AC T5,
+;AND THE VALUE OF THE JSYS IS IN AC T1.  IF "ALL" WAS TYPED, T1 IS NEGATIVE.
+
+
+
+
+;READJS:	MOVEI	T2,[FLDDB. (.CMNUM,,^D8,,<ALL>,<[FLDDB. (.CMFLD,,,<JSYS name>)]>)]
+READJS:	MOVEI	T2,[FLDDB. (.CMNUM,,^D8,,<ALL>,<[FLDDB. (.CMKEY,,JSTAB2,<JSYS name>)]>)]
+	SETZM	ATMBUF		;CLEAR THE ATOM BUFFER
+	PUSHJ	P,COMMND	;PARSE A NUMBER OR A NAME
+	TSC	T3,T3		;SEE WHICH ONE IT WAS
+	HRRI	T4,(T3)		;AND SAVE IT
+	SKIPN	T3		;WAS THIS A NUMBER?
+	jrst	.+3
+	hlrz	t5,0(t2)	; get address of string
+	move	t5,0(t5)	; get name of command	
+	txz	t5,ascii/     /
+	trna
+	MOVE	T5,T2		;YES, SAVE NUMBER
+	PUSHJ	P,CONFRM	;THEN CONFIRM THE COMMAND
+	MOVE	T1,T5		;RESTORE ARGUMENT
+	TRNN	T4,-1		;WAS THIS THE NUMBER?
+	JRST	READJN		;YES, JUST GO CHECK THE RANGE
+	MOVSI	T1,-1000	;GET READY FOR A SEARCH
+	CAMN	T5,[ASCIZ/ALL/]	;IS THIS THE SPECIAL WORD?
+	POPJ	P,		;YES, RETURN WITH T1 NEGATIVE
+
+JSYSRC:	MOVE	T2,JSTAB(T1)	;GET POINTER TO JSYS NAME
+	CAME	T5,(T2)		;MATCH?
+	AOBJN	T1,JSYSRC	;NO, KEEP LOOKING
+	JUMPGE	T1,BADJSY	;JUMP IF NOT FOUND
+	MOVEI	T1,(T1)		;THROW AWAY LEFT HALF
+
+READJN:	JUMPL	T1,BADJSY	;ERROR IF NEGATIVE
+	CAIGE	T1,1000		;IS THE VALUE ILLEGAL?
+	POPJ	P,		;YES, RETURN
+
+
+
+
+BADJSY:	HRROI	T1,[ASCIZ/
+? Illegal JSYS specified/]	;GET TEXT
+	PSOUT			;OUTPUT IT
+	JRST	LOSFIN		;AND FINISH
+
+;THE TABLE OF CLASSES THAT CAN BE SET OR CLEARED.
+
+
+
+CLSTAB:	CLSLEN,,CLSLEN			;NUMBER OF ENTRIES
+	AA	ALL,BT.ALL		;ALL JSYSES
+	AA	FILE,BT.FIL		;FILE ORIENTED JSYSES
+	AA	FORK,BT.FRK		;FORK RELATED JSYSES
+	AA	INFORMATION,BT.STS	;INFORMATION JSYSES
+	AA	INPUT,BT.INP		;INPUT RELATED JSYSES
+	AA	INTERRUPT,BT.INT	;INTERRUPT RELATED JSYSES
+	AA	IPCF,BT.IPC		;IPCF JSYSES
+SPCLCL:	AA	JSYS,0			;PARTICULAR JSYS
+	AA	OUTPUT,BT.OUT		;OUTPUT RELATED JSYSES
+	AA	SETTING,BT.SET		;JSYSES WHICH SET THINGS
+	AA	TERMINAL,BT.PRI		;TERMINAL RELATED JSYSES
+
+	CLSLEN==.-CLSTAB-1		;NUMBER OF KEYWORDS
+
+	SUBTTL	COMMAND TO SET WHAT CHARACTER TO INTERRUPT ON
+
+
+
+
+;HERE TO SET WHAT CHARACTER WILL BE USED TO INTERRUPT THE PROGRAM
+;WHEN WE ARE RUNNING IT.
+
+
+
+CMDINT:	HRROI	T2,[ASCIZ/CHARACTER IS CONTROL/]	;GET NOISE
+	PUSHJ	P,NOISE		;PARSE IT
+	MOVEI	T2,[FLDDB. (.CMFLD,,,<LETTER, A - Z>,<P>)]	;GET READY
+	PUSHJ	P,COMMND	;READ IT
+	MOVE	T4,ATMBUF	;SAVE FIRST WORD OF ATOM BUFFER
+	PUSHJ	P,CONFRM	;CONFIRM THE COMMAND
+	MOVE	T1,[POINT 7,T4]	;GET A BYTE POINTER READY
+	ILDB	T2,T1		;GET THE CHARACTER
+	CAIL	T2,"A"		;IS IT LEGAL ALPHABETIC CHAR?
+	CAILE	T2,"Z"		;WELL?
+	  JRST	BADCHR		;NO, COMPLAIN
+	ILDB	T3,T1		;GET NEXT CHAR TOO
+	JUMPN	T3,BADCHR	;IT MUST BE NULL
+	MOVEI	T2,.TICCA-"A"(T2)	;CONVERT TO INTERRUPT CODE
+	MOVEM	T2,INTCHR	;AND SAVE IT
+	POPJ	P,		;THEN RETURN
+
+
+BADCHR:	HRROI	T1,[ASCIZ/
+? Character must be from A - Z/]	;GET TEXT
+	PSOUT			;TYPE IT
+	JRST	LOSFIN		;AND FINISH THE ERROR
+
+	SUBTTL	COMMAND TO LOAD IN A PROGRAM TO BE WATCHED
+
+
+;THE "GET" COMMAND.  CREATES AN INFERIOR FORK AND READS IN THE GIVEN
+;PROGRAM INTO IT.  THE PROGRAM IS NOT YET STARTED.  IF THERE ARE ANY
+;SYMBOLS, THEY ARE EXTRACTED INTO OUR OWN CORE SO THAT WE CAN EASILY
+;USE THEM.
+
+
+
+
+CMDGET:	MOVEI	T2,[ASCIZ/PROGRAM/]	;GET NOISE
+	PUSHJ	P,NOISE		;PARSE IT
+	SETZM	JFNBLK+.GJNAM	;CLEAR ANY DEFAULT FILE NAME
+	HRROI	T2,[ASCIZ/EXE/]	;GET DEFAULT EXTENSION
+	MOVEM	T2,JFNBLK+.GJEXT	;AND SAVE IT
+	hrroi	t2,[asciz/SYS/]
+	movem	t2,jfnblk+.gjdev
+	MOVX	T2,GJ%OLD	;GET FLAGS
+	MOVEM	T2,JFNBLK	;SET THEM FOR GTJFN
+	MOVEI	T2,[FLDDB. (.CMFIL)]	;GET READY
+	PUSHJ	P,COMMND	;READ THE SPEC
+	HRRZ	T4,T2		;SAVE IT
+	PUSHJ	P,CONFRM	;CONFIRM THE COMMAND
+	TRNE	Fl,FR.INT	;DURING AN INTERRUPT?
+	  JRST	NOGET		;YES, LOSE
+	PUSHJ	P,CLRADR	;REMOVE ANY MAPPING FROM BEFORE
+	SKIPE	T1,HANDLE	;GET FORK HANDLE IF HAVE ONE
+	KFORK			;RELEASE IT, AND CLOSE JFN
+	  ERJMP	.+1		;CAN'T, IGNORE
+	SETZM	HANDLE		;CLEAR HANDLE
+	MOVEM	T4,JFN		;SAVE THE NEW JFN
+	MOVX	T1,CR%CAP	;GET READY
+	CFORK			;CREATE AN INFERIOR FORK
+	  ERJMP	LOSE		;FAILED
+	MOVEM	T1,HANDLE	;OK, SAVE HANDLE AWAY
+	MOVSI	T1,(T1)		;PUT JFN IN RIGHT PLACE
+	IOR	T1,JFN		;AND ADD IN JFN
+	GET			;READ IN THE PROGRAM
+	  ERJMP	LOSE		;FAILED
+	SETZM	JSJSYS		;CLEAR OLD JSYS
+	SETZM	REPCNT		;AND THE COUNTER
+	PJRST	GETSYM		;READ IN SYMBOL TABLE
+
+
+
+NOGET:	MOVE	T1,T4		;GET JFN
+	RLJFN			;RELEASE IT
+	  ERJMP	.+1		;FORGET IT
+	JRST	INTST		;AND COMPLAIN
+
+	SUBTTL	ROUTINE TO CONTINUE FROM INTERRUPTIONS
+
+
+
+
+;HERE ON THE "PROCEED" COMMAND.  THIS CODE SHOULD ONLY BE REACHED
+;WHEN A TERMINAL INTERRUPT IS IN PROGRESS.  WE RESTORE EVERYTHING AND
+;RETURN TO WHERE WE WERE INTERRUPTED FROM SUCH A LONG TIME AGO.
+
+
+
+
+CMDPRO:	MOVEI	T2,[ASCIZ/FROM INTERRUPTION/]	;GET TEXT
+	PUSHJ	P,NOISE		;PARSE NOISE
+	PUSHJ	P,CONFRM	;THEN END OF LINE
+	TRNN	Fl,FR.INT	;INTERRUPTED FROM RUNNING THE PROG?
+	  JRST	NOPRO		;NO, CAN'T DO THIS THEN
+	HRROI	T1,[ASCIZ/
+/]				;GET A CRLF
+	PSOUT			;TYPE IT TO LOOK NICE
+	MOVEI	T1,TTCHN	;GET CHANNEL FOR TERMINAL
+	HRL	T1,INTCHR	;AND CODE FOR INTERRUPT
+	ATI			;SET INTERRUPT CHARACTER
+	SKIPE	JFNOUT		;DON'T TURN ON TRAPPING IF NOT LOGGING
+	PUSHJ	P,TRAPON	;ALLOW TRAPPING AGAIN
+	MOVE	T1,HANDLE	;GET PROCESS HANDLE
+	RFORK			;RESUME THE INFERIORS
+	MOVEI	T1,.FHSLF	;GET READY
+	EIR			;ENABLE THE INTERRUPTS AGAIN
+	MOVE	P,[SAVET1,,T1]	;GET READY
+	BLT	P,P		;RESTORE AC'S, INCLUDING STACK
+	ANDCMI	Fl,FR.INT	;CLEAR INTERRUPT FLAG
+	DEBRK			;RETURN FROM INTERRUPT
+
+
+
+
+NOPRO:	HRROI	T1,[ASCIZ/
+? No interrupt was in progress/]	;GET TEXT
+	PSOUT			;TYPE IT
+	JRST	LOSFIN		;AND LOSE
+
+	SUBTTL	ROUTINE TO START INFERIOR
+
+
+;HERE TO START THE PROGRAM RUNNING THAT WAS READ INTO AN
+;INFERIOR FORK.  WE MAY OR MAY NOT BE LOGGING THE JSYSES AT THIS
+;POINT.  TERMINAL INTERRUPTS ARE ALWAYS ENABLED, SO THAT WE CAN
+;HANDLE A COMMAND WHEN THE USER WANTS TO.
+
+
+
+CMDST:	MOVEI	T2,[ASCIZ/PROGRAM/]	;NOISE
+	PUSHJ	P,NOISE		;PARSE IT
+	PUSHJ	P,CONFRM	;THEN CONFIRM IT
+cmdst1:	SKIPN	HANDLE		;SEE IF HAVE A PROGRAM READ IN
+	  JRST	NOST		;IF NONE, CAN'T DO THIS
+	TRNE	Fl,FR.INT	;GET HERE DURING AN INTERRUPT?
+	  JRST	INTST		;YES, LOSE
+	HRROI	T1,[ASCIZ/
+% Log file is not opened, thus no JSYS trapping will occur
+
+/]				;GET TEXT
+	SKIPN	JFNOUT		;HAVE OUTPUT FILE OPEN?
+	PSOUT			;NO, WARN HIM
+	MOVEI	T1,TTCHN	;GET CHANNEL FOR TERMINAL INTERRUPT
+	HRL	T1,INTCHR	;AND GET INTERRUPT CODE
+	ATI			;ALLOW INTERRUPTS
+	MOVEI	T1,.FHSLF	;GET SET
+	EIR			;ENABLE INTERRUPTS IN CASE WERE INTERRUPTED
+	SKIPE	JFNOUT		;DON'T TURN ON TRAPPING UNLESS LOGGING
+	PUSHJ	P,TRAPON	;TURN ON JSYS TRAPPING
+	MOVE	T1,HANDLE	;GET FORK TO START
+	SETZ	T2,		;START AT NORMAL ADDRESS
+	SFRKV			;START THE PROGRAM
+	  ERJMP	LOSE		;FAILED
+	RFORK			;START FORK RUNNING
+	WFORK			;NOW WAIT FOR IT TO TERMINATE
+	MOVE	T1,INTCHR	;GET INTERRUPT CODE
+	DTI			;REMOVE THE INTERRUPT
+	PJRST	CLSLOG		;AND CLOSE THE LOG FILE
+
+
+
+INTST:	HRROI	T1,[ASCIZ/
+? Program currently interrupted.  Type "RESET" first/]
+	SKIPA
+NOST:	HRROI	T1,[ASCIZ/
+? No program has been read in/]	;GET TEXT
+	PSOUT			;TYPE IT
+	JRST	LOSFIN		;AND FINISH UP
+
+	SUBTTL	ROUTINE TO HANDLE INTERRUPT FROM A JSYS
+
+
+;HERE ON AN INTERRUPT DUE TO A JSYS AN INFERIOR FORK HAS DONE.  WE
+;MUST LOG IT IN THE LOG FILE AND THEN PROCEED.
+
+
+JSYINT:	MOVEM	T1,SAV2T1	;SAVE AN AC
+	MOVE	T1,[T2,,SAV2T1+1]	;GET READY
+	BLT	T1,SAV2T1-T1+P	;SAVE THE REST
+	RTFRK			;READ WHICH FORK TRAPPED
+	MOVEM	T1,JSFORK	;REMEMBER WHICH FORK DID THE JSYS
+	CAMN	T2,JSJSYS	;IS THIS JSYS THE SAME AS LAST ONE?
+	AOSA	T3,REPCNT	;YES, ADD TO COUNTER
+	SETZB	T3,REPCNT	;NO, CLEAR COUNTER
+	MOVEM	T2,JSJSYS	;SAVE THIS JSYS NOW
+	CAMGE	T3,REPMAX	;EXCEEDED OUR MAXIMUM?
+	SKIPN	JFNOUT		;OR IS THERE NO OUTPUT JFN?
+	  JRST	JSYDON		;YES, FORGET THIS THEN
+	RFSTS			;READ THE FORK STATUS
+	MOVEM	T2,JSPC		;SAVE THE PC
+	MOVE	T1,JSFORK	;GET FORK AGAIN
+	MOVEI	T2,ACS		;POINT TO STORAGE AREA
+	RFACS			;READ THE FORK'S AC'S TOO
+	MOVE	T1,[POINT 7,OUTBUF]	;GET A BYTE POINTER
+	MOVEM	T1,OUTPTR	;INITIALIZE OUTPUT POINTER
+	SETZM	OUTCNT		;NOW START COUNTER AT FRONT OF A LINE
+	MOVE	T1,JSFORK	;GET FORK WHICH DID JSYS
+	MOVEI	T1,-.FHSLF(T1)	;KEEP ONLY SMALL NUMBER
+	MOVEI	Ch," "		;GET A SPACE
+	CAIG	T1,7		;IS FORK NUMBER ONLY ONE DIGIT?
+	PUTCHR			;YES, TYPE A SPACE
+	PUSHJ	P,OCTOUT	;OUTPUT NUMBER
+	MOVEI	T1,5		;GET COLUMN TO JUSTIFY TO
+	PUSHJ	P,JUSTFY	;SPACE OVER TO IT
+	movei	t1,7
+	txne	fl,fr.sym	; include symbols in log?
+	jrst	skpsym		; no.
+	MOVE	T1,JSPC		;GET THE PC OF THE FORK
+	MOVEI	T1,-1(T1)	;BACK UP TO THE REAL PC
+	PUSHJ	P,ADRTYP	;OUTPUT OCTAL AND SYMBOLIC ADDRESS
+	MOVEI	T1,^D25		;GET COLUMN TO GO GO
+skpsym:	PUSHJ	P,JUSTFY	;MOVE TO IT
+	hrrz	T1,JSJSYS	;GET THE JSYS THAT WAS DONE
+	MOVE	T1,JSTAB(T1)	;POINT TO THE ASCIZ STRING
+	move	t2,outcnt
+	addi	t2,6
+	PUSHJ	P,STROUT	;OUTPUT THE JSYS NAME
+	move	t1,t2
+	PUSHJ	P,JUSTFY	;SPACE OVER TO IT
+	hrrz	T5,JSJSYS	;GET JSYS AGAIN
+	move	a,outptr
+	CALL	@JSTAB1(T5)
+	movem	a,outptr
+ACDON:	HRROI	T1,[ASCIZ/
+/]				;GET A CRLF
+	PUSHJ	P,STROUT	;OUTPUT IT
+	SETZB	Ch,T3		;GET A NULL CHARACTER
+	PUTCHR			;STORE IT
+	MOVE	T1,JFNOUT	;GET OUTPUT JFN
+	HRROI	T2,OUTBUF	;POINT TO THE BUFFER
+	SOUT			;THEN OUTPUT THE WHOLE LINE
+
+JSYDON:	MOVE	T1,JSFORK	;GET FORK WHICH WAS STOPPED
+	UTFRK			;RESTART IT
+	MOVE	P,[SAV2T1,,T1]	;GET READY
+	BLT	P,P		;RESTORE ALL AC'S
+	DEBRK			;AND RETURN
+
+	SUBTTL	JSYS Argument Processing Subroutines
+$acces:	move	d,regs+1
+	flags	<ac%con,ac%own,ac%rem>,10
+	movei	b,","
+	idpb	b,a
+	movei	b,"["
+	idpb	b,a
+	move	b,regs+1
+	andi	b,3
+	movem	b,count1
+	move	b,regs+2	; get address or argument block
+	movem	b,addres
+	pushj	p,.get1		; go get the word whose address is in b, in b
+	hlr	c,b		; check for 777777
+	cain	c,777777
+	hrli	b,440700	; convert to real byte pointer
+	move	c,b
+	lsh	c,-^D30
+	caile	c,44		; good byte pointer value?
+	jrst	[dirst
+		  erjmp	[call	lsterr
+			jrst	$aces0]
+		jrst	$aces0]
+	pushj	p,.name		; treat as byte pointer, copy name
+$aces0:	sosg	count1
+	jrst	$aces1
+	movei	b,","
+	idpb	b,a
+	aos	b,addres	; get address of password string
+	call	.get1		; get process word
+	call	.name		; copy password string
+	sosg	count1
+	jrst	$aces1
+	movei	b,","
+	idpb	b,a
+	aos	b,addres
+	call	.get1		; get job number
+	movei	c,^D10
+	call	.nout
+$aces1:	movei	b,"]"
+	idpb	b,a
+	jrst	$null
+$adbrk:	movei	b,"["
+	idpb	b,a
+	hlrz	b,regs+1
+	funct	<.ABSET,.ABRED,.ABCLR,.ABGAD>
+	movei	b,","
+	idpb	b,a
+	idpb	b,a
+	hrrz	b,regs+1
+	call	.proc
+	movei	b,"]"
+	idpb	b,a
+	hlrz	b,regs+1
+	cain	b,.abclr
+	jrst	$null
+	cain	b,.abgad
+	jrst	$adbk1
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	movei	c,10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	d,regs+3
+	flags	<ab%red,ab%wrt,ab%xct>,10
+	jrst	$null
+$adbk1:	call	.arg.
+	jrst	$null
+$aic:	move	b,regs+1	; get process handle
+	pushj	p,.proc
+	movei	b,","
+	idpb	b,a
+	move	d,regs+2	; get interrupt channels to turn on
+	flags	<1B0,1B1,1B2,1B3,1B4,1B5,1B<.icaov>,1B<.icfov>,1B8,1B<.icpov>,1B<.iceof>,1B<.icdae>,1B<.icqta>,1B13,1B14,1B<.icili>,1B<.icird>,1B<.iciwr>,1B18,1B<.icift>,1B<.icmse>,1B21,1B<.icnxp>,1B23,1B24,1B25,1B26,1B27,1B28,1B29,1B30,1B31,1B32,1B33,1B34,1B35>,10
+	jrst	$null
+$alloc:	hrroi	b,[asciz/Wheel required anyway/]
+	movei	c,0
+	call	.sout
+	movei	b,"	"
+	idpb	b,a
+	move	b,regs+a
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+b
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+c
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+d
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	jrst	$null
+$asnd:	move	b,regs+1
+	call	.devst
+	jrst	$null
+$asnsq:	hrroi	b,[asciz/Wheel Needed!/]
+	movei	c,0
+	call	.sout
+	movei	b,"	"
+	idpb	b,a
+	move	b,regs+a
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+b
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+c
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+d
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	jrst	$null
+$atach:	move	d,regs+1
+	flags	<at%ccj,at%nat,at%trm>,10
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	call	.dirst
+	movei	b,","
+	idpb	b,a
+	movei	b,regs+3
+	call	.name
+	move	b,regs+1
+	txnn	b,at%trm
+	jrst	$null
+	movei	b,","
+	idpb	b,a
+	move	regs+4
+	movei	c,10
+	call	.nout
+	jrst	$null
+$ati:	movei	b,"["
+	idpb	b,a
+	hlre	b,regs+1
+	movx	c,10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	idpb	b,a
+	hrrz	b,regs+1
+	call	.nout
+	movei	b,"]"
+	idpb	b,a
+	jrst	$null
+$atnvt:	hllz	d,regs+1
+	flags	<an%ntp>,10
+	movei	b,","
+	idpb	b,a
+	hrrz	b,regs+2
+	call	.jfn
+	jrst	$null
+$bin:	move	b,regs+1
+	call	.srce
+	push	p,a		; save where we are
+	move	a,regs+1
+	dvchr
+	  erjmp	[pop	p,a
+		jrst	$null]
+	pop	p,a
+	txne	b,777B17
+	jrst	$null
+	push	p,a
+	move	a,regs+1
+	rfptr
+	  ercal	error
+	move	d,b
+	bin
+	exch	d,b
+	sfptr
+	  ercal	error
+	pop	p,a
+	movei	c,"	"
+	idpb	c,a
+	movei	c,"="
+	idpb	c,a
+	movei	c,76
+	idpb	c,a
+	movei	c,^D10
+	call	.nout
+	movei	c,"."
+	idpb	c,a
+	movei	c,","
+	idpb	c,a
+	move	b,d
+	call	.char
+	jrst	$null
+$bkjfn:	move	b,regs+1
+	call	.srce
+	jrst	$null
+$boot:	hrroi	b,[asciz/Wheel required anyway/]
+	movei	c,0
+	call	.sout
+	movei	b,"	"
+	idpb	b,a
+	move	b,regs+a
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+b
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+c
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+d
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	jrst	$null
+$bout:	move	b,regs+1	; get source
+	pushj	p,.srce
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2	; get character
+	pushj	p,.char
+	jrst	$null
+$cacct:	move	b,regs+1
+	txne	b,7B2
+	jrst	$cac.1
+	movei	c,10
+	call	.nout
+	jrst	$cac.2
+$cac.1:	call	.name
+$cac.2:	jrst	$null
+$cfibf:	move	b,regs+1
+	call	.srce
+	jrst	$null
+$cfobf:	move	b,regs+1
+	call	.srce
+	jrst	$null
+$cfork:	move	d,regs+1
+	flags	<cr%map,cr%cap,cr%acs,cr%st>,10
+	jrst	$null
+$chfdb:	movei	b,"["
+	idpb	b,a
+	hllz	d,regs+1
+	flags	<cf%nud,777B17>,10
+	movei	b,","
+	idpb	b,a
+	idpb	b,a
+	hrrz	b,regs+1
+	call	.jfn
+	movei	b,"]"
+	idpb	b,a
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	movei	c,10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+3
+	call	.nout
+	jrst	$null
+$chkac:	move	b,regs+1
+	movei	c,10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	movei	c,10
+	call	.nout
+	jrst	$null
+$cis:	jfcl			; nop to tell search routine we did this one
+	jrst	$null
+$closf:	move	d,regs+1	; get flags,,jfn
+	camn	d,[-1]		; special case here
+	jrst	[movei	b,"-"
+		idpb	b,a
+		movei	b,"1"
+		idpb	b,a
+		jrst	$null]
+	flags	<co%nrj,cz%abt,cz%nud>,10
+	skipn	d
+	jrst	$null
+	movei	b,","
+	idpb	b,a
+	move	b,d
+	pushj	p,.jfn
+	jrst	$null
+$clzff:	movei	b,"["
+	idpb	b,a
+	hllz	d,regs+1
+	flags	<cz%nif,cz%nsf,cz%nrj,cz%ncl,cz%unr,cz%arj,cz%abt,cz%nud>,10
+	movei	b,","
+	idpb	b,a
+	idpb	b,a
+	hrrz	b,regs+1
+	call	.proc
+	movei	b,"]"
+	idpb	b,a
+	jrst	$null
+$comnd:	move	b,regs+1	; get address of command state block
+	movei	c,10
+	call	.nout
+	move	c,[-^D10,,myblk] ; copy 10. words to here
+	call	.move
+	move	b,.cmgjb+myblk	; save this word for later possible use
+	movem	b,cmgjb
+	movei	b,"{"
+	idpb	b,a
+	movei	b,"["
+	idpb	b,a
+	hllz	d,myblk+.cmflg
+	flags	<cm%rai,cm%xif,cm%wkf>,10
+	movei	b,"+"
+	hllz	d,myblk+.cmflg
+	caie	d,0
+	idpb	b,a
+	hrrz	b,myblk+.cmflg
+	movei	c,10
+	call	.nout
+	movei	b,"]"
+	idpb	b,a
+	movei	b,","
+	idpb	b,a
+	movei	b,"["
+	idpb	b,a
+	hlrz	b,myblk+.cmioj
+	call	.jfn
+	movei	b,","
+	idpb	b,a
+	hrrz	b,myblk+.cmioj
+	call	.jfn
+	movei	b,"]"
+	idpb	b,a
+	movei	b,","
+	idpb	b,a
+	movei	b,"["
+	idpb	b,a
+	movei	b,42
+	idpb	b,a
+	move	b,myblk+.cmrty
+	call	.name
+	movei	b,42
+	idpb	b,a
+	movei	b,"]"
+	idpb	b,a
+	movei	b,"}"
+	idpb	b,a
+$cmnd1:	movei	b,","		; indent following arguments
+	idpb	b,a
+	movei	b,15
+	idpb	b,a
+	movei	b,12
+	idpb	b,a
+	movei	b,"	"
+	idpb	b,a
+	idpb	b,a
+	idpb	b,a
+	movei	b," "
+	idpb	b,a
+	idpb	b,a
+	idpb	b,a
+	idpb	b,a
+	move	b,regs+2	; address of first alternative func. desc. blk.
+	move	c,[-4,,myblk]
+	call	.move
+	move	b,regs+2
+	movei	c,10
+	call	.nout
+	movei	b,"{"
+	idpb	b,a
+	movei	b,"["
+	idpb	b,a
+	ldb	b,[point 9,myblk,8] ; get function code
+	funct	<.cmkey,.cmnum,.cmnoi,.cmswi,.cmifi,.cmofi,.cmfil,.cmfld,.cmcfm,.cmdir,.cmusr,.cmcma,.cmini,.cmflt,.cmdev,.cmtxt,.cmtad,.cmqst,.cmuqs,.cmtok,.cmnux,.cmact,.cmnod>
+	ldb	d,[point 9,myblk,^D17]
+	movei	b,","
+	idpb	b,a
+	flags	<cm%po,cm%hpp,cm%dpp,cm%sdh>
+	movei	b,","
+	idpb	b,a
+	hrrz	b,myblk
+	movem	b,regs+2
+	movei	c,10
+	call	.nout
+	movei	b,"]"
+	idpb	b,a
+	movei	b,","
+	idpb	b,a
+	move	b,myblk+.cmdat
+	movx	c,no%mag!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,myblk+.cmhlp
+	jumpe	b,[movei b,"0"
+		idpb	b,a
+		jrst	$cmnd2]
+	movei	c,42
+	idpb	c,a
+	call	.name
+	movei	b,42
+	idpb	b,a
+$cmnd2:	movei	b,","
+	idpb	b,a
+	move	b,myblk+.cmdef
+	jumpe	b,[movei b,"0"
+		idpb	b,a
+		jrst	$cmnd3]
+	movei	c,42
+	idpb	c,a
+	call	.name
+	movei	b,42
+	idpb	b,a
+$cmnd3:	movei	b,"}"
+	idpb	b,a
+	ldb	e,[point 9,myblk,8] ; get function code again
+	move	b,.cmdat+myblk	; get first kind of argument block
+	cain	e,.cmkey	; process argument blocks for functions
+	call	.ctblk		; TBLUK list address
+	cain	e,.cmnoi
+	call	.cname		; pointer to string
+	cain	e,.cmtok
+	call	.cname		; pointer to string
+	cain	e,.cmswi
+	call	.ctblk		; TBLUK list address
+	move	b,cmgjb		; get back the second kind of argument block
+	cain	e,.cmifi
+	call	.cfil
+	cain	e,.cmofi
+	call	.cfil
+	cain	e,.cmfil
+	call	.cfil
+$cmndx:	skipe	regs+2		; do we have another func desc block?
+	jrst	$cmnd1		; yes. go process it.
+	jrst	$null
+.ctblk:	movei	c,","
+	idpb	c,a
+	movei	c,15
+	idpb	c,a
+	movei	c,12
+	idpb	c,a
+	movei	c,"	"
+	idpb	c,a
+	idpb	c,a
+	idpb	c,a
+	movei	c,"t"
+	idpb	c,a
+	movei	c,"b"
+	idpb	c,a
+	movei	c,"l"
+	idpb	c,a
+	movei	c," "
+	idpb	c,a
+	movei	c,10		; tell the address
+	call	.nout
+	move	e,b		; save the address
+	call	.get1
+	move	d,b		; copy word 1
+	hlrzs	b
+	movei	c,"["
+	idpb	c,a
+	movei	c,^D10
+	call	.nout
+	movei	c,"."
+	idpb	c,a
+	movei	c,","
+	idpb	c,a
+	idpb	c,a
+	hrrz	b,d
+	movei	c,^D10
+	call	.nout
+	movei	c,"."
+	idpb	c,a
+	movei	c,"]"
+	idpb	c,a
+	hlrzs	d		; make actual count 0
+	caile	d,^D1000	; max number to get
+	movei	d,^D1000
+	cain	d,0		; is there anything here?
+	popj	p,		; no - return now
+	movns	d		; make negative
+	lsh	d,^D18		; make aobjn pointer
+	move	c,d
+	hrri	c,myblk		; copy stuff here
+	move	b,e		; get from here
+	call	.move
+.ctb.1:	movei	c,15		; go for next argument
+	idpb	c,a
+	movei	c,12
+	idpb	c,a
+	movei	c,"	"
+	idpb	c,a
+	idpb	c,a
+	movei	c," "
+	idpb	c,a
+	idpb	c,a
+	movei	c,"t"
+	idpb	c,a
+	movei	c,"b"
+	idpb	c,a
+	movei	c,"l"
+	idpb	c,a
+	movei	c," "
+	idpb	c,a
+	hrrzi	b,1(d)
+	movx	c,no%lfl!no%zro!no%ast!no%oov!3B17!^D10
+	call	.nout
+	movei	c,"["
+	idpb	c,a
+	hlrz	b,myblk+1(d)	; get adr side of this entry
+	movei	c,10
+	call	.nout
+	jumpe	b,.ctb.2
+	call	.get1		; get first word of user argument
+	move	e,b		; save first word here
+	txne	b,177B6
+	jrst	.ctb.3		; address is of string directly
+	txzn	b,1B7
+	jrst	.ctb.3		; address is of string directly
+	push	p,d
+	move	d,b
+	movei	c," "
+	caie	d,0
+	idpb	c,a
+	flags	<cm%abr,cm%nor,cm%inv>,10
+	pop	p,d
+	hlro	b,myblk+1(d)
+	aosa	b
+.ctb.3:	hlro	b,myblk+1(d)
+	movei	c,42
+	idpb	c,a
+	call	.name
+	movei	c,42
+	idpb	c,a
+.ctb.2:	movei	c,","
+	idpb	c,a
+	idpb	c,a
+	hrrz	b,myblk+1(d)	; get usr side of this entry
+	call	.get1
+	movei	c,10
+	call	.nout
+	txnn	e,cm%abr	; is the abbrev. bit set?
+	jrst	.ctb.4
+	movei	c,42
+	idpb	c,a
+	call	.name
+	movei	c,42
+	idpb	c,a
+.ctb.4:	movei	c,"]"
+	idpb	c,a
+	aobjn	d,.ctb.1
+	popj	p,
+.cfil:	movei	c,","
+	idpb	c,a
+	movei	c,15
+	idpb	c,a
+	movei	c,12
+	idpb	c,a
+	movei	c,"	"
+	idpb	c,a
+	idpb	c,a
+	idpb	c,a
+	movei	c,"f"
+	idpb	c,a
+	movei	c,"i"
+	idpb	c,a
+	movei	c,"l"
+	idpb	c,a
+	movei	c," "
+	idpb	c,a
+
+	popj	p,
+.cname:	movei	c,","
+	idpb	c,a
+	movei	c,15
+	idpb	c,a
+	movei	c,12
+	idpb	c,a
+	movei	c,"	"
+	idpb	c,a
+	idpb	c,a
+	idpb	c,a
+	movei	c,"n"
+	idpb	c,a
+	movei	c,"a"
+	idpb	c,a
+	movei	c,"m"
+	idpb	c,a
+	movei	c," "
+	idpb	c,a
+	movx	c,no%mag!10	; tell where we are
+	call	.nout
+	movei	c,42
+	idpb	c,a
+	call	.name
+	movei	c,42
+	idpb	c,a
+	popj	p,
+$crdir:	move	b,regs+1
+	call	.name
+	movei	b,","
+	idpb	b,a
+	movei	b,"["
+	idpb	b,a
+	hllz	d,regs+2
+	flags	<cd%len,cd%psw,cd%liq,cd%prv,cd%mod,cd%loq,cd%num,cd%fpt,cd%dpt,cd%ret,cd%lld,cd%ugp,cd%dgp,cd%sdq,cd%cug,cd%dac,cd%del>,10
+	movei	b,","
+	idpb	b,a
+	idpb	b,a
+	hrrz	b,regs+2
+	movei	c,10
+	call	.nout
+	movei	b,"]"
+	idpb	b,a
+	move	b,regs+3
+	hlr	c,b		; check for 777777
+	cain	c,777777
+	hrli	b,440700	; convert to real byte pointer
+	move	c,b
+	lsh	c,-^D30
+	caile	c,44		; good byte pointer value?
+	jrst	$null
+	movei	b,","
+	idpb	b,a
+	move	b,regs+3
+	call	.name
+	jrst	$null
+$crjob:	move	d,regs+1
+	flags	<cj%log,cj%nam,cj%act,cj%etf,cj%fil,cj%acs,cj%own,cj%wta,cj%npw,cj%nud,cj%spj,cj%cap,cj%cam,cj%slo,cj%dsn>,10
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	movx	c,10
+	call	.nout
+	move	b,regs+1
+	txnn	b,cj%dsn
+	jrst	$null
+	movei	b,","
+	idpb	b,a
+	move	b,regs+3
+	call	.nout
+	jrst	$null
+$crlnm:	move	b,regs+1
+	funct	<.CLNJ1,.CLNS1,.CLNJA,.CLNSA,.CLNJB,.CLNSY>
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	call	.name
+	movei	b,","
+	idpb	b,a
+	move	b,regs+3
+	call	.name
+	jrst	$null
+$cvhst:	move	b,regs+1
+	call	.srce
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	movei	c,10
+	call	.nout
+	call	.arg.
+	push	p,a
+	move	a,[point 7,name]
+	move	b,regs+2
+	cvhst
+	  erjmp	[pop	p,a
+		call	lsterr
+		jrst	$null]
+	pop	p,a
+	move	b,[point 7,name]
+	movei	c,0
+	call	.sout
+	jrst	$null
+$cvskt:	move	b,regs+1
+	call	.srce
+	jrst	$null
+$debrk:	jfcl
+	jrst	$null
+$deldf:	move	d,regs+1
+	flags	<dd%dtf,dd%dnf,dd%rst,dd%chk>,10
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	call	.dirst
+	jrst	$null
+$delf:	movei	b,"["
+	idpb	b,a
+	hllz	d,regs+1
+	flags	<df%nrj,df%exp,df%fgt,df%dir>,10
+	movei	b,","
+	idpb	b,a
+	idpb	b,a
+	hrrz	b,regs+1
+	call	.jfn
+	movei	b,"]"
+	idpb	b,a
+	jrst	$null
+$delnf:	move	b,regs+1
+	call	.jfn
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	movei	c,10
+	call	.nout
+	jrst	$null
+$deq:	move	b,regs+1
+	funct	<.DEQDR,.DEQDA,.DEQID>
+	move	b,regs+1
+	caie	b,.deqdr
+	jrst	$null
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	movei	c,10
+	call	.nout
+	jrst	$null
+$devst:	move	b,regs+1
+	call	.srce
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	call	.devst
+	jrst	$null
+$dfin:	move	b,regs+1
+	call	.srce
+	jrst	$null
+$dfout:	move	b,regs+1	; get destination
+	pushj	p,.srce
+	movei	b,","
+	idpb	b,a
+	push	p,a
+	move	a,[point 7,number]
+	move	b,regs+2	; get number
+	move	c,regs+3	; get ..
+	move	d,regs+4
+	dfout
+	  erjmp	[pop	p,a
+		call	lsterr
+		jrst	$dfot1]
+	pop	p,a
+	move	b,[point 7,number]
+	movei	c,0
+	call	.sout
+$dfot1:	movei	b,","
+	idpb	b,a
+	move	d,regs+4	; get format
+	flags	<fl%sgn,fl%jus,fl%one,fl%dol,fl%pnt,fl%exp,fl%esg,fl%ovl,fl%rnd,fl%fst,fl%thd>,10
+	jrst	$null
+$diag:	hrroi	b,[asciz/Wheel Needed!/]
+	movei	c,0
+	call	.sout
+	movei	b,"	"
+	idpb	b,a
+	move	b,regs+a
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+b
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+c
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+d
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	jrst	$null
+$dibe:	move	b,regs+1
+	call	.srce
+	jrst	$null
+$dic:	move	b,regs+1	; get process handle
+	pushj	p,.proc
+	movei	b,","
+	idpb	b,a
+	move	d,regs+2	; get interrupt channels to turn on
+	flags	<1B0,1B1,1B2,1B3,1B4,1B5,1B<.icaov>,1B<.icfov>,1B8,1B<.icpov>,1B<.iceof>,1B<.icdae>,1B<.icqta>,1B13,1B14,1B<.icili>,1B<.icird>,1B<.iciwr>,1B18,1B<.icift>,1B<.icmse>,1B21,1B<.icnxp>,1B23,1B24,1B25,1B26,1B27,1B28,1B29,1B30,1B31,1B32,1B33,1B34,1B35>,10
+	jrst	$null
+$dir:	move	b,regs+1	; get process handle
+	pushj	p,.proc
+	jrst	$null
+$dirst:	move	b,regs+1
+	pushj	p,.srce
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	call	.dirst
+	jrst	$null
+$disms:	move	b,regs+1
+	movei	c,^D10
+	call	.nout
+	movei	b,"."
+	idpb	b,a
+	jrst	$null
+$dobe:	move	b,regs+1
+	call	.srce
+	jrst	$null
+$dskas:	hrroi	b,[asciz/Wheel Needed!/]
+	movei	c,0
+	call	.sout
+	movei	b,"	"
+	idpb	b,a
+	move	b,regs+a
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+b
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+c
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+d
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	jrst	$null
+$dskop:	hrroi	b,[asciz/Wheel Needed!/]
+	movei	c,0
+	call	.sout
+	movei	b,"	"
+	idpb	b,a
+	move	b,regs+a
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+b
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+c
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+d
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	jrst	$null
+$dtach:	jfcl
+	jrst	$null
+$dti:	move	b,regs+1
+	movei	c,10
+	call	.nout
+	jrst	$null
+$dumpi:	move	b,regs+1
+	call	.jfn
+	movei	b,","
+	idpb	b,a
+	movei	b,"["
+	idpb	b,a
+	hllz	d,regs+2
+	flags	<dm%nwt>,10
+	movei	b,","
+	idpb	b,a
+	idpb	b,a
+	hrrz	b,regs+2
+	movei	c,10
+	call	.nout
+	movei	b,"]"
+	idpb	b,a
+	jrst	$null
+$dumpo:	move	b,regs+1
+	call	.jfn
+	movei	b,","
+	idpb	b,a
+	movei	b,"["
+	idpb	b,a
+	hllz	d,regs+2
+	flags	<dm%nwt>,10
+	movei	b,","
+	idpb	b,a
+	idpb	b,a
+	hrrz	b,regs+2
+	movei	c,10
+	call	.nout
+	movei	b,"]"
+	idpb	b,a
+	jrst	$null
+$dvchr:	move	b,regs+1
+	call	.jfn
+	jrst	$null
+$efact:	hrroi	b,[asciz/Wheel Needed!/]
+	movei	c,0
+	call	.sout
+	movei	b,"	"
+	idpb	b,a
+	move	b,regs+a
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+b
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+c
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+d
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	jrst	$null
+$eir:	move	b,regs+1
+	pushj	p,.proc
+	jrst	$null
+$enq:	move	b,regs+1
+	funct	<.ENQBL,.ENQAA,.ENQSI,.ENQMA>
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	movei	c,10
+	call	.nout
+	jrst	$null
+$enqc:	move	b,regs+1
+	movei	c,10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	movei	c,10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+3
+	movei	c,10
+	call	.nout
+	jrst	$null
+$epcap:	move	b,regs+1	; get process handle
+	pushj	p,.proc
+	movei	b,","
+	idpb	b,a
+	move	d,regs+2	; get possible capabilities
+	flags	<sc%ctc,sc%gtb,sc%mmn,sc%log,sc%mpp,sc%sdv,sc%sct,sc%sup,sc%frz,sc%whl,sc%opr,sc%cnf,sc%mnt,sc%ipc,sc%enq,sc%nwz,sc%nas>,10
+	movei	b,","
+	idpb	b,a
+	move	d,regs+3	; get capabilities to enable
+	flags	<sc%ctc,sc%gtb,sc%mmn,sc%log,sc%mpp,sc%sdv,sc%sct,sc%sup,sc%frz,sc%whl,sc%opr,sc%cnf,sc%mnt,sc%ipc,sc%enq,sc%nwz,sc%nas>,10
+	jrst	$null
+$erstr:	move	b,regs+1
+	call	.srce
+	movei	b,","
+	idpb	b,a
+	movei	b,"["
+	idpb	b,a
+	hlrz	b,regs+2
+	call	.proc
+	movei	b,","
+	idpb	b,a
+	idpb	b,a
+	hrrz	b,regs+2
+	cain	b,-1
+	hrli	b,-1
+	movei	c,10
+	call	.nout
+	movei	b,"]"
+	idpb	b,a
+	movei	b,","
+	idpb	b,a
+	hlre	b,regs+3
+	movei	c,^D10
+	call	.nout
+	movei	b,"."
+	idpb	b,a
+	call	.arg.
+	push	p,a
+	move	a,[point 7,number]
+	move	b,regs+b
+	movei	c,0
+	erstr
+	jfcl
+	jfcl
+	pop	p,a
+	move	b,[point 7,number]
+	movei	c,0
+	call	.sout
+	jrst	$null
+$esout:	move	b,regs+1
+	call	.name
+	jrst	$null
+$ffffp:	move	b,regs+1
+	call	.jfn
+	jrst	$null
+$ffork:	move	b,regs+1
+	call	.proc
+	jrst	$null
+$ffufp:	movei	b,"["
+	idpb	b,a
+	hlrz	b,regs+1
+	call	.jfn
+	movei	b,","
+	idpb	b,a
+	idpb	b,a
+	hrrz	b,regs+1
+	movei	c,^D10
+	call	.nout
+	movei	b,"."
+	idpb	b,a
+	movei	b,"]"
+	idpb	b,a
+	jrst	$null
+$flhst:	hrroi	b,[asciz/Wheel Needed!/]
+	movei	c,0
+	call	.sout
+	movei	b,"	"
+	idpb	b,a
+	move	b,regs+a
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+b
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+c
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+d
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	jrst	$null
+$flin:	move	b,regs+1
+	call	.jfn
+	jrst	$null
+$flout:	move	b,regs+1	; get destination
+	pushj	p,.jfn
+	movei	b,","
+	idpb	b,a
+	push	p,a
+	move	a,[point 7,number]
+	move	b,regs+2	; get number
+	move	c,regs+3
+	flout
+	  erjmp	[pop	p,a
+		call	lsterr
+		jrst	$flot1]
+	pop	p,a
+	move	b,[point 7,number]
+	movei	c,0
+	call	.sout
+$flot1:	movei	b,","
+	idpb	b,a
+	move	d,regs+3	; get format
+	flags	<fl%sgn,fl%jus,fl%one,fl%dol,fl%pnt,fl%exp,fl%esg,fl%ovl,fl%rnd,fl%fst,fl%snd,fl%thd>,10
+	jrst	$null
+$gacct:	move	b,regs+1
+	movei	c,10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	call	.srce
+	jrst	$null
+$gactf:	move	b,regs+1
+	call	.jfn
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	call	.srce
+	jrst	$null
+$gcvec:	move	b,regs+1
+	call	.proc
+	jrst	$null
+$gdskc:	move	b,regs+1
+	call	.devst
+	jrst	$null
+$gdsts:	move	b,regs+1
+	call	.jfn
+	call	.arg.
+	push	p,a
+	move	a,regs+1
+	gdsts
+	pop	p,a
+	movem	b,regs+b
+	movem	c,regs+c
+	movem	d,regs+d
+	movx	c,10!no%mag
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+c
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+d
+	call	.nout
+	jrst	$null
+$gdvec:	move	b,regs+1
+	call	.proc
+	jrst	$null
+$get:	movei	b,"["
+	idpb	b,a
+	hlrz	b,regs+1	; get process handle
+	pushj	p,.proc
+	movei	b,","
+	idpb	b,a
+	idpb	b,a
+	hrrz	d,regs+1	; get flags, jfn
+	flags	<gt%adr,gt%prl,gt%nov,gt%arg>
+	move	b,d
+	pushj	p,.jfn
+	movei	b,"]"
+	idpb	b,a
+	jrst	$null
+$getab:	movei	b,"["
+	idpb	b,a
+	hlre	b,regs+1
+	movei	c,10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	idpb	b,a
+	push	p,a		; save jfn
+	move	a,[sixbit/SYMTAB/]
+	sysgt
+	hrr	a,b		; get SYMTAB table number
+	hrl	a,regs+1	; get user table number
+	getab
+	  erjmp	[pop	p,a
+		call	lsterr
+		jrst	$getb1]
+	move	b,a		; save the user table name
+	pop	p,a		; get back jfn
+	call	.six
+	movei	b,"("
+	idpb	b,a
+	hrl	b,regs+1
+	movei	c,10
+	call	.nout
+	movei	b,")"
+	idpb	b,a
+$getb1:	movei	b,"]"
+	idpb	b,a
+	call	.arg.
+	push	p,a
+	move	a,regs+1
+	getab
+	  erjmp	[pop	p,a
+		call	lsterr
+		jrst	$null]
+	move	b,a
+	pop	p,a
+;	movx	c,no%mag+10
+;	call	.nout
+;	movei	c,","
+;	idpb	c,a
+	call	.char
+	jrst	$null
+$geter:	move	b,regs+1
+	call	.proc
+	call	.arg.
+	push	p,a		; save pointer
+	move	a,regs+1
+	cain	a,.fhslf
+	move	a,shadow
+	geter
+	  erjmp	[pop	p,a
+		call	lsterr
+		jrst	$null]
+	move	a,[point 7,number]
+	movei	c,0
+	erstr
+	jfcl
+	jfcl
+	pop	p,a
+	move	b,[point 7,number]
+	movei	c,0
+	call	.sout
+	jrst	$null
+$getji:	move	b,regs+1
+	movx	c,10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	movei	b,"["
+	idpb	b,a
+	hlre	b,regs+2
+	movx	c,10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	idpb	b,a
+	hrrz	b,regs+2
+	call	.nout
+	movei	b,"]"
+	idpb	b,a
+	movei	b,","
+	idpb	b,a
+	move	b,regs+3
+	movx	c,10
+	call	.nout
+	jrst	$null
+$getnm:	call	.arg.
+	push	p,a
+	getnm
+	movem	a,regs+1
+	move	b,a
+	pop	p,a
+	call	.six
+	jrst	$null
+$gevec:	move	b,regs+1
+	call	.proc
+	jrst	$null
+$gfrkh:	move	b,regs+1
+	call	.proc
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	call	.proc
+	jrst	$null
+$gfrks:	move	b,regs+1
+	call	.proc
+	movei	b,","
+	idpb	b,a
+	move	d,regs+2
+	flags	<gf%gfh,gf%gfs>,10
+	movei	b,","
+	idpb	b,a
+	movei	b,"["
+	idpb	b,a
+	hlre	b,regs+3
+	movei	c,^D10
+	call	.nout
+	movei	b,"."
+	idpb	b,a
+	movei	b,","
+	idpb	b,a
+	hrrz	b,regs+3
+	movei	c,10
+	call	.nout
+	movei	b,"]"
+	idpb	b,a
+	jrst	$null
+$gfust:	movei	b,"["
+	idpb	b,a
+	hlrz	b,regs+1
+	funct	<.GFAUT,.GFLWR>
+	movei	b,","
+	idpb	b,a
+	idpb	b,a
+	hrrz	b,regs+1
+	call	.jfn
+	movei	b,"]"
+	idpb	b,a
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	movei	c,10
+	call	.nout
+	jrst	$null
+$gjinf:	push	p,a
+	gjinf
+	movem	a,regs+1
+	movem	b,regs+2
+	movem	c,regs+3
+	movem	d,regs+4
+	pop	p,a
+	call	.arg.
+	move	b,regs+1
+	call	.dirst
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	call	.dirst
+	movei	b,","
+	idpb	b,a
+	move	b,regs+3
+	movei	c,10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+4
+	movei	c,10
+	call	.nout
+	jrst	$null
+$gnjfn:	move	b,regs+1
+	call	.jfn
+	jrst	$null
+$gpjfn:	move	b,regs+1
+	call	.proc
+	call	.arg.
+	push	p,a
+	move	a,regs+1
+	gpjfn
+	  ercal	error
+	pop	p,a
+	movem	b,regs+2
+	movei	b,"["
+	idpb	b,a
+	hlrz	b,regs+2
+	call	.jfn
+	movei	b,","
+	idpb	b,a
+	idpb	b,a
+	hrrz	b,regs+2
+	call	.jfn
+	movei	b,"]"
+	idpb	b,a
+	jrst	$null
+$gtad:	call	.arg.
+	push	p,a
+	gtad
+	move	b,a
+	move	a,[point 7,number]
+	movei	c,0
+	odtim
+	  ercal	error
+	pop	p,a
+	move	b,[point 7,number]
+	movei	c,0
+	call	.sout
+	jrst	$null
+$gtdal:	move	b,regs+1
+	camn	b,[-1]
+	jrst	[push	p,a
+		gjinf
+		pop	p,a
+		jrst	.+1]
+	call	.dirst
+	jrst	$null
+$gtdir:	move	b,regs+1
+	call	.dirst
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	movei	c,10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+3
+	call	.nout
+	jrst	$null
+$gtfdb:	move	b,regs+1
+	call	.jfn
+	movei	b,","
+	idpb	b,a
+	movei	b,"["
+	idpb	b,a
+	hlre	b,regs+2
+	movei	c,^D10
+	call	.nout
+	movei	b,"."
+	idpb	b,a
+	movei	b,","
+	idpb	b,a
+	idpb	b,a
+	hrrz	b,regs+2
+	movei	c,10
+	call	.nout
+	movei	b,"]"
+	idpb	b,a
+	movei	b,","
+	idpb	b,a
+	move	b,regs+3
+	movei	c,10
+	call	.nout
+	jrst	$null
+$gthst:	move	b,regs+1
+	funct	<.gthsz,.gthix,.gthns,.gthsn,.gthhn,.gthhi>
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	movei	c,10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+3
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+4
+	call	.nout
+	jrst	$null
+	call	.arg.
+	push	p,a
+	move	a,regs+1
+	move	b,regs+2
+	move	c,regs+3
+	move	d,regs+4
+	gthst
+	  erjmp	[pop	p,a
+		call	lsterr
+		jrst	$null]
+	movem	a,regs+1
+	movem	b,regs+2
+	movem	c,regs+3
+	movem	d,regs+4
+	move	b,regs+1
+	pop	p,a
+	funct	<.gthsz,.gthix,.gthns,.gthsn,.gthhn,.gthhi>
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	movei	c,10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+3
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+4
+	call	.nout
+	jrst	$null
+$gtjfn:	move	d,regs+1	; get user register 1
+	txne	d,gj%sht	; we only handle short form yet
+	jrst	$gtjf1
+	move	b,regs+1 ; get user address
+	move	c,[-16,,myblk] ; get 16(8) words, put them at myblk
+	call	.move
+	movei	b,"{"
+	idpb	b,a
+	move	d,myblk
+	flags	<gj%fou,gj%new,gj%old,gj%msg,gj%cfm,gj%tmp,gj%ns,gj%acc,gj%del,gj%ifg,gj%ofg,gj%flg,gj%phy,gj%xtn,gj%fns,gj%sht>,10
+	movei	b,","
+	idpb	b,a
+	movei	b,"["
+	idpb	b,a
+	hlrz	b,myblk+1
+	call	.jfn
+	movei	b,","
+	idpb	b,a
+	idpb	b,a
+	hrrz	b,myblk+1
+	call	.jfn
+	movei	b,"]"
+	idpb	b,a
+	movei	b,","
+	idpb	b,a
+	skipe	b,myblk+2
+	call	.name
+	movei	b,","
+	idpb	b,a
+	skipe	b,myblk+3
+	call	.name
+	movei	b,","
+	idpb	b,a
+	skipe	b,myblk+4
+	call	.name
+	movei	b,","
+	idpb	b,a
+	skipe	b,myblk+5
+	call	.name
+	movei	b,","
+	idpb	b,a
+	skipe	b,myblk+6
+	call	.name
+	movei	b,","
+	idpb	b,a
+	skipe	b,myblk+7
+	call	.name
+	movei	b,","
+	idpb	b,a
+	move	b,myblk+10
+	move	c,myblk
+	txne	c,gj%jfn
+	call	.jfn
+	movei	b,","
+	idpb	b,a
+	move	d,myblk+11
+	move	b,myblk+.gjgen
+	txnn	b,gj%xtn
+	jrst	$gtjf0
+	flags	<g1%rnd,g1%nln,g1%rcm,g1%rie>,10
+$gtjf0:	movei	b,"}"
+	idpb	b,a
+	movei	b,","
+	idpb	b,a
+	skipe	b,regs+2
+	call	.name
+	jrst	$null
+$gtjf1:	movei	c,0
+	flags	<gj%fou,gj%new,gj%old,gj%msg,gj%cfm,gj%tmp,gj%ns,gj%acc,gj%del,gj%ifg,gj%ofg,gj%flg,gj%phy,gj%fns,gj%sht>,10
+	movei	b,","
+	idpb	b,a
+	move	d,regs+1
+	txne	d,gj%fns
+	jrst	[movei	b,"["
+		idpb	b,a
+		hlrz	b,regs+2 ; get first jfn
+		pushj	p,.jfn
+		movei	b,","
+		idpb	b,a
+		idpb	b,a
+		hrrz	b,regs+2 ; get second jfn
+		pushj	p,.jfn
+		movei	b,"]"
+		idpb	b,a
+		jrst	$null]
+	move	b,regs+2
+	pushj	p,.name
+	jrst	$null
+$gtrpi:	move	b,regs+1
+	call	.proc
+	jrst	$null
+$gtncp:	move	b,regs+1
+	funct	<.GTNSZ,.GTNIX,.GTNNI,.GTNNO,.GTNJF>
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	movx	c,no%mag+10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+3
+	movx	c,no%mag+10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+4
+	movx	c,no%mag+10
+	call	.nout
+	jrst	$null
+$gtrpw:	move	b,regs+1
+	call	.proc
+	jrst	$null
+$gtsts:	move	b,regs+1
+	call	.jfn
+	call	.arg.
+	push	p,a
+	move	a,regs+1
+	gtsts
+	move	d,b
+	pop	p,a
+	flags	<gs%opn,gs%rdf,gs%wrf,gs%xcf,gs%rnd,gs%lng,gs%eof,gs%err,gs%nam,gs%ast,gs%asg,gs%hlt,gs%frk,gs%mod>,10
+	jrst	$null
+$gttyp:	move	b,regs+1
+	call	.jfn
+	call	.arg.
+	push	p,a
+	move	a,regs+1
+	gttyp
+	pop	p,a
+	movem	b,regs+2
+	movem	c,regs+3
+	move	b,regs+2
+	movei	c,^D10
+	call	.nout
+	movei	b,"."
+	idpb	b,a
+	movei	b,","
+	idpb	b,a
+	movei	b,"["
+	idpb	b,a
+	hlrz	b,regs+3
+	movei	c,^D10
+	call	.nout
+	movei	b,"."
+	idpb	b,a
+	movei	b,","
+	idpb	b,a
+	idpb	b,a
+	hrrz	b,regs+3
+	movei	c,^D10
+	call	.nout
+	movei	b,"."
+	idpb	b,a
+	movei	b,"]"
+	idpb	b,a
+	jrst	$null
+$haltf:	jfcl
+	jrst	$null
+$hfork:	move	b,regs+1
+	call	.proc
+	jrst	$null
+$hptim:	move	b,regs+1
+	funct	<.HPELP,.HPRNT>
+	jrst	$null
+$hsys:	hrroi	b,[asciz/Wheel Needed!/]
+	movei	c,0
+	call	.sout
+	movei	b,"	"
+	idpb	b,a
+	move	b,regs+a
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+b
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+c
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+d
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	jrst	$null
+$idcnv:	movei	b,","
+	idpb	b,a
+	movei	b,"["
+	idpb	b,a
+	hlrz	b,regs+2
+	movei	c,^D10
+	call	.nout
+	movei	b,"."
+	idpb	b,a
+	movei	b,","
+	idpb	b,a
+	idpb	b,a
+	hrrz	b,regs+2
+	movei	c,^D10
+	call	.nout
+	movei	b,"."
+	idpb	b,a
+	movei	b,"]"
+	idpb	b,a
+	movei	b,","
+	idpb	b,a
+	movei	b,"["
+	idpb	b,a
+	hlrz	b,regs+3
+	movei	c,^D10
+	call	.nout
+	movei	b,"."
+	idpb	b,a
+	movei	b,","
+	idpb	b,a
+	idpb	b,a
+	hrrz	b,regs+3
+	movei	c,^D10
+	call	.nout
+	movei	b,"."
+	idpb	b,a
+	movei	b,"]"
+	idpb	b,a
+	movei	b,","
+	idpb	b,a
+	move	d,regs+4
+	flags	<ic%dsa,ic%ads,ic%utz,ic%jud,ic%tmz>,10
+	jrst	$null
+$idtim:	move	b,regs+1
+	call	.jfn
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	flags	<it%nnm,it%snm,it%err,it%nis,it%ais,it%nac,it%aac,it%ams,it%ahm,it%n24,it%ntm,it%ntz>,10
+	jrst	$null
+$idtnc:	move	b,regs+1
+	call	.jfn
+	movei	b,","
+	idpb	b,a
+	move	d,regs+2
+	flags	<it%nda,it%nti>,10
+	jrst	$null
+$iic:	move	b,regs+1
+	call	.proc
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	movei	c,10
+	call	.nout
+	jrst	$null
+$inlnm:	movei	b,"["
+	idpb	b,a
+	hlrz	b,regs+1
+	funct	<.INLJB,.INLSY>
+	movei	b,","
+	idpb	b,a
+	idpb	b,a
+	hrrz	b,regs+1
+	movei	c,^D10
+	call	.nout
+	movei	b,"."
+	idpb	b,a
+	movei	b,"]"
+	idpb	b,a
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	movei	c,10
+	call	.nout
+	jrst	$null
+$jfns:	move	b,regs+1	; get dest
+	pushj	p,.srce
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	pushj	p,.jfn
+	movei	b,","
+	idpb	b,a
+	move	d,regs+3
+	flags	<js%dev,js%dir,js%nam,js%typ,js%gen,js%pro,js%act,js%tmp,js%siz,js%cdr,js%lwr,js%lrd,js%ptr,js%atr,js%at1,js%psd,js%tbr,js%tbp,js%paf>,10
+	jrst	$null
+$kfork:	move	b,regs+1
+	call	.proc
+	jrst	$null
+$lgout:	move	b,regs+1
+	movei	c,^D10
+	call	.nout
+	movei	b,"."
+	idpb	b,a
+	jrst	$null
+$lnmst:	move	b,regs+1
+	funct	<.LNSJB,.LNSSY>
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	call	.name
+	movei	b,","
+	idpb	b,a
+	move	b,regs+3
+	call	.name
+	jrst	$null
+$login:	move	b,regs+1
+	call	.dirst
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	call	.name
+	movei	b,","
+	idpb	b,a
+	move	b,regs+3
+	txne	b,7B2
+	jrst	$log.1
+	movei	c,10
+	call	.nout
+	jrst	$log.2
+$log.1:	call	.name
+$log.2:	jrst	$null
+$lpini:	hrroi	[asciz/Wheel Needed!/]
+	movei	c,0
+	call	.sout
+	movei	b,"	"
+	idpb	b,a
+	move	b,regs+a
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+b
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+c
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+d
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	jrst	$null
+$monrd:	move	b,regs+a
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+b
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+c
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	jrst	$null
+$mrecv:	move	b,regs+1
+	movei	c,10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	movei	c,10
+	call	.nout
+	jrst	$null
+$msend:	move	b,regs+1
+	movei	c,10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	movei	c,10
+	call	.nout
+	jrst	$null
+$msfrk:	hrroi	b,[asciz/Wheel Needed!/]
+	movei	c,0
+	call	.sout
+	movei	b,"	"
+	idpb	b,a
+	move	b,regs+a
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+b
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+c
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+d
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	jrst	$null
+$mstr:	movei	b,"["
+	idpb	b,a
+	hlrz	b,regs+1
+	movei	c,^D10
+	call	.nout
+	movei	b,"."
+	idpb	b,a
+	movei	b,","
+	idpb	b,a
+	idpb	b,a
+	hrrz	b,regs+1
+	funct	<.MSRNU,.MSRUS,.MSMNT,.MSDIS,.MSGSS,.MSSSS,.MSINI,.MSIMC,.MSDMC,.MSGSU>
+	movei	b,"]"
+	idpb	b,a
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	movei	c,10
+	call	.nout
+	jrst	$null
+$mtaln:	hrroi	b,[asciz/Wheel Needed!/]
+	movei	c,0
+	call	.sout
+	movei	b,"	"
+	idpb	b,a
+	move	b,regs+a
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+b
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+c
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+d
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	jrst	$null
+$mtopr:	move	b,regs+1	; tell about the jfn argument
+	call	.jfn
+	movei	b,","
+	idpb	b,a
+	push	p,a		; save where we are in the output
+	move	a,regs+1	; get the jfn
+	dvchr
+	ldb	e,[point ^D9,b,^D17] ; get the device type
+	pop	p,a
+	move	b,regs+2
+	cain	e,.dvnet	; is this ARPA Net?
+	jrst	[funct	<.moacp,.mosnd,.mosin,.moain>
+		jrst	$mtop1]
+	caie	e,.dvsrv
+	cain	e,.dvdcn
+	jrst	[funct	<.moacn,.morls,.morhn,.mortn,.morus,.morpw,.morac,.morda,.morcn,.morim,.mosim,.morod,.moclz,.mocc,.morss>
+		jrst	$mtop1]
+	cain	e,.dvfe		; is this a front end device?
+	jrst	[funct	<.moeof,.modte>
+		jrst	$mtop1]
+	cain	e,.dvmta	; is this mag tape?
+	jrst	[funct	<.mocle,.morew,.mosdr,.moeof,.mosdm,.mosrs,.mofwr,.mobkr,.moeot,.morul,.mordn,.moers,.mordm,.morrs,.mofwf,.mobkf,.mospr,.morpr,.monrb,.mofou,.mosdn,.moinF,.mordr,.mosid,.moiel,.monop,.moloc,.mosta,.moofl,.mopst,.morvl,.movls,.montr,.mordl,.mowul,.morli,.mosmv,.mosds>
+		jrst	$mtop1]
+	cain	e,.dvlpt	; is device a line printer?
+	jrst	[funct	<.mopsi,.monop,.molvF,.morvF,.moltr,.mortr,.mosts,.morst,.moflo>
+		jrst	$mtop1]
+	cain	e,.dvcdp	; is device a card punch?
+	jrst	[funct	<.mopsi,.morst>
+		jrst	$mtop1]
+	cain	e,.dvcdr	; is device a card reader?
+	jrst	[funct	<.mopsi,.morst>
+		jrst	$mtop1]
+	cain	e,.dvpty	; is device a pseudo-tty?
+	jrst	[funct	<.moapi,.mopih,.mobat>
+		jrst	$mtop1]
+	cain	e,.dvtty	; is device a terminal?
+	jrst	[funct	<.mopih,.mospd,.morsp,.morlw,.moslw,.morll,.mosll,.mosnt,.mornt,.mosig,.morbm,.mosbm,.morfw,.mosfw,.moxoF,.moslc,.morlc,.moslm,.morlm,.motps>
+		jrst	$mtop1]
+$mtop1:	movei	b,","
+	idpb	b,a
+	move	b,regs+3
+	movei	c,10
+	call	.nout		; give them register 3 as well.
+	jrst	$null
+$mutil:	move	b,regs+1
+	movei	c,^D10
+	call	.nout
+	movei	b,"."
+	idpb	b,a
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	movei	c,10
+	call	.nout
+	jrst	$null
+$nin:	move	b,regs+1
+	call	.jfn
+	movei	b,","
+	idpb	b,a
+	idpb	b,a
+	move	b,regs+3
+	movei	c,^D10
+	call	.nout
+	movei	b,"."
+	idpb	b,a
+	jrst	$null
+$node:	jfcl
+	jrst	$null
+$nout:	move	b,regs+1	; get destination
+	pushj	p,.srce
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2	; get number
+	move	c,regs+3	; get format
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	d,regs+3	; get format
+	flags	<no%mag,no%sgn,no%lfl,no%zro,no%oov,no%ast,no%col>,^D10
+	jrst	$null
+$odcnv:	movei	b,","
+	idpb	b,a
+	push	p,a
+	move	b,regs+2
+	move	a,[point 7,number]
+	movei	c,0
+	odtim
+	  erjmp	[pop	p,a
+		call	lsterr
+		jrst	$odcn1]
+	pop	p,a
+	move	b,[point 7,number]
+	movei	c,0
+	call	.sout
+$odcn1:	movei	b,","
+	idpb	b,a
+	idpb	b,a
+	move	d,regs+4
+	flags	<ic%dsa,ic%ads,ic%utz,ic%jud,77B17>,10
+	jrst	$null
+$odtim:	move	b,regs+1
+	call	.jfn
+	movei	b,","
+	idpb	b,a
+	push	p,a
+	move	b,regs+2
+	move	a,[point 7,number]
+	move	c,regs+3
+	odtim
+	  erjmp	[pop	p,a
+		call	lsterr
+		jrst	$odtm1]
+	pop	p,a
+	move	b,[point 7,number]
+	movei	c,0
+	call	.sout
+$odtm1:	movei	b,","
+	idpb	b,a
+	move	d,regs+3
+	flags	<ot%nda,ot%day,ot%fdy,ot%nmn,ot%fmn,ot%4yr,ot%dam,ot%spa,ot%sla,ot%ntm,ot%ntm,ot%nsc,ot%12h,ot%nco,ot%tmz,ot%scl>,10
+	jrst	$null
+$odtnc:	move	b,regs+1
+	call	.jfn
+	movei	b,","
+	idpb	b,a
+	movei	b,"["
+	idpb	b,a
+	hlrz	b,regs+2
+	movei	c,^D10
+	call	.nout
+	movei	b,"."
+	idpb	b,a
+	movei	b,","
+	idpb	b,a
+	idpb	b,a
+	hrrz	b,regs+2
+	movei	c,^D10
+	call	.nout
+	movei	b,"."
+	idpb	b,a
+	movei	b,"]"
+	idpb	b,a
+	movei	b,","
+	idpb	b,a
+	movei	b,"["
+	idpb	b,a
+	hlrz	b,regs+3
+	movei	c,^D10
+	call	.nout
+	movei	b,"."
+	idpb	b,a
+	movei	b,","
+	idpb	b,a
+	idpb	b,a
+	hrrz	b,regs+3
+	movei	c,^D10
+	call	.nout
+	movei	b,"."
+	idpb	b,a
+	movei	b,"]"
+	idpb	b,a
+	movei	b,","
+	idpb	b,a
+	move	d,regs+4
+	flags	<ic%ads,ic%jud,ic%tmz>,10
+	move	d,regs+5
+	flags	<ot%nda,ot%day,ot%fdy,ot%nmn,ot%fmn,ot%4yr,ot%dam,ot%spa,ot%sla,ot%ntm,ot%ntm,ot%nsc,ot%12h,ot%nco,ot%tmz,ot%scl>,10
+	jrst	$null
+$openf:	hrrz	b,regs+1	; get jfn from user register 1
+	pushj	p,.jfn
+	movei	b,","
+	idpb	b,a
+	move	d,regs+2	; get user register 2
+	ldb	b,[point 6,d,5]
+	movei	c,10
+	call	.nout
+	hrroi	b,[asciz/B5+/]
+	movei	c,0
+	call	.sout
+	txz	d,7777B9
+	flags	<of%her,of%rd,of%wr,of%ex,of%app,of%thw,of%awt,of%pdt,of%nwt,of%rtd,of%pln,of%dud,of%ofl>,10
+	jrst	$null
+$pbin:	jfcl
+	jrst	$null
+$pbout:	move	b,regs+1
+	call	.char
+	jrst	$null
+$peek:	hrroi	b,[asciz/Wheel Needed!/]
+	movei	c,0
+	call	.sout
+	movei	b,"	"
+	idpb	b,a
+	move	b,regs+a
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+b
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+c
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+d
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	jrst	$null
+$plock:	hrroi	b,[asciz/Wheel Needed!/]
+	movei	c,0
+	call	.sout
+	movei	b,"	"
+	idpb	b,a
+	move	b,regs+a
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+b
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+c
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+d
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	jrst	$null
+$pmap:	move	b,regs+1
+	camn	b,[-1]
+	jrst	[movei	c,10
+		call	.nout
+		jrst	$pmap2]
+	movei	b,"["
+	idpb	b,a
+	move	b,regs+1
+	jumpl	b,[hlrz	b,regs+1 ; it is a process handle
+		call	.proc
+		jrst	$pmap1]
+	jumpg	b,[hlrz	b,regs+1 ; it is a jfn
+		call	.jfn
+		jrst	.+1]
+$pmap1:	movei	b,","
+	idpb	b,a
+	idpb	b,a
+	hrrz	b,regs+1
+	movei	c,10
+	call	.nout
+	movei	b,"]"
+	idpb	b,a
+$pmap2:	movei	b,","
+	idpb	b,a
+	movei	b,"["
+	idpb	b,a
+	move	b,regs+2
+	jumpl	b,[hlrz	b,regs+2 ; it is a process handle
+		call	.proc
+		jrst	$pmap3]
+	jumpg	b,[hlrz	b,regs+2 ; it is a jfn
+		call	.jfn
+		jrst	$pmap3]
+$pmap3:	movei	b,","
+	idpb	b,a
+	idpb	b,a
+	hrrz	b,regs+2
+	movei	c,10
+	call	.nout
+	movei	b,"]"
+	idpb	b,a
+	movei	b,","
+	idpb	b,a
+	move	d,regs+3
+	jumpe	d,$null
+	flags	<pm%cnt,pm%rd,pm%wr,pm%ex,pm%pld,pm%cpy>,^D10
+	jrst	$null
+$pmctl:	hrroi	b,[asciz/Wheel Needed!/]
+	movei	c,0
+	call	.sout
+	movei	b,"	"
+	idpb	b,a
+	move	b,regs+a
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+b
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+c
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+d
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	jrst	$null
+$ppnst:	move	b,regs+1
+	movei	c,10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	push	p,a
+	move	a,[point 7,name]
+	move	b,regs+3	; go get the name
+	call	.name
+	movei	b,0
+	idpb	b,a
+	move	a,[point 7,number]
+	move	b,regs+2
+	move	c,[point 7,name]
+	ppnst
+	  erjmp	[pop	p,a
+		call	lsterr
+		jrst	$ppns1]
+	pop	p,a
+	move	b,[point 7,number]
+	movei	c,0
+	call	.sout
+$ppns1:	movei	b,","
+	idpb	b,a
+	move	b,[point 7,name]
+	movei	c,0
+	call	.sout
+	jrst	$null
+$prarg:	movei	b,"["
+	idpb	b,a
+	hlrz	b,regs+1	; get argument
+	movei	c,10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	hrrz	b,regs+1	; get process handle
+	pushj	p,.proc
+	movei	b,"]"
+	idpb	b,a
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2	; address of argument block
+	movei	c,10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+3	; length of argument block
+	call	.nout
+	hlrz	b,regs+1	; get function code again
+	caie	b,.prard	; read the argument?
+	jrst	$null
+	push	p,a		; get a handle on the process
+	move	a,shadow
+	hrrz	b,regs+1
+	caie	b,.fhslf
+	gfrkh
+	  erjmp	[pop	p,a
+		call	lsterr
+		jrst	$null]
+	push	p,a		; save new process handle
+	hrli	a,.prard
+	movei	b,myblk
+	movei	c,100
+	prarg
+	  ercal	error
+	movem	c,regs+3
+	pop	p,a		; get back process handle
+	hrrz	b,regs+1
+	caie	b,.fhslf
+	rfrkh			; release the process handle
+	  ercal	error
+	pop	p,a		; get back jfn
+	call	.arg.
+	movei	b,"["
+	idpb	b,a
+	movn	d,regs+3
+	hrlzs	d
+	jumpge	d,$null
+	movx	c,no%mag+10
+$prar1:	move	b,myblk(d)
+	call	.nout
+	movei	b,","
+	hlrz	e,d
+	cain	e,-1
+	movei	b,"]"
+	idpb	b,a
+	aobjn	d,$prar1
+	jrst	$null
+$psout:	move	b,regs+1
+	setzm	regs+c		; fool name1
+	call	.name1
+	jrst	$null
+$rcdir:	move	d,regs+1
+	flags	<rc%ana,rc%rlm,rc%wld,rc%nom,rc%amb,rc%nmd,rc%par,rc%stp,rc%awl,rc%emo>,10
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	tlnn	b,-1		; is this a jfn?
+	jrst	[call	.jfn
+		jrst	$rcdr1]
+	hlrz	c,b
+	cain	c,-1
+	hrli	b,440700
+	ldb	c,[point 6,b,5]	; get the first 6 bits
+	caile	c,44		; max size if byte pointer
+	jrst	[call	.dirst
+		jrst	$rcdr1]
+	call	.name
+$rcdr1:	move	b,regs+1
+	txnn	b,rc%stp
+	jrst	$null
+	movei	b,","
+	idpb	b,a
+	move	b,regs+3
+	call	.dirst
+	jrst	$null
+$rcm:	move	b,regs+1
+	call	.proc
+	jrst	$null
+$rcusr:	hll	d,regs+1
+	flags	<rc%ana,rc%rlm,rc%wld,rc%nom,rc%amb,rc%nmd,rc%par,rc%stp,rc%awl,rc%emo>,10
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	call	.name
+	jrst	$null
+$rcvim:	hrroi	b,[asciz/Wheel Needed!/]
+	movei	c,0
+	call	.sout
+	movei	b,"	"
+	idpb	b,a
+	move	b,regs+a
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+b
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+c
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+d
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	jrst	$null
+$rdtty:	move	b,regs+1
+	movei	c,10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	d,regs+2
+	flags	<rd%brk,rd%top,rd%pun,rd%bel,rd%crf,rd%rnd,rd%rie,rd%rai,rd%sui>,^D10
+	skipn	regs+3
+	jrst	$null
+	movei	b,","
+	idpb	b,a
+	move	b,regs+3
+	call	.name
+	jrst	$null
+$reld:	move	b,regs+1
+	camn	b,[-1]
+	jrst	[movei	c,10
+		call	.nout
+		jrst	$null]
+	call	.devst
+	jrst	$null
+$relsq:	hrroi	b,[asciz/Wheel Needed!/]
+	movei	c,0
+	call	.sout
+	movei	b,"	"
+	idpb	b,a
+	move	b,regs+a
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+b
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+c
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+d
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	jrst	$null
+$reset:	jfcl
+	jrst	$null
+$rfacs:	move	b,regs+1
+	call	.proc
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	movei	c,10
+	call	.nout
+	jrst	$null
+$rfbsz:	move	b,regs+1
+	call	.jfn
+	call	.arg.
+	push	p,a
+	move	a,regs+1
+	rfbsz
+	  erjmp	[pop	p,a
+		call	lsterr
+		jrst	$null]
+	movem	b,regs+2
+	pop	p,a
+	movei	c,^D10
+	call	.nout
+	movei	b,"."
+	idpb	b,a
+	jrst	$null
+$rfcoc:	hrrz	b,regs+1
+	pushj	p,.jfn
+	call	.arg.
+	push	p,a		; save the byte pointer
+	move	a,regs+1
+	rfcoc			; read the results
+	erjmp	[pop	p,a
+		call	lsterr
+		jrst	$null]
+	pop	p,a
+	move	d,c
+	movei	c,4
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,d
+	call	.nout
+	jrst	$null
+$rfmod:	hrrz	b,regs+1
+	pushj	p,.jfn
+	call	.arg.
+	push	p,a
+	move	a,regs+1
+	rfmod
+	  erjmp	[pop	p,a
+		call	lsterr
+		jrst	$null]
+	pop	p,a
+	move	d,b
+	flags	<tt%osp,tt%mff,tt%tab,tt%lca,tt%len,tt%wid,tt%ign,tt%wkf,tt%wkn,tt%wkp,tt%wka,tt%eco,tt%ecm,tt%alk,tt%aad,tt%dam,tt%uoc,tt%lic,tt%dum,tt%pgm,tt%car>,10
+	jrst	$null
+$rfork:	move	b,regs+1
+	call	.proc
+	jrst	$null
+$rfpos:	move	b,regs+1
+	call	.jfn
+	call	.arg.
+	push	p,a
+	move	a,regs+1
+	rfpos
+	pop	p,a
+	movem	b,regs+2
+	movei	b,"["
+	idpb	b,a
+	hlre	b,regs+2
+	movei	c,^D10
+	call	.nout
+	movei	b,"."
+	idpb	b,a
+	movei	b,","
+	idpb	b,a
+	idpb	b,a
+	hlle	b,regs+2
+	movei	c,^D10
+	call	.nout
+	movei	b,"]"
+	idpb	b,a
+	jrst	$null
+$rfptr:	move	b,regs+1
+	call	.jfn
+	call	.arg.
+	push	p,a
+	move	a,regs+1
+	rfptr
+	  erjmp	[pop	p,a
+		call	lsterr
+		jrst	$null]
+	pop	p,a
+	movem	b,regs+2
+	movei	c,^D10
+	call	.nout
+	movei	b,"."
+	idpb	b,a
+	jrst	$null
+$rfrkh:	move	b,regs+1
+	call	.proc
+	jrst	$null
+;------------------------------------------------------------------------
+; look out for this one! the exec has been known to use -1 for some reason
+;------------------------------------------------------------------------
+$rfsts:	move	b,regs+1
+	call	.proc
+	call	.arg.
+	skipg	b,regs+1
+	jrst	[hrroi	b,[asciz/Invalid process handle/]
+		movei	c,0
+		call	.sout
+		jrst	$null]
+	push	p,a
+	move	a,shadow
+	move	b,regs+1
+	gfrkh
+	  erjmp	[pop	p,a
+		call	lsterr
+		jrst	$null]
+	push	p,a
+	rfsts
+	  ercal	error
+	movem	a,regs+1
+	movem	b,regs+2
+	pop	p,a		; get back process handle
+	rfrkh
+	  ercal	error
+	pop	p,a
+	move	d,regs+1
+	txze	d,rf%frz
+	jrst	[hrroi	b,[asciz/rf%frz+/]
+		movei	c,0
+		call	.sout
+		jrst	.+1]
+	hlrz	b,regs+1
+	txz	b,1B18
+	funct	<.RFRUN,.RFIO,.RFHLT,.RFFPT,.RFWAT,.RFSLP,.RFTRP,.RFABK>
+	movei	b,"+"
+	idpb	b,a
+	hrrz	b,regs+1
+	movei	c,^D10
+	call	.nout
+	movei	b,"."
+	idpb	b,a
+	movei	b,","
+	idpb	b,a
+	hllz	d,regs+2
+	flags	<ovflow,carry0,carry1,fltovf,fpd,user,userio,public,afi,trap2,trap1,fltund,nodiv>,10
+	movei	b,"+"
+	idpb	b,a
+	move	b,regs+2
+	txz	b,77774B12
+	movei	c,10
+	call	.nout
+	jrst	$null
+$rftad:	move	b,regs+1
+	call	.srce
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	movei	c,10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+3
+	call	.nout
+	jrst	$null
+$rin:	move	b,regs+1
+	call	.jfn
+	movei	b,","
+	idpb	b,a
+	idpb	b,a
+	move	b,regs+3
+	movei	c,^D10
+	call	.nout
+	movei	b,"."
+	idpb	b,a
+	call	.arg.
+	push	p,a
+	move	a,regs+1
+	move	c,regs+3
+	rin
+	  erjmp	[pop	p,a
+		call	lsterr
+		jrst	$null]
+	pop	p,a
+	move	d,b
+	move	b,regs+3
+	movei	c,^D10
+	call	.nout
+	movei	c,"."
+	idpb	c,a
+	movei	c,","
+	idpb	c,a
+	move	b,d
+	call	.char
+	jrst	$null
+$rir:	move	b,regs+1
+	call	.proc
+	jrst	$null
+$rircm:	move	b,regs+1
+	call	.proc
+	jrst	$null
+$rljfn:	move	b,regs+1
+	camn	b,[-1]
+	jrst	[movei	c,10
+		call	.nout
+		jrst	$null]
+	call	.jfn
+	jrst	$null
+$rmap:	movei	b,"["
+	idpb	b,a
+	hlrz	b,regs+1	; get process handle
+	pushj	p,.proc
+	movei	b,","
+	idpb	b,a
+	idpb	b,a
+	hrrz	b,regs+1	; get page number
+	movei	c,10
+	call	.nout
+	movei	b,"]"
+	idpb	b,a
+	jrst	$null
+$rnamf:	move	b,regs+1
+	call	.jfn
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	call	.jfn
+	jrst	$null
+$rout:	move	b,regs+1
+	call	.jfn
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	call	.char
+	movei	b,","
+	idpb	b,a
+	move	b,regs+3
+	movei	c,^D10
+	call	.nout
+	movei	b,"."
+	idpb	b,a
+	jrst	$null
+$rpacs:	movei	b,"["
+	idpb	b,a
+	move	b,regs+1
+	jumpl	b,[hlrz	b,regs+1 ; it is a process handle
+		call	.proc
+		jrst	$rpac1]
+	jumpg	b,[hlrz	b,regs+1 ; it is a jfn
+		call	.jfn
+		jrst	$rpac1]
+$rpac1:	movei	b,","
+	idpb	b,a
+	idpb	b,a
+	hrrz	b,regs+1
+	movei	c,10
+	call	.nout
+	movei	b,"]"
+	idpb	b,a
+	call	.arg.
+	move	b,regs+1
+	jumpl	b,[push	p,a	; it is a fork handle - save a
+		move	a,shadow ; get the process that knows the fork handle
+		hlrz	b,regs+1 ; get the fork handle
+		caie	b,.fhslf ; if it is going to look at itself, we have it
+		gfrkh
+		  erjmp	[pop	p,a
+			call	lsterr
+			jrst	$null]
+		push	p,a	; save the process handle
+		hrlzs	a	; move to proper side of register
+		hrr	a,regs+1 ; get the page number
+		rpacs		; read the access
+		  ercal	error
+		movem	b,regs+2 ; save bits for decoding
+		pop	p,a	; get back process handle
+		came	a,shadow ; don't release this fork handle!
+		rfrkh
+		  ercal	error
+		pop	p,a		; get back jfn
+		jrst	$rpac2]
+	push	p,a
+	move	a,regs+1
+	rpacs
+	  erjmp	[pop	p,a
+		call	lsterr
+		jrst	$null]
+	movem	b,regs+2
+	pop	p,a
+$rpac2:	move	d,regs+2
+	flags	<pa%rd,pa%wt,pa%ex,pa%pex,pa%ind,pa%cpy,pa%prv,p1%rd,p1%wt,p1%ex,p1%pex,p1%cpy>,10
+	jrst	$null
+$rpcap:	move	b,regs+1	; get process handle
+	pushj	p,.proc
+	jrst	$null
+$rscan:	hlrz	b,regs+1
+	cain	b,0
+	jrst	$rsc.1
+	move	b,regs+1
+	call	.name
+	jrst	$null
+$rsc.1:	move	b,regs+1
+	funct	<.RSINI,.RSCNT>
+	jrst	$null
+$rtfrk:	jfcl
+	jrst	$null
+$rtiw:	hllz	d,regs+1
+	flags	<rt%dim>,10
+	movei	b,","
+	idpb	b,a
+	hrrz	b,regs+1
+	pushj	p,.proc
+	jrst	$null
+$runtm:	move	b,regs+1
+	call	.proc
+	jrst	$null
+$rwm:	move	b,regs+1
+	call	.proc
+	jrst	$null
+$rwset:	jfcl
+	jrst	$null
+$sactf:	move	b,regs+1
+	call	.jfn
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	ldb	c,[point 3,b,2]
+	cain	c,5
+	jrst	[txz	b,7B2
+		movei	c,10
+		call	.nout
+		jrst	$null]
+	push	p,a
+	move	a,[point 7,number]
+	movei	c,^D39
+	movei	d,0
+	call	.sout
+	idpb	d,a
+	pop	p,a
+	move	b,[point 7,number]
+	movei	c,0
+	call	.sout
+	jrst	$null
+$save:	movei	b,"["
+	idpb	b,a
+	hlrz	b,regs+1
+	call	.proc
+	movei	b,","
+	idpb	b,a
+	idpb	b,a
+	hrrz	b,regs+1
+	call	.jfn
+	movei	b,"]"
+	idpb	b,a
+	movei	b,","
+	idpb	b,a
+	movei	b,"["
+	idpb	b,a
+	hlrz	b,regs+2
+	movei	c,10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	idpb	b,a
+	hrrz	b,regs+2
+	movei	c,10
+	call	.nout
+	movei	b,"]"
+	idpb	b,a
+	jrst	$null
+$sctty:	movei	b,"["
+	idpb	b,a
+	hlrz	b,regs+1
+	funct	<.SCRET,.SCSET,.SCRST>
+	movei	b,","
+	idpb	b,a
+	idpb	b,a
+	hrrz	b,regs+1
+	call	.proc
+	movei	b,"]"
+	idpb	b,a
+	hlrz	b,regs+1
+	caie	b,.scset
+	jrst	$null
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	call	.jfn
+	jrst	$null
+$scvec:	move	b,regs+1
+	call	.proc
+	movei	b,","
+	idpb	b,a
+	movei	b,"["
+	idpb	b,a
+	hlre	b,regs+2
+	movx	c,10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	idpb	b,a
+	hrrz	b,regs+2
+	call	.nout
+	movei	b,"]"
+	idpb	b,a
+	movei	c,10
+	movei	b,","
+	idpb	b,a
+	movei	b,"["
+	idpb	b,a
+	hlre	b,regs+3
+	movx	c,10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	idpb	b,a
+	hrrz	b,regs+3
+	call	.nout
+	movei	b,"]"
+	idpb	b,a
+	jrst	$null
+$sdsts:	move	b,regs+1
+	call	.jfn
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	movei	c,10
+	call	.nout
+	jrst	$null
+$sdvec:	move	b,regs+1
+	call	.proc
+	movei	b,","
+	idpb	b,a
+	movei	b,"["
+	idpb	b,a
+	hlrz	b,regs+2
+	movei	c,^D10
+	call	.nout
+	movei	b,"."
+	idpb	b,a
+	movei	b,","
+	idpb	b,a
+	idpb	b,a
+	hrrz	b,regs+2
+	movei	c,10
+	call	.nout
+	movei	b,"]"
+	idpb	b,a
+	jrst	$null
+$seter:	move	b,regs+1
+	call	.proc
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	movei	c,10
+	call	.nout
+	jrst	$null
+$setjb:	move	b,regs+1
+	movei	c,10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	funct	<.SJDEN,.SJPAR,.SJDM,.SJRS,.SJDFS,.SJSRM,.SJT20,.SJDFR,.SJBAT,.SJLLO>
+	jrst	$null
+$setnm:	move	b,regs+1
+	pushj	p,.six
+	jrst	$null
+$setsn:	move	b,regs+1
+	pushj	p,.six
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	pushj	p,.six
+	jrst	$null
+$sevec:	move	b,regs+1
+	call	.proc
+	movei	b,","
+	idpb	b,a
+	movei	b,"["
+	idpb	b,a
+	hlrz	b,regs+2
+	movei	c,^D10
+	call	.nout
+	movei	b,"."
+	idpb	b,a
+	movei	b,","
+	idpb	b,a
+	idpb	b,a
+	hrrz	b,regs+2
+	movei	c,10
+	call	.nout
+	movei	b,"]"
+	idpb	b,a
+	jrst	$null
+$sfacs:	move	b,regs+1
+	call	.proc
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	movei	c,10
+	call	.nout
+	jrst	$null
+$sfbsz:	move	b,regs+1
+	call	.jfn
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	movei	c,^D10
+	call	.nout
+	movei	b,"."
+	idpb	b,a
+	jrst	$null
+$sfcoc:	move	b,regs+1
+	call	.jfn
+	movei	b,"	"
+	idpb	b,a
+	movei	b," "
+	idpb	b,a
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	movei	c,4
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+3
+	movei	c,4
+	call	.nout
+	jrst	$null
+$sfmod:	move	b,regs+1
+	call	.jfn
+	movei	b,","
+	idpb	b,a
+	move	d,regs+2
+	flags	<tt%osp,tt%mff,tt%tab,tt%lca,tt%len,tt%wid,tt%ign,tt%wkf,tt%wkn,tt%wkp,tt%wka,tt%eco,tt%ecm,tt%alk,tt%aad,tt%dam,tt%uoc,tt%lic,tt%dum,tt%pgm,tt%car>,10
+	jrst	$null
+$sfork:	movei	b,"["
+	idpb	b,a
+	hllz	d,regs+1
+	flags	<sf%con>,10
+	movei	b,","
+	idpb	b,a
+	idpb	b,a
+	hrrz	b,regs+1
+	call	.proc
+	movei	b,"]"
+	idpb	b,a
+	movei	b,","
+	idpb	b,a
+	hllz	d,regs+2
+	flags	<ovflow,carry0,carry1,fltovf,fpd,user,userio,public,afi,trap2,trap1,fltund,nodiv>,10
+	movei	b,"+"
+	hllz	d,regs+2
+	caie	d,0
+	idpb	b,a
+	hrrz	b,regs+2
+	movei	c,10
+	call	.nout
+	jrst	$null
+$sfpos:	move	b,regs+1
+	call	.jfn
+	movei	b,","
+	idpb	b,a
+	movei	b,"["
+	idpb	b,a
+	hlre	b,regs+2
+	movei	c,^D10
+	call	.nout
+	movei	b,"."
+	idpb	b,a
+	movei	b,","
+	idpb	b,a
+	idpb	b,a
+	hlle	b,regs+2
+	movei	c,^D10
+	call	.nout
+	movei	b,"]"
+	idpb	b,a
+	jrst	$null
+$sfptr:	move	b,regs+1
+	call	.jfn
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	movei	c,^D10
+	call	.nout
+	movei	b,"."
+	idpb	b,a
+	jrst	$null
+$sfrkv:	move	b,regs+1
+	call	.proc
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	movei	c,10
+	call	.nout
+	jrst	$null
+$sftad:	move	b,regs+1
+	call	.jfn
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	movei	c,10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+3
+	movei	c,^D10
+	call	.nout
+	movei	b,"."
+	idpb	b,a
+	jrst	$null
+$sfust:	movei	b,"["
+	idpb	b,a
+	hlrz	b,regs+1
+	funct	<.SFAUT,.SFLWR>
+	movei	b,","
+	idpb	b,a
+	idpb	b,a
+	hrrz	b,regs+1
+	call	.jfn
+	movei	b,"]"
+	idpb	b,a
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	call	.name
+	jrst	$null
+$sibe:	move	b,regs+1
+	call	.jfn
+	jrst	$null
+$sin:	move	b,regs+1	; get user register 1
+	pushj	p,.srce		; it's either byte pointer or jfn
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2	; get byte pointer
+	movx	c,no%mag+10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+3	; get character count
+	movei	c,^D10		; output
+	call	.nout
+	movei	c,"."
+	idpb	c,a
+	caig	b,0		; 4 registers only if count > 0
+	jrst	$null
+	movei	b,","
+	idpb	b,a
+	move	b,regs+4
+	movei	c,10
+	call	.nout
+	jrst	$null
+$sinr:	move	b,regs+1	; get user register 1
+	pushj	p,.srce		; it's either byte pointer or jfn
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2	; get byte pointer
+	movx	c,no%mag+10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+3	; get character count
+	movei	c,^D10		; output
+	call	.nout
+	movei	c,"."
+	idpb	c,a
+	caig	b,0		; 4 registers only if count > 0
+	jrst	$null
+	movei	b,","
+	idpb	b,a
+	move	b,regs+4
+	movei	c,10
+	call	.nout
+	jrst	$null
+$sir:	move	b,regs+1	; get process handle
+	pushj	p,.proc
+	movei	b,","
+	idpb	b,a
+	movei	b,"["
+	idpb	b,a
+	hlrz	b,regs+2	; get address of priority table
+	movx	c,10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	idpb	b,a
+	hrrz	b,regs+2	; get address of channel table
+	call	.nout
+	movei	b,"]"
+	idpb	b,a
+	jrst	$null
+$sircm:	move	b,regs+1
+	call	.proc
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	movei	c,10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+3
+	movei	c,^D10
+	call	.nout
+	movei	b,"."
+	idpb	b,a
+	jrst	$null
+$sizef:	move	b,regs+1
+	call	.jfn
+	jrst	$null
+$sjpri:	hrroi	b,[asciz/Wheel Needed!/]
+	movei	c,0
+	call	.sout
+	movei	b,"	"
+	idpb	b,a
+	move	b,regs+a
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+b
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+c
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+d
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	jrst	$null
+$skpir:	move	b,regs+1
+	call	.proc
+	jrst	$null
+$smap:	move	b,regs+1
+	movei	c,10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	movei	b,","
+	idpb	b,a
+	movei	b,"["
+	idpb	b,a
+	move	b,regs+2
+	jumpl	b,[hlrz	b,regs+2 ; it is a process handle
+		call	.proc
+		jrst	$smap3]
+	jumpg	b,[hlrz	b,regs+2 ; it is a jfn
+		call	.jfn
+		jrst	$smap3]
+$smap3:	movei	b,","
+	idpb	b,a
+	idpb	b,a
+	hrrz	b,regs+2
+	movei	c,10
+	call	.nout
+	movei	b,"]"
+	idpb	b,a
+	movei	b,","
+	idpb	b,a
+	move	d,regs+3
+	jumpe	d,$null
+	flags	<pm%cnt,pm%rd,pm%wr,pm%ex,pm%pld,pm%cpy>,^D10
+	jrst	$null
+$smon:	move	b,regs+1
+	funct	<.SFFAC,.SFCDE,.SFCDR,.SFMST,.SFRMT,.SFPTY,.SFCTY,.SFOPR,.SFLCL,.SFBTE,.SFCRD,.SFNVT,.SFUSG,.SFFLO,.SFMTA,.SFNTN,.SFNDU,.SFNHI,.SFTMZ,.SFLHN,.SFAVR,.SFSTS>
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	movei	c,10
+	call	.nout
+	jrst	$null
+$sndim:	hrroi	b,[asciz/ArpaNet Special!/]
+	movei	c,0
+	call	.sout
+	jrst	$null
+$snoop:	hrroi	b,[asciz/Wheel Needed!/]
+	movei	c,0
+	call	.sout
+	movei	b,"	"
+	idpb	b,a
+	move	b,regs+a
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+b
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+c
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+d
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	jrst	$null
+$sobe:	move	b,regs+1
+	call	.jfn
+	jrst	$null
+$sobf:	move	b,regs+1
+	call	.jfn
+	jrst	$null
+$sout:	move	b,regs+1	; get user register 1
+	pushj	p,.srce		; it's either byte pointer or jfn
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2	; get byte pointer
+	movx	c,no%mag+10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+3	; get character count
+	movei	c,^D10		; output
+	call	.nout
+	movei	c,"."
+	idpb	c,a
+	caig	b,0		; 4 registers only if count > 0
+	jrst	$sout1
+	movei	b,","
+	idpb	b,a
+	move	b,regs+4
+	movei	c,10
+	call	.nout
+$sout1:	move	b,regs+1
+	caie	b,.priin
+	cain	b,.priou
+	jrst	$sout2
+	cain	b,.cttrm
+	jrst	$sout2
+$sout2:	movei	b,","
+	idpb	b,a
+	movei	b,"\"
+	idpb	b,a
+	move	b,regs+2
+	call	.name1
+	movei	b,"\"
+	idpb	b,a
+	jrst	$null
+$soutr:	move	b,regs+1	; get user register 1
+	pushj	p,.srce		; it's either byte pointer or jfn
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2	; get byte pointer
+	movx	c,no%mag+10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+3	; get character count
+	movei	c,^D10		; output
+	call	.nout
+	movei	c,"."
+	idpb	c,a
+	caig	b,0		; 4 registers only if count > 0
+	jrst	$null
+	movei	b,","
+	idpb	b,a
+	move	b,regs+4
+	movei	c,10
+	call	.nout
+	jrst	$null
+$spacs:		movei	b,"["
+	idpb	b,a
+	move	b,regs+1
+	jumpl	b,[hlrz	b,regs+1 ; it is a process handle
+		call	.proc
+		jrst	$spac1]
+	jumpg	b,[hlrz	b,regs+1 ; it is a jfn
+		call	.jfn
+		jrst	$spac1]
+$spac1:	movei	b,","
+	idpb	b,a
+	idpb	b,a
+	hrrz	b,regs+1
+	movei	c,10
+	call	.nout
+	movei	b,"]"
+	idpb	b,a
+	movei	b,","
+	idpb	b,a
+	move	d,regs+2
+	flags	<pa%rd,pa%wt,pa%ex,pa%cpy>,10
+	jrst	$null
+$spjfn:	move	b,regs+1
+	call	.jfn
+	movei	b,","
+	idpb	b,a
+	movei	b,"["
+	idpb	b,a
+	hlrz	b,regs+2
+	call	.jfn
+	movei	b,","
+	idpb	b,a
+	idpb	b,a
+	hrrz	b,regs+2
+	call	.jfn
+	movei	b,"]"
+	idpb	b,a
+	jrst	$null
+$splfk:	move	b,regs+1
+	call	.proc
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	call	.proc
+	jrst	$null
+$spool:	movei	b,"["
+	idpb	b,a
+	hlre	b,regs+1
+	movei	c,^D10
+	call	.nout
+	movei	b,"."
+	idpb	b,a
+	movei	b,","
+	idpb	b,a
+	idpb	b,a
+	hrrz	b,regs+1
+	funct	<.SPLDI,.SPLSD,.SPLRD>
+	movei	b,"]"
+	idpb	b,a
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	movei	c,10
+	call	.nout
+	jrst	$null
+$spriw:	move	b,regs+1
+	call	.proc
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	movei	c,10
+	call	.nout
+	jrst	$null
+$ssave:	movei	b,"["
+	idpb	b,a
+	hlrz	b,regs+1
+	call	.proc
+	movei	b,","
+	idpb	b,a
+	idpb	b,a
+	hrrz	b,regs+1
+	call	.jfn
+	movei	b,"]"
+	idpb	b,a
+	movei	b,","
+	idpb	b,a
+	movei	b,"["
+	idpb	b,a
+	hlrz	b,regs+2
+	movei	c,10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	idpb	b,a
+	hrrz	b,regs+2
+	movei	c,10
+	call	.nout
+	movei	b,"]"
+	idpb	b,a
+	movei	b,","
+	idpb	b,a
+	move	b,regs+3
+	movei	c,10
+	call	.nout
+	jrst	$null
+$stad:	hrroi	b,[asciz/Wheel Needed!/]
+	movei	c,0
+	call	.sout
+	movei	b,"	"
+	idpb	b,a
+	move	b,regs+a
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+b
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+c
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+d
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	jrst	$null
+$stcmp:	move	b,regs+1
+	call	.name
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	call	.name
+	jrst	$null
+$stdev:	move	b,regs+1
+	call	.name
+	jrst	$null
+$sti:	move	b,regs+1
+	call	.jfn
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	call	.char
+	jrst	$null
+$stiw:	hllz	d,regs+1
+	flags	<st%dim>,10
+	hllz	d,regs+1
+	movei	b,"+"
+	txne	d,st%dim
+	idpb	b,a
+	hrrz	b,regs+1
+	call	.proc
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	movei	c,10
+	call	.nout
+	hllz	d,regs+1
+	txnn	d,st%dim
+	jrst	$null
+	movei	b,","
+	idpb	b,a
+	move	b,regs+3
+	movei	c,10
+	call	.nout
+	jrst	$null
+$sto:	move	b,regs+1
+	call	.jfn
+	jrst	$null
+$stpar:	move	b,regs+1
+	call	.jfn
+	movei	b,","
+	idpb	b,a
+	move	d,regs+2
+	flags	<tt%osp,tt%mff,tt%tab,tt%lca,tt%len,tt%wid,tt%ign,tt%wkf,tt%wkn,tt%wkp,tt%wka,tt%eco,tt%ecm,tt%alk,tt%aad,tt%dam,tt%uoc,tt%lic,tt%dum,tt%pgm,tt%car>,10
+	jrst	$null
+$stppn:	move	b,regs+1
+	tlnn	b,-1		; is this a jfn?
+	jrst	[call	.jfn
+		jrst	$null]
+	hlrz	c,b
+	cain	c,-1
+	hrli	b,440700
+	ldb	c,[point 6,b,5]	; get the first 6 bits
+	caile	c,44		; max size if byte pointer
+	jrst	[call	.dirst
+		jrst	$null]
+	call	.name
+	jrst	$null
+$ststs:	hrr	b,regs+1
+	call	.jfn
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	movei	c,10
+	call	.nout
+	jrst	$null
+$sttyp:	hrr	b,regs+1
+	call	.jfn
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	movei	c,10
+	call	.nout
+	jrst	$null
+$swjfn:	move	b,regs+1
+	call	.jfn
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	call	.jfn
+	jrst	$null
+$syerr:	hrroi	b,[asciz/Wheel Needed!/]
+	movei	c,0
+	call	.sout
+	movei	b,"	"
+	idpb	b,a
+	move	b,regs+a
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+b
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+c
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+d
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	jrst	$null
+$sysgt:	move	b,regs+1	; get 6-bit table name
+	pushj	p,.six
+	jrst	$null
+$tbadd:	move	b,regs+1
+	movei	c,10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	movei	c,10
+	call	.nout
+	jrst	$null
+$tbdel:	move	b,regs+1
+	movei	c,10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	movei	c,10
+	call	.nout
+	jrst	$null
+$tbluk:	move	b,regs+1
+	movei	c,10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	call	.name
+	jrst	$null
+$texti:	move	b,regs+1
+	movei	c,10
+	call	.nout
+	jrst	$null
+$tfork:	movei	b,"["
+	idpb	b,a
+	hlrz	b,regs+1
+	funct	<.TFSET,.TFRAL,.TFRTP,.TFSPS,.TFRPS,.TFTST,.TFRES,.TFUUO,.TFSJU,.TFRUU>
+	movei	b,","
+	idpb	b,a
+	idpb	b,a
+	hrrz	b,regs+1
+	call	.proc
+	movei	b,"]"
+	idpb	b,a
+	movei	b,","
+	idpb	b,a
+	movei	b,"["
+	idpb	b,a
+	hlrz	b,regs+2
+	movei	c,^D10
+	call	.nout
+	movei	b,"."
+	idpb	b,a
+	movei	b,","
+	idpb	b,a
+	idpb	b,a
+	hrrz	b,regs+2
+	movei	c,^D10
+	call	.nout
+	movei	b,"."
+	idpb	b,a
+	movei	b,"]"
+	idpb	b,a
+	movei	b,","
+	idpb	b,a
+	move	b,regs+3
+	movei	c,10
+	call	.nout
+	jrst	$null
+$thibr:	move	b,regs+1
+	movei	c,^D10
+	call	.nout
+	movei	b,"."
+	idpb	b,a
+	jrst	$null
+$timer:	movei	b,"["
+	idpb	b,a
+	hlrz	b,regs+1	; get process handle
+	pushj	p,.proc
+	movei	b,","
+	idpb	b,a
+	idpb	b,a
+	hrrz	b,regs+1	; get function code
+	funct	<.timrt,.timel,.timdt,.timdd,.timbF,.timal>
+	movei	b,"]"
+	idpb	b,a
+	movei	b,","
+	idpb	b,a
+	hrrz	c,regs+1
+	cain	c,.timrt
+	jrst	$timr1
+	cain	c,.timel
+	jrst	$timr1
+	cain	c,.timdt
+	jrst	$timr2
+	cain	c,.timdd
+	jrst	$timr2
+	cain	c,.timbf
+	jrst	$timr2
+	jrst	$null
+$timr1:	move	b,regs+2
+	movei	c,^D10
+	call	.nout
+	jrst	$timr3
+$timr2:	move	b,regs+2
+	movei	c,0
+	odtim
+	  erjmp	[call	lsterr
+		jrst	.+1]
+$timr3:	movei	b,","
+	idpb	b,a
+	move	b,regs+3
+	movei	c,^D10
+	call	.nout
+	jrst	$null
+$time:	call	.arg.
+	push	p,a
+	time
+	move	b,a
+	pop	p,a
+	movei	c,^D10
+	call	.nout
+	movei	b,"."
+	idpb	b,a
+	jrst	$null
+$tlink:	move	d,regs+1
+	flags	<tl%cro,tl%cor,tl%eor,tl%ero,tl%sab,tl%abs,tl%sta,tl%aad>,10
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	movei	c,10
+	call	.nout
+	jrst	$null
+$tmon:	move	b,regs+1
+	funct	<.SFFAC,.SFCDE,.SFCDR,.SFMST,.SFRMT,.SFPTY,.SFCTY,.SFOPR,.SFLCL,.SFBTE,.SFCRD,.SFNVT,.SFUSG,.SFFLO,.SFMTA,.SFNTN,.SFNDU,.SFNHI,.SFTMZ,.SFLHN,.SFAVR,.SFSTS>
+	jrst	$null
+$trace:	hrlzi	d,-10
+$trce1:	move	b,regs(d)
+	movei	c,10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	aobjn	d,$trce1
+	move	b,regs(d)
+	movei	c,10
+	call	.nout
+	jrst	$null
+$ttmsg:	hrroi	b,[asciz/Wheel Needed!/]
+	movei	c,0
+	call	.sout
+	movei	b,"	"
+	idpb	b,a
+	move	b,regs+a
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+b
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+c
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+d
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	jrst	$null
+$twake:	move	b,regs+1
+	movei	c,10
+	call	.nout
+	jrst	$null
+$ufpgs:	movei	b,"["
+	idpb	b,a
+	move	b,regs+1
+	hlrz	b,regs+1	; it is a jfn
+	call	.jfn
+	movei	b,","
+	idpb	b,a
+	idpb	b,a
+	hrrz	b,regs+1
+	movei	c,10
+	call	.nout
+	movei	b,"]"
+	idpb	b,a
+	movei	b,","
+	idpb	b,a
+	move	b,regs+2
+	movei	c,10
+	call	.nout
+	jrst	$null
+$usage:	hrroi	b,[asciz/Wheel Needed!/]
+	movei	c,0
+	call	.sout
+	movei	b,"	"
+	idpb	b,a
+	move	b,regs+a
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+b
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+c
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+d
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	jrst	$null
+$usrio:	hrroi	b,[asciz/Wheel Needed!/]
+	movei	c,0
+	call	.sout
+	movei	b,"	"
+	idpb	b,a
+	move	b,regs+a
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+b
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+c
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+d
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	jrst	$null
+$utest:	hrroi	b,[asciz/Wheel Needed!/]
+	movei	c,0
+	call	.sout
+	movei	b,"	"
+	idpb	b,a
+	move	b,regs+a
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+b
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+c
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	movei	b,","
+	idpb	b,a
+	move	b,regs+d
+	movx	c,no%mag!no%ast!no%oov!10
+	call	.nout
+	jrst	$null
+$utfrk:	hllz	d,regs+1
+	flags	<ut%trp>,10
+	hllz	d,regs+1
+	movei	b,"+"
+	caie	d,0
+	idpb	b,a
+	hrrz	b,regs+1
+	call	.proc
+	jrst	$null
+$vacct:	move	b,regs+1
+	camn	b,[-1]
+	jrst	[hrroi	b,[asciz/-1/]
+		movei	c,0
+		call	.sout
+		jrst	$null]
+	call	.dirst
+	jrst	$null
+$wait:	jfcl
+	jrst	$null
+$wfork:	move	b,regs+1
+	call	.proc
+	jrst	$null
+.char:	cail	b,0
+	caile	b,177
+	jrst	.char1
+	move	b,chrtbl(b)	; point to name of this character
+	movei	c,0
+	call	.sout
+	popj	p,
+.char1:	movei	c,10
+	call	.nout
+	move	d,b		; save the chars
+	jumpe	d,[popj	p,]
+	txne	d,1		; test the bit we can't get at
+	jrst	.char3
+	movei	b,","
+	idpb	b,a
+	movei	b,"'"
+	idpb	b,a
+	move	e,[point 7,d]
+.char2:	jumpe	d,[movei b,"'"
+		   idpb	b,a
+		   popj	p,]
+	ildb	b,e		; get the char
+	call	.char
+	movei	b,0
+	dpb	b,e
+	jrst	.char2
+.char3:	movei	b,","
+	idpb	b,a
+	movei	b,""""
+	idpb	b,a
+	move	e,[point 6,d]
+.char4:	jumpe	d,[movei b,""""
+		   idpb	b,a
+		   popj	p,]
+	ildb	b,e		; get the char
+	addi	b," "
+	call	.char
+	movei	b,0
+	dpb	b,e
+	jrst	.char4
+.six:	move	e,b
+	move	d,[point 6,e]
+	movei	c,6
+.six.1:	ildb	b,d
+	addi	b," "
+	cain	b," "
+	popj	p,
+	idpb	b,a
+	sojg	c,.six.1
+	popj	p,
+.srce:	call	.jfn
+	popj	p,
+.proc:	movei	c,0
+	cain	b,.fhslf
+	hrroi	c,[asciz/.FHSLF/]
+	cain	b,.fhsup
+	hrroi	c,[asciz/.FHSUP/]
+	cain	b,.fhtop
+	hrroi	c,[asciz/.FHTOP/]
+	cain	b,.fhsai
+	hrroi	c,[asciz/.FHSAI/]
+	cain	b,.fhinf
+	hrroi	c,[asciz/.FHINF/]
+	cain	b,.fhjob
+	hrroi	c,[asciz/.FHJOB/]
+	jumpe	c,.proc2
+	move	b,c
+	movni	c,6
+	call	.sout
+	popj	p,
+.proc2:	movx	c,no%mag+no%oov+no%ast+10
+	call	.nout
+	popj	p,
+lsterr:	push	p,a
+	movei	a,.fhslf
+	geter
+	move	a,[point 7,number]
+	movei	c,0
+	erstr
+	jfcl
+	jfcl
+	pop	p,a
+	move	b,[point 7,number]
+	movei	c,0
+	call	.sout
+	popj	p,
+.arg.:	movei	b,"	"
+	idpb	b,a
+	movei	b,"="
+	idpb	b,a
+	movei	b,76
+	idpb	b,a
+	popj	p,
+.jfn:	caile	b,0
+	cail	b,100
+	jrst	.jfn.1
+	push	p,b
+	push	p,a
+	move	a,[point 7,number]
+	movx	c,0
+	jfns
+	  ercal	[hrroi	b,[asciz/*-> ? <-*/]
+		movei	c,0
+		call	.sout
+		popj	p,]
+	movei	b,0
+	idpb	b,a
+	pop	p,a
+	move	b,[point 7,number]
+	movei	c,0
+	call	.sout
+	movei	c,"("
+	idpb	c,a
+	movei	c,10
+	pop	p,b
+	call	.nout
+	movei	c,")"
+	idpb	c,a
+	popj	p,
+.jfn.1:	movei	c,0
+	cain	b,.priou
+	hrroi	c,[asciz/.PRIOU/]
+	cain	b,.priin
+	hrroi	c,[asciz/.PRIIN/]
+	cain	b,.nulio
+	hrroi	c,[asciz/.NULIO/]
+	cain	b,.ttdes
+	hrroi	c,[asciz/.TTDES/]
+	cain	b,.cttrm
+	hrroi	c,[asciz/.CTTRM/]
+	jumpe	c,.jfn.2
+	move	b,c
+	movni	c,6
+	call	.sout
+	popj	p,
+.jfn.2:	movx	c,no%mag+no%oov+no%ast+10
+	call	.nout
+	popj	p,
+.get1:	caile	b,17		; see if the address is in the registers
+	jrst	.get1a		; no. go pmap the thing
+	move	b,regs(b)	; this is easy
+	popj	p,
+.get1a:	push	p,a
+	push	p,b		; save actual address
+	push	p,c
+	hrrz	a,b		; copy the address
+	lsh	a,-^D9		; convert to page number
+	hrl	a,shadow	; get process number
+	move	b,[.fhslf,,other]	; put it here
+	movx	c,pm%rd		; allow read access
+	pmap
+	move	c,-1(p)
+	andi	c,777		; get offset within page
+	iorx	c,other*1000	; get address in this process
+	move	b,0(c)		; get destination value
+	movem	b,-1(p)		; save it
+	movni	a,1		; unmap the page
+	move	b,[.fhslf,,other]
+	movei	c,1
+	pmap
+	pop	p,c
+	pop	p,b
+	pop	p,a
+	popj	p,
+.name:	push	p,b
+	push	p,c
+	push	p,d
+	push	p,e
+	push	p,f
+	push	p,g
+	hrrz	g,b		; byte pointer in b - save 18 bit "y"
+	hlrzs	b		; if left half is -1,
+	cain	b,777777
+	movei	b,440700	; use this default pointer
+	hrlzs	b
+	ldb	c,[point 6,b,^D17] ; get register number
+	caie	c,0		; 0 is special - no indexing
+	hrrz	c,regs(c)
+	add	g,c		; add in the user index value
+	hll	g,b		; g is now actual byte pointer
+	txz	g,77B17		; zap index field
+	push	p,a		; map the addressed 
+	hrrz	a,g
+	lsh	a,-^D9		; get source page number
+	move	b,[.fhslf,,other] ; map them here
+	movei	c,2		; map 2 pages as default
+	cain	a,777
+	movei	c,1
+	hrl	a,shadow	; get source process
+	cain	c,2
+	iorx	c,pm%cnt
+	iorx	c,pm%rd
+	pmap
+	  ercal	error
+	pop	p,a		; restore a
+	move	d,g
+	trz	d,777000
+	tro	d,other*1000
+	movei	e,^D80
+.nam.1:	ildb	b,d
+	cain	b,0
+	jrst	.nam.2
+	call	.char
+	sojg	e,.nam.1
+.nam.2:	push	p,a
+	movni	a,1
+	move	b,[.fhslf,,other]
+	movx	c,pm%cnt+2
+	pmap
+	  ercal	error
+	pop	p,a		; restore a
+	pop	p,g
+	pop	p,f
+	pop	p,e
+	pop	p,d
+	pop	p,c
+	pop	p,b
+	popj	p,
+.name1:	push	p,b
+	push	p,c
+	push	p,d
+	push	p,e
+	push	p,f
+	push	p,g
+	hrrz	g,b		; byte pointer in b - save 18 bit "y"
+	hlrzs	b		; if left half is -1,
+	cain	b,777777
+	movei	b,440700	; use this default pointer
+	hrlzs	b
+	ldb	c,[point 6,b,^D17] ; get register number
+	caie	c,0		; 0 is special - no indexing
+	hrrz	c,regs(c)
+	add	g,c		; add in the user index value
+	hll	g,b		; g is now actual byte pointer
+	txz	g,77B17		; zap index field
+	push	p,a		; map the addressed 
+	hrrz	a,g
+	lsh	a,-^D9		; get source page number
+	move	b,[.fhslf,,other] ; map them here
+	movei	c,2		; map 2 pages as default
+	cain	a,777
+	movei	c,1
+	hrl	a,shadow	; get source process
+	cain	c,2
+	iorx	c,pm%cnt
+	iorx	c,pm%rd
+	pmap
+	  ercal	error
+	pop	p,a		; restore a
+	move	d,g
+	trz	d,777000
+	tro	d,other*1000
+	move	e,regs+c	; check user count parameter
+	jumpl	e,.nnm.1	; exact number of chars?
+	jumpe	e,.nnm.2	; look for null?
+.nnm.3:	ildb	b,d		; third parameter is positive
+	call	.char
+	camn	b,regs+c
+	jrst	.nnm.4
+	sojg	e,.nnm.3
+	jrst	.nnm.4
+.nnm.1:	ildb	b,d		; third parameter is negative
+	call	.char
+	aojl	e,.nnm.1
+	jrst	.nnm.4
+.nnm.2:	ildb	b,d		; third parameter is zero
+	jumpe	b,.nnm.4
+	call	.char
+	jrst	.nnm.2
+.nnm.4:	push	p,a
+	movni	a,1
+	move	b,[.fhslf,,other]
+	movx	c,pm%cnt+2
+	pmap
+	  ercal	error
+	pop	p,a		; restore a
+	pop	p,g
+	pop	p,f
+	pop	p,e
+	pop	p,d
+	pop	p,c
+	pop	p,b
+	popj	p,
+.move:	push	p,a		; -6
+	push	p,b		; -5
+	push	p,c		; -4
+	push	p,d		; -3
+	push	p,e		; -2
+	push	p,f		; -1
+	push	p,g		; 0(p)
+	hrrz	g,b
+	hrrz	a,g
+	lsh	a,-^D9		; get source page number
+	move	b,[.fhslf,,other] ; map them here
+	movei	c,2		; map 2 pages as default
+	cain	a,777
+	movei	c,1
+	hrl	a,shadow	; get source process
+	cain	c,2
+	iorx	c,pm%cnt
+	iorx	c,pm%rd
+	pmap
+	  ercal	error
+	move	c,-4(p)
+	move	d,g
+	trz	d,777000
+	tro	d,other*1000
+.mov.1:	move	b,0(d)
+	movem	b,0(c)
+	aos	d
+	aobjn	c,.mov.1
+	movni	a,1
+	move	b,[.fhslf,,other]
+	movx	c,pm%cnt+2
+	pmap
+	  ercal	error
+	pop	p,g
+	pop	p,f
+	pop	p,e
+	pop	p,d
+	pop	p,c
+	pop	p,b
+	pop	p,a
+	popj	p,
+.devst:	push	p,b
+	push	p,c
+	push	p,a
+	move	a,[point 7,number]
+	devst
+	  ercal	error
+	pop	p,a
+	move	b,[point 7,number]
+	movei	c,0
+	call	.sout
+	pop	p,c
+	pop	p,b
+	popj	p,
+.dirst:	jumpe	b,[movei b,"0"
+		idpb	b,a
+		popj	p,]
+	push	p,b
+	push	p,c
+	push	p,a
+	move	a,[point 7,number]
+	dirst
+	  erjmp	[move	a,[point 7,number]
+		call	lsterr
+		jrst	.+1]
+	pop	p,a
+	move	b,[point 7,number]
+	movei	c,0
+	call	.sout
+.dirs1:	pop	p,c
+	pop	p,b
+	popj	p,
+.nout:	push	p,b
+	push	p,c
+	push	p,a
+	move	a,[point 7,number]
+	nout
+	  ercal	error
+	move	b,[point 7,number]
+	pop	p,a
+	movei	c,0
+	call	.sout
+	pop	p,c
+	pop	p,b
+	popj	p,
+.sout:	tlne	b,007000
+	hrli	b,440700
+	push	p,b
+	cail	c,0
+	jrst	.sout1
+.sout0:	ildb	b,0(p)		; get next character
+	idpb	b,a
+	aojn	c,.sout0	; copy all the characters there are
+.soutr:	pop	p,b
+	popj	p,
+.sout1:	caie	c,0		; copy till null?
+	jrst	.sout3
+.sout2:	ildb	b,0(p)		; get next character
+	cain	b,0
+	jrst	.soutr
+	idpb	b,a
+	jrst	.sout2
+.sout3:	ildb	b,0(p)		; copy (c) characters or until match (d)
+	idpb	b,a
+	camn	b,d
+	jrst	.soutr
+	sojg	c,.sout3
+$null:	popj	p,
+
+	SUBTTL	INTERRUPT ROUTINE FOR THE TERMINAL
+
+
+
+
+;HERE ON A TERMINAL INTERRUPT.  WE REMEMBER THE STATUS OF WHAT WE ARE
+;DOING, SAVE THE AC'S AND STACK, FREEZE THE FORKS, AND TURN OFF THE
+;TERMINAL INTERRUPTS.  THEN WE GO BACK TO THE COMMAND SCANNER FOR
+;MORE COMMANDS.  ON A "PROCEED" COMMAND, WE WILL RETURN WHERE WE
+;LEFT OFF.
+
+
+
+
+TTYINT:	IORI	Fl,FR.INT	;REMEMBER WE ARE INTERRUPTED
+	MOVEM	T1,SAVET1	;SAVE AN AC
+	MOVE	T1,[T2,,SAVET1+1]	;GET READY
+	BLT	T1,SAVET1-T1+P	;SAVE REST OF THEM TOO
+	MOVEI	T1,.FHSLF	;GET SET
+	DIR			;DISABLE ANY FURTHER INTERRUPTS
+	PUSHJ	P,TRAPOF	;TURN OFF TRAPPING
+	MOVE	T1,INTCHR	;GET THE INTERRUPT CODE
+	DTI			;CLEAR IT
+	HRROI	T1,[ASCIZ/
+% Interrupting
+
+/]				;GET TEXT
+	PSOUT			;PRINT IT
+	JRST	NEWCMD		;THEN JUMP BACK TO COMMAND SCANNER
+
+	SUBTTL	ROUTINES TO TURN ON AND OFF JSYS TRAPPING
+
+
+
+;HERE ARE THE ACTUAL ROUTINES TO INSERT ORE REMOVE JSYS TRAPS.
+;THE FORKS ARE FROZEN WHEN WE RETURN, SINCE THAT IS A NECESSARY
+;REQUIREMENT FOR THE TFORK JSYS.  IF NO FORK EXISTS, WE JUST RETURN.
+
+
+
+
+TRAPON:	SKIPN	T1,HANDLE	;GET HANDLE FOR INFERIORS
+	  POPJ	P,		;NONE, THEN RETURN
+	FFORK			;FREEZE THEM ALL
+	MOVX	T1,<.TFSET,,.FHINF>	;GET CODE FOR SETTING TRAPS
+	MOVX	T2,<JSCHN,,1000>	;AND CHANNEL AND NUMBER OF BITS
+	MOVEI	T3,BITS		;GET ADDRESS OF THE BITS
+	TFORK			;SAY WHICH JSYSES TO TRAP
+	HRLI	T1,.TFSPS	;GET CODE TO SET CHANNEL
+	TFORK			;SET WHICH CHANNEL TO INTERRUPT
+	POPJ	P,		;THEN RETURN
+
+
+
+
+TRAPOF:	SKIPN	T1,HANDLE	;GET HANDLE
+	  POPJ	P,		;IF NONE, RETURN
+	FFORK			;FREEZE THE FORKS
+	MOVX	T1,<.TFRES,,.FHINF>	;GET CODE TO UNDO ALL TRAPPING
+	TFORK			;DO IT
+	POPJ	P,		;ALL DONE
+
+	SUBTTL	SUBROUTINE TO READ IN SYMBOL TABLE
+
+
+
+;THIS ROUTINE IS CALLED TO PMAP THE PAGES OF THE INFERIOR FORK
+;WHERE THE SYMBOL POINTER RESIDES, SO THAT WE CAN LOOK AT IT.
+;ON A RETURN, SYMPTR IS EITHER ZERO, OR IS A SYMBOL POINTER.
+
+
+
+GETSYM:	PUSHJ	P,CLRADR	;FIRST REMOVE PREVIOUS MAPPING
+	HRRO	T1,SYMADR	;GET ADDRESS OF SYMBOL POINTER
+	PUSHJ	P,MAPADR	;MAP THE PAGE WHERE IT IS
+	  JRST	NOSYM		;CAN'T GET IT, NO SYMBOLS
+	SKIPL	T1,(T1)		;GET THE SYMBOL POINTER
+	  JRST	NOSYM		;IF NONNEGATIVE DON'T HAVE ONE
+	HLRZ	T2,T1		;GET COUNT OF SYMBOLS
+	CAIGE	T2,-SYMLEN	;TOO MANY FOR US?
+	HRLI	T2,-SYMLEN	;YES, REDUCE COUNT TO MAXIMUM
+	PUSHJ	P,MAPADR	;MAP THE ADDRESSES OF THE SYMBOLS
+	  JRST	NOSYM		;CAN'T, FLICK IT
+	MOVEM	T1,SYMPTR	;THEN SAVE THE POINTER FOR USE
+	SETOM	LASADR		;CLEAR THE SAVED ADDRESS
+	POPJ	P,		;AND RETURN
+
+
+NOSYM:	SETZM	SYMPTR		;CLEAR THE SYMBOL POINTER
+	HRROI	T1,[ASCIZ/
+% No symbols available
+
+/]				;GET TEXT
+	PSOUT			;OUTPUT IT
+	POPJ	P,		;AND RETURN
+
+	SUBTTL	ROUTINE TO MAP IN PAGES OF INFERIOR FORK
+
+
+
+;THIS ROUTINE IS CALLED WITH AN IOWD WHICH POINTS TO A LOCATION
+;IN THE INFERIOR FORK.  WE MAP THE REQUIRED PAGES INTO OUR OWN
+;CORE, AND DIDDLE THE IOWD SO THAT IT POINTS TO OUR OWN CORE.
+;WE ALSO CHECK FOR THE GOODNESS OF THE PAGES WHICH WE HAVE MAPPED.
+;SKIP RETURN IF SUCCESSFUL.
+
+
+
+MAPADR:	MOVEM	T1,IWDSAV	;SAVE THE IOWD
+	HLRE	T3,T1		;GET THE COUNT WHICH IS NEGATIVE
+	MOVM	T3,T3		;MAKE POSITIVE
+	HRRZS	T2,T1		;GET ADDRESS TO START FROM
+	ADDI	T2,-1(T3)	;COMPUTE LAST ADDRESS
+	LSH	T1,-^D9		;CONVERT FIRST ADDR TO PAGE
+	LSH	T2,-^D9		;AND LAST ADDRESS TOO
+	SUBI	T2,(T1)		;COMPUTE DIFFERENCE
+	ADDI	T2,1		;ADD 1 TO GET NUMBER OF PAGES
+	MOVEM	T2,MAPCNT	;SAVE NUMBER OF PAGES TO MAP
+	HRL	T1,HANDLE	;SET UP HANDLE OF INFERIOR
+	MOVE	T2,PAGADR	;GET ADDRESS OF OUR PAGES
+	LSH	T2,-^D9		;CONVERT TO PAGE NUMBER
+	HRLI	T2,.FHSLF	;PUT IN OUR OWN HANDLE
+	HRRZ	T3,MAPCNT	;GET THE COUNT OF PAGES
+	TXO	T3,PM%CNT+PM%RD	;SET FOR READ ACCESS ONLY
+	PMAP			;MAP THE PAGES NECESSARY
+	  ERJMP	CPOPJ		;RETURN IF ERROR
+	MOVE	T1,@PAGADR	;TOUCH FIRST PAGE TO SEE IF OK
+	  ERJMP	CPOPJ		;FAILURE
+	MOVE	T1,IWDSAV	;RESTORE THE IOWD
+	ANDCMI	T1,777000	;CLEAR PAGE NUMBER
+	IOR	T1,PAGADR	;AND INSERT OUR OWN
+	AOS	(P)		;SET FOR SKIP
+	POPJ	P,		;RETURN
+
+	SUBTTL	ROUTINE TO REMOVE MAPPING OF PAGES
+
+
+
+
+;HERE TO UNMAP ANY PAGES WHICH WE HAD EARLIER MAPPED.
+
+
+
+CLRADR:	SKIPN	T3,MAPCNT	;ANY PAGES THERE?
+	  POPJ	P,		;NO, THEN RETURN
+	SETO	T1,		;SET AC TO -1
+	MOVE	T2,PAGADR	;GET ADDRESS OF PAGES
+	LSH	T2,-^D9		;MAKE PAGE NUMBER
+	HRLI	T2,.FHSLF	;PUT OUR HANDLE IN
+	TXO	T3,PM%CNT	;ADD THE REPEAT BIT
+	PMAP			;REMOVE THE PAGES
+	  ERJMP	LOSE		;SHOULDN'T FAIL
+	SETZM	MAPCNT		;CLEAR COUNT NOW
+	POPJ	P,		;RETURN
+
+	SUBTTL	SUBROUTINE TO LOOK FOR A SYMBOL
+
+
+
+
+;THIS ROUTINE WILL SEARCH THE SYMBOL TABLE FOR THE SYMBOL NEAREST
+;THE GIVEN VALUE WHICH IS SUPPLIED IN AC T1.  NON-SKIP RETURN IF
+;NO SYMBOL WAS GOOD ENOUGH TO USE.  SKIP RETURN IF A SYMBOL WAS
+;FOUND, WITH THE RADIX-50 IN AC T1 AND THE OFFSET FROM THAT SYMBOL
+;IN AC T2.  USES AC'S T1-T4.
+
+
+
+SYMLOK:	SKIPLE	T1		;SEE IF VALUE IS NONPOSITIVE
+	SKIPL	T2,SYMPTR	;OR SEE IF HAVE NO SYMBOLS
+	  POPJ	P,		;YES, JUST RETURN
+	CAMN	T1,LASADR	;LOOKED FOR THIS ADDRESS LAST TIME?
+	  JRST	SYMKNW		;YES, GO BE FAST
+	MOVEM	T1,LASADR	;NO, SAVE NEW ADDRESS
+	SETZM	LASSYM		;AND CLEAR IT'S SYMBOL
+	MOVEI	T3,[-1]-1	;POINT TO A FAKE SMALL SYMBOL
+
+SYMLLP:	SKIPLE	0(T2)		;SEE IF SYMBOL IS SUPPRESSED
+	SKIPG	T4,1(T2)	;OR IF VALUE IS NON-POSITIVE
+	  JRST	SYMLNX		;YES, SKIP THIS ONE
+	CAMLE	T4,1(T3)	;VALUE SMALLER THAN PREVIOUS BEST ONE?
+	CAMLE	T4,T1		;OR LARGER THAN OUR TARGET?
+	  JRST	SYMLNX		;YES, DON'T USE IT
+	HRROI	T3,(T2)		;A BETTER SYMBOL, REMEMBER IT
+	CAMN	T4,T1		;HAVE AN EXACT MATCH?
+	  JRST	SYMXCT		;YES, SKIP OUT OF LOOP NOW
+
+SYMLNX:	AOBJN	T2,.+1		;BUMP POINTER PAST TWO WORDS
+	AOBJN	T2,SYMLLP	;AND KEEP LOOKING
+	JUMPGE	T3,CPOPJ	;RETURN IF NO SYMBOL FOUND
+
+SYMXCT:	MOVE	T2,T1		;COPY VALUE LOOKING FOR
+	SUB	T2,1(T3)	;THEN GENERATE OFFSET FROM FOUND SYMBOL
+	CAIL	T2,1000		;IS OFFSET SMALL ENOUGH TO USE?
+	  POPJ	P,		;NO, RETURN
+	MOVEM	T2,LASOFF	;YES, SAVE IT
+	MOVE	T1,0(T3)	;GET THE SYMBOL WHICH WE FOUND
+	MOVEM	T1,LASSYM	;SAVE IT TOO
+	AOS	(P)		;THEN SKIP
+	POPJ	P,		;RETURN
+
+SYMKNW:	SKIPE	T1,LASSYM	;GET LAST SYMBOL IF HAD ONE
+	AOS	(P)		;WE DID, THEN SET FOR SUCCESS
+	MOVE	T2,LASOFF	;GET OFFSET USED ALSO
+	POPJ	P,		;THEN RETURN
+
+	SUBTTL	ROUTINE TO PRINT OUT SYMBOL VALUE
+
+
+
+
+;THIS ROUTINE IS CALLED TO PRINT OUT THE VALUE OF A SYMBOL BOTH IN
+;OCTAL AND IN SYMBOLIC.  AC T1 CONTAINS THE ADDRESS TO BE PRINTED.
+;SYMBOLS ARE USUALLY ONLY TYPED FOR THE IMMEDIATE INFERIOR, SINCE
+;IN GENERAL WE HAVE NO IDEA WHAT THE OTHER FORK'S CORE IMAGES ARE LIKE.
+
+
+
+ADRTYP:	MOVE	T4,T1		;SAVE VALUE FOR LATER
+	PUSHJ	P,OCTSIX	;OUTPUT THE ADDRESS
+	MOVE	T1,JSFORK	;GET FORK WE TRAPPED FOR
+	TRNN	Fl,FR.SAM	;IF ALL FORKS ARE SAME, SKIP CHECK
+	CAMN	T1,HANDLE	;NOT OUR IMMEDIATE INFERIOR?
+	SKIPG	T1,T4		;OR THE VALUE IS NONNEGATIVE?
+	  POPJ	P,		;YES, CAN'T TYPE ANY SYMBOL THEN
+	PUSHJ	P,SYMLOK	;LOOK FOR THE SYMBOL
+	  POPJ	P,		;NOT FOUND, RETURN
+	MOVEI	Ch," "		;GET A SPACE
+	PUTCHR			;OUTPUT IT
+	PUTCHR			;TWICE
+	MOVE	T4,T2		;SAVE THE OFFSET
+	PUSHJ	P,R50OUT	;PRINT THE RADIX-50 VALUE
+	JUMPE	T4,CPOPJ	;FINISH UP IF SYMBOL WAS EXACT
+	MOVEI	Ch,"+"		;GET A PLUS SIGN
+	PUTCHR			;OUTPUT IT
+	MOVE	T1,T4		;GET OFFSET READY TO PRINT
+	PJRST	OCTOUT		;THEN GO PRINT IT
+
+	SUBTTL	OUTPUT ROUTINES WHICH STORE RESULTS IN CORE
+
+
+
+;THE FOLLOWING ROUTINES ARE CALLED WITH ARGUMENTS IN AC T1, TO
+;TYPE THE VALUE IN VARIOUS FORMATS.  THE OUTPUT IS DONE WITHOUT
+;JSYSES IN ORDER TO SPEED UP THE JSYS TRAPPING SUBROUTINE.  THE
+;FEWER JSYSES THAT ROUTINE DOES, THE BETTER.
+
+
+
+
+
+R50OUT:	TLZ	T1,740000	;CLEAR JUNK PART
+R50OUL:	IDIVI	T1,50		;GET A DIGIT SPLIT OFF
+	JUMPE	T1,R50FIN	;DONE IF HAVE A ZERO
+	HRLM	T2,(P)		;NO, SAVE THIS DIGIT
+	PUSHJ	P,R50OUL	;AND LOOP
+	HLRZ	T2,(P)		;GET BACK SAVED DIGIT
+R50FIN:	MOVEI	Ch," "		;IF NOTHING ELSE SET FOR SPACE
+	CAIN	T2,47		;CODE FOR PERCENT SIGN?
+	MOVEI	Ch,"%"		;YES, GET IT
+	CAIN	T2,46		;CODE FOR A DOLLAR SIGN?
+	MOVEI	Ch,"$"		;YES, GET IT
+	CAIN	T2,45		;CODE FOR A PERIOD?
+	MOVEI	Ch,"."		;YES, GET IT
+	CAIL	T2,13		;IN RANGE OF A LETTER?
+	CAILE	T2,44		;WELL?
+	SKIPA			;NO
+	MOVEI	Ch,"A"-13(T2)	;YES, GET IT
+	CAIGE	T2,13		;FINALLY, IN RANGE OF A NUMBER?
+	MOVEI	Ch,"0"-1(T2)	;YES, GET IT
+	PUTCHR			;OUTPUT THE CHAR
+	POPJ	P,		;AND RETURN
+
+
+
+
+STROUT:	HRLI	T1,(POINT 7,)	;MAKE A BYTE POINTER
+STROUL:	ILDB	Ch,T1		;GET NEXT CHARACTER
+	JUMPE	Ch,CPOPJ		;NO MORE, RETURN
+	PUTCHR			;STORE THIS ONE
+	JRST	STROUL		;AND LOOP OVER WHOLE STRING
+
+OCTOUT:	SKIPA	T3,[^D8]	;SET FOR OCTAL OUTPUT
+DECOUT:	MOVEI	T3,^D10		;SET FOR DECIMAL OUTPUT
+NUMOUT:	IDIVI	T1,(T3)		;GET A DIGIT
+	JUMPE	T1,NUMFIN	;JUMP IF GOT LAST ONE
+	HRLM	T2,(P)		;MORE, SAVE THIS ONE
+	PUSHJ	P,NUMOUT	;AND FIND NEXT ONE
+	HLRZ	T2,(P)		;OK, GET BACK A DIGIT
+NUMFIN:	MOVEI	Ch,"0"(T2)	;CONVERT IT TO ASCII
+	PUTCHR			;OUTPUT THE CHARACTER
+	POPJ	P,		;THEN RETURN
+
+
+
+OCTSIX:	HRLOI	T2,(T1)		;MOVE TO NICE AC
+OCTSIL:	SETZ	T1,		;CLEAR AC
+	LSHC	T1,3		;SHIFT IN NEXT DIGIT
+	MOVEI	Ch,"0"(T1)	;CONVERT IT TO ASCII
+	PUTCHR			;OUTPUT THE CHAR
+	TRNE	T2,-1		;ALL DONE?
+	JRST	OCTSIL		;NO, KEEP GOING
+	POPJ	P,		;YES, RETURN
+
+
+
+OCTSP6:	MOVEI	Ch," "		;GET A SPACE
+	CAIG	T1,77777	;LESS THAN SIX DIGITS?
+	PUTCHR			;YES, OUTPUT A SPACE
+	CAIG	T1,7777		;LESS THAN 5 DIGITS?
+	PUTCHR			;YES, ANOTHER SPACE
+	CAIG	T1,777		;LESS THAN 4 DIGITS?
+	PUTCHR			;YES, ANOTHER SPACE
+	CAIG	T1,77		;LESS THAN 3 DIGITS?
+	PUTCHR			;YES, ANOTHER SPACE
+	CAIG	T1,7		;ONLY ONE DIGIT?
+	PUTCHR			;YES, A FINAL SPACE
+	POPJ	P,		;RETURN
+
+;ROUTINE TO JUSTIFY OUTPUT.  CALLED WITH DESIRED POSITION ON A LINE
+;IN AC T1.  WILL SPACE OVER TO THAT COLUMN WITH SPACES.
+
+
+
+JUSTFY:	MOVEI	Ch," "		;GET A SPACE
+JUSTFL:	PUTCHR			;OUTPUT A SPACE
+	CAMLE	T1,OUTCNT	;MOVED TO RIGHT COLUMN YET?
+	JRST	JUSTFL		;NO, KEEP LOOPING
+	POPJ	P,		;YES, ALL DONE
+
+
+
+;THE OUTPUT ROUTINE.  NO CHECKING FOR OVERFLOWS OF THE OUTPUT BUFFER
+;IS DONE, THE CALLER MUST KNOW THAT THE BUFFER IS TO BE OUTPUT AFTER
+;EVERY LINE OF TEXT.
+
+
+
+CHROUT:	IDPB	Ch,OUTPTR	;STORE THIS CHARACTER
+	AOS	OUTCNT		;AND INCREMENT THE COUNTER
+CPOPJ:	POPJ	P,		;RETURN
+
+	SUBTTL	ERROR HANDLING ROUTINE
+
+
+
+;HERE ON ANY ERROR AT ALL.  WE CLOSE UP THE FILES IF THEY WERE
+;OPEN, AND RESTART THE PROGRAM.
+
+
+error:	pop	p,(p)
+LOSE:	HRROI	T1,[ASCIZ/
+? /]				;GET PRELIMINARY TEXT
+	PSOUT			;TYPE IT
+	MOVEI	T1,.PRIOU	;OUTPUT TO TERMINAL
+	HRLOI	T2,.FHSLF	;LAST ERROR IN THIS FORK
+	SETZ	T3,		;ALL OF THE TEXT
+	ERSTR			;PRINT THE ERROR
+	JFCL			;FAILED
+	JFCL			;FAILED
+
+
+LOSFIN:	HRROI	T1,[ASCIZ/
+
+/]				;GET FINAL STRING
+	PSOUT			;TYPE IT TOO
+	MOVEI	T1,.PRIIN	;GET READY
+	CFIBF			;CLEAR INPUT BUFFER
+	MOVE	P,[IOWD PDLSIZ,PDL]	;RESET STACK
+	JRST	NEWCMD		;AND GET ANOTHER COMMAND
+
+	SUBTTL	COMMAND JSYS SUBROUTINES
+
+
+
+;ANY ERROR IN THESE ROUTINES RESTARTS THE PROGRAM.
+;POINTER TO THE COMMAND BLOCK IS IN AC T1.
+
+
+
+NOISE:	HRROM	T2,NOIBLK+.CMDAT	;SAVE AS DATA
+	MOVEI	T2,NOIBLK	;POINT TO BLOCK
+	JRST	COMMND		;AND GO DO COMND JSYS
+
+
+
+CONFRM:	MOVEI	T2,[FLDDB. (.CMCFM)]	;GET CONFIRM FUNCTION
+COMMND:	COMND			;PARSE THE FUNCTION
+	  ERJMP	LOSE		;ERROR, GO COMPLAIN
+	TXNE	T1,CM%NOP	;DID IT PARSE?
+	  JRST	LOSE		;NO, COMPLAIN
+	POPJ	P,		;YES, RETURN SUCCESSFULLY
+
+
+
+
+NOIBLK:	FLDDB.	(.CMNOI)	;BLOCK FOR NOISE FUNCTION
+
+	SUBTTL	THE TABLES FOR THE JSYSES
+
+
+
+
+;THE FOLLOWING MACRO AND CONTAINS THE IMBEDDED JS MACRO, WHICH
+;HAS THE FOLLOWING ARGUMENTS:
+;
+;	JS	NAME, NUMBER OF AC'S, CLASSES
+;
+;WHERE NAME IS THE MNEMONIC FOR THE JSYS, THE NUMBER OF AC'S IS
+;THE NUMBER OF AC'S TO BE TYPED IN THE LOG FILE, AND CLASSES
+;IS A LIST OF THOSE CLASSES TO WHICH THIS JSYS BELONGS.
+
+
+	DEFINE	JSYSES,<
+
+	JS	JSYS 0,5,<ALL>
+	JS	LOGIN,3,<ALL>
+	JS	CRJOB,4,<ALL>
+	JS	LGOUT,1,<ALL>
+	JS	CACCT,1,<ALL,SET>
+	JS	EFACT,1,<ALL,FIL,SET>
+	JS	SMON,2,<ALL,SET>
+	JS	TMON,1,<ALL,STS>
+	JS	GETAB,1,<ALL,STS>
+	JS	ERSTR,3,<ALL,FIL,OUT,STS,PRI>
+	JS	GETER,1,<ALL,FRK,STS>
+	JS	GJINF,4,<ALL,STS>
+	JS	TIME,1,<ALL,STS>
+	JS	RUNTM,1,<ALL,STS>
+	JS	SYSGT,2,<ALL,STS>
+	JS	GNJFN,1,<ALL,FIL>
+	JS	GTJFN,2,<ALL,FIL>
+	JS	OPENF,2,<ALL,FIL>
+	JS	CLOSF,1,<ALL,FIL>
+	JS	RLJFN,1,<ALL,FIL>
+	JS	GTSTS,2,<ALL,FIL,STS>
+	JS	STSTS,2,<ALL,FIL,SET>
+	JS	DELF,1,<ALL,FIL>
+	JS	SFPTR,2,<ALL,FIL,SET>
+	JS	JFNS,3,<ALL,FIL,OUT,STS>
+	JS	FFFFP,1,<ALL,FIL,STS>
+	JS	RDDIR,4,<ALL>
+	JS	CPRTF,4,<ALL>
+	JS	CLZFF,1,<ALL,FIL>
+	JS	RNAMF,2,<ALL,FIL,SET>
+	JS	SIZEF,3,<ALL,FIL,STS>
+	JS	GACTF,2,<ALL,FIL,STS>
+	JS	STDIR,4,<ALL>
+	JS	DIRST,2,<ALL,FIL,OUT,STS>
+	JS	BKJFN,1,<ALL,FIL,SET>
+	JS	RFPTR,2,<ALL,FIL,STS>
+	JS	CNDIR,4,<ALL>
+	JS	RFBSZ,2,<ALL,FIL,STS>
+	JS	SFBSZ,2,<ALL,FIL,SET>
+	JS	SWJFN,2,<ALL,FIL,SET>
+	JS	BIN,2,<ALL,FIL,INP>
+	JS	BOUT,2,<ALL,FIL,OUT>
+	JS	SIN,4,<ALL,FIL,INP>
+	JS	SOUT,4,<ALL,FIL,OUT>
+	JS	RIN,3,<ALL,FIL,INP>
+	JS	ROUT,3,<ALL,FIL,OUT>
+	JS	PMAP,3,<ALL,FIL,FRK,INP,OUT>
+	JS	RPACS,2,<ALL,FIL,FRK,STS>
+	JS	SPACS,2,<ALL,FIL,FRK,SET>
+	JS	RMAP,2,<ALL,FRK,STS>
+	JS	SACTF,2,<ALL,FIL,SET>
+	JS	GTFDB,3,<ALL,FIL,STS>
+	JS	CHFDB,3,<ALL,FIL,SET>
+	JS	DUMPI,2,<ALL,FIL,INP>
+	JS	DUMPO,2,<ALL,FIL,OUT>
+	JS	DELDF,2,<ALL,FIL>
+	JS	ASND,1,<ALL,FIL,SET>
+	JS	RELD,1,<ALL,FIL,SET>
+	JS	CSYNO,4,<ALL>
+	JS	PBIN,1,<ALL,FIL,PRI,INP>
+	JS	PBOUT,1,<ALL,FIL,PRI,OUT>
+	JS	PSIN,4,<ALL>
+	JS	PSOUT,1,<ALL,FIL,PRI,OUT>
+	JS	MTOPR,3,<ALL,FIL,SET,STS>
+	JS	CFIBF,1,<ALL,FIL,INP>
+	JS	CFOBF,1,<ALL,FIL,OUT>
+	JS	SIBE,2,<ALL,FIL,PRI,INP>
+	JS	SOBE,2,<ALL,FIL,PRI,OUT>
+	JS	DOBE,1,<ALL,FIL,OUT>
+	JS	GTABS,4,<ALL>
+	JS	STABS,4,<ALL>
+	JS	RFMOD,2,<ALL,FIL,PRI,STS>
+	JS	SFMOD,2,<ALL,FIL,PRI,SET>
+	JS	RFPOS,2,<ALL,FIL,PRI,STS>
+	JS	RFCOC,3,<ALL,FIL,PRI,STS>
+	JS	SFCOC,3,<ALL,FIL,PRI,SET>
+	JS	STI,2,<ALL,FIL,PRI,INP>
+	JS	DTACH,0,<ALL,PRI,SET>
+	JS	ATACH,3,<ALL,PRI,SET>
+	JS	DVCHR,3,<ALL,FIL,STS>
+	JS	STDEV,2,<ALL,FIL,STS>
+	JS	DEVST,2,<ALL,FIL,STS>
+	JS	MOUNT,4,<ALL>
+	JS	DSMNT,4,<ALL>
+	JS	INIDR,4,<ALL>
+	JS	SIR,2,<ALL,FRK,INT,SET>
+	JS	EIR,1,<ALL,FRK,INT>
+	JS	SKPIR,1,<ALL,FRK,INT>
+	JS	DIR,1,<ALL,FRK,INT>
+	JS	AIC,2,<ALL,FRK,INT>
+	JS	IIC,2,<ALL,FRK,INT>
+	JS	DIC,1,<ALL,FRK,INT>
+	JS	RCM,1,<ALL,FRK,INT,STS>
+	JS	RWM,2,<ALL,FRK,INT,STS>
+	JS	DEBRK,0,<ALL,INT>
+	JS	ATI,1,<ALL,INT>
+	JS	DTI,1,<ALL,INT>
+	JS	CIS,0,<ALL,INT>
+	JS	SIRCM,3,<ALL,FRK,INT,SET>
+	JS	RIRCM,2,<ALL,FRK,INT,STS>
+	JS	RIR,2,<ALL,FRK,INT,STS>
+	JS	GDSTS,3,<ALL,FIL,STS>
+	JS	SDSTS,2,<ALL,SET>
+	JS	RESET,0,<ALL,FRK,INT,SET>
+	JS	RPCAP,3,<ALL,FRK,STS>
+	JS	EPCAP,3,<ALL,FRK,SET>
+	JS	CFORK,2,<ALL,FRK>
+	JS	KFORK,1,<ALL,FRK>
+	JS	FFORK,1,<ALL,FRK,SET>
+	JS	RFORK,1,<ALL,FRK,SET>
+	JS	RFSTS,2,<ALL,FRK,STS>
+	JS	SFORK,2,<ALL,FRK,SET>
+	JS	SFACS,2,<ALL,FRK,SET>
+	JS	RFACS,2,<ALL,FRK,STS>
+	JS	HFORK,1,<ALL,FRK,SET>
+	JS	WFORK,1,<ALL,FRK>
+	JS	GFRKH,3,<ALL,FRK>
+	JS	RFRKH,1,<ALL,FRK,SET>
+	JS	GFRKS,3,<ALL,FRK,STS>
+	JS	DISMS,1,<ALL>
+	JS	HALTF,0,<ALL>
+	JS	GTRPW,2,<ALL,FRK,STS>
+	JS	GTRPI,3,<ALL,FRK,STS>
+	JS	RTIW,3,<ALL,INT,PRI,STS>
+	JS	STIW,3,<ALL,PRI,INT,SET>
+	JS	SOBF,2,<ALL,FIL,PRI,OUT>
+	JS	RWSET,0,<ALL,SET>
+	JS	GETNM,1,<ALL,STS>
+	JS	GET,2,<ALL,FIL,FRK,INP>
+	JS	SFRKV,2,<ALL,FRK,SET>
+	JS	SAVE,2,<ALL,FRK,FIL,OUT>
+	JS	SSAVE,3,<ALL,FRK,FIL,OUT>
+	JS	SEVEC,2,<ALL,FRK,SET>
+	JS	GEVEC,2,<ALL,FRK,STS>
+	JS	GPJFN,2,<ALL,FRK,PRI,STS>
+	JS	SPJFN,2,<ALL,FRK,PRI,SET>
+	JS	SETNM,1,<ALL,SET>
+	JS	FFUFP,1,<ALL,FIL,STS>
+	JS	DIBE,1,<ALL,FIL,INP>
+	JS	FDFRE,4,<ALL>
+	JS	GDSKC,2,<ALL,FIL,STS>
+	JS	LITES,4,<ALL>
+	JS	TLINK,2,<ALL,SET,STS,PRI,FIL>
+	JS	STPAR,2,<ALL,FIL,PRI,SET>
+	JS	ODTIM,3,<ALL,FIL,OUT>
+	JS	IDTIM,2,<ALL,FIL,INP>
+	JS	ODCNV,4,<ALL,STS>
+	JS	IDCNV,4,<ALL,STS>
+	JS	NOUT,3,<ALL,FIL,OUT>
+	JS	NIN,3,<ALL,FIL,INP>
+	JS	STAD,1,<ALL,SET>
+	JS	GTAD,1,<ALL,STS>
+	JS	ODTNC,5,<ALL,FIL,OUT>
+	JS	IDTNC,4,<ALL,FIL,INP>
+	JS	FLIN,3,<ALL,FIL,INP>
+	JS	FLOUT,3,<ALL,FIL,OUT>
+	JS	DFIN,4,<ALL,FIL,INP>
+	JS	DFOUT,4,<ALL,FIL,OUT>
+	JS	JSYS 236,5,<ALL>
+	JS	JSYS 237,5,<ALL>
+	JS	CRDIR,3,<ALL,FIL,SET>
+	JS	GTDIR,3,<ALL,FIL,STS>
+	JS	DSKOP,4,<ALL,FIL,INP,OUT>
+	JS	SPRIW,2,<ALL,FRK,SET>
+	JS	DSKAS,2,<ALL,FIL,SET>
+	JS	SJPRI,2,<ALL,SET>
+	JS	STO,2,<ALL,FIL,PRI,OUT>
+	JS	JSYS 247,5,<ALL>
+	JS	JSYS 250,5,<ALL>
+	JS	JSYS 251,5,<ALL>
+	JS	JSYS 252,5,<ALL>
+	JS	JSYS 253,5,<ALL>
+	JS	JSYS 254,5,<ALL>
+	JS	JSYS 255,5,<ALL>
+	JS	JSYS 256,5,<ALL>
+	JS	JSYS 257,5,<ALL>
+	JS	ASNDP,4,<ALL>
+	JS	RELDP,4,<ALL>
+	JS	ASNDC,4,<ALL>
+	JS	RELDC,4,<ALL>
+	JS	STRDP,4,<ALL>
+	JS	STPDP,4,<ALL>
+	JS	STSDP,4,<ALL>
+	JS	RDSDP,4,<ALL>
+	JS	WATDP,4,<ALL>
+	JS	JSYS 271,5,<ALL>
+	JS	JSYS 272,5,<ALL>
+	JS	JSYS 273,5,<ALL>
+	JS	ATPTY,4,<ALL>
+	JS	CVSKT,4,<ALL>
+	JS	CVHST,4,<ALL>
+	JS	FLHST,4,<ALL>
+	JS	GCVEC,3,<ALL,FRK,STS>
+	JS	SCVEC,3,<ALL,FRK,SET>
+	JS	STTYP,2,<ALL,PRI,STS>
+	JS	GTTYP,3,<ALL,PRI,STS>
+	JS	BPT,4,<ALL>
+	JS	GTDAL,3,<ALL,FIL,STS>
+	JS	WAIT,0,<ALL>
+	JS	HSYS,2,<ALL,SET>
+	JS	USRIO,0,<ALL,SET>
+	JS	PEEK,2,<ALL,STS>
+	JS	MSFRK,2,<ALL,FRK,SET>
+	JS	ESOUT,1,<ALL,FIL,OUT,PRI>
+	JS	SPLFK,2,<ALL,FRK,SET>
+	JS	ADVIS,4,<ALL>
+	JS	JOBTM,4,<ALL>
+	JS	DELNF,2,<ALL,FIL>
+	JS	SWTCH,4,<ALL>
+	JS	TFORK,3,<ALL,FRK,INT,SET,STS>
+	JS	RTFRK,2,<ALL,FRK,STS>
+	JS	UTFRK,1,<ALL,FRK,SET>
+	JS	SCTTY,2,<ALL,PRI,SET>
+	JS	JSYS 325,5,<ALL>
+	JS	JSYS 326,5,<ALL>
+	JS	JSYS 327,5,<ALL>
+	JS	JSYS 330,5,<ALL>
+	JS	JSYS 331,5,<ALL>
+	JS	JSYS 332,5,<ALL>
+	JS	JSYS 333,5,<ALL>
+	JS	JSYS 334,5,<ALL>
+	JS	JSYS 335,5,<ALL>
+	JS	SETER,2,<ALL,SET,FRK>
+	JS	JSYS 337,5,<ALL>
+	JS	JSYS 340,5,<ALL>
+	JS	JSYS 341,5,<ALL>
+	JS	JSYS 342,5,<ALL>
+	JS	JSYS 343,5,<ALL>
+	JS	JSYS 344,5,<ALL>
+	JS	JSYS 345,5,<ALL>
+	JS	JSYS 346,5,<ALL>
+	JS	JSYS 347,5,<ALL>
+	JS	JSYS 350,5,<ALL>
+	JS	JSYS 351,5,<ALL>
+	JS	JSYS 352,5,<ALL>
+	JS	JSYS 353,5,<ALL>
+	JS	JSYS 354,5,<ALL>
+	JS	JSYS 355,5,<ALL>
+	JS	JSYS 356,5,<ALL>
+	JS	JSYS 357,5,<ALL>
+	JS	JSYS 360,5,<ALL>
+	JS	JSYS 361,5,<ALL>
+	JS	JSYS 362,5,<ALL>
+	JS	JSYS 363,5,<ALL>
+	JS	JSYS 364,5,<ALL>
+	JS	JSYS 365,5,<ALL>
+	JS	JSYS 366,5,<ALL>
+	JS	JSYS 367,5,<ALL>
+	JS	JSYS 370,5,<ALL>
+	JS	JSYS 371,5,<ALL>
+	JS	JSYS 372,5,<ALL>
+	JS	JSYS 373,5,<ALL>
+	JS	JSYS 374,5,<ALL>
+	JS	JSYS 375,5,<ALL>
+	JS	JSYS 376,5,<ALL>
+	JS	JSYS 377,5,<ALL>
+	JS	JSYS 400,5,<ALL>
+	JS	JSYS 401,5,<ALL>
+	JS	JSYS 402,5,<ALL>
+	JS	JSYS 403,5,<ALL>
+	JS	JSYS 404,5,<ALL>
+	JS	JSYS 405,5,<ALL>
+	JS	JSYS 406,5,<ALL>
+	JS	JSYS 407,5,<ALL>
+	JS	JSYS 410,5,<ALL>
+	JS	JSYS 411,5,<ALL>
+	JS	JSYS 412,5,<ALL>
+	JS	JSYS 413,5,<ALL>
+	JS	JSYS 414,5,<ALL>
+	JS	JSYS 415,5,<ALL>
+	JS	JSYS 416,5,<ALL>
+	JS	JSYS 417,5,<ALL>
+	JS	JSYS 420,5,<ALL>
+	JS	JSYS 421,5,<ALL>
+	JS	JSYS 422,5,<ALL>
+	JS	JSYS 423,5,<ALL>
+	JS	JSYS 424,5,<ALL>
+	JS	JSYS 425,5,<ALL>
+	JS	JSYS 426,5,<ALL>
+	JS	JSYS 427,5,<ALL>
+	JS	JSYS 430,5,<ALL>
+	JS	JSYS 431,5,<ALL>
+	JS	JSYS 432,5,<ALL>
+	JS	JSYS 433,5,<ALL>
+	JS	JSYS 434,5,<ALL>
+	JS	JSYS 435,5,<ALL>
+	JS	JSYS 436,5,<ALL>
+	JS	JSYS 437,5,<ALL>
+	JS	JSYS 440,5,<ALL>
+	JS	JSYS 441,5,<ALL>
+	JS	JSYS 442,5,<ALL>
+	JS	JSYS 443,5,<ALL>
+	JS	JSYS 444,5,<ALL>
+	JS	JSYS 445,5,<ALL>
+	JS	JSYS 446,5,<ALL>
+	JS	JSYS 447,5,<ALL>
+	JS	JSYS 450,5,<ALL>
+	JS	JSYS 451,5,<ALL>
+	JS	JSYS 452,5,<ALL>
+	JS	JSYS 453,5,<ALL>
+	JS	JSYS 454,5,<ALL>
+	JS	JSYS 455,5,<ALL>
+	JS	JSYS 456,5,<ALL>
+	JS	JSYS 457,5,<ALL>
+	JS	JSYS 460,5,<ALL>
+	JS	JSYS 461,5,<ALL>
+	JS	JSYS 462,5,<ALL>
+	JS	JSYS 463,5,<ALL>
+	JS	JSYS 464,5,<ALL>
+	JS	JSYS 465,5,<ALL>
+	JS	JSYS 466,5,<ALL>
+	JS	JSYS 467,5,<ALL>
+	JS	JSYS 470,5,<ALL>
+	JS	JSYS 471,5,<ALL>
+	JS	JSYS 472,5,<ALL>
+	JS	JSYS 473,5,<ALL>
+	JS	JSYS 474,5,<ALL>
+	JS	JSYS 475,5,<ALL>
+	JS	JSYS 476,5,<ALL>
+	JS	JSYS 477,5,<ALL>
+	JS	RSCAN,1,<ALL,FIL,PRI,INP,STS>
+	JS	HPTIM,1,<ALL,STS>
+	JS	CRLNM,3,<ALL,FIL,SET>
+	JS	INLNM,2,<ALL,FIL,STS>
+	JS	LNMST,3,<ALL,FIL,STS>
+	JS	RDTXT,4,<ALL,FIL,PRI,INP>
+	JS	SETSN,2,<ALL,SET>
+	JS	GETJI,3,<ALL,STS>
+	JS	MSEND,2,<ALL,IPC,OUT>
+	JS	MRECV,2,<ALL,IPC,INP>
+	JS	MUTIL,2,<ALL,IPC,SET,STS>
+	JS	ENQ,2,<ALL,FIL>
+	JS	DEQ,2,<ALL,FIL>
+	JS	ENQC,3,<ALL,FIL,SET,STS>
+	JS	SNOOP,4,<ALL,SET,STS>
+	JS	SPOOL,2,<ALL,FIL,SET>
+	JS	ALLOC,3,<ALL,FIL,SET>
+	JS	CHKAC,2,<ALL,FIL,STS>
+	JS	TIMER,3,<ALL,SET,FRK>
+	JS	RDTTY,3,<ALL,FIL,PRI,INP>
+	JS	TEXTI,1,<ALL,FIL,PRI,INP>
+	JS	UFPGS,2,<ALL,FIL,SET,OUT>
+	JS	SFPOS,2,<ALL,FIL,PRI,SET>
+	JS	SYERR,2,<ALL,FIL,SET>
+	JS	DIAG,1,<ALL,FIL,SET>
+	JS	SINR,4,<ALL,FIL,INP>
+	JS	SOUTR,4,<ALL,FIL,OUT>
+	JS	RFTAD,3,<ALL,FIL,STS>
+	JS	SFTAD,3,<ALL,FIL,SET>
+	JS	TBDEL,2,<ALL>
+	JS	TBADD,2,<ALL>
+	JS	TBLUK,3,<ALL>
+	JS	STCMP,2,<ALL,STS>
+	JS	SETJB,3,<ALL,SET>
+	JS	GDVEC,2,<ALL,FRK,STS>
+	JS	SDVEC,2,<ALL,FRK,SET>
+	JS	COMND,3,<ALL,FIL,PRI,INP>
+	JS	PRARG,3,<ALL,FRK,SET,STS>
+	JS	GACCT,2,<ALL,STS>
+	JS	LPINI,3,<ALL,FIL,SET>
+	JS	GFUST,2,<ALL,FIL,STS>
+	JS	SFUST,2,<ALL,FIL,SET>
+	JS	ACCES,2,<ALL,SET>
+	JS	RCDIR,3,<ALL,FIL,STS>
+	JS	RCUSR,3,<ALL,FIL,STS>
+	JS	MSTR,2,<ALL,FIL,SET,STS>
+	JS	STPPN,2,<ALL,FIL,STS>
+	JS	PPNST,3,<ALL,FIL,OUT,STS>
+	JS	PMCTL,3,<ALL,SET,STS>
+	JS	LOCK,4,<ALL>
+	JS	BOOT,2,<ALL,SET,INP,OUT>
+	JS	UTEST,2,<ALL,STS>
+	JS	USAGE,2,<ALL,OUT>
+	JS	JSYS 565,5,<ALL>
+	JS	VACCT,2,<ALL,STS>
+	JS	NODE,2,<ALL,SET,STS>
+	JS	ADBRK,3,<ALL,SET,STS,FRK>
+	JS	JSYS 571,5,<ALL>
+	JS	JSYS 572,5,<ALL>
+	JS	JSYS 573,5,<ALL>
+	JS	JSYS 574,5,<ALL>
+	JS	JSYS 575,5,<ALL>
+	JS	JSYS 576,5,<ALL>
+	JS	JSYS 577,5,<ALL>
+	JS	JSYS 600,5,<ALL>
+	JS	JSYS 601,5,<ALL>
+	JS	JSYS 602,5,<ALL>
+	JS	JSYS 603,5,<ALL>
+	JS	JSYS 604,5,<ALL>
+	JS	JSYS 605,5,<ALL>
+	JS	JSYS 606,5,<ALL>
+	JS	JSYS 607,5,<ALL>
+	JS	JSYS 610,5,<ALL>
+	JS	JSYS 611,5,<ALL>
+	JS	JSYS 612,5,<ALL>
+	JS	JSYS 613,5,<ALL>
+	JS	JSYS 614,5,<ALL>
+	JS	JSYS 615,5,<ALL>
+	JS	JSYS 616,5,<ALL>
+	JS	JSYS 617,5,<ALL>
+	JS	JSYS 620,5,<ALL>
+	JS	JSYS 621,5,<ALL>
+	JS	JSYS 622,5,<ALL>
+	JS	JSYS 623,5,<ALL>
+	JS	JSYS 624,5,<ALL>
+	JS	JSYS 625,5,<ALL>
+	JS	JSYS 626,5,<ALL>
+	JS	JSYS 627,5,<ALL>
+	JS	JSYS 630,5,<ALL>
+	JS	JSYS 631,5,<ALL>
+	JS	JSYS 632,5,<ALL>
+	JS	JSYS 633,5,<ALL>
+	JS	JSYS 634,5,<ALL>
+	JS	JSYS 635,5,<ALL>
+	JS	JSYS 636,5,<ALL>
+	JS	JSYS 637,5,<ALL>
+	JS	JSYS 640,5,<ALL>
+	JS	JSYS 641,5,<ALL>
+	JS	JSYS 642,5,<ALL>
+	JS	JSYS 643,5,<ALL>
+	JS	JSYS 644,5,<ALL>
+	JS	JSYS 645,5,<ALL>
+	JS	JSYS 646,5,<ALL>
+	JS	JSYS 647,5,<ALL>
+	JS	JSYS 650,5,<ALL>
+	JS	JSYS 651,5,<ALL>
+	JS	JSYS 652,5,<ALL>
+	JS	JSYS 653,5,<ALL>
+	JS	JSYS 654,5,<ALL>
+	JS	JSYS 655,5,<ALL>
+	JS	JSYS 656,5,<ALL>
+	JS	JSYS 657,5,<ALL>
+	JS	JSYS 660,5,<ALL>
+	JS	JSYS 661,5,<ALL>
+	JS	JSYS 662,5,<ALL>
+	JS	JSYS 663,5,<ALL>
+	JS	JSYS 664,5,<ALL>
+	JS	JSYS 665,5,<ALL>
+	JS	JSYS 666,5,<ALL>
+	JS	JSYS 667,5,<ALL>
+	JS	JSYS 670,5,<ALL>
+	JS	JSYS 671,5,<ALL>
+	JS	JSYS 672,5,<ALL>
+	JS	JSYS 673,5,<ALL>
+	JS	JSYS 674,5,<ALL>
+	JS	JSYS 675,5,<ALL>
+	JS	JSYS 676,5,<ALL>
+	JS	JSYS 677,5,<ALL>
+	JS	JSYS 700,5,<ALL>
+	JS	JSYS 701,5,<ALL>
+	JS	JSYS 702,5,<ALL>
+	JS	JSYS 703,5,<ALL>
+	JS	JSYS 704,5,<ALL>
+	JS	JSYS 705,5,<ALL>
+	JS	JSYS 706,5,<ALL>
+	JS	JSYS 707,5,<ALL>
+	JS	JSYS 710,5,<ALL>
+	JS	JSYS 711,5,<ALL>
+	JS	JSYS 712,5,<ALL>
+	JS	JSYS 713,5,<ALL>
+	JS	JSYS 714,5,<ALL>
+	JS	JSYS 715,5,<ALL>
+	JS	JSYS 716,5,<ALL>
+	JS	JSYS 717,5,<ALL>
+	JS	JSYS 720,5,<ALL>
+	JS	JSYS 721,5,<ALL>
+	JS	JSYS 722,5,<ALL>
+	JS	JSYS 723,5,<ALL>
+	JS	JSYS 724,5,<ALL>
+	JS	JSYS 725,5,<ALL>
+	JS	JSYS 726,5,<ALL>
+	JS	JSYS 727,5,<ALL>
+	JS	JSYS 730,5,<ALL>
+	JS	JSYS 731,5,<ALL>
+	JS	JSYS 732,5,<ALL>
+	JS	JSYS 733,5,<ALL>
+	JS	JSYS 734,5,<ALL>
+	JS	JSYS 735,5,<ALL>
+	JS	JSYS 736,5,<ALL>
+	JS	JSYS 737,5,<ALL>
+	JS	JSYS 740,5,<ALL>
+	JS	JSYS 741,5,<ALL>
+	JS	JSYS 742,5,<ALL>
+	JS	JSYS 743,5,<ALL>
+	JS	JSYS 744,5,<ALL>
+	JS	JSYS 745,5,<ALL>
+	JS	JSYS 746,5,<ALL>
+	JS	JSYS 747,5,<ALL>
+	JS	SNDIM,2,<ALL,SET>
+	JS	RCVIM,2,<ALL,STS>
+	JS	ASNSQ,2,<ALL,SET>
+	JS	RELSQ,1,<ALL,SET>
+	JS	JSYS 754,5,<ALL>
+	JS	JSYS 755,5,<ALL>
+	JS	JSYS 756,5,<ALL>
+	JS	JSYS 757,5,<ALL>
+	JS	JSYS 760,5,<ALL>
+	JS	JSYS 761,5,<ALL>
+	JS	JSYS 762,5,<ALL>
+	JS	JSYS 763,5,<ALL>
+	JS	JSYS 764,5,<ALL>
+	JS	JSYS 765,5,<ALL>
+	JS	JSYS 766,5,<ALL>
+	JS	JSYS 767,5,<ALL>
+	JS	THIBR,1,<ALL>
+	JS	TWAKE,1,<ALL,SET>
+	JS	MRPAC,4,<ALL>
+	JS	SETPV,4,<ALL>
+	JS	MTALN,2,<ALL,FIL,SET>
+	JS	TTMSG,2,<ALL,PRI,FIL>
+	JS	JSYS 776,5,<ALL>
+	JS	JSYS 777,5,<ALL>
+>
+
+;NOW GENERATE THE BIT TABLES FOR EACH TYPE OF JSYS.  THESE MASKS
+;ARE USED FOR THE SETTING OF WHICH JSYSES TO TRAP FOR.
+
+
+	DEFINE	BITGEN(TYP),<	;;MACRO TO MAKE BIT TABLE
+IRP TYP,<
+	..WRD==0		;;START WORD AT ZERO
+	..BIT==1B0		;;AND START BIT AT SIGN BIT
+	..VAL==JS.'TYP		;;DEFINE VALUE OF BIT
+BT.'TYP:	JSYSES		;;GENERATE THE TABLE
+	IFG ..BIT,<
+	EXP	..WRD		;LAST BITS FOR TABLE BT.'TYP
+>				;;DUMP OUT LAST WORD IF NECESSARY
+>
+>
+
+
+	DEFINE	JS(NAME,ACS,CODE,ROUTINE),<
+IRP CODE,<
+	IFN <..VAL&JS.'CODE>,<..WRD==..WRD!..BIT>	;;ADD BIT IF NEEDED
+>
+	..BIT==..BIT_-1		;;SHIFT OVER TO NEW BIT
+IFE ..BIT,<
+	EXP	..WRD		;BITS UP TO "NAME"
+	..WRD==0		;;RESET WORD TO ZERO
+	..BIT==1B0		;;AND RESET BIT TO FRONT OF WORD
+>
+>
+
+
+	XALL			;LET THE DATA SHOW
+
+
+
+BITGEN	<PRI,FRK,FIL,INT,SET,STS,IPC,INP,OUT,ALL>	;PRODUCE THE TABLES
+
+;NOW TO EXPAND THE JSYS TABLE.
+
+
+
+
+;;;	DEFINE	JS(NAME,NUMBER<4>,CLASS<>,ROUTINE<>),<
+;;;	XWD	-NUMBER,[ASCIZ/NAME/]
+;;;>
+
+	DEFINE	JS(NAME,NUMBER<4>,CLASS<>,ROUTINE<>),<
+	point 7,[asciz /name/]
+>
+
+JSTAB:	JSYSES			;DUMP THE JSYS NAMES
+
+	DEFINE	JS(NAME,NUMBER<4>,CLASS<>,ROUTINE<>),<
+	ifdef $'name,<$'name>
+	ifndef $'name,<$null>
+>
+jstab1:	jsyses
+
+jstab2:	^D512
+	block	^D512
+
+	SUBTTL	THE DATA AREA
+
+
+
+CMDBLK:	NEWPAR		;ADDRESS OF REPARSE ROUTINE
+	.PRIIN,,.PRIOU		;INPUT,,OUTPUT JFNS
+	-1,,[ASCIZ/JSTRAP>/]	;CONTROL-R POINTER
+	-1,,TXTBUF		;POINTER TO TEXT BUFFER
+	-1,,TXTBUF		;POINTER TO CURRENT POSITION
+	TXTLEN			;NUMBER OF CHARS IN BUFFER
+	0			;NUMBER OF UNPARSED CHARACTERS
+	-1,,ATMBUF		;POINTER TO ATOM BUFFER
+	TXTLEN			;NUMBER OF CHARACTERS IN BUFFER
+	EXP	JFNBLK		;POINTER TO GTJFN BLOCK
+
+JFNBLK:	GJ%OLD			;FLAGS,,GENERATION NUMBER
+	.PRIIN,,.PRIOU		;INPUT,,OUTPUT JFNS
+	BLOCK	20		;NO DEFAULTS
+
+
+
+
+LEVTAB:	EXP	CHN1PC		;LOCATION TO STORE PC
+	EXP	CHN2PC		;SAME FOR LEVEL 2
+	BLOCK	1		;LEVEL 3 IS UNUSED
+
+CHNTAB:	XWD	2,TTYINT	;LEVEL 2, INTERRUPT ROUTINE
+	XWD	1,JSYINT	;LEVEL 1, INTERRUPT ROUTINE
+	BLOCK	^D34		;OTHER CHANNELS UNUSED
+
+	XLIST			;DUMP THE LITERALS
+	LIT
+	LIST
+
+
+chrtbl:	point 7,[asciz/<NUL>/]
+	point 7,[asciz/<SOH>/]
+	point 7,[asciz/<STX>/]
+	point 7,[asciz/<ETX>/]
+	point 7,[asciz/<EOT>/]
+	point 7,[asciz/<ENQ>/]
+	point 7,[asciz/<ACK>/]
+	point 7,[asciz/<BEL>/]
+	point 7,[asciz/<BS>/]
+	point 7,[asciz/<HT>/]
+	point 7,[asciz/<LF>/]
+	point 7,[asciz/<VT>/]
+	point 7,[asciz/<FF>/]
+	point 7,[asciz/<CR>/]
+	point 7,[asciz/<SO>/]
+	point 7,[asciz/<SI>/]
+	point 7,[asciz/<DLE>/]
+	point 7,[asciz/<DC1>/]
+	point 7,[asciz/<DC2>/]
+	point 7,[asciz/<DC3>/]
+	point 7,[asciz/<DC4>/]
+	point 7,[asciz/<NAK>/]
+	point 7,[asciz/<SYN>/]
+	point 7,[asciz/<ETB>/]
+	point 7,[asciz/<CAN>/]
+	point 7,[asciz/<EM>/]
+	point 7,[asciz/<SUB>/]
+	point 7,[asciz/<ESC>/]
+	point 7,[asciz/<FS>/]
+	point 7,[asciz/<GS>/]
+	point 7,[asciz/<RS>/]
+	point 7,[asciz/<US>/]
+	point 7,[asciz/ /]
+	point 7,[asciz/!/]
+	point 7,[asciz/"/]
+	point 7,[asciz/#/]
+	point 7,[asciz/$/]
+	point 7,[asciz/%/]
+	point 7,[asciz/&/]
+	point 7,[asciz/'/]
+	point 7,[asciz/(/]
+	point 7,[asciz/)/]
+	point 7,[asciz/*/]
+	point 7,[asciz/+/]
+	point 7,[asciz/,/]
+	point 7,[asciz/-/]
+	point 7,[asciz/./]
+	point 7,[asciz\/\]
+	point 7,[asciz/0/]
+	point 7,[asciz/1/]
+	point 7,[asciz/2/]
+	point 7,[asciz/3/]
+	point 7,[asciz/4/]
+	point 7,[asciz/5/]
+	point 7,[asciz/6/]
+	point 7,[asciz/7/]
+	point 7,[asciz/8/]
+	point 7,[asciz/9/]
+	point 7,[asciz/:/]
+	point 7,[asciz/;/]
+	point 7,[asciz/</]
+	point 7,[asciz/=/]
+	point 7,[asciz/>/]
+	point 7,[asciz/?/]
+	point 7,[asciz/@/]
+	point 7,[asciz/A/]
+	point 7,[asciz/B/]
+	point 7,[asciz/C/]
+	point 7,[asciz/D/]
+	point 7,[asciz/E/]
+	point 7,[asciz/F/]
+	point 7,[asciz/G/]
+	point 7,[asciz/H/]
+	point 7,[asciz/I/]
+	point 7,[asciz/J/]
+	point 7,[asciz/K/]
+	point 7,[asciz/L/]
+	point 7,[asciz/M/]
+	point 7,[asciz/N/]
+	point 7,[asciz/O/]
+	point 7,[asciz/P/]
+	point 7,[asciz/Q/]
+	point 7,[asciz/R/]
+	point 7,[asciz/S/]
+	point 7,[asciz/T/]
+	point 7,[asciz/U/]
+	point 7,[asciz/V/]
+	point 7,[asciz/W/]
+	point 7,[asciz/X/]
+	point 7,[asciz/Y/]
+	point 7,[asciz/Z/]
+	point 7,[asciz/[/]
+	point 7,[asciz/\/]
+	point 7,[asciz/]/]
+	point 7,[asciz/^/]
+	point 7,[asciz/_/]
+	point 7,[asciz/`/]
+	point 7,[asciz/a/]
+	point 7,[asciz/b/]
+	point 7,[asciz/c/]
+	point 7,[asciz/d/]
+	point 7,[asciz/e/]
+	point 7,[asciz/f/]
+	point 7,[asciz/g/]
+	point 7,[asciz/h/]
+	point 7,[asciz/i/]
+	point 7,[asciz/j/]
+	point 7,[asciz/k/]
+	point 7,[asciz/l/]
+	point 7,[asciz/m/]
+	point 7,[asciz/n/]
+	point 7,[asciz/o/]
+	point 7,[asciz/p/]
+	point 7,[asciz/q/]
+	point 7,[asciz/r/]
+	point 7,[asciz/s/]
+	point 7,[asciz/t/]
+	point 7,[asciz/u/]
+	point 7,[asciz/v/]
+	point 7,[asciz/w/]
+	point 7,[asciz/x/]
+	point 7,[asciz/y/]
+	point 7,[asciz/z/]
+	point 7,[asciz/{/]
+	point 7,[asciz/|/]
+	point 7,[asciz/}/]
+	point 7,[asciz/~/]
+	point 7,[asciz/DEL/]
+
+CHN1PC:	BLOCK	1		;PC FOR INTERRUPT ON LEVEL 1
+CHN2PC:	BLOCK	1		;PC FOR INTERRUPT ON LEVEL 2
+BITS:	BLOCK	BITSIZ		;BIT STORAGE FOR WHICH JSYSES TO TRAP
+PDL:	BLOCK	PDLSIZ		;STACK ROOM
+addres:	block	1
+count1:	block	1
+myblk:	block	^D1000
+cmgjb:	block	1
+number:	block	20
+name:	block	20
+
+regs:
+ACS:	BLOCK	^D16		;THE INFERIOR FORK'S AC'S
+HANDLE:	BLOCK	1		;THE HANDLE OF THE INFERIOR
+INTCHR:	BLOCK	1		;THE CHARACTER CODE WE ARE TRAPPING FOR
+JSPC:	BLOCK	1		;THE PC OF A STOPPED FORK
+JSJSYS:	BLOCK	1		;THE JSYS A FORK EXECUTED
+shadow:
+JSFORK:	BLOCK	1		;THEN FORK NUMBER WHICH DID A JSYS
+SAVET1:	BLOCK	^D16		;STORAGE FOR AC'S IN AN INTERRUPT
+SAV2T1:	BLOCK	^D16		;ANOTHER SET OF AC'S FOR OTHER INTERRUPT
+REPMAX:	BLOCK	1		;MAXIMUM NUMBER JSYS REPETITIONS
+REPCNT:	BLOCK	1		;NUMBER OF REPETITIONS SO FAR
+JFN:	BLOCK	1		;JFN OF FILE WE ARE READING
+JFNOUT:	BLOCK	1		;OUTPUT JFN
+OUTPTR:	BLOCK	1		;BYTE POINTER INTO OUTPUT BUFFER
+OUTCNT:	BLOCK	1		;COUNTER OF POSITION ON A LINE
+OUTBUF:	BLOCK	5000		;BUFFER FOR OUTPUT
+IWDSAV:	BLOCK	1		;TEMPORARY LOCATION
+SAVEP:	BLOCK	1		;STOREAGE OF STACK
+TXTBUF:	BLOCK	TXTLEN/5+1	;BUFFER FOR COMMAND JSYS
+cmdlin:	block	txtlen/5+1+^D8
+ATMBUF:	BLOCK	TXTLEN/5+1	;BUFFER FOR ATOM BUFFER
+SYMPTR:	BLOCK	1		;SYMBOL POINTER
+LASADR:	BLOCK	1		;THE LAST ADDRESS WE SEARCHED FOR
+LASSYM:	BLOCK	1		;THE SYMBOL FOR THE LAST ADDRESS
+LASOFF:	BLOCK	1		;THE OFFSET FROM THE SYMBOL
+SYMADR:	BLOCK	1		;ADDRESS OF SYMBOL TABLE POINTER
+PAGADR:	BLOCK	1		;ADDRESS OF PMAP AREA
+MAPCNT:	BLOCK	1		;NUMBER OF PAGES WE HAVE MAPPED
+CORE:	BLOCK	SYMLEN+777	;RESERVE LOTS OF ROOM
+
+
+
+	END	3,,START
+ 

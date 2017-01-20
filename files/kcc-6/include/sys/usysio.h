@@ -1,0 +1,523 @@
+/* <SYS/USYSIO.H> - definitions for KCC USYS I/O runtime support
+**
+**	(c) Copyright Ken Harrenstien 1989
+**
+*/
+
+#ifndef _SYS_UIO_INCLUDED
+#define _SYS_UIO_INCLUDED
+
+#include <sys/param.h>		/* For sys-dep stuff */
+#include <sys/types.h>
+
+#if SYS_T20+SYS_10X
+#define OPEN_UF_MAX	OPEN_MAX	/* Max UFs we can support */
+#define UIO_NBUFS (OPEN_UF_MAX/2)
+#elif SYS_T10+SYS_CSI+SYS_WTS
+#define OPEN_UF_MAX	16		/* Max UFs limited by # channels */
+#define UIO_NBUFS (OPEN_UF_MAX*2)
+#elif SYS_ITS
+#define OPEN_UF_MAX	16		/* Max UFs limited by # channels */
+#endif
+
+#define UIO_FD_STDIN	0	/* Standard in/out/err FDs */
+#define UIO_FD_STDOUT	1
+#define UIO_FD_STDERR	2
+
+/* Determine UIO buffer size and structure.
+**	T20 and 10X can read/write directly to and from anyplace, with any
+** byte size.  A buffer is only needed for converted input FDs.
+**	ITS can sometimes do the same, but only for a couple of byte sizes.
+** It needs some small buffers to handle the head and tail of funny cases.
+**	T10 and WAITS must have fixed buffers with several restrictions.
+**
+** The I/O buffers are allocated as static data areas for now (ugh!)
+** because the syscalls cannot invoke malloc().
+*/
+#if SYS_T20+SYS_10X
+#define UIO_NBUFS (OPEN_UF_MAX/2)
+#define UIO_BUFSIZ	1024	/* buffer size in chars */
+#elif SYS_T10+SYS_CSI+SYS_WTS
+#define UIO_NBUFS (OPEN_UF_MAX*2)
+#define UIO_T10_DSKWDS 0200		/* # words of data in a disk block */
+#define UIO_BUFSIZ (sizeof(int)*UIO_T10_DSKWDS)	/* # bytes */
+#elif SYS_ITS
+#define UIO_NBUFS OPEN_UF_MAX	/* Default # of buffers */
+#define UIO_BUFSIZ	1024	/* buffer size in chars */
+#endif
+
+struct _iob {
+#if SYS_T20+SYS_10X+SYS_ITS
+	char b_data[UIO_BUFSIZ];
+#elif SYS_T10+SYS_CSI+SYS_WTS
+	int : 18;		/* Unused (?) */
+	unsigned bf_sts : 18;	/* File Status bits */
+	int bf_iou : 1;		/* Use bit - 1 if available to emptier */
+	unsigned bf_siz : 17;	/* Size of data area plus 1, in wds */
+	unsigned bf_nba : 18;	/* Next buffer address in ring */
+	int bf_bkp : 18;	/* System "bookkeeping" */
+	int bf_cnt : 18;	/* Data word count */
+	char b_data[UIO_BUFSIZ];
+#endif
+};
+
+#if SYS_T10+SYS_CSI+SYS_WTS
+
+/* Define lots of gross TOPS-10 stuff that has to go in the _ufile struct. */
+
+struct _iobring {	/* Buffer Ring Header */
+	int br_use : 1;		/* Use bit - 1 if no I/O yet */
+	int : 17;		/* unused */
+	unsigned br_buf : 18;	/* Current buffer pointer */
+	char *br_bp;		/* Byte ptr to data */
+	int br_cnt;		/* Byte count of data */
+};
+
+#define UIO_NSFDS 5		/* # of subdirectories to allow in pathname */
+				/* Can be derived from (.PTMAX-.PTSFD)-1 */
+struct _path {			/* General directory path structure */
+	int ppn;		/* PPN (UFD) */
+	int sfd[UIO_NSFDS+1];	/* SFD names, zero terminated */
+};
+
+struct _pathblk {		/* PATH. UUO arg block */
+	int p_arg;
+	int p_scan;
+	struct _path p_path;
+};
+
+struct _filespec {		/* Parsed Filespec */
+	int fs_nod;		/* Node name */
+	int fs_dev;		/* Device */
+	int fs_nam;		/* File name */
+	int fs_ext;		/* Extension */
+	int fs_nfds;		/* # of file directories parsed */
+	struct _pathblk fs_path;	/* Directory path info */
+};
+
+#endif /* T10+CSI+WAITS */
+
+/*
+ *	UF (Un*x File) I/O structure.  One for each open file or device.
+ */
+
+struct _ufile {
+	int uf_nopen;		/* # of FDs which have this UF open */
+	int uf_ch;		/* Sys I/O chan or JFN */
+	int uf_type;		/* OS device type     (== major device #) */
+	int uf_dnum;		/* USYS device number (== minor device #) */
+	int uf_flgs;		/* flag bits */
+	short uf_bsize;		/* I/O byte size opened in */
+	short uf_nbpw;		/* # bytes per word */
+	int uf_eof;		/* Non-zero if EOF seen */
+	long uf_flen;		/* Length of file in bytes (-1 if unknown) */
+	long uf_pos;		/* Current user position within file */
+	struct _iob *uf_buf;	/* Pointer to buffer (if any) */
+	char *uf_bpbeg;		/*   Byte pointer to beg of buffer */
+	int uf_blen;		/*   Length of buffer in I/O bytes */
+	long uf_bpos;		/*   System position at start of buffer */
+	char *uf_cp;		/*   current byte pointer into buffer */
+	int uf_rleft;		/*   # bytes left for reading */
+	int uf_wleft;		/*   # bytes left for writing */
+
+#if SYS_ITS
+#define UIO_ZBUFSIZ	4	/* Kludge for byte packing on ITS */
+	int uf_zcnt;
+	int uf_zbuf[UIO_ZBUFSIZ];
+#endif    /* SYS_ITS */
+
+#if SYS_T10+SYS_CSI+SYS_WTS
+	struct _iobring uf_biring;	/* T10 input buffer ring header */
+	struct _iobring uf_boring;	/* T10 output buffer ring header */
+	struct _filespec uf_fs;		/* T10 saved filespec for fstat() */
+#endif /* T10+CSI+WAITS */
+};
+
+/* Data structures for fork I/O cleanup */
+#define USYS_MAXFRK 30		/* Max # of forks we expect to see */
+				/* Same as in wait.c */
+struct _frkuf {
+    int fkhndl;
+    int ufmask[(OPEN_UF_MAX + 35) / 36];
+    };
+
+/*
+ *	Map from FD (File Descriptor) into internal Un*x File structure.
+ */
+
+#define _UFGET(fd) ((fd < 0 || fd >= OPEN_MAX) ? 0 : USYS_VAR_REF(uffd[fd]))
+
+/* Contents of various things in the UF structure */
+
+/* uf_flgs flag bits are defined in <fcntl.h> so that users can access
+** them via the fcntl() F_GETFL function.
+*/
+#include <fcntl.h>		/* Get defs for flags */
+#define UIOF_CONVERTED	FDF_CVTEOL	/* force CRLF-NL convert */
+#define UIOF_OLD	FDF_OLDFILE	/* this is an old file */
+#define UIOF_READ	FDF_READ	/* Open for user read */
+#define UIOF_WRITE	FDF_WRITE	/* Open for user write */
+#define UIOF_APPEND	FAPPEND		/* Appending (write must also be on) */
+#define UIOF_NDELAY	FNDELAY		/* Non-blocking I/O */
+#define UIOF_ASYNC	FASYNC		/* Enable SIGIO */
+#define UIOF_HANDPACK	FDF_HANDPACK	/* ITS: Handpacking bytes */
+
+#define UIOF_CANHANG	FDF_CANHANG	/* Device can hang on input */
+#define UIOF_BLKDEV	FDF_BLKDEV	/* Device uses block mode */
+#define UIOF_BMODIF	FDF_BMODIF	/* Buffer modified */
+#define UIOF_BREAD	FDF_BREAD	/* Buffer read in */
+#define UIOF_ISSYNC	FDF_ISSYNC	/* T10: IO.SYN set */
+#define UIOF_OCHAN	FDF_OCHAN	/* T10: chan open */
+#define UIOF_OREAD	FDF_OREAD	/* T10: chan open for read */
+
+/* Device types for uf_type are normally the OS-dependent device codes.
+**	Other special codes are defined here.
+*/
+#if SYS_T20+SYS_10X
+#include <monsym.h>
+#define UIO_DVDSK monsym(".DVDSK")
+#define UIO_DVTTY monsym(".DVTTY")
+#define UIO_CH_CTTRM monsym(".CTTRM")	/* Controlling Terminal chan */
+#define UIO_FSCHARQUOT1 ('\\')
+#define UIO_FSCHARQUOT2 ('V'&037)
+
+#elif SYS_ITS
+#include <sysits.h>
+#define UIO_DVDSK _DVDSK	/* Defined in <sysits.h> */
+#define UIO_DVTTY _DVTTY
+#define UIO_CH_CTTRM (0)	/* Controlling Terminal chan */
+#define UIO_FSCHARQUOT1 ('\\')
+#define UIO_FSCHARQUOT2 ('Q'&037)
+
+#elif SYS_T10+SYS_CSI+SYS_WTS
+#include <uuosym.h>
+#define UIO_DVDSK uuosym(".TYDSK")
+#define UIO_DVTTY uuosym(".TYTTY")
+#define UIO_CH_CTTRM (-1)	/* Controlling Terminal "chan" */
+#define UIO_FSCHARQUOT1 ('\\')
+#if SYS_WTS
+#define UIO_FSWORDQUOT1 ('A'&037)
+#else
+#define UIO_FSWORDQUOT1 ('\"')
+#endif
+#if SYS_CSI
+#define UIO_FSWORDQUOT2 ('\'')
+#endif
+#endif
+
+#ifndef UIO_FSCHARQUOT1
+#define UIO_FSCHARQUOT1 0
+#endif
+#ifndef UIO_FSCHARQUOT2
+#define UIO_FSCHARQUOT2 0
+#endif
+#ifndef UIO_FSWORDQUOT1
+#define UIO_FSWORDQUOT1 0
+#endif
+#ifndef UIO_FSWORDQUOT2
+#define UIO_FSWORDQUOT2 0
+#endif
+
+/*
+ *	Syscall function declarations
+ */
+
+#if defined(__STDC__) || defined(__cplusplus)
+# define P_(s) s
+#else
+# define P_(s) ()
+#endif
+
+/* open.c */
+#if SYS_T20+SYS_10X+SYS_T10+SYS_CSI+SYS_WTS+SYS_ITS	
+extern int creat P_((const char *path,mode_t mode));
+extern int open P_((const char *path,int flags,...));
+extern void _openuf P_((int fd,struct _ufile *uf,int flags));
+extern int _uiofd P_((void));
+extern struct _ufile *_ufcreate P_((void));
+extern int _uiobuf P_((struct _ufile *uf));
+#if SYS_T20+SYS_10X
+extern int _gtjfn P_((const char *path,int flags));
+#endif 
+#if SYS_T10+SYS_CSI+SYS_WTS	
+extern int _opnrel P_((struct _ufile *uf));
+extern int _flookup P_((char *file,struct _filehack *f,int lertyp));
+extern int _frename P_((struct _filespec *fsold,struct _filespec *fsnew));
+extern int _t10error P_((int err));
+extern int _fparse P_((struct _filespec *f,char *path));
+#endif 
+#endif 
+
+/* read.c */
+#if SYS_T20+SYS_10X+SYS_T10+SYS_CSI+SYS_WTS+SYS_ITS	
+extern int read P_((int fd,void *buf,size_t nbytes));
+#if SYS_T20+SYS_10X
+extern int _nread P_((struct _ufile *uf,long *arg));
+#endif	
+#endif 
+
+/* write.c */
+#if SYS_T20+SYS_10X+SYS_T10+SYS_CSI+SYS_WTS+SYS_ITS	
+extern int write P_((int fd,const void *buf,size_t nbytes));
+#if SYS_10X+SYS_T20
+extern int _nwrite P_((struct _ufile *uf,long *arg));
+#endif 
+#if SYS_T10+SYS_CSI+SYS_WTS
+extern int _blkprime P_((struct _ufile *uf,int nbytes));
+extern int _blkfin P_((struct _ufile *uf));
+#endif 
+#if SYS_ITS
+extern int _outblock P_((struct _ufile *uf,const char *ptr,int *cntptr));
+#endif 
+#endif 
+
+/* lseek.c */
+#if SYS_T20+SYS_10X+SYS_ITS+SYS_T10+SYS_WTS+SYS_CSI	
+extern off_t lseek P_((int fd,off_t,int whence));
+extern long tell P_((int fd));
+#endif 
+
+/* close.c */
+#if SYS_T20+SYS_10X+SYS_T10+SYS_CSI+SYS_WTS+SYS_ITS	
+extern int _ufclose P_((int fd,struct _ufile *uf));
+extern int close P_((int fd));
+#endif 
+
+/* uiodat.c */
+#if SYS_T20+SYS_10X+SYS_T10+SYS_CSI+SYS_WTS+SYS_ITS 
+extern struct _tty *_uftty P_((struct _ufile *uf));
+extern void _lckuf P_((int *lockp));
+extern struct _iob *_iobget P_((void));
+extern void _iobfre P_((struct _iob *b));
+extern void _iobinit P_((void));
+extern void _iobfork P_((int fkhndl, int *frkfds));
+extern void _iobclean P_((void));
+extern int _iobgufi P_((void));
+#endif 
+
+#undef P_
+
+/* Various monitor interaction stuff */
+
+#if SYS_T10+SYS_CSI+SYS_WTS
+
+#define _IOWD(cnt,loc) XWD(-(cnt),(loc)-1)	/* Dump mode cmd list word */
+#define _SIXWRD(lit) (*(int *)(_KCCtype_char6 *)lit)
+
+
+struct _toblk {			/* TRMOP. UUO arg block */
+	int to_fnc;
+	int to_udx;
+	union {
+	    struct {		/* CSI-specific terminal I/O structure */
+		int brkf : 1;
+		int	 : 13;
+		int chrf : 1;
+		int dlyf : 1;
+		int nblkf : 1;
+		int litf : 1;
+		unsigned cnt : 18;
+		char *bp;
+		int timeout;
+	    } io;
+	    int wd[5];
+	} to_arg;
+};
+#if SYS_CSI
+#define _TOOUT 022	/* Special CSI output TRMOP. function */
+#define _TOINP 025	/* Special CSI input TRMOP. function */
+#define _TOFLG_8BIT	(1<<18)	/* I/O: 8-bit (image) mode */
+#define _TOFLG_NOBLK	(1<<19)	/* I/O: Non-blocking */
+#define _TOFLG_DELAY	(1<<20)	/* I: Delay on input */
+#define _TOFLG_CHRMODE	(1<<21)	/* I: Character mode (CBREAK) */
+#define _TOFLG_BREAK	(1<<35)	/* I: Break signal received */
+
+extern int _trmopuse;		/* Nonzero to use TRMOP. TTY I/O */
+#endif
+
+
+/* FILOP. function codes, sometimes used as args even without FILOP. */
+#define _FORED uuosym(".FORED")
+#define _FOWRT uuosym(".FOWRT")
+#define _FOSAU uuosym(".FOSAU")
+#define _FOCLS uuosym(".FOCLS")
+#define _FOUSI uuosym(".FOUSI")
+#define _FOUSO uuosym(".FOUSO")
+#define _FORNM uuosym(".FORNM")
+#define _FODLT uuosym(".FODLT")
+#define _FOINP uuosym(".FOINP")
+#define _FOOUT uuosym(".FOOUT")
+#define _FOSET uuosym(".FOSET")
+#define _FOGET uuosym(".FOGET")
+#define _FOREL uuosym(".FOREL")
+#define _FOWAT uuosym(".FOWAT")
+
+extern int _filopuse;		/* Nonzero to use FILOP. UUO */
+
+/* Argument to flerset() and _flookup() saying kind of LOOKUP blk to use */
+#define LER_OLD 0			/* Use old 4-word format */
+#define LER_RBSIZ uuosym(".RBSIZ")	/* Only up to .RBSIZ */
+#define LER_RBTIM uuosym(".RBTIM")	/* Only up to .RBTIM */
+#define LER_RBMAX (sizeof(struct _xlerblk)/sizeof(int))	/* Everything */
+
+#define RB_CRX uuosym("RB.CRX")	/* .RBEXT extension of RB.CRD creation date */
+#define RB_ACD uuosym("RB.ACD")	/*	Date last accessed */
+
+#define RB_PRV uuosym("RB.PRV")	/* .RBPRV protection code field */
+#define RB_MOD uuosym("RB.MOD")	/*	data mode */
+#define RB_CRT uuosym("RB.CRT")	/*	Time created */
+#define RB_CRD uuosym("RB.CRD")	/*	Date created */
+
+struct _openblk {		/* OPEN UUO arg block */
+	int op_mod;		/* flags & mode */
+	int op_dev;		/* device name (SIXBIT) */
+	unsigned op_buf;	/* output ring,,input ring */
+};
+
+struct _foblk {			/* FILOP. UUO arg block */
+	unsigned fo_chn : 18;	/* Channel # */
+	unsigned fo_fnc : 18;	/* Function code */
+	int fo_ios;		/* I/O status */
+	int fo_dev;		/* Device */
+	int fo_brh;		/* Buffer ring header addrs (out,,in) */
+	int fo_nbf;		/* # buffers to use (#out,,#in) */
+	int fo_leb;		/* Blk addrs for (Rename,,Lookup/Enter) */
+	int fo_pat;		/* Ptr to PATH. block (#len,,addr) */
+	int fo_ppn;		/* Pretend-PPN */
+	int fo_fsp;		/* Ptr to filespec block (#len,,addr) */
+	int fo_bsa;		/* Buffer starting addrs (out,,in) */
+	int fo_bsz;		/* Buffer sizes (out,,in) */
+};
+
+struct _fofsblk {		/* FILOP. UUO filespec arg block */
+	int fof_nod;		/* Node name */
+	int fof_dev;		/* Device */
+	int fof_nam;		/* File name */
+	int fof_ext;		/* Extension */
+	struct _path fof_path;	/* Directory path (PPN and SFDs) */
+};
+
+union _rbext {			/* File extension word format in LER block */
+    unsigned wd;
+    struct {
+	unsigned ext : 18;	/* LH is SIXBIT extension */
+	unsigned crx : 3;	/* Extension of creation date in .RBPRV */
+	unsigned acd : 15;	/* Access date (last reference) */
+    } rb;
+    struct {
+	unsigned ext : 18;
+	unsigned err : 18;	/* Error code in RH on error */ 
+    } rbe;
+};
+
+union _rbprv {			/* File Protection word format in LER block */
+    unsigned wd;
+    struct {
+	unsigned prv : 9;	/* File protection */
+	unsigned mod : 4;	/* Data mode */
+	unsigned crt : 11;	/* Time created (mins since midnight) */
+	unsigned crd : 12;	/* Date created (rb_crx has high 3 bits) */
+    } rb;
+};
+
+struct _olerblk {		/* Old LOOKUP/ENTER/RENAME arg block */
+	unsigned rb_nam;	/* 0  SIXBIT file name */
+	union _rbext rb_ext;	/* 1  SIXBIT file ext, plus garbage */
+	union _rbprv rb_prv;	/* 2  Protection and other garbage */
+	int rb_ppn;		/* 3  PPN or path pointer */
+};
+    
+struct _xlerblk {		/* New extended LOOKUP/ENTER/RENAME arg blk */
+	unsigned rb_cnt;	/* 0 # of args following */
+	unsigned rb_ppn;	/* 1 Directory; PPN or path pointer */
+	unsigned rb_nam;	/* 2 Name (SIXBIT) */
+	union _rbext rb_ext;	/* 3 Extension (SIXBIT) in LH, plus garbage */
+	union _rbprv rb_prv;	/* 4 Privilege (protection) bits etc */
+	unsigned rb_siz;	/* 5 # words in file */
+	unsigned rb_ver;	/* 6 Version # frobbery */
+	unsigned rb_spl;	/* 7 Spooled file name */
+	unsigned rb_est;	/* 10 Estimated length */
+	unsigned rb_alc;	/* 11 Allocation */
+	unsigned rb_pos;	/* 12 Position to allocate */
+	unsigned rb_ufw;	/* 13 Units file was written on (was .RBFT1)*/
+	unsigned rb_nca;	/* 14 Non-priv. customer arg */
+	unsigned rb_mta;	/* 15 Tape label */
+	unsigned rb_dev;	/* 16 Logical unit name in SIXBIT */
+	unsigned rb_sts;	/* 17 File status bits */
+	unsigned rb_elb;	/* 20 Error logical block */
+	unsigned rb_eun;	/* 21 Error unit and length */
+    union {
+	unsigned wd;		/* 22 UFD/file multi-use var */
+	unsigned ufd_qtf;	/*   UFD: FCFS logged-in quota */
+	struct {		/*   File: type and flags word */
+	    int dec : 1;	/*   DEC-formatted file => 4 wds valid */
+	    unsigned flgs : 14;	/*   Other file flags */
+	    unsigned cry : 3;	/*   File encryption algorithm type */
+	    unsigned dty : 6;	/*   File data type (.RBDxx) */
+	    unsigned dto : 6;	/*   Data "OTS" type (.RBOxx) */
+	    unsigned dcc : 6;	/*   Data "carrige control" fmting (.RBCxx) */
+	} rb;
+    } rb_typ;
+    union {
+	unsigned wd;		/* 23 UFD/file multi-use var */
+	unsigned ufd_qto;	/*   UFD: logged-out quota */
+	struct {		/*   File: Byte sizes and formats */
+	    unsigned bsz : 8;	/*   Logical data byte size */
+	    unsigned fsz : 8;	/*   Physical data frame size */
+	    unsigned hsz : 8;	/*   Fixed-header size */
+	    unsigned rfm : 6;	/*   Record format (.RBRxx) */
+	    unsigned rfo : 6;	/*   Record organization (.RBRxx) */
+	} rb;
+    } rb_bsz;
+    union {
+	unsigned wd;		/* 24 UFD/file multi-use var */
+	unsigned ufd_qtr;	/*   UFD: reserved quota */
+	struct {		/*   File: record and block sizes */
+	    unsigned rsz : 18;	/*   Record size (bytes) */
+	    unsigned bls : 18;	/*   Block size (bytes) */
+	} rb;
+    } rb_rsz;
+    union {
+	unsigned wd;		/* 25 UFD/file multi-use var */
+	unsigned ufd_usd;	/*   UFD: # blocks allocated to files */
+	struct {		/*   File: FFB and CRY fields */
+	    unsigned ffb : 18;	/*   First free byte within last block */
+	    unsigned acw : 18;	/*   Application-specific field */
+	} rb;
+    } rb_ffb;
+	unsigned rb_aut;	/* 26 Author PPN */
+	unsigned rb_nxt;	/* 27 Future DEC argument */
+	unsigned rb_idt;	/* 30 Backup's incremental date/time in UFD */
+				/*	(formerly .RBPRD) */
+	unsigned rb_pca;	/* 31 Priv. customer arg */
+	unsigned rb_ufd;	/* 32 Pointer back to UFD */
+	unsigned rb_flr;	/* 33 Rel blk in file covered by this RIB */
+	unsigned rb_xra;	/* 34 Pointer to next RIB in chain */
+	unsigned rb_tim;	/* 35 Creation <date,,time>, GTAD fmt (GMT) */
+	unsigned rb_lad;	/* 36 UFD: last accounting date */
+	unsigned rb_ded;	/* 37 UFD: directory expiration date */
+				/*    File: expiration date (labeled tapes) */
+	unsigned rb_act[8];	/* 40 Account string words */
+};
+
+
+struct _filehack {	/* For general file handling */
+    int error;			/* Error # if some function failed */
+    int chan;			/* Channel # used for L/E/R */
+    int lerppn;			/* Parsed PPN value to use for L/E/R */
+    struct _filespec fs;	/* Parsed filespec */
+    struct _foblk filop;	/* FILOP. arg block */
+    struct _pathblk path;	/* PATH. arg block */
+    union {			/* Old LER (Lookup/Enter/Rename) arg block */
+	struct _olerblk s;
+	unsigned arr[sizeof(struct _olerblk)/sizeof(int)];
+    } orb;
+    union {			/* New-style extended LER arg block */
+	struct _xlerblk s;
+	unsigned arr[sizeof(struct _xlerblk)/sizeof(int)];
+    } xrb;
+};
+
+#endif /* SYS_T10+SYS_CSI+SYS_WTS */
+
+#endif /* ifndef _SYS_UIO_INCLUDED */

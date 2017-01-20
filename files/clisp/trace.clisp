@@ -1,0 +1,494 @@
+;;; **********************************************************************
+;;; This code was written as part of the Spice Lisp project at
+;;; Carnegie-Mellon University, and has been placed in the public domain.
+;;; If you want to use this code or any part of Spice Lisp, please contact
+;;; Scott Fahlman (FAHLMAN@CMUC). 
+;;; **********************************************************************
+;;;
+;;; Spice Lisp Function-Encapsulation functions
+;;;
+;;;    Being a mechanism for temorary re-defining of functions such that
+;;;      tracing and similar activities shall be made more pleasing to the
+;;;      implementor and the user alike.
+;;;
+;;; Written by Jim Large.
+;;; Currently maintained by Skef Wholey, I guess.
+;;;
+;;; **********************************************************************
+;;;
+;;;
+;;; (Encapsulate symbol type body) => symbol
+;;;
+;;;  Saves the current definition of symbol, and replaces it with a new
+;;;    function which returns the result of evaluating the body form.
+;;;    Type is used as a tag which identifies a particular class of 
+;;;    encapsulation.  Types will always be compared with EQ.
+;;;
+;;;  When the new function is called, several LOCAL variables will be bound
+;;;    while the body is evaled:
+;;;
+;;;    argument-list:     A list of values
+;;;      The arguments which the function is currently being applied to.
+;;;
+;;;    basic-definition:  A function object
+;;;      Argument-list may be applied to basic-definition to call the
+;;;      encapsulated function.
+;;;
+;;;
+;;;
+;;; (Unencapsulate symbol type) => flag
+;;;   Undoes the effect of the most recent active encapsulation of symbol.
+;;;   Only encapsulations of the specified type are affected.  Returns ()
+;;;   if the symbol is not currently encapsulated.  Returns T otherwise.
+;;;
+;;; (encapsulated-p symbol type) => flag
+;;;   Returns T if the symbol has an encapsulation of the specified type.
+;;;   Returns () otherwise.
+;;;
+;;;
+;;; (fset symbol function &optional (carefully T))
+;;;   Sets the definition of a symbol.  When carefully is T ,the default,
+;;;   encapsulations are preserved.  Otherwise all encapsulations of the
+;;;   symbol are destroyed.
+;;;
+;;; (symbol-function symbol &optional (carefully T))
+;;;   Returns the function definition of symbol.  When carefully is T, the
+;;;   basic definition will be returned.  Otherwise, the outermost
+;;;   encapsulating function will be returned.
+
+(in-package 'lisp)
+
+(export '(encapsulate unencapsulate encapsulated-p trace untrace
+	  *trace-print-level* *trace-print-length*))
+
+;;; Encapsulate
+
+(defun encapsulate (symbol type body)
+  "Saves symbol's old definition, & inserts a new function which evals body
+   See *no-documentation* for details."
+  (let ((old-def (symbol-function symbol))
+	(old-encaps (get symbol 'encapsulated-definition))
+	(old-e-type (get symbol 'encapsulation-type))
+	(new-def ())
+	(new-encaps (make-symbol (symbol-name symbol))))
+    (if (not (functionp old-def))
+	(error "~S is not a valid function." symbol))
+    ;;compute the new function from the body.
+    ;; ** TEMPORARY ** this will only work for exprs & subrs right now.
+    ;; ** needs to be fixed for macros & fexprs later.
+    (setq new-def
+       `(lambda (&rest argument-list)
+	  (let ((basic-definition (symbol-function ',new-encaps)))
+	    ,body)))
+    ;;transfer the existing encapsulation to new-encaps
+    (fset new-encaps old-def)
+    (if old-encaps (setf (get new-encaps 'encapsulated-definition) old-encaps))
+    (if old-e-type (setf (get new-encaps 'encapsulation-type) old-e-type))
+    ;;encapsulate the symbol (everything works by the time we get here)
+    (fset symbol new-def)
+    (setf (get symbol 'encapsulated-definition) new-encaps)
+    (setf (get symbol 'encapsulation-type) type)
+    ;;return symbol as the value
+    symbol))
+
+;;; Unencapsulate
+
+(defun unencapsulate (symbol type)
+  "Removes symbol's most recent encapsulation of the specified type."
+  (do ((sym symbol (get sym 'encapsulated-definition)))
+      ((eq (get sym 'encapsulation-type) type)
+       ;;sym is the proper symbol to unencapsulate.
+       (let* ((cur-encaps (get sym 'encapsulated-definition))
+	      (prev-encaps (get cur-encaps 'encapsulated-definition))
+	      (prev-e-type (get cur-encaps 'encapsulation-type)))
+	 ;;make the previous encapsulation be the current encapsulation.
+	 (fset sym (symbol-function cur-encaps))
+	 (if prev-encaps
+	     (setf (get sym 'encapsulated-definition) prev-encaps)
+	     (remprop sym 'encapsulated-definition))
+	 (if prev-e-type
+	     (setf (get sym 'encapsulation-type) prev-e-type)
+	     (remprop sym 'encapsulation-type)))
+       T)						;return success
+    ;;if we run out of encapsulated-definitions while searching, return ().
+    (if (null sym) (return ()))))
+
+
+;;; encapsulated-p
+
+(defun encapsulated-p (symbol type)
+  "Returns T if symbol has an encapsulation of the given type.  () otherwise."
+  (do ((sym symbol (get sym 'encapsulated-definition)))
+      ((null sym) ())
+    (if (eq (get sym 'encapsulation-type) type)
+	(return T))))
+
+
+(proclaim
+ '(special
+   *Trace-output*        ;The stream where all traced output goes.
+   Trace-in-trouble-p    ;used to detect infinite recursion due to tracing
+   trace-went-deeper     ;decides whether ok to print result on same line.
+   *print-level*         ;so we can twiddle it.
+   *print-length*        ;ditto.
+   pp-hash-table	 ;  "
+   *pprint-recursive-call* ; "
+   *print-circle*        ;  "
+   *print-pretty*
+   ))
+
+(defvar trace-level ()
+  "How many levels deep are the traced calls.")
+
+(defvar *traced-function-list* ()
+  "A list of the names of all functions which are being traced.")
+
+(defvar *Max-trace-indentation* 40
+  "The maximum number of spaces for trace to indent.")
+
+(defvar *trace-print-length* ()
+  "*Print-length* will be bound to this value when trace is printing.")
+
+(defvar *trace-print-level* ()
+  "*Print-level* will be bound to this value when trace is printing.")
+
+;;; Marked-Function-Caller
+
+;;; The marked-function-caller is like apply, but it takes a third parameter,
+;;;  a variable to increment before the call, and decrement after the call.
+;;;  Marked-function-caller is used to encapsulate functions which have been
+;;;  marked by Trace-function-mark
+
+(defun marked-function-caller (function variable args)
+  (set variable (1+ (symbol-value variable)))
+  (unwind-protect (apply function args)
+		  (set variable (1- (symbol-value variable)))))
+
+;;; Trace-Function-Mark
+
+;;; Trace-function-mark returns an uninterned symbol which will be incremented
+;;;  every time the marked function is entered, and decremented every time
+;;;  the function exits.  The symbol and the number of times the function
+;;;  has been "marked" are stored as a cons (symbol . times) on the function-
+;;;  name's trace-recursion-counter property.
+
+(defun trace-function-mark (function-name)
+  "Returns a symbol which the function will 1+ on entry and 1- on exit."
+  ;;If the symbol already has the encapsulation,
+  (cond ((encapsulated-p function-name 'trace-recursion-counter)
+	 ;;update the number of times marked,
+ 	 (setf (get function-name 'trace-recursion-counter) 
+	       (cons (car (get function-name 'trace-recursion-counter))
+		     (1+ (cdr (get function-name 'trace-recursion-counter)))))
+	 ;;and return the symbol which is already in the property list.
+	 (car (get function-name 'trace-recursion-counter)))
+	;;Otherwise, Make a new uninterned symbol,
+	(T (let ((uninterned-symbol (make-symbol (symbol-name function-name))))
+	     ;;encapsulate the function with the marked-function-caller,
+	     (encapsulate function-name 'trace-recursion-counter
+	      `(marked-function-caller basic-definition
+				       ',uninterned-symbol
+				       argument-list))
+	     ;;put (uninterned-symbol . 1) on function-name's plist,
+	     (setf (get function-name 'Trace-recursion-counter) 
+		   (cons uninterned-symbol 1))
+	     ;;and initialize the counter to 0.
+	     (set uninterned-symbol 0)
+	     uninterned-symbol))))
+
+;;; Trace-Function-Unmark
+
+;;; Trace-function-unmark informs the function that we are no longer using the
+;;;  counter provided by trace-function-mark.  It does not necessarily turn
+;;;  the feature, because other functions may be looking at the same symbol.
+
+(defun trace-function-unmark (function-name)
+  "Informs function that caller is no longer using trace-function-mark
+  feature."
+  ;;Get the trace-recursion-counter (symbol . times-marked)
+  (let ((trc (get function-name 'trace-recursion-counter)))
+    ;;if the number of times marked is < 2,
+    (cond ((< (cdr trc) 2)
+	   ;;unencapsulate the function and remove the nasty property
+	   (unencapsulate function-name 'trace-recursion-counter)
+	   (remprop function-name 'trace-recursion-counter))
+	  ;;otherwise decrement the number of times marked.
+	  (T (setf (get function-name 'trace-recursion-counter) 
+		   (cons (car trc) (1- (cdr trc))))))
+    ()))
+
+;;; Trace-Aux-Print & Trace-Indent
+
+;;; Trace-indent takes a level and prints out useful looking indentation
+;;;  text on a fresh line.
+
+(defun trace-indent (level)
+  (write-string "
+                                                                                "
+		*trace-output*
+		:start 0
+		:end (+ 2 (min (* level 2) *max-trace-indentation*)))
+  (princ level *trace-output*))
+
+;;; Trace-aux-print takes a list of forms, and prints the value of each one
+;;;   after calling trace-indent to indent a fresh line.
+
+(defun trace-aux-print (forms level)
+  (do ((flist forms (cdr flist)))
+      ((null flist) ())
+    (trace-indent level)
+    (princ "* " *trace-output*)
+    (prin1 (eval (car flist)) *trace-output*)))
+;;; Trace Call
+
+;;; Trace-call is similar to apply except that it prints out debugging info
+;;;   on function entry & exit.  On entry, it prints NAME and ARGS and the
+;;;   value of each of the forms in the list PRINT, iff the form
+;;;   CONDITION evals to non-nil.  On exit it prints the result (or results
+;;;   if multiple values) of the function call and the result of evaluating
+;;;   each of the forms in the list PRINT-AFTER, iff CONDITION evaled to non-
+;;;   nil before the call.
+
+(defun trace-call (function name condition break break-after
+			    print print-after args)
+  (let ((pp-hash-table (make-hash-table :test #'eq))
+	(*pprint-recursive-call* nil))
+    ;;If trace-in-trouble-p untrace the thing & abort.
+    (cond ((and (boundp 'trace-in-trouble-p) trace-in-trouble-p)
+	   (untrace-1 name)
+	   (error "Could not trace ~s." name))
+	  (T ()))
+    ;;So that our caller will know we have been printing stuff.
+    (setq trace-went-deeper T)
+    ;;Some local variables bound for rest of this function
+    (let* ((trace-in-trouble-p T)
+	   (trace-went-deeper ())
+	   (print-p (if condition (eval condition) 'T))
+	   (trace-level
+	    (if print-p					;level gets incremented
+		(if (and (boundp 'trace-level)		; iff we are printing
+			 (numberp trace-level))
+		    (1+ trace-level)
+		    0)
+		trace-level)))
+      ;;if printing, print the args while binding *print-level* &
+      ;; *print-length*.
+      (if print-p
+	  (let ((*print-level* *trace-print-level*)
+		(*print-length* *trace-print-length*)
+		(old-pc *print-circle*)
+		(*print-circle* nil)
+		(old-pp *print-pretty*)
+		(*print-pretty* nil))
+	    (trace-indent trace-level)
+	    (princ ": " *trace-output*)
+	    (let ((*print-circle* old-pc)
+		  (*print-pretty* old-pp))
+	      (prin1 (cons name args) *trace-output*))
+	    (if print (trace-aux-print print trace-level))))
+      ;;Turn off trace-in-trouble-p temporarily while we call the original
+      ;;funct, and optionaly while we are in the break loop.
+      ;;  Function may return multiple values.
+      (setq trace-in-trouble-p ())
+      (if (eval break) (break "Trace entry"))
+      (let ((result (multiple-value-list (apply function args))))
+	(if (eval break-after) (break "Trace exit"))
+	(setq trace-in-trouble-p T)
+	;;if printing, bind *print-level* & *print-length*, & do hairy print.
+	(if print-p
+	    (let ((*print-level* *trace-print-level*)
+		  (*print-length* *trace-print-length*))
+	      (trace-indent trace-level)
+	      (let ((*print-pretty* nil)
+		    (*print-circle* nil))
+		(princ ": returned" *trace-output*))
+	      (do ((res result (cdr res)))		;do loop prints all the
+		  ((null res) ())			;values separated by
+		(let ((*print-pretty* nil)			;spaces
+		      (*print-circle* nil))
+		  (princ " " *trace-output*))
+		(prin1 (car res) *trace-output*))
+	      (if print-after (trace-aux-print print-after trace-level))))
+	;;return multiple values or single value according to result.
+	(if (cdr result)
+	    (values-list result)
+	    (car result))))))
+;;; Trace-1
+
+;;; Puts a trace encapsulation around the specified function.  If the function
+;;;  is already traced, all of the old options will be canceled.
+;;;
+;;;  FUNCTION-NAME is the name of the function to trace.
+;;; If an option is () then it is ignored.
+;;;  CONDITION form to eval at each entry  Controls printing of trace info.
+;;;  BREAK -- a form to eval at each entry.  If T, call break loop.
+;;;  BREAK-AFTER -- same, but happens afterward.
+;;;  WHEREIN list of function names.  Trace only when inside call to one.
+;;;  PRINT is a list of forms to eval & print at start of each call.
+;;;  PRINT-AFTER  forms to eval & print at end of each call.
+
+(defun trace-1 (function-name condition break break-after
+			      wherein print print-after)
+  "Called by TRACE to put a trace encapsulation around a function."
+  (let ((pp-hash-table (make-hash-table :test #'eq))
+	(*pprint-recursive-call* nil))
+    (untrace-1 function-name)	            ;cancel any existing trace options.
+    ;;make form which returns non-() iff evaled inside any of the wherein funs.
+    ;;Trace-function-mark returns a variable which is plusp iff inside function
+    (let ((wherein-form
+	   (case (length wherein)
+	     ((0) ())				    ;trivial case always false.
+	     ;;one function.  form tests variable for plusp
+	     ((1) `(plusp ,(trace-function-mark (car wherein))))
+	     ;;more than one, form or's one function cases
+	     (T `
+	      (or ,@(do ((names wherein (cdr names))
+			 (result ()
+				 (cons
+				  `(plusp ,(trace-function-mark (car names)))
+				  result)))
+			((null names) result)))))))
+      ;;If wherein was provided, save wherein list on plist for untrace,
+      (cond (wherein
+	     (setf (get function-name 'trace-only-within) wherein)
+	     ;;and make a new condition form combining old one with wherein.
+	     (setq condition (if condition
+				 `(and ,condition ,wherein-form)
+				 wherein-form)))
+	    (T ()))
+      ;;Encapsulate the function with a trace-call.
+      (encapsulate function-name 'trace
+		   `(trace-call basic-definition      ;defined by encapsulate.
+				',function-name
+				',condition
+				',break
+				',break-after
+				',print
+				',print-after
+				argument-list)))      ;defined by encapsulate.
+      ;;save the name of the function for untrace-all, and return name.
+    (push function-name *traced-function-list*)
+    function-name))
+
+;;; Untrace-1
+
+;;; Untrace-1 will untrace the specified function.  If the function was not 
+;;;  already traced, nothing special will happen.  Because untrace-1 can be
+;;;  called due to trace-in-trouble-p, we must ALWAYS unencapsulate first, 
+;;;  and clean up later.
+
+(defun untrace-1 (function-name)
+  "Turns off tracing for the specified function."
+  (let ((pp-hash-table (make-hash-table :test #'eq))
+	(*pprint-recursive-call* nil))
+    (unencapsulate function-name 'trace)
+    ;;Be polite, and unmark all of the functions which we are traced wherein.
+    (let ((wherein (get function-name 'trace-only-within)))
+      (cond (wherein
+	     (do ((funct wherein (cdr funct)))
+		 ((null funct) ())
+	       (trace-function-unmark (car funct)))
+	     (remprop function-name 'trace-only-within))
+	    (T ())))
+    ;;Remove function-name from who's who.
+    (setq *Traced-function-list*
+	  (remove function-name *traced-function-list*))
+    ;;And return function-name.
+    function-name))
+
+;;; TRACE
+
+;;; Trace parses a list of specs, and if they survive some type checking, it 
+;;;  returns a progn which will call trace-1 once for each spec.  If anything
+;;;  fails, No tracing will be done.
+;;;
+;;; A spec is either a function name, or a list of a function name followed by
+;;;  keywords and arguments.
+
+(defmacro trace (&rest specs)
+  "For simple use, specs are function names.  Undo with Untrace."
+  (if
+   specs
+   (do ((name ())			   ;name of function this iteration
+	(options ())			   ;list of keywords & options for name
+	(trace-1-forms ())		   ;list of calls to trace-1
+	(name-list ())			   ;list of names so we can fboundp
+	(spec-list specs (cdr spec-list)))
+       ;;return a form which trace-1's all the functions iff all are fboundp.
+       ((null spec-list)
+	`(do ((names ',name-list (cdr names)))
+	     ((null names) ,@trace-1-forms)
+	   (if (not (fboundp (car names)))
+	       (error "No such function:  ~s." (car names)))))
+     ;;LOOP BODY stuffs one form into Trace-1-forms on each pass.
+     ;;first, separate the name & the list of options
+     (typecase (car spec-list)
+       (symbol (setq name (car spec-list))
+	       (setq options ()))
+       (list
+	(if (not (symbolp (caar spec-list)))
+	    (error "Illegal function name:  ~s." (caar spec-list)))
+	(if (eq (caar spec-list) 'quote)
+	    (error "I bet you don't want to trace QUOTE."))
+	(setq options (cdar spec-list))
+	(setq name (caar spec-list)))
+       (T (error "Illegal trace spec:  ~s." (car spec-list))))
+     ;;parse the options list.
+     (with-keywords options
+       ((:condition condition ())
+	(:break break ())
+	(:break-after break-after ())
+	(:break-all break-all ())
+        (:wherein wherein ())
+        (:print print ())
+        (:print-after print-after ())
+	(:print-all print-all ()))
+      (when break-all (setq break (setq break-after break-all)))
+      (when print-all (setq print (setq print-after print-all)))
+      ;;Make sure wherein spec is a list of symbols or ()
+      (setq wherein
+	(typecase wherein
+	 (null ())
+	 (symbol (list wherein))
+	 (list (do ((funs wherein (cdr funs)))
+		   ((null funs) wherein)
+		 (if (not (symbolp (car funs)))
+		     (error
+			     "Illegal function name, ~s, in :wherein."
+			     (car funs)))))
+	 (T (error "Illegal :wherein option:  ~s." wherein))))
+      ;;make sure print and print-after are lists.
+      (if (not (listp print))
+	  (error "Illegal form list, ~s, for :print."
+		  print))
+      (if (not (listp print-after))
+	  (error "Illegal form list, ~s, for :print-after."
+		  print-after))
+      (push `(trace-1 ',name ',condition ',break ',break-after
+		      ',wherein ',print ',print-after)
+	    trace-1-forms)
+      (push name name-list)))
+   ;; if (not specs)
+   '*traced-function-list*
+   ))
+
+;;; UNTRACE
+
+;;; Untrace checks to see that its args are all symbols.  If they are, it
+;;; returns a form which will untrace each one.  Otherwise, it signals an
+;;; error, and none of the forms are untraced.
+;;;
+;;; with no args, untraces all traced functions.
+
+(defmacro untrace (&rest names)
+  "Removes tracing from the functions named.  With no args, untraces all
+  functions."
+  (if (null names) (setq names *traced-function-list*))
+  (do ((untrace-1-forms ())
+       (name-list names (cdr name-list)))
+      ((null name-list)
+       `(progn ,@untrace-1-forms))
+    (if (symbolp (car name-list))
+	(push `(untrace-1 ',(car name-list)) untrace-1-forms)
+	(error "Illegal function name:  ~s." (car name-list)))))
+

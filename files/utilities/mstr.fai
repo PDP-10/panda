@@ -1,0 +1,859 @@
+;ACCT:<ADMIN.PROGRAMS>MSTR.FAI.7,  7-Sep-81 16:00:13, Edit by B.BOMBADIL
+; add SET FOO: REGULATED and SET FOO: UNREGULATED commands
+;ACCT:<ADMIN.PROGRAMS>MSTR.FAI.3,  7-Sep-81 15:17:54, Edit by B.BOMBADIL
+; Remove unimplemented INITIALIZE command (makes me nervous)
+; Remove EMOUNT (exclusive mount - ms%xcl) code - unnecessary and can
+;  be use to successfully wedge a structure
+; Minor code cleanup
+;ACCT:<ADMIN.PROGRAMS>MSTR.FAI.2,  7-Sep-81 01:34:06, Edit by B.BOMBADIL
+; Always mount structures as domestic and unregulated
+;ACCT:<BOB>MSTR.FAI.2,  7-Jul-81 16:31:53, Edit by R.RMK
+; Change status printouts.
+
+	TITLE MSTR comnd-jsysized version
+
+search monsym,macsym
+.require sys:macrel
+nolit
+xall
+.direct .xtabm
+
+;registers, etc.
+
+p=17				;what else but a stack pointer?
+flag=0				;flags
+				;1B0 no longer in use
+m%auto==1b1			;automount without asking
+m%prmn==1b2			;prompt then mount
+m%show==1b3			;print display
+m%decr==1b4			;decrement mount count
+m%adis==1b5			;dismount all (prompting)
+
+;constants, etc.
+
+maxunit==2			;maximum number of units per structure
+
+
+Subttl Some Useful Macros
+
+define error (foo,retadr) <
+ifdif <foo>,<>,<	hrroi 1,[asciz @foo
+@]
+	esout >
+ifidn <foo>,<>,<	call jserr0 >
+ifdif <retadr>,<>,<	jrst retadr >
+>
+; build a command state block
+define bldcsb (repars,prompt) <
+	cm%rai+repars
+	.priin,,.priou
+	point 7,[asciz @prompt@]
+	point 7,cmdbuf
+	point 7,cmdbuf
+	lcmdbf*5
+	0
+	point 7,atmbuf
+	latmbf*5
+	filblk
+ifndef cmdbuf,<
+    ifndef lcmdbf,<lcmdbf==200 >
+cmdbuf:	block lcmdbf >
+ifndef atmbuf,<
+    ifndef latmbf,<latmbf=40 >
+atmbuf:	block latmbf >
+ifndef filblk,<
+filblk:	block =15 >
+>
+
+; parse a noise word
+define noise (foo) <
+	movei 2,[<.cmnoi>*1b8+cm%fix
+		point 7,[asciz @foo@]
+		]
+	comnd
+>
+; parse a carriage return
+define	confirm <
+	movei 2,[<.cmcfm>*1b8+cm%fix]
+	comnd
+>
+;GETNUM macro - lets COMND input a number
+;	FLGS - COMND flags, see monitor calls manual
+;	BASE - base for number		DEFALT - default
+;	HELP - help message		NEXT   - next COMND (optional)
+DEFINE GETNUM (FLAGS,BASE,HELP,DEFALT,NEXT) <
+
+	MOVEI 2,[flddb. (.CMNUM,FLAGS,BASE,HELP,DEFALT,NEXT)]
+	COMND
+>
+
+; build a table
+define  t ' (text,wbits,addr,bits) <
+ifidn <>,<addr>,<
+    ifidn <>,<bits>,< [	asciz @text@],,[<wbits>,,.'text] >
+    ifdif <>,<bits>,< [	bits+cm%fw
+			asciz @text@],,[<wbits>,,.'text] > >
+ifdif <>,<addr>,<
+    ifidn <>,<bits>,< [	asciz @text@],,[<wbits>,,addr] >
+    ifdif <>,<bits>,< [	bits+cm%fw
+			asciz @text@],,[<wbits>,,addr] > >
+>
+define table<
+	0			;filled by next tend
+..t==.				;used by next tend
+>
+define tend <
+..u==.
+	reloc ..t-1
+	<..u-..t>,,<..u-..t>
+	reloc ..u
+>
+
+;build a chain of function descriptor blocks
+;to define a linked list of function descriptors, simply include
+;them in order in your file, followed by a FDBEND to signal the
+;end of this list:
+;	foo:	fdb(disp1,.cmkey,,keytab)	;parse a keyword
+;		fdb(disp2,.cmswi,,switab)	;or a switch
+;		fdb(disp3,.cmcfm)		;or a CR
+;		fdbend
+;then, to use it, say
+;		initial(csb)			;set up the csb
+;	repars:	parse foo			;do the parse, and dispatch
+;				;to either disp1,disp2, or disp3
+define fdb (dispatch,typ,flgs,data,hlpm,defm)<
+	ifndef ..%00,<..%00===0>
+	..%00==..%00+1
+	dispatch		;;other halfword is available for flags
+..id:	gensy1(..id,\..%00)
+ifidn <>,<flgs>,<flddb.(typ,cm%fix,<data>,<hlpm>,<defm>,..id) >
+ifdif <>,<flgs>,<flddb.(typ,cm%fix!flgs,<data>,<hlpm>,<defm>,..id) >
+>;fdb
+;end a chain of function descriptor blocks
+define fdbend <..id==0		;;sorry, but this is necessary too
+	gensym(..id,\..%00)
+>;fdbend
+
+;parse a chain of fdb macros, dispatching appropriately.
+define parse (foo) <
+	movei 2,foo+1		;;note the +1 !!!
+	comnd
+	jrst @-1(3)
+>;parse
+
+; output status information about structure ala STRTST.
+
+define outstat(flag)<
+;	move 4,argblk+.msgst
+;	hrroi 5,[asciz/. /]
+;	hrroi 6,[asciz/X /]
+; ...are assumed to be before this call.
+
+	move 1,5
+	txne 4,flag
+	move 1,6
+	psout>
+	subttl data
+
+pdllen==40
+pdl:	block pdllen
+begzer:				;beginning of area cleared for each command
+strnam:	block 12		;space for structure name
+alias:	block 12		;space for alias
+argblk:	block 30		;mstr write block
+autblk:	block 30		;mstr read block
+buff:	block 30		;block for text strings (temporaries)
+endzer==.-1			;end of area cleared for each command
+
+Subttl COMND% Tables
+
+;comnd block data
+
+lcmdbf==40			;160. chars max
+cmdbuf:	block lcmdbf
+latmbf==12			;50. chars max
+atmbuf:	block latmbf
+
+csbmai:	cm%rai+repars
+	.priin,,.priou
+	point 7,[asciz @MSTR>@]
+	point 7,cmdbuf
+	point 7,cmdbuf
+	lcmdbf*5
+	0
+	point 7,atmbuf
+	latmbf*5
+
+
+Subttl Main Program
+
+start:	reset
+main:	movei 1,csbmai
+	movei 2,[flddb. .cmini]
+	comnd%			;set up CSB, etc.
+repars:	setzm begzer
+	move 1,[xwd begzer,begzer+1]
+	blt 1,endzer		;clear data areas
+	txz flag,m%auto!m%prmn!m%show!m%decr!m%adis ;clear all short-term flags
+	move p,[iowd pdllen,pdl] ;setup (each time, in case subr. reparses)
+	movei 1,csbmai
+	movei 2,[flddb. .cmkey,cm%fix,$main]
+	comnd%			;parse a command
+	hrrz 4,(2)		;get righthalf index from command table
+	jrst @(4)		;go do the command
+
+	
+$main:	table
+T AUTOMOUNT,,.AUTO		;scan through list and automount on request
+T DECREMENT,,.DECRE		;decrement mount count
+T DISMOUNT,,.DISMO		;dismount this structure
+T EXIT,,.EXIT			;all done
+T HELP,,.HELP			;give some general info
+T INCREMENT,,.INCRE		;increment mount count
+T MOUNT				;mount this structure
+T SET				;set status
+T STATUS,,.STAT			;get info
+	tend
+
+Subttl EXIT and HELP Commands
+
+
+.exit:	confirm
+	haltf
+	jrst start
+
+
+.help:	confirm
+	tmsg <Commands include:
+
+   STATUS *		Display status of all disk devices.
+	disk		Display status of specified [by channel,unit] disk.
+	name		Display (brief) status of mounted structure.
+   AUTOMOUNT		Mount all online units.
+   MOUNT *		Scan all units, prompting for permission to mount.
+	disk		Mount the structure on the specified unit.
+	name		Mount the named structure.  May contain several units.
+   DISMOUNT name	Force dismount of specified structure.
+	disk		Force dismount of structure on specified unit.
+	*		Force dismount of all dismountable structures.
+   INCREMENT name	Increment mount count for specified structure.
+   DECREMENT name	Decrement mount count for specified structure.
+   SET name DOMESTIC	Mark mounted structure as having same users as PS.
+	    FOREIGN	Mark structure as not domestic.
+   EXIT			Quit.
+   HELP			This text.
+>
+	jrst main
+
+Subttl MOUNT Command
+
+
+.mount:	noise (structure)
+	call gtstnm		;get structure identifier
+	jrst @moudis(3)		;dispatch 1=name,0=all
+
+moudis:	mounal			;all units
+	mount0			;named structure
+	mounun			;channel,unit
+	monal0
+
+;mount a named structure
+mount0:	move 2,[buff,,strnam]	;move name to appropriate place
+	blt 2,strnam+11		;40 chars worth should be enough
+	noise (alias)
+	movei 2,[<.cmdev>*1b8+cm%fix!cm%hpp!cm%sdh!cm%dpp!cm%po
+		0
+		-1,,[asciz/Structure alias/]
+		-1,,strnam ]
+	comnd			;get a structure/device name in atom buffer
+	move 2,[atmbuf,,alias]	;move name to appropriate place
+	blt 2,alias+11		;40 chars worth should be enough
+	noise (on drives)
+	movei 16,argblk+.mstui	;start with no units at beginning of block
+	call gtun1		;get channel in 3,unit in 4
+mount1:	movem 4,.mstch(16)	;channel
+	setom .mstct(16)	;controller
+	movem 5,.mstun(16)	;unit
+	addi 16,3
+	call gtunit		;get another channel,unit pair, or CR
+	jrst mount1		;loop for more units
+	movei 4,-argblk-.mstui(16)	;CR seen.
+	idivi 4,3		;get number of units
+	jumple 4,[ error (<You must specify at least one drive>,main) ]
+	caile 4,maxunit
+	 jrst [	error (<Too many devices specified>,main) ]
+	movem 4,argblk+.mstfl	;number of units in structure
+	hrroi 1,strnam		;set up rest of block
+	hrroi 2,alias
+	call gomoun		;do rest of mounting
+	jrst main		;keep going
+
+;mount all units (MOUNT *)
+mounal:	confirm
+monal0:	txo flag,m%show!m%prmn	;but display and prompt-and-mount
+	jrst auto0		;join automount code
+
+;mount specified unit (MOUNT channel,unit)
+mounun:	confirm
+	call gstun		;get current status of unit in autblk
+	hrrz 3,autblk+.msrns	;get number of units
+	caile 3,1
+	 jrst [	error (<Unit is part of a multi-volume structure>,main) ]
+	call stmoun		;go do mount
+	jrst main
+
+Subttl DISMOUNT Command
+
+.dismo:	noise (structure)
+	call gtstnm
+	jrst @disdis(3)
+
+disdis:	disal
+	dism0
+	dismun
+	disal0
+
+;dismount a given structure
+dism0:	confirm
+	move 2,[buff,,alias]	;move name to appropriate place
+	blt 2,alias+11		;40 chars worth should be enough
+	call dism1
+	jrst main
+
+disal:	confirm
+disal0:	txo flag,m%adis		;don't display or prompt
+	jrst auto0
+
+dismun:	confirm
+	call gstun		;get current status in autblk
+	move 3,autblk+.msrst	;get status
+	txnn 3,ms%mnt		;already dismounted?
+	 jrst [	error(<Unit is not mounted.>,main)]
+	call dism1
+	jrst main
+
+Subttl SET Command
+
+.set:	noise (structure)
+	call gtstnm
+	jrst @setdis(3)
+
+setdis:	setal
+	set0
+	setun
+	setal0
+
+;set a given structure to DOMESTIC or FOREIGN
+set0:	move 2,[buff,,alias]	;move name to appropriate place
+	blt 2,alias+11		;40 chars worth should be enough
+	call gtkey		;get keyword in 4
+	confirm
+
+set1:	hrroi 1,alias
+	movem 1,autblk+.msssn
+	setzb 5,6
+	call @(4)		;go do whatever
+	movem 5,autblk+.mssst
+	movem 6,autblk+.mssmw
+	move 1,[.mssln,,.mssss]	;set status
+	movei 2,autblk
+	mstr
+	 ercal jserr0		;print the message
+	jrst main
+
+;set the structure on a particular channel,unit to DOMESTIC or FOREIGN
+setun:	call gtkey
+	confirm
+	call gstun		;get current status in autblk
+	move 3,autblk+.msrst	;get status
+	txnn 3,ms%mnt		;already set?
+	 jrst [	error(<Unit is not mounted.>,main)]
+	jrst set1
+
+setal:	confirm
+setal0:	error(<Not yet implemented.>,main)
+
+
+gtkey:	noise (to)
+	movei 1,csbmai
+	movei 2,[flddb. .cmkey,cm%fix,$setky]
+	comnd%
+	hrrz 4,(2)		;get right halfword
+	ret
+
+$setky:	table
+T DISMOUNT-IN-PROGRESS,,.setdm
+T DOMESTIC,,.setdo
+T FOREIGN,,.setfr
+T NO-DISMOUNT,,.setnd
+T REGULATED,,.setrg
+T UNREGULATED,,.setnr
+	tend
+
+.setdo:	movsi 5,(ms%dom)
+.setfr:	movsi 6,(ms%dom)	;set mask
+	ret
+.setdm:	movsi 5,(ms%dis)
+.setnd:	movsi 6,(ms%dis)	;set mask
+	ret
+.setnr:	movsi 5,(ms%nrs)
+.setrg:	movsi 6,(ms%nrs)	;set mask
+	ret
+
+Subttl STATUS Command
+
+.stat:	noise (of structure)
+	
+	txo flag,m%show		;say we're printing
+	call gtstnm		;get structure identifier
+	jrst @stadis(3)		;dispatch 1=name,0=all
+
+stadis:	statal
+	stat0
+	statun
+	sttal0
+
+;status of one structure.  Currently, only mounted structures may be printed
+stat0:	move 2,[buff,,alias]
+	blt 2,alias+11
+	confirm
+	call prmstr		;print status info for a mounted structure
+	jrst main
+
+;status of all structures
+statal:	confirm
+sttal0:	jrst auto0		;joint automount code
+
+;status of a particular unit
+statun:	confirm
+	call gstun
+	setom sthead#
+	call prunit
+	jrst main
+
+Subttl INCREMENT and DECREMENT Commands
+
+.decre:	txo flag,m%decr		;say we're decrementing
+.incre:	noise (mount count for structure)
+	call gtstnm
+	jrst @incdis(3)
+
+incdis:	incal
+	inc0
+	incun
+	incal0
+
+;increment/decrement a given structure
+inc0:	confirm
+	move 2,[buff,,alias]	;move name to appropriate place
+	blt 2,alias+11		;40 chars worth should be enough
+
+inc1:	move 1,[1,,.msimc]	;increment
+	txne flag,m%decr
+	 move 1,[1,,.msdmc]	;decrement
+	movei 2,[-1,,alias]
+	mstr
+	 erjmp [error(,main)]
+	tmsg < [Structure >
+	hrroi 1,alias
+	psout
+	hrroi 1,[asciz/ mount count incremented]
+/]
+	txne flag,m%decr
+	hrroi 1,[asciz/ mount count decremented]
+/]
+	psout
+	jrst main
+
+incal:	confirm
+incal0:	error(<Not yet implemented.>,main)
+
+;increment/decrement a particular unit
+incun:	confirm
+	call gstun		;get current status in autblk
+	move 3,autblk+.msrst	;get status
+;	txnn 3,ms%mnt		;already dismounted?
+;	 jrst [	error(<Unit is not mounted.>,main)]
+	jrst inc1
+	
+Subttl AUTOMOUNT Command
+
+
+.auto:	confirm
+	txo flag,m%auto		;but automount
+
+auto0:	setom autblk+.msrch	;set up start of loop over all disks
+	setom autblk+.msrct
+	setom autblk+.msrun
+	setom sthead		; print status header
+
+auto1:	setzm strnam
+	setzm alias
+	hrroi 1,strnam		;structure name
+	movem 1,autblk+.msrsn
+	hrroi 1,alias		;alias string
+	movem 1,autblk+.msrsa
+	move 1,[.msrln,,.msrnu]
+	movei 2,autblk
+	mstr			;get status info in autblk
+	 erjmp [movei 1,.fhslf	;Check for done.
+		geter		;get most recent error
+		camn 2,[.fhslf,,mstx18]	;"no more units in system"
+		 jrst main	;yes
+		error(,main)	;no.  Some other problem.
+		]
+	txne flag,m%show	;display?
+	 call prunit		;yes
+	move 3,autblk+.msrst	;get status
+	txne flag,m%adis	;autodismount?
+	 jrst auto4		;yes
+
+	txne flag,m%auto!m%prmn	;mount?
+	 txne 3,ms%mnt!ms%ofl!ms%dia!ms%err!ms%bbb!ms%hbb
+	  jrst auto1		;already mounted or not mounting or something
+	hrrz 3,autblk+.msrns
+	caie 3,1		;can't mount multi-unit structures
+	 jrst auto1		;  w/out much more work
+	txne flag,m%auto	;automount?
+	 jrst auto2		;yes
+	tmsg<	Mount this unit?>
+	call gtyno		;prompt
+	 jrst auto1		;don't mount
+auto2:	call stmoun
+	jrst auto1
+
+auto4:	call dism1		;go do dismount (maybe)
+	jrst auto1
+
+Subttl Major Subroutines
+
+$csbyn:	bldcsb(ynorp,<Yes or no:>)
+$yesno:	table
+	[asciz/NO/],,0
+	[cm%inv!cm%fw		;invisible
+	 asciz/OK/],,-1
+	[asciz/YES/],,-1
+	tend
+
+;parse a yes or no
+gtyno:	movei 1,$csbyn
+	movei 2,[flddb. .cmini]
+	comnd%			;initialize CSB
+ynorp:	movei 1,$csbyn
+	movei 2,[flddb. .cmkey,cm%fix,$yesno]
+	comnd%
+	hrrz 4,(2)		;get 0 for false, -1 for true
+	confirm
+	jumpe 4,r		;false=+1 return
+	retskp			;true=+2 return
+
+$star:	fdb(gotcfm,.cmcfm)
+	fdb(gotsta,.cmtok,,<-1,,[asciz/*/]>)
+	fdb(gotchn,.cmnum,cm%sdh,10,<channel,unit>)
+	fdb(gotnam,.cmdev,cm%po+cm%sdh,0,<Structure name>)
+	fdbend
+
+;parse a structure name.  Return with 3 containing a function code:
+; 0=* parsed
+; 1=structure name parsed (name is in buff)
+; 2=channel number,unit number (returned in 4,5)
+gtstnm:	parse($star)		;parse a structure name
+
+gotnam:	move 2,[atmbuf,,buff]	;copy to atmbuf
+	blt 2,buff+11
+	movei 3,1		;parsed a name
+	ret
+
+gotsta:	movei 3,0		;parsed a star
+	ret
+
+gotcfm:
+	movei 3,3		;parsed a confirm
+	ret
+
+;parse a channel,unit pair, or a CR
+;return +1  with 4/channel number   5/unit number
+;	+2, normally, on CR
+gtunit:	parse($cret)
+
+;parse channel,unit pair.  No CR permitted
+;return +1, always
+gtun1:	parse($chan)
+
+$cret:	fdb (rskp,.cmcfm)
+$chan:	fdb (gotchn,.cmnum,cm%sdh,10,< channel,unit >)
+	fdbend
+	
+gotchn:	push p,2		;save the channel
+	movei 2,[flddb. (.cmcma,cm%fix)]
+	comnd
+	movei 2,[flddb. (.cmnum,cm%fix!cm%sdh,10,< unit >)]
+	comnd
+	pop p,4			;get channel back
+	move 5,2		;save unt in 5
+	movei 3,2		;and return 2 in 2
+	ret
+
+
+;do the mounting
+stmoun:	movei 1,1		;number of units must be 1
+	movem 1,argblk+.mstfl
+	move 1,[autblk,,argblk+.mstui]
+	blt 1,argblk+.mstui+.mstun	;fill in info on the unit
+	hrroi 1,strnam		;set up rest of block
+	hrroi 2,strnam		;n.b. if unmounted, try same name by def.
+	call gomoun		;go do mount
+	ret
+
+
+;enter with number of units in this structure, and particular
+;units, already set up in argblk
+;enter with ptr to structure name in 1, ptr to alias in 2
+gomoun:	stkvar <goalias>
+	movem 1,argblk+.mstnm
+	movem 2,argblk+.mstal
+	movem 2,goalias		;save alias for a bit
+	move 1,[<maxunit*3+3>,,.msmnt]
+	movei 2,argblk
+	mstr
+	 erjmp jserr0		;do appropriate things, then return
+	movx 1,ms%dom+ms%nrs	;want domestic and non-regulated
+	movem 1,argblk+.mssst	;new values
+	movem 1,argblk+.mssmw	;mask of values to be changed
+	move 1,goalias
+	movem 1,argblk+.msssn	;pointer to structure alias
+	move 1,[xwd .mssln,.mssss] ;function is change structure status
+	movei 2,argblk
+	mstr
+	 erjmp jserr0
+	tmsg < [Structure >
+	move 1,goalias		;get back the alias
+	psout
+	tmsg < mounted]
+>
+	ret
+
+;dismount a structure (call with structure name set up in alias)
+dism1:	call prmstr		;get status, but don't print it
+	move 2,argblk+.msgst	;check status
+	txne 2,ms%pps		;primary PS?
+	 ret			; yes.  Ignore
+	skipg 2,argblk+.msgmc	;check mount count
+	 jrst dism2		;looks like zero, or some error
+	tmsg<
+Structure >
+	hrroi 1,alias
+	psout
+	tmsg< has non-zero mount count:  >
+	call prnum
+	tmsg<
+Forced dismount?  >
+	call gtyno		;confirm
+	ret			;abort dismount
+dism2:	move 1,[1,,.msdis]	;dismount
+	movei 2,[-1,,alias]
+	mstr
+	 erjmp [jrst jserr0	;and return
+		]
+	tmsg < [Structure >
+	hrroi 1,alias
+	psout
+	tmsg < dismounted]
+>
+	ret
+
+
+;get status of a particular unit
+;enter with 4,5 containing channel,unit
+gstun:	movem 4,autblk+.msrch
+	movem 5,autblk+.msrun
+	setom autblk+.msrct
+	hrroi 1,strnam
+	movem 1,autblk+.msrsn
+	hrroi 1,alias
+	movem 1,autblk+.msrsa
+	move 1,[.msrln,,.msrus]
+	movei 2,autblk
+	mstr
+	 erjmp [ jserr
+		jrst main ]
+	ret
+
+Subttl Printing Routines
+
+;print status of unit described in autblk
+prunit:	skipn sthead		; do a header?
+	jrst prnohd		; nope.
+
+	setzm sthead		; do it only once.
+
+	tmsg <	 Part of mounted structure
+	 | In use by diagnostic
+	 | | Drive off-line
+	 | | | Read error
+	 | | | | Bad BAT block
+	 | | | | | Bad HOME block
+	 | | | | | | Write-protected
+Ch# Un#	 V V V V V V V	Type   Units   Unit#   Swap space   Name   Alias
+>
+
+prnohd:
+	movei 1,.priou
+	move 2,autblk+.msrch	;get channel
+	movx 3,no%lfl!2b17!=10
+	nout
+	 jfcl
+	move 2,autblk+.msrun
+	movx 3,no%lfl!4b17!=10
+	nout
+	 jfcl
+	tmsg <   >
+	move 4,autblk+.msrst
+	hrroi 5,[asciz/. /]
+	hrroi 6,[asciz/X /]
+	outstat MS%MNT
+	outstat MS%DIA
+	outstat MS%OFL
+	outstat MS%ERR
+	outstat MS%BBB
+	outstat MS%HBB
+	outstat MS%WLK
+	tmsg < >
+	ldb 4,[pointr(<autblk+.msrst>,ms%typ)]
+	skipe 1,typtab(4)
+	caile 4,typtl		;in range?
+	 jrst [	tmsg <UNK >
+		jrst prun1 ]
+	psout			;print device type
+prun1:	movei 1,.priou
+	hrrz 2,autblk+.msrns	; logical unit number
+	movx 3,no%lfl!6b17!=10
+	nout
+	 jfcl
+	hlrz 2,autblk+.msrns	; number of units in structure.
+	movx 3,no%lfl!=8b17!=10
+	nout
+	 jfcl
+	move 2,autblk+.msrsw	;swapping space
+	movx 3,no%lfl!=15b17!=10
+	nout
+	 jfcl
+	tmsg <   >
+	movei 1,.priou
+	hrroi 2,strnam
+	movei 3,6
+	setzm 4
+	sout
+	movei 1," "
+	aos 3
+bloop1:	pbout
+	sojge 3,bloop1	
+	movei 1,.priou
+	hrroi 2,alias
+	movei 3,10
+	sout
+	tmsg <
+>
+	ret
+
+
+
+typtab:	0
+	point 7,[asciz/RP04/]
+	0
+	0
+	0
+	point 7,[asciz/RP05/]
+	point 7,[asciz/RP06/]
+	point 7,[asciz/RP07/]
+	point 7,[asciz/RP20/]
+	point 7,[asciz/RM03/]
+typtl==.-typtab
+
+
+;find and print status of mounted structure.  Structure alias is in alias.
+;uses argblk
+prmstr:	hrroi 1,alias
+	movem 1,argblk+.msgsn	;point to alias
+	setzm argblk+.msgst
+	hrroi 1,buff
+	movem 1,argblk+.msgsi	;physical ID if any
+	move 1,[.msgln,,.msgss]
+	movei 2,argblk
+	mstr
+	 erjmp [txnn flag,m%show	;are we printed?
+		 jrst [	error(,main) ]	;no.  Just setting up.
+		tmsg <Structure >
+		hrroi 1,alias
+		psout
+		tmsg < is not mounted.
+>
+		ret ]
+	txnn flag,m%show	;are we printing status, or just setting up?
+	 ret			;just setting up
+
+	tmsg <Status of structure:  >
+
+	hrroi 1,buff		; output the name
+	psout
+
+	tmsg <
+Public structure
+| Being dismounted
+| | Domestic structure
+| | | THE public structure
+| | | | Being initialized
+| | | | | Limited to 2050 size
+| | | | | | Non-regulated
+V V V V V V V	# Units   Mount count   Open file count   Alias
+>
+	
+; just print out status of all the flags at once.
+
+	move 4,argblk+.msgst
+	hrroi 5,[asciz/. /]
+	hrroi 6,[asciz/X /]
+
+	outstat MS%PS
+	outstat MS%DIS
+	outstat MS%DOM
+	outstat MS%PPS
+	outstat MS%INI
+	outstat MS%LIM
+	outstat MS%NRS
+	
+	movei 1,.priou
+	move 2,argblk+.msgnu	; output number of units.
+	movx 3,no%lfl!6b17!=10
+	nout
+	jfcl
+
+	move 2,argblk+.msgmc	; output mount count for structure.
+	movx 3,no%lfl!=12b17!=10
+	nout
+	jfcl
+
+	move 2,argblk+.msgfc	; output open file count for structure.
+	movx 3,no%lfl!=16b17!=10
+	nout
+	jfcl
+
+	tmsg <          >	; pad.
+
+	hrroi 1,alias		; output the alias
+	psout
+
+	tmsg <
+>
+	ret
+
+
+;print the base 10 number in ac 2
+prnum:	movei 1,.priou
+	movei 3,12
+	nout
+	 jfcl			;who cares?
+	ret
+
+
+	end start

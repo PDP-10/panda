@@ -1,0 +1,736 @@
+MODULE MXERR =
+BEGIN
+!	COPYRIGHT (c) DIGITAL EQUIPMENT CORPORATION 1985, 1989.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A  LICENSE AND MAY BE USED AND  COPIED
+!	ONLY IN  ACCORDANCE  WITH  THE  TERMS OF  SUCH  LICENSE  AND  WITH  THE
+!	INCLUSION OF THE ABOVE  COPYRIGHT NOTICE.  THIS  SOFTWARE OR ANY  OTHER
+!	COPIES THEREOF MAY NOT BE PROVIDED  OR OTHERWISE MADE AVAILABLE TO  ANY
+!	OTHER PERSON.  NO  TITLE TO  AND OWNERSHIP  OF THE  SOFTWARE IS  HEREBY
+!	TRANSFERRED.
+!
+!	THE INFORMATION IN THIS  SOFTWARE IS SUBJECT  TO CHANGE WITHOUT  NOTICE
+!	AND SHOULD  NOT  BE CONSTRUED  AS  A COMMITMENT  BY  DIGITAL  EQUIPMENT
+!	CORPORATION.
+!
+!	DIGITAL ASSUMES NO  RESPONSIBILITY FOR  THE USE OR  RELIABILITY OF  ITS
+!	SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+
+!++
+! FACILITY: MX's error handling routines
+!
+! ABSTRACT:
+!
+!       This module contains the MX$ERROR_ROUTINE which is called by the $ERROR
+!   macro.  In addition, the global error table, MXERRS, is defined in this
+!   module by the $ERROR_TABLE macro.  The error strings themselves are
+!   maintained in the file MXERR.REQ.  See that file for further details...
+!
+! ENVIRONMENT:  BLISS-36
+!
+! AUTHOR: Richard B. Waddington	, CREATION DATE: 21-March-1985
+!
+! MODIFIED BY:
+!
+! 	, : VERSION
+! 01	-
+!--
+
+!
+! INCLUDE FILES:
+!
+%IF %SWITCHES(TOPS20) %THEN
+    LIBRARY 'monsym';
+    LIBRARY 'mxjlnk';
+%FI
+LIBRARY 'mxnlib';
+LIBRARY 'mxlib';
+!
+! TABLE OF CONTENTS:
+!
+
+FORWARD ROUTINE
+    mx$error_processor,               !The main error processing routine.
+    mx$build_error_message,         !Format an error string using NMU$TEXT.
+    log: NOVALUE,                   !Write an error string to the logfile.
+    link: NOVALUE;                  !Link an error string into the Message
+                                    !   Table Entry.
+!
+! OWN STORAGE:
+!
+
+$error_table ;
+
+!
+! EXTERNAL REFERENCES:
+!
+
+EXTERNAL
+        logspc,
+        mxlogf,
+        mxlogm,
+        active_message_table;
+
+EXTERNAL ROUTINE
+        mx$file_exists,
+        mx$file_routines,
+        mx$message_queue_routines,
+	nmu$text_manager,
+	nmu$sched_manager,
+	nmu$queue_manager,
+	nmu$memory_manager,
+	nmu$table_routines;
+
+%global_routine ('MX$ERROR_PROCESSOR', signal_vector_) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!%(318)% Rewrite this routine
+!
+!       This routine performs error handling for MX.  Errors are described
+!   by a Bliss Condition Code.  Condition Codes have 3 parts: SEVERITY
+!   (either Informational, Warning, or Severe), FACILITY (which piece of
+!   software encountered the error), and CODE (the error code itself).  MX
+!   uses the CODE as an index into an error string table.  The FACILITY
+!   field determines which table to use.  There are several defined
+!   facilities: $ERR denotes the MXERRS table.  This table contains general
+!   MX errors.  $DCN denotes the DNERRS table.  This table contains DECnet
+!   reject codes.  For TOPS-10, there are also $FOP (for FILOP. errors),
+!   $ENQ (for ENQ. and DEQ. errors).  Other tables may be added as needed.
+!   $MON is a special code that denotes monitor errors.  On TOPS-20, it
+!   invokes code to expand jsys errors via the ERSTR% jsys.  On TOPS-10,
+!   the optional data field is treated as a status value which in turn
+!   denotes the appropriate error table and index.
+!
+!   INFORMATION ERRORS:
+!
+!       An error string is built based on the Facility and Error Code.
+!   This string is written to the logfile.
+!   
+!   WARNING ERRORS:
+!
+!       An error string is built based on the Facility and Error Code.
+!   This string is written to the logfile.  If the ID field denotes a mail
+!   message, then this string is hooked into that message.
+!
+!   SEVERE ERRORS:
+!
+!       An error string is built based on the Facility and Error Code.
+!   This string is written to the logfile.  If the ID field denotes a mail
+!   message, then this string is hooked into that message, and the message
+!   is rejected.  If the ID field does not denote a mail message then this
+!   is a severe internal error, in which case, we crash MX.
+!
+!       Error strings are built by making calls to the NMU$TEXT routine.
+!   Consequently, error strings may contain any directive supported by
+!   NMU$TEXT.  If an error message contains a directive, then the call to
+!   this routine must include the data for the error message.  Similarly,
+!   if an optional message is included, and it contains directives for
+!   NMU$TEXT, then the optional data must be included.  For more details on
+!   individual message formats, see MXERR.REQ.
+!
+!       This routine takes an argument block with the following format:
+!
+!   SIGNAL_VECTOR:  +---------------------------+   0   $ecnt
+!                   |         Count             |
+!                   +---------------------------+   1   $ecc
+!                   |      Condition Code       |
+!                   +---------------------------+   2   $eamx
+!                   |        Message ID         |
+!                   +---------------------------+   3   $edc
+!                   !  OptDataCnt,,MsgDataCnt   |
+!                   +---------------------------+   4   $emd
+!                   \    Error message data     \
+!                   \           ...             \
+!                   \                           \
+!                   +---------------------------+
+!                   |  Opt. Msg Condition Code  |
+!                   +---------------------------+
+!                   \   Optional message data   \
+!                   \           ...             \
+!                   \                           \
+!                   +---------------------------+
+!
+!       The message id is the index into the Active Message Table.
+!
+!       The condition code format is the same as the one defined in the
+!   Bliss Language Guide section on Condition Handling, and it contains the
+!   Severity level (STS$K_INFO, STS$K_WARNING, STS$K_SEVERE) the error code
+!   (an index into an error table), and the Facility ($ERR, $DCN, etc.)
+!   The Facility is used as an index into a meta-table (ERRTYP) to fetch
+!   the address of the table containing the error string.  Note that the
+!   signal_vector is very similar to signal vectors used by the condition
+!   handling facilities of Bliss.
+!
+! FORMAL PARAMETERS:
+!
+!	Signal_vector:  The address of the argument block described above.
+!
+! IMPLICIT INPUTS:
+!
+!       ERRTYP: The global table of error tables
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!       NONE
+!
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+    BIND
+        sig = .signal_vector_: VECTOR,
+        cnt =                   sig[$ecnt], 
+        cond =                  sig[$ecc]: CONDITION_VALUE,
+        msg_id =                sig[$eamx], 
+        data_counts =           sig[$edc];
+
+    LOCAL
+        list_header,
+        len,
+        msg_data_block: REF message_table_entry,
+        err_msg;
+
+    len = mx$build_error_message(sig,err_msg);
+
+    log(.err_msg,.msg_id);
+
+    IF (.msg_id EQL 0) AND (.cond[STS$V_SEVERITY] EQL STS$K_SEVERE)
+    THEN
+        stop_program;
+
+    IF (.cond[STS$V_SEVERITY] EQL STS$K_WARNING) OR 
+       (.cond[STS$V_SEVERITY] EQL STS$K_INFO)
+    THEN
+        BEGIN
+        nmu$memory_release(.err_msg,CH$ALLOCATION(.len));
+        RETURN 0;
+        END;
+
+    IF .msg_id NEQ 0
+    THEN
+        BEGIN
+!
+! Get the message data block
+!
+        nmu$table_fetch(
+            active_message_table,
+            .msg_id<message_index>,
+            msg_data_block);
+!
+! Link in the error message
+!
+        list_header = .msg_data_block[msg_err_list];
+        link(.err_msg, list_header);
+        msg_data_block[msg_err_list] = .list_header;
+!
+! Does this message have outstanding work requests still?
+! If so, we're done for now.
+!
+        IF .msg_data_block[msg_state] EQL $msg_incomplete
+        THEN
+            RETURN -2;
+!
+! Otherwise, set the message state appropriately.
+!
+        IF .cond[STS$V_SEVERITY] EQL STS$K_SEVERE
+        THEN
+            msg_data_block[msg_state] = $msg_canceled
+        END;
+
+    RETURN 0;
+    END;			!End of MX$ERROR_ROUTINE
+
+%global_routine('MX$ERROR_HANDLER', SIG, MECH, ENBL) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!%(318)% Rewrite this routine
+!
+!       This routine is a Bliss Condition Handler for MX.  It is only
+!   invoked by MXLCL routines.  It's purpose is similar to that of
+!   MX$ERROR_PROCESSOR.
+!
+! FORMAL PARAMETERS:
+!
+!	SIG:    Same as for MX$ERROR_PROCESSOR.
+!       MECH:   The mechanism vector.  See the bliss manual for
+!               more information.
+!       ENBL:   The enable vector.  The following items are passed
+!               here:
+!
+!       +-----------------------------------+
+!       | Count of the following arguments  |
+!       +-----------------------------------+
+!       |  Address of IPCF header record    |
+!       +-----------------------------------+
+!       |  Address of Message Data Block    |
+!       +-----------------------------------+
+!       | Address of current Recpient Record|
+!       +-----------------------------------+
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! COMPLETION CODES:
+!
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!--
+    BEGIN
+
+    MAP
+      sig: REF VECTOR,			! signal vector
+      mech: REF VECTOR,			! mechanism vector
+      enbl: REF VECTOR;			! enable vector
+
+    BIND
+        cnt =                   sig[$ecnt],
+        cond =                  sig[$ecc]: CONDITION_VALUE,
+        msg_id =                sig[$eamx],
+        data_counts =           sig[$edc],
+
+        enbcnt =                 enbl[0],
+        hdr =                   .enbl[1]: REF ipcf_hdr,
+        msg =                   .enbl[2]: REF message_table_entry,
+        rec =                   .enbl[3]: REF ipcf_rec,
+        return_value = MECH
+	[
+	%BLISS16(1)
+	%BLISS36(1)
+	%BLISS32(3)
+	];
+
+    EXTERNAL LITERAL SS$UNW;
+
+    LOCAL 
+        len,
+        err_msg;
+
+    IF sts$match(.cond, ss$unw)
+    THEN
+        RETURN 0;
+
+    len = mx$build_error_message(.sig,err_msg);
+
+    log(.err_msg,.msg_id);
+
+    nmu$memory_release(.err_msg, CH$ALLOCATION(.len));
+
+    return_value = 1;
+
+    IF .msg EQL 0 
+    THEN
+        SETUNWIND()
+    ELSE
+        BEGIN
+        IF .cond[STS$V_SEVERITY] EQL STS$K_ERROR
+        THEN
+            BEGIN
+            SETUNWIND();
+            msg[msg_state] = $msg_canceled;
+            END
+        ELSE
+            IF .cond[STS$V_SEVERITY] EQL STS$K_SEVERE
+            THEN
+                msg[msg_state] = $msg_canceled
+            ELSE
+                msg[msg_state] = $msg_warning;
+        END;
+
+    IF .enbcnt EQL 3
+    THEN
+        rec[rec_error] = .cond[STS$V_CODE];
+
+    RETURN .return_value
+    END;
+%global_routine ('MX$BUILD_ERROR_MESSAGE', signal_vector_, msg_) =
+!++
+!%(318)% Rewrite this routine
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!          This routine builds the error message string from the error table
+!   (MXERRS) and the data in the signal vector.  This message is then copied to
+!   dynamic storage, and its address is returned.
+!
+! FORMAL PARAMETERS:
+!
+!	Signal_vector:  The address of the argument block described above.
+!
+!       Msg:    The address to return the address of the message string
+!
+! IMPLICIT INPUTS:
+!
+!	MXERRS:         The global error message table.
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!       The address of the formatted error message.
+!
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+    BIND
+        msg =                  .msg_,
+        sig =                  .signal_vector_: VECTOR,
+        cnt =                   sig[$ecnt],
+        cond =                  sig[$ecc]: CONDITION_VALUE,
+        msg_id =                sig[$eamx],
+        data_counts =           sig[$edc];
+
+    BIND
+       err_msg_directive = CH$PTR(UPLIT(%ASCIZ '%A%I')),
+       opt_msg_directive = CH$PTR(UPLIT(%ASCIZ '%A%I%/%27S (%I)')),
+       wrn_prefix        = CH$PTR(UPLIT(%ASCIZ '%')),
+       sev_prefix        = CH$PTR(UPLIT(%ASCIZ '?')),
+%IF %SWITCHES(TOPS20) %THEN
+       mon_opt_msg        = CH$PTR(UPLIT(%ASCIZ '%J'));
+%ELSE
+       mon_opt_msg        = CH$PTR(UPLIT(%ASCIZ '%A'));
+%FI
+
+    LOCAL
+        len,
+        directive,
+        buf_ptr,
+        arg_cnt,
+        opt_msg: REF CONDITION_VALUE,
+        arglist:    VECTOR[20];
+
+    STACKLOCAL
+        buf:    VECTOR[CH$ALLOCATION(256)];
+
+!
+! Get the prefix argument (% or ?)
+!
+    arglist[0] = (
+        IF .cond[STS$V_SEVERITY] EQL STS$K_SEVERE
+        THEN
+            sev_prefix
+        ELSE
+            wrn_prefix);
+!
+! Get the error string directive based on the condition code
+!
+    arglist[1] = .(.errtyp[.cond[STS$V_FAC_MX]] + .cond[STS$V_CODE]);
+!
+! Copy the error string arguments
+!
+    INCR j FROM 0 TO .data_counts<right_half> - 1 DO 
+        arglist[.j + 2] = .sig[$emd + .j];
+!
+! Get the Optional Message Condition Code
+!
+    opt_msg = sig[$emd + .data_counts<right_half>];
+!
+! If there's an optional message, use the appropriate directive.  Set the
+! argument count.
+!
+    arg_cnt = .data_counts<right_half> + 2;
+
+    IF ..opt_msg EQL 0
+    THEN
+        directive = err_msg_directive
+    ELSE
+        BEGIN
+        directive = opt_msg_directive;
+!
+! Since have an optional msg, include it and its arguments in the arglist.
+!
+%IF %SWITCHES(TOPS20) %THEN
+        arglist[.arg_cnt] = (
+            IF .opt_msg[STS$V_FAC_MX] EQL $mon
+            THEN
+                IF .sig[$emd + .data_counts<right_half> + 1] GTR %O'600000'
+                THEN
+                    mon_opt_msg
+                ELSE
+                    .mxerrs[.sig[$emd + .data_counts<right_half> + 1]]
+            ELSE
+                .(.errtyp[.opt_msg[STS$V_FAC_MX]] + .opt_msg[STS$V_CODE])
+            );
+
+%ELSE !Begin TOPS-10 Conditional
+
+        IF .opt_msg[STS$V_FAC_MX] EQL $mon
+        THEN
+            opt_msg = .opt_msg + 1;
+
+        arglist[.arg_cnt] =
+            .(.errtyp[.opt_msg[STS$V_FAC_MX]] + .opt_msg[STS$V_CODE]);
+
+%FI !End TOPS-10 Conditional
+
+        INCR j FROM 1 TO .data_counts<left_half> DO
+            arglist[.j + .arg_cnt] = 
+                .sig[$emd + .data_counts<left_half> + .j];
+
+        arg_cnt = .arg_cnt + .data_counts<left_half> + 1;
+        END;
+!
+! Now, build the final string in the temporary buffer
+!
+    buf_ptr = CH$PTR(buf);
+    len = nmu$text(buf_ptr, 256, .directive, .arg_cnt, arglist);
+!
+! Get memory for the string and copy it
+!
+    msg = nmu$memory_get(CH$ALLOCATION(.len));
+    CH$MOVE(.len, CH$PTR(buf), CH$PTR(.msg));
+    RETURN .len
+
+    END;			!End of MX$BUILD_ERROR_MESSAGE
+%global_routine ('log', err_msg, id): NOVALUE =
+!++
+!%(318)% Add ID field to be displayed
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!       This routine takes an error message string and appends it to the log
+!   file (MX.LOG).  
+! FORMAL PARAMETERS:
+!
+!	ERR_MSG: The address of the error message text string.
+!       ID:      The id field to be displayed in the log file or 0.
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!       NONE
+!
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+    LOCAL
+        idd,
+        len,
+        ptr,
+        error;
+    STACKLOCAL
+        tbuf:   VECTOR[CH$ALLOCATION(40)],
+        buf:    VECTOR[CH$ALLOCATION(max_string_length)];
+
+    IF .err_msg<left_half> EQL 0
+    THEN
+        err_msg = CH$PTR(.err_msg);
+
+    %IF %SWITCHES(TOPS20) %THEN
+        BEGIN
+        declare_jsys(odtim);
+        $$odtim(CH$PTR(tbuf),-1,0);
+        END;
+    %ELSE
+	udtdat(-1,tbuf);
+    %FI
+
+    IF .id EQL 0
+    THEN
+        BEGIN
+        idd = CH$PTR(UPLIT(%ASCIZ '%A'));
+        id = CH$PTR(UPLIT(%ASCIZ '     '))
+        END
+    ELSE
+        idd = CH$PTR(UPLIT(%ASCIZ '%(5R)H'));
+
+    ptr = CH$PTR(buf);
+    len = $nmu$text(ptr,max_string_length, '%A %I  %A%/', 
+                    CH$PTR(tbuf),
+                    .idd,
+                    .id,
+                    .err_msg) - 1;
+
+    IF .mxlogf EQL 0
+    THEN
+        BEGIN
+        IF mx$file_exists(CH$PTR(logspc))
+        THEN
+            mxlogm = file_access_append_only
+        ELSE    
+            mxlogm = file_access_write_only;
+
+        mxlogf = mx$file_open(CH$PTR(logspc), .mxlogm, error);
+        END;
+
+    mx$file_write(.mxlogf, CH$PTR(buf), .len, error);
+    mxlogm = -1;
+!    $E_DISPLAY(CH$PTR(buf));
+    END;			!End of MX$ERROR_ROUTINE
+%global_routine ('elog', err_code, mid, dat, reason): NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       This routine builds a single argument error string and writes it to
+!   the log file (MX.LOG).
+!
+! FORMAL PARAMETERS:
+!
+!	ERR_CODE: An index into the $ERR table of errors.
+!       MID:       The id field to be displayed in the log file or 0.
+!       DAT:      The variable data to be displayed.
+!       REASON:   For TOPS-20, either a jsys error, or a DECnet reject
+!                 code.  For TOPS-10, TAB,,INDEX identifying which error
+!                 table and which error to display.
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!       NONE
+!
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+    IF .reason EQL 0
+    THEN
+        $error( SEVERITY =      STS$K_WARNING,
+                CODE =          .err_code,
+                FACILITY =      $err,
+                MESSAGE_DATA =  .dat,
+                ID=             .mid)
+    ELSE
+
+%IF %SWITCHES(TOPS20) %THEN
+        IF .reason GTR %O'600000'
+        THEN
+            $error( SEVERITY =      STS$K_WARNING,
+                    CODE =          .err_code,
+                    FACILITY =      $err,
+                    MESSAGE_DATA =  .dat,
+                    OPTIONAL_MESSAGE = (FAC=$mon),
+                    OPTIONAL_DATA = .reason,
+                    ID=             .mid)
+        ELSE
+%FI !End TOPS20 CONDITIONAL
+
+            $error( SEVERITY =      STS$K_WARNING,
+                    CODE =          .err_code,
+                    FACILITY =      $err,
+                    MESSAGE_DATA =  .dat,
+                    OPTIONAL_MESSAGE = (FAC=$dcn,
+                                        SEV=STS$K_INFO,
+                                        COD=.reason),
+                    ID=             .mid)
+    END;			!End of ELOG
+%routine ('link', err_msg_, header_block_): NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       This routine takes an error message string and links it into the
+!   message data block.
+!
+! FORMAL PARAMETERS:
+!
+!	ERR_MSG:        The address of the error message text string.
+!
+!       HEADER_BLOCK:   The address of the list header.
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!       NONE
+!
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+    BIND
+        err_msg = .err_msg_,
+        header_block = .header_block_;
+
+    LOCAL
+        oldblk:     REF list_blk,
+        newblk:     REF list_blk;
+
+    newblk = mx$get_list_blk;
+    newblk[lst_data] = err_msg;
+    newblk[lst_next] = 0;
+    IF .header_block EQL 0
+    THEN
+        header_block = .newblk
+    ELSE
+        BEGIN
+        oldblk = .header_block;
+
+        WHILE .oldblk[lst_next] NEQ 0 DO oldblk = .oldblk[lst_next];
+
+        oldblk[lst_next] = .newblk;
+        END;
+    END;			!End of MX$ERROR_ROUTINE
+
+END				!End of module
+ELUDOM

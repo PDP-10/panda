@@ -1,0 +1,2064 @@
+/*	CCSTMT.C - Statement and Expression Parsing
+**
+**	(c) Copyright Ken Harrenstien 1989
+**		All changes after v.340, 4-Aug-1988
+**	(c) Copyright Ken Harrenstien, SRI International 1985, 1986
+**		All changes after v.101, 8-Aug-1985
+**
+**	Original version (C) 1981  K. Chen
+*/
+
+#include "cc.h"
+#include "cclex.h"	/* For reference to "constant" structure */
+
+/* Local prototypes */
+#ifdef __STDC__
+#define P_(a) a
+#else
+#define P_(a) ()
+#endif
+
+static NODE *statement P_((void));
+static NODE *compoundstmt P_((int toplev));
+static NODE *dostmt P_((void));
+static NODE *whilestmt P_((void));
+static NODE *continuestmt P_((void));
+static NODE *breakstmt P_((void));
+static NODE *forstmt P_((void));
+static NODE *ifstmt P_((void));
+static NODE *gotostmt P_((void));
+static SYMBOL *plabel P_((SYMBOL *osym,int defp));
+static NODE *switchstmt P_((void));
+static NODE *casestmt P_((void));
+static NODE *defaultstmt P_((void));
+static NODE *returnstmt P_((void));
+static NODE *exprstmt P_((void));
+static NODE *exprcntrl P_((void));
+static NODE *exprconst P_((void));
+static NODE *evalifok P_((NODE *e));
+static NODE *ediscifok P_((NODE *e));
+static NODE *expression P_((void));
+static NODE *condexpr P_((void));
+static NODE *binary P_((int prec));
+static NODE *castexpr P_((void));
+static NODE *unary P_((void));
+static NODE *ptrapply P_((NODE *n));
+static NODE *sizeexpr P_((void));
+static NODE *postexpr P_((void));
+static NODE *pincdec P_((NODE *n,int op));
+static NODE *primary P_((void));
+static NODE *bin_asm P_((void));
+static NODE *bin_offsetof P_((void));
+static NODE *parglist P_((SYMBOL *s,TYPE *ft));
+static int cmpatype P_((TYPE *pt,TYPE *at));
+static NODE *chkadd P_((int op,NODE *n));
+
+#undef P_
+
+/* Variables global to statement parsing routines */
+static int contlevel,		/* Current nesting depth for continue (loop) */
+	caselevel,		/* Ditto for case (switch) */
+	breaklevel;		/* Ditto for break (either loop or switch) */
+
+/* Variables pushed/restored by each switch, global during a switch level */
+static struct sw {		/* Structure for easier push/pop */
+	NODE	*swdefault,	/* Default stmt if any seen */
+		*swcases,	/* Head of list of case stmts seen */
+		*swtail;	/* Tail of list */
+	int	swcount;	/* # of case labels in list */
+	unsigned swrange;	/* AND constant for case range check */
+} sw;
+
+/*
+** FUNSTMT - Parse function statement.
+**	Main entry to statement parser from CCDECL.
+**	Returns a statement-list which ends with a Q_RETURN node.
+** Entered with current token T_LBRACE ('{').
+** Returns with current token T_RBRACE ('}'), unlike most other
+** parsing routines.
+** Originally this was so that the calling routine can fix up the symtab
+** before attempting to read the next token.  See compoundstmt() for more
+** explanation.
+*/
+
+NODE *
+funstmt()
+{
+    /* Initialize local vars */
+    contlevel = caselevel = breaklevel = 0;
+
+    return ndeflr(N_STATEMENT,
+		compoundstmt(1),		/* Parse top-level block */
+		ndefl(N_STATEMENT,		/* with a RETURN at end */
+			ndefop(Q_RETURN)));
+}
+
+/*
+** Parse statement
+** Ref. [1] A.9
+*/
+
+static NODE *
+statement()
+{
+    SYMBOL *sym, *nlabel;
+    NODE *s;
+    int tokn;
+
+    switch (token) {
+    case T_SCOLON:		/* Null statement */
+	nextoken();
+	return NULL;
+    case T_LBRACE:		/* Compound statement */
+	s = compoundstmt(0);	/* Parse inner block */
+	nextoken();		/* Doesn't set up new token, so do it now */
+	return s;
+
+    case Q_SWITCH:	return switchstmt();
+    case Q_CASE:	return casestmt();
+    case Q_DEFAULT:	return defaultstmt();
+    case Q_DO:		return dostmt();
+    case Q_WHILE:	return whilestmt();
+    case Q_FOR:		return forstmt();
+    case Q_GOTO:	return gotostmt();
+    case Q_IF:		return ifstmt();
+    case Q_RETURN:	return returnstmt();
+    case Q_BREAK:	return breakstmt();
+    case Q_CONTINUE:	return continuestmt();
+
+    case Q_IDENT:	/* Check for labeled statement [H&S 8.3] */
+	sym = csymbol;			/* get last symbol if any */
+	tokn = token;			/* and last token */
+	if (nextoken() == T_COLON) {	/* it is if followed by colon */
+	    nextoken();			/* skip over lab: */
+	    nlabel = plabel(sym, 1);	/* get label symbol number */
+	    s = ndefl(N_LABEL, statement());	/* make label node */
+	    s->Nxfsym = nlabel;
+	    return(s);
+	}
+	tokpush (tokn, sym);		/* push back token */
+					/* and fall through to try expr */
+    default:
+	return exprstmt();		/* Parse expression stmt */
+
+    case T_EOF:				/* catch premature EOF */
+	error("Unexpected EOF within function");
+	return NULL;
+    }
+}
+
+/* COMPOUNDSTMT - Parse compound statement
+**	[K&R A.9.2]  [H&S 8.4]
+**
+** When called, current token is the left-brace opening the compound stmt.
+** On return, the current token is either T_EOF or the closing right-brace.
+** This is only called from funstmt() at top level, or statement() at
+** any inner levels.
+**
+**	NOTE CAREFULLY: At the end of a compound statement (block)
+** any local symbols which were defined within that
+** block must be deactivated.  This must be done BEFORE the lexer looks
+** at the next token, because the next token might be an identifier and this
+** identifier might happen to correspond to a symbol which is about to
+** be deactivated!  Typedef symbols are especially vulnerable to this.
+**
+** Note that this is unlike most other parsing routines which always set up the
+** next token after gobbling everything pertinent to their parsing.
+** Originally this was to permit CCDECL's funcdef() to properly reset
+** the symbol table; this routine could not just call nextoken() after the
+** endlsym() because if it was parsing a function body, the terminating
+** '}' would end not only the current inner block but also a virtual block
+** that enclosed the function parameter definitions.  Ending this virtual
+** block at the right level required waiting until control returned to
+** CCDECL's funcdef().  This is no longer necessary because ANSI C mandates
+** that function parameters have the same scope as if declared at the
+** start of the function body's block, and so funcdef() has already set up
+** this local symbol block for us.  funstmt() passes the word by setting
+** "toplev" TRUE.
+*/
+
+static NODE *
+compoundstmt(toplev)		/* toplev TRUE if this is function body */
+{
+    SYMBOL *prevlsym;
+    NODE *u, *beg, *n, *nr;
+    extern NODE *ldecllist();	/* from CCDECL */
+    extern SYMBOL *beglsym();
+    extern void endlsym();
+
+    prevlsym = toplev ? NULL	/* At top level, block is already set up */
+		: beglsym();	/* else start a new symbol block! */
+    nextoken();			/* Now get next token after left-brace */
+
+    u = ldecllist();		/* Parse declarations, get list of inits */
+
+    for (beg = n = NULL; token != T_RBRACE && token != T_EOF; n = nr) {
+	nr = ndefl(N_STATEMENT, statement());
+	if (n != NULL) n->Nright = nr;
+	else beg = nr;
+    }
+    if (u) u = ndeflr(N_STATEMENT, u, beg);
+    else u = beg;		/* No declarations, just code */
+
+    endlsym(prevlsym);		/* End local sym block - deactivate syms */
+				/* Important that this be done BEFORE reading
+				** the next token after the right brace!
+				*/
+    return u;	/* Return result, with right-brace still current token */
+}
+
+/* DOSTMT - Parse DO iterative statement
+**	[K&R A.9.5]  [H&S 8.6.2]
+*/
+
+static NODE *
+dostmt()
+{
+    NODE *cond, *stmt;
+
+    nextoken();
+    contlevel++;
+    breaklevel++;
+    stmt = statement();
+    breaklevel--;
+    contlevel--;
+    expect(Q_WHILE);
+    expect(T_LPAREN);
+    cond = exprcntrl();
+    expect(T_RPAREN);
+    expect(T_SCOLON);
+    return ndeflr(Q_DO, cond, stmt);
+}
+
+/* WHILESTMT - Parse WHILE iterative statement
+**	[K&R A.9.4] [H&S 8.6.1]
+*/
+
+static NODE *
+whilestmt()
+{
+    NODE *cond, *stmt;
+
+    nextoken();
+    expect(T_LPAREN);
+    cond = exprcntrl();
+    expect(T_RPAREN);
+    breaklevel++;
+    contlevel++;
+    stmt = statement();
+    breaklevel--;
+    contlevel--;
+    return ndeflr(Q_WHILE, cond, stmt);
+}
+
+/* CONTINUESTMT - Parse CONTINUE statement
+**	[H&S 8.8]
+*/
+
+static NODE *
+continuestmt()
+{
+    if (contlevel == 0) error("Continue must be within loop");
+    nextoken();
+    expect(T_SCOLON);		/* it's followed by a semicolon */
+    return ndefop(Q_CONTINUE);
+
+}
+
+/* BREAKSTMT - Parse BREAK statement
+**	[H&S 8.8]
+*/
+
+static NODE *
+breakstmt()
+{
+    if (breaklevel == 0) error("Break must be within loop or switch");
+    nextoken();
+    expect(T_SCOLON);		/* it's followed by a semicolon */
+    return ndefop(Q_BREAK);
+}
+
+/* FORSTMT - Parse FOR iterative statement
+**	[K&R A.9.6]  [H&S 8.6.3]
+*/
+
+static NODE *
+forstmt()
+{
+    NODE *preamble, *e1, *e2, *e3, *s;
+
+    nextoken();
+    e1 = e2 = e3 = NULL;
+    expect(T_LPAREN);
+    if (token != T_SCOLON)		/* Get initialization expr if one */
+	e1 = ediscifok(evalifok(expression()));
+    expect(T_SCOLON);
+    if (token != T_SCOLON)		/* Get control expr if one */
+	e2 = exprcntrl();
+    expect(T_SCOLON);
+    if (token != T_RPAREN)		/* Get incrementation expr if one */
+	e3 = ediscifok(evalifok(expression()));
+    expect(T_RPAREN);
+    contlevel++;
+    breaklevel++;
+    s = statement();
+    breaklevel--;
+    contlevel--;
+    preamble = ndeflr(N_NODE, e1, e2);
+    preamble = ndeflr(N_NODE, preamble, ndefl(N_NODE, e3));
+    return ndeflr(Q_FOR, preamble, s);
+}
+
+/* IFSTMT - Parse IF conditional statement
+**	[K&R A.9.3] [H&S 8.5]
+*/
+static NODE *
+ifstmt()
+{
+    NODE *cond, *then, *elsec;
+
+    nextoken();
+    expect(T_LPAREN);
+    cond = exprcntrl();
+    expect(T_RPAREN);
+    then = statement();
+    if (token == T_ELSE) {
+	nextoken();
+	elsec = statement();
+    } else elsec = NULL;
+
+    return ndeflr(Q_IF, cond, ndeflr(N_NODE, then, elsec));
+}
+
+/* ----------------------------------------- */
+/*	goto statement  Ref.[1]  A.9.11      */
+/* ----------------------------------------- */
+
+static NODE *
+gotostmt()
+{
+    NODE *n;
+    SYMBOL *s;
+
+    nextoken();
+    s = csymbol;
+    expect(Q_IDENT);			/* goto lab */
+    n = ndefop(Q_GOTO);
+    n->Nxfsym = plabel(s, 0);
+    expect(T_SCOLON);			/* goto lab; */
+    return n;
+}
+
+
+/* PLABEL - Handle label identifier
+*/
+static SYMBOL *
+plabel(osym, defp)
+SYMBOL *osym;
+{
+    SYMBOL *sym;
+
+    if (osym == NULL) return 0;		/* already lost, don't barf twice */
+
+    if (sym = symflabel(osym)) {	/* See if this is a label sym */
+	if (osym->Sclass == SC_UNDEF)	/* Yes!  If original was undefined */
+	    freesym(osym);		/* then flush it */
+    } else {				/* No existing label sym, make one */
+	sym = symqcreat(osym);		/* Make new local sym from this one */
+	sym->Sflags |= SF_LABEL;	/* Now mark as a label sym! */
+	sym->Sclass = SC_ULABEL;
+	sym->Ssym = newlabel();		/* give it a real label number */
+	if (!defp)			/* If not defining the label, */
+	    sym->Srefs++;		/* then this is a reference */
+    }
+
+    if (defp) {
+	if (sym->Sclass == SC_LABEL)	/* previously defined? */
+	    error("Label %S already defined", sym);
+	else
+	    sym->Sclass = SC_LABEL;	/* if being defined, remember so */
+    }
+    return sym->Ssym;			/* return the label symbol */
+}
+
+/* SWITCHSTMT - Parse SWITCH statement
+**	[K&R A.9.7]  [H&S 8.7]
+*/
+
+static NODE *
+switchstmt()
+{
+    NODE *cond, *stmt, *n;
+    struct sw savesw;		/* Saved state of case stmt collection */
+
+    nextoken();
+    expect(T_LPAREN); 
+    cond = expression();
+    expect(T_RPAREN);
+
+    /* Must fix up this check to reflect what we are capable of compiling.
+    ** Aggregate, pointer and floating-point types are not allowed.
+    ** Perhaps this could be set in the runtime table.
+    */
+    if (!tisinteg(cond->Ntype)) {
+	error("Switch expression must be of integral type");
+	cond = ndeficonst(0);
+    } else				/* Apply usual unary conversions */
+	cond = evalifok(convunary(cond));
+
+    caselevel++;
+    breaklevel++;
+    savesw = sw;			/* Save current level's variables */
+    sw.swdefault = sw.swcases = sw.swtail = NULL;
+    sw.swcount = 0;			/* No case stmts seen yet */
+    sw.swrange = -1;			/* Range is all bits for now */
+    if (cond->Nop == Q_ANDT) {		/* but check for const AND */
+	if (cond->Nleft->Nop == N_ICONST) sw.swrange &= cond->Nleft->Niconst;
+	if (cond->Nright->Nop == N_ICONST) sw.swrange &= cond->Nright->Niconst;
+    }
+
+    stmt = statement();
+
+    caselevel--;
+    breaklevel--;
+
+    n = ndeflr(Q_SWITCH, cond, stmt);
+    if (sw.swdefault) {		/* Put default at start of list, */
+	sw.swdefault->Nright = sw.swcases;
+	n->Nxswlist = sw.swdefault;
+    } else n->Nxswlist = sw.swcases;	/* and point to head of result */
+    sw = savesw;		/* Restore vars for previous level */
+    return n;
+}
+
+/* CASESTMT - Parse CASE labeled statement
+**	[K&R A.9.7]  [H&S 8.7]
+*/
+
+static NODE *
+casestmt()
+{
+    NODE *n, *this, *old;
+
+    nextoken();
+    n = exprconst();		/* parse constant expr for this case */
+    if (caselevel == 0) {	/* make sure in switch stmt */
+	error("Case label outside switch statement");	/* nope */
+	n = NULL;			/* disable further checks */
+    }
+    this = ndefop(Q_CASE);
+
+    /* Need to fix up the case constant-expression value further.
+    ** It must be a constant expression and of the same type as the
+    ** switch control-expression.  We fold in case convunary produces a cast.
+    */
+    if (n != NULL)
+	n = evalexpr(convunary(n));
+
+    /*
+    ** Perform various checks on the new case value.
+    **
+    ** If it's NULL, then there was some error that's already been reported.
+    ** Otherwise, it must be a constant, and one that hasn't been seen before
+    ** in this switch().  We also make sure that, if the value being tested
+    ** is a bitwise AND with a constant, the case value can happen as a result.
+    */
+    if (n == NULL) ;			/* already complained, don't redo */
+    else if (n->Nop != N_ICONST)
+	error("Case label must be integral constant expr");
+    else {				/* Yes, can perform further checks */
+	for (old = sw.swcases; old != NULL; old = old->Nright) /* go through */
+	    if (old->Nxfint == n->Niconst) {	/* checking for same value */
+		error("Switch statement has duplicate case labels: %d",
+			n->Niconst);	/* complain if duplicate */
+		break;			/* but only complain once */
+	    }
+	if (old == NULL) {		/* do this unless it was a dup */
+	    if ((n->Niconst & sw.swrange) != n->Niconst) /* check range */
+		advise("Case label outside range of AND in switch -- %d",
+			n->Niconst);
+	    this->Nxfint = n->Niconst;	/* now safe to set case value */
+	    if (sw.swtail)		/* add to list of known cases */
+		sw.swtail->Nright = this;
+	    else sw.swcases = this;
+	    sw.swtail = this;
+
+	    if (++sw.swcount > MAXCASE)	/* Bump count of known cases */
+		error("Too many case statements (%d; max is %d)",
+			sw.swcount, MAXCASE);
+	}
+    }
+
+    /* checked value and set in list of cases, parse rest of case statement */
+    expect (T_COLON);			/* colon comes after expression */
+    this->Nleft = statement();		/* only parse after setting swcases */
+    return this;			/* return with whole of case stmt */
+}
+
+/* DEFAULTSTMT - Parse DEFAULT labeled statement
+**	[K&R A.9.7] [H&S 8.7]
+*/
+
+static NODE *
+defaultstmt()
+{
+    NODE *n;
+
+    nextoken();
+    if (caselevel == 0)
+	error("Case label outside switch statement");
+    else if (sw.swdefault != NULL)	/* Err if already have default stmt */
+	error("Switch statement has multiple \"default\" labels");
+
+    expect(T_COLON);
+    sw.swdefault = n = ndefop(Q_DEFAULT);
+    n->Nleft = statement();
+    return n;
+}
+
+/* RETURNSTMT - Parse RETURN statement
+**	[K&R A.9.10]  [H&S 8.9 and 9.8]
+*/
+
+static NODE *
+returnstmt()
+{ 
+    NODE *e;
+    TYPE *t;
+
+    t = curfn->Stype->Tsubt;		/* Get type of function return val */
+    if (nextoken() == T_SCOLON) {
+	/* No return value.  Should check to see whether return type is
+	** specified for function and give warning if so.
+	** Not error, for backwards compatibility.  See H&S 9.8.
+	*/
+	e = NULL;
+	if (t->Tspec != TS_VOID && t->Tspec != TS_INT)
+	    warn("No return value for value-returning function");
+    }
+    else {
+	/* Parse expression, apply assignment conversions, and optimize */
+	if (t->Tspec != TS_VOID)
+	    e = evalifok(convasgn(t, expression()));
+	else {
+	    warn("Return expression illegal in function returning void");
+	    (void)expression();		/* Parse and ignore expr */
+	    e = NULL;
+	}
+    }
+    expect(T_SCOLON);
+    return ndeflr(Q_RETURN, (NODE *)NULL, e);
+}
+
+/* EXPRSTMT - Expression statement
+**	[H&S 8.2]
+**	The result value of the expression will be thrown away, so
+** some optimization can be attempted by flushing anything that has no
+** side effects.  This is performed by evaldiscard().
+*/
+static NODE *
+exprstmt()
+{
+    NODE *n;
+    n = ediscifok(evalifok(expression()));	/* Parse expr list */
+    expect(T_SCOLON);				/* followed by semicolon */
+    return n;
+}
+
+#if 0
+			EXPRESSION PARSER
+
+Here is some information about how the expression parser works.  It is
+not complete nor guaranteed to be correct.  See the INTERN.DOC file for
+a better overview.
+
+About NF_STKREF and stackrefs:
+	The global "stackrefs" is used only to decide whether some
+optimizations (in CCCSE and CCOPT) should be attempted.  If non-zero,
+they aren't.  The flag NF_STKREF is only used here in CCSTMT for
+the sole purpose of incrementing or decrementing "stackrefs".
+The meaning of this variable appears to be "number of stack-address
+values floating around the function".  If an expression such as
+"&foo" is used in the function, and foo is an auto var, then the
+code generator/optimizer has to be avoid doing things which would
+wipe out the part of the stack that the address references, since
+there is no way to tell what parts of the local-variable stack area are
+actually being used once such an address value is created.
+	The NF_STKREF flag appears to only be set (and stackrefs bumped)
+for N_ADDR nodes (i.e. the & address operator).  Thus stackrefs would
+simply amount to a count of the number of N_ADDRs in the function which
+have an auto operand.  However, there are a few situations where an
+& address value is used immediately and then thrown away.  These places
+test their operands for the NF_STKREF flag, and if it exists then they
+decrement stackrefs.  These places appear to be:
+	(1) operands to && and ||
+	(2) The * indirection operator eg "*(&foo)"
+	(3) Some kinds of array refs (where the * op is implicitly used)
+	(4) The -> struct member operator, eg "(&foo)->"
+
+There is probably no reason why the stackrefs variable could not be computed
+after the parse tree was finished, rather than doing it during parsing.
+It is better to err on the side of bumping it up than down since the worst
+that will happen if the count is too high is that some optimizations will
+not be done.
+
+#endif
+
+/* This page contains functions which provide an interface between
+** the statement parsing routines and the expression parsing routines.
+*/
+
+/* EXPRCNTRL - Parse a statement control expression
+**	(for IF, WHILE, DO, FOR) [H&S 8.1.2]
+**	Checks the parsed <expr> for validity as a logical or control expr
+**	and returns a node pointer.
+*/
+static NODE *
+exprcntrl()
+{
+    NODE *e;
+    e = expression();			/* Parse expression */
+    if (!tisscalar(e->Ntype)) {
+	error("Control expression must be scalar type");
+	return ndeficonst(0);
+    }
+    return evalifok(e);
+}
+
+/* PCONST - parse for a constant integral expression
+**
+** Optimization is always enabled for constant parsing, since we
+** need to be able to fully resolve all constant arithmetic ops and
+** the like.
+*/
+long
+pconst()
+{
+    NODE *e;
+
+    e = exprconst();		/* Get fully optimized expression */
+    if (e->Nop != N_ICONST) {
+	error("Integral constant expected");
+	return 0;
+    }
+    return e->Niconst;
+}
+
+/* EXPRCONST - Parse for a "constant" expression.
+**	This basically just means always evaluating the parse result.
+**	This also enforces the restriction that comma and assignment ops
+**	are not parsed.
+*/
+static NODE *
+exprconst()
+{
+    return evalexpr(condexpr());	/* Get fully optimized expression */
+}
+
+
+/* EVALIFOK(e) - Optimize and evaluate an expression if OK.
+**	Unless optimization is turned off, this should be called
+**	to crunch a parsed expression.
+*/
+static NODE *
+evalifok(e)
+NODE *e;
+{	return (optpar ? evalexpr(e) : e);
+}
+static NODE *
+ediscifok(e)
+NODE *e;
+{
+    if (optpar)
+	return evaldiscard(e);
+    if (e)
+	e->Nflag |= NF_DISCARD;		/* just set flag for top-level node */
+    return e;
+}
+
+/*
+** EXPRESSION - Parse expression.
+**	[H&S 7.2.1, 7.9]
+**
+**	<expr> ::= <comma-expr>		(lowest precedence = 1)
+**		| <no-comma-expr>	(higher precedence)
+**
+**	<comma-expr> ::= <expr> ',' <expr>
+**
+**	<no-comma-expr> ::= <assignment-expr>	(precedence = 2)
+**			| <conditional-expr>	(ternary, prec = 3)
+**			| <logical-expr>
+**			| <binary-expr>
+**			| <unary-expr>
+**			| <primary-expr>
+*/
+
+/*
+** Parse <expr> - either a <no-comma-expr> or a <comma-expr> (expression list)
+** Ref. [1] A.7.1
+*/
+
+static NODE *
+expression()
+{
+    NODE *s, *e;
+
+    e = asgnexpr();			/* Get first expression */
+    if (token != T_COMMA) return e;	/* if no comma, that's it */
+
+    /*
+    ** We have an expression followed by a comma, parse the whole list.
+    ** Note array/function conversions are applied in this context.
+    **
+    ** We terminate it with a NULL (as with LISP lists) to distinguish
+    ** ((1, 2), 3) from (1, 2, 3).
+    ** The type of the last expression becomes the result type.
+    */
+    s = NULL;				/* start with chain empty, expr in t */
+    while (1) {				/* until we break out with return */
+	e = convarrfn(e);
+	s = ndef(N_EXPRLIST, e->Ntype, 0, s, e); /* chain expr */
+	if (token != T_COMMA)		/* If no comma, that's it */
+	    return s;
+
+	/* Set flag to indicate that 1st operand of comma expression can
+	** have its value discarded.  This gets set for both the list
+	** structure node (N_EXPRLIST) and the expression itself.
+	*/
+	if ((s->Nright = ediscifok(e)) == NULL) {	/* If expr flushed, */
+	    s = s->Nleft;			/* forget structure too. */
+	} else s->Nflag |= NF_DISCARD;		/* Else just add flag */
+
+	nextoken();			/* pass over comma */
+	e = asgnexpr();			/* parse another expression */
+    }
+}
+
+/*
+** ASGNEXPR - Parse assignment expression
+** Ref. [1] A.9.1
+**	[H&S 7.2.1]
+**
+**	<assignment-expr> ::= <conditional-expr>
+**			  ::= <unary-expr> <asop> <assignment-expr>
+**
+**	<asop> ::= one of:
+**			= += -= *= /= %= <<= >>= &= ^= |=
+*/
+
+NODE *
+asgnexpr()
+{
+    NODE *l, *r, *b;
+    TYPE *restype;
+    int op;
+
+    b = condexpr();			/* parse lower priority part of expr */
+    if (tok[token].tktype == TKTY_ASOP) { /* if we now have an assignment op */
+
+	/* See if left operand is a modifiable lvalue */
+	if (!(b->Nflag & NF_LVALUE)) {	/* make sure can asgn to left side */
+	    /* Nope, check for common mistake of (c ? t : f = x) */
+	    if (b->Nop == Q_QUERY && !(b->Nflag & NF_INPARENS))
+		advise("= in 3rd operand of (?:) has lower precedence -- use parentheses");
+	    error("Lvalue required as left operand of assignment");
+	}
+	else if (tisconst(b->Ntype) || tisstructiconst(b->Ntype))
+	    error("Left operand of assignment must be modifiable");
+	else if (b->Ntype->Tspec == TS_ARRAY)
+	    error("Left operand of assignment cannot be array");
+	else if (sizetype(b->Ntype) == 0)
+	    error("Left operand of assignment cannot be incomplete type");
+
+	op = token;			/* get the assignment op */
+	nextoken();			/* and move on in the token world */
+	r = asgnexpr();			/* parse right side of assignment */
+
+	l = b;				/* Save ptr to left-hand side */
+	restype = l->Ntype;		/* Remember what result type shd be */
+	b = ndef(op, restype, 0, l, r);	/* Set up operator node */
+
+	switch (op) {
+	case Q_ASPLUS:			/* +=	*/
+	case Q_ASMINUS:			/* -=	*/
+	    /* Left op can be scalar type (arith, pointer, enum) but if
+	    ** pointer or enum then right op must be integral.
+	    */
+	    if (!tisscalar(l->Ntype)) {
+		error("Left operand must have scalar type");
+		return ndeficonst(0);
+	    }
+	    if (!tisarith(l->Ntype)) {	/* Pointer or enum? */
+		if (!tisinteg(r->Ntype)) {
+		    error("Right operand must have integral type");
+		    return ndeficonst(0);
+		}
+		b = chkadd(op == Q_ASPLUS ? Q_PLUS : Q_MINUS, b);
+	    } else if (!tisarith(r->Ntype)) {
+		error("Right operand must have arithmetic type");
+		return ndeficonst(0);
+	    } else b = convbinary(b);		/* Normal binary conversions */
+	    break;
+
+	case Q_ASMPLY:			/* *=	*/
+	case Q_ASDIV:			/* /=	*/
+	    if (!tisarith(l->Ntype) || !tisarith(r->Ntype)) {
+		error("Operands must have arithmetic type");
+		return ndeficonst(0);
+	    }
+	    b = convbinary(b);		/* Apply binary convs */
+	    break;
+
+	case Q_ASMOD:			/* %=	*/
+	case Q_ASRSH:			/* >>=	*/
+	case Q_ASLSH:			/* <<=	*/
+	case Q_ASAND:			/* &=	*/
+	case Q_ASXOR:			/* ^=	*/
+	case Q_ASOR:			/* |=	*/
+	    if (!tisinteg(l->Ntype) || !tisinteg(r->Ntype)) {
+		error("Operands must have integral type");
+		return ndeficonst(0);
+	    }
+	    b = convbinary(b);		/* Apply binary convs */
+	    break;
+
+	case Q_ASGN:			/* =  Simple assignment */
+	    b->Nright = convasgn(restype, r);
+	    break;
+
+	default:
+	    int_error("asgnexpr: bad asop %Q", op);
+	    return ndeficonst(0);
+	}
+
+	/* Now see whether an additional type conversion needs to be
+	** specified when assigning the result to the left operand.
+	** This is a little bit inefficient but permits code sharing.
+	*/
+	b->Nascast = CAST_NONE;		/* Default is no conversion */
+	if (b->Ntype != restype) {	/* If type isn't what it should be, */
+	    b = convasgn(restype, b);	/* then apply assignment convs */
+	    if (b->Nop == N_CAST) {		/* If a cast was done, */
+		b->Nleft->Nascast = b->Ncast;	/* remember cast op type */
+		b = b->Nleft;		/* and remove the cast operator. */
+		b->Ntype = restype;	/* and force type to that desired. */
+	    }
+	}
+    }
+    return b;
+}
+
+/* CONDEXPR - Parse conditional expression (ternary)
+**	[H&S 7.7]
+**		<cond-expr> ::= <binary-expr> '?' <expr> ':' <cond-expr>
+**
+** One of the following must apply:
+**	Both operands have arithmetic type
+**	Both have compatible struct or union type
+**	Both have void type
+**	Both are pointers to {un}qualified versions of compatible types
+**	One is a pointer and the other is a null ptr constant
+**	One is a pointer and the other is a ptr to {un}qualified (void).
+*/
+
+static NODE *
+condexpr()
+{
+    NODE *c, *n;
+
+    c = binary(1);		/* Should check out this precedence */
+    if (token != Q_QUERY)
+	return c;		/* Not a conditional expression */
+
+    c = convarrfn(c);		/* Apply array/function conversions */
+
+    /* Conditional expression, have the conditional.  Check it. */
+    nextoken();
+    if (!tisscalar(c->Ntype)) {
+	error("First operand of (?:) must have scalar type");
+	c = ndeficonst(0);
+    }
+
+    /* Get "true" expression */
+    n = expression();
+    if (n->Nop == N_EXPRLIST && !(n->Nflag & NF_INPARENS))
+	advise("Comma inside (?:) has lower precedence -- use parentheses");
+    expect(T_COLON);
+
+    /* Now get "false" expression, bind together */
+    n = ndeflr(N_NODE, n, condexpr());
+
+    /* Now fix up types.  Things are REAL hairy for this operator.
+    */
+    n = convbinary(n);		/* First apply binary conversions. */
+    if (n->Nleft->Ntype == n->Nright->Ntype)	/* Types OK? */
+	n->Ntype = n->Nleft->Ntype;		/* Yep, use that type */
+    else {
+	if (!(n->Ntype = convternaryt(n))) {	/* Try pointer hackery */
+	    /* Failed.  Maybe later do more checking and just warn instead if
+	    ** it is possible to do an implicit conversion -- but to
+	    ** which type, left-hand or right-hand??
+	    */
+	    error("Operands of (?:) have incompatible types");
+	    n->Ntype = n->Nleft->Ntype;		/* Use type of left */
+	    n->Nleft = n->Nright = ndeficonst(0);
+	}
+    }
+
+    return ndef(Q_QUERY, n->Ntype, 0, c, n);
+}
+
+/* BINARY - Parse binary (or logical) expression
+**	Ref.[1] A.18.1
+**	[H&S 7.5, 7.6]
+**
+**		<binary-expr> ::=  <cast-expr> {<op> <binary-expr>}
+**
+** where <op> is one of:
+**				Optypes	Convs	Result	Lvalue
+**	Multiplicative:	* /	arith	bin	cvops	no
+**			%	integ	bin	cvops	no
+**	Additive:	+ -	*	bin	*	no
+**	Shift:		<< >>	integ	un,sep	cvlftop	no
+**	Inequality:  < <= > >=	*	bin	int(0/1) no
+**	Equality:	== !=	*	bin	int(0/1) no
+**	Bitwise:	& | ^	integ	bin	cvops	no
+** and <logical-op> is:
+**	Logical:	&& ||	scalar	*	int(0/1) no
+*/
+
+static NODE *
+binary(prec)
+{
+    int nprec, op, typ;
+    NODE *lx, *rx, *bx;	/* Left, right, and binary expressions */
+
+    lx = castexpr();	/* First get a left-hand <cast-expr> expression */
+
+    /* Then, if a binary operator follows it, handle the binary expression */
+    while ((typ = tok[token].tktype) == TKTY_BINOP || typ == TKTY_BOOLOP) {
+	if ((nprec = tok[token].tkprec) <= prec)
+	    break;		/* New op has lower prec than current, stop */
+	op = token;		/* Save op */
+	nextoken();
+	rx = binary(nprec);	/* Now get right-hand side of expression */
+
+	bx = ndef(op, voidtype, 0, lx, rx);	/* No type, must set */
+	switch (op) {
+	    default:
+		int_error("binary: illegal op %Q", op);
+		return ndeficonst(0);
+
+	    case Q_LAND:	/* && Logical AND */
+	    case Q_LOR:		/* || Logical OR */
+		/* Check to ensure operands are scalar */
+		lx = convarrfn(lx);	/* Apply array/funct convs */
+		rx = convarrfn(rx);
+		if (!tisscalar(lx->Ntype) || !tisscalar(rx->Ntype)) {
+		    error("Operands of && or || must have scalar type");
+		    lx = ndeficonst(0);
+		    continue;	/* Skip rest of stuff, restart loop */
+		}
+		/* Technically no further conversions are required.
+		** However, it makes life easier for the code generation if
+		** it only has to deal with full integers.
+		** If the code generation is beefed up then these two calls
+		** can be removed.
+		*/
+		bx->Nleft = convunary(lx);	/* Apply promotions if any */
+		bx->Nright = convunary(rx);
+		bx->Ntype = inttype;
+		break;
+
+	    case Q_EQUAL:
+	    case Q_NEQ:
+		/* Operands must have same type, and must be one of
+		** arith, pointer, or enum (i.e. scalar)
+		** EXCEPT for case where one is ptr and other is 0.
+		** ANSI also allows comparing any ptr to a (void *) ptr.
+		*/
+
+	    case Q_LEQ:
+	    case Q_GEQ:
+	    case Q_LESS:
+	    case Q_GREAT:
+		/* Operands must have same type, and must be one of
+		** arith, pointer, or enum (i.e. scalar)
+		*/
+		bx = convbinary(bx);		/* Apply binary convs */
+		if (op == Q_EQUAL || op == Q_NEQ) {
+		    bx = convnullcomb(bx);	/* Also check ptr + null */
+		    bx = convvoidptr(bx);	/* Also check ptr + void* */
+		}
+		if (!tisscalar(bx->Ntype)) {
+		    error("Operands of comparison must have scalar type");
+		    lx = ndeficonst(0);
+		    continue;
+		}
+		/* If types not now same, this is only okay if both are
+		** pointers to compatible unqualified types.
+		*/
+		if (bx->Nleft->Ntype != bx->Nright->Ntype	/* Not same? */
+		  && ( bx->Nleft->Ntype->Tspec == TS_PTR	/* L ptr? */
+		    && bx->Nright->Ntype->Tspec == TS_PTR	/* R ptr? */
+		    && !cmputype(bx->Nleft->Ntype->Tsubt,	/* Compat? */
+				bx->Nright->Ntype->Tsubt))) {
+		    error("Operands of comparison must have same type (%T is not compatible with %T)",
+			  bx->Nleft->Ntype->Tsubt, bx->Nright->Ntype->Tsubt);
+		    lx = ndeficonst(0);
+		    continue;
+		}
+		bx->Ntype = inttype;	/* OK, type of result is always int */
+		break;
+
+	    case Q_MPLY:
+	    case Q_DIV:
+		bx = convbinary(bx);	/* Apply usual binary convs */
+		if (!tisarith(bx->Ntype)
+			|| bx->Nleft->Ntype != bx->Nright->Ntype) {
+		    error("Mult/div operands must have arithmetic type");
+		    lx = ndeficonst(0);
+		    continue;
+		}
+		break;
+
+	    case Q_MOD:
+		bx = convbinary(bx);	/* Apply usual binary convs */
+		if (!tisinteg(bx->Ntype)
+			|| bx->Nleft->Ntype != bx->Nright->Ntype) {
+		    error("Remainder operands must have integral type");
+		    lx = ndeficonst(0);
+		    continue;
+		}
+		break;
+
+	    case Q_PLUS:
+	    case Q_MINUS:
+		bx = chkadd(op, bx);		/* Do heavy checking */
+		break;
+
+	    case Q_LSHFT:
+	    case Q_RSHFT:
+		/* Not the usual binary conversions!! */
+		bx->Nleft = convunary(lx);
+		bx->Nright = convunary(rx);
+		if (!tisinteg(bx->Nleft->Ntype)
+			|| !tisinteg(bx->Nright->Ntype)) {
+		    error("Shift operands must have integral type");
+		    lx = ndeficonst(0);
+		    continue;
+		}
+		bx->Ntype = bx->Nleft->Ntype;	/* Type is whatever left is */
+		break;
+
+	    case Q_ANDT:
+	    case Q_XORT:
+	    case Q_OR:
+		bx = convbinary(bx);
+		if (!tisinteg(bx->Ntype)
+			|| bx->Nleft->Ntype != bx->Nright->Ntype) {
+		    error("Bitwise operands must have integral type");
+		    lx = ndeficonst(0);
+		    continue;
+		}
+		break;		/* Type already set up OK */
+	}
+
+	lx = bx->Nleft;		/* For more convenient checking below */
+	rx = bx->Nright;
+	if (lx->Ntype->Tspec == TS_VOID || rx->Ntype->Tspec == TS_VOID) {
+	    error("Binary operand cannot have void type");
+	    lx->Ntype = rx->Ntype = bx->Ntype = inttype;
+	}
+	if (typ == TKTY_BOOLOP) {	/* stack is safe from comparisons */
+	    if (lx->Nflag & NF_STKREF) stackrefs--;
+	    if (rx->Nflag & NF_STKREF) stackrefs--;
+	    bx->Nflag |= NF_WASCOMP;	/* remember comparison */
+	}
+	if ((bx->Nop == Q_ANDT || bx->Nop == Q_OR) &&
+	    (((lx->Nflag & NF_WASCOMP) && !(lx->Nflag & NF_INPARENS)) ||
+	     ((rx->Nflag & NF_WASCOMP) && !(rx->Nflag & NF_INPARENS))))
+	    		/* likely lossage with & precedence */
+	    advise("Bitwise operation on result of comparison -- use parentheses");
+
+	lx = bx;		/* Binary expr becomes new left-hand operand */
+    }
+    return lx;
+}
+
+/* CASTEXPR and UNARY - Parse cast and unary expressions
+**
+**	[H&S 7.4]  Note that the BNF in the text of H&S 7.4 is faulty.
+** The following revised BNF corresponds to the LALR(1) grammar in Appendix C,
+** and should be correct.  Note in particular:
+**	(1) All unary operators have equal precedence, except for the
+** postfix operators (which have a special BNF definition).
+**	(2) A special check is made in the code for the case of
+** "sizeof(<type-name>)" in order to parse it on the spot and remove
+** a possible ambiguity (referred to by H&S 7.4.2).  This is not reflected
+** in the BNF, although H&S App. C deals with it by moving the syntax to
+** primary-expression level.
+**
+**	<unary-expr> ::= <cast-expr>
+**			| <prefix-expr>
+**
+**	<cast-expr> ::=  '(' <type-name> ')' <unary-expr>
+**
+**	<prefix-expr> ::= <postfix-expr>
+**			| <sizeof-expr>
+**			| '-' <unary-expr>	(unary minus)
+**			| '!' <unary-expr>	(logical negation)
+**			| '~' <unary-expr>	(bitwise negation)
+**			| '&' <unary-expr>	(address operator)
+**			| '*' <unary-expr>	(indirection)
+**			| '++' <unary-expr>	(preincrement)
+**			| '--' <unary-expr>	(predecrement)
+**
+**	<postfix-expr> ::= <postfix-expr> '++'	(postincrement operator)
+**			| <postfix-expr> '--'	(postdecrement operator)
+**			| <primary-expr>
+**
+**	<sizeof-expr> ::= 'sizeof' '(' <type-name> ')'
+**			| 'sizeof' <prefix-expr>	(*)
+**						
+**	(*) = the reason this is <prefix-expr> instead of <unary-expr> is
+** to reflect the fact that a cast expression cannot be used there since
+** it would be interpreted as the other kind of sizeof expression.
+**
+** Notes on unary expr ops:
+**				Operand	Convs	Result	Lvalue result
+**	Cast			any	any	any	no
+**	Sizeof			any	-	int	no
+**	Unary minus: -()	arith	unary	=	no
+**	Logical negate: !()	scalar	unary	int(0/1) no
+**	Bitwise negate: ~()	integ	unary	=	no
+**	Address: &()		lvalue	-	*()	no
+**	Indirect: *()		ptr	unary	obj	yes
+**	Prefix inc/dec:	++ --	scalar	bin	=	no
+**	Postfix inc/dec: ++ --	scalar	bin	=	no
+*/
+
+static NODE *
+castexpr()
+{
+    NODE *n;
+    TYPE *t;
+
+    if (token != T_LPAREN)
+	return unary();
+    nextoken();			/* Peek at next token */
+    if (csymbol && (tok[token].tktype == TKTY_RWTYPE
+			|| csymbol->Sclass == SC_TYPEDEF)) {
+	t = typename();		/* Parse the type-name */
+	expect(T_RPAREN);
+	prtchk(t, NULL, NULL);	/* Check for missing prototypes */
+				/* (no symbol or arg #) */
+	n = convcast(t, convarrfn(castexpr()));
+					/* Get expression, apply cast */
+	n->Nflag |= NF_USERCAST;	/* Say this was explicit user cast */
+	return n;
+    }
+    tokpush(T_LPAREN, (SYMBOL *)NULL);	/* Not a cast, push token back */
+    return unary();			/* and parse unary-expr instead! */
+}
+
+static NODE *
+unary()
+{
+    NODE *n;
+    int op;
+  
+    switch (token) {
+    default:	return postexpr();	/* Parse <postfix-expr> */
+    case T_SIZEOF: return sizeexpr();	/* Parse <sizeof-expr> */
+
+    case T_INC:	nextoken();		/* ++() Prefix increment */
+		return pincdec(unary(), N_PREINC);
+    case T_DEC:	nextoken();		/* --() Prefix decrement */
+		return pincdec(unary(), N_PREDEC);
+
+    case Q_COMPL: op = Q_COMPL;	break;	/* ~()  Bitwise not */
+    case Q_NOT:   op = Q_NOT;	break;	/* !()  Logical not */
+    case Q_PLUS:  op = Q_PLUS;	break;	/* +() Unary plus */
+    case Q_MINUS: op = N_NEG;	break;	/* -() Arithmetic negation */
+    case Q_ANDT:  op = N_ADDR;	break;	/* &() Address of */
+    case Q_MPLY:  op = N_PTR;	break;	/* *() Indirection */
+    }
+    nextoken();			/* Have a prefix op, move on to next token */
+    n = castexpr();		/* and parse cast-expr following the op */
+    if (n->Ntype->Tspec == TS_VOID)
+	error("Unary operand cannot have void type");
+
+    switch (op) {
+    case N_PREINC:		/* ++() Prefix increment */
+    case N_PREDEC:		/* --() Prefix decrement */
+	n = pincdec(n, op);
+	break;
+
+    case Q_COMPL:		/* ~()  Bitwise not */
+	if (!tisinteg(n->Ntype)) {	/* Check for integral type */
+	    error("Operand of ~ must have integral type");
+	    return ndeficonst(0);
+	}
+	n = convunary(n);			/* Convert if needed */
+	return ndef(op, n->Ntype, 0, n, (NODE*)NULL);	/* Result has converted type */
+
+    case Q_NOT:			/* !()  Logical not */
+	n = convunary(n);		/* Apply conversions */
+	if (!tisscalar(n->Ntype)) {	/* Check for scalar type */
+	    error("Operand of ! must have scalar type");
+	    return ndeficonst(0);
+	}
+					/* Note result type is always int! */
+	return ndef(op, inttype, 0, n, (NODE*)NULL);
+
+    case Q_PLUS:		/* +() Unary plus */
+	if (!tisarith(n->Ntype)) {	/* Check for arithmetic type */
+	    error("Operand of + must have arithmetic type");
+	    return ndeficonst(0);
+	}
+	return convunary(n);		/* Apply integral promotions */
+
+    case N_NEG:			/* -() Arithmetic negation */
+	if (!tisarith(n->Ntype)) {	/* Check for arithmetic type */
+	    error("Operand of - must have arithmetic type");
+	    return ndeficonst(0);
+	}
+				/* Apply the usual unary conversions */
+	n = convunary(n);			/* Convert if needed */
+	return ndef(op, n->Ntype, 0, n, (NODE*)NULL);	/* Result has cvted type */
+
+
+    case N_ADDR:		/* &() Address of */
+	/* No unary conversions apply here.  Only check for lvalue.
+	** Application to functions and arrays is tricky.
+	**	Level	&(fun of T)		&(array of T)
+	**	-----	-----------		-------------
+	**	base:	error			error
+	**	carm:	warn (ptr to fun of T)	warn (ptr to T)
+	**	ansi:	OK   (ptr to fun of T)	OK   (ptr to array of T)
+	*/
+
+	if (n->Ntype->Tspec == TS_FUNCT || n->Ntype->Tspec == TS_ARRAY) {
+	    switch (clevel) {
+		default:
+		case CLEV_BASE:
+		    error("& applied to array or function");
+		    return convarrfn(n);
+		case CLEV_CARM:
+		case CLEV_ANSI:
+		    warn("& applied to array or function");
+		    return convarrfn(n);	/* Let this convert to addr */
+		case CLEV_STDC:
+		    if (n->Ntype->Tspec == TS_FUNCT)
+			return convarrfn(n);
+		    break;			/* For array, drop thru. */
+	    }
+	}
+	if (!(n->Nflag & NF_LVALUE))	/* Operand must be lvalue */
+	    error("Operand of & must be lvalue");
+	if (n->Nop == Q_IDENT &&
+	    (n->Nid->Sclass == SC_RAUTO || n->Nid->Sclass == SC_RARG)) {
+		warn("& applied to register variable");
+	}
+
+	n = ndef(N_ADDR, n->Ntype, 0, n, (NODE*)NULL);
+	if (!(n->Nleft->Nflag & NF_GLOBAL)) { /* If object has local extent */
+	    stackrefs++;		/* then count it as a */
+	    n->Nflag |= NF_STKREF;	/* stack reference */
+	}
+	n->Ntype = findtype(TS_PTR, n->Ntype); /* add ref to type */
+	break;
+
+    case N_PTR:			/* *() Indirection */
+	return ptrapply(n);	/* Use common routine */
+    }
+    return n;
+}
+
+/* PTRAPPLY - Apply "*" operator to an expression.
+**	This is a common subroutine rather than part of unary() because
+** array subscripting wants to invoke "*" as well.
+*/
+static NODE *
+ptrapply(n)
+NODE *n;
+{
+    n = convunary(n);			/* Apply usual unary conversions */
+    if (n->Ntype->Tspec != TS_PTR) {
+	error("Operand of * must have pointer type");
+	n->Ntype = findtype(TS_PTR, n->Ntype);	/* patch up */
+    }
+    if (n->Ntype->Tsubt->Tspec == TS_VOID) {
+	error("Operand of * cannot be ptr to void");
+	return ndeficonst(0);
+    }
+    n = ndef(N_PTR, n->Ntype->Tsubt, 0, n, (NODE*)NULL);
+
+    if (n->Nleft->Nflag & NF_STKREF)	/* If addr was on stack, */
+	stackrefs--;			/* "*" cancels existence of addr. */
+    else n->Nflag |= NF_GLOBAL;		/* Not stack addr so must be global */
+
+    if (n->Ntype->Tspec != TS_FUNCT)
+	n->Nflag |= NF_LVALUE;		/* Result is lvalue unless function */
+    return n;
+}
+
+/* SIZEEXPR - Handle "sizeof" operator.
+**	Note that the size is always in terms of TGSIZ_CHAR size bytes,
+** rather than the actual # bits used by a "char" type; the latter can vary
+** (mainly if -x=ch7 was specified), but by fiat we always measure objects
+** in terms of 9-bit bytes so that everything will divide evenly and not
+** confuse library routines and so forth.
+**	The exception is arrays; char arrays always return the number of
+** elements (chars) in the array, regardless of the size of a char.
+** Similarly, the size of a char is always 1, regardless of the actual # of
+** bits it uses.
+*/
+static NODE *
+sizeexpr()
+{
+    TYPE *t;
+    NODE *n, *e;
+
+    n = ndeft(N_ICONST, siztype);	/* Get node for integer constant */
+					/* Use special type for "sizeof" */
+    t = NULL;
+    if (nextoken() == T_LPAREN) {	/* Check for possible type-name */
+	nextoken();
+	if(csymbol && (tok[token].tktype == TKTY_RWTYPE
+		|| csymbol->Sclass == SC_TYPEDEF)) {
+	    t = typename();
+	    expect(T_RPAREN);
+	} else	/* Not a reserved-word type or typedef, push paren back. */
+		tokpush(T_LPAREN, (SYMBOL *)NULL);
+    }
+
+    if (t == NULL) {	/* If no type-name seen, get a prefix-expression. */
+	e = unary();		/* Get expr, without fun/arr convs */
+	t = e->Ntype;		/* and use type of the expression */
+
+	/* Special check for string constant, which normally doesn't
+	** have the size set in its type.
+	*/
+	if (e->Nop == N_SCONST) {	/* Is it string constant? */
+	    n->Niconst = e->Nsclen;	/* Yes, return length! */
+	    return n;
+	}
+    }
+
+    /* Have type, now determine its size */
+    n->Niconst = 0;			/* Clear in case of error */
+    switch (t->Tspec) {
+	    case TS_VOID:
+		warn("Operand of sizeof has void type");
+		break;
+
+	    case TS_FUNCT:
+		error("Operand of sizeof has function type");
+		break;
+
+	    case TS_ARRAY:
+		if (t->Tsize == 0) {
+		    error("Size of array not known");
+		    n->Niconst = 0;
+		    break;
+		}
+		if (tischararray(t)) {		/* If char array, */
+		    n->Niconst = sizearray(t);	/* size is # of elements */
+		    break;
+		}
+
+		/* Drop through */
+	    case TS_STRUCT:
+	    case TS_UNION:	/* (size in wds)*(chars per word) */
+		n->Niconst = sizetype(t) * (TGSIZ_WORD/TGSIZ_CHAR);
+		break;
+
+	    case TS_CHAR:
+	    case TS_UCHAR:
+		n->Niconst = 1; /* char always takes one byte */
+		break;
+
+	    case TS_BITF:
+	    case TS_UBITF:
+		warn("Operand of sizeof has bitfield type");
+		/* Drop through */
+
+		/* Anything left had better be a scalar type! */
+	    default:
+		if (!tisscalar(t))
+		    int_error("sizeexpr: invalid type: %d", t->Tspec);
+		n->Niconst = (tbitsize(t) + TGSIZ_CHAR-1) / TGSIZ_CHAR;
+		break;
+	}
+    return n;			/* return the filled in const node */
+}
+
+
+/* POSTEXPR - Parse postfix expression
+**	[dpANS 3.3.2]
+**
+**	<postfix-expr> ::= <primary-expr>
+**		| <postfix-expr> '[' <expr> ']'		Array subscript
+**		| <postfix-expr> '(' {arg-expr-list} ')'	Function call
+**		| <postfix-expr> '.' <ident>		Direct component sel
+**		| <postfix-expr> "->" <ident>		Indirect component sel
+**		| <postfix-expr> "++"			Post-increment
+**		| <postfix-expr> "--"			Post-decrement
+**
+** Current token is 1st token of a postfix expression.
+** On return, current token is the next one after the expression.
+*/
+
+static NODE *
+postexpr()
+{
+    int op, off;
+    NODE *n;
+    TYPE *tp, *mt;
+    SYMBOL *sy;
+
+    n = primary();		/* First get primary expression */
+    for (;;) switch (token) {	/* Loop to handle all postfixes */
+    case T_LPAREN:
+	    /* Parse function call ::=	<postfix-expr> '(' {arg-expr-list} ')'
+	    ** [dpANS 3.3.2.2]
+	    */
+	    tp = n->Ntype;		/* Remember function type */
+	    sy = n->Nop == Q_IDENT ? n->Nid : NULL;	/* Get ident if one */
+	    switch (tp->Tspec) {
+		case TS_FUNCT: break;	/* Should be this */
+		case TS_PTR:		/* OK to be this */
+		    sy = NULL;
+		    if (tp->Tsubt->Tspec == TS_FUNCT) {
+			if (clevel < CLEV_ANSI)
+			    warn("Assuming ptr to function is function");
+			tp = tp->Tsubt;
+			if (n->Nop == N_ADDR) {	/* Simplify &f() to f() */
+			    n = n->Nleft;
+			    sy = n->Nop == Q_IDENT ? n->Nid : NULL;
+			} else				/* Use addr */
+			    n = ndef(N_PTR, tp, 0, n, (NODE*)NULL);
+			break;
+		    }
+		    /* Else fall thru to fail */
+		default:
+		    error("Call to non-function");
+		    n = ndeft(N_UNDEF, tp = findftype(tp, (TYPE *)NULL));
+		    sy = NULL;
+	    }
+
+	    n = ndef(N_FNCALL, tp->Tsubt, 0, n, (NODE*)NULL);
+
+	    /* Hack for returning structures -- see if internal auto
+	    ** struct is needed to hold return value, and allocate if so.
+	    */
+	    if (sizetype(n->Ntype) > 2) {
+		static int cntr = 0;
+		char temp[20];
+		if (n->Ntype->Tspec != TS_STRUCT && n->Ntype->Tspec !=TS_UNION)
+		    int_error("postexpr: Fn retval too large");
+		/* Make unique ident and then a local variable for type */
+		sprintf(temp,"%cstruct%d", SPC_IAUTO, ++cntr);
+		n->Nretstruct = defauto(temp, n->Ntype);
+	    } else n->Nretstruct = NULL;
+
+	    /* Parse argument list if any */
+	    n->Nright = parglist(sy, tp);	/* Get arglist (may be NULL) */
+	    break;			/* Results aren't checked further. */
+
+    case T_LBRACK:
+	    /*
+	    ** Parse array subscript ::= <postfix-expr> '[' <expr> ']'
+	    **
+	    **	This is implemented by converting it into
+	    **		*(<postfix-expr> + <expr>)
+	    */
+	    nextoken();			/* Move on to expr */
+	    n = ndeflr(Q_PLUS, expression(), n);
+	    n = chkadd(Q_PLUS, n);	/* Do type checking etc */
+	    tp = n->Ntype;		/* get type back, make sure ptr */
+	    if (tp->Tspec != TS_PTR)
+		error("Array or pointer type required");
+	    expect(T_RBRACK);
+
+	    /* Propagate flags (global & stkref only) */
+	    n->Nflag = (n->Nleft->Nflag | n->Nright->Nflag)
+			 & (NF_STKREF | NF_GLOBAL);
+
+
+	    /* Now apply *() to the result, unless it will be an array.
+	    ** If the result of the * is going to be an array (ie it will
+	    ** remain a pointer) then skip this step to save the overhead
+	    ** of a pointless pair of "*" and "&" nodes, and put the result
+	    ** type directly into the Q_PLUS node.
+	    */
+	    if (tp->Tsubt->Tspec == TS_ARRAY) {
+		n->Ntype = tp->Tsubt;		/* Make result be that array */
+#if 0
+		n->Nflag &= ~NF_LVALUE;		/* Make sure not an lvalue */
+#else
+		n->Nflag |= NF_LVALUE;		/* Make sure not an lvalue */
+#endif
+	    }
+	    else n = ptrapply(n);	/* Not array, apply * to result */
+	    break;
+
+    case Q_DOT:
+    case Q_MEMBER:
+	/* Parse struct/union component selection
+	**			::= <postfix-expr> '.'  <ident>
+	**			  | <postfix-expr> "->" <ident>
+	**
+	** For ".", the first operand must be a qualified
+	** or unqualified struct/union type, and the second operand
+	** must name a member of that type.
+	** The result is an lvalue if the first expression is, and has
+	** the type of the member with the struct's qualifiers added.
+	**
+	** For "->", the first operand must be a pointer (quals are flushed
+	** by standard lvalue mungage, [dpANS 3.2.2.1]) to the same thing
+	** as ".", ditto second operand.
+	** The result is always an lvalue, and the type is as for ".".
+	*/
+	op = token;		/* Remember which kind of selection it is */
+
+	/* Check that type of preceding expr is correct */
+	n = convarrfn(n);		/* Apply array/funct convs if any */
+	tp = n->Ntype;			/* (if no conv, qualifiers intact!) */
+	if (op == Q_MEMBER) {
+	    if (tp->Tspec != TS_PTR || !(tp=tp->Tsubt)
+		 || (tp->Tspec != TS_STRUCT && tp->Tspec != TS_UNION)) {
+		error("Left operand of -> must be pointer to struct or union");
+		if ((tp=n->Ntype)->Tspec == TS_STRUCT || tp->Tspec == TS_UNION) {
+		    op = Q_DOT;	/* Pretend "." seen instead */
+		} else tp = NULL;
+	    }
+	} else if (tp->Tspec != TS_STRUCT && tp->Tspec != TS_UNION) {
+	    error("Left operand of . must be struct or union");
+	    if (tp->Tspec == TS_PTR && (tp=tp->Tsubt)
+	      && (tp->Tspec == TS_STRUCT || tp->Tspec == TS_UNION)) {
+		op = Q_MEMBER;	/* Pretend "->" seen instead */
+	    } else tp = NULL;
+	}
+	if (nextoken() != Q_IDENT) {
+	    error("Struct or union member expected");
+	    break;			/* Give up now, leave expr as is */
+	}
+
+	/* Check that component name is OK */
+	/* look up member name in symbol table */
+	/* Get right name for a member identifier by adding prefix */
+	sy = symfmember(csymbol, (tp ? tp->Tsmtag : NULL));
+	if (sy == NULL) {		/* Not a known member? */
+	    error("Unknown struct/union component %S", csymbol);
+	    off = 0;			/* No offset for missing symbol */
+	    mt = deftype;		/* Use default (int) type of result */
+	} else {
+	    off = sy->Ssmoff;
+	    mt = sy->Stype;
+	}
+	if (csymbol->Sclass == SC_UNDEF) freesym(csymbol);
+
+	/* Now ensure that any type qualifiers for the struct are also
+	** applied to the type of the member we just selected.
+	** If the struct/union was not an lvalue (as can happen for Q_DOT)
+	** then all qualifiers will be flushed by whatever uses this
+	** expression farther on.
+	*/
+	if (tp && tisqualif(tp))	/* Add any type qualifiers needed */
+	    mt = findqtype(mt, tp->Tflag & TF_QUALS);
+
+	/* The flags remain the same for Q_DOT - this is how lvalueness is
+	** passed on.
+	** Q_MEMBER, however, involves
+	** a deferencing and so can undo a stackref or make a
+	** non-stackref safe from future address-taking.
+	*/
+	n = ndef(op, mt, n->Nflag, n, (NODE*)NULL);
+	n->Nxoff = off;
+	if (op == Q_MEMBER) {
+	    n->Nflag |= NF_LVALUE;	/* addr of a->b can be taken */
+	    if (n->Nflag & NF_STKREF) {
+		stackrefs--;	/* (&x)->y  for x on stack */
+		n->Nflag &=~ NF_STKREF; /* dereferences address op */
+	    } else n->Nflag |= NF_GLOBAL; /* otherwise not on stack */
+	}
+
+#if 0
+	/*
+	** Do special handling for member type == TS_ARRAY
+	**
+	** If the struct was returned from some function,
+	** we can't take the addresses of parts of it.
+	** It should be legal to do  foo().x[i]  even
+	** though we can't do  foo().x,  but it's too hard
+	** to do right, so we don't do it at all.
+	** Hopefully the ANSI C standard will clarify this.
+	**
+	** If the struct is local, we have to adjust stackrefs.
+	*/
+	if (tp->Tspec == TS_ARRAY) {
+	    if (!(n->Nflag & NF_LVALUE)) {
+		error("Lvalue required as array ref in struct");
+	    }
+	    n->Nflag &= ~NF_LVALUE;	/* Array is never lvalue */
+	}
+#endif
+	nextoken();		/* Done, now safe to skip over token! */
+	break;
+
+    case T_INC:
+    case T_DEC:
+	/*
+	** Parse post(inc/dec)rement ::= <postfix-expr> ["++" | "--"]
+	**	The operand must have qualified or unqualified scalar type
+	**	and must be a modifiable lvalue.
+	*/
+	n = pincdec(n, token == T_INC ? N_POSTINC : N_POSTDEC);
+	nextoken();
+	break;
+
+    default:			/* If token not a postfix operator, */
+	    return n;		/* just return what we have so far. */
+    }		/* End of switch and suffix loop */
+}
+
+/* PINCDEC - common auxiliary to handle postfix/prefix increment/decrement.
+**
+**	The operand must have qualified or unqualified scalar type
+**	and must be a modifiable lvalue.
+**
+** Conversions are tricky here, since result value may not be
+** of right type.  See H&S 7.4.8.
+** "the type of the result is that of the operand before conversion".
+** This is one of the rare instances where we let the code generation
+** worry about conversions rather than telling it what to do.
+*/
+static NODE *
+pincdec(n, op)
+NODE *n;	/* Operand expression */
+int op;		/* Operator (N_PREINC, N_PREDEC, N_POSTINC, N_POSTDEC) */
+{
+    if (!(n->Nflag&NF_LVALUE))
+	error("Operand of ++ or -- must be lvalue");
+    else if (!tisscalar(n->Ntype))
+	error("Operand of ++ or -- must have scalar type");
+    else if (tisconst(n->Ntype))
+	error("Operand of ++ or -- cannot be const-qualified");
+    else if (n->Ntype->Tspec == TS_PTR && n->Ntype->Tsubt->Tspec == TS_VOID)
+	error("Operand of ++ or -- cannot be ptr to void");
+    else return	ndef(op, n->Ntype, 0, n, (NODE*)NULL);	/* Success! */
+
+    /* Failure, return a suitable placeholder */
+    return ndeficonst(0);	/* For now, later match type better? */
+}
+
+/* PRIMARY - Parse primary expression
+**	[dpANS 3.3.1]
+**
+**	<primary-expr> ::= <ident>
+**			| <constant>
+**			| <string-literal>
+**			| '(' <expr> ')'
+** KCC EXTENSION:	| <asm-expr>
+**
+** A <ident> must be either an object (of some type) or a function.
+**	The former is an lvalue, the latter a function designator.
+**	Note special case of enum constant, which is also an <ident>.
+** A <constant> has a type and value as per syntax (CCLEX, [dpANS 3.1.3])
+**	It is not an lvalue.
+** A <string-literal> is an lvalue, normally with type "array of char",
+**	per [dpANS 3.1.4].
+**
+** Current token must be the first token of a valid primary expression.
+** On return, current token is the next one after the expression.
+*/
+
+static NODE *
+primary()
+{
+    NODE *n;
+    SYMBOL *s, d;
+
+    switch (token) {
+    case Q_IDENT:
+	/*
+	** Parse <ident>
+	**	This may be an enum constant as well as an object or function.
+	**	This is where we check for handling calls to undeclared functs.
+	*/
+	s = csymbol;		/* Remember pointer to identifier symbol */
+	nextoken();		/* then flush token, set up next */
+	switch (s->Sclass) {
+	case SC_ENUM:		/* If <ident> is Enumeration constant */
+				/* it evaluates into an integer constant */
+	    return ndeficonst(s->Svalue);	/* Note not lvalue! */
+
+	case SC_UNDEF:		/* Undefined identifier may be function call */
+	    if (token != T_LPAREN) {	/* Check for function-call case */
+					/* Undefined, complain */
+		error("Undefined identifier: %S", s);
+		freesym(s);		/* Flush losing symbol */
+		return ndeft(N_UNDEF, deftype);
+		/* Returns special undef node so can continue processing */
+	    }
+	    /* Pretend we declared this identifier as
+	    ** "extern int ident();" in current block.
+	    */
+	    advise("Call to undeclared function %S", s);
+	    d.Sclass = SC_EXTREF;	/* Storage class as if "extern" */
+	    d.Stype = findftype(inttype, (TYPE *)NULL);	/* Set type */
+	    s = funchk(0, SC_EXTREF, &d, s);	/* Perform funct declaration */
+	    s->Srefs++;			/* Say referenced by call */
+
+	    /* Now can drop through to handle normally */
+
+	default:
+	    /* Normal variable or function name */
+	    n = ndefident(s);		/* Make Q_IDENT node */
+
+	    /* Now set appropriate flags for this node.  Note Nflag
+	    ** was initialized to 0 by the ndefident() above.
+	    */
+	    if ( s->Sclass != SC_AUTO && s->Sclass != SC_RAUTO
+	      && s->Sclass != SC_ARG  && s->Sclass != SC_RARG)
+		n->Nflag |= NF_GLOBAL;		/* Var has static extent */
+
+	    if (n->Ntype->Tspec != TS_FUNCT)	/* If not a function, */
+		n->Nflag |= NF_LVALUE;		/* then is an lvalue! */
+	}
+	break;
+
+    /* Constants and literals [H&S 2.7] [dpANS 3.1.3]
+    ** The lexer has already parsed the constant into a T_*CONST token,
+    ** and left information about the constant type and value in the
+    ** global struct "constant".
+    */
+    case T_ICONST:		/* Handle integer constant */
+    case T_CCONST:		/* Handle character constant */
+	n = ndeft(N_ICONST, constant.ctype);
+	n->Niconst = constant.cvalue;
+	nextoken();
+	break;
+
+    case T_FCONST:		/* Handle floating-point constant */
+	n = ndeft(N_FCONST, constant.ctype);
+	switch (constant.ctype->Tspec) {
+	    case TS_FLOAT:	n->Nfconst = constant.Cfloat; break;
+	    case TS_DOUBLE:	n->Nfconst = constant.Cdouble; break;
+	    case TS_LNGDBL:	n->Nfconst = constant.Clngdbl; break;
+	}
+	nextoken();
+	break;
+
+    case T_SCONST:		/* Handle <string-literal> */
+	n = ndeft(N_SCONST, constant.ctype);
+	n->Nsconst = constant.csptr; /* get pointer */
+	n->Nsclen = constant.cslen;	/* and num chars including null */
+	nextoken();
+	break;
+
+    case T_LPAREN:
+	/*
+	** Parse parenthesized expression ::= '(' <expr> ')'
+	*/
+	nextoken();			/* Advance past left-paren */
+	n = expression();		/* Get expr list in parens */
+	n->Nflag |= NF_INPARENS;	/* Remember it was paren-enclosed */
+	expect(T_RPAREN);		/* followed by close paren */
+	break;
+
+    case Q_ASM:			/* Handle "asm" built-in */
+	return bin_asm();
+
+    case T_OFFSET:		/* Handle "_KCC_offsetof" built-in */
+	return bin_offsetof();
+
+    default:				/* Bad token... */
+	error("Primary expr expected");	/* Complain and return dummy */
+	return ndeft(N_UNDEF, deftype);
+    }
+    return n;
+}
+
+/* Parsing for various built-in expressions */
+
+/* "asm" - handle built-in for assembly code inclusion
+**
+**	<asm-expr> ::= "asm" '(' <exprlist> ')'
+**
+** This is a KCC-specific feature and can only happen if
+** "asm" was initialized as a keyword by CCSYM on startup.
+*/
+static NODE *
+bin_asm()
+{
+    NODE *n;
+
+    if (nextoken() != T_LPAREN) {
+	error("Bad syntax for \"asm\" - no left paren");
+	return primary();		/* Try again on this token */
+    }
+    n = parglist(NULL, NULL);		/* Parse args as if function call */
+
+    /* Check out against currently supported syntax.
+    ** This must be a single string literal after constant optimization.
+    */
+    if (!n || n->Nleft || !(n = evalexpr(n->Nright)) || n->Nop != N_SCONST)
+	error("Arg to \"asm\" must be a single string literal");
+
+    return ndef(Q_ASM, voidtype, 0, n, (NODE*)NULL);
+}
+
+/* _KCC_offsetof - handle built-in for "offsetof"
+**
+**	<offset-expr> ::=
+**		"_KCC_offsetof" '(' <structtype> ',' <memb> { '.' <memb> }* ')'
+**
+** This implements the built-in that the "offsetof" macro uses.
+** This can only happen if the symbol was initialized as a
+** keyword by CCSYM on startup.
+*/
+static NODE *
+ bin_offsetof()
+{
+    NODE *n;
+    TYPE *t;
+    int off = 0, bsiz;
+
+    if (nextoken() != T_LPAREN) {
+	error("Bad syntax for \"_KCC_offsetof\"");
+	return primary();		/* Try again on this token */
+    }
+
+    /* Gather args and check syntax.
+    ** The first arg must be a structure type name.
+    */
+    nextoken();			/* Set up for typename parsing */
+    t = typename();		/* Will complain if bad syntax */
+
+    /* Provide free de-reference so that "struct foo *" is equivalent */
+    /* to "struct foo" */
+    if (t->Tspec == TS_PTR) t = t->Tsubt;
+
+    if (token != T_COMMA) error("Bad syntax for \"_KCC_offsetof\"");
+    else do {
+	SYMBOL *s;
+	long ioff;
+
+	if (t->Tspec != TS_STRUCT) {
+	    error("Structure type expected");
+	    t = NULL;
+	}
+
+	if (nextoken() != Q_IDENT) {
+	    error("Bad syntax for \"_KCC_offsetof\"");
+	    break;
+	}
+	s = t ? symfmember(csymbol, t->Tsmtag) : NULL;
+	ioff = 0;		/* In case of error */
+	if (s == NULL)				/* Not a known member? */
+	    error("Unknown structure component %S", csymbol);
+	else {
+	    s->Srefs--;			/* Not really a ref */
+	    if (tisbitf(s->Stype))
+		error("Cannot use bitfield member in _KCC_offsetof");
+	    else {
+		ioff = s->Ssmoff;
+		if (ioff >= 0) ioff *= (TGSIZ_WORD/TGSIZ_CHAR);
+		else {	/* Byte offset in PDP10 word is (36-(P+S))/bsiz */
+		    /* For byte sizes less than char (9), use that byte */
+		    /* size; else if 16 bit short, use 8; else use 9. */
+		    bsiz = tisscalar(s->Stype)	       /* Get object size */
+		      ? tbitsize(s->Stype)	       /* in bits if can */
+			: (tisbytearray(s->Stype)      /* Byte array? */
+			   ? elembsize(s->Stype)       /* Yes, elem. size */
+			   : TGSIZ_WORD);	       /* else force wd mode */
+		    if (bsiz > TGSIZ_CHAR) { 	/* Bigger than char? */
+		      if (bsiz == 16) bsiz = 8;	/* For 16 bit (short), use 8 */
+		      else bsiz = TGSIZ_CHAR; /* Else use char */
+		    }
+		    ioff = ((-ioff)>>12) * (TGSIZ_WORD/bsiz)
+		      + (TGSIZ_WORD - ((((-ioff)>>6)&077)+((-ioff)&077)))
+			/ bsiz;
+		}
+	    }
+	}
+	off += ioff;		/* Add incremental offset to total */
+	if (csymbol->Sclass == SC_UNDEF) freesym(csymbol);
+	t = s->Stype;		/* Get type of member */
+
+	nextoken();		/* Done with ident, go past it */
+
+	/* Handle any array reference */
+	while (token == T_LBRACK) {
+	    if (t->Tspec != TS_ARRAY) {
+	        error("Array type expected");
+		break;		/* Exit loop */
+	    }
+	    nextoken();		/* Start expr */
+	    ioff = pconst()	/* Compute offset to this element */
+	      * (tischararray(t) ? sizearray(t->Tsubt)
+		 : sizetype(t->Tsubt) * (TGSIZ_WORD/TGSIZ_CHAR));
+	    t = t->Tsubt;	/* Get array subtype */
+	    expect(T_RBRACK);	/* Should close array ref */
+	    off += ioff;	/* Add incremental offset to total */
+	}
+
+	/* If next token is dot, try to iterate on this member as structure. */
+	/* Otherwise, just return offset to this member. */
+    } while (token == Q_DOT);
+
+    expect(T_RPAREN);
+
+    n = ndeft(N_ICONST, siztype);	/* Make constant of proper type */
+    n->Niconst = off;
+    return n;
+}
+
+/* PARGLIST - Parse an argument list for a function-type expression.
+**	Should only be called if current token is T_LPAREN.
+**	On return, token is first one after T_RPAREN.
+** Returns:
+**	N_EXPRLIST if at least one arg,
+**	NULL if no args, N_ERROR if some error.
+*/
+
+static NODE *
+parglist(s, ft)
+SYMBOL *s;			/* Function identifier, if known */
+TYPE *ft;			/* Function type */
+{
+    NODE *e, *n = NULL;		/* Start with no args */
+    int warnf = 0;
+    TYPE *proto;
+
+    /* First get prototype, if any, to check */
+    proto = (ft && ft->Tproto)		/* If fn type has proto, */
+	? ft->Tproto			/* use that */
+	: ((s && s->Shproto)		/* else, if have identifier with */
+		? (warnf++, s->Shproto)	/* hidden proto, use w/warning. */
+		: NULL);		/* No info, no checking */
+
+    /* Skip over T_LPAREN, do startup checks */
+    if (nextoken() == T_RPAREN) {		/* No args? */
+	if (proto && proto->Tspec != TS_PARVOID) {
+	    if (warnf) advise("No args given to function defined with params");
+	    else warn("Number of args doesn't match function prototype");
+	}
+	nextoken();
+	return n;
+    }
+    if (proto && proto->Tspec == TS_PARVOID) {
+	if (warnf) advise("Args given to function defined without params");
+	else warn("Number of args doesn't match function prototype");
+	proto = NULL;
+    }
+
+    for(;;) {		/* Enter arg parsing loop */
+	e = asgnexpr();			/* Parse an expression */
+	if (!proto || warnf) {		/* If no "real" prototype */
+	    e = convfunarg(e);		/* Use default arg promotions */
+	    if (proto && !cmpatype(proto->Tsubt, e->Ntype))
+	        e = convasgn(proto->Tsubt, e); /* Not compat, attempt conv */
+#if 0 /* This doesn't fix "int *" => "const int *", use convasgn above */
+		advise("Type of arg (%T) doesn't match param in function def (%T)",
+		       e->Ntype, proto->Tsubt);
+#endif
+	} else {			/* Handling real prototype */
+	    e = convasgn(proto->Tsubt, e);	/* Ensure arg converted */
+	}
+	if (proto) proto = proto->Tproto;
+	if (proto && proto->Tspec == TS_PARINF)
+	    proto = NULL;		/* Stop conversions at ",..." */
+
+	n = ndef(N_EXPRLIST,		/* Add fun arg onto list */
+		 e->Ntype, 0, n, e);
+	if (token != T_COMMA) break;	/* If no comma, that's it */
+	nextoken();			/* pass over comma */
+    }
+    if (proto) {
+	if (warnf) advise("Number of args doesn't match function def");
+	else warn("Number of args doesn't match function prototype");
+    }
+    expect(T_RPAREN);			/* Close with right paren */
+    return n;
+}
+
+/* CMPATYPE - Auxiliary for PARGLIST.  Compares "hidden" prototype
+**	parameter type (from an old-style function def) with an actual
+**	argument type, and returns TRUE if types are OK.
+**	Mainly exists because we want to permit signed and unsigned versions
+**	of otherwise compatible types -- this is just (int) and (long)
+**	since the default promotions have been done.
+*/
+static int
+cmpatype(pt, at)
+TYPE *pt, *at;		/* Param type, Arg type */
+{
+    if (cmpgetype(pt, at))	/* If .GE. compatible, win. */
+	return 1;
+    switch (pt->Tspec) {	/* Hmm, check for signedness */
+	case TS_INT:	return (at->Tspec == TS_UINT);
+	case TS_UINT:	return (at->Tspec == TS_INT);
+	case TS_LONG:	return (at->Tspec == TS_ULONG);
+	case TS_ULONG:	return (at->Tspec == TS_LONG);
+    }
+    return 0;			/* That's all we can check for, give up. */
+}
+
+/* CHKADD - Check an add/sub expression node for conversions and validity.
+*/
+static NODE *
+chkadd(op, n)
+int op;		/* Either Q_PLUS or Q_MINUS */
+NODE *n;
+{
+    TYPE *lt, *rt;
+
+    n = convbinary(n);		/* First apply binary convs */
+    if (tisarith(n->Nleft->Ntype) && tisarith(n->Nright->Ntype))
+	return n;		/* If both are arithmetic, OK */
+
+    /* Not both arith, check out pointer types */
+    lt = n->Nleft->Ntype;
+    rt = n->Nright->Ntype;
+    if ( (lt->Tspec == TS_PTR && !sizetype(lt->Tsubt))
+      || (rt->Tspec == TS_PTR && !sizetype(rt->Tsubt))) {
+	error("Pointer operand for + or - must point to valid object");
+	return n;
+    }
+    if (op == Q_PLUS) {
+	/* Not both arith, only allow the 2 combinations
+	** ptr+integ, integ+ptr
+	*/
+	if (lt->Tspec == TS_PTR && tisinteg(rt)) {    /* Handle ptr+int */
+	    return n;		/* Type already properly set to left type */
+	}
+	if (rt->Tspec == TS_PTR && tisinteg(lt)) {    /* Handle int+ptr */
+	    n->Ntype = rt;
+	    return n;
+	}
+	error("Bad operand type combination for +");
+	return ndeficonst(0);
+    }
+    else {	/* Handle Q_MINUS */
+	/* Not both arith, only allow the combinations
+	** ptr-ptr (if point to same unqualified type), or ptr-integ.
+	*/
+	if (lt->Tspec == TS_PTR) {	/* Left op better be pointer! */
+	    if (tisinteg(rt))		/* Handle ptr-int. */
+		return n;		/* Type already set to left type */
+	    if (rt->Tspec == TS_PTR	/* Only case left is ptr-ptr */
+	      && cmputype(lt->Tsubt, rt->Tsubt)) { /* Unqual-compatible? */
+		n->Ntype = ptrdifftype;	/* Win, result type is pointer diff */
+		return n;
+	    }
+	}
+	error("Bad operand types combination for - (%T is not compatible with %T)",
+	      lt, rt);
+	return ndeficonst(0);
+    }
+}

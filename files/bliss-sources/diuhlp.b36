@@ -1,0 +1,297 @@
+%TITLE 'DIU Help Table Creation'
+
+MODULE DIUHLP (
+               IDENT = '174',
+               LANGUAGE(BLISS36),
+               ENTRY (hlpini)                 ! Init help table
+               ) =
+BEGIN
+
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+! FACILITY:    DIU (Data Interchange Utility for TOPS-10/20)
+!
+! ABSTRACT:    This module implements the structured HELP in DIU. 
+!
+! ENVIRONMENT: TOPS-10 V7.02 or TOPS-20 V6.1, RMS V3, BLISS-36 V4, XPORT
+!
+! AUTHOR: Larry Campbell                   CREATION DATE: July 13, 1982
+
+! HISTORY:     
+!
+!  174  Remove library of TOPS20, use MONSYM and JSYSDEF instead.
+!       Gregory A. Scott 20-May-86
+!
+!  131  Remove external of diudbg, which wasn't referenced here and is no
+!       longer used.
+!       Gregory A. Scott 28-Apr-86
+!
+! V01-01     DPR0001	     Doug Rayner		   14-Aug-85
+!	     Minor modifications for TOPS-10.  Create code to emulate
+!	     the TOPS-20 TBADD% JSYS
+!
+! V01-00     RDF0001         Rick Fricchione               22-Oct-1984
+!            DIU version.  Modify to handle DIU changes.
+!
+! V00-00     AWN0001         Andrew Nourse                 -no date-
+!            FTS Version up to edit level 2.
+!--
+
+!**************************************************************************
+!**                     F O R W A R D   R O U T I N E 
+!**************************************************************************
+FORWARD ROUTINE
+    hlpini    : NOVALUE,                ! Init help table
+    table_add : NOVALUE;                ! Do a TBADD
+
+!*************************************************************************
+!**                       L I B R A R Y   F I L E S
+!*************************************************************************
+
+LIBRARY 'BLI:XPORT';                    ! XPORT of course
+LIBRARY 'DIU';                          ! DIU data structures
+%IF %SWITCHES (TOPS20) 
+%THEN
+LIBRARY 'MONSYM';                       ! Monitor symbols
+REQUIRE 'JSYSDEF';                      ! JSYS macros
+%FI
+
+!*************************************************************************
+!**                 G L O B A L S    A N D   E X T E R N A L S
+!*************************************************************************
+LITERAL
+    hlp_table_size = 200;
+   
+GLOBAL
+    hlp_count : INITIAL(0),             ! Count of topics.
+    hlptab    : VECTOR [hlp_table_size];
+
+EXTERNAL
+    tty : $XPO_IOB ();                  ! IOB for the terminal
+
+EXTERNAL ROUTINE
+    diu$abort : NOVALUE,                ! Condition handler
+    st_help   : NOVALUE,                ! Action routine for HELP command
+    s$geterr;                           ! Return most recent TOPS-20 error
+
+!*********************************************************************
+!**                        H L P I N I 
+!*********************************************************************
+GLOBAL ROUTINE hlpini : NOVALUE =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       This routine initializes the help table.  HLPTAB is a TBLUK-style table
+!       whose left halves point to topic names and whose right halves point  to
+!       descriptors for  the text  of the  help.  It  is filled  in by  reading
+!       HLP:DIU.HLP.  The help file is a simple ASCII text file containing zero
+!       or more entries.  Each entry consists of:
+!
+!       1) The name of the topic on its own line
+!       2) The text for the topic (multiple lines and blank lines OK)
+!       3) The terminator line:  a line containing just three hyphens
+!
+! IMPLICIT OUTPUTS:
+!
+!       hlptab: A TBLUK-style table that is filled in such that COMAND.B36
+!               (the BLISS Interface to the COMND JSYS) can use it directly
+!               to parse a keyword.  Each entry is set so that:
+!                       Next state is -2 (this means take the next state
+!                                        from the parent FLDDB block)
+!                       Action routine is ST_HELP (defined in DIUCMD)
+!                       Context item is address of a descriptor for
+!                                        the text for this item
+!--
+
+LOCAL hlpiob : $XPO_IOB (),
+      retcode;
+
+ENABLE DIU$ABORT;
+
+IF .(hlptab[0])<lh> NEQ 0               ! If help table already filled in
+THEN RETURN;                            ! then return now
+
+hlptab[0] = hlp_table_size;             ! OK, init the table header
+
+! Init the IOB to the help file
+
+$XPO_IOB_INIT (IOB = hlpiob, FILE_SPEC = 'HLP:DIU.HLP');
+
+! Open the help file
+
+IF NOT (retcode = $XPO_OPEN (IOB=hlpiob,OPTIONS=INPUT,FAILURE=0))
+THEN SIGNAL (DIU$_NO_HELP_FILE, .retcode);
+
+WHILE $XPO_GET (IOB = hlpiob)           ! While the file still has data
+DO BEGIN
+   LOCAL topic_descriptor :     $STR_DESCRIPTOR (CLASS = DYNAMIC),
+         text_descriptor  : REF $STR_DESCRIPTOR (CLASS = DYNAMIC),
+         this_line        :     $STR_DESCRIPTOR (CLASS = DYNAMIC);
+
+   ! Init a temp descriptor for topic name and allocate and init
+   ! a descriptor in heap space for the topic text
+
+   $STR_DESC_INIT (DESCRIPTOR = topic_descriptor, CLASS = DYNAMIC);
+   $XPO_GET_MEM (UNITS = STR$K_D_BLN, RESULT = text_descriptor);
+   $STR_DESC_INIT (DESCRIPTOR = .text_descriptor, CLASS = DYNAMIC);
+
+   ! First we should have a topic name, but might have to skip blank lines
+
+   WHILE .hlpiob[$SUB_FIELD (IOB$T_STRING, STR$H_LENGTH)] EQL 0
+   DO $XPO_GET (IOB = hlpiob);
+
+  ! Now fetch lines of text until a line containing '---' is found.
+  ! Each line will be appended to text_descriptor.
+
+  $STR_COPY (TARGET = topic_descriptor, STRING = hlpiob[IOB$T_STRING]);
+
+  WHILE BEGIN                           ! Copy the help text
+        retcode = $XPO_GET (IOB = hlpiob);      ! read a line from file
+        $STR_DESC_INIT (DESCRIPTOR = this_line, CLASS = DYNAMIC);
+        $STR_COPY (TARGET = this_line, STRING = hlpiob[IOB$T_STRING]);
+
+        ! if the string isn't "---" and its not EOF or something
+
+        $STR_NEQ (STRING1 = '---', STRING2 = this_line)
+        AND .retcode
+        END
+   DO $STR_APPEND (TARGET = .text_descriptor,
+                   STRING = $STR_CONCAT (this_line,
+                                         %CHAR (13, 10)));
+
+   ! Insure ASCIZ for topic name string
+
+   $STR_APPEND (TARGET = topic_descriptor, STRING = %CHAR (0));
+
+   ! Now add this info to the help table
+
+   TABLE_ADD (hlptab,
+              .topic_descriptor[STR$A_POINTER],
+              .text_descriptor);
+   END;                                 ! end of WHILE $XPO_GET DO
+
+! Close the help file and return
+
+$XPO_CLOSE (IOB = hlpiob);
+
+END;                                    ! End of hlpini
+
+!*******************************************************************
+!                        T A B L E _ A D D
+!*******************************************************************
+ROUTINE table_add (p_table, string_pointer, data_item) : NOVALUE =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!   Add an item to a TBLUK-style table.  What actually goes in the right
+!   half of the entry is the address of a "fake FLDDB block" so that
+!   the BLISS interface to the COMND JSYS can use the keyword table
+!   directly.  What we're really doing is generating at runtime what
+!   the $COMAND_OPTION macro (see COMAND.R36) generates at compiletime.
+!
+! FORMAL PARAMETERS:
+!   p_table             - address of the table
+!   string_pointer      - string pointer to the key string
+!   data_item           - data item for the entry
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   NONE
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+
+LOCAL fake_flddb : REF VECTOR [2];
+
+%IF %SWITCHES (TOPS10)                  ! Needed for TOPS-10 only
+%THEN
+
+LOCAL table_len,
+      new_index,
+      fake_flddb : REF VECTOR [2];
+
+BIND table = .p_table : VECTOR[0],
+     table_size = table[0];
+%FI
+
+! Allocate space for a "fake FLDDB block"
+
+$XPO_GET_MEM (FULLWORDS = 2, RESULT = fake_flddb);      
+
+(fake_flddb[0])<lh> = -2;               ! Next state (take from parent FLDDB)
+(fake_flddb[0])<rh> = st_help;          ! Action routine
+fake_flddb[1] = .data_item;             ! Context is data item passed to us
+
+%IF %SWITCHES (TOPS20)
+%THEN                                   ! TOPS-20 ONLY
+
+     IF NOT JSYS_TBADD(.p_table,
+                       (((CH$PLUS(.string_pointer,1))<rh>)^18 OR .fake_flddb))
+     THEN SIGNAL (DIU$_BUG, s$geterr($FHSLF));
+
+%ELSE                                   ! TOPS-10 ONLY
+
+     IF (.table_size<rh> EQL (table_len = .table_size<lh>))
+     THEN
+         RETURN;			! Table full
+
+     new_index = .table_len + 1;
+
+     !
+     ! Search for a string that is GTR than this string.  If found, we must
+     ! expand the table to insert this string.  If not, we add this string
+     ! to the end of the table.
+     !
+     INCR i FROM 1 TO .table_len DO
+         IF (CH$COMPARE(asciz_len(.string_pointer),.string_pointer,
+          asciz_len(CH$PTR(.(table[.i])<lh>)),CH$PTR(.(table[.i])<lh>))) EQL -1
+         THEN
+          (new_index = .i; EXITLOOP);
+
+     !
+     ! Open up a slot in the table, if necessary
+     !
+     DECR i FROM .table_len TO .new_index DO
+         table[.i + 1] = .table[.i];
+
+     !
+     ! Insert new list item
+     !
+     (table[.new_index])<rh> = .fake_flddb;
+     (table[.new_index])<lh> = (CH$PLUS(.string_pointer, 1))<rh>;
+     table_size<lh> = .table_len + 1;
+
+%FI                                     ! END OF TOPS-10 / TOPS-20 CONDITIONAL
+
+hlp_count = .hlp_count + 1;             ! Increment size count
+
+END;                                    ! End of table_add
+
+
+END                                     ! End of module
+ELUDOM

@@ -1,0 +1,360 @@
+%TITLE 'T R U N C   -- $TRUNCATE service'
+!<BLF/REQUIRE 'RMSBLF.REQ'>
+MODULE trunc =
+BEGIN
+
+GLOBAL BIND
+    trunv = 3^24 + 0^18 + 622;			!EDIT DATE: 4-JUN-86
+
+!+
+!
+!
+!    FUNCTION:	THIS MODULE CONTAINS ROUTINES WHICH PROCESS
+!    THE $TRUNCATE MACRO IN RMS-20.
+!    AUTHOR:	S. BLOUNT
+!
+!    THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY ONLY BE USED
+!    OR COPIED IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE.
+!
+!    !COPYRIGHT (C) 1977, 1979, 1986 BY DIGITAL EQUIPMENT CORPORATION
+!
+!
+!
+!    **********	TABLE OF CONTENTS	**************
+!
+!
+!
+!
+!    ROUTINE			FUNCTION
+!    =======			========
+!
+!    $TRUNCATE		PROCESSOR FOR $TRUNCATE MACRO
+!
+!
+!
+!
+!
+!    REVISION HISTORY:
+!
+!    EDIT	WHO	DATE		PURPOSE
+!    ====	===	====		=======
+!
+!    1	JK	5-AUG-76	NEW ASCII CHANGES.
+!    2	JK	12-AUG-76	$CONNECT; $TRUNCATE IS ILLEGAL.
+!    3	SB	22-DEC-76	CHANGE ER$TRU TO ER$IOP
+!    4	SB	22-FEB-77	GIVE ER$CUR IF NO RP, DONT PMAP PAGES IF PAGE 0
+!    5	SB	24-FEB-77	FIX EDIT 4, DONT CHECK FOR SUCCESS
+!    6	SB	6-APR-77	CHANGE HYBYTE AND FLGTRUNC TO RST
+!
+!    *************************************************
+!    *						*
+!    *		NEW REVISION HISTORY		*
+!    *						*
+!    *************************************************
+!
+!    PRODUCT	MODULE	 SPR
+!    EDIT	 EDIT	 QAR		DESCRIPTION
+!    ======	======	=====		===========
+!    560                                Remote $Truncate
+!    614            			BLK-mode $Truncate
+!    622				V2 bug $Truncating large
+!					seq file: bad page calculation
+!
+!    ***** END OF REVISION HISTORY *****
+!
+!
+!
+!
+!
+!-
+!+
+!    EXTERNAL DECLARATIONS
+!-
+
+REQUIRE 'RMSREQ';
+
+EXTERNAL ROUTINE
+    Dap$Truncate,
+    Psizefile;			!614
+
+%SBTTL '$TRUNCATE - $TRUNCATE processor'
+
+GLOBAL ROUTINE $truncate (rabblock, errorreturn) =
+! $TRUNCATE
+! =========
+!
+! PROCESSOR FOR $TRUNCATE MACRO.
+!
+!	THE $TRUNCATE MACRO LOGICALLY REMOVES ALL RECORDS
+!	IN THE FILE, BEGINNING WITH THE RECORD DESIGNATED
+!	BY THE "CURRENT RECORD POINTER", AND INCLUDING ALL
+!	SUBSEQUENT RECORDS UNTIL THE END-OF-FILE IS REACHED.
+!	NOT ONLY ARE THE RECORDS LOGICALLY REMOVED FROM THE
+!	FILE, BUT THE PAGES WHICH HELD THEM ARE ALSO PHYSICALLY
+!	DESTROYED, THUS SHRINKING THE SIZE OF THE FILE.
+!	THE FOLLOWING RESTRICTIONS ARE IMPOSED ON THE USE
+!	OF THE $TRUNCATE MACRO:
+!
+!		1. VALID ONLY FOR SEQUENTIAL FILES (INCLUDING ASCII,LSA)
+!
+!		2. ONLY ONE RAB CAN BE ACTIVE (I.E., $CONNECTED)
+!
+!		3. THE FILE MUST BE OPEN FOR EXCLUSIVE ACCESS.
+!
+!		4. FILE MUST RESIDE ON DIRECT-ACCESS DEVICE.
+!
+!		5. THERE MUST BE A "CURRENT RECORD".
+!
+! THE FORMAT OF THE $TRUNCATE MACRO IS:
+!
+!		$TRUNCATE	<RAB-ADDR> [,ERROR-ADDRESS]
+!
+! RAB FIELDS WHICH ARE USED AS INPUT TO $TRUNCATE:
+!
+!	ISI		INTERNAL STREAM IDENTIFIER
+!
+!
+! RAB FIELDS RETURNED TO USER:
+!
+!	STS		COMPLETION STATUS CODE
+!
+!
+! INPUT:
+!	ADDRESS OF USER RECORD BLOCK
+!	ADDRESS OF USER ERROR ROUTINE
+!
+! OUTPUT:
+!	<STATUS FIELD>
+!
+! GLOBALS USED:
+!	GTBYTE
+!
+! NOTES:
+!
+!	1.	THIS ROUTINE CURRENTLY PMAPS ALL PAGES AWAY FROM AN
+!		ASCII FILE IF IT IS $TRUNCATED (ALL PAGES FROM THE CURRENT
+!		PAGE TO PAGE 777). IT DOES NOT PMAP AWAY PAGES BEYOND 777
+!		BECAUSE THE MONITOR WILL GIVE AN ERROR IF THERE IS NO PAGE
+!		TABLE FOR THE LONG-FILE PAGES.
+!
+    BEGIN
+
+    LOCAL
+	crp,
+	filepointer : REF BLOCK,
+	pagecount,
+	p_in_file,
+	temp,
+	ptr;
+
+    rmsentry ($truncate);
+
+    !+
+    !    FETCH THE USER'S RAB ADDRESS AND HIS ERROR ROUTINE ADDRESS
+    !-
+
+    rab = .rabblock;				! FETCH RAB ADDRESS
+    erradr = .errorreturn;			! AND USER ERROR ADDRESS
+
+    !+
+    !    SET UP SYSTEM-WIDE POINTERS AND MAKE SURE THAT
+    !    THE USER SPECIFIED $TRUNCATE ACCESS IN HIS FAC FIELD
+    !-
+
+    rsetup (axtrn);				! SET UP THINGS
+
+    !+
+    !    REMOTE FILE TRUNCATE
+    !-
+    IF .Fst[Fst$v_Remote]
+    THEN
+        BEGIN
+        Dap$Truncate( .rab, .erradr );
+        UsrRet();
+        END;
+
+    !+
+    !    LOCAL FILE TRUNCATE (rest of routine)
+    !-
+
+    !+
+    !    MAKE SURE THIS IS A DISK FILE
+    !-
+
+    IF NOT dasd THEN usererror (er$dev);	! MUST BE A DISK
+
+    !+
+    !    THIS MUST BE A SEQUENTIAL FILE WITH ONLY ONE CONNECTED RAB
+    !-
+
+    IF fileorg GEQ orgrel			! STREAM OR SEQ FILE
+	OR (.rst [flink] NEQ .fst)		! ONLY ONE RAB IS CONNECTED
+    THEN
+	usererror (er$iop);
+
+    !+
+    !    FILE MUST BE OPENED FOR EXCLUSIVE ACCESS
+    !-
+
+    IF shareaccess NEQ axnil THEN usererror (er$xcl);
+
+    !+
+    !    FOR SEQUENTIAL RMS FILES, DO THE FOLLOWING...
+    !-
+
+    IF seqfile
+    THEN
+	BEGIN
+
+	!+
+	!    There must be a valid record pointer for this
+	!    $TRUNCATE to succeed.  This is only possible if
+	!    the last operation was a successful $FIND or $GET.
+	!-
+
+	IF (.rst [rstlastoper] NEQ c$find AND 	!
+	    .rst [rstlastoper] NEQ c$get)	!
+	THEN
+	    usererror (er$cur);			! BAD RECORD POINTER
+
+	!+
+	!    LOCATE THE CURRENT RECORD IN OUR CURRENT BUFFER
+	!-
+
+	crp = .rst [rstdatarfa];
+	gtbyte (.crp, 				! Locate record
+	    false);				! Flag
+
+	!+
+	!    FETCH A POINTER TO THE CURRENT RECORD
+	!-
+
+	filepointer = .rst [rstpagptr];		! GET POINTER TO BUFFER
+	filepointer [wholeword] = 0;		! CLEAR 1ST WORD
+!+
+!    WE HAVE NOW MAPPED THE RECORD INTO OUT BUFFER,
+!    AND ZEROED THE HEADER WORD.  BUT THIS IS NOT
+!    ENOUGH TO GUARENTEE A GOOD EOF MARK BECAUSE
+!    THE NEXT RECORD THAT WE WRITE MAY CAUSE A
+!    NON-ZERO WORD TO BE TAKEN AS THE HEADER OF A
+!    NON-EXISTENT RECORD. THEREFORE, WE MUST CLEAR
+!    THE ENTIRE PAGE FROM THIS WORD DOWN.  IF THE
+!    HEADER IS THE LAST WORD IN THE PAGE, THEN WE
+!    CAN STOP.
+!-
+
+	IF (.filepointer AND ofsetmask) NEQ ofsetmask
+	THEN 					! Not at bottom of page
+	    movewords (.filepointer, 		! From
+		.filepointer + 1, 		! To
+		(.filepointer OR ofsetmask) - .filepointer);	! Size
+
+	p_in_file = sizefile (.fst [fstjfn]);	! Get word count
+	rst [rstnrp] = .crp;			! Reset NRP to old CRP
+	fst [fstsof] = .crp;			! Crock [why? 4-83, RL]
+	END
+    ELSE
+	BEGIN					! Truncate a stream/LSA file
+
+!+ 614	BLK-mode $TRUNCATE.  Kill pages from the page specified 
+!	by RAB BKT to the end of file.  Set the highest byte written
+!	to the last byte on the last remaining page after truncation,
+!	so a close will update the bytecount.  If more flavors of
+!	$TRUNCATE are needed, make the follow test a SELECT.
+!-
+        IF (.Rab[Rab$b_Rac] AND Rab$k_Blk) NEQ 0 !614
+        THEN
+        BEGIN		!BLK-mode $TRUNCATE
+
+          LOCAL Bkt: INITIAL(.Rab[Rab$g_Bkt]),	!File page # to trunc after
+                p_in_file,                     	!File page count
+                bytes_per_page,			!Bytes/page
+                truncflg;
+
+          ! Special case for VBN=0, the FDB
+          IF .Bkt EQL 0				!Can't truncate the FDB
+          THEN usererror (er$cur);          
+
+          ! Get file's page count
+          p_in_file = psizefile (.fst[fstjfn]) ;  !Get # pages in file
+
+          IF .Bkt GTR .p_in_file  !Can't truncate after last page
+          THEN usererror (er$cur);
+
+          ! Kill remaining pages
+          Truncfile (.fst[fstjfn],
+                    .Bkt,
+                    .p_in_file - .Bkt + 1);
+
+          ! Flag the $TRUNCATE
+          setflag (rst[rstflags], flgtrunc);
+          truncflg = (.rst[rstflags] AND flgtrunc);
+
+          ! Set "Highest byte written" to the last byte # of the
+          ! highest remaining page in the file
+          bytes_per_page = (%BPVAL/.fst[fst$h_Bsz]) * pagesize;
+          rst[rsthybyte] = (.Bkt-1) * .bytes_per_page;
+
+          ! Flag EOF
+          setflag (rst [rstflags], flgeof);
+
+          ! Reset the FDB now
+          Adjeof (.fst[fstjfn],.rst[rsthybyte],truncflg);
+
+          rst[rstdatarfa] = 0;			!No crp any more
+          Rab[rabrfa, 0] = 0;
+          usrret ();
+        END;		!BLK-mode $TRUNCATE
+
+
+	!+
+	!    Do we have a current record?
+	!-
+
+	IF endoffile OR 			! No truncation at EOF
+	    .rst [rstlastoper] EQL c$connect	!   or if just $CONNECTed.
+	THEN
+	    usererror (er$cur);			! ** Not positioned **
+
+
+	!+
+	!    Set CRP to the beginning of the current physical record.
+	!-
+
+	crp = .rst [rstdatarfa] - .rst [rstrhsize];	! CRP in chars
+	setflag (rst [rstflags], flgeof);	! Set EOF
+	posascfil (.fst [fstjfn], .crp);	! Reposition file
+!	p_in_file = sizefile (.fst [fstjfn]);	! Get char count   !622
+!	p_in_file = (.p_in_file + 4) MOD 5;	! Word count       !622
+	END;
+
+!+
+!    DESTROY ALL FILE PAGES FROM THIS PAGE FORWARD.
+!    THIS WILL GUARANTEE THAT ANY EXISTING DATA IN THE FILE
+!    WILL GO AWAY AND WILL NOT BE CONFUSED LATER FOR AN EOF MARK
+!-
+!+
+!    BUT, DON'T DO IT IF THERE IS NO CURRENT PAGE YET
+!    (I.E., THE CURRENT FILE PAGE IS -1)
+!-
+
+    IF (temp = (.currentfilepage + 1)) NEQ 0
+    THEN
+	BEGIN
+	p_in_file = psizefile (.fst [fstjfn]);  ! PAGES IN FILE 	!622
+	truncfile (.fst [fstjfn], 		! JFN
+	    .temp, 				! Next page
+	    .p_in_file - .currentfilepage );	! Number of pages	!622
+	END;
+
+    setflag (rst [rstflags], flgtrunc);		! REMEMBER THIS $TRUNCATE
+    rst [rstdatarfa] = 0;			! CLEAR OUT RECORD POINTER
+    rab [rabrfa, 0] = 0;			! UNDEFINED CRP
+    rst [rsthybyte] = .crp;			! RESET HIGHEST WRITTEN BYTE
+    usrret ()					! RETURN TO USER
+    END;					! End $TRUNCATE
+
+END
+
+ELUDOM
+   

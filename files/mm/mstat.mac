@@ -1,0 +1,188 @@
+
+	TITLE MSTAT
+
+	COMMENT /
+
+This is the "user" portion of the mail status query program. It passes
+the user's name, controlling TTY #, privilege flag and login directory #
+to the <OPERATOR>MAILST program (running in background under SMTPSV job)
+via IPCF. MAILST (a hacked version of Tom Rindfleisch's QDMAIL) does all
+the actual file work for both MAILQ: and the user's login directory.
+
+This mail status program runs in non-privileged and privileged modes. In
+non-privileged mode the user is shown MAILQ: files with sender name identical
+to user name, and all mail files in the user's login directory. In
+privileged mode (WHEEL or OPERATOR capabilities enabled) the user is shown
+all mail files in MAILQ: and the user's login directory.
+
+Mail files are reported in the following formats:
+
+Non-Privileged:
+
+Trying POBOX:<MAIL.QUEUE>...
+You have mail in the queue:
+
+      To: Miles@RADC-TOPS20.ARPA
+ Subject: MSTAT sample
+  Queued: 17-Oct-83 11:21:21
+   Until: 23-Oct-83 00:00:00
+
+Trying POBOX:<MILES>...
+You have no outgoing mail in POBOX:<MILES>
+
+Privileged:
+
+Trying POBOX:<MAIL.QUEUE>...
+[Retransmit Queued Mail]
+    From: MILES@RADC-TOPS20.ARPA
+      To: Miles@RADC-TOPS20.ARPA
+ Subject: MSTAT sample
+  Queued: 17-Oct-83 11:21:21
+   Until: 23-Oct-83 00:00:00
+
+Trying POBOX:<MILES>...
+
+	/
+
+	SEARCH MONSYM
+	SEARCH MACSYM
+	.TEXT "MSTAT/SAVE"
+
+VWHO==0
+VMAJOR==6			;TOPS-20 release 6.1
+VMINOR==1
+VMSTAT==^D3			;MSTAT's version number
+
+
+A=1
+B=2
+C=3
+D=4
+T=11
+U=12
+V=13
+W=14
+
+;This PID descriptor block (among other things) freely adapted from MRC's MM
+PIDGET:	IP%CPD			;Create a PID to use as sender's PID
+PIDNUM:	0			;PID of sender
+	0			;PID of receiver (0 for INFO)
+	END1-.,,.+1		;length,,addr of message
+	1,,.IPCIW		;get PID associated with name
+	0			;no duplicates to receive INFO response
+PIDNAM:	ASCIZ/[SYSTEM]MAILST/	;name of mail query server
+END1==.-1
+RCVBF:	BLOCK 10		;Buffer for receiving messages
+MPID:	BLOCK 1			;MAILST's PID
+
+; Next block of data used for MSTAT ---> MAILST communications
+USRSTR:	BLOCK 8			;User name string
+TTYNUM:	BLOCK 1			;Controlling TTY number
+PRVFLG:	BLOCK 1			;User's enabled priv's flag
+USRDIR:	BLOCK 1			;User's login directory number
+
+; Program entry vector
+ENTVEC:	JRST START		;Normal entry
+	JRST START		;REENTER entry
+	BYTE(3)VWHO(9)VMAJOR(6)VMINOR(18)VMSTAT
+ENTVCL==.-ENTVEC
+
+START:	RESET%
+	SETZM PRVFLG		;Assume no privileges
+	MOVEI A,.FHSLF
+	RPCAP%
+	TXNE C,SC%WHL!SC%OPR	;Wheel or Operator priv's enabled
+	SETOM PRVFLG		; lets user look at all queued files
+	MOVEI A,4		;Length of packet descriptor block
+	MOVEI B,PIDGET		;Address of PDB
+	MSEND%			;Get a PID and assign the name to it
+	 ERJMP PIDERR		;Something went wrong...
+
+; Get the response from <SYSTEM>INFO
+
+LOOP:   SETZB T,U		;No flags, any sender
+        MOVE V,PIDGET+.IPCFS	;Receiver PID
+        MOVE W,[10,,RCVBF]	;Buffer length,,Address
+        MOVEI A,4		;Length of PDB
+        MOVEI B,T		;Address of PDB
+        MRECV%			;Get message from INFO
+         ERJMP PIDERR		;Something went wrong
+        LOAD U,IP%CFC,T		;See who sent message
+        CAIE U,.IPCCC		;From <SYSTEM>IPCF
+         CAIN U,.IPCCF		;Or <SYSTEM>INFO?
+          CAIA	       		;Yes, good
+	   JRST LOOP		;No, get another message
+        TXNE T,IP%CFE       	;Was it undeliverable?
+	 JRST GETERR
+	JUMPN A,LOOP		;There's more in the queue, so this probably
+				;wasn't the right message (this shouldn't
+				;happen)
+	MOVE A,RCVBF+1		;Save MSTAT's PID
+	MOVEM A,MPID
+
+; get user name
+
+	GJINF%			;Get job information
+	JUMPL D,HALT		;This shouldn't happen
+	MOVEM D,TTYNUM		;TTY #
+	MOVEM A,T		;Save user # DIRST
+	MOVE B,A		;User # to AC2 for RCDIR
+	SETZ A,			;No flags
+	RCDIR%			;Get directory number
+	MOVEM C,USRDIR		;Put in message block
+	MOVE B,T		;User # to AC2 for DIRST
+	MOVE A,[POINT 7,USRSTR]	;pointer for name string in AC1
+	DIRST%			;convert user # to user name
+	 ERJMP DIRERR		;to DIRERR if error
+
+; Send data block to MAILST, wait for signal that it's finished
+
+	SETZ T,			;No flags
+	MOVE U,PIDNUM		;Sender PID
+	MOVE V,MPID		;Receiver PID
+	MOVE W,[^D11,,USRSTR]	;Length,,Address
+	MOVEI A,4		;PDB length
+	MOVEI B,T		;PDB address
+	MSEND%			;Send it
+	 ERJMP PIDERR		;Something went wrong
+
+; Set up to receive message from MAILST
+
+GETMES:	SETZB T,U		;No flags, no sender PID
+	MOVE V,PIDNUM		;Receiver PID
+	MOVE W,[1,,RCVBF]	;Length,,Address
+	MOVEI A,4		;PDB length
+	MOVEI B,T		;PDB address
+	MRECV%			;Wait for message
+	 ERJMP PIDERR		;Something went wrong...
+	JUMPN A,GETMES		;There's still something in the queue, so
+				; clean it up before we're done
+HALT:	HALTF%			;normal program halt
+	JRST START		;we can continue
+
+
+	SUBTTL Error subroutines
+
+DIRERR: HRROI A,[ASCIZ/
+? DIRST Error: /]
+	JRST ERROUT
+
+PIDERR:	HRROI A,[ASCIZ/
+? IPCF error: /]
+	JRST ERROUT
+
+GETERR:	HRROI A,[ASCIZ/
+? Can't get MAILST'S PID - can't continue/]
+	PSOUT%
+	JRST HALT
+
+ERROUT:	PSOUT%			;output local error message
+  	MOVE A,[.PRIOU]		;output JSYS error message to TTY
+	MOVE B,[.FHSLF,,-1]	;current process,,last error
+	SETZ C,			;no limit on message length
+	ERSTR%			;output message
+	 JFCL			;ignore errors for string output...
+	 JFCL			; ...
+	JRST HALT
+
+	END <ENTVCL,,ENTVEC>

@@ -1,0 +1,988 @@
+TITLE FAKDYN -- User-mode implementation of dynamic libraries
+
+;
+;	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1984, 1986.
+;	ALL RIGHTS RESERVED.
+;
+;	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+;	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+;	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+;	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+;	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+;	SOFTWARE IS HEREBY TRANSFERRED.
+;
+;	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+;	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+;	EQUIPMENT CORPORATION.
+;
+;	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+;	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+;
+
+SEARCH DDBSYM, MONSYM, MACSYM
+SEARCH DYNSYM
+
+SALL
+SUBTTL Edit History
+
+; Version 1.0
+
+;.EDIT 4	Fix restart master-init problem for RTL
+;		DDB,9-MAY-84,SPR:NONE
+;.EDIT 10	Fix code to handle new PDV format
+;		DDB,12-JUN-84,SPR:NONE
+
+; Version 1.1
+
+;.EDIT 50	Formally go to version 1.1, update copyright, insert V1.1
+;			development changes (formally V2)
+;		DDB,15-Jan-85,SPR:NONE
+;.EDIT 51	Add GLOBbing in build procedure, make DY$CBK work from JCK.
+;		DDB,30-Apr-85,SPR:NONE
+
+EXTERNAL RTLSER, RTLERS, RTLJER, RTLCER, RTLERR
+EXTERNAL RTLPDV, SG.NAS
+
+	REGDEF CX, LLB		;EFIW LDLBLK is overwhelmingly important
+SUBTTL DY$DYN -- Routine called on first reference through LTVEC
+
+; On call, PC must be in non-zero section, stack pointer must be global,
+; and there must be at least <foo> words available on the stack.
+
+SEGMENT CODE
+
+DY$DYN::
+	;Save registers 0-16 in format DY$DYN expects to restore from
+	ADJSP P, 17		;Allocate save block on stack
+	MOVEM 2, -14(P)		;Put AC2 in save block
+	XMOVEI 2, 1(P)		;Adr of block end + 1
+	DMOVEM 0, -16(P)	;Put AC0 and AC1 in save block
+	DMOVE 0, [EXP -14, 17]	;Set up 0,1 for reverxe XBLT (2 already set)
+	EXTEND 0, [XBLT]	;Save 3-16 in save block
+FAKSAV==17
+
+; Local temp storage:
+FAKTMP==23
+LCL1==-FAKTMP+1
+LCL2==-FAKTMP+2
+LCL6==-FAKTMP+4			;6-word local storage block
+LCL12==-FAKTMP+12		;12-word local storage block
+	ADJSP P, FAKTMP		;Allocate local work space
+
+; Names for stuff left on stack while calling us:
+CLDLBK==-<FAKSAV+FAKTMP>	;Address of local dynamic library block
+UCIP1==CLDLBK-1			;Address of user call instruction + 1
+
+	MOVE LLB, CLDLBK(P)	;Address of LDLBLK
+
+; Check LDLBLK format version number to see if we speak that language
+
+	PUSH P, [VM%MIG]	;Accept if equal or minor greater
+	PUSH P, [$DYFVN]	;"Us"
+	PUSH P, .LDFVN(LLB)	;"Him" is what LDLBLK is
+	CALL VERMAT
+	    SKIPA		;Fails
+	JRST FAK002		;Succeeds
+
+; Error -- local dynamic library block is a version that this FAKDYN
+; doesn't understand.
+
+	PUSH P, .LDFVN(LLB)
+	PUSH P, [1]
+	PUSH P, [DY$DYV]
+	CALL RTLERS		;Make signal block, return address in T1
+	JRST FAKLDU
+
+FAK002:
+
+; If library has already been initialized, then we got here as a result of
+; a bad offset
+	MOVX T1, LD%INI
+	TDNE T1, .LDFLG(LLB)	;Skip if library not initialized
+	    JRST BADOFF
+
+; Look for existing providers of the requested service class
+
+	XMOVEI T2, LCL6(P)	;Use LCL6 as PDV argument block
+	MOVX T0, 6
+	MOVEM T0, .POCT1(T2)
+	MOVX T0, .FHSLF
+	MOVEM T0, .POPHD(T2)
+	MOVX T0, 12
+	MOVEM T0, .POCT2(T2)
+	XMOVEI T0, LCL12(P)	;Use LCL12 as PDV data block
+	MOVEM T0, .PODAT(T2)
+	SETZM .POADR(T2)
+	MOVX T1, <777,,-1>	;Highest possible memory address
+	MOVEM T1, .POADE(T2)
+	;.poloc isn't documented to respect .poadr .poade, but it does
+	MOVX T1, .POLOC		;Function code
+	GETBP T3, .LDCLS(LLB), T4 ;Pointer to class name string
+	PDVOP%
+	    ERCAL FAKJSE
+
+	; Note: no check yet for whether more providers present than
+	; would fit into data block.  This may not be important?
+
+; We now have a list of providers of the service class requested in LCL12.
+; We must step through this list and see if any of them are available to
+; satisfy the current request.
+
+FAK003:	HRRZ T0, .POCT2(T2)	;Count of words returned
+	MOVX T1, 0		;Counter/index for walking list
+	XMOVEI T2, LCL12(P)	;Address of data block
+	TXO T2, <<T1>B5>	;!!! Make indexed (global format index)
+
+; Examine the next provider
+FAKNXP:	CAML T1, T0		;Skip if there is such a provider
+	    JRST FAKNPR		;No more providers to consider
+
+; For each provider
+	MOVE T3, @T2		;Get provider PDVA
+				;T2 holds an EFIW indexed by T1
+	XMOVEI T3, @.PVSTR(T3)	;Get DLBLK adr from provider PDV
+
+; Magically determine if this one is available to provide the service
+	MOVE T5, .DYFLG(T3)	;Get library flag word from DLBLK
+	TXNE T5, DY%BSY		;Skip if not busy
+	    JRST FAK001
+
+; Provider can provide the service.  Prepare registers as required.
+	MOVE T1, T3		;FAKFND expects DLBLK address in T1
+	JRST FAKFND
+
+; Loop through additional providers
+FAK001:	AOJA T1, FAKNXP		;Go try next one
+
+; If no provider found, make one
+
+FAKNPR:
+; If this process is execute-only, ignore job-wide logical names on GTJFN%
+; to give the process at least some hope of maintaining security (with help
+; from the system manager, of course).
+
+; [RFSTS WORKAROUND] ;	XMOVEI T2, LCL12(P) ;Address of status block
+	XMOVEI T2, RFSHCK	;[RFSTS WORKAROUND] Address of status block
+	MOVX T1, .RFSFL+1	;length to at least include status flags
+	MOVEM T1, .RFCNT(T2)
+	MOVX T1, <RF%LNG+.FHSLF>
+	RFSTS%
+	  ERCAL FAKJSE
+	MOVE T0, .RFSFL(T2)	;Recover status flags returned
+	MOVX T1, GJ%OLD!GJ%SHT
+	TXNE T0, RF%EXO		;Skip if process is not execute-only
+	  TXO T1, GJ%PHY	;Ignore job logical names if execute-only
+	GETBP T2, .LDSPC(LLB), T4
+	GTJFN%
+	    ERCAL FAKJSE
+
+; JFN is now sitting in T1.  Don't break it!
+; Address of LDLBLK is sitting in LLB. 
+
+; Get the file into the process
+
+; First, save entry vector
+	MOVEM T1, LCL1(P)	;Save JFN temporarily
+	MOVX T1, .FHSLF
+	XGVEC%
+	    ERCAL FAKJSE
+
+	DMOVEM T2, LCL2(P)	;Use as temp hold area
+	MOVE T1, LCL1(P)	;Restore JFN
+
+; Magically allocate a section.  Leave section number in T3.
+
+	CALL SECTIO		;Allocate a section, leaving result in T3
+	  JRST [
+		PUSH P, [0]
+		PUSH P, [DY$SEC]
+		CALL RTLERS
+		JRST FAKLDU
+	    ]
+
+; Get the file into the chosen section
+; JFN still sitting in T1; Section number in T3
+
+	XMOVEI T2, LCL12(P)	;Use LCL12 block for data block
+	MOVEM T3, .GBASE(T2)
+	MOVX T0, GT%BAS
+	MOVEM T0, .GFLAG(T2)
+	TXZ T1, <^-GT%JFN>	;Clear out all non-JFN bits
+	TXO T1, GT%NOV!GT%ARG	;Set flags
+	HRLI T1, .FHSLF
+	GET%
+	    ERCAL FAKJSE
+
+; Restore entry vector
+	MOVX T1, .FHSLF
+	DMOVE T2, LCL2(P)	;Get length and address from temp hold
+	XSVEC%
+	    ERCAL FAKJSE
+
+; Do a PDVOP% over just the new section to find the dynamic library PDV,
+; and thus the DLBLK.  We do this rather than looping back to the initial 
+; search because that search, over the full address space, might find a
+; previously-loaded copy of this service provider which has become free
+; due to asynchronous activity since we last looked.  If that were to happen,
+; the copy we just loaded would not get initialized, which could cause
+; disaster if a later call for service happened to choose it to call.
+
+FAK004:	XMOVEI T2, LCL6(P)	;Use LCL6 for PDV arg block
+				;again.  This was its last use.
+	MOVX T0, 12
+	MOVEM .POCT2(T2)
+	XMOVEI T1, LCL12(P)	;Use LCL12 for PDV data block
+	MOVEM T1, .PODAT(T2)
+	MOVE T1, .GBASE(T1)	;Still contains GET% args, including section
+	HRLZM T1, .POADR(T2)	;section,,0 -- start of range to search
+	HRLOM T1, .POADE(T2)	;section,,-1 -- end of range to search
+	MOVX T1, .POLOC		;Function -- locate PDV by name
+	; .poloc isn't documented to respect .poadr .poade, but it does
+	GETBP T3, .LDCLS(LLB), T4 ;Pointer to class name string
+				;(By searching for class name instead of for
+				;the Dynamic Library PDV, we are performing
+				;a check to make sure the file specified in
+				;the LDLBLK actually provides the service
+				;specified in the LDLBLK.)
+
+	PDVOP%
+	    ERCAL FAKJSE
+
+	HRRZ T1, .POCT2(T2)	;Get number of providers found (better be 1!)
+	CAIE T1, 1		;Should be exactly one provider PDV in a single
+				;dynamic library
+	  JRST [
+		PUSH P, [0]
+		PUSH P, [DY$CLS]
+		CALL RTLERS
+		JRST FAKLDU
+	    ]
+
+	MOVE T1, LCL12(P)	;Get the single PDVA
+	XMOVEI T1, @.PVSTR(T1)	;Get DLBLK from PDV
+
+; Check format version number of DLBLK in library found.
+
+	PUSH P, [VM%MIG]	;Accept if equal or minor greater
+	PUSH P, [$DYFVN]	;"Us"
+	PUSH P, .DYFVN(T1)	;"Him" is DLBLK format version
+	CALL VERMAT
+	    SKIPA		;Fails
+	JRST FAK005		;Succeeds
+
+; Error -- Master dynamic library block is a version that this FAKDYN
+; doesn't understand.
+
+	PUSH P, .DYFVN(T1)
+	PUSH P, [1]
+	PUSH P, [DY$LBV]
+	CALL RTLERS
+	JRST FAKLDU
+
+DY$BS::				;DYNBOO JRSTs to here when bootstrapping
+				;the RTL
+; This entry point must be offset .RTBOO in CUSTOMER vector.
+
+; Required state:
+;	LLB/	EFIW LDLBLK
+;	T1/	EFIW DLBLK
+;	P2/	Non-zero if library was just mapped in by DYNBOO
+;	STACK:
+;		UCIP1,CLDLBK,LCL12,LCL6,LCL2,LCL1,FAKSAV
+
+	JUMPE P2, FAKFND	;Don't init unless just mapped in
+
+FAK005:
+; Call master init of newly mapped library
+	XMOVEI T2, @.DYDTV(T1)	;EFIW master transfer vector
+	PUSH P, T1		;Preserve regs we count on
+	PUSH P, LLB
+	CALL @.DEMIN(T2)	;Call master init through master transfer vector
+	MOVE T2, T1		;Preserve error indication
+	POP P, LLB
+	POP P, T1
+
+	JUMPE T2, FAKFND	;Found, if no master init error
+	PUSH P, T2		;Error code
+	PUSH P, [1]
+	PUSH P, [DY$MIE]
+	CALL RTLERS
+	JRST FAKLDU
+
+FAKFND:
+
+; Come here if we have found a provider.
+
+; DLBLK address in T1 (not available elsewhere!!!!)
+; LDLBLK address in LLB
+
+; Verify that version of library found is acceptable to LDLBLK we are looking
+; on behalf of.
+
+	;This code depends on version match rule being in same bits in .LDFLG
+	;and .DYFLG.  This requirement is documented in DYNSYM.MAC
+	MOVE T0, .LDFLG(LLB)	;Get local match rule
+	TXNN T0, LD%VMA		;Skip if local match rule overrides master
+	    MOVE T0, .DYFLG(T1)	;Get master match rule
+	LDB T0, [POINTR T0,LD%VER] ;Extract version match field
+	;End of dependency
+
+	PUSH P, T0		;Push version match rule
+	PUSH P, .LDVER(LLB)	;Push local version ("us")
+	PUSH P, .DYVER(T1)	;Push actual version ("him")
+	CALL VERMAT
+	    JRST FAKVER		;Didn't match
+	JRST FAKVOK		;Did match
+
+FAKVER:
+; Print a nifty error message describing why the versions don't match
+	PUSH P, .DYVER(T1)
+	PUSH P, .LDVER(LLB)
+	PUSH P, [2]
+	PUSH P, [DY$VER]
+	CALL RTLERS
+	JRST FAKLDU
+
+FAKVOK:	; Versions meet the matching criteria, we can use this one
+
+; Wave hands over LDLBLK and dependents
+
+	XMOVEI T0, @.DYCTV(T1)	;EFIW Address of CTVEC
+	XMOVEI T2, @.LDCTV(LLB)	;EFIW Address of LCTVEC
+	CALL WAVHND		;Wave hands over one transfer vector
+	  JRST [
+		PUSH P, [0]
+		PUSH P, [DY$CTV]
+		CALL RTLERS
+		JRST FAKLDU
+	    ]
+
+	XMOVEI T0, @.DYDTV(T1)	;EFIW Address of DTVEC
+	XMOVEI T2, @.LDDTV(LLB)	;EFIW Address of LDTVEC
+	CALL WAVHND		;Wave hands over the other transfer vector
+	  JRST [
+		PUSH P, [0]
+		PUSH P, [DY$DTV]
+		CALL RTLERS
+		JRST FAKLDU
+	    ]
+
+	XMOVEI T0, @.DYDGV(T1)	;EFIW Address of DGVEC
+	XMOVEI T2, @.LDDGV(LLB)	;EFIW Address of LDGVEC
+	CALL WAVHND		;Wave hands over the other transfer vector
+	  JRST [
+		PUSH P, [0]
+		PUSH P, [DY$DGV]
+		CALL RTLERS
+		JRST FAKLDU
+	    ]
+	XMOVEI T0, @.DYCGV(T1)	;EFIW Address of CGVEC
+	XMOVEI T2, @.LDCGV(LLB)	;EFIW Address of LCGVEC
+	CALL WAVHND		;Wave hands over the other transfer vector
+	  JRST [
+		PUSH P, [0]
+		PUSH P, [DY$CGV]
+		CALL RTLERS
+		JRST FAKLDU
+	    ]
+
+; Mark library as loaded and initialized
+	MOVX T0, LD%INI
+	ORM T0, .LDFLG(LLB)	;Set bit in flag word in LDLBLK
+
+; At this point, we've found or loaded the library, and we've waved
+; our hands over the local transfer vectors.  It's time to clean up
+; the mess we made on the stack and re-execute the user call instruction
+; that got us here in the first place.
+
+	SOS UCIP1(P)		;Decrement user return to point back
+				;to call instruction
+	ADJSP P, -FAKTMP	;Remove temp storage
+
+;Restore registers saved by DYNBOO or FAKDYN
+	MOVX 0, 14		;Count for XBLT
+	XMOVEI 1, -13(P)	;Source address: AC3 in save block
+	MOVX 2, 3		;Destination address: AC3
+	EXTEND 0, [XBLT]	;Restore 3-16
+	DMOVE 0, -16(P)		;Restore 0,1
+	MOVE 2, -14(P)		;Restore 2
+
+	ADJSP P, -20		;Remove save block from stack (17)
+				;Take off the LDLBLK address from the
+				;extra PUSHJ before the LDLBLK (1)
+
+	POPJ P,			;Return to re-execute user call instruction
+
+BADOFF:
+
+; If LTVEC longer than MTVEC and one of those extra locations is called,
+; control comes here.
+
+	PUSH P, [0]
+	PUSH P, [DY$BOF]
+	CALL RTLERS
+	JRST FAKLDU
+SUBTTL VERMAT -- Version matching routine
+
+; This routine compares two TOPS-20 version numbers and decides whether their
+; relationship satisfies a specified version matching rule.
+
+; Accepts three arguments on stack:
+.VMRUL==-3			;Version matching rule
+				;(Use VM%xxx codes from DYNSYM)
+.VMUS==-2			;"Our" version (TOPS-20 version format)
+.VMHIM==-1			;"His" version (TOPS-20 version format)
+
+; Returns +1 if versions don't match, +2 if they do.  Removes args from stack.
+; Trashes registers T0, T2, T3, T4.
+
+VERMAT:
+
+	LDB T2, [POINTR .VMUS(P),VI%MAJ] ;Our major version
+	LDB T3, [POINTR .VMHIM(P),VI%MAJ] ;His major version
+	CAMN T3, T2		;Skip if major versions differ
+	    JRST VMAMEQ		;Major versions are equal
+
+	; Compare major versions against major version match rule
+
+	SETZ T4,
+	CAMG T3, T2		;Skip if he is majorly newer
+	    TXOA T4, VM%MAL	;He is majorly older (and skip)
+	TXO T4, VM%MAG		;He is majorly newer
+	TDNE T4, .VMRUL(P)	;Skip if rule not satisfied
+	    JRST VMAVOK		;Rule satisfied; version is ok
+	JRST VMAVER			;Loses.
+
+; Major version numbers are equal, compare on minor
+
+VMAMEQ:
+	LDB T2, [POINTR .VMUS(P),VI%MIN] ;Our minor version
+	LDB T3, [POINTR .VMHIM(P),VI%MIN] ;His minor version
+	CAMN T3, T2		;Skip if minor versions differ
+	    JRST VMAVOK		;Perfect match wins
+
+	; Compare minor versions against minor version match rule
+
+	SETZ T4,
+	CAMG T3, T2		;Skip if he is minorly newer
+	    TXOA T4, VM%MIL	;He is minorly older (and skip)
+	TXO T4, VM%MIG		;He is minorly newer
+	TDNE T4, .VMRUL(P)	;Skip if rule not satisfied
+	    JRST VMAVOK		;Wins
+	JRST VMAVER		;Loses
+
+VMAVOK:	AOS 0(P)		;Skip return
+
+VMAVER:				;Regular return
+
+	; Clean stack and exit
+	MOVE T2, 0(P)		;Get return address
+	MOVEM T2, .VMRUL(P)	;Put over first arg
+	ADJSP P, -3		;Remove return and last n-1 args
+	RET			;Return
+SUBTTL Error processing routines
+
+; FAKLDU
+; JRST to this as part of the process of dying.
+; This routine prefixes the signal in T1 with library and user PC information.
+; LLB must be set up.  The stack must be in normal state for FAKDYN -- the
+; usual amount of garbage, nothing extra.
+
+FAKLDU:	CALL FAKFLL		;Put the FLL and UPC in front of what's in T1
+	;JRST FAKSER		;And go make it an error!!!!!
+
+; FAKSER
+; JRST to this as part of the process of dying.
+; Given the signal we want to send in T1, and a normal stack setup,
+; clean up the stack and then call RTLSER
+FAKSER:	ADJSP P, -FAKTMP	;Get rid of temp stuff
+	MOVEM T1, -15(P)	;Put our T1 over one in save block
+
+; Restore registers saved by DYNBOO or FAKDYN
+	MOVX 0, 14		;Count for XBLT
+	XMOVEI 1, -13(P)	;Source address: AC3 in save block
+	MOVX 2, 3		;Destination address: AC3
+	EXTEND 0, [XBLT]	;Restore 3-16
+	DMOVE 0, -16(P)		;Restore 0,1
+	MOVE 2, -14(P)		;Restore 2
+
+	ADJSP P, -20		;Remove save block from stack (17)
+				;Take off the LDLBLK address from the
+				;extra PUSHJ before the LDLBLK (1)
+	JRST RTLSER
+
+; FAKFLL
+; This is a subroutine, call it with a CALL.  It takes a signal in T1 and
+; prefixes it with library and user PC information.  LLB must be set up.
+; The stack must be in normal state at the time of the call (obviously there
+; will be one extra thing on it when we get here).
+
+FAKFLL:	MOVE P7, T1		;Preserve this signal
+
+	MOVE T1, UCIP1-1(P)	;Get address of user call plus 1
+				;The "-1" is because of the FAKFLL return adr
+				;sitting on the stack
+	SOS T1
+	PUSH P, T1
+	PUSH P, [1]
+	PUSH P, [DY$UPC]
+	CALL RTLERS
+	MOVE P6, T1
+
+	GETBP T1, .LDCLS(LLB), T4
+	PUSH P, T1
+	GETBP T1, .LDSPC(LLB), T4
+	PUSH P, T1
+	PUSH P, [2]
+	PUSH P, [DY$FLL]
+	CALL RTLERS
+
+	MOVEM P6, .SGNXT(T1)	;The FLL points to the UPC
+	MOVEM P7, .SGNXT(P6)	;The UPC points to what the user gave us
+
+	RET			;And we're done
+
+; FAKFAT
+
+; JRST here with a signal block address in T1.  We will produce the chain
+;   DY$FLL, DY$UPC, the signal in T1, JSYS error block
+; and pass it into RTLSER
+
+FAKFAT:	MOVE P1, T1		;Save given signal block
+	CALL RTLJER		;Make JSYS error block
+	MOVEM T1, .SGNXT(P1)	;Make chain given, JSYS
+	MOVE T1, P1
+	CALL FAKFLL		;Make chain DY$FLL, DY$UPC, given, JSYS
+	JRST FAKSER		;Go use it
+
+; FAKJSE
+; CALL here with no signal block address anywhere.  We produce a chain
+;   DY$FLL, DY$UPC, DY$EPC, JSYS error
+; and pass it into RTLSER
+
+FAKJSE:	CALL RTLJER		;Make JSYS error block
+	MOVEM T1, P1		;Save address of block produced
+	; PC at which error occurred is at top of stack from CALL to here
+	SOS 0(P)		;Point to instruction that failed
+	PUSH P, [1]
+	PUSH P, [DY$EPC]
+	CALL RTLERS
+	MOVEM P1, .SGNXT(T1)	;EPC points to JSYS
+	CALL FAKFLL		;Make FLL and UPC pointing to EPC and JSYS
+	JRST FAKSER
+SUBTTL SECTIO -- Allocate a section
+
+; This routine allocates a free section to map a library into.
+
+; This interim version uses Pete Mierswa's "section sniffer".  In the future,
+; a more complete algorithm including the possibility of user rules for
+; controlling section allocation should be employed.
+
+; Call:
+;	PUSHJ P, SECTIO
+;    Returns +1 if error (no more sections available!!)
+;    Returns +2 if no error, with
+;	T3/	Number of section allocated
+
+SECTIO:	PUSH P, T1		;Need elbow room
+	PUSH P, T2
+
+	MOVEI T3,1		;Start looking in section 2
+
+NEXTSC:	ADDI T3,1		;Look at the next section
+	CAIN T3,^D32		;No free sections on a KL?
+	  JRST SECFAL
+
+	MOVE T1, T3		;Next section to check
+	HRLI T1,.FHSLF		;For this process
+	RSMAP%			;Status of this section
+	  ERCAL FAKFAT		;Error?
+
+	TXNE T2,PA%PEX		;Does the page exist?
+	JRST NEXTSC		;Yes, look for a free section
+
+; Section number is in T3
+
+; Success -- skip return
+	AOS -2(P)		;Two saved registers on stack!
+
+SECFAL:
+
+SECOK:	POP P, T2
+	POP P, T1
+
+SECEX:	RET
+SUBTTL WAVHND -- Wave hands over one pair of transfer vectors
+
+; This routine takes a master and a local transfer vector, and updates
+; the local to point to the routines listed in the master (with EFIW's).
+
+; CALL:
+;	T0/	EFIW Master transfer vector (in library)
+;	T2/	EFIW Local transfer vector (in caller)
+;	LLB/	EFIW LDLBLK (in caller)
+;	CALL WAVHND
+;	Returns +1 if error, +2 if ok
+;	T0, T2, T3, T4, T5 TRASHED
+
+;   Rules for overloading:
+;
+; LTVEC entries not containing their default initial  state  will
+; not  be  altered.  The default initial state is "IFIW LDLBLK-1"
+; for the user-mode implementation.
+; 
+; If an MTVEC entry contains 0, the corresponding LTVEC entry  is
+; not altered.  (Section is ignored, check is for n,,0).
+; 
+; If the LTVEC is longer than the MTVEC, excess  LTVEC  locations
+; are not altered.
+; 
+; If the MTVEC is longer than the  LTVEC,  the  additional  MTVEC
+; entries are ignored.
+
+
+WAVHND:	PUSH P, T1
+	MOVX T1, 0		;Offset zero is vector length
+	TXO T0, <<T1>B5>	;!!! Index by T1 
+	TXO T2, <<T1>B5>	;!!! Index by T1
+
+	HRRZ T4, LLB		;LDLBLK
+	SOS T4			;LDLBLK-1
+	TXO T4, IFIW		;IFIW LDLBLK-1 (as found in LTVEC entries)
+
+	MOVE T3, @T2		;Get local transfer vector length
+	CAMLE T3, @T0		;Skip if local length less or equal master
+	    MOVE T3, @T0	;Master is shorter
+	; T3 now has length of shorter vector
+
+; Leave part of ltvec beyond mtvec unchanged; the invalid entry error will
+; be detected in fakdyn if that offset is ever used.
+
+; Wave hands over part of LTVEC within length of MTVEC.
+; Need: T0: EFIW MTVEC(T1), T2: EFIW LTVEC(T1)
+
+	MOVE T1, T3		;Start at end of shorter vector
+	TXO T0, <1B1>		;!!! Make indirect !!!
+
+; Loop through local vector length updating entries
+WAVNXT:	SOJLE T1, WAVDON	;Vectors may be zero long
+	MOVEI T3, @T0		;Get in-section part of address from MTVEC
+				;Note: this should NOT be an XMOVEI, I only
+				;want the in-section part of the address!!!
+	JUMPE T3, WAVNXT	;If zero, skip over this one
+	XMOVEI T3, @T0		;Get EFIW routine (note t0 is indirect indexed)
+	CAMN T4, @T2		;Skip if this LTVEC entry isn't normal IFIW
+	    MOVEM T3, @T2	;Store into LTVEC
+	JRST WAVNXT
+
+WAVDON:	AOS -1(P)		;Skip return
+
+WAVERR:				;Normal return
+
+WAVEXI:	POP P, T1		;Restore what we saved
+	RET
+
+	UN$LLB
+SUBTTL DY$MIN -- Master initialize all loaded libraries
+
+; Perform master init of all libraries curently mapped in.
+; Main programs using dynamic libraries should call this as part of their
+; "START" code, before their first call to a dynamic library.  This makes
+; such programs restartable!!
+
+; Formal Arguments: None
+
+; Value returned: None
+
+; Preserves no registers
+
+MINTMP==26			;Temp storage space
+.PDDAT==-17			;20 long
+.PDARG==-25			;6 long
+
+DY$MIN::
+	ADJSP P, MINTMP		;Make temp storage space
+
+; Turn on traps (delayed from master init for section-zero support)
+	SKIPE SG.NAS		;Skip if traps to be allowed
+	  JRST MIN001		;Bypass trap initialization
+
+; Turn on the trap system
+EXTERNAL %TRPINI
+	CALL %TRPINI		;Initialize trap system
+
+MIN001:
+
+; Set up PDVOP% arg block
+	XMOVEI T2, .PDARG(P)	;Adr of PDVOP% arg block
+	MOVX T0, 6
+	MOVEM .POCT1(T2)	;Arg block word count
+	MOVX T0, .FHSLF
+	MOVEM .POPHD(T2)	;Process handle
+	XMOVEI T0, .PDDAT(P)
+	MOVEM T0, .PODAT(T2)	;Adr of PDVOP% data block
+	; The addresses aren't documented as being used by .POLOC, but
+	; they are, and wrong too.  0 0 won't be interpreted to mean all memory
+	SETZM .POADR(T2)	;Start of memory range
+	MOVX T0, <7777,,-1>	;
+	MOVEM T0, .POADE(T2)	;End of memory range
+
+; Look for Dynamic Libraries
+MINSRC:	MOVX T0, 20
+	MOVEM T0, .POCT2(T2)	;Data block size
+	MOVX T1, .POGET		;Find all PDVA's 
+	; T2 still set to arg block address
+	PDVOP%
+	    ERCAL FAKFAT
+
+; Set up for loop through .PDDAT
+	HRRZ T0, .POCT2(T2)	;Number of entries
+	XMOVEI T1, .PDDAT(P)	;Index into .PDDAT
+
+; Loop through data block hitting master init for each entry
+MINNXT:	SOJL T0, MINBFI		;Finished with batch?
+	MOVE T3, 0(T1)		;Get PDVA
+
+; Decide if this PDV represents a dynamic library
+	XMOVEI P1, @.PVNAM(T3)	;[10]Address of name string
+;[10]				;Has form 0,,adr , must be interpreted 
+;[10]				; as section-local
+;[10]	XMOVEI T4, .PVNAM(T3)	;Get section where this came from
+;[10]	HLL P1, T4		;Set up as global index
+	MOVX T4, <POINT 7, 0(P1)> ;Pointer to name string
+	MOVX T5, <POINT 7, [ASCIZ /DYNLIB$/]> ;Pointer to desired string
+MINMAY:	ILDB P2, T4		;Get character of name string
+	JUMPE P2, MINNBL	;Name shorter than DYNLIB$, can't be equal
+	ILDB P3, T5		;Get character of desired string
+	JUMPE P3, MINDYN	;They matched to end of desired string, it's
+				;a baby dynamic library!!!
+
+; Note: case folding isn't desired here, name should be in caps!!!
+	CAMN P2, P3
+	    JRST MINMAY		;So far, so good; keep trying
+	JRST MINNBL		;Names not equal, not a dynamic library
+
+; This PDV actually represents a dynamic library!!
+MINDYN:	MOVE P1, T3		;Preserve PDVA
+	XMOVEI T3, @.PVSTR(T3)	;Get DLBLK address
+	XMOVEI T3, @.DYDTV(T3)	;Get MDTVEC address
+
+; Save registers we need around master-init call
+	PUSH P, T0
+	PUSH P, T1
+	PUSH P, T2
+	CALL @.DEMIN(T3)	;Call master init routine routine
+	MOVE T3, T1		;Preserve error code
+	POP P, T2
+	POP P, T1
+	POP P, T0
+	
+	JUMPE T3, MINNBL	;Proceed if all OK
+	PUSH P, T3
+	PUSH P, [1]
+	PUSH P, [DY$MIE]
+	CALL RTLERS
+	MOVE P2, T1		;Preserve block address
+	XMOVEI T0, @.PVNAM(P1)	;[10]Get address of name string from PDV block
+;[10]	HLL T0, P1		;Interpret as in section with PDB block
+	PUSH P, T0
+	PUSH P, [1]
+	PUSH P, [DY$MIA]
+	CALL RTLERS
+	MOVEM P2, .SGNXT(T1)
+	ADJSP P, -MINTMP	;Clean up our stack
+	JRST RTLSER		;Signal it internal-style
+
+; Try the next entry in the block.
+MINNBL:	AOJA T1, MINNXT		;Go try next .PDDAT entry
+
+; Done processing this chunk of data.  See if there's another, loop or done.
+MINBFI:	MOVS T0, .POCT2(T2)
+	CAMN T0, .POCT2(T2)	;Skip if <available> .ne. <returned>
+	    JRST MINDON
+
+; Although .POLOC isn't documented to use the address limit fields, it seems
+; to as of TOPS-20 5.1
+	MOVE T1, -1(T1)		;Get last PDVA (incremented after ref above)
+	AOS T1			;Increment
+	MOVEM T1, .POADR(T2)	;Set up starting address for next search
+	JRST MINSRC
+
+MINDON:	ADJSP P, -MINTMP
+	RET
+SUBTTL DY$CBK -- Call back into section zero
+
+; This routine is for use by a dynamic library that has been called from
+; section zero using the xxxZER mechanism.  It is intended for, e.g., calling
+; user error-processing routines specified in the call.
+
+; [51] In edit 51, I extended DY$CBK to handle callbacks in cases other
+; than when called through the ZER mechanism.  The possibility of programs
+; including both section zero and non-zero sections is better accounted for.
+;
+; [51] If the routine to be called back to is in section zero or in the section
+; which zero is mapped to (if any), the old action is taken.
+;
+; [51] If the routine to be called is in a non-zero section other than the one
+; to which section zero is mapped, a direct call is made.
+;
+; The passing of arguments to DY$CBK and to the routine being called
+; are intermixed, making things somewhat complicated.
+
+; Arguments to DY$CBK are placed on the stack in the following order:
+;	-2(P)/	Address of routine to call [51]
+;	-1(P)/	Return PC of call into library.  
+;		[51] NOTE WELL: if called through the ZER mechanism, this
+;		must be the return address from the transition from ZMS to
+;		library.  (If not called through ZER, this is ignored.)
+;		This is used to find the appropriate ZMV in ZMS.
+;	0(P)/	Return address of call to DY$CBK (put here by the PUSHJ)
+
+; Arguments to the routine being called may be pushed onto the stack before
+; the DY$CBK arguments (which are removed before the routine is called),
+; or may be in registers (all registers are preserved to the entry to the
+; user routine).  Remember that a routine in section 0 will not be able to
+; do anything with addresses in a non-zero section!
+
+DY$CBK::
+
+; AC save and local stack offsets
+CBKACC==4			;Save 4 ACs
+CBKAC1==-<CBKACC-1>
+CBKAC2==-<CBKACC-2>
+CBKAC3==-<CBKACC-3>
+CBKAC4==-<CBKACC-4>
+
+; Argument stack offsets
+CBKRTN==-<CBKACC+2>		;Address of user routine to call
+CBKXPC==-<CBKACC+1>		;Return PC of user call to library
+CBKRET==-<CBKACC>		;Our return address
+
+	ADJSP P, CBKACC		;Make room to save ACs
+	DMOVEM T1, CBKAC1(P)
+	DMOVEM T3, CBKAC3(P)
+
+; [51] Determine if we do fancy call or cheap call
+	HLRZ T1, CBKRTN(P)	;[51] Get section number of routine
+	JUMPE T1, CBKNOR	;[51] From zero, do it the hard way
+	CAME T1, DY.ZMP		;[51] 
+	  JRST CBKEZ		;[51] Not from ZMS, do it the easy way
+
+CBKNOR:				;[51]
+
+; Get global index to ZV structure in zero-map-section (ZMS)
+	MOVE T4, CBKXPC(P)	;Get XPC
+	HRR T4, .DYZVO(T4)	;Make global index to ZV
+				;Magic constant, see DYNSYM
+
+; Push CBKRET on ZY stack
+	XMOVEI T3, @.ZVZBL(T4)	;Adr of ZY pointer
+	AOS @T3			;Push onto ZY stack
+	MOVE T2, CBKRET(P)
+	MOVEM T2, @0(T3)	;Put data into space created
+
+; Calculate proper section 0 local stack pointer
+	XMOVEI T3, @0(T3)	;Get ZBL stack pointer (we have pushed to it)
+	SOS T3			;Now have pointer to ZY block we want
+	HRLZI T1, CBKRET(P)	;In-section address of stack word
+	HRLZ T2, .ZYSP(T3)
+	SUB T2, T1
+	ADD T2, .ZYSP(T3)
+	HRRI T2, CBKRET(P)	;Whew!
+	MOVEM T2, CBKRET(P)	;Final location
+
+; The time has come to talk in detail about stack formats.  The next
+; bit of code spends most of its time setting up the stack the way it
+; should be when we leave this routine.
+;
+; Currently, the stack looks like this:
+;
+;	CBKRTN/	Address of routine we will call
+;	CBKXPC/	Return address into ZMS from call to library
+; 	CBKRET/	Originally return address from DY$CBK,
+;			recently trashed; now contains the
+;			section-local stack pointer to be restored in
+;			DY$CS0
+;	CBKAC1/	Saved AC1
+;	CBKAC2/	Saved AC2
+;	CBKAC3/	Saved AC3
+; P/-->	CBKAC4/	Saved AC4
+;
+; After this munging around, we are going to RET, which we want to
+; take us to the DY$CS0 routine in the section to which zero is mapped
+; (the Zero Map Section, or ZMS).  The CBKXXX stack offset labels are
+; used informally to refer to the absolute location they referred to
+; after we had saved registers above.
+;
+; Obviously to do this we must change the stack around a bit.  We want
+; it to look like this:
+;
+;	CBKRTN/	0,,DY$BKR
+;	CBKXPC/	0,,address of routine we will call
+;	CBKRET/	New stack pointer to install in DY$CS0
+; P/-->	CBKAC1/	ZMS,,DY$CS0
+
+	MOVE T1, CBKRTN(P)
+	HRRZM T1, CBKXPC(P)	;[51] Final location (force 0,,n)
+	DMOVE T1, CBKAC1(P)	;Restore T1-T2
+
+;
+	XMOVEI T3, @.ZVCS0(T4)
+	MOVEM T3, CBKAC1(P)	;ZMS,,DY$CS0
+	XMOVEI T3, @.ZVBKR(T4)
+	HRRZM T3, CBKRTN(P)	;0,,DY$BKR
+;
+	DMOVE T3, CBKAC3(P)	;Restore T3-T4
+	ADJSP P, -<CBKACC-1>	;Remove excess stack stuff
+	RET			;After our stack doctoring, this "returns"
+				;to ZMS,,DY$CS0
+; [51]
+; Do the call-back the easy way (when not going back into zero)
+CBKEZ:	DMOVE T1, CBKAC1(P)	;[51] Restore T1-T2
+	DMOVE T3, CBKAC3(P)	;[51] Restore T3-T4
+	ADJSP P, -CBKACC	;[51] Back to where we entered
+
+	EXCH T1, -2(P)		;[51] Save T1, get routine address to call
+	MOVEM T1, -1(P)		;[51] Put over dummy arg
+	POP P, T1		;[51] Get return address
+	EXCH T1, -1(P)		;[51] Restore T1, save return address
+	RET			;[51] Call routine
+SUBTTL Force loading of RTL
+
+SEGMENT CODE
+
+; [51]
+; This routine doesn't do anything; calling it will insure that the RTL
+; has been loaded (thus allowing access to galactic variables).
+
+RL$NUL::
+	RET
+SUBTTL Routine stubs for routines not yet implemented
+
+SEGMENT CODE
+
+DY$LOD::
+DY$LER::
+	PUSH P, 0(P)		;Duplicate return address
+	PUSH P, [1]		;Arg count
+	PUSH P, [DY$NYI]	;Condition
+	JRST RTLERR
+
+SEGMENT DATA
+
+; Static block for RFSTS% JSYS (which, as of 16-dec-83, couldn't handle a
+; non-local address for its status block)
+RFSHCK:	BLOCK 5			;[RFSTS WORKAROUND]
+
+; [51] 
+; If we are called through ZERBOO from section zero, ZERBOO will fill in this
+; location with the number of the section that it mapped zero to.  This is
+; used in DY$CBK to determine if the routine was called via ZER or JCK.
+DY.ZMP:: 0			;[51] Do NOT master init this!
+				;[51] On a restart, zero is already mapped
+				;[51] somewherw!
+
+SEGMENT CODE
+
+	END
+  

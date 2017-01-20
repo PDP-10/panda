@@ -1,0 +1,409 @@
+/*
+**	STRING	- string manipulation routines for KCC runtimes
+**
+**	(c) Copyright Ken Harrenstien 1989
+**		for all changes after v.39, 21-Mar-1988
+*/
+/*	references:	man 3 string				    */
+/*			H&S I, 1984, section 11.2		    */
+/*			H&S II, 1987, chapter 15		    */
+/*								    */
+/*         David Eppstein / Stanford University / 3-July-1984       */
+/*	  Ken Harrenstien / SRI International / 30-Nov-1985	    */
+/*		Ian Macky / SRI International / '87		    */
+/* ---------------------------------------------------------------- */
+
+#include <c-env.h>
+#include <string.h>
+#include <ctype.h>
+
+#if __STDC__
+#define CONST const
+#else
+#define CONST
+#endif
+
+/* -------------------------------------------------------------- */
+/* STRCAT -  append strings, return ptr to null-terminated result */
+/* -------------------------------------------------------------- */
+
+char *strcat(s1, s2)
+char *s1;
+CONST char *s2;
+{
+    char *s;
+
+    if (*s2 == '\0')			/* make sure we have something to do */
+	return s1;
+    s = s1;				/* copy start pointer */
+    if (*s1 != '\0')
+	while (*++s1 != '\0') ;		/* skip to first null */
+    *s1 = *s2;				/* copy first char */
+    while ((*++s1 = *++s2) != '\0') ;	/* loop copying until null */
+    return s;				/* return pointer to start of string */
+}
+
+/* ----------------------------------------------------------- */
+/* STRNCAT -  append strings with limit on number to copy      */
+/* ----------------------------------------------------------- */
+
+char *strncat(s1, s2, n)
+char *s1;
+CONST char *s2;
+size_t n;
+{
+    char *s;
+
+    if (*s2 == '\0' || n <= 0) 		/* make sure have something to do */
+	return s1;
+    s = s1;				/* copy start pointer */
+    if (*s1 != '\0')
+	while (*++s1 != '\0') ;		/* skip to first null */
+        *s1 = *s2;				/* copy first char */
+    while (--n > 0 && (*++s1 = *++s2) != '\0') ; /* loop copying until null */
+    if (n == 0) *++s1 = '\0';		/* null-terminate */
+    return s;				/* return pointer to start of string */
+}
+
+/* --------------------------------- */
+/* STRCMP - compare two strings      */
+/* --------------------------------- */
+
+int strcmp(s1, s2)
+CONST char *s1, *s2;
+{
+    while (*s1 == *s2) {
+	if (*s1++ == '\0') return 0;
+	s2++;
+    }
+    return *s1 - *s2;
+}
+
+/* -------------------------------------------------- */
+/* STRNCMP - like strcmp but look at at most n chars  */
+/* -------------------------------------------------- */
+
+int strncmp(s1, s2, n)
+CONST char *s1, *s2;
+size_t n;
+{
+    if (n <= 0) return 0;
+    while (--n > 0 && *s1 == *s2) {
+	if (*s1++ == '\0') return 0;
+	s2++;
+    }
+    return *s1 - *s2;	/* Counted out.  Return 0 if last chars match. */
+}
+
+/* ----------------------------------------------------*/
+/* strcasecmp - compare two strings case insensitively */
+/* ----------------------------------------------------*/
+
+int strcasecmp(s1, s2)
+const char *s1, *s2;
+{
+    register char c1, c2;
+
+    for (;;) {
+	if (isascii(c1 = *s1) && isupper(c1))
+	  c1 = tolower(c1);
+	if (isascii(c2 = *s2) && isupper(c2))
+	  c2 = tolower(c2);
+	if (c1 != c2)
+	  return c1 - c2;
+	if (c1 == '\0') return 0;
+	s1++;
+	s2++;
+    }
+}
+
+/* ------------------------------------------------*/
+/* strncasecmp - compare n chars of two strings    */
+/* ------------------------------------------------*/
+
+int strncasecmp(s1, s2, n)
+const char *s1, *s2;
+size_t n;
+{
+    register char c1, c2;
+    int sn = n;
+
+    while (--sn >= 0) {
+	if (isascii(c1 = *s1) && isupper(c1))
+	  c1 = tolower(c1);
+	if (isascii(c2 = *s2) && isupper(c2))
+	  c2 = tolower(c2);
+	if (c1 != c2)
+	  return c1 - c2;
+	if (!c1) return 0;
+	s1++;
+	s2++;
+    }
+    return 0;
+}
+
+int strcoll(s1, s2)		/* Locale-specific strcmp */
+CONST char *s1, *s2;
+{
+    return strcmp(s1, s2);	/* No other locales but C */
+}
+
+size_t strxfrm(s1, s2, n)
+char *s1;
+CONST char *s2;
+size_t n;
+{
+    register size_t left = n;
+    if (left) do {
+	if (!(*s1++ = *s2++))
+	    return n-left;
+	} while (--left);
+    return (n-left) + strlen(s2);
+}
+
+/* ------------------------------------------- */
+/* STRCPY -  copy one string over another      */
+/* ------------------------------------------- */
+
+char *strcpy(s1, s2)
+char *s1;
+CONST char *s2;
+{
+    char *s;
+    s = s1;
+
+    if ((*s1 = *s2) != '\0')		/* if string isn't completely empty */
+	while ((*++s1 = *++s2) != '\0') ; /* copy rest of it */
+    return s;				/* return original pointer */
+}
+
+/* ------------------------------------------------------- */
+/* STRNCPY -  like strcpy, but copy exact number of chars  */
+/* ------------------------------------------------------- */
+
+char *strncpy(s1, s2, n)
+char *s1;
+CONST char *s2;
+size_t n;
+{
+    char *s;
+    s = s1;
+
+    while (n-- > 0)
+	if ((*s1++ = *s2) != '\0')
+	    s2++;
+    return s;
+}
+
+/* ----------------------------------------------------- */
+/* STRLEN - find number of non-null chars in string      */
+/* ----------------------------------------------------- */
+
+size_t strlen(s)
+CONST char *s;
+{
+    size_t n;
+
+    if (*s == '\0')
+	return 0;
+    n = 1;
+    while (*++s != '\0')
+	n++;
+    return n;
+}
+
+/* ------------------------------------------------ */
+/* STRCHR - find first occurrence of char in string */
+/* INDEX - old BSD name of the same		    */
+/* ------------------------------------------------ */
+
+char *strchr(s, c)
+CONST char *s;
+int c;
+{
+    while (*s != c) {
+	if (*s == '\0') return NULL;	/* no occurrences */
+	s++;				/* maybe more, go look */
+    }
+    return (char *)s;			/* found one, return it */
+}
+
+char *index(s, c)
+CONST char *s;
+int c;
+{
+    return strchr(s, c);
+}
+
+/* ------------------------------------------------------------ */
+/* STRPOS - find position of first occurrence of char in string */
+/* ------------------------------------------------------------ */
+
+int strpos(s,c)
+CONST char *s;
+int c;
+{
+    register int i;
+
+    for (i = 0; *s != c; ++s, ++i)
+	if (*s == '\0')
+	    return -1;
+    return i;
+}
+
+/* ----------------------------------------------- */
+/* STRRCHR, find last occurrence of char in string */
+/* RINDEX - old BSD name of the same		   */
+/* ----------------------------------------------- */
+
+char *strrchr(s, c)
+CONST char *s;
+int c;
+{
+    CONST char *r;
+
+    r = NULL;
+    do
+	if (*s == c) r = s;	/* remember last pointer to char */
+    while (*s++);
+    return (char *)r;		/* return the last one we found */
+}
+
+char *rindex(s, c)
+CONST char *s;
+int c;
+{
+    return strrchr(s, c);
+}
+
+/* -------------------------------------------------------- */
+/* STRRPOS - find pos of last occurrence of char in string  */
+/* -------------------------------------------------------- */
+
+int strrpos(s, c)
+CONST char *s;
+int c;
+{
+    char *r;
+
+    return ((r = strrchr(s,c)) == NULL) ? -1 : r - s;
+}
+
+/* ------------------------------------------------------------ */
+/* STRSPN - find pos of first occurrence of char NOT in set     */
+/* ------------------------------------------------------------ */
+
+size_t strspn(s, set)
+CONST char *s, *set;
+{
+    register int i;
+    register CONST char *cp;
+
+    if (*set == '\0') return 0;
+    for (i = 0; *s != '\0'; ++s, ++i) {
+	cp = set;
+	for (;;) {
+	    if (!*cp) return i;
+	    if (*s == *cp++)
+		break;
+	}
+    }
+    return i;
+}
+
+/* ----------------------------------------------------- */
+/* STRCSPN - search for 1st char in set			 */
+/* ----------------------------------------------------- */
+
+size_t strcspn(s, set)
+CONST char *s, *set;
+{
+    register int i;
+    register CONST char *cp;
+
+    for (i = 0; *s != '\0'; ++s, ++i) {
+	cp = set;
+	while (*cp)
+	    if (*s == *cp++) return i;
+    }
+    return i;
+}
+
+/* ----------------------------------------------------- */
+/* STRPBRK - find first occurrence of set in string      */
+/* ----------------------------------------------------- */
+
+char *strpbrk(s,set)
+CONST char *s, *set;
+{
+    register int i;
+    register CONST char *cp;
+
+    for (i = 0; *s != '\0'; ++s, ++i) {
+	cp = set;
+	while (*cp)
+	    if (*s == *cp++)
+		return (char *)s;
+    }
+    return NULL;
+}
+
+/* -------------------------------------------------*/
+/* STRRPBRK - find last occurrence of set in string */
+/* -------------------------------------------------*/
+
+char *strrpbrk(s,set)
+CONST char *s, *set;
+{
+    CONST char *r;
+
+    r = NULL;
+    while ((s = strpbrk(s,set)) != NULL)
+	r = s++;
+    return (char *)r;
+}
+
+/*
+ *	STRSTR - find first occurrence of substring within string
+ */
+
+char *strstr(src, sub)
+CONST char *src, *sub;
+{
+    int n, c;
+    char *p;
+
+    n = strlen(sub);			/* get length of substring */
+    if (!n)				/* a null substring is always found */
+	return (char *)src;		/* at the head of the target string */
+    c = *sub;				/* first char of substring */
+    for (p = strchr(src, c); p; p = strchr(++src, c))
+	if (!strncmp(p, sub, n))	/* search for 1st char of substring, */
+	    return p;			/* then see if there's a match for */
+    return NULL;			/* the rest... */
+}
+
+/*
+ *	STRTOK - separate a string into tokens
+ */
+
+static char *_tokptr = NULL;		/* internal state pointer */
+
+char *strtok(str, set)
+char *str;
+CONST char *set;
+{
+    char *source, *p, *start;
+
+    source = (str) ? str : _tokptr;	/* new string or next part of old */
+    p = source + strspn(source, set);	/* skip leading chars in set */
+    if (!p || !*p)			/* nothing but separators? */
+	return _tokptr = NULL;		/* fraid so, so done with string */
+    start = p;				/* save start of token */
+    if (p = strpbrk(start, set)) {	/* look for end of token now */
+	*p = '\0';			/* found it, clobber terminator */
+	_tokptr = ++p;			/* and point to after that char */
+    } else				/* hit end of string, so no more */
+	_tokptr = NULL;			/* next time. */
+    return start;			/* return start of token */
+}

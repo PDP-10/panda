@@ -1,0 +1,417 @@
+%TITLE 'Modify DIU Requests'
+
+MODULE DIUMOD (IDENT = '252',
+               LANGUAGE(BLISS36),
+               ENTRY(DIU$MODIFY)) =
+BEGIN
+
+!	COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1986.
+!	ALL RIGHTS RESERVED.
+!
+!	THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!	COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!	THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!	ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!	AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!	SOFTWARE IS HEREBY TRANSFERRED.
+!
+!	THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!	NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!	EQUIPMENT CORPORATION.
+!
+!	DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!	ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+!
+! FACILITY:    DIU-20  (Data Interchange Utility for TOPS-20)
+!
+! ABSTRACT:    This module handles modifications to existing queued
+!              reqeusts.
+!
+! ENVIRONMENT: TOPS-20 V6.1          XPORT
+!              BLISS-32 V4           RMS V3
+!
+! AUTHOR:      Andrew Nourse                    CREATED: 5-Dec-1981
+
+! HISTORY:
+!
+!  252	Remove library of CONDIT.
+!	Sandy Clemens  1-Jul-86
+!
+!  213  Bad call to S$USERNAME was causing modify requests to occasionally fail
+!       and also not default the username correctly.
+!       Gregory A. Scott 2-Jun-86
+!
+!  205  Make the  NEXT function  set the  after time  to zero  and release  the
+!       request.  Clean up DIU$MODIFY, move MODREQ outside DIU$MODIFY block.
+!       Gregory A. Scott 27-May-86
+!
+!  146  Last edit was a bit too  adventerous  about  printing  the  node  name.
+!       Only output  it if  there wasn't  a request  number specified.   Add  a
+!       number of errors to list in MODREQ.
+!       Gregory A. Scott 7-May-86
+!
+!  144  Rename Q$MESSAGE to be DIU$MMESSAGE, and make it print better  messages
+!       including the node name specified.   Change call to DIU$MESSAGE to  not
+!       enter these messages into the system log file.
+!       Gregory A. Scott 6-May-86
+!
+!  127  Remove strange hack where a negative request id meant that you really 
+!       wanted /SEQ:CONT.
+!       Gregory A. Scott 26-Apr-86
+!
+! V01-031  Sandy Clemens  17-Sep-85
+!       Change name of DIU-COMMAND.R36 to DIUCOMMAND.R36 to make porting
+!       to TOPS-10 easier.  (TOPS-10 will truncate DIUCOMMAND to DIUCOM,
+!       but cannot bypass the "-").
+!
+! V01-004  Doug Rayner     14-Aug-85
+!       Add support for TOPS-10 [P,Pn]'s
+!
+! V01-003  Rick Fricchione  26-Oct-1984
+!         Modify for DIU.  Use new queue find routines. Handle
+!         new request block format, and clean up.
+!
+! V01-002  Andy Nourse  --no date--
+!          02 - Put in ENTRY points
+!--
+%SBTTL 'Forward Routine'
+
+FORWARD ROUTINE
+    DIU$MODIFY,                         ! Modify existing DIU request(s)
+    MODREQ,                             ! Modify one request
+    DIU$MMESSAGE: NOVALUE;              ! Print an error with a request block
+%SBTTL 'Libraries and Externals'
+
+! Libraries
+
+LIBRARY 'BLI:XPORT';                    ! XPORT is not your friend
+LIBRARY 'DIU';                          ! DIU Data Structures
+LIBRARY 'FAO';                          ! FAO macros and symbols
+LIBRARY 'DIUCOMMAND';                   ! DIU command macros
+
+! External routines 
+
+EXTERNAL ROUTINE IP_FIND,               ! Find a request
+                 IP_MODIFY,             ! Modify a request
+                 IP_DELETE,             ! Delete a request
+                 DIU$MESSAGE,           ! ASCIIze an error message
+                 S$CRIF,                ! Output CRLF if needed
+                 S$USERNAME,            ! Username from usernumber
+                 S$JOBNO,               ! Return our job number
+                 S$JOBUSR;              ! Usernumber from job number
+
+EXTERNAL TTY: $XPO_IOB();               ! TTY IOB
+
+MACRO $ = 0, 0, 0, 0 %;
+
+! Static data
+
+OWN modtab: VECTOR[M_MAX+1]
+            PRESET(
+                    [M_HOLD]   =PP('held'),
+                    [M_KILL]   =PP('cancelled'),
+                    [M_MODIFY] =PP('modified'),
+                    [M_NEXT]   =PP('next'),
+                    [M_RELEASE]=PP('released'));
+%SBTTL 'Routine DIU$MODIFY'
+
+GLOBAL ROUTINE DIU$MODIFY (request_block : REF $DIU_BLOCK,
+                           mfunct,
+                           mopt : REF BITVECTOR 
+                          )=
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!        Perform work for the following commands: HOLD, RELEASE, KILL, NEXT,
+!        and of course MODIFY.
+!
+! FORMAL PARAMETERS:
+!
+!        request_block: Template request to modify
+!        mfunct: Function code for command (M_MODIFY, M_HOLD, etc).
+!        mopt: Bit map for what to modify.
+!--
+
+! Condition handler for this routine - just frees memory
+
+ROUTINE modfree (signal_args : REF VECTOR,
+                 mech_args,
+                 enable_args : REF VECTOR)=
+BEGIN                                   ! Routine to free block we allocated
+
+LOCAL tchn;
+
+tchn =..enable_args[1];                 ! Head of chain
+
+SELECT .signal_args[1] OF
+        SET
+        [SS$_UNWIND]: WHILE .tchn NEQ 0 ! Until we reach the end of chain
+                      DO BEGIN
+                         LOCAL ttc;
+                         ttc = .tchn;
+                         tchn = ..tchn; ! Next link
+                         $XPO_FREE_MEM(BINARY_DATA=(DIU$K_LEN+%UPVAL,.ttc));
+                         SS$_RESIGNAL
+                         END;
+        [OTHERWISE]: RETURN SS$_RESIGNAL;
+        TES
+END;                                    ! MODFREE
+
+LOCAL req_count : INITIAL(0),           ! Number of requests processed
+      line : $STR_DESCRIPTOR(CLASS=DYNAMIC),    ! Line to print on terminal
+      chain : REF VECTOR,               ! Pointer to chain of requests
+      tchain : VOLATILE REF VECTOR,
+      status;
+
+ENABLE MODFREE(tchain);                 ! Enable our memory free routine
+
+! If no username specified, then default properly to requestor's own requests
+
+IF .request_block[DIU$H_USERNAME] EQL 0
+%IF %SWITCHES(TOPS10) %THEN
+    AND (.request_block[DIU$G_USER_NUMBER] EQL 0)
+%FI
+THEN BEGIN
+     LOCAL usrdesc : $STR_DESCRIPTOR(CLASS=BOUNDED,
+                                     STRING=(40,CH$PTR(request_block[DIU$T_USERNAME])));
+
+     ! Default our user name into the passed request block
+
+     %IF %SWITCHES(TOPS20)
+     %THEN
+     request_block[DIU$H_USERNAME] = S$USERNAME(S$JOBUSR(S$JOBNO()),usrdesc);
+     %ELSE
+     request_block[DIU$H_USERNAME] = S$USERNAME(S$JOBNO(),usrdesc);
+     %FI
+     END;
+
+
+! Loop through all requests looking for one that matches to change
+
+IF (status = IP_FIND(request_block[$],chain))   ! Look for something to fiddle
+THEN DO BEGIN                                   ! Got something
+        BIND REQ=CHAIN[%UPVAL]: $DIU_BLOCK;     ! Bind to current request
+
+        ! Request found, do it to this one
+
+        modreq(request_block[$],req[$],.mfunct,.mopt,req_count); 
+
+        ! Free memoru that IP_FIND got for us
+        tchain = .chain;                ! Save addr of block so we can free it
+        chain = .chain[0];              ! Point to next one in chain
+        $XPO_FREE_MEM(BINARY_DATA=(DIU$K_LEN+%UPVAL,.tchain));  ! Free one req
+
+        END WHILE .chain NEQ 0          ! Loop until no more requests to check
+
+ELSE DIU$MMESSAGE(.status,0,request_block[$]);  ! Request wasn't found
+
+! Give message telling how many requests were modified.
+
+S$CRIF();                               ! CRLF if needed
+
+$STR_DESC_INIT(DESC=line, CLASS=DYNAMIC);
+
+$GET_FAO('[!SL request!%S !AZ]!/',      ! Make the line up
+         line,
+         .req_count,
+         .modtab[.mfunct]);
+
+$XPO_PUT(IOB=tty, STRING=line);         ! Send it to the user
+
+$XPO_FREE_MEM(STRING=line);             ! Free dynamic string memory
+
+.status                                 ! Return what IP_FIND returned
+END;                                    ! DIU$MODIFY
+%SBTTL 'Routine MODREQ'
+ROUTINE modreq (request_block: REF $DIU_BLOCK,  ! Template
+                req: REF $DIU_BLOCK,            ! Current request
+                mfunct,                         ! Which command (M_whatever)
+                mopt: REF BITVECTOR,            ! Bitmap of modify options
+                req_count                       ! Count of requests hacked
+                ) =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!      This routine hacks one request for routine DIU$MODIFY.
+!
+! FORMAL PARAMETERS:
+!
+!       request_block: user's modify request template
+!       req: current request to modify
+!       mfunct: command to perform
+!       mopt: bitmask of fields that change
+!       req_count: count of request successfully modified
+!
+! SIDE EFFECTS:
+!
+!       The specified request is modified.
+!--
+
+! Routine to handle conditions from here... all it does is print messages.
+
+ROUTINE modhan (signal_args: REF VECTOR,
+                mech_args: REF VECTOR,
+                enable_args: REF VECTOR) =        ! [1]=request block
+        BEGIN
+        SELECT .signal_args[1] OF
+               SET
+
+               ! Request finished or killed while we were running this
+               [DIU$_REQ_NOT_FOUND]: RETURN SETUNWIND();
+
+               [DIU$_INSUFF_PRIVS,      ! These errors should not stop
+                DIU$_ACTIVE,            ! the command
+                DIU$_NO_PREREQ,
+                DIU$_HAS_DEPENDENT,
+                DIU$_INVALID_PREREQ,
+                DIU$_PREREQ_NON_EXIST,
+                DIU$_PREREQ_NOT_YOURS,
+                DIU$_PREREQ_LOOP]: BEGIN
+                                   DIU$MMESSAGE(.signal_args[1],
+                                                0,..enable_args[1]);
+                                   RETURN SETUNWIND();
+                                   END;
+               [OTHERWISE]: RETURN SS$_RESIGNAL;
+               TES
+        END;                            ! End of MODHAN condition handler
+
+LOCAL reqsav: VOLATILE;                 ! Request ID of this request
+
+ENABLE modhan (reqsav);                 ! Enable message printer
+
+reqsav = req[$];
+
+CASE .mfunct FROM M_MIN TO M_MAX OF     ! Figure out what to do
+      SET
+      [M_KILL]: IP_DELETE(.req[DIU$H_REQUEST_ID]);      ! KILL command
+      [M_MODIFY]: BEGIN                                 ! MODIFY command
+                  IF .mopt[DIUQ$K_AFTER]                ! /AFTER
+                  THEN IP_MODIFY(.req[DIU$H_REQUEST_ID],DIUQ$K_AFTER,
+                                 .request_block[DIU$G_AFTER]);
+
+                  IF .mopt[DIUQ$K_DEADLINE]             ! /DEADLINE
+                  THEN IP_MODIFY(.req[DIU$H_REQUEST_ID],DIUQ$K_DEADLINE,
+                                 .request_block[DIU$G_DEADLINE]);
+
+                  IF .mopt[DIUQ$K_PRIORITY]             ! /PRIORITY
+                  THEN IP_MODIFY(.req[DIU$H_REQUEST_ID],DIUQ$K_PRIORITY,
+                                 .request_block[DIU$B_PRIORITY]);
+
+                  IF .mopt[DIUQ$K_LOG_FILESPEC]         ! /[NO]LOG
+                  THEN BEGIN
+                       LOCAL d_log: $STR_DESCRIPTOR();
+                             $STR_DESC_INIT(DESC=d_log,
+                                            STRING=(.request_block[DIU$H_LOG_FILESPEC],
+                                                    CH$PTR(request_block[DIU$T_LOG_FILESPEC])));
+                       IP_MODIFY(.req[DIU$H_REQUEST_ID],DIUQ$K_LOG_FILESPEC,D_LOG);
+                       END;
+
+                   IF .mopt[DIUQ$K_SEQUENCE]            ! /SEQUENCE
+                   THEN IP_MODIFY(.req[DIU$H_REQUEST_ID],DIUQ$K_SEQUENCE,
+                                  .request_block[DIU$V_SEQ_CONTINUE]);
+
+                   IF .mopt[DIUQ$K_PREREQUISITE_ID]     ! /PREREQUISITE
+                   THEN IP_MODIFY(.req[DIU$H_REQUEST_ID],
+                                  DIUQ$K_PREREQUISITE_ID,
+                                  .request_block[DIU$H_PREREQUISITE_ID]);
+
+                   IF .mopt[DIUQ$K_NOTIFY]
+                   THEN IP_MODIFY(.req[DIU$H_REQUEST_ID],DIUQ$K_NOTIFY,
+                                  .request_block[DIU$Z_NOTIFY]);
+                   END;                                 ! End of MODIFY command
+
+          [M_NEXT]: BEGIN                               ! NEXT command
+                    IP_MODIFY(.req[DIU$H_REQUEST_ID],DIUQ$K_PRIORITY,63);
+                    IP_MODIFY(.req[DIU$H_REQUEST_ID],DIUQ$K_AFTER,0);
+                    IP_MODIFY(.req[DIU$H_REQUEST_ID],DIUQ$K_HOLDING,0);
+                    END;                                ! End of NEXT command
+
+          [M_HOLD]: IP_MODIFY(.req[DIU$H_REQUEST_ID],DIUQ$K_HOLDING,1);
+
+          [M_RELEASE]: IP_MODIFY(.req[DIU$H_REQUEST_ID],DIUQ$K_HOLDING,0);
+
+          [INRANGE,OUTRANGE]: SIGNAL(DIU$_BUG);         ! owie
+      TES;                              ! End of CASE
+
+(.req_count) = ..req_count+1            ! Count the request as modified
+
+END;                                    ! MODREQ
+%SBTTL 'Routine DIU$MMESSAGE'
+GLOBAL ROUTINE DIU$MMESSAGE (primary, 
+                             secondary,
+                             req: REF $DIU_BLOCK): NOVALUE =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!       Print an error message related to a request block
+!
+! FORMAL PARAMETERS:
+!
+!       primary: Primary error code
+!       secondary: Secondary error code
+!       req: Address of request block
+!--
+
+LOCAL addtext: $STR_DESCRIPTOR(CLASS=DYNAMIC);
+
+$STR_DESC_INIT(DESC=addtext, CLASS=DYNAMIC);
+
+! Build a description of the request into addtext
+
+IF .req[DIU$H_REQUEST_ID] NEQ 0                         ! Request number or all requests
+THEN $STR_COPY(TARGET=addtext, 
+               STRING=$STR_CONCAT('Request ',
+                                  $STR_ASCII(.req[DIU$H_REQUEST_ID])))
+ELSE BEGIN
+     $STR_COPY(TARGET=addtext,                          ! No request number specified
+               STRING='All requests with');
+     IF .req[DIU$H_SOURCE_FILESPEC] NEQ 0               ! Was there a node name?
+     THEN $STR_APPEND(TARGET=addtext,
+                      STRING=$STR_CONCAT(' node ',
+                                    $STR_FORMAT((.req[DIU$H_SOURCE_FILESPEC],
+                                           CH$PTR(req[DIU$T_SOURCE_FILESPEC])),
+                                                UP_CASE),
+                                         '::'));
+     END;
+
+IF .req[DIU$H_USERNAME] NEQ 0           ! Was there a user name?
+THEN $STR_APPEND(TARGET=addtext,
+                 STRING=$STR_CONCAT(' user ',
+                                    $STR_FORMAT((.req[DIU$H_USERNAME],
+                                                 CH$PTR(req[DIU$T_USERNAME])),
+                                                UP_CASE)));
+
+IF .req[DIU$H_JOBNAME] NEQ 0            ! Was there a job name?
+THEN $STR_APPEND(TARGET=addtext,
+                 STRING=$STR_CONCAT(' job ',
+                                    $STR_FORMAT((.req[DIU$H_JOBNAME],
+                                                 CH$PTR(req[DIU$T_JOBNAME])),
+                                                UP_CASE)));
+
+%IF %SWITCHES(TOPS10) %THEN
+IF .req[DIU$G_USER_NUMBER] NEQ 0
+THEN $STR_APPEND(TARGET=addtext,        ! Was there a PPN? [10,33]?
+                 STRING=$STR_CONCAT(' [',
+                                    $STR_ASCII(.REQ[DIU$G_USER_NUMBER]^-18,
+                                               LEADING_BLANK, UNSIGNED, BASE8),
+                                    ',',
+                                    $STR_ASCII(.REQ[DIU$G_USER_NUMBER] AND %O'777777',
+                                               LEADING_BLANK, UNSIGNED, BASE8),
+                                    ']'))
+%FI
+
+! Get all of that turned into a error message, and print it out.
+
+DIU$MESSAGE(.primary, .secondary, addtext, FALSE);   ! Not to system log file
+
+! Free memory and return
+
+$XPO_FREE_MEM(STRING=addtext);
+
+END;
+
+END
+ELUDOM

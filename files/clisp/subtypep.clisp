@@ -1,0 +1,696 @@
+;;; **********************************************************************
+;;; This code was written as part of the Spice Lisp project at
+;;; Carnegie-Mellon University, and has been placed in the public domain.
+;;; If you want to use this code or any part of Spice Lisp, please contact
+;;; Scott Fahlman (FAHLMAN@CMUC). 
+;;; **********************************************************************
+;;;
+;;; Subtypep function for Spice Lisp.
+;;;    these functions are part of the standard Spice Lisp environment.
+;;;
+;;; Written by Jim Large and Skef Wholey.
+;;; Maintained by Skef Wholey.
+;;;
+;;; **********************************************************************
+
+(in-package 'lisp)
+
+(export '(subtypep))
+
+;;; ST-Range>= is used for comparing the lower limits of subranges of numbers.
+;;;  St-range>= returns T if n1 >= n2, or if the range whose lower limit is
+;;;  n1 is within a range whose lower limit is n2.  N1 and n2 may take on one
+;;;  of three distinct types of values:   A number is an inclusive lower bound,
+;;;  a list of a number is an exclusive lower bound, and the symbol * 
+;;;  represents  minus infinity which is not greater than any other number.
+;;;
+;;; (st-range>= '(3) 3) => T,    (st-range>= 3 '(3)) => ().
+
+(defun st-range>= (n1 n2)
+  (cond
+   ((eq n2 '*) T)            ;anything is >= -inf.
+   ((eq n1 '*) ())	     ; -inf not >= anything else.
+   ((listp n1)
+    (if (listp n2)
+	(>= (car n1) (car n2))
+	(>= (car n1) n2)))
+   (T (if (listp n2)
+	  (> n1 (car n2))    ;this case must be strictly greater than
+	  (>= n1 n2)))))
+
+
+
+
+;;; St-range<= is like St-range>= except that it is used to compare upper
+;;;  bounds.  It returns true iff n1 is the upper bound of a range which is
+;;;  within the range bounded by n2.  Here, * represents + infinity which is
+;;;  not less than any other number.
+
+(defun st-range<= (n1 n2)
+  (cond
+   ((eq n2 '*) T)            ;anything is <= +inf
+   ((eq n1 '*) ())	     ; +inf is not <= anything else
+   ((listp n1)
+    (if (listp n2)
+	(<= (car n1) (car n2))
+	(<= (car n1) n2)))
+   (T (if (listp n2)
+	  (< n1 (car n2))    ;this case must be strictly less than.
+	  (<= n1 n2)))))
+;;; Array hacking helping functions
+
+;;; St-Array-Dimensions-Encompass returns true iff the first array dimension
+;;; specifier is the same as, or more specific than, the second array
+;;; dimension specifier.
+
+(defun st-array-dimensions-encompass (first-spec second-spec)
+  (cond ((eq second-spec '*)
+	 t)
+	((integerp second-spec)
+	 (cond ((eq first-spec '*)
+		nil)
+	       ((integerp first-spec)
+		(= second-spec first-spec))
+	       ((listp first-spec)
+		(= second-spec (length first-spec)))
+	       (t
+		(throw 'hairy-subtypep (values () ())))))
+	((listp second-spec)
+	 (cond ((eq first-spec '*)
+		nil)
+	       ((integerp first-spec)
+		(do ((second-spec second-spec (cdr second-spec)))
+		    ((null second-spec) t)
+		  (if (not (eq (car second-spec) '*))
+		      (return nil))))
+	       ((listp first-spec)
+		(do ((second-spec second-spec (cdr second-spec))
+		     (first-spec first-spec (cdr first-spec)))
+		    ((or (null second-spec) (null first-spec))
+		     (and (null second-spec) (null first-spec)))
+		  (if (not (or (eq (car second-spec) '*)
+			       (eq (car second-spec) (car first-spec))))
+		      (return nil))))
+	       (t
+		(throw 'hairy-subtypep (values () ())))))
+	(t
+	 (throw 'hairy-subtypep (values () ())))))
+
+;;; St-Array-Element-Type determines the element type of an array specified.
+
+(defun st-array-element-type (spec)
+  (if (symbolp spec)
+      (case spec
+	((array vector simple-array) '*)
+	(simple-vector t)
+	((bit-vector simple-bit-vector) 'bit)
+	((string simple-string) 'string-char)
+	(t (throw 'hairy-subtypep (values () ()))))
+      (case (car spec)
+	((array vector simple-array)
+	 (if (cadr spec)
+	     (let ((etype (type-expand (cadr spec))))
+	       (cond ((subtypep etype 'bit) 'bit)
+		     ((subtypep etype 'string-char) 'string-char)
+		     (t etype)))
+	     '*))
+	(simple-vector t)
+	((bit-vector simple-bit-vector) 'bit)
+	((string simple-string) 'string-char)
+	(t (throw 'hairy-subtypep (values () ()))))))
+
+(defun st-array-dimensions (spec)
+  (if (symbolp spec)
+      (case spec
+	((array simple-array) '*)
+	((vector simple-vector bit-vector simple-bit-vector
+		 string simple-string)
+	 '(*))
+	(t (throw 'hairy-subtypep (values () ()))))
+      (case (car spec)
+	((array simple-array) (or (caddr spec) '*))
+	((vector simple-vector) (if (caddr spec) (list (caddr spec)) '(*)))
+	((bit-vector simple-bit-vector string simple-string)
+	 (if (cadr spec) (list (cadr spec)) '(*)))
+	(t (throw 'hairy-subtypep (values () ()))))))	 
+
+;;; Def-subtypep-specialist defines a specialist for handling list type
+;;;  specifiers.  Name is the car of the list types to be handled, and number
+;;;  distinguishes whether this is the specialist for type1 or type2.  Forms 
+;;;  are the body of a function which has two args, type1 and type2.  The 
+;;;  form returned by the macro, pushes the binding of the specialist function
+;;;  on the appropriate a-list.  Name can be a list of names, as well.
+
+(eval-when (compile eval)
+
+(defmacro def-subtypep-specialist (number name &rest forms)
+  (if (listp name)
+      `(let ((fun #'(lambda (type1 type2) ,@forms)))
+	 ,@(mapcar #'(lambda (name)
+		       `(push (cons ',name fun)
+			      ,(if (= number 1)
+				   '*stp-specialist-1-table*
+				   '*stp-specialist-2-table*)))
+		   name))
+      `(push (cons ',name #'(lambda (type1 type2) ,@forms))
+	     ,(if (= number 1)
+		  '*stp-specialist-1-table*
+		  '*stp-specialist-2-table*))))
+
+)
+
+
+;;; There are several specialists for lost causes.  They might as well all be
+;;;  the same function.
+
+(defun always-too-hairy (type1 type2)
+  (declare (ignore type1 type2))
+  (throw 'hairy-subtypep (values () ())))
+
+(eval-when (compile eval)
+
+(defmacro def-subtypep-too-hairy (number name)
+  `(push (cons ',name #'always-too-hairy)
+	 ,(if (= number 1)
+	      '*stp-specialist-1-table*
+	      '*stp-specialist-2-table*)))
+
+)
+
+
+;;; Call-subtypep-specialist returns a form which looks up a specialist
+;;;  function and calls it.  number specifies whether to call the type1
+;;;  specialist or the type2 specialist.
+
+(eval-when (compile eval)
+
+(defmacro call-subtypep-specialist (number type1 type2)
+  (if (= number 1)
+      `(let ((fun (cdr (assoc (car ,type1) *stp-specialist-1-table*))))
+	 (if fun
+	     (funcall fun ,type1 ,type2)
+	     (throw 'hairy-subtypep (values () ()))))
+      `(let ((fun (cdr (assoc (car ,type2) *stp-specialist-2-table*))))
+	 (if fun
+	     (funcall fun ,type1 ,type2)
+	     (throw 'hairy-subtypep (values () ()))))))
+
+)
+
+;;; The function Subtypep-Init is around for a couple of reasons.  First,
+;;; we want all these lambdas scattered all over the place to get compiled.
+;;; Second, we want to put them onto lists, but can't do that in the
+;;; cold load.
+
+(defun subtypep-init ()
+;;; *Symbol-subtype-table*
+
+;;; The symbol-subtypep-table is a list containing one entry per known symbol
+;;;  type.  Each entry is a list of symbols which are all subtypes of the car 
+;;;  of the list.  To test whether b is a subtype of a, find the list 
+;;;  beginning with a, and then see whether b is in it.
+
+(defvar *symbol-subtype-table*
+  '((* array atom bignum bit bit-vector character common compiled-function
+       complex cons double-float fixnum float function hash-table integer
+       keyword list long-float nil null number package pathname
+       random-state ratio rational readtable sequence short-float
+       simple-array simple-bit-vector simple-string simple-vector
+       single-float standard-char stream string string-char symbol t
+       vector)
+    (t array atom bignum bit bit-vector character common compiled-function
+       complex cons double-float fixnum float function hash-table integer
+       keyword list long-float nil null number package pathname
+       random-state ratio rational readtable sequence short-float
+       simple-array simple-bit-vector simple-string simple-vector
+       single-float standard-char stream string string-char symbol t
+       vector)
+    (array bit-vector simple-array simple-bit-vector simple-string
+	   simple-vector string vector)
+    (atom array bignum bit bit-vector character common compiled-function
+	  complex double-float fixnum float function hash-table integer
+	  keyword long-float nil null number package pathname
+	  random-state ratio rational readtable sequence short-float
+	  simple-array simple-bit-vector simple-string simple-vector
+	  single-float standard-char stream string string-char symbol
+	  vector)
+    (bignum)
+    (bit)
+    (bit-vector simple-bit-vector)
+    (character standard-char string-char)
+    (common array atom bignum bit bit-vector character common compiled-function
+	    complex cons double-float fixnum float function hash-table integer
+	    keyword list long-float nil null number package pathname
+	    random-state ratio rational readtable sequence short-float
+	    simple-array simple-bit-vector simple-string simple-vector
+	    single-float standard-char stream string string-char symbol
+	    vector)
+    (compiled-function)
+    (complex)
+    (cons)
+    (double-float)
+    (fixnum bit)
+    (float double-float long-float short-float single-float)
+    (function compiled-function symbol)
+    (hash-table)
+    (integer bignum fixnum bit)
+    (keyword)
+    (list cons null)
+    (long-float)
+    (nil)
+    (null)
+    (number bignum bit complex double-float fixnum float integer long-float
+	    ratio rational short-float single-float)
+    (package)
+    (pathname)
+    (random-state)
+    (ratio)
+    (rational bignum bit fixnum integer ratio)
+    (readtable)
+    (sequence array bit-vector list simple-array simple-bit-vector
+	      simple-string simple-vector string vector)
+    (short-float)
+    (simple-array simple-bit-vector simple-string simple-vector)
+    (simple-bit-vector)
+    (simple-string)
+    (simple-vector)
+    (single-float)
+    (standard-char)
+    (stream)
+    (string simple-string)
+    (string-char standard-char)
+    (symbol keyword null)
+    (vector bit-vector simple-bit-vector simple-string simple-vector
+	    string)))
+;;; Subtypep-specialist-Tables
+
+;;; The Subtypep-specialist tables are A lists of (name . function) where name
+;;;  is a symbol which is the car of some list style type specifier.  The
+;;;  specialist functions are versions of Sub-Subtypep which work for one 
+;;;  particular case.  The entry for foo in the specialist-1 table handles
+;;;  the case for (sub-subtypep (foo ...) xxx), and the entry for foo in the
+;;;  specialist-2 table handles the case for (sub-subtypep xxx (foo ...)).
+;;;
+;;; The specialists in the type1 table are usually more comprehensive, because
+;;;  the type1 specialists are given the first chance.
+
+(defvar *stp-specialist-1-table* ())
+(defvar *stp-specialist-2-table* ())
+;;;    Array specialists
+
+;;; For some array type to be a subtype of another, the following
+;;; things must be true:
+;;; the major type of type2 must have the same "simpleness" as the major
+;;;  type of type1,
+;;; the element type of type2 must be a subtype of the element type of
+;;;  type1, and
+;;; the dimensions of type2 must be encompassed by the dimensions of
+;;;  of type1.
+
+;;; For the case where type1 is (array ...)
+
+(def-subtypep-specialist 1 (array simple-array vector simple-vector
+			    bit-vector simple-bit-vector
+			    string simple-string)
+  (let ((type2-major (or (and (listp type2) (car type2)) type2)))
+    (and (if (memq type2-major '(simple-array simple-vector
+				 simple-bit-vector simple-string))
+	     (memq (car type1) '(simple-array simple-vector
+				 simple-bit-vector simple-string))
+	     t)
+	 (sub-subtypep (st-array-element-type type1)
+		       (st-array-element-type type2))
+	 (st-array-dimensions-encompass (st-array-dimensions type1)
+					(st-array-dimensions type2)))))
+
+;;; For the case where type2 is (array ...)
+
+(def-subtypep-specialist 2 (array simple-array vector simple-vector
+			    bit-vector simple-bit-vector
+			    string simple-string)
+  (let ((type1-major (or (and (listp type1) (car type1)) type1)))
+    (and (if (memq (car type2) '(simple-array simple-vector
+				 simple-bit-vector simple-string))
+	     (memq type1-major '(simple-array simple-vector
+				 simple-bit-vector simple-string))
+	     t)
+	 (sub-subtypep (st-array-element-type type1)
+		       (st-array-element-type type2)))))
+;;;    Complex numbers
+
+(def-subtypep-specialist 1 complex
+  (cond
+
+   ;;(complex ...) is a subtype of any type that COMPLEX is a subtype of,
+   ((sub-subtypep 'complex type2) T)
+
+   ;;but not a subtype of any symbol type that COMPLEX is not a subtype of.
+   ((symbolp type2) ())
+
+   ;;Case where Type2 is another complex
+   ((eq (car type2) 'complex)
+    (and (sub-subtypep (nth 1 type1) (nth 1 type2))
+	 (sub-subtypep (nth 2 type1) (nth 2 type2))))
+
+   ;;punt to specialist for type2
+   (T (call-subtypep-specialist 2 type1 type2))))
+
+
+
+;; specialist for the case where type2 is (complex ...)
+(def-subtypep-specialist 2 complex
+  (declare (ignore type2))
+  (cond ((symbolp type1) ())
+	(T (throw 'hairy-subtypep (values () ())))))
+;;;    Functions, Satisfies, Members, Ands, Ors, Nots
+
+(def-subtypep-too-hairy 1 function)
+(def-subtypep-too-hairy 2 function)
+
+(def-subtypep-too-hairy 1 satisfies)
+(def-subtypep-too-hairy 2 satisfies)
+
+(def-subtypep-too-hairy 1 member)
+(def-subtypep-too-hairy 2 member)
+
+#| I don't think this is right  -- Ram
+;;; (subtypep '(and t1 t2 ...) 't3) <=>
+;;; (or (subtypep 't1 't3) (subtypep 't2 't3) ...)
+;;; because '(and t1 t2 ...) denotes the intersection of types t1, t2, ...
+
+(def-subtypep-specialist 1 and
+  (do ((type1 (cdr type1) (cdr type1)))
+      ((null type1) nil)
+    (if (sub-subtypep (car type1) type2)
+	(return t))))
+
+Try something safer:
+|#
+(def-subtypep-too-hairy 1 and)
+
+;;; (subtypep 't1 '(and t2 t3 ...)) <=>
+;;; (and (subtypep 't1 't2) (subtypep 't1 't3) ...)
+;;; because '(and t2 t3 ...) denotes the intersection of types t2, t3, ...
+
+(def-subtypep-specialist 2 and
+  (do ((type2 (cdr type2) (cdr type2)))
+      ((null type2) nil)
+    (if (sub-subtypep type1 (car type2))
+	(return t))))
+
+;;; (subtypep '(or t1 t2 ...) 't3) <=>
+;;; (and (subtypep 't1 't3) (subtypep 't2 't3) ...)
+;;; because '(or t1 t2 ...) denotes the union of types t1, t2, ...
+
+(def-subtypep-specialist 1 or
+  (do ((type1 (cdr type1) (cdr type1)))
+      ((null type1) t)
+    (if (not (sub-subtypep (car type1) type2))
+	(return nil))))
+
+#| I don't think this is correct  - Dks
+;;; (subtypep 't1 '(or t2 t3 ...)) <=>
+;;; (or (subtypep 't1 't2) (subtypep 't1 't3) ...)
+;;; because '(or t1 t2 ...) denotes the union of types t1, t2, ...
+
+(def-subtypep-specialist 2 or
+  (do ((type2 (cdr type2) (cdr type2)))
+      ((null type2) nil)
+    (if (not (sub-subtypep type1 (car type2)))
+	(return t))))
+|#
+(def-subtypep-too-hairy 2 or)
+
+#| And this is even harder -- Ram
+;;; (subtypep '(not t1) t2) <=> (not (subtypep 't1 't2))
+
+(def-subtypep-specialist 1 not
+  (not (sub-subtypep (cadr type1) type2)))
+
+;;; (subtypep t1 '(not t2)) <=> (not (subtypep 't1 't2))
+
+(def-subtypep-specialist 2 not
+  (not (sub-subtypep type1 (cadr type2))))
+|#
+(def-subtypep-too-hairy 1 not)
+(def-subtypep-too-hairy 2 not)
+;;;    Integers
+
+(def-subtypep-specialist 1 integer
+  (let ((low1 (if (listp (nth 1 type1))    	;turn exclusive limits into
+		  (1+ (car (nth 1 type1)))	; inclusive ones.
+		  (nth 1 type1)))
+	(high1 (if (listp (nth 2 type1))
+		   (1- (car (nth 2 type1)))
+		   (nth 2 type1))))
+    (cond
+     ((sub-subtypep 'integer type2) T)
+     ((eq type2 'fixnum)
+      (sub-subtypep type1
+		    `(integer ,most-negative-fixnum ,most-positive-fixnum)))
+     ((eq type2 'bignum) T)
+     ((eq type2 'bit) (sub-subtypep type1 '(integer 0 1)))
+     ((symbolp type2) ())
+
+     ;; integer versus integer
+     ((eq (car type2) 'integer)
+      (let ((low2 (if (listp (nth 1 type2))    	;turn exclusive limits into
+		      (1- (car (nth 1 type2)))	; inclusive ones.
+		      (nth 1 type2)))
+	    (high2 (if (listp (nth 2 type2))
+		       (1- (car (nth 2 type2)))
+		       (nth 2 type2))))
+	(and (st-range>= low1 low2)		;T if range1 is within
+	     (st-range<= high1 high2))))	; range2
+	
+     ;; integer versus rational
+     ((eq (car type2) 'rational)
+      (sub-subtypep `(rational ,low1 ,high1) type2))
+
+     ;; Otherwise, maby the specialist for type2 can help
+     (T (call-subtypep-specialist 2 type1 type2))
+     )))
+
+
+;; specialist for the case where type2 is (integer ...)
+(def-subtypep-specialist 2 integer
+  (cond ((eq type1 'bit)
+	 (sub-subtypep '(integer 0 1) type2))
+	((symbolp type1)
+	 nil)
+	(t
+	 (throw 'hairy-subtypep (values () ())))))
+
+;;;    Rationals
+
+(def-subtypep-specialist 1 rational
+  (let ((low1 (nth 1 type1))
+	(high1 (nth 2 type1)))
+    (cond
+     ((sub-subtypep 'rational type2) T)
+     ((symbolp type2) ())
+
+     ;; rational to rational
+     ((eq (car type2) 'rational)
+      (let ((low2 (nth 1 type2))
+	    (high2 (nth 2 type2)))
+	(and (st-range>= low1 low2)     ;T if type1 range is within
+	     (st-range<= high1 high2))	; type2 range.
+	))
+
+     ;; otherwise maybe the specialist for type2 can help
+     (T (call-subtypep-specialist 2 type1 type2)))))
+
+
+(def-subtypep-specialist 2 rational
+  (declare (ignore type2))
+  (cond ((symbolp type1) ())
+	(T (throw 'hairy-subtypep (values () ())))))
+;;;    Floats
+
+(def-subtypep-specialist 1 float
+  (let ((low1 (nth 1 type1))
+	(high1 (nth 2 type1)))
+    (cond
+     ((sub-subtypep 'float type2) T)
+     ((eq type2 'short-float)
+      (sub-subtypep type1 `(float ,most-negative-short-float
+			      ,most-positive-short-float)))
+     ((eq type2 'single-float)
+      (sub-subtypep type1 `(float ,most-negative-single-float
+			      ,most-positive-single-float)))
+     ((eq type2 'double-float)
+      (sub-subtypep type1 `(float ,most-negative-double-float
+			      ,most-positive-double-float)))
+     ((eq type2 'long-float)
+      (sub-subtypep type1 `(float ,most-negative-long-float
+			      ,most-positive-long-float)))
+     ((symbolp type2) ())
+
+     ;; float to float
+     ((eq (car type2) 'float)
+      (let ((low2 (nth 1 type2))
+	    (high2 (nth 2 type2)))
+	(and (st-range>= low1 low2)     ;T if type1 range is within
+	     (st-range<= high1 high2))	; type2 range.
+	))
+
+     ;; otherwise maybe the specialist for type2 can help
+     (T (call-subtypep-specialist 2 type1 type2)))))
+
+
+(def-subtypep-specialist 2 float
+  (declare (ignore type2))
+  (cond ((symbolp type1) ())
+	(T (throw 'hairy-subtypep (values () ())))))
+;;;    Mods, Signed-Bytes, Unsigned-Bytes
+
+;; these forms all turn different flavors of (integer ...) into something
+;; that the specialist for integer can understand.
+
+(def-subtypep-specialist 1 mod
+  (sub-subtypep `(integer 0 ,(1- (nth 1 type1))) type2))
+
+(def-subtypep-specialist 2 mod
+  (sub-subtypep type1 `(integer 0 ,(1- (nth 1 type2)))))
+
+
+
+(def-subtypep-specialist 1 signed-byte
+  (let ((highest (ldb (byte (1- (nth 1 type1)) 0) -1)))	  ;gets n-1 bits of 1's
+    (sub-subtypep `(integer ,(1- (- highest)) ,highest) type2)))
+
+(def-subtypep-specialist 2 signed-byte
+  (let ((highest (ldb (byte (1- (nth 1 type2)) 0) -1)))	  ;gets n-1 bits of 1's
+    (sub-subtypep type1 `(integer ,(1- (- highest)) ,highest))))
+
+
+
+(def-subtypep-specialist 1 unsigned-byte
+  (let ((highest (ldb (byte (nth 1 type1) 0) -1)))	  ;gets n bits of 1's
+    (sub-subtypep `(integer 0 ,highest) type2)))
+
+(def-subtypep-specialist 2 unsigned-byte
+  (let ((highest (ldb (byte (nth 1 type2) 0) -1)))	  ;gets n bits of 1's
+    (sub-subtypep type1 `(integer 0 ,highest))))
+;;;    Float types
+
+(def-subtypep-specialist 1 short-float
+  (cond
+   ((sub-subtypep 'short-float type2) T)
+   ((member type2 '(single-float double-float long-float)) ())
+   (T (sub-subtypep `(float ,(nth 1 type1) ,(nth 2 type1)) type2))))
+
+(def-subtypep-specialist 2 short-float
+  (declare (ignore type2))
+  (if (symbolp type1)
+      ()
+      (throw 'hairy-subtypep (values () ()))))
+
+
+
+(def-subtypep-specialist 1 single-float
+  (cond
+   ((sub-subtypep 'single-float type2) T)
+   ((member type2 '(short-float double-float long-float)) ())
+   (T (sub-subtypep `(float ,(nth 1 type1) ,(nth 2 type1)) type2))))
+
+(def-subtypep-specialist 2 single-float
+  (declare (ignore type2))
+  (if (symbolp type1)
+      ()
+      (throw 'hairy-subtypep (values () ()))))
+
+
+
+(def-subtypep-specialist 1 double-float
+  (cond
+   ((sub-subtypep 'double-float type2) T)
+   ((member type2 '(short-float single-float long-float)) ())
+   (T (sub-subtypep `(float ,(nth 1 type1) ,(nth 2 type1)) type2))))
+
+(def-subtypep-specialist 2 double-float
+  (declare (ignore type2))
+  (if (symbolp type1)
+      ()
+      (throw 'hairy-subtypep (values () ()))))
+
+
+
+(def-subtypep-specialist 1 long-float
+  (cond
+   ((sub-subtypep 'long-float type2) T)
+   ((member type2 '(short-float single-float double-float)) ())
+   (T (sub-subtypep `(float ,(nth 1 type1) ,(nth 2 type1)) type2))))
+
+(def-subtypep-specialist 2 long-float
+  (declare (ignore type2))
+  (if (symbolp type1)
+      ()
+      (throw 'hairy-subtypep (values () ()))))
+
+
+
+;;; The following paren closes subtypep-init
+)
+;;; Sub-Subtypep
+
+;;; Sub-Subtypep returns T if TYPE1 is a subtype of TYPE2, () if it is not.
+;;;  Some cases can not be decided.  If this occurs, the values () () are
+;;;  thrown to the catch tag 'HAIRY-SUBTYPEP.
+;;;
+;;; If type1 is a list, then call a specialized function which handles that
+;;;  particular list type when it appears as type1.  Otherwise, if type2 is a
+;;;  list, then call the specialist which handles that particular list type
+;;;  when it appears as type2.
+;;;
+;;; If both types are symbols, then lookup the subtype relation in the
+;;;  *symbol-subtype-table*. 
+;;;
+;;; Specialist functions are associated with the name of the car of the list
+;;;  types.  The macro get-subtype-specialist is used look up the function.
+;;;  The numeric arg specifies whether to get the specialist for the type1
+;;;  case or the type2 case.
+
+(defun sub-subtypep (type1 type2)
+  "Returns T iff type1 is a subtype of type2."
+  (let ((type1 (type-expand type1))
+	(type2 (type-expand type2)))
+    (cond
+     ((equal type1 type2) (values t t))
+     ((eq type2 '*) (values t t))
+     ((and (eq type2 t) (not (eq type1 '*))) (values t t))
+     ((eq type1 nil) (values t t))
+     ((listp type1)
+      (call-subtypep-specialist 1 type1 type2))
+     ((listp type2)
+      (call-subtypep-specialist 2 type1 type2))
+     ((not (assoc type1 *symbol-subtype-table*))
+      (if (get type1 'defstruct-description)
+	  (values (include-chase type1 type2) t)
+	  (throw 'hairy-subtypep (values () ()))))
+     (T
+      (let ((subtypes-of-2  (assoc type2 *symbol-subtype-table*)))
+	(if (null subtypes-of-2)
+	    (throw 'hairy-subtypep (values () ())))
+	(if (member type1 subtypes-of-2)
+	    T
+	    ())
+	))
+     )))
+;;; Subtypep
+
+;;; Subtypep returns two values which may be any of the three following pairs.
+;;;
+;;;   T T    -- TYPE1 is a subtype of TYPE2.
+;;;   () T   -- TYPE1 is not a subtype of TYPE2.
+;;;   () ()  -- Couldn't tell.
+;;;
+;;; Passing the not-sure  value around is too complex.  Sub-Subtypep returns
+;;;  the first value, and throws (values () ()) if it encounters an 
+;;;  undecideable case somewhere up the stack.
+
+(defun subtypep (type1 type2)
+  "Returns T if type1 is a subtype of type2.  If second value is (), couldn't
+  decide."
+  (catch 'hairy-subtypep (values (Sub-Subtypep type1 type2) T)))

@@ -1,0 +1,525 @@
+;<FTP>TCPDAT.MAC.15, 20-Apr-2006 21:36:38, Edit by MRC
+; Implement passive mode (thank you Tom DeBellis)
+;<FTP>TCPDAT.MAC.14, 26-Sep-2005 08:35:22, Edit by MRC
+; Handle remote not implementing MODE/STRU (thank you Tom DeBellis)
+;<FTP>TCPDAT.MAC.13,  9-Sep-85 16:40:57, Edit by LOUGHEED
+; Merge MIT changes
+;[MIT-XX]PS:<GZ.FTP>TCPDAT.MAC.2, 31-Aug-85 15:13:04, Edit by GZ
+;(CHASW) Jump to chaos routines for transport-protocol part of TCDOPN.
+;<FTP>TCPDAT.MAC.12,  3-Jul-85 12:56:39, Edit by LOUGHEED
+;<FTP>TCPDAT.MAC.11,  3-Jul-85 12:37:34, Edit by LOUGHEED
+; TCDOPN recreates data connections blown up by server.
+;<FTP>TCPDAT.MAC.10, 12-Feb-85 21:03:31, Edit by LOUGHEED
+; From Rutgers:
+;  - disable auto-block mode until someone wants to debug it
+;  - TCDRSP copes with a 125 response that comes after the data transfer.
+;     The IBM VMS server currently sends both a 150 and 125 response
+;     to RETR.  The code for RETR reads the 150 and then starts
+;     the transfer. When we to the end of the data transfer, we see the 125.
+;     Better solutions are to either fix IBM server or to split this program
+;     into two processes like the BBN FTP.
+;<FTP>TCPDAT.MAC.9, 16-Sep-84 14:10:59, Edit by LOUGHEED
+; From UTEXAS: fix indexing bug in TCPSMD
+;<FTP>TCPDAT.MAC.8, 28-Aug-84 00:19:37, Edit by SATZ
+; Change PERSIST:0 to TIMEOUT:60 when opening data connection
+
+	SEARCH FTPDEF
+	TTITLE(TCPDAT, -- User-DTP for TCP FTP)
+	SUBTTL David Eppstein / Stanford University / 2-Feb-1984
+
+	;; Copyright (C) 1984, 1985 Board of Trustees, Stanford University
+	;; The information in this software is subject to change without
+	;; notice and should not be construed as a commitment by Stanford
+	;; University.  Stanford assumes no responsibility for the use or
+	;; reliability of this software.
+
+	.REQUIRE TCPXFR		; Use low level data transfer stuff
+
+	EXTERN $GTHNS,HSTNUM,TCPRSP,FILPRP,LCLPRT,NETBUF
+	EXTERN SETCMD,SAVPDL,SETMOD,SETTYP,FLSTAK,PUSHIO
+	EXTERN TCPRSQ,TCPTFM,MODCOR,MODCTB,TCXSND,TCXREC,TCXJFN
+
+	IFN CHASW,<EXTERN CHAFTP,CFDOPN>
+
+DEFINE FTPM (STRING) <UFTPM [ASCIZ\STRING\]>
+
+SUBTTL Setting of connection parameters
+
+; Call TCPSET before calling TCDOPN, returns +1/failure, +2/success
+
+LS TCDMOD			; Currently set mode
+LS TCDTYP			; Currently set transfer type
+LS TCDSTR			; Currently set structure
+LS TCDBSZ			; Currently set byte size
+
+; Main entry point
+TCPSET::CALL TCPSMD		; Set mode
+	 RET			; Propagate failure return
+	SKIPE B,FILPRP+P.XTYP	; Look at remote transfer type
+	 SKIPN C,FILPRP+P.TYPE	; And local type
+	  JRST TCTSET		; One or the other unspecified, ask for new one
+	JRST @[ TCTASC		; TT.TXT ASCII
+		TCTBIN		; TT.BIN binary
+		TCTPAG		; TT.PAG paged
+		TCTDIR		; TT.DIR shouldn't happen
+		TCTPAG		; TT.MEI more paged
+		TCTEBC		; TT.EBC EBCDIC
+		TCTIMG		; TT.IMG image
+		TCTNON ]-1(B)	; TT.NON don't specify
+
+; Here to set up not sending a STRU keyword
+TCTNON: SAVEAC <P1,P2>		; Preserve some accumulators
+	DMOVE P1,B		; Tuck away the calling arguments
+	MOVX B,"A"		; Will want ASCII
+	CAMN B,TCDTYP		; Compare current type
+	IFSKP.			; Need to change
+	  MOVEM B,TCDTYP	; Update current type
+	  SETZM TCDBSZ		; Byte size is OVERLOADED with FM.UNS format
+	  DO.
+	    FTPM <TYPE A>	; Send off TYPE command
+	    CALL TCTRRS		; Read response
+	     LOOP.		; Need to resend command
+	  ENDDO.
+	ENDIF.
+	CAMN P1,TCDSTR		; Same as previous structure?
+	IFSKP.			; No need to set again
+	  MOVX B,TT.NON		; Structure is none
+	  MOVEM B,TCDSTR	; Save as new setting
+	ENDIF.
+	RETSKP			; Return success
+
+; Here to read a response, returns +1 if need to resend
+TCTRRS: DO.
+	  CALL TCPRSP		; Read server response
+	   EXIT. 		; Error, don't do this again
+	   RET			; Interrupted by login, resend
+	  CAIN B,"-"		; Continued?
+	   LOOP.		; Yes, get some more stuff
+	ENDDO.
+	RETSKP			; Done
+
+; Here to set structure for file
+; enter at TCTPGS for paged, TCTFIL for file
+; returns +1/need retry, +2/ok
+TCTPGS:	SKIPA B,["P"]		; Paged entry
+TCTFIL:	 MOVEI B,"F"		; File entry
+	CAMN B,TCDSTR		; Same as previous structure?
+	 RETSKP			; No need to set again
+	MOVEM B,TCDSTR		; Save as new setting
+TCTST2:	FTPM <STRU %2C>		; Send off
+TCTST3:	CALL TCPRSP		; Get response
+	 JRST TCTST0		; Bad, need new setting
+	 JRST TCTST1		; Retry, remember need to send STRU again
+	CAIN B,"-"		; Continued?
+	 JRST TCTST3		; Yes
+	RETSKP			; Ok
+
+; Here with complete failure of structure, need to get a new transfer type
+TCTST0:	SETZM TCDSTR		; No structure yet
+	RET			; Need to get new setting
+
+; Here when login intervened, now try sending structure again
+TCTST1:	MOVE B,TCDSTR		; Get structure back
+	JRST TCTST2		; Send it off again
+
+; Here to clear out saved types when a new connection is opened
+TCPZRO::SETZM TCDMOD		; No mode
+	SETZM TCDTYP		; Or type
+	SETZM TCDSTR		; Or structure
+	SETZM TCDBSZ		; Or bytesize
+	RET
+
+; Various transfer type settings
+
+; Here for image transfers
+TCTIMG::CALL TCTCKP		; Must not be paged
+	 JRST TCTINC		; Is
+	CAMN B,TCDTYP		; Image before?
+	 RETSKP			; Yes, ok
+	MOVEM B,TCDTYP		; No, save as new type
+	CALL TCTFIL		; File structure
+	 JRST TCTSET		; Retry
+TCTIM0:	FTPM <TYPE I>		; Type image
+TCTIM1:	CALL TCPRSP		; Get reply
+	 JRST TCTSET		; Bad
+	 JRST TCTIM0		; Need to retry
+	CAIN B,"-"		; Continued?
+	 JRST TCTIM1		; Yes
+	RETSKP			; All set
+
+
+; Here for EBCDIC and ASCII transfers
+TCTEBC:	SKIPA B,["E"]		; EBCDIC
+TCTASC:	 MOVEI B,"A"		; ASCII
+	CALL TCTCKP		; Must not be paged
+	 JRST TCTINC		; Is
+	MOVE C,FILPRP+P.TFRM	; Get format
+	CAMN B,TCDTYP		; Same type
+	 CAME C,TCDBSZ		; And format as before?
+	  IFSKP. <RETSKP>	; Yes
+	MOVEM B,TCDTYP		; Save type
+	MOVEM C,TCDBSZ		; and format for later comparison
+	CALL TCTFIL		; File structure
+	 JRST TCTSET		; Lossage
+TCTTX0:	MOVE B,TCDTYP		; Now get type back
+	MOVE C,TCDBSZ		; and format
+	HRROI C,[ 0		; FM.UNS unspecified format
+		  " N"		; FM.NPR non-print
+		  " T"		; FM.TEL TELNET
+		  " C" ](C)	; FM.ASA carriage control
+	FTPM <TYPE %2C%3S>	; Send off TYPE command
+TCTTX1:	CALL TCPRSP		; Read server response
+	 JRST TCTSET		; Didn't like, find new type
+	 JRST TCTTX0		; Interrupted by login, resend
+	CAIN B,"-"		; Continued?
+	 JRST TCTTX1		; Yes
+	RETSKP			; All ok
+
+; More type setting
+
+; Here for binary ("logical-byte") transfers
+TCTBIN:	CALL TCTCKP		; Must not be paged
+	 JRST TCTINC		; Is
+	CALL TCTFIL		; File structure
+	 JRST TCTSET		; Retry
+	SKIPG C,FILPRP+P.XBYT	; Get byte size
+	 MOVEI C,^D8		; None given, assume 8-bit
+	CALL TCTLBY		; Set logical bytes
+	 JRST TCTSET		; Not liked, find another type
+	RETSKP			; All ok
+
+; Here for paged transfers i.e. paged structure with logical-byte 36
+TCTPAG:	CALL TCTCKP		; Paged locally?
+	 IFSKP. <JRST TCTINC>	; No, incompatible
+	MOVEI C,^D36		; 36-bit bytes
+	CALL TCTLBY		; Set logical bytes
+	 JRST TCTSET		; Not liked, find another type
+	CALL TCTPGS		; Page structure
+	 JRST TCTSET		; Not liked, find another type
+	RETSKP			; All ok
+
+; Common code for logical byte and paged transfers
+TCTLBY:	MOVEI B,TT.BIN		; Binary transfer type
+	CAMN B,TCDTYP		; Same type
+	 CAME C,TCDBSZ		; and byte size?
+	  IFSKP. <RETSKP>	; Yes, return success
+	MOVEM B,TCDTYP		; New, save for next time
+	MOVEM C,TCDBSZ
+TCTLB0:	MOVE C,TCDBSZ		; Get byte size back
+	FTPM <TYPE L %3D>	; Send off transfer type
+TCTBL1:	CALL TCPRSP		; Get response
+	 JRST TCTSET		; Failed, propagate
+	 JRST TCTLB0		; Login intervened, send type again
+	CAIN B,"-"		; Continued?
+	 JRST TCTBL1		; Yes
+	RETSKP			; Success, return with it
+
+
+; Here if we somehow get TT.DIR as a transfer type
+TCTDIR:	TYPE <%% Directory transfer type encountered in TCPSET%/>
+	JRST TCTSET		; Don't even try with this loser
+
+; Here for non-paged types to check if local type is paged
+; Local type will be in C, returns +1/paged, +2/unpaged
+TCTCKP:	CAIE C,TT.MEI		; This paged
+	 CAIN C,TT.PAG		; Or this one?
+	  RET			; Yes, return +1
+	RETSKP			; No, return +2
+
+; Here with oncompatible combination of paged and non-paged transfer
+TCTINC:	TYPE <%% Incompatible local and remote transfer type settings%/>
+;	JRST TCTSET		; Go ask for a new setting
+
+; Here with failure from some TYPE or STRU
+TCTSET:	SETZM TCDTYP		; Type has not been set yet
+	CALL FLSTAK		; Abort any take file
+	CALL SETTYP		; Ask for new transfer type
+	 RET			; Lost, return failure from setting
+	JRST TCPSET		; Retry
+
+; Here to set transfer mode
+
+; Enter here on retry.  We have to clear the old mode so we
+; don't get confused and think it is already set.
+TCPSM1:	SETZM TCDMOD		; Here on retry to make sure mode sent again
+				; fall into...
+; Main entry point
+; returns +1/failure, +2/success with remote mode set appropriately
+; if mode not accepted, prompts for new one
+TCPSMD:	MOVE A,FILPRP+P.TMOD	; Get mode
+	MOVE B,MODCTB(A)	; Get I/O coroutines to use
+	MOVE A,[ "A"		; MD.ABK auto-block mode
+		 "S"		; MD.STR stream mode
+		 "B"		; MD.BLK block mode
+		 "C"		; MD.CMP compressed mode
+		 "N" ](A)	; MD.NON don't send MODE command
+	CAMN A,TCDMOD		; Same as previous mode?
+	 RETSKP			; Yes, no need to set again
+	MOVEM A,TCDMOD		; Save as new mode
+	MOVEM B,MODCOR		; Save new I/O coroutines
+	CAIN A,"N"		; Don't send mode?
+	 RETSKP			; Silently fail
+	CAIE A,"A"		; Auto-block?
+	 JRST TCPSM3		; No, just send as is
+REPEAT 0,<
+;Disable block mode until such time as we debug it.  Use stream instead.
+;Presently only Multics  and IBM VMS implement block mode.
+	FTPM <MODE B>		; Yes, try block
+
+; Here to read response to Block mode message from Auto-block
+TCPSM5:	CALL TCPRSQ		; Get response
+	 JRST TCPSM4		; Bad, use stream instead
+	 JRST TCPSM1		; Retry
+	CAIN B,"-"		; Continued?
+	 JRST TCPSM5		; Yes, get continuation
+	RETSKP			; Good
+
+; Here on failure from Auto-Block.  We assume that meant not to use
+; block mode and we use stream mode instead.
+TCPSM4:	CAIN B,"-"		; Continued?
+	 JRST TCPSM5		; Yes, get continuation
+>;REPEAT 0
+	MOVEI A,"S"		; Autoblock failed, try stream
+	MV. MODCTB+MD.STR,MODCOR ; and get correct coroutine to use
+
+; Here on normal modes, or on auto-block after B failed.
+; A contains the letter for the appropriate mode.
+TCPSM3:	FTPM <MODE %1C>		; Want to reset connection mode
+	DO.
+	  CALL TCPRSP		; Server response
+	   JRST TCPSM2		; Bad mode, get another
+	   JRST TCPSM1		; Retry
+	  CAIN B,"-"		; Continued?
+	   LOOP.		; Yes, get continuation
+	ENDDO.
+	RETSKP			; Good
+
+; Here when server didn't like that transfer mode
+TCPSM2:	SETZM TCDMOD
+	CALL FLSTAK		; Abort any take file
+	CALL PUSHIO		; Make sure talking to the terminal
+	PROMPT [ASCIZ \SET MODE (for data connections to) \]
+	SETABORT (R)		; If we abort, give failure return
+	CALL SETCMD
+	MOVE P,SAVPDL
+	CALL SETMOD		; Try SET MODE again
+	CLRABORT
+	JRST TCPSMD		; Retry
+
+SUBTTL Data port opening and closing
+
+; TCDOPN - Get the data port
+; returns +1/failure, +2/success
+
+TCDOPN::SAVEAC <A,B,C,D>
+IFN CHASW,<
+	SKIPE CHAFTP		; Using Chaos instead of TCP?
+	 JRST CFDOPN		; Yes.
+>;IFN CHASW
+	SKIPN A,TCXJFN		; Is there a data connection?
+	 JRST TCDOP1		; No, go create one
+	GTSTS%			; Get status of current connection
+	TXNE B,GS%NAM		; Is JFN valid? (not released, etc.)
+	 TXNE B,GS%ERR		; Is valid.  Is it in an error state?
+	  JRST TCDOP0		; Bad JFN, not valid or in error state
+	GDSTS%			; JFN okay, now look at TCP connection
+	 ERJMP TCDOP0		; Some error 
+	CAMN B,[XWD .TCSYN,.TCSYN]	; SYN.SYN?
+	 RETSKP			; Net connection good too, return to caller
+TCDOP0:	TXO A,CZ%ABT		; Abort this connection
+	CLOSF%			; ...
+	 ERJMP .+1		; Ignore any errors
+	SETZM TCXJFN		; Say no more JFN
+TCDOP1: IFXE. F,F%PASV		; Active?
+	  TXNE F,F%ALTS		; Want alternate sockets?
+	   CALL TCDNSK		; Yes, get new socket
+	  HRROI A,NETBUF	; Into this buffer space
+	  MOVE B,LCLPRT		; Get the new local port number
+	  MOVE C,HSTNUM		; With foreign host number
+	  WRITE <TCP:%2D.%3O-20;CONNECTION:PASSIVE;TIMEOUT:60> ; Make JFN string
+	ELSE.			; Otherwise passive
+	  CALL TCDPAS		; Find out the port from the host
+	  HRROI A,NETBUF	; Into this buffer space
+	  MOVE C,HSTNUM		; Control connection remote host address
+	  WRITE <TCP:.%3O-%4D;CONNECTION:ACTIVE;TIMEOUT:60> ; C,D
+	ENDIF.
+	MOVX A,GJ%SHT		; Short form of GTJFN%
+	HRROI B,NETBUF		; Filestring
+	GTJFN%			; Get a handle on the connection
+	 ETYPE <Can't initiate data connection - %J%/>,<ADJSP P,-1> ; Err, ret
+	MOVEM A,TCXJFN		; Save data JFN
+				; Base network bits: 8 bit bytes, read/write
+	MOVX B,<<FLD ^D8,OF%BSZ>!OF%WR!OF%RD>
+				; When active, don't wait, high throughput
+	MOVX C,<FLD .TCMIH,OF%MOD>
+	TXNE F,F%PASV		; Passive mode?
+	 MOVX C,<FLD .TCMWH,OF%MOD>
+				; Assume wait before return, high throughput
+	IOR B,C			; Construct complete open bits
+	OPENF%			; Open the connection, but return immediately
+	 SKIPA A,TCXJFN		; Failed, get connection JFN
+	  RETSKP		; Succeeded, return success
+	RLJFN%			; Release losing JFN
+	 NOP			; Ignore an error here
+	SETZM TCXJFN		; Say no more JFN
+	ETYPE <Can't open data connection - %J%/> ; Print error message
+	RET			; Take failure return
+
+; Here to get a new socket number for the data connection
+
+TCDNSK:	MOVX A,.GTHLN		; Getting host number on network
+	MOVE B,HSTNUM		; From remote host number
+	GTHST%			; Read our number on same net
+	IFSKP.
+	  MOVE D,B		; Copy into right register
+	ELSE.
+	  MOVX A,.GTHSZ		; Failed, try reading local host number
+	  GTHST%		; Do it
+	   FATAL <Couldn't get Internet host number>
+	ENDIF.
+	HRROI A,NETBUF		; Point to net buffer
+	MOVEI B,4		; Four bytes
+	LSH D,4			; Shift into place
+	DO.
+	  SETZ C,		; Clear out destination
+	  LSHC C,8		; Get an octet
+	  WRITE <%3D,>		; Write it
+	  SOJG B,TOP.		; Back for the rest
+	ENDDO.
+	AOS C,LCLPRT		; Get a new port
+	LSHC C,-8		; Shift into octets
+	LSH D,-^D28		; And shift low-order octet into place
+	HRROI B,NETBUF		; Point to host number string
+	FTPM <PORT %2S%3D,%4D>	; Make PORT command
+TCDNS0:	CALL TCPRSQ		; Get response
+	 JRST TCDNS1		; Lost, go complain
+	 JRST TCDNSK		; Retry, get new socket
+	CAIN B,"-"		; Won.  Continued?
+	 JRST TCDNS0		; Yes, back for more
+	RET			; No, stop
+
+TCDNS1:	CAIN B,"-"		; Continued?
+	 JRST TCDNS0		; Yes, get rest
+	TXZ F,F%ALTS		; Can't use alternate-sockets any more
+	SOS LCLPRT		; Get port back in synch
+	TYPE <%% Host does not support PORT, can't use ALTERNATE-SOCKETS%/>
+	RET
+; Here to get a port from the remote host when in passive mode
+
+TCDPAS: FTPM <PASV>		; Ask server for a port
+TCDPA1: CALL TCPRSQ		; Get response
+	 JRST TCDPA2		; Lost; maybe the server doesn't have PASV?
+	 JRST TCDPAS		; Retry, we weren't logged in
+	CAIN B,"-"		; Continued????
+	 JRST TCDPA1		; Yes, only want one line
+	CAIE A,^D227		; Did it give us a port?
+	 JRST TCDPA3		; No, bad response
+				; So far, so good: parse the response
+	SETZB A,B		; Penultimate and ultimate commas
+	DO.			; Parse for the port
+	  ILDB D,C		; Pick up a character
+	  CAIE D,","		; A comma?
+	  IFSKP.		; Yes, this delimits host and port octets
+	    MOVE A,B		; Remember last comma
+	    MOVE B,C		; This one, two, too
+	  ENDIF.		; End case of octet delimiter
+	  JUMPN D,TOP.		; Not at end?  Get more characters
+	ENDDO.			; Now should have high and low port
+				; Do a little bogo-checking
+	JUMPE A,TCDPA4		; No high port octet?
+	JUMPE B,TCDPA4		; No low port octet?
+				; Good, now form the internal 16 bit port
+	MOVE D,B		; Save low order
+	MOVX C,^D10		; Port octet is reported in decimal
+	NIN%			; Convert to internal
+	 ERJMPS TCDPA4		;  Mal-formed server response
+	MOVE A,D		; Load low order position
+	MOVE D,B		; Save high order byte
+	NIN%			; Convert low port octet to internal
+	 ERJMPS TCDPA4		;  Mal-formed server response
+	LSH D,^D8		; Position high order byte
+	IORB B,D		; Complete the waiting data port number
+	RET			; Return a twin, just in case
+
+TCDPA2: ETYPE <Couldn't negotiate a passive data connection - %J%/> ; Complain
+	RET
+
+TCDPA3: ETYPE <Server didn't report a passive data connection port - %J%/>
+	RET
+
+TCDPA4: ETYPE <Server didn't specify a passive data connection port number - %J%/>
+	RET
+
+
+; TCXCLS - Release the data port
+; returns +1/always
+; This should not be called after every data transfer, rather it should
+; only be called explicitly when closing down the TELNET connection.
+
+; Enter at TCXABT instead of TCXCLS to abort connection without
+; prior expectation of FTP server.
+
+TCXCLS::SAVEAC <A,B,C>		; Don't clobber AC
+	TMOSET(15000,TCXCLT)	; Give up after 15 seconds
+	CALL TCXCL0		; Call routine to do it
+	TMOCLR			; No more timeout
+	RET			; Done
+
+TCXCL0:	SKIPE A,TCXJFN		; Get the JFN
+	 CLOSF%			; Close the connection 
+	  ERJMP TCXABT		; Lost, try again
+	SETZM TCXJFN		; Flag we don't have a JFN
+	RET			; Go back
+
+TCXCLT:	CLRTMO			; Flush interrupt
+	TYPE <%_%% Timeout or abort while closing data connection%/>
+TCXABT::SKIPN A,TCXJFN		; Get JFN again
+	 RET			; Entered at TCXABT and nothing there
+	HRLI A,(CZ%ABT)		; Aborting
+	CLOSF%			; Flush it
+	 TYPE <%_%% Unlikely failure to close data connection - %J%/>
+	SETZM TCXJFN		; Flag we don't have a JFN
+	RET
+
+SUBTTL Data transfer jacket routines
+
+; TCDREC - Receive file from net
+; takes opened JFN in A, file properties in FILPRP
+; TCPSET and TCDOPN must already have been done
+; TCXCLS will be done if necessary
+; returns +1/failure, +2/success
+
+TCDREC::CALL TCXREC		; Do low-level data receive
+	 TXZA F,F%TEMP		; Failed
+	  TXO F,F%TEMP		; Succeeded
+
+; Common reply code for TCDREC and TCDSND
+; F%TEMP should be set if wants +2 return on successful reply
+TCDRSP:	CALL TCPRSP		; Get response
+	 RET			; Failure
+	 RET			; Retry too late
+	SKTERS VB.VRB		; If verbose
+	 CALL TCPTFM		; Type it
+	CAIL A,^D200		; If left-over startup response
+	 CAIN B,"-"		; Or continued?
+	  JRST TCDRSP		; Yes, get more
+	CAIN A,^D226		; Closing down data connection?
+	 CALL TCXCLS		; Yes, make sure it has been done
+	TXZE F,F%TEMP		; Did we win?
+	 RETSKP			; Yes
+	RET			; No
+
+SUBTTL Sending of data to net
+
+; TCDSND - Send file to net
+; takes opened JFN in FILJFN, file properties in FILPRP
+; TCPSET and TCDOPN must already have been done
+; TCXCLS will be done if necessary
+; returns +1/failure, +2/success
+
+TCDSND::CALL TCXSND		; Do low-level data send
+	 TXZA F,F%TEMP		; Failed
+	  TXO F,F%TEMP		; Succeeded
+	JRST TCDRSP		; Go join common code with receive
+
+	END

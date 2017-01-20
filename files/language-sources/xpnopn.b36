@@ -1,0 +1,789 @@
+%TITLE 'XPNOPN - Open a network link'
+MODULE xpnopn (
+               ENTRY ( XPN$OPEN ),
+               IDENT = '3'
+              ) =
+BEGIN
+!  COPYRIGHT (C) DIGITAL EQUIPMENT CORPORATION 1986.
+!  ALL RIGHTS RESERVED.
+!  
+!  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY  BE  USED  AND
+!  COPIED ONLY IN ACCORDANCE WITH THE TERMS OF SUCH LICENSE AND WITH
+!  THE INCLUSION OF THE ABOVE COPYRIGHT NOTICE.   THIS  SOFTWARE  OR
+!  ANY  OTHER  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE
+!  AVAILABLE TO ANY OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE
+!  SOFTWARE IS HEREBY TRANSFERRED.
+!  
+!  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT  TO  CHANGE  WITHOUT
+!  NOTICE  AND  SHOULD  NOT  BE CONSTRUED AS A COMMITMENT BY DIGITAL
+!  EQUIPMENT CORPORATION.
+!  
+!  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF
+!  ITS SOFTWARE ON EQUIPMENT THAT IS NOT SUPPLIED BY DIGITAL.
+
+!++
+! FACILITY:
+!   Transportable BLISS interface to DECNET, TOPS20 implementation
+!
+! ABSTRACT:
+!   This module contains the BLISSnet OPEN function support routines.
+!
+! ENVIRONMENT:
+!   TOPS20 user mode.
+!
+! AUTHOR: Larry Campbell, CREATION DATE: 2 November, 1981
+!
+! MODIFIED BY: Andrew Nourse
+!
+! 03 - Make FAL debugging hack work
+! 02 - Make connect format 1 work
+! 01 - The beginning
+!--
+
+!
+! TABLE OF CONTENTS:
+!
+FORWARD ROUTINE
+    xpn$open,                           ! First level routine
+    xpn$$open,                          ! Actual work routine
+    xpn$$active_spec,                   ! Build filespec, active
+    xpn$$passive_spec,                  ! Build filespec, passive
+    xpn$$attributes : NOVALUE,          ! Add attributes to filespec string
+    xpn$$legalize_string : NOVALUE,     ! Legalize a filespec field string
+    xpn$$gtjfn_openf;                   ! Do a GTJFN and OPENF for net link
+!
+! INCLUDE FILES:
+!
+LIBRARY 'BLI:XPORT';                    ! XPORT definitions
+LIBRARY 'BLISSNET';                     ! BLISSnet definitions
+LIBRARY 'BLI:MONSYM';                   ! TOPS20 monitor definitions
+LIBRARY 'BLISSNET20';                   ! BLISSnet-20 internal definitions
+REQUIRE 'JSYSDEF';                      ! JSYS linkage definitions
+!
+! MACROS:
+!
+
+!
+! EQUATED SYMBOLS:
+!
+LITERAL
+    openf_byte_size = %O'100000000000';
+LITERAL
+    OBJ$K_FAL = 17;                     ![3] The FAL object type
+!
+! OWN STORAGE:
+!
+
+!
+! EXTERNAL REFERENCES:
+!
+
+EXTERNAL ROUTINE
+    xpn$$valid_nlb,                     ! Validate an NLB
+    xpn$$int_set : NOVALUE,             ! Set up for interrupts for a link
+    xpn$$sleep : NOVALUE,               ! Sleep for specified no. of msecs
+    xpn$pmr;                            ! Negotiate poor-man's routing
+
+GLOBAL ROUTINE xpn$open (nlb, success_routine, failure_routine) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   This is the first level imperative routine for the OPEN function.
+!   The expansion of the $XPN_OPEN macro calls this routine.  xpn$$open_active
+!   or xpn$$open_passive, as appropriate, is called to perform the
+!   OPEN function.  The completion code is checked, and the success
+!   or failure action routine is called, as appropriate.
+!
+! FORMAL PARAMETERS:
+!   nlb                 - address of the Network Link Block
+!   success_routine     - address of a success action routine, or zero if
+!                         no action routine is to be called
+!   failure-routine     - address of a failure action routine, or zero if
+!                         no action routine is to be called
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!   NLB$G_COMP_CODE is set based on the return code from the success or
+!   failure action routine.  NLB$G_2ND_CODE may be set if a failure occurs;
+!   in particular, if a JSYS error occurs it is set to the TOPS20 error code.
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   The completion code from the success or failure action routine is
+!   returned as the routine value, if an action routine is called.
+!   Otherwise, the completion code from xpn$$open_active or xpn$$open_passive
+!   is returned.
+!
+! SIDE EFFECTS:
+!   A network link is opened.
+!
+!--
+    BEGIN
+
+    MAP
+        nlb : REF $XPN_NLB();
+
+    LOCAL
+        original_primary_code,
+        primary_code,
+        secondary_code,
+        retcode;
+
+    nlb_binds;                          ! create nice names for NLB fields
+    !
+    ! validate the NLB
+    !
+    retcode = xpn$$valid_nlb (.nlb);
+    IF NOT .retcode
+    THEN
+        BEGIN
+        original_primary_code = XPN$_BAD_NLB;
+        secondary_code = .retcode
+        END
+    ELSE
+        BEGIN
+        !
+        ! Initialize all common fields and bits.
+        !
+        nlb[NLB$V_DATA_REQ] = 0;
+        nlb[NLB$V_END_MSG] = 0;
+        nlb[NLB$V_STRING] = 0;
+        nlb[NLB$V_ABORTALL] = 0;
+        nlb[NLB$V_CONN_REQ] = 0;
+        nlb[NLB$V_ABORTED] = 0;
+        nlb[NLB$V_DISCONNECTED] = 0;
+        nlb[NLB$V_IRPT_MSG] = 0;
+        nlb[NLB$V_OPEN] = 0;
+        nlb[NLB$V_CONNECTED] = 0;
+        nlb[NLB$V_VALIDITY] = 0;
+        !
+        ! If allowing poor-man's routing, do it that way, otherwise
+        ! do simple open
+        !
+        IF .nlb[NLB$V_PMR]
+        THEN
+            original_primary_code = xpn$pmr (.nlb)
+        ELSE
+            BEGIN
+            original_primary_code = xpn$$open (.nlb);
+            !
+            ! If caller specified OPTION = WAIT, and there are no errors so far,
+            ! wait for an event.
+            !
+            IF .nlb[NLB$V_WAIT] AND (.original_primary_code) THEN
+                original_primary_code =
+                    BEGIN
+                    LOCAL
+                        event_code;
+                    !
+                    ! For active links, we let $XPN_EVENT_INFO do the waiting.
+                    ! For passive links, we can do it with interrupts.
+                    !
+                    IF active
+                    THEN
+                        BEGIN
+                        event_code = $XPN_EVENT_INFO (NLB = .nlb,
+                                                      FAILURE = 0,
+                                                      OPTION = WAIT);
+                        IF .event_code EQL XPN$_ABORTED
+                        THEN
+                            event_code =
+                                (SELECTONE .nlb[NLB$G_2ND_CODE] OF
+                                    SET
+                                    [$DCX1] : XPN$_RESALLOC;
+                                    [$DCX2] : XPN$_NOSUCHNODE;
+                                    [$DCX4, $DCX41] : XPN$_NOSUCHOBJ;
+                                    [$DCX8] : XPN$_THIRD;
+                                    [$DCX34] : XPN$_NO_ACCESS;
+                                    [$DCX38, $DCX40] : XPN$_ABORTED;
+                                    [$DCX39] : XPN$_UNREACH;
+                                    [$DCX1 TO $DCX43] : XPN$_REJECTED;
+                                    [OTHERWISE] : XPN$_ABORTED;
+                                    TES);
+                        .event_code
+                        END
+                    ELSE
+                        BEGIN
+                        LOCAL
+                            event_code,
+                            nlb_vec : VECTOR[2];
+                        nlb_vec[0] = 1;
+                        nlb_vec[1] = .nlb;
+                        xpn$$int_set (nlb_vec);     ! Set up for interrupts
+                        WHILE (event_code = $XPN_EVENT_INFO (NLB = .nlb,
+                                                             FAILURE = 0))
+                               EQL XPN$_NO_EVENT
+                        DO
+                            !
+                            ! Do infinite sleep, which connect initiate interrupt
+                            ! will wake us up from (I hope!)
+                            !
+                            xpn$$sleep (0);
+                        .event_code
+                        END
+                    END;
+            END;
+        nlb[NLB$G_COMP_CODE] = .original_primary_code;
+        secondary_code = .nlb[NLB$G_2ND_CODE]
+        END;
+    !
+    ! Check completion code and call success or failure routine as required
+    !
+    IF .original_primary_code
+    THEN
+        IF .success_routine NEQ 0
+        THEN
+            primary_code =
+                (.success_routine) (XPN$K_OPEN, .original_primary_code,
+                    .secondary_code, .nlb)
+        ELSE
+            primary_code = .original_primary_code
+    ELSE
+        IF .failure_routine NEQ 0
+        THEN
+            primary_code =
+                (.failure_routine) (XPN$K_OPEN, .original_primary_code,
+                    .secondary_code, .nlb)
+        ELSE
+            primary_code = .original_primary_code;
+    !
+    ! Unless the NLB was bad, store the completion code there
+    !
+    IF .original_primary_code NEQ XPN$_BAD_NLB
+    THEN
+        nlb[NLB$G_COMP_CODE] = .primary_code;
+    RETURN (.primary_code);
+
+    END;			!End of XPN$OPEN
+
+ROUTINE xpn$$open (nlb) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   This is the work routine for xpn$open.  It calls xpn$$passive
+!   or xpn$$active, to build the filespec string appropriately,
+!   then calls xpn$$gtjfn_openf to actually open the link.
+!
+! FORMAL PARAMETERS:
+!   nlb         - address of the Network Link Block
+!
+! IMPLICIT INPUTS:
+!   nlb[NLB$V_REMEMBER]         - if set, don't build filespec, reuse JFN
+!   nlb[NLB$V_ACTIVE]
+!   nlb[NLB$V_PASSIVE]
+!
+! IMPLICIT OUTPUTS:
+!   nlb[NLB$H_JFN]              - gets JFN for the link
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   Value returned by xpn$$active, xpn$$passive, or xpn$$gtjfn_openf
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+    BEGIN
+
+    MAP
+        nlb : REF $XPN_NLB ();
+
+    LOCAL
+        ret_val,
+        filespec_string : VECTOR [CH$ALLOCATION (255)],
+        filespec : $STR_DESCRIPTOR (CLASS = BOUNDED);
+
+    nlb_binds;                          ! Get short names for popular fields
+    IF NOT .nlb[NLB$V_REMEMBER]         ! If not reusing JFN,
+    THEN
+        BEGIN
+        $STR_DESC_INIT (DESCRIPTOR = filespec, CLASS = BOUNDED,
+                        STRING = (255, CH$PTR (filespec_string)));
+        IF active THEN ret_val = xpn$$active_spec (.nlb, filespec);
+        IF passive THEN ret_val = xpn$$passive_spec (.nlb, filespec);
+        IF NOT .ret_val
+        THEN
+            RETURN (.ret_val);          ! Stop now if errors
+        !
+        ! Add common attributes (password, account, user-ID, etc.)
+        !
+        xpn$$attributes (.nlb, filespec);
+        !
+        ! Append a null to insure ASCIZ for GTJFN, then do the GTJFN
+        !
+        $STR_APPEND (STRING = %CHAR (0), TARGET = filespec);
+        END;
+    IF (ret_val = xpn$$gtjfn_openf (.nlb, filespec))
+    THEN
+        BEGIN
+        nlb[NLB$V_OPEN] = 1;
+        IF active
+        THEN
+            nlb[NLB$V_CONN_REQ] = 1;
+        END;
+    RETURN (.ret_val)
+    END;                                !End of xpn$$open
+
+ROUTINE xpn$$active_spec (nlb, filespec) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Builds filespec string for active links.
+!
+! FORMAL PARAMETERS:
+!   nlb         - address of Network Link Block
+!   filespec    - address of bounded descriptor of buffer for filespec
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   XPN$_NORMAL         - normal (success) return
+!
+!   XPN$_NO_OPEN        - TOPS20 failed to open link
+!       various                 - TOPS20 error code (>600000) or DECNET error code
+!   XPN$_BUG            - bug, or not-yet-implemented function called
+!
+! SIDE EFFECTS:
+!
+!   A JFN is assigned (NLB$H_JFN) and a connect initiate has been queued.
+!   Unused JFNs are never left lying around;  if the OPENF failes, the JFN
+!   is released.
+!
+!--
+    BEGIN
+
+    MAP
+        nlb : REF $XPN_NLB (),
+        filespec : REF $STR_DESCRIPTOR (CLASS = BOUNDED);
+
+    nlb_binds;                          ! create nice names for NLB fields
+    !
+    ! Build the filespec string (DCN:host-object-descr.taskname;attr;attr)
+    !
+    $STR_COPY (STRING =
+                  $STR_CONCAT
+                      ('DCN:',
+                       remote_host,
+                       '-'),
+               TARGET = .filespec);
+    !
+    ! Build filespec part according to format type
+    !
+    CASE remote_format FROM 0 TO 2 OF
+        SET
+        [0] :                           ! Format 0, object type must be nonzero
+            BEGIN
+            IF remote_object_type EQL 0
+            THEN
+                RETURN (XPN$_NO_OBJECT);
+            !
+            ! Copy object type to filespec string
+            !
+            $STR_APPEND
+                 (STRING = $STR_ASCII (remote_object_type, BASE10),
+                  TARGET = .filespec);
+            END;
+        [1] :                           ! Format 1 connect, by taskname
+            BEGIN                       ![2] Implement this
+            IF remote_object_type eql OBJ$K_FAL        ![3] let FAL-DEBUG work
+            THEN $STR_APPEND
+                     (STRING = 'FAL',
+                      TARGET = .filespec)
+            ELSE $STR_APPEND
+                     (STRING = $STR_ASCII (remote_object_type, BASE10),
+                      TARGET = .filespec);
+
+            $STR_APPEND(STRING='-', TARGET=.filespec);
+            $STR_APPEND(STRING=remote_descriptor,
+                        TARGET=.filespec);
+
+            END;
+        [2] :                           ! Format 2 connect, user/group & tsk
+            BEGIN
+            RETURN (XPN$_BUG)           ! *** not implemented
+            END;
+        TES;
+    RETURN (XPN$_NORMAL)
+    END;
+
+ROUTINE xpn$$passive_spec (nlb, filespec) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Second-level OPEN routine for passive links.
+!
+! FORMAL PARAMETERS:
+!   nlb         - address of Network Link Block
+!   filespec    - address of bounded descriptor to buffer for filespec
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   XPN$_NORMAL         - normal (success) return
+!
+!   XPN$_NO_OPEN        - TOPS20 failed to open link
+!       various                 - TOPS20 error code (>600000)
+!                                 or DECNET error code
+!   XPN$_BUG            - bug, or not-yet-implemented function called
+!
+! SIDE EFFECTS:
+!
+!   A network link is inited in passive mode and a JFN is assigned.
+!
+!--
+    BEGIN
+
+    MAP
+        nlb : REF $XPN_NLB (),
+        filespec : REF $STR_DESCRIPTOR (CLASS = BOUNDED);
+
+    nlb_binds;                          ! get nice names for NLB fields
+    !
+    ! Build the filespec string (SRV:object-descr.taskname;attr;attr)
+    !
+    $STR_COPY (STRING = 'SRV:', TARGET = .filespec);
+    !
+    ! Build filespec part according to format type
+    !
+    CASE local_format FROM 0 TO 2 OF
+        SET
+        [0] :                           ! Format 0, object type required
+            BEGIN
+            IF local_object_type EQL 0
+            THEN
+                RETURN (XPN$_NO_OBJECT);
+            !
+            ! Copy object type to filespec string
+            !
+            $STR_APPEND
+                 (STRING = $STR_ASCII (local_object_type, BASE10),
+                  TARGET = .filespec);
+            END;
+        [1] :                           ! Format 1, connect by taskname
+            BEGIN                       ![2] Implement this
+            IF local_object_type eql OBJ$K_FAL        ![3] let FAL-DEBUG work
+            THEN $STR_APPEND
+                     (STRING = 'FAL',
+                      TARGET = .filespec)
+            ELSE $STR_APPEND
+                     (STRING = $STR_ASCII (local_object_type, BASE10),
+                      TARGET = .filespec);
+
+            $STR_APPEND(STRING='-', TARGET=.filespec);
+            $STR_APPEND(STRING=local_descriptor,
+                        TARGET=.filespec);
+
+            END;
+        [2] :                           ! Format 2, connect by user/group & tsk
+            BEGIN
+            RETURN (XPN$_BUG)
+            END;
+        TES;
+    RETURN (XPN$_NORMAL)
+    END;                                ! End of xpn$$passive_spec
+
+ROUTINE xpn$$attributes (nlb, filespec) : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   This routine appends the JFN attributes to the string pointed to
+!    by filespec.
+!
+! FORMAL PARAMETERS:
+!   nlb		- address of the Network Link Block
+!   filespec	- descriptor of the filespec string
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!	NONE
+!
+! SIDE EFFECTS:
+!	Appends to the string pointed to by filespec.
+!
+!--
+    BEGIN
+
+    MAP
+	nlb : REF $XPN_NLB (),
+        filespec : REF $STR_DESCRIPTOR ();
+
+    nlb_binds;                          ! create nice names for NLB fields
+    !
+    ! Validate user-ID and copy to filespec string if present
+    !
+    IF user_ID NEQ 0
+    THEN
+        BEGIN
+        IF .user_ID[STR$H_LENGTH] GTR 39
+        THEN
+            RETURN (XPN$_IVUSERLEN);
+        IF .user_ID[STR$H_LENGTH] NEQ 0
+        THEN
+            BEGIN
+            LOCAL
+                legal_string : $STR_DESCRIPTOR (CLASS = DYNAMIC);
+            $STR_DESC_INIT (DESCRIPTOR = legal_string, CLASS = DYNAMIC);
+            xpn$$legalize_string (user_ID, legal_string);
+            $STR_APPEND
+                (STRING = $STR_CONCAT
+                    (';USERID:',
+                     legal_string),
+                 TARGET = .filespec);
+            $XPO_FREE_MEM (STRING = legal_string);
+            END;
+        END;
+    !
+    ! Validate password and copy to filespec string if present
+    !
+    IF password NEQ 0
+    THEN
+        BEGIN
+        IF .password[STR$H_LENGTH] GTR 39
+        THEN
+            RETURN (XPN$_IVPWDLEN);
+        IF .password[STR$H_LENGTH] NEQ 0
+        THEN
+            BEGIN
+            LOCAL
+                legal_string : $STR_DESCRIPTOR (CLASS = DYNAMIC);
+            $STR_DESC_INIT (DESCRIPTOR = legal_string, CLASS = DYNAMIC);
+            xpn$$legalize_string (password, legal_string);
+            $STR_APPEND
+                (STRING = $STR_CONCAT
+                    (';PASSWORD:',
+                     legal_string),
+                 TARGET = .filespec);
+            $XPO_FREE_MEM (STRING = legal_string);
+            END;
+        END;
+    !
+    ! Validate account string and copy to filespec string if present
+    !
+    IF account NEQ 0
+    THEN
+        BEGIN
+        IF .account[STR$H_LENGTH] GTR 39
+        THEN
+            RETURN (XPN$_IVACCTLEN);
+        IF .account[STR$H_LENGTH] NEQ 0
+        THEN
+            BEGIN
+            LOCAL
+                legal_string : $STR_DESCRIPTOR (CLASS = DYNAMIC);
+            $STR_DESC_INIT (DESCRIPTOR = legal_string, CLASS = DYNAMIC);
+            xpn$$legalize_string (account, legal_string);
+            $STR_APPEND
+                (STRING = $STR_CONCAT
+                    (';CHARGE:',
+                     legal_string),
+                 TARGET = .filespec);
+            $XPO_FREE_MEM (STRING = legal_string);
+            END;
+        END;
+    !
+    ! Validate optional data string and append to filespec if present
+    !
+    IF optional NEQ 0
+    THEN
+        BEGIN
+        IF .optional[STR$H_LENGTH] GTR 39
+        THEN
+            RETURN (XPN$_IVOPTLEN);
+        IF .optional[STR$H_LENGTH] NEQ 0
+        THEN
+            !
+            ! If byte pointer is 7-bit, do ;DATA (ASCII) attribute
+            ! If byte pointer is 8-bit, do ;BDATA (binary) attribute
+            !  (We could just do ;BDATA always but this makes things
+            !  more readable when trapping file openings, or poking around
+            !  in DDT)
+            !
+            BEGIN
+            SELECTONE .(optional[STR$A_POINTER])<24,6>
+            OF
+                SET
+                [7] :
+                    BEGIN
+                    LOCAL
+                        legal_string : $STR_DESCRIPTOR (CLASS = DYNAMIC);
+                    $STR_DESC_INIT (DESCRIPTOR = legal_string,
+                                    CLASS = DYNAMIC);
+                    xpn$$legalize_string (optional, legal_string);
+                    $STR_APPEND
+                        (STRING = $STR_CONCAT
+                            (';DATA:',
+                             legal_string),
+                         TARGET = .filespec);
+                    $XPO_FREE_MEM (STRING = legal_string);
+                    END;
+                [8] :
+                    BEGIN
+                    LOCAL
+                        ptr;
+                    ptr = .optional[STR$A_POINTER];
+                    $STR_APPEND
+                        (STRING = ';BDATA:',
+                         TARGET = .filespec);
+                    DECR count FROM .optional[STR$H_LENGTH] TO 1
+                    DO
+                        $STR_APPEND (STRING = $STR_ASCII (CH$RCHAR_A (ptr),
+                                                          LENGTH = 3, BASE8),
+                                     TARGET = .filespec);
+                    END;
+                TES;
+            END;
+        END;
+    END;
+
+ROUTINE xpn$$legalize_string (p_src_desc, p_dest_desc) : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   Legalize a TOPS-20 filespec field and copy the legalized field to the
+!   descriptor specified.  Legalizing means quoting with ctrl-V all characters
+!   which would otherwise be considered punctuation.
+!
+! FORMAL PARAMETERS:
+!   p_src_desc      - pointer to descriptor for source string
+!   p_dest_desc     - pointer to descriptor to receive legalized string
+!
+! IMPLICIT INPUTS:
+!   NONE
+!
+! IMPLICIT OUTPUTS:
+!   NONE
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!   NONE
+!
+! SIDE EFFECTS:
+!   NONE
+!
+!--
+    BEGIN
+
+    BIND
+        src_desc = .p_src_desc : $STR_DESCRIPTOR (),
+        dest_desc = .p_dest_desc : $STR_DESCRIPTOR ();
+
+    LOCAL
+        input_ptr,
+        output_ptr,
+        output_cnt,
+        temp_buffer : VECTOR [CH$ALLOCATION (39*2)],
+        temp_desc : $STR_DESCRIPTOR ();
+
+    $STR_DESC_INIT (DESCRIPTOR = temp_desc,
+                    STRING = (0, CH$PTR (temp_buffer)));
+    input_ptr = .src_desc[STR$A_POINTER];
+    output_ptr = CH$PTR (temp_buffer);
+    output_cnt = 0;
+    DECR input_cnt FROM .src_desc[STR$H_LENGTH] TO 1
+    DO
+        BEGIN
+        LOCAL
+            char;
+        SELECT (char = CH$RCHAR_A (input_ptr))
+        OF
+            SET
+            [%C'[', %C']', %C',', %C';',
+             %C'<', %C'>', %C':', %C'!'] :
+                BEGIN
+                !
+                ! Character requires quoting, output a ctrl-V
+                !
+                output_cnt = .output_cnt + 1;
+                CH$WCHAR_A (%C'V' - %O'100', output_ptr);
+                END;
+            [ALWAYS] :
+                BEGIN
+                output_cnt = .output_cnt + 1;
+                CH$WCHAR_A (.char, output_ptr);
+                END;
+            TES;
+        END;
+    !
+    ! Update temp_desc, and STR$COPY its contents to caller-supplied
+    ! output descriptor
+    !
+    temp_desc[STR$H_LENGTH] = .output_cnt;
+    $STR_COPY (TARGET = dest_desc, STRING = temp_desc);
+    END;                                ! End of xpn$$legalize_string
+
+ROUTINE xpn$$gtjfn_openf (nlb, filespec) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!   This routine does the actual GTJFN/OPENF JSYSes to set up a net link.
+!
+! FORMAL PARAMETERS:
+!   nlb		- address of Network Link Block
+!   filespec	- bounded descriptor pointing to the filespec string (ASCIZ)
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NLB$H_JFN	- JFN goes here if the open is successful
+!
+! ROUTINE VALUE and
+! COMPLETION CODES:
+!	XPN$_NORMAL	- all went well
+!	XPN$_NO_OPEN	- something failed,
+!                         NLB$G_2ND_CODE gets TOPS20 error code
+!
+! SIDE EFFECTS:
+!	A JFN is assigned and associated with the link.
+!
+!--
+    BEGIN
+
+    MAP
+        nlb : REF $XPN_NLB (),
+        filespec : REF $STR_DESCRIPTOR ();
+
+    LOCAL
+        output;
+
+    IF NOT .nlb[NLB$V_REMEMBER]         ! If we're not reusing a JFN,
+    THEN
+        BEGIN
+        IF NOT JSYS_GTJFN (GJ_SHT, .filespec[STR$A_POINTER]; output)
+        THEN                            !  ..
+            BEGIN                       !  ..
+            nlb[NLB$G_2ND_CODE] = .output;      ! return JSYS error code in NLB
+            RETURN (XPN$_NO_OPEN)
+            END;
+        nlb[NLB$H_JFN] = .output        ! Save JFN in NLB
+        END
+    ELSE
+        output = .nlb[NLB$H_JFN];
+    !
+    ! Now do the OPENF for the link
+    !
+    IF NOT JSYS_OPENF (.output, openf_byte_size + OF_RD + OF_WR; output)
+    THEN                                ! If failure
+	BEGIN                           !  ..
+	nlb[NLB$G_2ND_CODE] = .output;  ! return JSYS error code in NLB
+        JSYS_RLJFN (.nlb[NLB$H_JFN]);   ! Release the (now-useless) JFN
+        nlb[NLB$H_JFN] = 0;
+	RETURN (XPN$_NO_OPEN)
+	END;
+    RETURN (XPN$_NORMAL);
+    END;
+
+
+END				!End of module XPNOPN
+ELUDOM
