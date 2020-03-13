@@ -406,3 +406,4 @@
     (if (< from 0) (setq from (+ from length)))
     (if (< to 0) (setq to (+ to length)))
     (substring string from (+ from to))))
+    

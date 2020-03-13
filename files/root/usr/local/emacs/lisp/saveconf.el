@@ -238,3 +238,4 @@ nor nil it means to not count the minibuffer window even if it is active."
       (setq w (next-window w mini)))
     windows))
 
+    

@@ -389,3 +389,4 @@ int _trmopuse = SYS_CSI;	/* Non-zero to use TRMOP. TTY I/O */
 #endif
 
 #endif /* T20+10X+T10+CSI+WAITS+ITS */
+ 

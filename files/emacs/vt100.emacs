@@ -351,3 +351,4 @@ FS REREAD'
     fs tyi source"e @ft  '	    !* Echo an altmode to show we have exited.!
     qP mMM_&_Maybe_Push_Point	    !* Maybe leave mark at place search started.!
     0
+ 

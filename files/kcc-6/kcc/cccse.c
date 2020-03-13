@@ -1046,3 +1046,4 @@ PCODE *q;
 
     return (flushtop == maxcse && pregmatch < 0);
 }
+   

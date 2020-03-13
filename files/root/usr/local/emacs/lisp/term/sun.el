@@ -291,3 +291,4 @@
 
 ;;; If Emacstool is being nice, and informs us of its presence:
 (if (getenv "IN_EMACSTOOL") (emacstool-init))
+ 

@@ -305,3 +305,4 @@ int l_close()			/* close the line */
  linejfn = 0;
  return(success);
 }
+ 

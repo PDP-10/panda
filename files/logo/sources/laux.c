@@ -569,3 +569,4 @@ struct object *arg;
 	endflag = 1;
 	return(arg);
 }
+   

@@ -463,3 +463,4 @@ Runs the shell command defined by TeX-show-queue-command."
   (send-string "TeX-shell" (concat TeX-show-queue-command "\n"))
   (TeX-recenter-output-buffer nil))
 
+  

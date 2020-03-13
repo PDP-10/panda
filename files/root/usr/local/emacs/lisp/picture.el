@@ -561,3 +561,4 @@ With no argument strips whitespace from end of every line in Picture buffer
    (goto-char (point-min))
    (while (re-search-forward "[ \t][ \t]*$" nil t)
      (delete-region (match-beginning 0) (point)))))
+    

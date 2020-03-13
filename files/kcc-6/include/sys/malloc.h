@@ -275,3 +275,4 @@ extern void *malloc __P((unsigned long size, int type, int flags));
 extern void free __P((void *addr, int type));
 #endif /* KERNEL */
 #endif /* !_MALLOC_H_ */
+ 

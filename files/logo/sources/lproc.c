@@ -553,3 +553,4 @@ register int no;
 {
 	while (no--)putchar(' ');
 }
+  

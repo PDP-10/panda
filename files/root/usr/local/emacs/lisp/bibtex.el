@@ -424,3 +424,4 @@ if that value is non-nil."
   (interactive)
   (local-set-mouse  '(text right) 'bibtex-sun-menu-eval))
 
+ 

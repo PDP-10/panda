@@ -396,3 +396,4 @@ by the PF1 key.  GOLD is the ASCII the 7-bit escape sequence <ESC>OP.")
 (or (assq 'edt-direction-string minor-mode-alist)
     (setq minor-mode-alist (cons '(edt-direction-string edt-direction-string)
 				 minor-mode-alist)))
+  

@@ -862,3 +862,4 @@ yyprompt(clear) {
 		fflush(stdout);
 	}
 }
+    

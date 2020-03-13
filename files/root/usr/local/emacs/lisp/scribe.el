@@ -305,3 +305,4 @@ preceding text is of the form @Command."
 				   scribe-open-parentheses)))
 	  (save-excursion
 	    (insert (aref scribe-close-parentheses paren-char)))))))
+  

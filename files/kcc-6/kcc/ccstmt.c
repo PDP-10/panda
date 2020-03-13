@@ -2062,3 +2062,4 @@ NODE *n;
 	return ndeficonst(0);
     }
 }
+ 

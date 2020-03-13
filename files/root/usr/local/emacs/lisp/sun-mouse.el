@@ -668,3 +668,4 @@ just close the window, and wait for reopening."
 (make-variable-buffer-local 'current-local-mousemap)
 (setq-default current-local-mousemap nil)
 (defvar current-global-mousemap (make-mousemap))
+   

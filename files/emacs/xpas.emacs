@@ -737,3 +737,4 @@ A pre-comma arg means to capitalize a reserved word!
 !# Pascal for Template:! !S Insert template for WHILE or FOR statement!
 
  :i*do,:m(m.m& Pascal while/then Clause)
+   

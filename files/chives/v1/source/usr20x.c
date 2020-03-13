@@ -472,3 +472,4 @@ int usr_whopr(q,whoprs)
 	    return(1);
     return(0);
 }
+ 

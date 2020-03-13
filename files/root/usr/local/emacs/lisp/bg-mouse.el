@@ -303,3 +303,4 @@ X and Y are 0-based character positions on the screen."
 (bind-bg-mouse-click (+ bg-in-minibuf bg-button-m) 'suspend-emacs)
 (bind-bg-mouse-click (+ bg-in-minibuf bg-button-r) 'eval-expression)
 
+    

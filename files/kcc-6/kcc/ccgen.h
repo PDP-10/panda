@@ -478,3 +478,4 @@ extern void realcode P_((PCODE *p));
 extern int oneinstr P_((PCODE *p));
 
 #undef P_
+   

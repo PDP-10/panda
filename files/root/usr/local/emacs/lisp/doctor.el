@@ -1612,3 +1612,4 @@ global variable owner to possibly correct result"
 
 
 (defun doctor-chat () (doctor-type ($ chatlst)))
+ 

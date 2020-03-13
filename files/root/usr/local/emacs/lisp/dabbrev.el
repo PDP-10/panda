@@ -219,3 +219,4 @@ with the next possible expansion not yet tried."
 		  (setq test (cdr test)))
 		(if test (setq result nil))))))	; if already in table, ignore
       result)))
+   

@@ -304,3 +304,4 @@
     (flame2 (if (= (% (random) 2) 0) 2 1))
     (sit-for 0)
     (doctor-ret-or-read 1)))
+    

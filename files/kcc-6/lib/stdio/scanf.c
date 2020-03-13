@@ -573,3 +573,4 @@ struct scanf_work *sf;
 	sf->asscnt++;
     }
 }
+    

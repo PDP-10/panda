@@ -379,3 +379,4 @@ With argument, repeat that many times; negative args move backward."
   (push-mark (point))
   (macro-beginning-of-function)
   (backward-paragraph))
+  

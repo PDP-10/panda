@@ -469,3 +469,4 @@ ANALYZE-STAT.
 	DISPLAY "Dil-Severity was: " DIL-SEVERITY.
 
     DISPLAY "%Process halted due to severity of error return.".
+  

@@ -758,3 +758,4 @@ extern SYMBOL *htable[];	/* Symbol hash table (CCSYM, CCDATA) */
 extern TYPE *ttable[];		/* Type hash table (CCSYM, CCDATA) */
 extern TYPE types[];	/* Table of type structs (CCDUMP, CCSYM, CCDATA) */
 			/* Eventually make this dynamic */
+   

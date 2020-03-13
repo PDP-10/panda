@@ -615,3 +615,4 @@ Initialize the library if a prefix arg is given."
   "Bind the current program library, using the current binding options."
   (interactive)
   (compile (concat "adabind " ada-bind-opts " " ada-lib-dir-name)))
+ 

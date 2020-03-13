@@ -416,3 +416,4 @@ Control-C followed by the first character of the construct.
 	((string-equal (substring (buffer-name) -3) ".md")
 	 (find-file-other-window
 	  (concat (substring (buffer-name) 0 -3)  ".mi")))))
+  

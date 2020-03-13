@@ -705,3 +705,4 @@ Allowed only if variable Info-enable-edit is non-nil."
   (and (marker-position Info-tag-table-marker)
        (buffer-modified-p)
        (message "Tags may have changed.  Use Info-tagify if necessary")))
+   

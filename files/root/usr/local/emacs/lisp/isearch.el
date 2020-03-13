@@ -383,3 +383,4 @@
     (setq command-history (cons (list function string) command-history))
     ;; Go ahead and search.
     (funcall function string)))
+    

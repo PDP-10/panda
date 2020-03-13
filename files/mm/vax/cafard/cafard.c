@@ -770,7 +770,7 @@ printf("%s",queline);
       if (p_sout(queline,strlen(queline)) == P_ERR) /* send the line */
        {
 
-	error = TRUE;
+	error = TRUE;
 
 	break;
        }
@@ -999,3 +999,4 @@ printf("[closing]\n");
   break;
  }
 }
+ 

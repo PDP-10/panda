@@ -658,3 +658,4 @@ the current line is to be regarded as part of a block comment."
 		    (progn (indent-for-comment) (beginning-of-line)))))))))
 ; (message "Indenting C expression...done")
   )
+    

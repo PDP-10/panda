@@ -1424,3 +1424,4 @@ DIT-STAT-CHECK SECTION.
 	DISPLAY "%DIT: Invalid or unexpected status return code. "
 	DISPLAY "%Process Halted."
 	STOP RUN.
+ 

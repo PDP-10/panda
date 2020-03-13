@@ -1790,3 +1790,4 @@ A rectangle is drawn by the function DRAWRECT.  Note how the use of
 the properties defined for a GRAPHICSOBJECT allows an easy interface
 to the system functions MOVETO and DRAWTO in terms of the properties
 LEFT, RIGHT, TOP, and BOTTOM.
+    

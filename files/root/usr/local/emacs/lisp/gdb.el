@@ -395,3 +395,4 @@ It is for customization by you.")
     (switch-to-buffer current-gdb-buffer)
     (goto-char (dot-max))
     (insert-string comm)))
+   

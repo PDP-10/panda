@@ -265,3 +265,4 @@ Return not at end copies rest of line to end and sends it.
   (interactive "P\nr")
   (prolog-consult-region compile beg end)
   (switch-to-buffer "*prolog*"))
+   

@@ -257,3 +257,4 @@ char c;
 }
 
 #endif /* CHARTABLE */
+    

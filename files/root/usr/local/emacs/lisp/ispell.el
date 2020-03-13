@@ -950,3 +950,4 @@ replace the entire word."
 	    (if in-word (kill-word 1));; Replace the whole word.
 	    (search-backward current-word)
 	    (replace-match replacement)))));; To preserve capitalization etc.
+ 

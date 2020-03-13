@@ -671,3 +671,4 @@ char **acp;
     *acp = ++cp;
     return (tgmachuse.mapch ? tgmapch(c) : c);	/* Map char if must */
 }
+ 

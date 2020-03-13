@@ -3089,3 +3089,4 @@ vip-s-string"
 (if (file-exists-p "~/.vip") (load "~/.vip"))
 
 ;; End of VIP
+  

@@ -289,3 +289,4 @@ Save in Emacs kill ring also."
   (define-key mouse-map x-button-right 'x-cut-text)
   (define-key mouse-map x-button-left 'x-mouse-set-point)
   (define-key mouse-map x-button-middle 'x-paste-text))
+    

@@ -1590,3 +1590,4 @@ portion files and process the text in them.
 The @@Generate command declares portions; the first reference to
 @index(@@Generate)
 a portion creates the scratch file and opens it for output.
+  

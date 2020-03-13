@@ -1412,3 +1412,4 @@ buffer visiting that file."
   "Break up a digest message into its constituent messages.
 Leaves original message, deleted, before the undigestified messages."
   t)
+   

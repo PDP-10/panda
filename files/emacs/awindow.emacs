@@ -187,4 +187,4 @@ not in emacs.  These consist of the last part of the .... !
 
 !& Setup AWINDOW library:! !S Make variable!
 0m.vAmbassador Window Mode		!* Say no modes enabled!
-
+    

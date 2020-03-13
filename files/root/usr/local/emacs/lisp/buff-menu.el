@@ -271,3 +271,4 @@ You can mark buffers with the \\[Buffer-menu-mark] command."
     (switch-to-buffer (other-buffer))
     (pop-to-buffer buff)
     (bury-buffer menu)))
+ 

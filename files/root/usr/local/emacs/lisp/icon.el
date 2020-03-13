@@ -529,3 +529,4 @@ Returns nil if line starts inside a string, t if in a comment."
 	    (or (looking-at comment-start-skip)
 		(if (re-search-forward comment-start-skip (save-excursion (end-of-line) (point)) t)
 		    (progn (indent-for-comment) (beginning-of-line))))))))))
+  

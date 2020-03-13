@@ -1432,3 +1432,4 @@ long flen;			/* # bytes in file */
 
     return ep - ((struct sfent *)tabp);		/* Return # entries we got */
 }
+  

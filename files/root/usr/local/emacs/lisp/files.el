@@ -1067,3 +1067,4 @@ With prefix arg, silently save all file-visiting buffers, then kill."
 (define-key ctl-x-4-map "f" 'find-file-other-window)
 (define-key ctl-x-4-map "\C-f" 'find-file-other-window)
 (define-key ctl-x-4-map "b" 'switch-to-buffer-other-window)
+  

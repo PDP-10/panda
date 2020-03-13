@@ -534,3 +534,4 @@ register struct object *arg;
 	str[1] = '\0';
 	return(localize(objcpstr(str)));
 }
+    

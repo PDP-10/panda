@@ -431,3 +431,4 @@ Entering this mode calls value of hook variable rmail-summary-mode-hook."
 		       (delete-window (selected-window))))
     ;; Switch to the rmail buffer in this window.
     (switch-to-buffer rmail-buffer)))
+    

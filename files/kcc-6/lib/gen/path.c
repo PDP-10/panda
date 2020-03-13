@@ -411,3 +411,4 @@ char *dev, *dir, *name, *type, *gen, *atr;
 #else /* SYS_T20+SYS_10X */
 #error abspath only available under T20 or 10X
 #endif /* SYS_T20+SYS_10X */
+ 

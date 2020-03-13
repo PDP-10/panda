@@ -639,3 +639,4 @@ TTYINRESPONSES to (APPEND '(your entries) TTYINRESPONSES) inside any
 module where you want to do this sort of special processing.
 
 Special responses are not checked for during READ-style input.
+  

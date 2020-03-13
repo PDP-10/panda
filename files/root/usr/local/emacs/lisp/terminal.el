@@ -1142,3 +1142,4 @@ of the terminal-emulator"
 					     (1+ stupid)))
 		   cretin (1+ stupid)))
 	   (concat "\"" harder "\"")))))
+    

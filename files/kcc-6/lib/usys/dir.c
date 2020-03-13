@@ -402,3 +402,4 @@ int dirfd(DIR *dir)
 #else /* SYS_T20+SYS_10X */
 #error mkdir/rmdir/opendir/readdir/closedir only available under T20 or 10X
 #endif /* SYS_T20+SYS_10X */
+    

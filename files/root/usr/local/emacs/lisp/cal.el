@@ -238,3 +238,4 @@ calendar window has been prepared."
     (insert "**")
     (backward-char 1)))
 
+ 

@@ -407,3 +407,4 @@ CONST char *set;
 	_tokptr = NULL;			/* next time. */
     return start;			/* return start of token */
 }
+ 

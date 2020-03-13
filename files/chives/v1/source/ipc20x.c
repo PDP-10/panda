@@ -478,3 +478,4 @@ cleanup:				/* UNWIND-PROTECT */
     return(result);
 }
 #undef punt
+    

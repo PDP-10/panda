@@ -524,3 +524,4 @@ register int *temptab;		/* Temp table of at least MAXCASE words */
     }
     return 1;
 }
+   

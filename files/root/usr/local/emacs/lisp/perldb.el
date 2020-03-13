@@ -421,3 +421,4 @@ or \"p $ENV{%s}\"."
     (switch-to-buffer-other-window current-perldb-buffer)
     (goto-char (dot-max))
     (insert-string comm)))
+   

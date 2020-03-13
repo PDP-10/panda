@@ -1089,3 +1089,4 @@ PCODE *p;
 	p->Pop = P_MOVE;		/* add P_MOVE to put in right place */
     }
 }
+   
